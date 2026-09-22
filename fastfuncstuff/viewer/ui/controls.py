@@ -69,6 +69,22 @@ def _decimals(step: float) -> int:
     return 3
 
 
+class _PathList(QtWidgets.QListWidget):
+    """A list as tall as its rows, capped at :data:`PATH_LIST_ROWS`.
+
+    The height is a size *hint* rather than a fixed height set when the items
+    are added, because a row's height is not known until the widget has been
+    styled -- and the theme's stylesheet arrives after the panel is built. Set
+    eagerly, every list came out two thirds of a row short.
+    """
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        step = self.sizeHintForRow(0) if self.count() else 0
+        rows = max(1, min(self.count() or 1, PATH_LIST_ROWS))
+        height = rows * max(step, 18) + 2 * self.frameWidth() + 2
+        return QtCore.QSize(super().sizeHint().width(), height)
+
+
 class _Cell(QtWidgets.QWidget):
     """One control's label and widget, sized so hiding it keeps its place."""
 
@@ -155,9 +171,9 @@ class ControlPanel(QtWidgets.QWidget):
             if body is None:
                 continue
             span = max(1, min(int(spec.span), ROW_UNITS))
-            if spec.newline or used + span > ROW_UNITS:
-                if used:
-                    row, used = self._new_row(), 0
+            if used and (spec.newline or used + span > ROW_UNITS):
+                self._close_row(row, used)
+                row, used = self._new_row(), 0
             cell = _Cell(spec.label, body)
             if spec.help:
                 cell.setToolTip(spec.help)
@@ -166,8 +182,7 @@ class ControlPanel(QtWidgets.QWidget):
             self._cells[spec.name] = cell
             row.layout().addWidget(cell, span)
             used += span
-        if used and used < ROW_UNITS:
-            row.layout().addStretch(ROW_UNITS - used)
+        self._close_row(row, used)
 
         if actions:
             # A grid of three, not one row: ICA declares seven buttons, and a
@@ -187,7 +202,14 @@ class ControlPanel(QtWidgets.QWidget):
                 button.setMinimumWidth(10)
                 g.addWidget(button, *divmod(position, 3))
                 self._widgets[f"action:{spec.name}"] = button
+            holder.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+            )
             self._rows.addWidget(holder)
+        # Spare height goes here rather than into the last row. A panel given
+        # more space than it needs otherwise hands it to whatever is at the
+        # bottom, which is how FIT and KEEP ended up four hundred pixels tall.
+        self._rows.addStretch(1)
 
         self.apply_visibility()
 
@@ -196,8 +218,23 @@ class ControlPanel(QtWidgets.QWidget):
         h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
+        # Rows are as tall as what is in them. Left to grow, a row holding
+        # anything vertically expandable -- a path list -- takes the whole
+        # panel and pushes everything under it off the bottom.
+        row.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         self._rows.addWidget(row)
         return row
+
+    def _close_row(self, row: QtWidgets.QWidget, used: int) -> None:
+        """Pad a part-filled row so its controls keep the width they asked for.
+
+        Without this a lone half-width control takes the whole row, and the
+        span that was meant to say "this is a small thing" says nothing.
+        """
+        if 0 < used < ROW_UNITS:
+            row.layout().addStretch(ROW_UNITS - used)
 
     # -- visibility ----------------------------------------------------
     def apply_visibility(self) -> None:
@@ -209,23 +246,34 @@ class ControlPanel(QtWidgets.QWidget):
             other, wanted = spec.visible_when
             cell.setVisible(str(self._values.get(other, "")) in wanted)
 
-    def sync_values(self, values: dict[str, object]) -> None:
-        """Write state back into widgets that are not being typed into.
+    @staticmethod
+    def _being_edited(widget: QtWidgets.QWidget | None) -> bool:
+        """Whether writing to this control now would fight whoever is using it.
 
-        Focus is the whole guard. A refresh lands while the pointer is on a
-        slider and the caret is in a spin box, and overwriting either is how a
-        control ends up fighting the person using it.
+        Not simply "has focus". A combo box holds focus from the moment it is
+        clicked and commits on activation, so refusing to update a focused one
+        means the panel stops following state as soon as anyone touches it.
+        What must be left alone is a half-typed number or a slider mid-drag.
         """
+        if widget is None:
+            return False
+        for slider in widget.findChildren(QtWidgets.QSlider):
+            if slider.isSliderDown():
+                return True
+        focus = QtWidgets.QApplication.focusWidget()
+        if focus is None or not (focus is widget or widget.isAncestorOf(focus)):
+            return False
+        return isinstance(focus, QtWidgets.QLineEdit | QtWidgets.QAbstractSpinBox)
+
+    def sync_values(self, values: dict[str, object]) -> None:
+        """Write state back into widgets nobody is part-way through changing."""
         self._syncing = True
         try:
-            focus = QtWidgets.QApplication.focusWidget()
             for name, setter in self._setters.items():
                 if name not in values or name in self._pending:
                     continue
-                widget = self._widgets.get(name)
-                if focus is not None and widget is not None:
-                    if widget is focus or widget.isAncestorOf(focus):
-                        continue
+                if self._being_edited(self._widgets.get(name)):
+                    continue
                 setter(values[name])
             self._values.update(values)
         finally:
@@ -304,16 +352,14 @@ class ControlPanel(QtWidgets.QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
 
-        listing = QtWidgets.QListWidget()
+        listing = _PathList()
         listing.setAlternatingRowColors(True)
         listing.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         listing.setUniformItemSizes(True)
         listing.setMinimumWidth(80)
-
-        def fit_height() -> None:
-            step = listing.sizeHintForRow(0) if listing.count() else 18
-            rows = max(1, min(listing.count() or 1, PATH_LIST_ROWS))
-            listing.setFixedHeight(rows * max(step, 14) + 2 * listing.frameWidth() + 2)
+        listing.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
 
         def fill(entries) -> None:
             listing.blockSignals(True)
@@ -328,7 +374,7 @@ class ControlPanel(QtWidgets.QWidget):
                 )
                 listing.addItem(item)
             listing.blockSignals(False)
-            fit_height()
+            listing.updateGeometry()
 
         def entries() -> list[tuple[str, bool]]:
             out = []
@@ -372,15 +418,19 @@ class ControlPanel(QtWidgets.QWidget):
             ("−", drop, "Remove the selected files. Untick instead to keep them handy."),
         ):
             button = QtWidgets.QPushButton(text)
-            button.setFixedWidth(24)
+            button.setObjectName("tool")
+            # Square and small: two stacked buttons otherwise set the row's
+            # height, and an empty list next to them reads as a large blank
+            # box rather than as a list with nothing in it yet.
+            button.setFixedSize(22, 22)
             button.setToolTip(tip)
             button.clicked.connect(slot)
             buttons.addWidget(button)
-        buttons.addStretch(1)
 
         fill(PathListControl.parse(value if value is not None else spec.default))
         h.addWidget(listing, 1)
         h.addLayout(buttons)
+        h.setAlignment(buttons, QtCore.Qt.AlignmentFlag.AlignTop)
         self._setters[spec.name] = lambda v: fill(PathListControl.parse(v))
         return row
 
