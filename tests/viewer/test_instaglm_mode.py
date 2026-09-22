@@ -500,3 +500,89 @@ def test_a_pipeline_stem_is_not_carried_into_every_column_name(glm_session):
     mode = _enter(glm_session, ortvec=f"+{path}")
     ort = [c.label for c in mode._fit.model.columns if c.group == "ort"]
     assert ort == [f"motion#{i}" for i in range(6)]
+
+
+# -- spatial smoothing ------------------------------------------------------
+
+
+def test_blur_is_off_by_default_and_changes_nothing(glm_session):
+    mode = _enter(glm_session, events=glm_session.events)
+    assert mode.params["blur"] == 0.0
+    assert mode._blur == 0.0
+
+
+def test_blur_smooths_the_map(glm_session):
+    """The point of asking for it: neighbouring voxels stop disagreeing."""
+    _enter(glm_session, events=glm_session.events, show="beta", column="faces")
+    sharp = np.array(_map(glm_session), copy=True)
+    glm_session.set_mode_param("blur", "6")
+    glm_session.mode.refresh()
+    smooth = _map(glm_session)
+
+    def roughness(v):
+        v = np.asarray(v, dtype=np.float64)
+        return float(np.abs(np.diff(v, axis=0)).mean())
+
+    assert roughness(smooth) < roughness(sharp)
+
+
+def test_blur_regathers_rather_than_only_refitting(glm_session):
+    """It changes the data, not the design, so the cached run has to go.
+
+    Without this the slider refits smoothed betas onto unsmoothed data and
+    nothing on screen says which one you are looking at.
+    """
+    mode = _enter(glm_session, events=glm_session.events)
+    before = mode._prepared
+    glm_session.set_mode_param("blur", "5")
+    assert mode._prepared is not before
+    assert mode._blur == 5.0
+    # And back again, rather than sticking at the smoothed copy.
+    glm_session.set_mode_param("blur", "0")
+    assert mode._blur == 0.0
+
+
+def test_blur_does_not_change_which_voxels_are_fitted(glm_session):
+    """The mask comes off the unsmoothed run, so two blurs stay comparable."""
+    mode = _enter(glm_session, events=glm_session.events)
+    n_before = mode._prepared.n_voxels
+    mask_before = np.array(mode._prepared.mask, copy=True)
+    glm_session.set_mode_param("blur", "6")
+    assert mode._prepared.n_voxels == n_before
+    assert np.array_equal(mode._prepared.mask, mask_before)
+
+
+def test_blur_does_not_drag_air_into_the_brain_edge():
+    """Blur-in-mask leaves a constant exactly constant, edge voxels included.
+
+    That is the defining property -- blur(c.m)/blur(m) is c everywhere -- and
+    it is what a plain blur does not have: outside the mask the data is zero,
+    so a plain blur pulls every rim voxel down toward it, which is
+    indistinguishable from a real drop-off in activation at the brain's edge.
+    """
+    from fastfuncstuff.viewer import instaglm as engine
+
+    mask = np.zeros((12, 12, 10), dtype=bool)
+    mask[3:9, 3:9, 2:8] = True
+    data = np.where(mask[..., None], 100.0, 0.0).astype(np.float32).repeat(4, axis=3)
+
+    rows = engine._blurred_rows(data, mask, (2.0, 2.0, 2.0), CPU)
+    assert np.allclose(np.asarray(rows), 100.0, atol=1e-3), "the edge was pulled toward the air"
+
+    # What it would have been without the correction, at the same sigma.
+    from fastfuncstuff.stats.smooth3d import gaussian3d_batched
+
+    plain = gaussian3d_batched(torch.as_tensor(data[..., 0]).unsqueeze(0), (2.0, 2.0, 2.0)).squeeze(
+        0
+    )
+    assert float(np.asarray(plain)[mask].min()) < 70.0, "a plain blur is expected to sag here"
+
+
+def test_blur_is_recorded_in_the_script(glm_session):
+    """Through the bus, which is the path a click takes and the one replay reads."""
+    from fastfuncstuff.viewer.vocab import SetModeParam
+
+    _enter(glm_session, events=glm_session.events)
+    glm_session.do(SetModeParam("blur", "4"))
+    assert "SET_MODE_PARAM blur 4" in glm_session.to_script()
+    assert glm_session.mode.params["blur"] == 4.0

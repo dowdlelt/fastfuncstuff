@@ -462,12 +462,61 @@ class Prepared:
         return int(self.y.numel() * self.y.element_size())
 
 
+def _blurred_rows(
+    data: np.ndarray,
+    mask: np.ndarray,
+    sigma_vox: tuple[float, float, float],
+    device: torch.device,
+    progress: ProgressFn | None = None,
+) -> torch.Tensor:
+    """``(V, T)`` of the run smoothed *within* the mask.
+
+    Within, as ``3dBlurInMask`` does it: ``blur(x . m) / blur(m)``. A plain
+    blur mixes the zeros outside the brain into every edge voxel, which pulls
+    the rim of the map toward nothing and is indistinguishable from a real
+    drop-off in activation there.
+
+    Chunked over time rather than blurring the whole 4-D run at once, because
+    a real run is a gigabyte and this is the interactive path -- the smoothed
+    copy would be a second one. Peak is one chunk of volumes on top of the
+    ``(V, T)`` output, which has to exist regardless.
+    """
+    from fastfuncstuff.memory import get_available_memory
+    from fastfuncstuff.stats.smooth3d import gaussian3d_batched
+
+    nx, ny, nz, nt = data.shape
+    keep = torch.as_tensor(np.flatnonzero(mask.reshape(-1)), device=device, dtype=torch.long)
+    out = torch.empty((int(keep.numel()), nt), dtype=torch.float32, device=device)
+
+    m = torch.as_tensor(mask.astype(np.float32), device=device).unsqueeze(0)
+    # Once, not per chunk: the denominator is the same for every time point.
+    denom = gaussian3d_batched(m, sigma_vox).clamp_min(1e-6)
+
+    # Four volumes per time point in flight -- the block, it masked, the blur's
+    # working copy and the result -- so budget for that and keep at least one.
+    per_t = 4 * nx * ny * nz * 4
+    budget = get_available_memory(device, empty_cache=False)
+    chunk = max(1, min(nt, int(budget // max(per_t, 1))))
+    for t0 in range(0, nt, chunk):
+        t1 = min(t0 + chunk, nt)
+        if progress is not None:
+            progress(0.05 + 0.25 * (t0 / nt), f"blurring {t0}-{t1} of {nt}")
+        block = torch.as_tensor(
+            np.ascontiguousarray(data[..., t0:t1], dtype=np.float32), device=device
+        ).permute(3, 0, 1, 2)
+        smoothed = gaussian3d_batched(block * m, sigma_vox) / denom
+        out[:, t0:t1] = smoothed.reshape(t1 - t0, -1)[:, keep].T
+        del block, smoothed
+    return out
+
+
 def prepare(
     data: np.ndarray,
     *,
     affine: np.ndarray,
     tr: float,
     mask: np.ndarray | None = None,
+    blur_fwhm: float = 0.0,
     device: torch.device | None = None,
     progress: ProgressFn | None = None,
 ) -> Prepared:
@@ -477,6 +526,11 @@ def prepare(
     signal change is a division by noise and the colour scale ends up set by
     air. The mask is AFNI's, through ``series.py:automask_from_series``, which
     is the same brain this viewer's carpets find.
+
+    ``blur_fwhm`` smooths in millimetres before gathering. The mask is found on
+    the *unsmoothed* run, so turning the blur up does not quietly grow the
+    brain -- which would change how many voxels are fitted as well as what
+    they contain, and make two fits at two blurs not comparable.
     """
     if data.ndim != 4:
         raise ValueError(f"InstaGLM needs one 4-D run; got shape {tuple(data.shape)}")
@@ -496,14 +550,22 @@ def prepare(
     lookup = np.full(mask.shape, -1, dtype=np.int32)
     lookup[mask] = np.arange(int(mask.sum()), dtype=np.int32)
 
-    if progress is not None:
-        progress(0.35, "gathering")
-    flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
-    y = torch.as_tensor(flat[mask.reshape(-1)])
-    if device.type != "cpu":
+    if blur_fwhm > 0:
+        from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox
+
+        zooms = tuple(
+            float(np.linalg.norm(np.asarray(affine, float)[:3, i])) or 1.0 for i in range(3)
+        )
+        y = _blurred_rows(data, mask, fwhm_mm_to_sigma_vox(blur_fwhm, zooms), device, progress)
+    else:
         if progress is not None:
-            progress(0.7, "to device")
-        y = y.to(device)
+            progress(0.35, "gathering")
+        flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
+        y = torch.as_tensor(flat[mask.reshape(-1)])
+        if device.type != "cpu":
+            if progress is not None:
+                progress(0.7, "to device")
+            y = y.to(device)
     if progress is not None:
         progress(1.0, "ready")
     return Prepared(

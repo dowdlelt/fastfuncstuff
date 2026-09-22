@@ -45,6 +45,7 @@ from fastfuncstuff.viewer.modes.base import (
     FloatControl,
     IntControl,
     Mode,
+    OptionalFloatControl,
     OverlayKind,
     PathControl,
     PathListControl,
@@ -115,6 +116,8 @@ class InstaGLMMode(Mode):
         self._prepared: engine.Prepared | None = None
         self._fit: engine.Fit | None = None
         self._source_key: str | None = None
+        #: The blur the prepared run was gathered at, so a change is detectable.
+        self._blur = 0.0
         self._source_name = ""
         self._tr = 0.0
         self._hrf: np.ndarray | None = None
@@ -258,6 +261,22 @@ class InstaGLMMode(Mode):
                 help="Depth of the custom double gamma's undershoot, as a fraction of the "
                 "peak. Only read when HRF is 'custom'.",
             ),
+            OptionalFloatControl(
+                name="blur",
+                on_value=4.0,
+                label="blur",
+                lo=0.0,
+                hi=12.0,
+                default=0.0,
+                step=0.5,
+                unit=" mm",
+                span=THIRD,
+                newline=True,
+                help="Spatial smoothing, in mm FWHM, applied to the run before it is "
+                "fitted -- so every map, t and R2 comes from smoothed data. Blurred "
+                "inside the brain mask, and the mask is found on the unsmoothed run, "
+                "so turning this up does not also grow what is fitted.",
+            ),
             IntControl(
                 name="polort",
                 label="polort",
@@ -265,7 +284,6 @@ class InstaGLMMode(Mode):
                 hi=9,
                 default=2,
                 span=THIRD,
-                newline=True,
                 help="Legendre drift order; -1 removes the baseline entirely, which is worth "
                 "doing once to see what it was holding up.",
             ),
@@ -329,6 +347,7 @@ class InstaGLMMode(Mode):
                 "width",
                 "undershoot",
                 "polort",
+                "blur",
                 "ortvec",
                 "ort_deriv",
                 "pcs",
@@ -394,6 +413,13 @@ class InstaGLMMode(Mode):
             return False
         device = self.session.store.device
 
+        # Blur is the one parameter that changes the *gather* rather than the
+        # design, so it has to drop the prepared run and not merely the fit --
+        # otherwise moving the slider refits smoothed betas onto unsmoothed
+        # data and nothing on screen says which one you are looking at.
+        if self._prepared is not None and float(self.params.get("blur") or 0.0) != self._blur:
+            self._prepared = None
+            self._fit = None
         if self._prepared is None and not self._gather(device, progress):
             return False
         assert self._prepared is not None
@@ -437,9 +463,11 @@ class InstaGLMMode(Mode):
             data,
             affine=np.asarray(layer.affine, dtype=float),
             tr=tr,
+            blur_fwhm=float(self.params.get("blur") or 0.0),
             device=device,
             progress=progress,
         )
+        self._blur = float(self.params.get("blur") or 0.0)
         self._source_key = layer.key
         self._source_name = layer.name
         self._tr = tr
