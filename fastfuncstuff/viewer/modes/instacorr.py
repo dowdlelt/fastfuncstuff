@@ -257,17 +257,13 @@ class InstaCorrMode(Mode):
     def _to_source(self, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
         """A display-grid voxel as a voxel of the run being correlated.
 
-        Through millimetres, because the display grid is the underlay's: with a
-        1 mm anatomy under a 3 mm run, anatomy voxel (120, 140, 90) is far past
-        the run's edge, and indexing the run with it silently produced no map.
+        ``session.layer_voxel`` does the arithmetic; this exists because the
+        run is held by reference rather than as a layer, so there is no layer
+        to ask for the affine.
         """
-        grid = self.session.state.grid if self.session is not None else None
-        if grid is None or self._affine is None:
+        if self.session is None or self._affine is None:
             return ijk
-        mm = grid.ijk_to_mm(ijk)
-        v = np.linalg.inv(self._affine) @ np.array([*mm, 1.0])
-        i, j, k = (int(round(float(c))) for c in v[:3])
-        return (i, j, k)
+        return self.session.layer_voxel(self._affine, ijk)
 
     def _seed_timecourse(self) -> torch.Tensor | None:
         data, valid = self._prepared, self._valid

@@ -1691,8 +1691,29 @@ class ViewerSession:
                 return layer, found
         return None
 
+    def layer_voxel(self, affine: np.ndarray, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        """A display-grid voxel as the nearest voxel of a layer on ``affine``.
+
+        Through millimetres, because the display grid belongs to the bottom of
+        the stack and nothing else is obliged to share it. **Anything that
+        reads a layer's array at "where the crosshair is" has to come through
+        here.** Indexing a 3 mm run with an index into a 1 mm anatomy is out of
+        bounds near the far edge -- which reads as "the graph stopped working"
+        -- and, worse, *in* bounds near the origin, where it silently returns a
+        voxel three times too close to the corner.
+
+        Nearest rather than interpolated: a plotted time course should be one
+        the scanner measured.
+        """
+        grid = self.state.grid
+        if grid is None:
+            return ijk
+        mm = grid.ijk_to_mm(ijk)
+        v = np.linalg.inv(np.asarray(affine, dtype=float)) @ np.array([*mm, 1.0])
+        return (int(round(float(v[0]))), int(round(float(v[1]))), int(round(float(v[2]))))
+
     def timeseries(self, key: str, ijk: tuple[int, int, int] | None = None) -> np.ndarray:
-        """The time course at a voxel, or an empty array if not yet resident.
+        """The time course at a display-grid voxel, empty if not yet resident.
 
         Returns empty rather than blocking: the graph pane asks on every
         crosshair move, and waiting seconds for an inflate would be exactly the
@@ -1701,7 +1722,9 @@ class ViewerSession:
         res = self.store.get(key)
         if res.array is None:
             return np.empty(0, dtype=np.float32)
-        i, j, k = ijk if ijk is not None else self.state.crosshair
+        layer = self.state.layers.find(key)
+        ijk = self.state.crosshair if ijk is None else ijk
+        i, j, k = ijk if layer is None else self.layer_voxel(layer.affine, ijk)
         nx, ny, nz = res.array.shape[:3]
         if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
             return np.empty(0, dtype=np.float32)

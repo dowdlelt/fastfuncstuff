@@ -671,6 +671,12 @@ class InstaGLMMode(Mode):
         )
 
     # -- graph lines ---------------------------------------------------
+    def _to_run(self, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        """A display-grid voxel as a voxel of the run that was fitted."""
+        if self.session is None or self._prepared is None:
+            return ijk
+        return self.session.layer_voxel(self._prepared.affine, ijk)
+
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
         """The model pulled apart at this voxel.
 
@@ -686,7 +692,15 @@ class InstaGLMMode(Mode):
         """
         if self._fit is None:
             return []
-        lines = self._fit.decompose(ijk, column=self._column_index())
+        # The crosshair is in display-grid indices and the fit is on the run's
+        # grid. They are the same grid only while the run is at the bottom of
+        # the stack; with a 1 mm anatomy under it they are not, and indexing
+        # the fit directly loses every line -- which looks like the model
+        # having failed rather than the lookup having missed.
+        lines = self._fit.decompose(
+            self._to_run(ijk) if self.session is not None else ijk,
+            column=self._column_index(),
+        )
         if not lines:
             return []
         label = self._fit.model.labels[self._column_index()] if self._fit.model.n_columns else ""
