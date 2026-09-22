@@ -53,6 +53,7 @@ from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
+from fastfuncstuff.viewer.ui.widgets import RowSizedList
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
@@ -135,6 +136,10 @@ class Controller:
 
 #: How long a directory has to stay quiet before a rescan runs.
 RESCAN_QUIET_MS = 1200
+#: Layers shown before the list scrolls. Six covers an anatomy, a run, a mode's
+#: output and a couple of kept copies -- past that the list is being used as a
+#: workspace and scrolling it is better than spending the panel on it.
+LAYER_ROWS = 6
 BACKGROUND = QtCore.Qt.ItemDataRole.BackgroundRole
 FOREGROUND = QtCore.Qt.ItemDataRole.ForegroundRole
 
@@ -147,7 +152,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
-        self.resize(430, 820)
+        # Wide enough that the panel never scrolls sideways. The layer form
+        # beside the colour bar needs ~480 once a stats layer gives the
+        # sub-brick pickers something to show, and a controller that clips its
+        # own range numbers to save twenty pixels is saving the wrong thing.
+        self.resize(500, 820)
 
         # Watching the directory. A pipeline writes a file in bursts, so a
         # change starts a quiet period and the rescan runs once it ends,
@@ -590,11 +599,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         A sub-brick label can be forty characters, and a form column sized to
         it pushes the colour bar off the side of the controller.
+
+        Five characters rather than eight: eight still left the THR ON row --
+        a picker plus two tick boxes -- as the widest thing in the panel, so
+        the panel scrolled sideways and clipped the range numbers off the far
+        edge. The popup is where a long label is read, and that is not elided.
         """
         box.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        box.setMinimumContentsLength(8)
+        box.setMinimumContentsLength(5)
         view = box.view()
         if view is not None:
             view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
@@ -969,8 +983,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
         v.setSpacing(8)
 
         v.addWidget(self._head("LAYERS  [ / ]"))
-        self.layer_list = QtWidgets.QListWidget()
-        self.layer_list.setMaximumHeight(190)
+        # Sized to the stack rather than to the space available. Four layers is
+        # the common case and nine is a lot; a fixed 190-pixel box spent most of
+        # itself on blank rows, and those pixels came out of the sections below
+        # it -- which is how changing a mode parameter pushed the colour bar off
+        # the bottom of the controller. Past the cap it scrolls, which is the
+        # right thing for the list to give up rather than the whole panel.
+        self.layer_list = RowSizedList(max_rows=LAYER_ROWS, min_rows=2)
         self.layer_list.setToolTip(
             "[ and ] step through the stack; space or the tick box hides a layer.\n"
             "A soloed image window draws whichever one is selected here."
@@ -1745,6 +1764,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # state is a refresh that dispatches, which puts a SELECT_LAYER into
         # the recording for every repaint and can recurse.
         self.layer_list.blockSignals(False)
+        self.layer_list.rows_changed()
         self._sync_layer_controls()
 
     def _sync_mode_panel(self) -> None:

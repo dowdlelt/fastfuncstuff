@@ -303,6 +303,14 @@ class RangeBar(QtWidgets.QWidget):
         spin.setToolTip(tip)
         spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        # A spin box sizes itself to the widest number its range allows, and
+        # this range allows -1000000000.0000 -- sixteen characters, 157 pixels,
+        # for a box that shows "8.24". Three of them made the range column
+        # wider than the whole controller, so the panel scrolled sideways and
+        # clipped the numbers off the other end. Ignored lets the layout size
+        # it; the minimum keeps four significant figures legible.
+        spin.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        spin.setMinimumWidth(64)
         return spin
 
     # -- incoming ------------------------------------------------------

@@ -31,6 +31,7 @@ import torch
 from fastfuncstuff.viewer import instaglm as engine
 from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
+    FULL,
     HALF,
     THIRD,
     ActionControl,
@@ -125,7 +126,7 @@ class InstaGLMMode(Mode):
                 label="show",
                 choices=engine.MAPS,
                 default="beta",
-                span=THIRD,
+                span=HALF,
                 newline=True,
                 help="What to colour the brain with. The colour bar and its range "
                 "belong to this map. Changing it does not refit.",
@@ -135,7 +136,7 @@ class InstaGLMMode(Mode):
                 label="thresh",
                 choices=("same", *engine.MAPS),
                 default="same",
-                span=THIRD,
+                span=HALF,
                 help="What to cut on, when that is not what you are looking at. "
                 "Colour by a beta and threshold on its t is the ordinary GLM "
                 "picture, and it is the one a single map cannot draw: the "
@@ -148,7 +149,8 @@ class InstaGLMMode(Mode):
                 label="column",
                 choices=columns,
                 default=columns[0],
-                span=THIRD,
+                span=FULL,
+                newline=True,
                 help="Which regressor the beta, t and unique-R2 maps are of -- "
                 "for both 'show' and 'thresh', since a beta and its own t are "
                 "the pair worth seeing together.",

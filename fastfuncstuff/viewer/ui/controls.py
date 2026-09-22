@@ -43,6 +43,7 @@ from fastfuncstuff.viewer.modes.base import (
     PathControl,
     PathListControl,
 )
+from fastfuncstuff.viewer.ui.widgets import RowSizedList
 
 #: How long to wait after the last change before applying it. Long enough to
 #: swallow a drag, short enough that a deliberate single change feels immediate.
@@ -67,22 +68,6 @@ def _decimals(step: float) -> int:
         if abs(round(step, places) - step) < 1e-12 and round(step, places) != 0:
             return places
     return 3
-
-
-class _PathList(QtWidgets.QListWidget):
-    """A list as tall as its rows, capped at :data:`PATH_LIST_ROWS`.
-
-    The height is a size *hint* rather than a fixed height set when the items
-    are added, because a row's height is not known until the widget has been
-    styled -- and the theme's stylesheet arrives after the panel is built. Set
-    eagerly, every list came out two thirds of a row short.
-    """
-
-    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
-        step = self.sizeHintForRow(0) if self.count() else 0
-        rows = max(1, min(self.count() or 1, PATH_LIST_ROWS))
-        height = rows * max(step, 18) + 2 * self.frameWidth() + 2
-        return QtCore.QSize(super().sizeHint().width(), height)
 
 
 class _Cell(QtWidgets.QWidget):
@@ -352,14 +337,11 @@ class ControlPanel(QtWidgets.QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
 
-        listing = _PathList()
+        listing = RowSizedList(max_rows=PATH_LIST_ROWS)
         listing.setAlternatingRowColors(True)
         listing.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         listing.setUniformItemSizes(True)
         listing.setMinimumWidth(80)
-        listing.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
-        )
 
         def fill(entries) -> None:
             listing.blockSignals(True)
@@ -374,7 +356,7 @@ class ControlPanel(QtWidgets.QWidget):
                 )
                 listing.addItem(item)
             listing.blockSignals(False)
-            listing.updateGeometry()
+            listing.rows_changed()
 
         def entries() -> list[tuple[str, bool]]:
             out = []
@@ -438,13 +420,20 @@ class ControlPanel(QtWidgets.QWidget):
         combo = QtWidgets.QComboBox()
         combo.addItems(list(spec.choices))
         combo.setCurrentText(str(value if value is not None else spec.default))
-        # Wide enough for its longest choice and no wider. A picker stretched
-        # across a panel says nothing extra and crowds out the one beside it.
-        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        # Shrinkable. Sized to its longest choice, a picker offering "unique
+        # R2" sets a floor the whole panel has to clear, and three of them on
+        # one row made that floor wider than the controller. The popup is where
+        # a long choice is read, and that is not elided.
+        combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         combo.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        combo.setMinimumContentsLength(6)
+        combo.setMinimumContentsLength(5)
+        view = combo.view()
+        if view is not None:
+            view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         combo.activated.connect(
             lambda _, n=spec.name, c=combo: self._queue(n, c.currentText(), now=True)
         )
