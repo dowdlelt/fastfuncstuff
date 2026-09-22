@@ -258,3 +258,47 @@ def test_a_mode_that_reads_nothing_claims_no_input(session):
     assert session.mode.name == "plain"
     assert session.mode.source_layer() is None
     assert session.input_candidates() == []
+
+
+# ---------------------------------------------------------------------------
+# fitting on one grid, reading the result on another
+# ---------------------------------------------------------------------------
+
+
+def test_a_result_fitted_on_the_functional_draws_on_the_anatomical_grid(tmp_path):
+    """The other half of the ask: fit the 2 mm run, read it over the 1 mm anat.
+
+    The display grid comes from the bottom of the stack, so a result computed
+    on the run's grid has to resample into the anatomy's rather than dragging
+    the panes down to the functional resolution.
+    """
+    from fastfuncstuff.viewer.compose import render_plane
+    from fastfuncstuff.viewer.state import Plane
+
+    rng = np.random.default_rng(9)
+    fine = np.diag([1.0, 1.0, 1.0, 1.0])
+    fine[:3, 3] = (-8.0, -9.0, -7.0)
+    nib.save(
+        nib.Nifti1Image((rng.random((16, 18, 14)) * 100).astype(np.float32), fine),
+        str(tmp_path / "anat.nii.gz"),
+    )
+    _write(tmp_path, "run.nii.gz", rng.random((8, 9, 7, 12)), tr=2.0)
+
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+        s.do(AddOverlay(str(tmp_path / "run.nii.gz")))
+        assert s.state.grid.shape == (16, 18, 14)
+        s.do(SetMode("test_sum"))
+
+        out = s.state.layers.find_by_source("mode:test_sum")
+        assert out is not None
+        assert out.shape == (8, 9, 7), "the result lives on the grid it was fitted on"
+        assert s.state.grid.shape == (16, 18, 14), "and the panes stay on the anatomy's"
+
+        # It still draws: the compositor resamples it into the display grid.
+        image = render_plane(s, Plane.AXIAL)
+        assert image is not None
+        assert image.rgba.shape[:2] == (18, 16)
+    finally:
+        s.close()

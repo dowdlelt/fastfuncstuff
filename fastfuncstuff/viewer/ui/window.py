@@ -1203,13 +1203,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         controls.addLayout(bar_column)
         v.addLayout(controls)
 
-        self.mode_head = self._head("MODE PARAMETERS")
-        v.addWidget(self.mode_head)
-
-        # Above the parameters, because it is the first thing the mode needs
-        # and the one the parameters are all about. Its own row rather than a
-        # declared control, since every mode that reads anything asks the same
-        # question and none of them should have to say so.
+        # Above the MODE PARAMETERS header, not under it: the input is not a
+        # parameter, it is the thing the parameters are all about, and it is
+        # the first question the mode asks. Its own row rather than a declared
+        # control, since every mode that reads anything asks it and none of
+        # them should have to say so.
         input_row = QtWidgets.QHBoxLayout()
         input_row.setSpacing(6)
         self.input_head = self._head("INPUT")
@@ -1230,6 +1228,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.input_row_host.setLayout(input_row)
         v.addWidget(self.input_row_host)
 
+        self.mode_head = self._head("MODE PARAMETERS")
+        v.addWidget(self.mode_head)
         self.mode_panel = ControlPanel()
         self.mode_panel.changed.connect(self._mode_param_changed)
         self.mode_panel.action_requested.connect(self._mode_action)
