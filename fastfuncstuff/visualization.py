@@ -1555,6 +1555,8 @@ def plot_denoising_summary(
     n_noise_voxels: int | None = None,
     n_criteria_voxels: int | None = None,
     xval_r2_all_voxels: np.ndarray | None = None,
+    xval_r2_clean_reference_excess: np.ndarray | None = None,
+    clean_reference_ss_tot_fraction: np.ndarray | None = None,
     min_gain: float | None = None,
     n_cv_folds: int | None = None,
     output_path: str | None = None,
@@ -1595,6 +1597,16 @@ def plot_denoising_summary(
         `xval_r2_per_fold` has a single row no matter how many runs there
         were — deriving the fold count from its shape reported "1 fold" on a
         six-run dataset.
+    xval_r2_clean_reference_excess : ndarray, optional
+        Diagnostic curve scored against a held-out run with its own leading k
+        PCs projected out, minus the same referee's 0-PC null. Already a gain,
+        so it is plotted as-is. The raw curve is deliberately not drawn: it
+        rises steeply on the shrinking denominator alone, by 20x the real
+        effect on synthetic data, and the null subtraction cancels that.
+    clean_reference_ss_tot_fraction : ndarray, optional
+        Fraction of held-out variance surviving that projection at each k. Drawn
+        inverted on a second axis, because a clean-reference curve that rises in
+        step with it is rising on a shrinking denominator, not on a finding.
     min_gain : float, optional
         Gain floor the selection had to clear. Drawn as a band above baseline so
         a flat curve is visibly flat instead of auto-scaled into a landscape.
@@ -1745,6 +1757,49 @@ def plot_denoising_summary(
                 label="All voxels",
             )
 
+        if xval_r2_clean_reference_excess is not None:
+            # The excess over the same referee's 0-PC null, NOT the raw clean
+            # curve: projecting PCs out of the target raises R2 by itself, and
+            # on synthetic data that mechanical rise was 20x the real effect it
+            # was hiding. Subtracting the null cancels it exactly, because both
+            # curves share a denominator at every k.
+            excess = np.asarray(xval_r2_clean_reference_excess)
+            # Its own axis. The excess is routinely an order of magnitude
+            # larger than the selection gain -- on the very data this panel
+            # exists to show, +0.18 against -0.09 -- so sharing the left axis
+            # flattens the curve the panel is actually about.
+            ax2c = ax2.twinx()
+            ax2c.plot(
+                range(len(excess)),
+                excess,
+                color="purple",
+                linestyle="-.",
+                linewidth=1.5,
+                marker="s",
+                markersize=3,
+                label="Clean reference, excess over null",
+            )
+            ax2c.axhline(0, color="purple", alpha=0.3, linewidth=0.8, linestyle="-")
+            ax2c.set_ylabel("Clean-ref excess Δ R² (diagnostic)", fontsize=7, color="purple")
+            ax2c.tick_params(axis="y", labelcolor="purple", labelsize=7)
+            ax2c.legend(loc="upper right", fontsize=7)
+
+            if clean_reference_ss_tot_fraction is not None:
+                # How much referee that excess cost, as an annotation rather
+                # than a third axis: the null subtraction already cancels the
+                # mechanical rise, so this is context, not a correction.
+                frac = np.asarray(clean_reference_ss_tot_fraction)
+                peak = int(np.argmax(excess))
+                ax2c.annotate(
+                    f"{1.0 - float(frac[peak]):.0%} of held-out\nvariance removed",
+                    xy=(peak, float(excess[peak])),
+                    xytext=(4, -22),
+                    textcoords="offset points",
+                    fontsize=6.5,
+                    color="purple",
+                    alpha=0.8,
+                )
+
         ax2.axvline(
             optimal_n_components,
             color="red",
@@ -1755,6 +1810,10 @@ def plot_denoising_summary(
         ax2.set_xlabel("Number of Noise PCs")
         ax2.set_ylabel("Δ R² vs 0 PCs")
         ax2.set_title("Gain over baseline (the selection criterion)")
+        # Headroom, so the all-voxel curve is not flush against the frame when
+        # the diagnostic's own axis has taken the wide range away from this one.
+        lo2, hi2 = ax2.get_ylim()
+        ax2.set_ylim(lo2 - 0.06 * (hi2 - lo2), hi2 + 0.06 * (hi2 - lo2))
         ax2.legend(loc="best", fontsize=8)
         ax2.grid(True, alpha=0.3)
 
@@ -1841,3 +1900,197 @@ def plot_denoising_summary(
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
 
     return fig
+
+
+def split_runs_for_figures(n_runs: int, max_per_figure: int = 5) -> list[list[int]]:
+    """Split runs into balanced groups of at most ``max_per_figure``.
+
+    Balanced rather than greedy: 11 runs at a cap of 5 gives 4/4/3, not 5/5/1.
+    A trailing figure with one run next to figures with five reads as though
+    that run were special.
+    """
+    if n_runs <= max_per_figure:
+        return [list(range(n_runs))]
+    n_figs = -(-n_runs // max_per_figure)  # ceil
+    base, extra = divmod(n_runs, n_figs)
+    groups: list[list[int]] = []
+    start = 0
+    for i in range(n_figs):
+        size = base + (1 if i < extra else 0)
+        groups.append(list(range(start, start + size)))
+        start += size
+    return groups
+
+
+def plot_pc_task_overlap(
+    overlap: dict,
+    optimal_n_components: int | None = None,
+    output_path: str | None = None,
+    figsize: tuple[int, int] = (12, 8),
+    max_runs_per_figure: int = 5,
+) -> list[plt.Figure]:
+    """Noise-PC / task-design overlap, per component and as a subspace.
+
+    Both panels carry the phase-randomised null, which is the entire point: an
+    HRF-convolved design is smooth and so is physiological noise, so the bars
+    are meaningless without the band.
+
+    Panel 1 is drawn PER RUN rather than run-averaged. The components are
+    extracted per run, so PC k is a different timeseries in each one and shares
+    only a rank in that run's variance ordering -- on real data the spread
+    across runs was as large as the mean, and a single bar labelled "PC 1"
+    implies a component that does not exist. Panel 2's per-run curves ARE
+    commensurable: "the first k PCs of this run" is well defined everywhere.
+
+    Runs are split across figures at ``max_runs_per_figure``, because 20 runs
+    of grouped bars over 20 components is 400 bars and unreadable. Every figure
+    carries the all-run mean and the null, so the groups stay comparable.
+    Returns one figure per group; ``output_path`` gains a ``_01`` suffix when
+    there is more than one.
+
+    Drawn from
+    :func:`~fastfuncstuff.denoise.sequential.compute_pc_task_overlap`.
+    """
+    per_pc = np.asarray(overlap["per_pc"])
+    p95 = np.asarray(overlap["per_pc_null_p95"])
+    null_mean = np.asarray(overlap["per_pc_null_mean"])
+    sub = np.asarray(overlap["subspace"])
+    sub_null = np.asarray(overlap["subspace_null_mean"])
+    sub_sd = np.asarray(overlap["subspace_null_sd"])
+    sub_z = np.asarray(overlap["subspace_z"])
+    per_run = np.asarray(overlap.get("per_pc_by_run", per_pc[None, :]))
+    sub_run = np.asarray(overlap.get("subspace_by_run", sub[None, :]))
+    n_runs = per_run.shape[0]
+
+    x = np.arange(1, len(per_pc) + 1)
+    ks = np.arange(len(sub))
+    # Counts are over ALL runs, so every figure reports the same global result
+    # rather than a per-group count that looks weaker for being a subset.
+    n_exceed = int((per_run > p95[None, :]).sum())
+    groups = split_runs_for_figures(n_runs, max_runs_per_figure)
+    figures: list[plt.Figure] = []
+
+    for g_idx, runs in enumerate(groups):
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
+        colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(runs), 2)))
+
+        ax1.axhspan(
+            0,
+            float(p95[0]),
+            color="gray",
+            alpha=0.22,
+            zorder=1,
+            label="spectrum-matched null (to p95)",
+        )
+        ax1.axhline(
+            float(null_mean[0]),
+            color="black",
+            linestyle=":",
+            linewidth=1,
+            zorder=2,
+            label="null mean",
+        )
+        width = 0.8 / len(runs)
+        for slot, r in enumerate(runs):
+            ax1.bar(
+                x + (slot - (len(runs) - 1) / 2) * width,
+                per_run[r],
+                width=width,
+                color=colors[slot],
+                label=f"run {r + 1}",
+                zorder=3,
+            )
+        span = f"runs {runs[0] + 1}-{runs[-1] + 1} of {n_runs}" if n_runs > 1 else "1 run"
+        ax1.set_xlabel("Noise PC index (a per-run RANK — PC k differs between runs)")
+        ax1.set_ylabel("R² of PC explained by task design")
+        ax1.set_title(
+            f"Per-component overlap with the task design — {span}\n"
+            f"{n_exceed} of {per_run.size} run×PC bars exceed the null across ALL runs "
+            f"(~{0.05 * per_run.size:.0f} expected by chance)",
+            fontweight="bold",
+            fontsize=10,
+        )
+        ax1.legend(fontsize=7, loc="upper right", ncol=2)
+        ax1.grid(True, alpha=0.3, axis="y", zorder=0)
+        step = max(1, len(per_pc) // 20)
+        ax1.set_xticks(x[::step])
+        ax1.set_xticklabels([str(int(v)) for v in x[::step]])
+
+        # Panel 2 is the one that predicts beta contamination. An overlap spread
+        # thinly over many components leaves panel 1 looking innocent while this
+        # one climbs away from its null.
+        ax2.fill_between(
+            ks,
+            sub_null - 2 * sub_sd,
+            sub_null + 2 * sub_sd,
+            color="gray",
+            alpha=0.25,
+            label="null ±2 SD",
+            zorder=1,
+        )
+        ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
+        for slot, r in enumerate(runs):
+            ax2.plot(
+                ks,
+                sub_run[r],
+                "-",
+                color=colors[slot],
+                linewidth=1.0,
+                alpha=0.75,
+                label=f"run {r + 1}",
+                zorder=3,
+            )
+        ax2.plot(
+            ks,
+            sub,
+            "o-",
+            color="firebrick",
+            linewidth=2,
+            markersize=4,
+            label=f"mean of all {n_runs} runs",
+            zorder=4,
+        )
+        if optimal_n_components is not None:
+            ax2.axvline(
+                optimal_n_components,
+                color="red",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"selected: {optimal_n_components}",
+            )
+        peak_k = int(np.argmax(sub_z))
+        ax2.text(
+            0.98,
+            0.06,
+            f"peak z = {sub_z[peak_k]:+.1f} (k={peak_k})",
+            transform=ax2.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="firebrick",
+            fontweight="bold",
+        )
+        ax2.set_xlabel("Number of noise PCs (k)")
+        ax2.set_ylabel("Fraction of DESIGN variance\ninside the k-PC subspace")
+        ax2.set_title(
+            "Subspace overlap — what actually contaminates the betas\n"
+            "(an overlap spread thinly over many PCs leaves the panel above innocent)",
+            fontweight="bold",
+            fontsize=10,
+        )
+        ax2.legend(fontsize=7, loc="upper left", ncol=2)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xticks(ks[:: max(1, len(ks) // 20)])
+
+        fig.tight_layout()
+        if output_path:
+            if len(groups) == 1:
+                path = output_path
+            else:
+                stem, _, ext = str(output_path).rpartition(".")
+                path = f"{stem}_{g_idx + 1:02d}.{ext}"
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+        figures.append(fig)
+
+    return figures

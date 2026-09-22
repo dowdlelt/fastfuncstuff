@@ -168,6 +168,13 @@ Outputs:
                                                 k PCs (labelled npc00..npcN). The
                                                 selection curve is this file's median
                                                 over criteria voxels.
+        {prefix}_clean_reference_excess.nii.gz - With -diag_clean_reference: per-voxel
+                                                excess over the null at every count,
+                                                same npc00..npcN layout. Look at WHERE
+                                                it lives: gray matter and task regions
+                                                argue the PCs rescued task signal,
+                                                edges/ventricles/sinuses argue the
+                                                projection just took motion with it.
 
         Each stack carries the ceiling built at ITS OWN PC count, because the two
         R²s are scored on differently-projected data and a ceiling only bounds an
@@ -525,6 +532,26 @@ Notes:
         type=int,
         default=100,
         help="Cap on CV permutations for random (non-LORO) splits.",
+    )
+    eval_opts.add_argument(
+        "-diag_clean_reference",
+        action="store_true",
+        help="Add a DIAGNOSTIC curve scoring each PC count against a held-out run that has had"
+        " its own leading k PCs projected out, drawn alongside the real one. Never selects.\n"
+        "The normal curve treats the held-out run as truth. That breaks when a subject breathes"
+        " or moves in time with the task: the 0-PC model earns R² by fitting task-locked"
+        " artifact, so every PC that removes it reads as a loss and you get 'no PCs for you' on"
+        " a perfectly good noise pool. This asks the other question -- if the held-out run were"
+        " denoised too, would the PCs help?\n"
+        "What is plotted is the EXCESS over that same referee's 0-PC null, not the raw curve."
+        " Projecting PCs out of the target raises R² on its own (it takes equally from ss_res"
+        " and ss_tot), and on synthetic data that mechanical rise was 20x the real effect it"
+        " was hiding -- the raw curves for task-locked and independent noise differed by 0.002,"
+        " while their excesses differed by 0.22. The null subtraction cancels it exactly.\n"
+        "Read it as: a clear positive excess means the PCs help even when the referee is"
+        " denoised too, so the main curve is under-counting; an excess near zero means the main"
+        " curve's verdict stands.\n"
+        "Costs a second full CV sweep, so roughly double the CV time.",
     )
     add_cv_metric_arg(eval_opts)
     add_noise_ceiling_args(
@@ -1154,6 +1181,25 @@ def save_denoising_results(
         )
         output_files["xval_r2_by_pc"] = r2_by_pc_path
 
+    # 3f. Per-voxel clean-reference excess, when the diagnostic ran. Saved
+    # unconditionally with it rather than behind another flag: the aggregate
+    # curve can say an excess exists but not whether it is task signal the PCs
+    # rescued or motion the projection took with it, and that question is the
+    # reason to have run the diagnostic at all.
+    if results.clean_reference_excess_per_voxel is not None:
+        excess_path = f"{output_prefix}_clean_reference_excess{nii_ext}"
+        excess = np.asarray(results.clean_reference_excess_per_voxel, dtype=np.float32)
+        save_4d_nifti(
+            excess,
+            excess_path,
+            volume_shape,
+            affine,
+            mask_flat=voxel_mask_np,
+            header=nifti_header,
+            brick_labels=[f"npc{k:02d}" for k in range(excess.shape[1])],
+        )
+        output_files["clean_reference_excess"] = excess_path
+
     # 4. CV R² arrays
     xval_r2_path = f"{output_prefix}_xval_r2_by_npcs.npy"
     np.save(xval_r2_path, results.xval_r2_by_n_components)
@@ -1310,6 +1356,41 @@ def save_denoising_results(
             except Exception as e:
                 print(f"  Warning: Could not save noise-pool PCA scree plot: {e}")
 
+    # 6d. Noise-PC / task-design overlap. Answers "is my noise pool
+    # task-correlated at all?", which is the premise behind -diag_clean_reference
+    # and behind every argument about whether these PCs should be removed.
+    overlap = results.metadata.get("pc_task_overlap")
+    if overlap is not None:
+        try:
+            import matplotlib.pyplot as plt
+
+            from fastfuncstuff.visualization import plot_pc_task_overlap
+
+            fig_prefix = f"{output_prefix}_figures"
+            Path(fig_prefix).mkdir(parents=True, exist_ok=True)
+            overlap_path = f"{fig_prefix}/pc_task_overlap.png"
+            # Split across figures at 5 runs each: grouped bars over 20
+            # components are unreadable once there are many runs.
+            overlap_figs = plot_pc_task_overlap(
+                overlap,
+                optimal_n_components=results.optimal_n_components,
+                output_path=overlap_path,
+            )
+            for fig_i, ov_fig in enumerate(overlap_figs):
+                plt.close(ov_fig)
+                saved = (
+                    overlap_path
+                    if len(overlap_figs) == 1
+                    else f"{fig_prefix}/pc_task_overlap_{fig_i + 1:02d}.png"
+                )
+                key = "pc_task_overlap_plot" + (
+                    "" if len(overlap_figs) == 1 else f"_{fig_i + 1:02d}"
+                )
+                output_files[key] = saved
+                print(f"  Saved: {saved}")
+        except Exception as e:
+            print(f"  Warning: Could not save PC/task overlap plot: {e}")
+
     # 7. Plots (based on plots_mode)
     if plots_mode in ["yes", "full", "all"]:
         try:
@@ -1330,6 +1411,12 @@ def save_denoising_results(
                 n_noise_voxels=results.metadata["n_noise_voxels"],
                 n_criteria_voxels=results.metadata["n_criteria_voxels"],
                 xval_r2_all_voxels=results.metadata.get("xval_r2_all_voxels"),
+                xval_r2_clean_reference_excess=results.metadata.get(
+                    "xval_r2_clean_reference_excess"
+                ),
+                clean_reference_ss_tot_fraction=results.metadata.get(
+                    "clean_reference_ss_tot_fraction"
+                ),
                 min_gain=results.metadata.get("pc_selection_min_gain"),
                 n_cv_folds=results.metadata.get("n_runs"),
                 output_path=f"{fig_prefix}/denoising_summary.png",
@@ -3555,6 +3642,8 @@ def main():
             tr=args.tr,
             r2_threshold=args.r2_threshold,
             zero_event_strategy=args.zero_event,
+            clean_reference_diagnostic=args.diag_clean_reference,
+            compute_task_overlap=args.plots in ("yes", "full", "all"),
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
@@ -3597,6 +3686,8 @@ def main():
             tr=args.tr,
             r2_threshold=args.r2_threshold,
             zero_event_strategy=args.zero_event,
+            clean_reference_diagnostic=args.diag_clean_reference,
+            compute_task_overlap=args.plots in ("yes", "full", "all"),
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,

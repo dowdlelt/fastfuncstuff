@@ -1527,7 +1527,13 @@ def make_nuisance_block_from_glob(
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
     from fastfuncstuff.design.trim import trim_run_series
 
-    matched = sorted(Path(p) for p in glob_module.glob(pattern))
+    # glob reads [0..7] as a character class, so a pattern carrying a 1D column
+    # selector would match nothing. Split it off, glob the bare pattern, and
+    # re-attach it to each match for load_nuisance_file to act on.
+    from fastfuncstuff.io.headers import split_1d_selector_suffix
+
+    glob_pattern, selector = split_1d_selector_suffix(pattern)
+    matched = sorted(Path(p) for p in glob_module.glob(glob_pattern))
     if not matched:
         raise ValueError(f"-ortvec_glob {pattern!r}: matched no files")
 
@@ -1544,7 +1550,7 @@ def make_nuisance_block_from_glob(
         expected = (run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints) - run_starts[
             run_idx
         ]
-        arr = load_nuisance_file(path)
+        arr = load_nuisance_file(f"{path}{selector}")
         if trim is not None and trim.active:
             arr = trim_run_series(arr, expected, trim, path)
         elif arr.shape[0] != expected:
@@ -1552,7 +1558,8 @@ def make_nuisance_block_from_glob(
                 f"{path}: has {arr.shape[0]} rows, run {run_idx + 1} has {expected} timepoints"
             )
         per_run[run_idx] = arr
-        source[run_idx] = str(path)
+        # Provenance keeps the selector: "which columns" is part of what was used.
+        source[run_idx] = f"{path}{selector}"
 
     return NuisanceBlock(
         label=label, per_run=per_run, source=source, block_diagonal=True, transform=transform
@@ -1579,6 +1586,16 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         " LABEL may carry a transform modifier: LABEL:deriv (per-run backward "
         "difference, as 1d_tool.py -derivative), LABEL:deriv_fwd (forward "
         "difference), LABEL:deriv_back (explicit synonym of :deriv)."
+        "\nFILE may carry AFNI 1D selectors: [cols] and {rows}, the same way round as"
+        " AFNI reads them for a .1D file. Quote them so the shell does not expand the"
+        " brackets.\n"
+        "  'pcs.1D[0..8]'    first 9 columns -- e.g. run with 9 noise PCs\n"
+        "  'pcs.1D[0,2,5]'   those three columns\n"
+        "  'pcs.1D[0..$(2)]' every 2nd column\n"
+        "  'pcs.1D{10..$}'   drop the first 10 ROWS\n"
+        "Reading a PC-count curve and then rerunning at a chosen count is what this is"
+        " for: ffs_denoise writes all components to {prefix}_runNN_PCs.txt, and"
+        " '...PCs.txt[0..8]' feeds back exactly the first 9."
     )
     # argparse would derive these dests itself, but the prefixed family relies
     # on them matching what collect_nuisance_blocks(prefix=...) looks up.
@@ -1653,7 +1670,10 @@ def expand_ortvec_concat(
     a sequence of ``-ortvec`` (mode 1) entries. Labels are zero-padded to
     the width of ``n_runs``: ``motion01``, ``motion02``, ….
     """
-    matched = sorted(Path(p) for p in glob_module.glob(pattern))
+    from fastfuncstuff.io.headers import split_1d_selector_suffix
+
+    glob_pattern, selector = split_1d_selector_suffix(pattern)
+    matched = sorted(Path(p) for p in glob_module.glob(glob_pattern))
     if not matched:
         raise ValueError(f"-ortvec_concat {pattern!r}: matched no files")
     run_indices_1 = [
@@ -1666,7 +1686,7 @@ def expand_ortvec_concat(
     width = max(2, len(str(n_runs)))
     return sorted(
         (
-            (path, f"{label}{idx:0{width}d}")
+            (Path(f"{path}{selector}"), f"{label}{idx:0{width}d}")
             for path, idx in zip(matched, run_indices_1, strict=True)
         ),
         key=lambda t: t[1],

@@ -34,6 +34,8 @@ from fastfuncstuff.stats.variance_partition import (
     permutation_test,
 )
 
+CPU = torch.device("cpu")
+
 N_STIM = 20
 N_TASK = 21
 N_REP = 3
@@ -239,6 +241,60 @@ def test_preference_index_tracks_the_dominant_factor():
     assert task_pref.median() > 0.5
     assert res.unique["stim"][:n_each].median() > res.unique["task"][:n_each].median()
     assert res.unique["task"][n_each:].median() > res.unique["stim"][n_each:].median()
+
+
+def test_preference_is_zeroed_when_neither_factor_explains_anything():
+    """A reliable unit with no main effects must not report a confident preference.
+
+    Bug of record: the only denominator guard was ``denom > 1e-8``, eight orders of
+    magnitude below the noise scale. On 45 runs of real data that let parcels whose two
+    uniquenesses were +1.2e-3 and -9.3e-4 report |preference| = 6.8 -- a ratio of two
+    numbers that were both zero, painted over the map as an overwhelming preference.
+
+    Reproducing it needs the right regime, and two obvious guesses do not: pure noise is
+    already gated by the ceiling, and a strong interaction gives uniquenesses that are
+    small but same-signed, so the ratio stays inside [-1, 1]. The pathology needs a
+    LOW-SNR interaction -- a ceiling that is real (~0.15 here, matching the data) while
+    both uniquenesses are noise around 0, so they straddle zero and nearly cancel.
+
+    Thresholds are passed explicitly rather than taken from the default, so tuning the
+    default is not a test failure.
+    """
+    rng = np.random.default_rng(11)
+    factors, rep, run = make_crossed_table()
+    n_vox = 300  # the divergent tail is rare; 20 voxels never samples it
+    e = rng.normal(0, 0.25, size=(n_vox, N_STIM, N_TASK))
+    betas = synth_betas(factors, e=e, noise=1.0, seed=12)
+
+    def fit(data, thresh):
+        return partition_variance(
+            data,
+            factors,
+            repeat=rep,
+            run=run,
+            min_preference_frac_ceiling=thresh,
+            verbose=False,
+            device=CPU,
+        )
+
+    unguarded = fit(betas, 0.0)
+    guarded = fit(betas, 0.15)
+
+    # The ceiling is obtainable, so the old ceiling-only guard does not fire here.
+    assert guarded.noise_ceiling.median() > 0.05
+    # Without the denominator guard the ratio diverges far past the nominal [-1, 1].
+    assert unguarded.preference.abs().max() > 10.0
+    # With it, nothing survives that a reader would misread as an overwhelming preference.
+    assert guarded.preference.abs().max() < 1.4
+    assert guarded.diagnostics["preference_uninterpretable_frac"] > 0.5
+
+    # The guard must be nearly free where a factor genuinely dominates -- otherwise it
+    # buys trust by deleting the result. |preference| slightly past 1 is EXPECTED there:
+    # it means the losing factor's held-out uniqueness went negative.
+    a = rng.normal(0, 1.5, size=(n_vox, N_STIM))
+    real = fit(synth_betas(factors, a=a, noise=1.0, seed=13), 0.15)
+    assert real.diagnostics["preference_uninterpretable_frac"] < 0.05
+    assert real.preference.median() < -0.5
 
 
 @pytest.mark.gpu

@@ -652,6 +652,7 @@ def partition_variance(
     max_rank: int | None = None,
     min_ncsnr_for_rank: float = 0.75,
     min_interaction_frac_ceiling: float = 0.02,
+    min_preference_frac_ceiling: float = 0.05,
     n_nuclear_taus: int = 11,
     strict_run_locality: bool = False,
     nested_gamma: bool = True,
@@ -689,6 +690,14 @@ def partition_variance(
         because the interaction band was shrunk away entirely. This is a detection
         threshold, not a significance test -- for that, run the permutation null on the
         ``interaction`` statistic.
+    min_preference_frac_ceiling
+        Interpretability floor for ``preference``: the two uniquenesses must SUM to at
+        least this fraction of the voxel's noise ceiling before a ratio is reported.
+        Being a ratio, preference blows up without bound as that sum approaches zero --
+        two uniquenesses of +1.2e-3 and -9.3e-4 give 6.8, which reads as an overwhelming
+        preference when in fact neither factor explained anything. An absolute floor
+        cannot separate the two cases, because the same sum is meaningful at a ceiling of
+        0.02 and noise at a ceiling of 0.3. Set to 0 to report every positive denominator.
     n_nuclear_taus
         Grid size for the singular-value soft-threshold (nuclear) sweep, which is the
         continuous counterpart of the hard rank sweep. Thresholds are fractions of each
@@ -1166,12 +1175,21 @@ def partition_variance(
     # |denominator| is not enough: a denominator of -1e-3 passes it and flips the sign for no
     # reason, painting a confident "purely A-driven" over tissue where neither factor
     # explains anything. Require a POSITIVE denominator and an obtainable ceiling.
+    #
+    # A positive denominator is still not enough, and this was a bug of record: on 45 runs of
+    # real data the |preference| > 1.6 tail was nine parcels whose denominators had collapsed
+    # to ~0.002 against ceilings of ~0.14, i.e. ratio blow-up on two numbers that were both
+    # zero. Gate the denominator on the ceiling as well, exactly as the interaction rank does
+    # -- an absolute floor is unfair to genuinely low-ceiling tissue. |preference| > 1 itself
+    # is NOT the pathology: it means the losing factor's held-out uniqueness went negative,
+    # which is a real and interpretable outcome as long as the sum is a real quantity.
     preference = None
     interpretable = torch.ones(n_vox, dtype=torch.bool)
     if len(main_bands) == 2:
         u_a, u_b = unique[main_bands[0]], unique[main_bands[1]]
         denom = u_a + u_b
-        interpretable = (denom > 1e-8) & obtainable
+        floor = min_preference_frac_ceiling * ceiling_cpu.clamp_min(NC_FLOOR_FOR_RATIO)
+        interpretable = (denom > 1e-8) & (denom > floor) & obtainable
         preference = torch.where(interpretable, (u_b - u_a) / denom, torch.zeros_like(denom))
 
     diagnostics = {
@@ -1190,6 +1208,7 @@ def partition_variance(
         "nested_gamma": nested_gamma,
         "min_ncsnr_for_rank": min_ncsnr_for_rank,
         "min_interaction_frac_ceiling": min_interaction_frac_ceiling,
+        "min_preference_frac_ceiling": min_preference_frac_ceiling,
         "rank_undetermined_frac_per_pair": {
             p: float((rank_e_all[p] < 0).float().mean()) for p in pair_bands
         },

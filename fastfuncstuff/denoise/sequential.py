@@ -299,6 +299,12 @@ class DenoiseResults:
     initial_noise_ceiling: torch.Tensor | None = None
     initial_explainable_r2: torch.Tensor | None = None
     noise_ceiling_notes: list[str] = field(default_factory=list)
+    # (n_voxels, max_components + 1) from clean_reference_diagnostic. The
+    # aggregate curve cannot say whether an excess is task signal the PCs
+    # rescued or motion the projection happened to take with it; only where it
+    # falls in the brain can. Gray matter and task regions argue the first,
+    # edges and ventricles and sinuses the second.
+    clean_reference_excess_per_voxel: np.ndarray | None = None
 
 
 @dataclass
@@ -1308,6 +1314,8 @@ def cross_validate_noise_pcs(
     progress_leave: bool = True,
     announce_missing: bool = False,
     zero_event_strategy: str = "zero",
+    clean_reference: bool = False,
+    diagnostics: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -1373,6 +1381,32 @@ def cross_validate_noise_pcs(
         ``pcR2cutoff`` picks the voxels that vote on the curve by an absolute
         per-voxel R2 threshold, so a downward shift changes the electorate. Wired
         identically to the initial R2 so the two agree.
+    clean_reference : bool, default=False
+        Score each PC count against a held-out run that has had *its own* leading
+        k PCs projected out, instead of against the raw held-out run.
+
+        The default referee is deliberately frozen: the held-out data is the same
+        at every k, PCs enter only through the betas, and the R2 denominator sits
+        outside the PC loop. That is what makes the curve comparable across k,
+        and it is what ``ffs_denoisatorial -criterion within_run`` got wrong.
+
+        It also assumes the held-out run is trustworthy truth. When a subject
+        breathes or moves in time with the task, it is not: the 0-PC model earns
+        held-out R2 by fitting task-locked artifact, and every PC that removes
+        that artifact from the training fit looks like a loss. This option asks
+        the alternative question -- if the held-out run were denoised the same
+        way, would the PCs help? -- at the cost of a denominator that shrinks
+        with k, so part of any rise is mechanical. Read it against
+        ``diagnostics['ss_tot_fraction']``, which says how much of the held-out
+        variance the referee lost at each k, and never select on it alone.
+
+        Diagnostic only: the returned R2 at k is in different units from the
+        default curve's R2 at k, so only the *shape* is comparable.
+    diagnostics : dict, optional
+        Filled in place when ``clean_reference`` is set, with
+        ``'ss_tot_fraction'``: (n_voxels, max_components + 1) float32, the
+        fraction of the k=0 held-out sum of squares that survives the referee's
+        own projection at each k. Identically 1.0 in column 0.
 
     Returns
     -------
@@ -1402,12 +1436,23 @@ def cross_validate_noise_pcs(
         assert hrf_indices is not None
         n_all_voxels = data.shape[0]
         r2_maps = np.zeros((n_all_voxels, max_components + 1), dtype=np.float32)
+        ss_tot_fraction = (
+            np.zeros((n_all_voxels, max_components + 1), dtype=np.float32)
+            if diagnostics is not None
+            else None
+        )
+        r2_null = (
+            np.zeros((n_all_voxels, max_components + 1), dtype=np.float32)
+            if diagnostics is not None
+            else None
+        )
         unique_hrf = torch.unique(hrf_indices).tolist()
         if verbose:
             print(f"Per-HRF mode: {len(unique_hrf)} HRF group(s)")
 
         for hrf_idx in unique_hrf:
             voxel_mask = (hrf_indices == hrf_idx).cpu()
+            group_diag: dict | None = {} if diagnostics is not None else None
             group_maps, _ = cross_validate_noise_pcs(
                 data=data[voxel_mask, :],
                 design_matrix=designs_by_hrf[hrf_idx],
@@ -1424,9 +1469,19 @@ def cross_validate_noise_pcs(
                 device=device,
                 verbose=verbose,
                 zero_event_strategy=zero_event_strategy,
+                clean_reference=clean_reference,
+                diagnostics=group_diag,
             )
             r2_maps[voxel_mask.numpy(), :] = group_maps
+            if ss_tot_fraction is not None and group_diag:
+                ss_tot_fraction[voxel_mask.numpy(), :] = group_diag["ss_tot_fraction"]
+                assert r2_null is not None
+                r2_null[voxel_mask.numpy(), :] = group_diag["r2_null"]
 
+        if diagnostics is not None and ss_tot_fraction is not None:
+            diagnostics["ss_tot_fraction"] = ss_tot_fraction
+            assert r2_null is not None
+            diagnostics["r2_null"] = r2_null
         r2_summary = np.median(r2_maps, axis=0)
         return r2_maps, r2_summary
 
@@ -1585,6 +1640,7 @@ def cross_validate_noise_pcs(
                 max_chunk_size=None,
                 safety_factor=0.5,
                 verbose=verbose,
+                per_component_actuals=clean_reference,
             )
 
     # CRITICAL: Keep data on CPU, stream chunks to GPU as needed
@@ -1595,6 +1651,15 @@ def cross_validate_noise_pcs(
 
     # Output: R² maps for all voxels and all PC counts
     r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
+    # Only meaningful when the referee moves with k; None otherwise so the
+    # default path does not pay for it.
+    ss_tot_by_pc = (
+        np.zeros((n_voxels, max_components + 1), dtype=np.float64)
+        if (clean_reference and diagnostics is not None)
+        else None
+    )
+    want_null = clean_reference and diagnostics is not None
+    r2_null_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32) if want_null else None
 
     if verbose:
         if is_loro:
@@ -1636,6 +1701,10 @@ def cross_validate_noise_pcs(
     # for every PC count. Small: (n_runs, max_components+1, run_len, n_task).
     xtilde_by_run: list[torch.Tensor] = []
     gram_by_run: list[torch.Tensor] = []
+    # Kept only for clean_reference: the referee projects the held-out run with
+    # the same nested basis the design was residualized by, so the two sides
+    # move together.
+    pc_basis_by_run: list[torch.Tensor] = []
     for r in range(n_runs):
         start_tp, end_tp = run_slices[r]
         design_run = design_matrix_cpu[start_tp:end_tp, :].to(proj_device)
@@ -1645,6 +1714,7 @@ def cross_validate_noise_pcs(
             design_run = design_run - q_nuis @ (q_nuis.T @ design_run)
 
         pc_basis = _nested_orthonormal_basis(noise_pcs_on_device[r].to(proj_device))
+        pc_basis_by_run.append(pc_basis)
         xt = _residualize_design_by_pc_count(design_run, pc_basis, max_components)
         xtilde_by_run.append(xt)
         # (max_components+1, n_task, n_task)
@@ -1712,7 +1782,12 @@ def cross_validate_noise_pcs(
         # this run never saw are zero here, so they contribute nothing.
         design_test_fit = {}
         for r in test_runs:
-            design_r = design_proj_by_run[r][:, fit_mask]
+            # Under clean_reference the referee itself loses its leading k PCs,
+            # so the prediction must be built in that same subspace: X̃[k], the
+            # design already residualized by k PCs, rather than X̃[0] for every
+            # k. (K+1, run_len, n_fit) instead of (run_len, n_fit).
+            source = xtilde_by_run[r] if clean_reference else design_proj_by_run[r]
+            design_r = source[..., fit_mask]
             basis = unpred_basis_by_run.get(r)
             if basis is not None:
                 # The SAME projection the held-out data gets below: applying it
@@ -1736,6 +1811,11 @@ def cross_validate_noise_pcs(
     # Whether any fold actually removes something. When nothing is projected the
     # accumulation below stays exactly where it was, so 'zero' is untouched.
     any_projection = any(bool(plan["unpred_basis_by_run"]) for plan in fold_plans)
+    # Whether the actual-data statistics can still be taken in the single pass
+    # over all runs. They cannot once the held-out run is modified -- either by
+    # the unpredictable-condition projection or, per PC count, by the referee's
+    # own PC projection -- because then they are a property of the fold.
+    defer_actual = any_projection or clean_reference
 
     if (verbose or announce_missing) and max(n_dropped_by_fold) > 0:
         print(
@@ -1783,20 +1863,39 @@ def cross_validate_noise_pcs(
         )
         if is_loro:
             # Every timepoint is a test timepoint exactly once, so the actual-data
-            # statistics are totals over all runs and do not vary with PC count.
-            sum_actual = torch.zeros(chunk_size_actual, dtype=reduce_dtype, device=accum_dev)
-            sum_sq_actual = torch.zeros(chunk_size_actual, dtype=reduce_dtype, device=accum_dev)
+            # statistics are totals over all runs and do not vary with PC count
+            # -- unless clean_reference moves the referee itself with k, which is
+            # exactly what gives that mode a denominator that is not frozen.
+            actual_shape = (
+                (max_components + 1, chunk_size_actual) if clean_reference else (chunk_size_actual,)
+            )
+            sum_actual = torch.zeros(actual_shape, dtype=reduce_dtype, device=accum_dev)
+            sum_sq_actual = torch.zeros(actual_shape, dtype=reduce_dtype, device=accum_dev)
             ss_res_by_pc = torch.zeros(
                 (max_components + 1, chunk_size_actual), dtype=reduce_dtype, device=accum_dev
+            )
+            ss_res_null_by_pc = (
+                torch.zeros(
+                    (max_components + 1, chunk_size_actual),
+                    dtype=reduce_dtype,
+                    device=accum_dev,
+                )
+                if want_null
+                else None
             )
         else:
             pred_by_pc_chunk = [
                 torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
                 for _ in range(max_components + 1)
             ]
-            actual_projected_chunk = torch.zeros(
-                chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu"
-            )
+            actual_projected_chunk = [
+                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
+                for _ in range(max_components + 1 if clean_reference else 1)
+            ]
+            pred_null_by_pc_chunk = [
+                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
+                for _ in range(max_components + 1 if want_null else 0)
+            ]
 
         for r in range(n_runs):
             y_run = _load_run(chunk_data_cpu, r)
@@ -1806,13 +1905,13 @@ def cross_validate_noise_pcs(
             # measured on. Under 'nuisance' the held-out data is projected, so
             # these move into the fold loop and are accumulated from there
             # instead; training still uses the unprojected run above.
-            if not any_projection:
+            if not defer_actual:
                 if is_loro:
                     sum_actual += y_run.sum(dim=1, dtype=reduce_dtype).to(accum_dev)
                     sum_sq_actual += (y_run * y_run).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
                 else:
                     start_tp, end_tp = run_slices[r]
-                    actual_projected_chunk[:, start_tp:end_tp] = y_run.cpu()
+                    actual_projected_chunk[0][:, start_tp:end_tp] = y_run.cpu()
             del y_run
 
         # ------------------------------------------------------------------
@@ -1840,9 +1939,9 @@ def cross_validate_noise_pcs(
                 start_tp, end_tp = run_slices[r]
                 design_test = plan["design_test_fit"][r]  # (run_len, n_fit)
                 basis = plan["unpred_basis_by_run"].get(r)
-                if basis is not None:
+                if basis is not None and not clean_reference:
                     y_test = _project_out_basis(y_test, basis, time_dim=1)
-                if any_projection:
+                if defer_actual and not clean_reference:
                     # LORO scores each timepoint exactly once, so accumulating
                     # here covers the whole timeseries with no double counting.
                     if is_loro:
@@ -1851,18 +1950,71 @@ def cross_validate_noise_pcs(
                             (y_test * y_test).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
                         )
                     else:
-                        actual_projected_chunk[:, start_tp:end_tp] = y_test.cpu()
+                        actual_projected_chunk[0][:, start_tp:end_tp] = y_test.cpu()
+                # The referee for count k. Rebound once per k under
+                # clean_reference, constant otherwise.
+                y_ref = y_test
+                pc_basis_test = pc_basis_by_run[r] if clean_reference else None
                 for n_pcs in range(max_components + 1):
+                    if clean_reference:
+                        # The basis is nested, so count k's referee is count
+                        # k-1's with one more column removed -- a rank-1 update
+                        # rather than a fresh projection per k. Past this run's
+                        # component count there is nothing left to remove, which
+                        # is the same guard _residualize_design_by_pc_count uses.
+                        assert pc_basis_test is not None
+                        if 0 < n_pcs <= pc_basis_test.shape[1]:
+                            q_col = pc_basis_test[:, n_pcs - 1 : n_pcs]
+                            y_ref = y_ref - (y_ref @ q_col) @ q_col.T
+                        # The unpredictable-condition projection comes *after*
+                        # the PC one, matching the order on the design side
+                        # (X̃[k] built first, then projected) -- two orthogonal
+                        # projectors do not commute, so scoring in one subspace
+                        # against a prediction built in another would charge
+                        # their disagreement to the residual. Applied to a copy
+                        # so the nested PC recursion carries forward unprojected.
+                        y_score = (
+                            y_ref if basis is None else _project_out_basis(y_ref, basis, time_dim=1)
+                        )
+                        if is_loro:
+                            sum_actual[n_pcs] += y_score.sum(dim=1, dtype=reduce_dtype).to(
+                                accum_dev
+                            )
+                            sum_sq_actual[n_pcs] += (
+                                (y_score * y_score).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                            )
+                        else:
+                            actual_projected_chunk[n_pcs][:, start_tp:end_tp] = y_score.cpu()
                     # (run_len, n_fit) @ (n_fit, chunk) -> (run_len, chunk)
-                    y_pred = (design_test @ betas_fit[n_pcs]).T
+                    design_k = design_test[n_pcs] if clean_reference else design_test
+                    y_pred = (design_k @ betas_fit[n_pcs]).T
                     if is_loro:
-                        resid = y_test - y_pred
+                        resid = (y_score if clean_reference else y_test) - y_pred
                         ss_res_by_pc[n_pcs] += (
                             (resid * resid).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
                         )
                     else:
                         pred_by_pc_chunk[n_pcs][:, start_tp:end_tp] = y_pred.cpu()
-                del y_test
+                    if want_null:
+                        # Same referee, same subspace, but the UNCHANGED 0-PC
+                        # model. Projecting a noise direction out of the target
+                        # takes the same amount from ss_res and ss_tot, which
+                        # raises R2 on its own -- measurably more, on synthetic
+                        # data with no task-correlated noise at all, than any
+                        # real effect this mode was built to find. This null
+                        # carries that rise and nothing else, so the difference
+                        # between the two curves is what the PCs actually did.
+                        y_null = (design_k @ betas_fit[0]).T
+                        if is_loro:
+                            null_resid = y_score - y_null
+                            ss_res_null_by_pc[n_pcs] += (
+                                (null_resid * null_resid)
+                                .sum(dim=1, dtype=reduce_dtype)
+                                .to(accum_dev)
+                            )
+                        else:
+                            pred_null_by_pc_chunk[n_pcs][:, start_tp:end_tp] = y_null.cpu()
+                del y_test, y_ref
             del test_data, xty_train, xty_fit, betas_fit
 
         # ------------------------------------------------------------------
@@ -1870,23 +2022,45 @@ def cross_validate_noise_pcs(
         # ------------------------------------------------------------------
         if is_loro:
             for n_pcs in range(max_components + 1):
+                s1 = (sum_actual[n_pcs] if clean_reference else sum_actual).double()
+                s2 = (sum_sq_actual[n_pcs] if clean_reference else sum_sq_actual).double()
                 r2 = compute_r2_from_sufficient_stats(
-                    ss_res_by_pc[n_pcs].double(),
-                    sum_actual.double(),
-                    sum_sq_actual.double(),
-                    n_timepoints,
+                    ss_res_by_pc[n_pcs].double(), s1, s2, n_timepoints
                 )
                 r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy()
+                if ss_tot_by_pc is not None:
+                    ss_tot_by_pc[chunk_start:chunk_end, n_pcs] = (
+                        (s2 - s1 * s1 / n_timepoints).cpu().numpy()
+                    )
+                if ss_res_null_by_pc is not None and r2_null_maps is not None:
+                    r2_null_maps[chunk_start:chunk_end, n_pcs] = (
+                        compute_r2_from_sufficient_stats(
+                            ss_res_null_by_pc[n_pcs].double(), s1, s2, n_timepoints
+                        )
+                        .cpu()
+                        .numpy()
+                    )
             del ss_res_by_pc, sum_actual, sum_sq_actual, chunk_data_cpu
         else:
             for n_pcs in range(max_components + 1):
-                r2 = compute_r2_metric(
-                    actual_projected_chunk, pred_by_pc_chunk[n_pcs], metric="cod"
-                )
+                actual_k = actual_projected_chunk[n_pcs if clean_reference else 0]
+                r2 = compute_r2_metric(actual_k, pred_by_pc_chunk[n_pcs], metric="cod")
                 r2_maps[chunk_start:chunk_end, n_pcs] = (
                     r2.cpu().numpy() if r2.is_cuda else r2.numpy()
                 )
-            del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
+                if ss_tot_by_pc is not None:
+                    centred = actual_k.double() - actual_k.double().mean(dim=1, keepdim=True)
+                    ss_tot_by_pc[chunk_start:chunk_end, n_pcs] = (
+                        (centred * centred).sum(dim=1).numpy()
+                    )
+                if want_null and r2_null_maps is not None:
+                    r2_null = compute_r2_metric(
+                        actual_k, pred_null_by_pc_chunk[n_pcs], metric="cod"
+                    )
+                    r2_null_maps[chunk_start:chunk_end, n_pcs] = (
+                        r2_null.cpu().numpy() if r2_null.is_cuda else r2_null.numpy()
+                    )
+            del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk, pred_null_by_pc_chunk
 
         del xty_total
 
@@ -1895,6 +2069,17 @@ def cross_validate_noise_pcs(
     # ================================================================
     # Summary: median R² across ALL voxels for each PC count
     r2_summary = np.median(r2_maps, axis=0)
+
+    if ss_tot_by_pc is not None and diagnostics is not None:
+        # How much of the held-out variance the referee lost at each k. A rise
+        # in the clean-reference curve that tracks this fall is the mechanical
+        # component, not evidence that the PCs helped.
+        baseline = ss_tot_by_pc[:, :1]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fraction = np.where(baseline > 0, ss_tot_by_pc / baseline, 1.0)
+        diagnostics["ss_tot_fraction"] = fraction.astype(np.float32)
+        assert r2_null_maps is not None
+        diagnostics["r2_null"] = r2_null_maps
 
     if verbose:
         print("\n" + "=" * 70)
@@ -2310,6 +2495,9 @@ def fit_denoising_model(
     n_perms: int = 100,
     r2_method: str = "auto",
     zero_event_strategy: str = "zero",
+    clean_reference_diagnostic: bool = False,
+    compute_task_overlap: bool = False,
+    task_overlap_surrogates: int = 200,
     ceiling_method: str = "auto",
     repeat_groups: list[list[int]] | None = None,
     device: torch.device | None = None,
@@ -2421,6 +2609,21 @@ def fit_denoising_model(
         moves both masks. The voxels that flip are the marginal-SNR ones nearest
         the threshold, which is the worst possible composition for a noise pool
         whose PCs are then projected out of every voxel.
+    clean_reference_diagnostic : bool, default=False
+        Run a second CV sweep scoring each PC count against a held-out run that
+        has had its own leading k PCs projected out, and report it alongside the
+        real curve. It never influences the selection.
+
+        The question it answers: the default curve treats the held-out run as
+        trustworthy truth, which fails when a subject breathes or moves in time
+        with the task -- the 0-PC model then earns R2 by fitting task-locked
+        artifact, and the PCs that remove it look like a loss. If this curve
+        rises where the real one falls, that is the signature. If the two agree,
+        the noise pool is taking something the task never explained anyway.
+
+        Costs a second full sweep, and its denominator shrinks with the PC
+        count, so read it with ``clean_reference_ss_tot_fraction``. See
+        :func:`cross_validate_noise_pcs`.
 
         ``'zero'`` remains the default because it is what every published
         GLMdenoise result used. Where every condition appears in every run the
@@ -2975,6 +3178,27 @@ def fit_denoising_model(
     if verbose:
         print("\nStep 4: Cross-validating PC selection (ALL voxels)...")
 
+    # PC/design overlap, computed here because everything it needs is in hand
+    # and it costs a few seconds. Independent of the CV: it asks whether the
+    # noise pool's structure is task-correlated at all, which is the question
+    # behind every "should I be removing these?" argument.
+    pc_task_overlap: dict | None = None
+    if compute_task_overlap:
+        try:
+            overlap_design = (
+                design_matrix if not per_hrf_mode else next(iter(designs_by_hrf.values()))  # type: ignore[union-attr]
+            )
+            pc_task_overlap = compute_pc_task_overlap(
+                noise_pcs=noise_pcs,
+                design_matrix=overlap_design,
+                run_starts=run_starts,
+                n_timepoints=n_timepoints,
+                nuisance=nuisance if isinstance(nuisance, list) else None,
+                n_surrogates=task_overlap_surrogates,
+            )
+        except Exception as exc:  # diagnostic only; never fail a fit for it
+            print(f"  Warning: PC/task overlap not computed: {exc}")
+
     if per_hrf_mode:
         # Per-HRF mode: Process each HRF group separately, then aggregate
         assert hrf_indices is not None
@@ -3050,6 +3274,55 @@ def fit_denoising_model(
             zero_event_strategy=zero_event_strategy,
         )
 
+    # -------------------------------------------------------------------
+    # Optional second sweep: the same curve against a denoised referee
+    # -------------------------------------------------------------------
+    # Deliberately a second full sweep rather than a cheaper reuse of the
+    # first. Nothing about the model is shared -- only the referee changes --
+    # but the referee is what every accumulated statistic was built on, so
+    # there is nothing to reuse. It never touches the selection below.
+    r2_clean_reference: np.ndarray | None = None
+    clean_ss_tot_fraction: np.ndarray | None = None
+    r2_clean_null: np.ndarray | None = None
+    r2_clean_excess: np.ndarray | None = None
+    clean_excess_per_voxel: np.ndarray | None = None
+    if clean_reference_diagnostic:
+        if verbose:
+            print("\nStep 4b: Diagnostic sweep against a PC-projected referee...")
+        clean_diag: dict = {}
+        clean_maps, _ = cross_validate_noise_pcs(
+            data=data,
+            design_matrix=None if per_hrf_mode else design_matrix,
+            designs_by_hrf=designs_by_hrf if per_hrf_mode else None,
+            hrf_indices=hrf_indices if per_hrf_mode else None,
+            noise_pcs=noise_pcs,
+            run_starts=run_starts,
+            max_components=max_components,
+            tr=tr,
+            nuisance=nuisance,
+            metric=metric,
+            cv_strategy=cv_strategy,
+            n_perms=n_perms,
+            chunk_size=chunk_size,
+            preload_data_to_device=preload_data_to_device,
+            device=device,
+            verbose=False,
+            progress_desc="Clean-reference diagnostic",
+            zero_event_strategy=zero_event_strategy,
+            clean_reference=True,
+            diagnostics=clean_diag,
+        )
+        # Summarised over the same voxels as the main curve so the two are
+        # Held per voxel until the criteria mask exists. Aggregating here would
+        # summarise the diagnostic over ALL voxels while the selection curve it
+        # is meant to be read against is a median over criteria voxels only --
+        # on a real dataset those differed by 0.10 in R2 (-0.007 vs +0.097),
+        # with 89% of the all-voxel median coming from the noise pool.
+        clean_maps_per_voxel = clean_maps
+        clean_null_per_voxel = clean_diag["r2_null"]
+        clean_frac_per_voxel = clean_diag["ss_tot_fraction"]
+        del clean_diag
+
     # Determine criteria voxels: R² > threshold in ANY PC count (GLMdenoise Step 7)
     threshold = pcR2cutoff if pcR2cutoff is not None else 0.0
     optimal_n_components, criteria_mask_final = select_optimal_pcs(
@@ -3060,6 +3333,63 @@ def fit_denoising_model(
 
     # Convert criteria_mask_final to torch tensor
     criteria_mask = torch.from_numpy(criteria_mask_final)
+
+    # -------------------------------------------------------------------
+    # Step 4b, part two: summarise the diagnostic over the same electorate
+    # -------------------------------------------------------------------
+    if clean_reference_diagnostic:
+        agg = np.median if metric == "median" else np.mean
+        # Criteria voxels when there are any: the selection curve is their
+        # median, and a diagnostic meant to contradict it has to be read on the
+        # same voxels. Falling back to all voxels keeps it defined either way.
+        vox = criteria_mask_final if criteria_mask_final.any() else slice(None)
+        r2_clean_reference = agg(clean_maps_per_voxel[vox], axis=0)
+        r2_clean_null = agg(clean_null_per_voxel[vox], axis=0)
+        clean_ss_tot_fraction = agg(clean_frac_per_voxel[vox], axis=0)
+        # The headline. Raw and null both drift with the shrinking denominator;
+        # their difference is what refitting the betas with k PCs actually did.
+        # Measured on synthetic data: with noise independent of the task the
+        # raw curve gained +0.084 and the excess +0.004, while with the same
+        # noise made task-locked the raw curve gained an indistinguishable
+        # +0.086 and the excess +0.223. The raw curve cannot tell those apart.
+        r2_clean_excess = r2_clean_reference - r2_clean_null
+        # Kept per voxel, not just aggregated: the curve says an excess exists,
+        # the map says whether to believe it.
+        clean_excess_per_voxel = (clean_maps_per_voxel - clean_null_per_voxel).astype(np.float32)
+        del clean_maps_per_voxel, clean_null_per_voxel, clean_frac_per_voxel
+
+        # Unconditional, like the other decision lines: -verb defaults to 0, so
+        # anything gated on verbose is invisible in normal use, and a diagnostic
+        # nobody sees is worse than one that was never run.
+        peak = int(np.argmax(r2_clean_excess))
+        n_vox_diag = int(criteria_mask_final.sum()) if criteria_mask_final.any() else n_voxels
+        print(
+            f"  Clean-reference diagnostic ({n_vox_diag:,} criteria voxels): excess over "
+            f"its own null peaks at {peak} PCs ({r2_clean_excess[peak]:+.4f}), with "
+            f"{1.0 - clean_ss_tot_fraction[peak]:.1%} of held-out variance removed from "
+            f"the referee there."
+        )
+        # The floor cannot come from pc_selection_floor: that takes 1% of the
+        # curve's baseline, and this curve's baseline is identically zero by
+        # construction, so its dominant arm contributes nothing and what is
+        # left is roughness alone. Scale it to the quantity the excess would
+        # have to be worth arguing about instead -- the selection curve's own
+        # baseline, which is the R2 the PCs would have to improve on.
+        rough_floor, _, _ = pc_selection_floor(r2_clean_excess, pc_min_gain)
+        scale_floor = 0.05 * abs(float(np.median(r2_maps[vox], axis=0)[0]))
+        excess_floor = rough_floor if pc_min_gain is not None else max(rough_floor, scale_floor)
+        if r2_clean_excess[peak] > excess_floor:
+            print(
+                f"  That clears the floor ({excess_floor:.4f}): the PCs improve the fit even "
+                "when the referee is denoised too, so the main curve may be under-counting. "
+                "Task-correlated noise is the usual cause."
+            )
+        else:
+            print(
+                f"  Below the floor ({excess_floor:.4f}) -- not a meaningful excess. The "
+                "main curve's verdict stands."
+            )
+        print("  Diagnostic only; it never selects.")
 
     # Transpose r2_maps for compatibility with downstream code
     r2_per_voxel = r2_maps  # (n_voxels, n_pc_counts)
@@ -3375,6 +3705,27 @@ def fit_denoising_model(
         "xval_r2_all_voxels": r2_all_voxels.tolist(),
     }
 
+    if pc_task_overlap is not None:
+        metadata["pc_task_overlap"] = {
+            k: np.asarray(v).tolist() for k, v in pc_task_overlap.items()
+        }
+
+    if r2_clean_reference is not None:
+        # Not comparable in level to the curve above -- its denominator shrinks
+        # with the PC count, which is what ss_tot_fraction records. Shape only.
+        metadata["xval_r2_clean_reference"] = r2_clean_reference.tolist()
+        assert clean_ss_tot_fraction is not None
+        metadata["clean_reference_ss_tot_fraction"] = clean_ss_tot_fraction.tolist()
+        assert r2_clean_null is not None and r2_clean_excess is not None
+        metadata["xval_r2_clean_reference_null"] = r2_clean_null.tolist()
+        metadata["xval_r2_clean_reference_excess"] = r2_clean_excess.tolist()
+        # Which voxels the four curves above are a median over, so a saved run
+        # can be read without guessing whether it is the criteria electorate.
+        metadata["clean_reference_n_voxels"] = int(
+            criteria_mask_final.sum() if criteria_mask_final.any() else n_voxels
+        )
+        metadata["clean_reference_voxels"] = "criteria" if criteria_mask_final.any() else "all"
+
     if ic_variance_ratio_per_run is not None:
         metadata["ic_variance_ratio_per_run"] = [
             ratios.detach().cpu().tolist() for ratios in ic_variance_ratio_per_run
@@ -3422,6 +3773,7 @@ def fit_denoising_model(
         initial_noise_ceiling=initial_noise_ceiling,
         initial_explainable_r2=initial_explainable_r2,
         noise_ceiling_notes=noise_ceiling_notes,
+        clean_reference_excess_per_voxel=clean_excess_per_voxel,
         pcselection_mask=pcselection_mask,
         noise_pool_mask=noise_pool_mask,
         criteria_mask=criteria_mask,
@@ -3434,3 +3786,136 @@ def fit_denoising_model(
         improvement=improvement,
         metadata=metadata,
     )
+
+
+def compute_pc_task_overlap(
+    noise_pcs: list[torch.Tensor],
+    design_matrix: torch.Tensor,
+    run_starts: list[int],
+    n_timepoints: int,
+    nuisance: list[torch.Tensor] | None = None,
+    n_surrogates: int = 200,
+    seed: int = 0,
+) -> dict:
+    """How much the noise PCs and the task design overlap, against a fair null.
+
+        Two views, because they answer different questions and the first one alone
+        is actively misleading:
+
+        * ``per_pc`` — R2 of each PC explained by the task design. Reads as
+          "is this component task-locked?"
+        * ``subspace`` — fraction of the DESIGN's variance lying inside the first-k
+          PC subspace. This is the one that predicts beta contamination, and it is
+          not recoverable from the per-PC numbers: an overlap spread thinly across
+          many components leaves every individual PC looking innocent.
+
+        Both are scored against **phase-randomised surrogates of the PCs**, which
+        preserve each component's power spectrum and destroy only its phase
+        relationship to the task. Without that null the numbers are unreadable: an
+        HRF-convolved design is smooth, physiological noise is smooth, and any two
+        smooth timeseries correlate. Measured on real data, the naive chance level
+        for a 7-condition design over 455 df is 0.015 while the spectrum-matched
+        null sits at 0.085 -- so a PC scoring 0.12 looks like a 8x enrichment and is
+        in fact unremarkable.
+
+    PC index is a **per-run rank**, not an identity: the components are
+        extracted per run, so PC k in run 1 and PC k in run 2 are different
+        timeseries that merely sit at the same position in their own run's variance
+        ordering. Hence ``per_pc_by_run`` / ``subspace_by_run``, which the figure
+        plots; the run-averaged versions are a summary, and on real data the spread
+        across runs was as large as the mean.
+
+        Returns a dict of arrays: ``per_pc_by_run`` (n_runs, n_components),
+        ``subspace_by_run`` (n_runs, n_components + 1), their run-means ``per_pc``
+        and ``subspace``, and the null summaries ``per_pc_null_p95``,
+        ``subspace_null_mean`` / ``subspace_null_sd`` / ``subspace_z``.
+    """
+    rng = np.random.default_rng(seed)
+    n_runs = len(run_starts)
+    n_comp = min(int(pcs.shape[1]) for pcs in noise_pcs)
+
+    def _slice(r: int) -> slice:
+        end = run_starts[r + 1] if r < n_runs - 1 else n_timepoints
+        return slice(run_starts[r], end)
+
+    def _phase_randomise(x: np.ndarray) -> np.ndarray:
+        spec = np.fft.rfft(x, axis=0)
+        phase = rng.uniform(0, 2 * np.pi, spec.shape)
+        phase[0] = 0.0
+        return np.fft.irfft(np.abs(spec) * np.exp(1j * phase), n=x.shape[0], axis=0)
+
+    per_pc_obs: list[np.ndarray] = []
+    per_pc_null: list[np.ndarray] = []
+    sub_by_run: list[np.ndarray] = []
+    sub_obs = np.zeros(n_comp + 1)
+    sub_null = np.zeros((n_surrogates, n_comp + 1))
+
+    for r in range(n_runs):
+        sl = _slice(r)
+        design_run = design_matrix[sl, :].detach().cpu().numpy().astype(np.float64)
+        pcs_run = noise_pcs[r][:, :n_comp].detach().cpu().numpy().astype(np.float64)
+
+        # Everything below lives in the nuisance-orthogonal space, matching the
+        # GLM: drift the design never sees cannot contaminate its betas.
+        if nuisance is not None:
+            q_nuis, _ = np.linalg.qr(nuisance[r].detach().cpu().numpy().astype(np.float64))
+            design_run = design_run - q_nuis @ (q_nuis.T @ design_run)
+            pcs_run = pcs_run - q_nuis @ (q_nuis.T @ pcs_run)
+
+        q_design, _ = np.linalg.qr(design_run)
+
+        def _explained_by_design(mat: np.ndarray, q_design=q_design) -> np.ndarray:
+            fit = q_design @ (q_design.T @ mat)
+            return (fit**2).sum(axis=0) / np.maximum((mat**2).sum(axis=0), 1e-12)
+
+        def _design_in_subspace_cumulative(
+            basis: np.ndarray, design_run=design_run, total=None
+        ) -> np.ndarray:
+            """Design variance inside the first-k columns, for every k at once.
+
+            QR is nested -- the first k columns of Q span the first k columns of
+            the input -- so every k shares one factorization, and the energy is
+            then a cumulative sum of per-direction projections. The obvious loop
+            redoes a QR per k, which is 20x the work for the same numbers.
+            """
+            q_basis, _ = np.linalg.qr(basis)
+            coef = q_basis.T @ design_run  # (n_comp, n_cond)
+            per_dir = (coef**2).sum(axis=1)
+            return np.concatenate([[0.0], np.cumsum(per_dir)]) / total
+
+        design_energy = max((design_run**2).sum(), 1e-12)
+        per_pc_obs.append(_explained_by_design(pcs_run))
+        run_sub = _design_in_subspace_cumulative(pcs_run, total=design_energy)
+        sub_by_run.append(run_sub)
+        sub_obs += run_sub / n_runs
+
+        for s_idx in range(n_surrogates):
+            surr = _phase_randomise(pcs_run)
+            if nuisance is not None:
+                surr = surr - q_nuis @ (q_nuis.T @ surr)
+            if s_idx < 40 or n_surrogates <= 40:
+                # The per-PC null converges fast (one number per component per
+                # surrogate); only the subspace null needs the full count.
+                per_pc_null.append(_explained_by_design(surr))
+            sub_null[s_idx] += _design_in_subspace_cumulative(surr, total=design_energy) / n_runs
+
+    null_stack = np.concatenate([n.ravel() for n in per_pc_null])
+    sd = sub_null.std(axis=0)
+    return {
+        # Per run, because PC k is a DIFFERENT component in each run: the PCs are
+        # extracted per run and k is only a rank in that run's own variance
+        # ordering. The mean is kept for a one-number summary, but plotting it
+        # alone implies a component that does not exist -- measured spreads
+        # across runs were as large as the means themselves.
+        "per_pc_by_run": np.asarray(per_pc_obs),
+        "subspace_by_run": np.asarray(sub_by_run),
+        "per_pc": np.mean(per_pc_obs, axis=0),
+        "per_pc_null_p95": np.full(n_comp, float(np.percentile(null_stack, 95))),
+        "per_pc_null_mean": np.full(n_comp, float(null_stack.mean())),
+        "subspace": sub_obs,
+        "subspace_null_mean": sub_null.mean(axis=0),
+        "subspace_null_sd": sd,
+        "subspace_z": np.divide(
+            sub_obs - sub_null.mean(axis=0), sd, out=np.zeros_like(sub_obs), where=sd > 1e-12
+        ),
+    }

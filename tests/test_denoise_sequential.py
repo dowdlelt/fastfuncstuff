@@ -960,7 +960,9 @@ def _fwl_case(n_runs=4, tp=40, n_vox=90, max_comp=3, ragged=False):
     )
 
 
-def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100, zero_event_strategy="zero"):
+def _explicit_full_model_r2(
+    case, cv_strategy=1, n_perms=100, zero_event_strategy="zero", clean_reference=False
+):
     """Reference R² built the slow, obvious way: fit [X | zero-padded PCs] directly.
 
     This is the formulation the fast path replaced. It exists here so the
@@ -1037,6 +1039,22 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100, zero_event_strateg
             betas = (pinv @ data_p[:, tr_tps].double().T)[:n_fit, :]
             design_te = design_p[te_tps, :][:, fit_mask].double()
 
+            if clean_reference:
+                # The referee loses its own leading k PCs, so the prediction has
+                # to be built in that same subspace. Explicit pinv projector on
+                # the raw PC columns -- independent of the nested Gram-Schmidt
+                # recursion the fast path uses.
+                for r in test_runs:
+                    n_use = min(k, pcs[r].shape[1])
+                    if n_use == 0:
+                        continue
+                    r_tps = torch.arange(run_starts[r], run_ends[r])
+                    local = torch.searchsorted(te_tps, r_tps)
+                    x_pc = pcs[r][:, :n_use].double()
+                    proj = x_pc @ torch.linalg.pinv(x_pc, rcond=1e-6)
+                    design_te[local, :] -= proj @ design_te[local, :]
+                    actual[:, r_tps] -= (proj @ actual[:, r_tps].T).T
+
             if zero_event_strategy == "nuisance":
                 # Per test RUN, since which columns are unpredictable depends on
                 # the run being scored, not on the fold.
@@ -1074,6 +1092,100 @@ def test_cross_validate_noise_pcs_matches_explicit_full_model(ragged):
     reference = _explicit_full_model_r2(case, cv_strategy=1)
 
     assert np.abs(fast - reference).max() < 1e-4
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_clean_reference_matches_explicit_projection(ragged):
+    """The incremental nested referee must equal an explicit per-k projection.
+
+    ``clean_reference`` projects the held-out run's own leading k PCs out of
+    both the referee and the design predicting it. The fast path does that as a
+    rank-1 update per k off the nested basis; this checks it against a fresh
+    pinv projector built from the raw PC columns at each k.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case(ragged=ragged)
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True)
+    reference = _explicit_full_model_r2(case, cv_strategy=1, clean_reference=True)
+
+    assert np.abs(fast - reference).max() < 1e-4
+
+
+def test_clean_reference_agrees_with_default_at_zero_pcs():
+    """At k=0 nothing is projected, so the two referees must be the same one.
+
+    A drift here means clean_reference changed something other than the
+    reference -- the training fit, say -- which would make the whole curve
+    incomparable to the default one rather than just differently scaled.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    default, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    clean, _ = cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True)
+
+    assert np.abs(clean[:, 0] - default[:, 0]).max() < 1e-5
+    # And past k=0 it must actually differ, or the flag is a silent no-op.
+    assert np.abs(clean[:, 1:] - default[:, 1:]).max() > 1e-4
+
+
+def test_clean_reference_reports_shrinking_denominator():
+    """The diagnostic has to expose the denominator the mode gives away.
+
+    Part of any rise in this curve is the referee losing variance, so the
+    fraction that survives is reported alongside it. It is 1.0 at k=0 and can
+    only fall: an orthogonal projection never adds variance back.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    diagnostics: dict = {}
+    cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True, diagnostics=diagnostics)
+
+    fraction = diagnostics["ss_tot_fraction"]
+    assert fraction.shape == (case["data"].shape[0], case["max_components"] + 1)
+    assert np.allclose(fraction[:, 0], 1.0)
+    assert np.all(np.diff(fraction, axis=1) <= 1e-6)
+    # The fixture injects PC noise into every run, so the loss is real, not
+    # round-off.
+    assert fraction[:, -1].mean() < 0.95
+
+
+def test_clean_reference_null_absorbs_the_mechanical_gain():
+    """The null must carry the denominator rise, leaving ~nothing as excess.
+
+    Projecting a noise direction out of the held-out run takes the same amount
+    from ss_res as from ss_tot, so R2 climbs with k even when the model is
+    untouched. The PCs here are random and independent of the design, so there
+    is little real gain to find and nearly the whole rise must show up in the
+    null.
+
+    Long runs on purpose. What survives as excess in this fixture is chance
+    correlation between a random PC and the design, and it shrinks with run
+    length: 43% of the rise at the fixture's default 40 TRs, 19% at 120, 5% at
+    300. Measured instead on a genuinely task-locked artifact, the excess was
+    20x the independent case -- which is the whole point of the diagnostic, and
+    is invisible in the raw curve, where the two cases differ by 0.002.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case(tp=300, n_vox=200)
+    diagnostics: dict = {}
+    clean, _ = cross_validate_noise_pcs(
+        **case, cv_strategy=1, clean_reference=True, diagnostics=diagnostics
+    )
+    null = diagnostics["r2_null"]
+
+    # k=0 is the same model twice, so the null IS the curve there.
+    assert np.abs(null[:, 0] - clean[:, 0]).max() < 1e-5
+
+    raw_rise = np.median(clean, axis=0) - np.median(clean[:, 0])
+    excess = np.median(clean - null, axis=0)
+    # The rise is real and substantial...
+    assert raw_rise[-1] > 0.01
+    # ...and almost all of it is the null, not the PCs.
+    assert abs(excess[-1]) < 0.25 * raw_rise[-1]
 
 
 def test_cross_validate_noise_pcs_drops_conditions_absent_from_training():
@@ -1656,3 +1768,127 @@ def test_matched_prep_reproduces_the_pool_loadings_where_the_pool_is():
         # what it draws is just voxel amplitude.
         assert corr(raw[0][:n_pool, k], pool_loadings[0][:, k]) < 0.9
         assert corr(raw[0][:, k].abs(), scale[:, 0]) > 0.4
+
+
+# ---------------------------------------------------------------------------
+# PC / task-design overlap, against a spectrum-matched null
+# ---------------------------------------------------------------------------
+
+
+def _overlap_case(rho: float, n_runs=3, tp=240, n_comp=6, seed=3):
+    """PCs whose FIRST component carries a controlled amount of the design."""
+    torch.manual_seed(seed)
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+    design = torch.zeros(n_tp, 2)
+    for c in range(2):
+        for r in range(n_runs):
+            design[r * tp + 10 + 7 * c :: 26, c] = 1.0
+    # Smooth it, so the design has the low-frequency character that makes a
+    # naive chance level wrong and the spectrum-matched null necessary.
+    kern = torch.ones(1, 1, 9) / 9
+    for c in range(2):
+        design[:, c] = torch.nn.functional.conv1d(
+            design[:, c].view(1, 1, -1), kern, padding=4
+        ).view(-1)[:n_tp]
+
+    nuisance = [construct_polynomial_matrix(tp, 2, DEVICE).float() for _ in range(n_runs)]
+    pcs = []
+    for r in range(n_runs):
+        sl = slice(r * tp, (r + 1) * tp)
+        task_r = design[sl, :].sum(dim=1)
+        task_r = (task_r - task_r.mean()) / task_r.std()
+        indep = torch.randn(tp)
+        indep = indep - task_r * (torch.dot(indep, task_r) / torch.dot(task_r, task_r))
+        indep = (indep - indep.mean()) / indep.std()
+        first = rho * task_r + float(np.sqrt(max(0.0, 1 - rho**2))) * indep
+        rest = torch.randn(tp, n_comp - 1)
+        pcs.append(torch.cat([first.view(-1, 1), rest], dim=1))
+    return pcs, design, run_starts, n_tp, nuisance
+
+
+def test_pc_task_overlap_tracks_real_overlap_not_smoothness():
+    """Overlap must rise with genuine design correlation and sit at the null without it.
+
+    The naive chance level for a smooth design is far too low -- a PC can score
+    several times "chance" purely by being smooth. The phase-randomised null is
+    what makes the number readable, so this checks the observed value against
+    THAT, at rho=0 and rho=0.7.
+    """
+    from fastfuncstuff.denoise.sequential import compute_pc_task_overlap
+
+    zs = {}
+    for rho in (0.0, 0.7):
+        pcs, design, run_starts, n_tp, nuisance = _overlap_case(rho)
+        out = compute_pc_task_overlap(
+            pcs, design, run_starts, n_tp, nuisance=nuisance, n_surrogates=60
+        )
+        zs[rho] = float(out["subspace_z"][1])
+
+    # No real overlap -> indistinguishable from spectrum-matched surrogates.
+    assert abs(zs[0.0]) < 3.0
+    # Strong overlap -> far outside them, and ordered.
+    assert zs[0.7] > 6.0
+    assert zs[0.7] > zs[0.0] + 5.0
+
+
+def test_pc_task_overlap_subspace_is_monotone_and_bounded():
+    """Design variance inside the first-k PCs can only grow, and never exceeds 1."""
+    from fastfuncstuff.denoise.sequential import compute_pc_task_overlap
+
+    pcs, design, run_starts, n_tp, nuisance = _overlap_case(0.4)
+    out = compute_pc_task_overlap(pcs, design, run_starts, n_tp, nuisance=nuisance, n_surrogates=40)
+    sub = np.asarray(out["subspace"])
+    assert sub[0] == pytest.approx(0.0)
+    assert np.all(np.diff(sub) >= -1e-9)
+    assert sub.max() <= 1.0 + 1e-9
+
+    # The nested-QR shortcut must agree with the obvious per-k QR it replaced:
+    # QR nests, so Q[:, :k] spans the first k columns and the energy is a
+    # cumulative sum. Checked on run 0 against an explicit per-k factorization.
+    qn, _ = np.linalg.qr(nuisance[0].numpy().astype(np.float64))
+    d = design[: run_starts[1], :].numpy().astype(np.float64)
+    d = d - qn @ (qn.T @ d)
+    pc0 = pcs[0].numpy().astype(np.float64)
+    pc0 = pc0 - qn @ (qn.T @ pc0)
+    per_run = compute_pc_task_overlap(
+        [pcs[0]],
+        design[: run_starts[1], :],
+        [0],
+        run_starts[1],
+        nuisance=[nuisance[0]],
+        n_surrogates=1,
+    )
+    for k in (1, 3, 5):
+        qk, _ = np.linalg.qr(pc0[:, :k])
+        explicit = ((qk @ (qk.T @ d)) ** 2).sum() / (d**2).sum()
+        assert per_run["subspace"][k] == pytest.approx(explicit, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    "n_runs,expected",
+    [
+        (1, [1]),
+        (5, [5]),
+        (6, [3, 3]),
+        (7, [4, 3]),
+        (10, [5, 5]),
+        (11, [4, 4, 3]),
+        (20, [5, 5, 5, 5]),
+    ],
+)
+def test_run_figure_split_is_balanced(n_runs, expected):
+    """Runs split into balanced groups, never a lone trailing run.
+
+    Greedy packing would give 11 -> 5/5/1, and a figure holding one run beside
+    figures holding five reads as though that run were singled out.
+    """
+    from fastfuncstuff.visualization import split_runs_for_figures
+
+    groups = split_runs_for_figures(n_runs)
+    assert [len(g) for g in groups] == expected
+    # Every run appears exactly once, in order.
+    assert [r for g in groups for r in g] == list(range(n_runs))
+    assert all(len(g) <= 5 for g in groups)

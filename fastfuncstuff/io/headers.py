@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import nibabel as nib
+import numpy as np
 
 _NIFTI_ECODE_AFNI = 4
 
@@ -82,6 +83,92 @@ def parse_subbrick_selector(path: str | Path) -> tuple[str, list[int] | None]:
     return clean_path, _parse_selector(selector)
 
 
+_1D_SELECTOR_RE = re.compile(r"(\[[^\[\]]*\]|\{[^{}]*\})\s*'?\s*$")
+
+
+def parse_1d_selectors(path: str | Path) -> tuple[str, list[int] | None, list[int] | None]:
+    """Parse AFNI-style ``[columns]`` and ``{rows}`` selectors off a text-file path.
+
+    For an ASCII/1D file AFNI reads ``[..]`` as a **column** selector and
+    ``{..}`` as a **row** selector — the opposite assignment to the one that
+    feels natural if you come at it from ``dataset[0..100]``, where the brackets
+    pick volumes. ``mri_read.c`` states it outright: "column selectors [..] and
+    row selectors {..} are allowed in fname". Matching AFNI here is the whole
+    point: the same string has to mean the same thing to ``3dREMLfit``, or a
+    file that works in one tool silently selects something else in the other.
+
+    Both may appear, in either order, and each accepts the full selector
+    grammar :func:`parse_subbrick_selector` already supports — ``[0]``,
+    ``[1,3,5]``, ``[0..7]``, ``[0..$]``, ``[0..$(2)]``.
+
+    Examples
+    --------
+    - ``pcs.1D[0..7]``          — first 8 columns (e.g. the first 8 PCs)
+    - ``pcs.1D[0,2,5]``         — those three columns
+    - ``pcs.1D{10..$}``         — drop the first 10 rows
+    - ``pcs.1D[0..7]{10..$}``   — both
+
+    Returns
+    -------
+    clean_path : str
+        The path with every selector removed.
+    columns, rows : list[int] or None
+        Resolved indices, or *None* where that selector was absent. A ``$``
+        endpoint is left as the deferred marker for :func:`_resolve_indices`.
+    """
+    base, suffix = split_1d_selector_suffix(path)
+    columns: list[int] | None = None
+    rows: list[int] | None = None
+    for token in re.findall(r"\[[^\[\]]*\]|\{[^{}]*\}", suffix):
+        parsed = _parse_selector(token[1:-1])
+        if token[0] == "[":
+            columns = parsed
+        else:
+            rows = parsed
+    return base, columns, rows
+
+
+def split_1d_selector_suffix(path: str | Path) -> tuple[str, str]:
+    """Split a path into ``(base, trailing selector text)`` without parsing it.
+
+    Needed because :mod:`glob` reads ``[0..8]`` as a character class, so a
+    pattern carrying a column selector matches nothing at all. A glob caller
+    splits first, globs the bare pattern, then re-attaches ``suffix`` to each
+    match so the loader still sees it.
+    """
+    text = str(path).strip()
+    tokens: list[str] = []
+    # Strip from the right, so both selectors come off whichever order they are
+    # written in, and a directory name containing a bracket is never touched.
+    while True:
+        match = _1D_SELECTOR_RE.search(text)
+        if match is None:
+            break
+        tokens.append(match.group(1))
+        text = text[: match.start()].rstrip().rstrip("'").rstrip()
+    return text.rstrip("'"), "".join(reversed(tokens))
+
+
+def apply_1d_selectors(
+    data: np.ndarray,
+    columns: list[int] | None,
+    rows: list[int] | None,
+    source: str = "file",
+) -> np.ndarray:
+    """Apply parsed 1D selectors to a ``(n_rows, n_columns)`` array."""
+    if rows is not None:
+        try:
+            data = data[_resolve_indices(rows, data.shape[0], noun="row"), :]
+        except ValueError as exc:
+            raise ValueError(f"{source}: {{rows}} selector: {exc}") from exc
+    if columns is not None:
+        try:
+            data = data[:, _resolve_indices(columns, data.shape[1], noun="column")]
+        except ValueError as exc:
+            raise ValueError(f"{source}: [columns] selector: {exc}") from exc
+    return data
+
+
 def _parse_selector(selector: str) -> list[int]:
     """Parse the content inside brackets into a list of volume indices.
 
@@ -124,17 +211,24 @@ def _range_with_sentinel(start: int, end: int, step: int) -> list[int]:
     return list(range(start, end + 1, step))
 
 
-def _resolve_indices(indices: list[int], n_volumes: int) -> list[int]:
-    """Resolve deferred ``$`` selectors once the volume count is known."""
+def _resolve_indices(indices: list[int], n_volumes: int, noun: str = "volume") -> list[int]:
+    """Resolve deferred ``$`` selectors once the volume count is known.
+
+    ``noun`` names the axis in error messages. The same grammar selects volumes
+    from a dataset and columns from a 1D file, and "volume index 10 out of range
+    for image with 10 volumes" is baffling when what you selected was a column.
+    """
     if indices and indices[0] == -1 and len(indices) == 3:
         _, start, step = indices
         return list(range(start, n_volumes, step))
     # Validate explicit indices
     for i in indices:
         if i < 0:
-            raise ValueError(f"Negative volume index {i} is not valid")
+            raise ValueError(f"Negative {noun} index {i} is not valid")
         if i >= n_volumes:
-            raise ValueError(f"Volume index {i} out of range for image with {n_volumes} volumes")
+            raise ValueError(
+                f"{noun} index {i} out of range: there are {n_volumes} {noun}s (0..{n_volumes - 1})"
+            )
     return indices
 
 

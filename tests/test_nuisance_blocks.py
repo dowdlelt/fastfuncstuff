@@ -787,3 +787,102 @@ class TestAppendNuisanceBlocks:
         nuisance = [torch.ones(10, 2), torch.ones(10, 2)]
         out = append_nuisance_blocks(nuisance, [], [0, 10], 20)
         assert out[0].shape == (10, 2)
+
+
+# ---------------------------------------------------------------------------
+# AFNI 1D selectors on nuisance files: [columns] and {rows}
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def selector_file(tmp_path):
+    """20 rows x 10 columns, value = row*10 + column, so any slice is checkable."""
+    arr = np.arange(20 * 10, dtype=float).reshape(20, 10)
+    path = tmp_path / "pcs.1D"
+    np.savetxt(path, arr, fmt="%.1f")
+    return path
+
+
+@pytest.mark.parametrize(
+    "selector,shape,first_row",
+    [
+        ("", (20, 10), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ("[0..7]", (20, 8), [0, 1, 2, 3, 4, 5, 6, 7]),
+        ("[0]", (20, 1), [0]),
+        ("[0,2,5]", (20, 3), [0, 2, 5]),
+        ("[0..$]", (20, 10), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ("[0..$(2)]", (20, 5), [0, 2, 4, 6, 8]),
+        ("'[0..3]'", (20, 4), [0, 1, 2, 3]),
+    ],
+)
+def test_column_selector_matches_afni(selector_file, selector, shape, first_row):
+    """``[..]`` selects COLUMNS from a 1D file, as in AFNI's mri_read.c.
+
+    Inverting this against AFNI would be silent: the same -ortvec string would
+    feed 3dREMLfit eight timepoints where it fed ffs_reml eight PCs.
+    """
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    arr = load_nuisance_file(f"{selector_file}{selector}")
+    assert arr.shape == shape
+    assert arr[0].tolist() == pytest.approx(first_row)
+
+
+def test_row_selector_selects_rows(selector_file):
+    """``{..}`` selects ROWS, the other half of the AFNI convention."""
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    arr = load_nuisance_file(f"{selector_file}{{0..4}}")
+    assert arr.shape == (5, 10)
+    assert arr[:, 0].tolist() == pytest.approx([0, 10, 20, 30, 40])
+
+
+def test_both_selectors_compose(selector_file):
+    """Both may appear, in either order."""
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    first = load_nuisance_file(f"{selector_file}[0..2]{{0..4}}")
+    second = load_nuisance_file(f"{selector_file}{{0..4}}[0..2]")
+    assert first.shape == (5, 3)
+    np.testing.assert_allclose(first, second)
+
+
+def test_bracket_in_directory_name_is_not_a_selector(tmp_path):
+    """A path may contain brackets; only a TRAILING group is a selector.
+
+    The parser anchors to the end of the string for exactly this reason -- the
+    older rfind('[') approach would have eaten half of this path.
+    """
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    weird = tmp_path / "dir[weird]"
+    weird.mkdir()
+    np.savetxt(weird / "pcs.1D", np.arange(12, dtype=float).reshape(4, 3), fmt="%.1f")
+
+    assert load_nuisance_file(str(weird / "pcs.1D")).shape == (4, 3)
+    assert load_nuisance_file(f"{weird / 'pcs.1D'}[0..1]").shape == (4, 2)
+
+
+def test_selector_runs_before_the_row_count_check(selector_file):
+    """expected_rows must be compared against what the caller GETS.
+
+    Checking the file on disk instead would reject a valid ``{..}`` row
+    selection for having the wrong length.
+    """
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    assert load_nuisance_file(f"{selector_file}{{0..4}}", expected_rows=5).shape == (5, 10)
+    with pytest.raises(ValueError, match="rows"):
+        load_nuisance_file(f"{selector_file}{{0..4}}", expected_rows=20)
+
+
+@pytest.mark.parametrize(
+    "selector,message",
+    [("[0..99]", "column index"), ("{0..999}", "row index"), ("[-1]", "Negative column")],
+)
+def test_out_of_range_selector_names_the_axis(selector_file, selector, message):
+    """The error has to say column or row, not 'volume'."""
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+
+    with pytest.raises(ValueError, match=message):
+        load_nuisance_file(f"{selector_file}{selector}")
