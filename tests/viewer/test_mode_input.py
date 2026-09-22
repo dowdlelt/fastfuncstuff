@@ -302,3 +302,42 @@ def test_a_result_fitted_on_the_functional_draws_on_the_anatomical_grid(tmp_path
         assert image.rgba.shape[:2] == (18, 16)
     finally:
         s.close()
+
+
+def test_the_whole_gesture(tmp_path):
+    """Anat, run, fit, untick the run -- and the run is still all the way there.
+
+    The sequence this was all for: load an anatomical, load a functional, fit
+    something on the functional, then switch the functional off so the result
+    reads over the anatomy. What is switched off must remain loaded, graphable
+    and refittable; only the picture loses it.
+    """
+    rng = np.random.default_rng(17)
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 9, 7)) * 100)
+    _write(tmp_path, "bold.nii.gz", rng.random((8, 9, 7, 20)), tr=2.0)
+
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+        s.do(AddOverlay(str(tmp_path / "bold.nii.gz")))
+        run = next(ly for ly in s.state.layers if ly.n_volumes > 1)
+        s.do(SetMode("test_sum"))
+
+        anat, result = s.state.layers.layers[0], s.state.layers.layers[-1]
+        assert result.is_computed
+        # Installing the result took the run out of the picture by itself.
+        assert [ly.key for ly in s.state.layers.visible_layers()] == [anat.key, result.key]
+
+        # It is a layer, not a memory of one.
+        assert s.state.layers.find(run.key) is not None
+        assert run.key in [ly.key for ly in s.graph_layers()], "still graphable"
+        assert s.timeseries(run.key, (4, 4, 3)).shape == (20,), "still has its time course"
+        assert s.mode.source_layer().key == run.key, "still the input"
+
+        # And refitting reads it, with nothing switched back on to do so.
+        s.mode.invalidate()
+        s.refresh_mode()
+        assert [ly.key for ly in s.state.layers.visible_layers()] == [anat.key, result.key]
+        assert _output(s) == pytest.approx(_mean_of(s, run.key))
+    finally:
+        s.close()
