@@ -30,6 +30,10 @@ from fastfuncstuff.viewer.vocab import CloseView, SetViewGeometry
 
 #: Gap left between tiled windows, and around the edge of the work area.
 TILE_GAP = 6
+#: Candidate positions per axis when placing a window that has no remembered
+#: geometry. Six is fine enough to find a gap beside three image windows and
+#: coarse enough that the search is 36 rectangle intersections.
+PLACE_STEPS = 6
 
 #: Every kind of companion window. They share no base class on purpose -- what
 #: they have in common is the four methods the manager calls, not an ancestry.
@@ -83,6 +87,8 @@ class WindowManager(QtCore.QObject):
                 self.windows[vid] = win
                 if viewport.geometry is not None:
                     win.setGeometry(QtCore.QRect(*viewport.geometry))
+                else:
+                    self._place_new(win)
                 win.show()
             win.apply(viewport)
             if self.label:
@@ -273,6 +279,67 @@ class WindowManager(QtCore.QObject):
                 win.setGeometry(x, y, w, h)
                 mgr.record_geometry(win.vid, x, y, w, h)
                 win.raise_()
+        finally:
+            self._placing = False
+
+    def _place_new(self, win: Companion) -> None:
+        """Put a window that has no remembered place somewhere free.
+
+        Qt's default is to stack a new window over the last one, which for a
+        panel a mode opens by itself -- the HRF curve, arriving the moment
+        InstaGLM starts -- means it lands on top of the image window someone
+        is watching it against. The two are meant to be read together: moving
+        the HRF peak and seeing the map redraw is the point, and it cannot be
+        the point if one covers the other.
+
+        Least overlap rather than first fit, so a crowded screen still gets the
+        best of a bad set of choices instead of falling back to the corner.
+        """
+        area = self._work_area(self._parent)
+        # The window's own idea of its size, capped by the area. Every
+        # companion sets one in its constructor, and overriding that here
+        # would undo the choice the window made about itself.
+        w = min(win.width(), max(area.width() - 2 * TILE_GAP, 120))
+        h = min(win.height(), max(area.height() - 2 * TILE_GAP, 120))
+        taken = [
+            other.frameGeometry()
+            for other in self.windows.values()
+            if other is not win and other.isVisible()
+        ]
+
+        def slot(step: int, span: int, size: int, origin: int) -> int:
+            travel = max(span - size - 2 * TILE_GAP, 0)
+            return origin + TILE_GAP + round(step * travel / max(PLACE_STEPS - 1, 1))
+
+        best, best_cost = None, None
+        for row in range(PLACE_STEPS):
+            for col in range(PLACE_STEPS):
+                rect = QtCore.QRect(
+                    slot(col, area.width(), w, area.x()),
+                    slot(row, area.height(), h, area.y()),
+                    w,
+                    h,
+                )
+                cost = sum(
+                    r.width() * r.height()
+                    for r in (rect.intersected(t) for t in taken)
+                    if r.isValid()
+                )
+                # Ties go to the earliest candidate, which walks left to right
+                # and top to bottom -- the reading order of the screen.
+                if best_cost is None or cost < best_cost:
+                    best, best_cost = rect, cost
+                if best_cost == 0:
+                    break
+            if best_cost == 0:
+                break
+
+        if best is None:
+            return
+        self._placing = True
+        try:
+            win.setGeometry(best)
+            self.record_geometry(win.vid, best.x(), best.y(), best.width(), best.height())
         finally:
             self._placing = False
 

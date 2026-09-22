@@ -64,7 +64,9 @@ def _rows(panel):
 
 
 def test_controls_pack_across_a_row_until_the_budget_runs_out(qapp):
-    specs = [ChoiceControl(name=f"c{i}", label=f"c{i}", choices=("a",), span=THIRD) for i in range(4)]
+    specs = [
+        ChoiceControl(name=f"c{i}", label=f"c{i}", choices=("a",), span=THIRD) for i in range(4)
+    ]
     panel = _panel(qapp, specs, {})
     assert _rows(panel) == [["c0", "c1", "c2"], ["c3"]]
 

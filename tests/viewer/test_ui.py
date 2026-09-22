@@ -173,13 +173,18 @@ def test_a_repaint_does_not_write_back_into_the_recording(win, qapp):
 
 
 def test_tiling_gives_every_window_a_rectangle(win, qapp):
+    before = len(
+        [ln for ln in win.session.to_script().splitlines() if ln.startswith("SET_VIEW_GEOM")]
+    )
     win._tile()
     qapp.processEvents()
     rects = [v.geometry for v in win.session.state.viewports]
     assert all(r is not None for r in rects)
     # Recorded per window: collapsing on command type alone would leave one.
+    # Counted as a delta, because opening a window now records where it was
+    # put as well, and those lines are in the script before tiling runs.
     lines = [ln for ln in win.session.to_script().splitlines() if ln.startswith("SET_VIEW_GEOM")]
-    assert len(lines) == len(rects)
+    assert len(lines) - before == len(rects)
 
 
 def test_tiling_does_not_cover_the_controller(win, qapp):

@@ -126,3 +126,62 @@ def test_every_window_button_is_reachable_at_the_default_width(qapp, datadir):
     # And they wrapped rather than running off the side.
     assert max(b.x() + b.width() for b in buttons) <= win.width()
     win.close()
+
+
+# -- where a new window lands -----------------------------------------------
+
+
+def test_a_mode_panel_does_not_open_on_top_of_an_image(qapp, datadir, monkeypatch):
+    """The HRF curve and the map it redraws are meant to be read together, so
+    the one arriving must not cover the other. Qt's default is to stack."""
+    from PySide6 import QtCore
+
+    from fastfuncstuff.viewer.ui import manager as manager_mod
+
+    # Patched before the window exists: its image windows are built on the
+    # first refresh. The offscreen screen is 800x800, which cannot hold three
+    # image windows and a panel however they are arranged, and the placement
+    # is what is under test -- not whether a small screen has room.
+    monkeypatch.setattr(
+        manager_mod.WindowManager, "_work_area", lambda self, anchor: QtCore.QRect(0, 0, 2400, 1200)
+    )
+    win = _window(qapp, datadir)
+    win.session.do(SetUnderlay(str(datadir / "v0.nii.gz")))
+    _settle(win, qapp, Aspect.LAYERS | Aspect.VIEWPORTS)
+
+    win.session.do(SetMode("instaglm"))
+    win.refresh(win.session.open_mode_panels() | Aspect.VIEWPORTS)
+    for _ in range(4):
+        qapp.processEvents()
+
+    rects = {}
+    for viewport in win.session.state.viewports:
+        rects[viewport.id] = win.manager.windows[viewport.id].frameGeometry()
+    assert len(rects) >= 2
+
+    overlaps = [
+        (a, b)
+        for i, a in enumerate(rects)
+        for b in list(rects)[i + 1 :]
+        if rects[a].intersected(rects[b]).isValid()
+        and rects[a].intersected(rects[b]).width() > 0
+        and rects[a].intersected(rects[b]).height() > 0
+    ]
+    assert not overlaps, f"windows opened on top of each other: {overlaps}"
+    win.close()
+
+
+def test_a_remembered_geometry_still_wins(qapp, datadir):
+    """Placement is for windows that have never had one. A replayed session
+    must come back to the rectangles it recorded."""
+    from fastfuncstuff.viewer.viewports import ViewKind
+    from fastfuncstuff.viewer.vocab import SetViewGeometry
+
+    win = _window(qapp, datadir)
+    win.session.do(SetUnderlay(str(datadir / "v0.nii.gz")))
+    _settle(win, qapp, Aspect.LAYERS | Aspect.VIEWPORTS)
+    vid = win.session.open_view(ViewKind.GRAPH, win.session.state.viewports.images[0].plane)
+    win.session.do(SetViewGeometry(vid, 111, 222, 333, 444))
+    _settle(win, qapp, Aspect.VIEWPORTS)
+    assert win.manager.windows[vid].geometry().topLeft().toTuple() == (111, 222)
+    win.close()
