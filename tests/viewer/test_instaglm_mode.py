@@ -356,3 +356,136 @@ def test_dragging_the_hrf_peak_moves_the_curve_and_the_map(glm_session):
 
 def test_the_panel_is_named_so_a_window_opens_for_it(glm_session):
     assert _enter(glm_session).panel_names() == ("hrf",)
+
+
+# -- show, thresh and column ------------------------------------------------
+#
+# Colouring by one map and cutting on another is the ordinary GLM picture and
+# the one a single-volume overlay cannot draw. What is tested here is that the
+# two halves stay attached to the right things: the colour scale to what is
+# shown, the p-value and the slider's reach to what is cut on.
+
+
+def _layer(session):
+    layer = session.state.layers.find_by_source(SOURCE)
+    assert layer is not None, "the mode installed no overlay"
+    return layer
+
+
+def test_thresholding_on_a_different_map_installs_it_as_a_second_sub_brick(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    layer = _layer(glm_session)
+    assert layer.n_volumes == 2
+    assert layer.volume_index == 0 and layer.threshold_index == 1
+    assert layer.labels == ("faces beta", "faces t")
+    stored = glm_session.store.get(layer.key).array
+    np.testing.assert_allclose(stored[..., 0], mode._fit.volume("beta", column=0))
+    np.testing.assert_allclose(stored[..., 1], mode._fit.volume("t", column=0))
+
+
+def test_the_p_value_is_read_from_the_threshold_map_not_the_shown_one(glm_session):
+    """A beta carries no distribution. Offering a p for one would be inviting a
+    number that means nothing, and the whole point of the pair is that the t
+    beside it does carry one."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="same")
+    assert _layer(glm_session).stat_spec() is None
+
+    glm_session.set_mode_param("thresh", "t")
+    spec = _layer(glm_session).stat_spec()
+    assert spec is not None
+    name, dof = spec
+    assert name == "fitt"
+    assert dof == float(glm_session.mode._fit.dof)
+
+
+def test_the_threshold_slider_reaches_the_cut_map_not_the_coloured_one(glm_session):
+    """Colouring a beta of 0.3 and cutting on its t of 12: a slider spanning
+    the beta can never reach the t."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    layer = _layer(glm_session)
+    scale = glm_session.threshold_scale(layer.key)
+    stored = glm_session.store.get(layer.key).array
+    assert scale == pytest.approx(np.abs(stored[..., 1]).max())
+    assert scale != pytest.approx(np.abs(stored[..., 0]).max())
+
+
+def test_changing_only_the_threshold_map_does_not_refit(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, show="beta")
+    before = mode._fit
+    glm_session.set_mode_param("thresh", "t")
+    assert glm_session.mode._fit is before
+
+
+def test_going_back_to_same_drops_the_second_volume(glm_session):
+    """The layer is updated in place, so a stale threshold_index would cut on a
+    sub-brick that is no longer there."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    assert _layer(glm_session).n_volumes == 2
+    glm_session.set_mode_param("thresh", "same")
+    layer = _layer(glm_session)
+    assert layer.n_volumes == 1
+    assert layer.threshold_index is None
+    assert layer.stat_spec() is None
+
+
+def test_both_maps_follow_one_column_picker(glm_session):
+    mode = _enter(
+        glm_session, events=glm_session.events, show="beta", thresh="t", column="Pol#1"
+    )
+    stored = glm_session.store.get(_layer(glm_session).key).array
+    k = mode._fit.model.index_of("Pol#1")
+    np.testing.assert_allclose(stored[..., 0], mode._fit.volume("beta", column=k))
+    np.testing.assert_allclose(stored[..., 1], mode._fit.volume("t", column=k))
+
+
+def test_moving_the_threshold_map_rescales_but_a_refit_does_not(glm_session):
+    """A threshold set on an R2 means nothing on a t. A refit of the same pair
+    leaves it alone, because holding a threshold while the design moves is the
+    gesture the mode exists for."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    glm_session.state.layers.update(_layer(glm_session).key, threshold=7.5)
+
+    glm_session.set_mode_param("polort", "3")
+    assert _layer(glm_session).threshold == pytest.approx(7.5)
+
+    glm_session.set_mode_param("thresh", "R2")
+    assert _layer(glm_session).threshold == pytest.approx(0.05)
+
+
+# -- several ortvecs, ticked and unticked -----------------------------------
+
+
+def _ortvec(session, name, n_columns, seed=0):
+    path = session.tmp / name
+    np.savetxt(path, np.random.default_rng(seed).normal(size=(N_TIME, n_columns)))
+    return str(path)
+
+
+def test_several_ortvec_files_are_fitted_side_by_side(glm_session):
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    b = _ortvec(glm_session, "physio.1D", 2, seed=2)
+    mode = _enter(glm_session, ortvec=f"+{a}|+{b}")
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 5
+    # Named for their file, since two motion estimates in one model are
+    # otherwise two sets of columns called the same thing.
+    assert any(lab.startswith("motion:") for lab in mode._fit.model.labels)
+    assert any(lab.startswith("physio:") for lab in mode._fit.model.labels)
+
+
+def test_unticking_a_file_drops_its_columns_without_forgetting_it(glm_session):
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    b = _ortvec(glm_session, "physio.1D", 2, seed=2)
+    _enter(glm_session, ortvec=f"+{a}|+{b}")
+    glm_session.set_mode_param("ortvec", f"+{a}|-{b}")
+    mode = glm_session.mode
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
+    # Still in the parameter, so ticking it back is one click and not a retype.
+    assert b in str(mode.params["ortvec"])
+
+
+def test_a_single_unprefixed_path_still_works(glm_session):
+    """What a script written before the list existed passes, and what someone
+    types by hand."""
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    mode = _enter(glm_session, ortvec=a)
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
