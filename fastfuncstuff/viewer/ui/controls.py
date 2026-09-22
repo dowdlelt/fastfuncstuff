@@ -5,6 +5,21 @@ mode contributes UI code, which is the property that makes calc, GLM and ICA
 cheap to add: a new mode is one file describing what it needs, not a file plus a
 panel plus a wiring change.
 
+Three things the layout does that a plain form does not, all of them because
+InstaGLM has fourteen parameters and a form of fourteen full-width rows is a
+scroll bar rather than a panel:
+
+* **Spans.** A control asks for a fraction of a row and they pack left to
+  right. Three pickers on one line beat three lines of one picker each, and a
+  drop-down given the whole width of a panel is mostly whitespace.
+* **Conditional visibility.** ``visible_when`` hides a control whose owning
+  choice is not selected, *keeping its space*, so a library index does not sit
+  there inviting a click while the HRF is set to custom -- and revealing it
+  does not shove the rest of the panel down a row.
+* **Stable widgets.** A rebuild with the same declarations reuses the widgets
+  instead of deleting them. The panel is rebuilt on every refit, and a list
+  someone is part-way through editing must not vanish underneath them.
+
 Changes are debounced. An InstaCorr parameter that alters preparation costs
 ~600 ms to apply, and a slider drag emits a value per pixel, so applying every
 one would queue a minute of work to answer a gesture that took a second.
@@ -17,6 +32,7 @@ from collections.abc import Callable, Sequence
 from PySide6 import QtCore, QtWidgets
 
 from fastfuncstuff.viewer.modes.base import (
+    ROW_UNITS,
     ActionControl,
     BoolControl,
     ChoiceControl,
@@ -25,6 +41,7 @@ from fastfuncstuff.viewer.modes.base import (
     IntControl,
     OptionalFloatControl,
     PathControl,
+    PathListControl,
 )
 
 #: How long to wait after the last change before applying it. Long enough to
@@ -33,6 +50,42 @@ DEBOUNCE_MS = 250
 
 #: Sliders are integers, so a float control is quantised into this many steps.
 FLOAT_TICKS = 1000
+
+#: Rows a path list shows before it scrolls. Three is enough to see that there
+#: is more than one and short enough that the list is not the panel.
+PATH_LIST_ROWS = 3
+
+
+def _decimals(step: float) -> int:
+    """Enough decimal places to type the declared step, and no more.
+
+    A spin box with two decimals cannot express a step of 0.005, and one with
+    six turns 0.25 into ``0.250000``. Both make the number harder to read than
+    the slider it is standing next to.
+    """
+    for places in range(7):
+        if abs(round(step, places) - step) < 1e-12 and round(step, places) != 0:
+            return places
+    return 3
+
+
+class _Cell(QtWidgets.QWidget):
+    """One control's label and widget, sized so hiding it keeps its place."""
+
+    def __init__(self, label: str, body: QtWidgets.QWidget) -> None:
+        super().__init__()
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        self.caption = QtWidgets.QLabel(label.upper())
+        h.addWidget(self.caption)
+        h.addWidget(body, 1)
+        policy = self.sizePolicy()
+        # The whole reason a hidden control still costs a row: without this the
+        # panel reflows every time an HRF choice changes and every control
+        # below it moves under the pointer that is about to click one.
+        policy.setRetainSizeWhenHidden(True)
+        self.setSizePolicy(policy)
 
 
 class ControlPanel(QtWidgets.QWidget):
@@ -45,11 +98,17 @@ class ControlPanel(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self._form = QtWidgets.QFormLayout(self)
-        self._form.setContentsMargins(0, 0, 0, 0)
-        self._form.setSpacing(6)
+        self._rows = QtWidgets.QVBoxLayout(self)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.setSpacing(6)
         self._widgets: dict[str, QtWidgets.QWidget] = {}
+        self._cells: dict[str, _Cell] = {}
+        self._setters: dict[str, Callable[[object], None]] = {}
+        self._specs: tuple[Control, ...] = ()
+        self._actions: tuple[ActionControl, ...] = ()
+        self._values: dict[str, object] = {}
         self._pending: dict[str, str] = {}
+        self._syncing = False
         self._timer = QtCore.QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(DEBOUNCE_MS)
@@ -62,33 +121,61 @@ class ControlPanel(QtWidgets.QWidget):
         values: dict[str, object],
         actions: Sequence[ActionControl] = (),
     ) -> None:
-        """Replace the panel with widgets for ``controls``."""
-        while self._form.count():
-            item = self._form.takeAt(0)
+        """Build widgets for ``controls``, or refresh them if they are already up.
+
+        The declarations are compared first. A mode's controls are static apart
+        from the choice lists that follow a refit, so the common rebuild is a
+        no-op that must not be paid for by destroying widgets: a path list
+        mid-edit, a spin box with the caret in it and a slider under the thumb
+        all die with the panel.
+        """
+        controls = tuple(controls)
+        actions = tuple(actions)
+        if controls == self._specs and actions == self._actions and self._widgets:
+            self.sync_values(values)
+            return
+
+        while self._rows.count():
+            item = self._rows.takeAt(0)
             if item is None:
                 break
             w = item.widget()
             if w is not None:
                 w.deleteLater()
         self._widgets.clear()
+        self._cells.clear()
+        self._setters.clear()
         self._pending.clear()
+        self._specs, self._actions = controls, actions
+        self._values = dict(values)
 
+        row, used = self._new_row(), 0
         for spec in controls:
-            widget, label = self._build(spec, values.get(spec.name))
-            if widget is None:
+            body = self._build(spec, values.get(spec.name))
+            if body is None:
                 continue
+            span = max(1, min(int(spec.span), ROW_UNITS))
+            if spec.newline or used + span > ROW_UNITS:
+                if used:
+                    row, used = self._new_row(), 0
+            cell = _Cell(spec.label, body)
             if spec.help:
-                widget.setToolTip(spec.help)
-            self._widgets[spec.name] = widget
-            self._form.addRow(label, widget)
+                cell.setToolTip(spec.help)
+                body.setToolTip(spec.help)
+            self._widgets[spec.name] = body
+            self._cells[spec.name] = cell
+            row.layout().addWidget(cell, span)
+            used += span
+        if used and used < ROW_UNITS:
+            row.layout().addStretch(ROW_UNITS - used)
 
         if actions:
             # A grid of three, not one row: ICA declares seven buttons, and a
             # row that long made the whole panel wider than its window.
-            row = QtWidgets.QWidget()
-            h = QtWidgets.QGridLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
+            holder = QtWidgets.QWidget()
+            g = QtWidgets.QGridLayout(holder)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setSpacing(4)
             for position, spec in enumerate(actions):
                 button = QtWidgets.QPushButton(spec.label.upper())
                 button.setToolTip(spec.help)
@@ -98,109 +185,325 @@ class ControlPanel(QtWidgets.QWidget):
                     lambda _=False, n=spec.name: (self.flush_now(), self.action_requested.emit(n))
                 )
                 button.setMinimumWidth(10)
-                h.addWidget(button, *divmod(position, 3))
+                g.addWidget(button, *divmod(position, 3))
                 self._widgets[f"action:{spec.name}"] = button
-            self._form.addRow(row)
+            self._rows.addWidget(holder)
 
-    def _build(
-        self, spec: Control, value: object
-    ) -> tuple[QtWidgets.QWidget | None, QtWidgets.QWidget]:
-        label = QtWidgets.QLabel(spec.label.upper())
+        self.apply_visibility()
 
+    def _new_row(self) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        self._rows.addWidget(row)
+        return row
+
+    # -- visibility ----------------------------------------------------
+    def apply_visibility(self) -> None:
+        """Show or hide each ``visible_when`` control against current values."""
+        for spec in self._specs:
+            cell = self._cells.get(spec.name)
+            if cell is None or spec.visible_when is None:
+                continue
+            other, wanted = spec.visible_when
+            cell.setVisible(str(self._values.get(other, "")) in wanted)
+
+    def sync_values(self, values: dict[str, object]) -> None:
+        """Write state back into widgets that are not being typed into.
+
+        Focus is the whole guard. A refresh lands while the pointer is on a
+        slider and the caret is in a spin box, and overwriting either is how a
+        control ends up fighting the person using it.
+        """
+        self._syncing = True
+        try:
+            focus = QtWidgets.QApplication.focusWidget()
+            for name, setter in self._setters.items():
+                if name not in values or name in self._pending:
+                    continue
+                widget = self._widgets.get(name)
+                if focus is not None and widget is not None:
+                    if widget is focus or widget.isAncestorOf(focus):
+                        continue
+                setter(values[name])
+            self._values.update(values)
+        finally:
+            self._syncing = False
+        self.apply_visibility()
+
+    # -- widgets -------------------------------------------------------
+    def _build(self, spec: Control, value: object) -> QtWidgets.QWidget | None:
         if isinstance(spec, BoolControl):
-            box = QtWidgets.QCheckBox()
-            box.setChecked(bool(value if value is not None else spec.default))
-            box.toggled.connect(lambda on, n=spec.name: self._queue(n, "1" if on else "0"))
-            return box, label
-
+            return self._build_bool(spec, value)
+        if isinstance(spec, PathListControl):
+            return self._build_path_list(spec, value)
         if isinstance(spec, PathControl):
-            row = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            edit = QtWidgets.QLineEdit(str(value if value is not None else spec.default))
-            edit.setPlaceholderText("none")
-            edit.setMinimumWidth(40)
-            # Show the end of a long path -- the folder name -- not its root.
-            edit.setCursorPosition(len(edit.text()))
-            # On enter or focus-out, not per keystroke: a half-typed path is not
-            # a parameter.
-            edit.editingFinished.connect(
-                lambda n=spec.name, e=edit: self._queue(n, e.text().strip(), now=True)
-            )
-            browse = QtWidgets.QPushButton("…")
-            browse.setMaximumWidth(34)
-
-            def pick(_=False, n=spec.name, e=edit, flt=spec.filter, folder=spec.directory) -> None:
-                if folder:
-                    path = QtWidgets.QFileDialog.getExistingDirectory(self, spec.label, e.text())
-                else:
-                    path, _ = QtWidgets.QFileDialog.getOpenFileName(self, spec.label, e.text(), flt)
-                if path:
-                    e.setText(path)
-                    self._queue(n, path, now=True)
-
-            browse.clicked.connect(pick)
-            h.addWidget(edit, 1)
-            h.addWidget(browse)
-            return row, label
-
+            return self._build_path(spec, value)
         if isinstance(spec, ChoiceControl):
-            combo = QtWidgets.QComboBox()
-            combo.addItems(list(spec.choices))
-            combo.setCurrentText(str(value if value is not None else spec.default))
-            combo.activated.connect(
-                lambda _, n=spec.name, c=combo: self._queue(n, c.currentText(), now=True)
-            )
-            return combo, label
-
+            if spec.style == "radio":
+                return self._build_radio(spec, value)
+            return self._build_choice(spec, value)
         if isinstance(spec, IntControl):
-            box = QtWidgets.QSpinBox()
-            box.setRange(spec.lo, spec.hi)
-            box.setValue(int(value if value is not None else spec.default))
-            box.valueChanged.connect(lambda v, n=spec.name: self._queue(n, str(int(v))))
-            return box, label
-
+            return self._build_int(spec, value)
         if isinstance(spec, OptionalFloatControl):
-            return self._build_optional_float(spec, value), label
-
+            return self._build_optional_float(spec, value)
         if isinstance(spec, FloatControl):
-            row = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
-            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            slider.setRange(0, FLOAT_TICKS)
-            readout = QtWidgets.QLabel()
-            readout.setObjectName("value")
-            readout.setMinimumWidth(52)
+            return self._build_float(spec, value)
+        return None
 
-            current = float(value if value is not None else spec.default)
-            span = (spec.hi - spec.lo) or 1.0
+    def _build_bool(self, spec: BoolControl, value: object) -> QtWidgets.QWidget:
+        box = QtWidgets.QCheckBox()
+        box.setChecked(bool(value if value is not None else spec.default))
+        box.toggled.connect(lambda on, n=spec.name: self._queue(n, "1" if on else "0", now=True))
+        self._setters[spec.name] = lambda v, b=box: b.setChecked(bool(v))
+        return box
 
-            def to_tick(v: float) -> int:
-                return int(round((v - spec.lo) / span * FLOAT_TICKS))
+    def _build_path(self, spec: PathControl, value: object) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        edit = QtWidgets.QLineEdit(str(value if value is not None else spec.default))
+        edit.setPlaceholderText("none")
+        edit.setMinimumWidth(40)
+        # Show the end of a long path -- the folder name -- not its root.
+        edit.setCursorPosition(len(edit.text()))
+        # On enter or focus-out, not per keystroke: a half-typed path is not
+        # a parameter.
+        edit.editingFinished.connect(
+            lambda n=spec.name, e=edit: self._queue(n, e.text().strip(), now=True)
+        )
+        browse = QtWidgets.QPushButton("…")
+        browse.setMaximumWidth(34)
 
-            def to_value(t: int) -> float:
-                raw = spec.lo + (t / FLOAT_TICKS) * span
-                # Snap to the declared step so the readout shows 0.05, not
-                # 0.04999999999999999.
-                return round(raw / spec.step) * spec.step if spec.step else raw
+        def pick(_=False, n=spec.name, e=edit, flt=spec.filter, folder=spec.directory) -> None:
+            if folder:
+                path = QtWidgets.QFileDialog.getExistingDirectory(self, spec.label, e.text())
+            else:
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, spec.label, e.text(), flt)
+            if path:
+                e.setText(path)
+                self._queue(n, path, now=True)
 
-            slider.setValue(to_tick(current))
-            readout.setText(f"{current:g}{spec.unit}")
+        browse.clicked.connect(pick)
+        h.addWidget(edit, 1)
+        h.addWidget(browse)
+        self._setters[spec.name] = lambda v, e=edit: e.setText(str(v or ""))
+        return row
 
-            def on_move(t: int, n=spec.name, r=readout, u=spec.unit) -> None:
-                v = to_value(t)
-                r.setText(f"{v:g}{u}")
-                self._queue(n, repr(float(v)))
+    def _build_path_list(self, spec: PathListControl, value: object) -> QtWidgets.QWidget:
+        """A ticked list of files, with add and remove beside it.
 
-            slider.valueChanged.connect(on_move)
-            h.addWidget(slider, 1)
-            h.addWidget(readout)
-            return row, label
+        Unticking rather than deleting is the feature. "What does this file buy
+        me" is a question you ask of each of them in turn and then of the pair,
+        and the answer is only cheap if putting one back is one click.
+        """
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
 
-        return None, label
+        listing = QtWidgets.QListWidget()
+        listing.setAlternatingRowColors(True)
+        listing.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        listing.setUniformItemSizes(True)
+        listing.setMinimumWidth(80)
+
+        def fit_height() -> None:
+            step = listing.sizeHintForRow(0) if listing.count() else 18
+            rows = max(1, min(listing.count() or 1, PATH_LIST_ROWS))
+            listing.setFixedHeight(rows * max(step, 14) + 2 * listing.frameWidth() + 2)
+
+        def fill(entries) -> None:
+            listing.blockSignals(True)
+            listing.clear()
+            for path, on in entries:
+                item = QtWidgets.QListWidgetItem(path.rsplit("/", 1)[-1])
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+                item.setToolTip(path)
+                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    QtCore.Qt.CheckState.Checked if on else QtCore.Qt.CheckState.Unchecked
+                )
+                listing.addItem(item)
+            listing.blockSignals(False)
+            fit_height()
+
+        def entries() -> list[tuple[str, bool]]:
+            out = []
+            for i in range(listing.count()):
+                item = listing.item(i)
+                out.append(
+                    (
+                        str(item.data(QtCore.Qt.ItemDataRole.UserRole)),
+                        item.checkState() is QtCore.Qt.CheckState.Checked,
+                    )
+                )
+            return out
+
+        def commit() -> None:
+            if self._syncing:
+                return
+            self._queue(spec.name, PathListControl.encode(entries()), now=True)
+
+        def add(_=False) -> None:
+            paths, _flt = QtWidgets.QFileDialog.getOpenFileNames(self, spec.label, "", spec.filter)
+            if not paths:
+                return
+            have = {p for p, _ in entries()}
+            fill(entries() + [(p, True) for p in paths if p not in have])
+            commit()
+
+        def drop(_=False) -> None:
+            chosen = {listing.row(i) for i in listing.selectedItems()}
+            if not chosen:
+                return
+            fill([e for i, e in enumerate(entries()) if i not in chosen])
+            commit()
+
+        listing.itemChanged.connect(lambda _item: commit())
+
+        buttons = QtWidgets.QVBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(2)
+        for text, slot, tip in (
+            ("+", add, "Add one or more files."),
+            ("−", drop, "Remove the selected files. Untick instead to keep them handy."),
+        ):
+            button = QtWidgets.QPushButton(text)
+            button.setFixedWidth(24)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+
+        fill(PathListControl.parse(value if value is not None else spec.default))
+        h.addWidget(listing, 1)
+        h.addLayout(buttons)
+        self._setters[spec.name] = lambda v: fill(PathListControl.parse(v))
+        return row
+
+    def _build_choice(self, spec: ChoiceControl, value: object) -> QtWidgets.QWidget:
+        combo = QtWidgets.QComboBox()
+        combo.addItems(list(spec.choices))
+        combo.setCurrentText(str(value if value is not None else spec.default))
+        # Wide enough for its longest choice and no wider. A picker stretched
+        # across a panel says nothing extra and crowds out the one beside it.
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        combo.setMinimumContentsLength(6)
+        combo.activated.connect(
+            lambda _, n=spec.name, c=combo: self._queue(n, c.currentText(), now=True)
+        )
+        self._setters[spec.name] = lambda v, c=combo: c.setCurrentText(str(v))
+        return combo
+
+    def _build_radio(self, spec: ChoiceControl, value: object) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        group = QtWidgets.QButtonGroup(row)
+        current = str(value if value is not None else spec.default)
+        for choice in spec.choices:
+            button = QtWidgets.QRadioButton(choice)
+            button.setChecked(choice == current)
+            group.addButton(button)
+            button.toggled.connect(
+                lambda on, n=spec.name, c=choice: on and self._queue(n, c, now=True)
+            )
+            h.addWidget(button)
+        h.addStretch(1)
+
+        def put(v: object) -> None:
+            for button in group.buttons():
+                button.setChecked(button.text() == str(v))
+
+        self._setters[spec.name] = put
+        return row
+
+    def _build_int(self, spec: IntControl, value: object) -> QtWidgets.QWidget:
+        box = QtWidgets.QSpinBox()
+        box.setRange(spec.lo, spec.hi)
+        box.setValue(int(value if value is not None else spec.default))
+        box.setKeyboardTracking(False)
+        box.valueChanged.connect(lambda v, n=spec.name: self._queue(n, str(int(v))))
+        self._setters[spec.name] = lambda v, b=box: b.setValue(int(v))
+        return box
+
+    def _build_float(self, spec: FloatControl, value: object) -> QtWidgets.QWidget:
+        """A slider for the gesture, a spin box for the number.
+
+        Both, because they answer different questions. Dragging is how you find
+        out what the parameter *does*; typing is how you say what it should be,
+        and a read-only label can only ever do the first.
+        """
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, FLOAT_TICKS)
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setObjectName("value")
+        spin.setRange(spec.lo, spec.hi)
+        spin.setSingleStep(spec.step or 0.01)
+        spin.setDecimals(_decimals(spec.step or 0.01))
+        spin.setSuffix(spec.unit)
+        # Otherwise every digit typed on the way to 10 is a parameter: 1, then
+        # 10, and on a refitting mode the 1 costs a fit nobody asked for.
+        spin.setKeyboardTracking(False)
+        spin.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+
+        current = float(value if value is not None else spec.default)
+        span = (spec.hi - spec.lo) or 1.0
+        guard = {"on": False}
+
+        def to_tick(v: float) -> int:
+            return int(round((v - spec.lo) / span * FLOAT_TICKS))
+
+        def to_value(t: int) -> float:
+            raw = spec.lo + (t / FLOAT_TICKS) * span
+            # Snap to the declared step so the readout shows 0.05, not
+            # 0.04999999999999999.
+            return round(raw / spec.step) * spec.step if spec.step else raw
+
+        slider.setValue(to_tick(current))
+        spin.setValue(current)
+
+        def on_move(t: int, n=spec.name) -> None:
+            if guard["on"]:
+                return
+            v = to_value(t)
+            guard["on"] = True
+            spin.setValue(v)
+            guard["on"] = False
+            self._queue(n, repr(float(v)))
+
+        def on_type(v: float, n=spec.name) -> None:
+            if guard["on"]:
+                return
+            guard["on"] = True
+            slider.setValue(to_tick(v))
+            guard["on"] = False
+            self._queue(n, repr(float(v)), now=True)
+
+        slider.valueChanged.connect(on_move)
+        spin.valueChanged.connect(on_type)
+        h.addWidget(slider, 1)
+        h.addWidget(spin)
+
+        def put(v: object) -> None:
+            guard["on"] = True
+            spin.setValue(float(v))
+            slider.setValue(to_tick(float(v)))
+            guard["on"] = False
+
+        self._setters[spec.name] = put
+        return row
 
     def _build_optional_float(self, spec: OptionalFloatControl, value: object) -> QtWidgets.QWidget:
         """A checkbox beside a slider, faded when off.
@@ -261,11 +564,32 @@ class ControlPanel(QtWidgets.QWidget):
         h.addWidget(check)
         h.addWidget(slider, 1)
         h.addWidget(readout)
+
+        def put(v: object) -> None:
+            val = float(v)
+            enabled = val != spec.off_value
+            check.blockSignals(True)
+            check.setChecked(enabled)
+            check.blockSignals(False)
+            if enabled:
+                slider.blockSignals(True)
+                slider.setValue(to_tick(val))
+                slider.blockSignals(False)
+            paint(enabled, val)
+
+        self._setters[spec.name] = put
         return row
 
     # -- debounce ------------------------------------------------------
     def _queue(self, name: str, value: str, *, now: bool = False) -> None:
+        if self._syncing:
+            return
         self._pending[name] = value
+        # Before the debounce, not after it: a control that reveals another one
+        # must reveal it on the click, not a quarter second later once the
+        # refit it also triggered has come back.
+        self._values[name] = value
+        self.apply_visibility()
         if now:
             self._flush()
         else:

@@ -63,6 +63,13 @@ class OverlayKind(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+#: Width units in one row of a control panel. Six so that halves and thirds
+#: both divide it, which is the whole vocabulary a parameter form needs: a
+#: path wants the row, three pickers share it, two spinners split it.
+ROW_UNITS = 6
+FULL, HALF, THIRD = 6, 3, 2
+
+
 @dataclass(frozen=True)
 class Control:
     """Base for a mode parameter the UI should offer."""
@@ -70,6 +77,21 @@ class Control:
     name: str
     label: str
     help: str = ""
+    #: How much of a row this control asks for, out of :data:`ROW_UNITS`.
+    #: Controls are packed left to right and wrap when the budget runs out.
+    #: The default is the whole row, because that is what every control did
+    #: before spans existed and a mode that has not thought about layout
+    #: should not get a surprising one.
+    span: int = FULL
+    #: Start a new row even if this control would have fitted on the last.
+    #: Grouping is meaning, not just width: ``show`` / ``thresh`` / ``column``
+    #: are one thought and belong together on a line of their own.
+    newline: bool = False
+    #: ``(other parameter, values that reveal this one)``. Hidden otherwise --
+    #: but the space is kept, so revealing a control does not shove the rest of
+    #: the panel down. A library index beside an HRF set to 'custom' is a knob
+    #: that does nothing, and a knob that does nothing is worse than no knob.
+    visible_when: tuple[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +131,12 @@ class IntControl(Control):
 class ChoiceControl(Control):
     choices: tuple[str, ...] = ()
     default: str = ""
+    #: ``"combo"`` for a drop-down, ``"radio"`` for the choices side by side.
+    #: Radio for a short, stable set whose options are worth reading without a
+    #: click -- two units, three colour rules. A drop-down hides how many
+    #: choices there are and costs a click to find out, which is the wrong
+    #: trade for a set of two.
+    style: str = "combo"
 
 
 @dataclass(frozen=True)
@@ -125,6 +153,54 @@ class PathControl(Control):
     filter: str = "All (*)"
     #: Browse for a folder rather than a file.
     directory: bool = False
+
+
+#: Separates entries in a :class:`PathListControl` value. A parameter has to
+#: survive being written down as one string -- that is what makes it
+#: replayable through ``SET_MODE_PARAM`` -- so the list is encoded rather than
+#: held as a list. Each entry is ``+path`` or ``-path``, ticked or not.
+PATH_LIST_SEP = "|"
+
+
+@dataclass(frozen=True)
+class PathListControl(Control):
+    """Several files, each of which can be ticked off without being removed.
+
+    The point is the comparison. One motion file, one respiration trace, one
+    set of physio regressors: the question is never "which of these do I want"
+    but "what does each of them do to the map", and answering it by deleting a
+    path and typing it back in is answering it badly. Unticking keeps the entry
+    where it is, so the next fit is one click away and the click is reversible.
+    """
+
+    default: str = ""
+    filter: str = "All (*)"
+
+    @staticmethod
+    def parse(value: object) -> list[tuple[str, bool]]:
+        """``"+a.1D|-b.1D"`` to ``[("a.1D", True), ("b.1D", False)]``."""
+        out: list[tuple[str, bool]] = []
+        for entry in str(value or "").split(PATH_LIST_SEP):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if entry[0] in "+-":
+                out.append((entry[1:], entry[0] == "+"))
+            else:
+                # An unprefixed path is one a person typed or a script wrote
+                # by hand. Taking it as enabled is the reading that does what
+                # they meant.
+                out.append((entry, True))
+        return out
+
+    @staticmethod
+    def encode(entries: Sequence[tuple[str, bool]]) -> str:
+        return PATH_LIST_SEP.join(f"{'+' if on else '-'}{p}" for p, on in entries if p)
+
+    @staticmethod
+    def enabled(value: object) -> list[str]:
+        """Just the ticked paths, in order -- what a mode actually reads."""
+        return [p for p, on in PathListControl.parse(value) if on]
 
 
 @dataclass(frozen=True)
@@ -182,6 +258,20 @@ class ComputedOverlay:
     colormap: str = "redblue"
     display_range: tuple[float, float] | None = None
     threshold: float | None = None
+    #: A second volume to cut on, when what you want to *see* and what you
+    #: want to *believe* are different numbers. That is the ordinary case for
+    #: a GLM -- colour by effect size, threshold on the t -- and the layer
+    #: stack already knows how to do it for a stats bucket read off disk, so a
+    #: mode says which volume is which and everything downstream follows:
+    #: the colour bar scales the shown one, the p spinner reads the cut one.
+    threshold_values: np.ndarray | None = None
+    #: What the two volumes are called, once there are two of them to tell
+    #: apart -- ``("Faces beta", "Faces t")``.
+    volume_labels: tuple[str, ...] = ()
+    #: ``("fitt", dof)`` for the threshold volume, in the same shape
+    #: :meth:`Layer.stat_spec` returns, so a computed t map earns the p
+    #: spinner a loaded one gets. ``None`` when the cut is on a plain value.
+    threshold_stat: tuple[str, float | tuple[float, float] | None] | None = None
     #: Whether this output means something different from the last one, so the
     #: colour scale must follow it. Off by default, because the usual update is
     #: the *same* quantity recomputed -- the next seed, the next component --
@@ -460,6 +550,12 @@ __all__ = [
     "Mode",
     "OptionalFloatControl",
     "PathControl",
+    "PathListControl",
+    "PATH_LIST_SEP",
+    "ROW_UNITS",
+    "FULL",
+    "HALF",
+    "THIRD",
     "ActionControl",
     "ProgressFn",
     "ModeRegistry",

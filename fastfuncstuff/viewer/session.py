@@ -117,6 +117,46 @@ def _brick_name(layer: Layer, index: int) -> str:
     return f"#{index} " if layer.n_volumes > 1 and not layer.time_linked else ""
 
 
+def _overlay_array(overlay: ComputedOverlay) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """A mode's output as the ``(nx, ny, nz, nv)`` block the store adopts.
+
+    Two volumes when the mode wants to colour one thing and cut on another,
+    stacked shown-first so that ``volume_index`` 0 and ``threshold_index`` 1
+    are the same convention a stats bucket off disk already uses.
+    """
+    values = np.asarray(overlay.values, dtype=np.float32)
+    nx, ny, nz = (int(v) for v in values.shape[:3])
+    shape = (nx, ny, nz)
+    if overlay.threshold_values is None:
+        return values[..., None], shape
+    cut = np.asarray(overlay.threshold_values, dtype=np.float32)
+    if cut.shape[:3] != shape:
+        raise ValueError(f"threshold volume {cut.shape[:3]} does not match the overlay {shape}")
+    return np.stack([values, cut], axis=3), shape
+
+
+def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
+    """Layer fields that say where this overlay's threshold reads from."""
+    if overlay.threshold_values is None:
+        # Back to cutting on what is shown. Said explicitly because a layer
+        # that was two volumes a moment ago still points at sub-brick 1.
+        return {"threshold_index": None, "threshold_follow": "same", "stataux": {}}
+    stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
+    if overlay.threshold_stat is not None:
+        from fastfuncstuff.io.afni import stat_type_to_stataux
+
+        name, params = overlay.threshold_stat
+        flat = () if params is None else (params if isinstance(params, tuple) else (params,))
+        try:
+            stataux[1] = stat_type_to_stataux(name, flat)
+        except ValueError:
+            stataux = {}
+    # ``fixed``, not ``next``: the threshold brick is where the mode put it,
+    # and the shown brick never moves off 0, so following would be a rule
+    # describing something that cannot happen.
+    return {"threshold_index": 1, "threshold_follow": "fixed", "stataux": stataux}
+
+
 def _short(name: str, limit: int = 24) -> str:
     for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
         name = name.removesuffix(ext)
@@ -1046,10 +1086,12 @@ class ViewerSession:
         """
         existing = self.state.layers.find_by_source(source)
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
-        self.store.adopt(key, overlay.values, name=overlay.name)
+        array, shape_of = _overlay_array(overlay)
+        self.store.adopt(key, array, name=overlay.name)
         self.invalidate(key)
 
         lo, hi = overlay.display_range or derive_range(overlay.values)
+        cut = _overlay_cut(overlay)
         if existing is not None:
             # The name is identity -- showing "IC 0" while displaying IC 4 is a
             # lie. Range and threshold deliberately do NOT follow: stepping
@@ -1060,6 +1102,18 @@ class ViewerSession:
             changes: dict[str, object] = {}
             if existing.name != overlay.name:
                 changes["name"] = overlay.name
+            # The shape of the output can change under one layer: ticking a
+            # threshold map on turns a one-volume overlay into two. Restated
+            # every time rather than only on creation, because a layer left
+            # claiming one volume while the store holds two thresholds on a
+            # brick that is no longer there.
+            changes.update(
+                n_volumes=int(array.shape[3]),
+                shape=shape_of,
+                labels=overlay.volume_labels,
+                volume_index=0,
+                **cut,
+            )
             if overlay.rescale:
                 changes.update(
                     colormap=overlay.colormap,
@@ -1075,14 +1129,16 @@ class ViewerSession:
                     key=key,
                     name=overlay.name,
                     path=f"<{overlay.name}>",
-                    shape=tuple(int(v) for v in overlay.values.shape[:3]),
-                    n_volumes=1,
+                    shape=shape_of,
+                    n_volumes=int(array.shape[3]),
+                    labels=overlay.volume_labels,
                     affine=np.asarray(overlay.affine, dtype=float),
                     colormap=overlay.colormap,
                     range_lo=lo,
                     range_hi=hi,
                     threshold=overlay.threshold or 0.0,
                     source=source,
+                    **cut,
                 )
             )
         return key
