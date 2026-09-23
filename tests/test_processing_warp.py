@@ -997,6 +997,37 @@ class TestPatchWriteBackDedup:
                 device=torch.device("cpu"),
             )
 
+    def test_level_zero_rollback_preserves_initial_warp(self, monkeypatch):
+        """The global pass must not discard a better optiwarp/iniwarp hand-off."""
+        import fastfuncstuff.processing.warp as warp_mod
+
+        base = torch.rand(12, 12, 12) + 0.1
+        zero = torch.zeros_like(base)
+
+        def worsen(*args, **kwargs):
+            state = args[4]
+            state.xd = torch.full_like(state.xd, 4.0)
+            state.warped_source = torch.zeros_like(state.warped_source)
+
+        monkeypatch.setattr(warp_mod, "_improve_warp_batched", worsen)
+        _, xd, yd, zd = warp_mod.qwarp(
+            base,
+            base.clone(),
+            initial_warp=(zero, zero, zero),
+            config=QwarpConfig(
+                max_level=0,
+                reject_worse_levels=True,
+                batch_optimizer_iters_lev0=1,
+                verb=0,
+            ),
+            device=torch.device("cpu"),
+            pad=False,
+        )
+
+        torch.testing.assert_close(xd, zero)
+        torch.testing.assert_close(yd, zero)
+        torch.testing.assert_close(zd, zero)
+
     # ---------------------------------------------------------------------------
     # WarpState mutation patterns
     # ---------------------------------------------------------------------------

@@ -1218,6 +1218,8 @@ def _warpomatic(
     # --- Level 0: global warp (single patch) ---
     if config.start_level == 0:
         first_cost = state.cost
+        if config.reject_worse_levels:
+            saved_xd, saved_yd, saved_zd = state.xd.clone(), state.yd.clone(), state.zd.clone()
 
         # Level 0: progressive basis complexity. The resident batched optimizer
         # (B=1) avoids SciPy/Powell's repeated tensor↔NumPy boundary, so it wins
@@ -1336,22 +1338,52 @@ def _warpomatic(
                     base, state.warped_source, weight, base_clip, source_clip
                 )
 
+        # An initial warp is already a fitted solution.  Level 0 re-solves the
+        # global deformation and therefore needs the same incumbent protection as
+        # every finer level; otherwise an optiwarp/iniwarp hand-off can be lost
+        # before the guarded level loop even begins.
+        rejected_lev0 = config.reject_worse_levels and state.cost > first_cost + 1e-4
+        if rejected_lev0:
+            worsened = state.cost
+            with torch.no_grad():
+                state.xd, state.yd, state.zd = saved_xd, saved_yd, saved_zd
+                state.warped_source = warp_image(
+                    source, state.xd, state.yd, state.zd, mode=config.interp
+                )
+            state.cost = first_cost
+
         if config.verb >= 1:
             elapsed = time.time() - t0
             if _tqdm is not None and isinstance(pbar, _tqdm):
-                pbar.set_postfix_str(f"cost={first_cost:.5f}=>{state.cost:.5f} {elapsed:.1f}s")
+                suffix = (
+                    f"cost={first_cost:.5f}=>{worsened:.5f}, rolled back"
+                    if rejected_lev0
+                    else f"cost={first_cost:.5f}=>{state.cost:.5f}"
+                )
+                pbar.set_postfix_str(f"{suffix} {elapsed:.1f}s")
                 pbar.close()
             else:
-                print(f" done [cost:{first_cost:.5f}==>{state.cost:.5f}] ({elapsed:.1f}s)")
+                suffix = (
+                    f"{first_cost:.5f}=>{worsened:.5f}, rolled back"
+                    if rejected_lev0
+                    else f"{first_cost:.5f}=>{state.cost:.5f}"
+                )
+                print(f" done [cost:{suffix}] ({elapsed:.1f}s)")
 
         if config.level_callback is not None:
             config.level_callback(0, state.xd, state.yd, state.zd, state.warped_source)
         if config.movie_recorder is not None:
             config.movie_recorder.capture_displacement(
                 (state.xd, state.yd, state.zd),
-                label=f"lev=0 global  cost {state.cost:.5f}",
+                label=(
+                    f"lev=0 global worsened, rolled back  cost {state.cost:.5f}"
+                    if rejected_lev0
+                    else f"lev=0 global  cost {state.cost:.5f}"
+                ),
                 pinned=True,
             )
+        if rejected_lev0:
+            return
 
     # --- Levels 1..N: progressively smaller patches (batched GPU) ---
     xwid0 = ittt - ibbb + 1
