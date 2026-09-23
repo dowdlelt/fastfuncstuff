@@ -575,25 +575,26 @@ def batched_gn_estimate(
             if not bool(active.any()):
                 break
 
-    # Retain the stage's incoming transform volume by volume when the attempted
-    # solve finishes worse. This protects both identity -> coarse and coarse ->
-    # fine hand-offs without changing how Gauss-Newton takes its steps.
-    incumbent_warped, incumbent_valid = shear_resample_triton(
-        sources, params_to_matrix_batched(incumbent), shape, interp
-    )
-    candidate_warped, candidate_valid = shear_resample_triton(
-        sources, params_to_matrix_batched(params), shape, interp
-    )
-    denom = weight_flat_1d.sum().clamp_min(1e-10)
-    incumbent_mse = (
-        weight_flat_1d[None] * (base_flat[None] - incumbent_warped.reshape(B, N)) ** 2
-    ).sum(1) / denom
-    candidate_mse = (
-        weight_flat_1d[None] * (base_flat[None] - candidate_warped.reshape(B, N)) ** 2
-    ).sum(1) / denom
-    keep_incumbent = incumbent_valid & (~candidate_valid | (incumbent_mse < candidate_mse))
-    params = torch.where(keep_incumbent[:, None], incumbent, params)
-    invalid = invalid | ~incumbent_valid | ~candidate_valid
+    if init_params is not None:
+        # A supplied initializer is a fitted result from the previous stage. Retain
+        # it volume by volume where the attempted fine solve finishes worse. The
+        # ordinary one-pass path avoids these two extra resamples entirely.
+        incumbent_warped, incumbent_valid = shear_resample_triton(
+            sources, params_to_matrix_batched(incumbent), shape, interp
+        )
+        candidate_warped, candidate_valid = shear_resample_triton(
+            sources, params_to_matrix_batched(params), shape, interp
+        )
+        denom = weight_flat_1d.sum().clamp_min(1e-10)
+        incumbent_mse = (
+            weight_flat_1d[None] * (base_flat[None] - incumbent_warped.reshape(B, N)) ** 2
+        ).sum(1) / denom
+        candidate_mse = (
+            weight_flat_1d[None] * (base_flat[None] - candidate_warped.reshape(B, N)) ** 2
+        ).sum(1) / denom
+        keep_incumbent = incumbent_valid & (~candidate_valid | (incumbent_mse < candidate_mse))
+        params = torch.where(keep_incumbent[:, None], incumbent, params)
+        invalid = invalid | ~incumbent_valid | ~candidate_valid
     return params, n_iters, invalid
 
 
