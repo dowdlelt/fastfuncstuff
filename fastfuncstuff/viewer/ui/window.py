@@ -1012,8 +1012,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _build_panel(self) -> None:
         panel = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(panel)
-        v.setContentsMargins(9, 9, 9, 9)
-        v.setSpacing(8)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(5)
 
         v.addWidget(self._head("LAYERS  [ / ]"))
         # Sized to the stack rather than to the space available. Four layers is
@@ -1059,7 +1059,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setToolTip(f"{tip} ({key})")
-            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
             b.clicked.connect(slot)
             stack_row.addWidget(b, *divmod(position, 3))
         v.addLayout(stack_row)
@@ -1069,9 +1069,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # column of space the form's labels leave free instead of claiming a
         # full-width band of their own below it.
         controls = QtWidgets.QHBoxLayout()
-        controls.setSpacing(8)
+        controls.setSpacing(6)
         form = QtWidgets.QFormLayout()
-        form.setSpacing(7)
+        form.setSpacing(4)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # A stats bucket is a stack of named contrasts, and the names are in

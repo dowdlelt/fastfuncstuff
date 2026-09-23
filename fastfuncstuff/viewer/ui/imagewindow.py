@@ -163,7 +163,7 @@ class ImageWindow(QtWidgets.QWidget):
         b = QtWidgets.QPushButton(full)
         b.setCheckable(True)
         b.setToolTip(f"{tip}  ({key})")
-        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
         self._labels.append((b, full, bare))
         return b
 
