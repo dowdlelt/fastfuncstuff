@@ -45,16 +45,24 @@ class ColorBar(QtWidgets.QWidget):
     colours it cuts.
     """
 
+    #: Shift+click: the value under the cursor, to become the threshold.
     clicked = QtCore.Signal(float)
+    #: A plain click: run the scale the other way.
+    reverse_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._lut_name = "gray"
+        self._reverse = False
         self._lo, self._hi = 0.0, 1.0
         self._threshold = 0.0
         self._sign = SignMode.BOTH
         self._panes = 0
         self._alpha = AlphaMode.OFF
+        self.setToolTip(
+            "Click to reverse the colour scale.\nShift+click to set the threshold there."
+        )
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setFixedWidth(BAR_WIDTH)
         self.setMinimumHeight(BAR_MIN_HEIGHT)
         self.setSizePolicy(
@@ -63,6 +71,7 @@ class ColorBar(QtWidgets.QWidget):
 
     def configure(self, layer) -> None:
         self._lut_name = layer.colormap
+        self._reverse = bool(layer.colormap_reversed)
         self._lo = float(layer.range_lo if layer.range_lo is not None else 0.0)
         self._hi = float(layer.range_hi if layer.range_hi is not None else 1.0)
         # Marked on the bar only when it is in the bar's units. A t of 3 drawn
@@ -80,7 +89,7 @@ class ColorBar(QtWidgets.QWidget):
         h = max(self.height() - 2, 1)
         bar = QtCore.QRect(1, 1, BAR_WIDTH - 2, h)
         try:
-            lut = build_lut(self._lut_name, 256, device=torch.device("cpu"))
+            lut = build_lut(self._lut_name, 256, device=torch.device("cpu"), reverse=self._reverse)
         except KeyError:
             p.end()
             return
@@ -123,7 +132,17 @@ class ColorBar(QtWidgets.QWidget):
         p.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
-        """Click the bar to set the threshold to the value under the cursor."""
+        """Click to reverse the scale; shift+click to threshold at the cursor.
+
+        Reversing is the plain click because it is what the bar is for -- a
+        picture of the scale -- and it replaces a ``_r`` twin of every map in
+        the picker.
+        """
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        if not event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
+            self.reverse_requested.emit()
+            return
         h = max(self.height() - 2, 1)
         frac = max(0.0, min(1.0, (event.position().y() - 1) / h))
         self.clicked.emit(self._hi - frac * (self._hi - self._lo))
@@ -190,6 +209,7 @@ class RangeBar(QtWidgets.QWidget):
     mirror_changed = QtCore.Signal(bool)
     threshold_changed = QtCore.Signal(float)
     autorange_requested = QtCore.Signal()
+    reverse_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -209,6 +229,7 @@ class RangeBar(QtWidgets.QWidget):
 
         self.bar = ColorBar()
         self.bar.clicked.connect(self._threshold_from_bar)
+        self.bar.reverse_requested.connect(self.reverse_requested)
         h.addWidget(self.bar)
 
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)

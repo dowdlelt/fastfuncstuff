@@ -184,6 +184,19 @@ def test_mirror_holds_min_at_minus_max(session):
     assert layer.range_lo == -layer.range_hi
 
 
+def test_a_reversed_scale_replays_from_a_script(session):
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.vocab import SetColormapReversed
+
+    session.do(SetColormapReversed(_stats(session).key, True))
+    replay = ViewerSession(device=CPU)
+    try:
+        replay.run_script(session.to_script())
+        assert replay.state.layers.overlay.colormap_reversed
+    finally:
+        replay.close()
+
+
 # ---------------------------------------------------------------------------
 # the window
 # ---------------------------------------------------------------------------
@@ -504,3 +517,29 @@ def test_the_image_corner_follows_the_crosshair(win, qapp):
     qapp.processEvents()
     assert pane._readout and pane._readout != first
     assert pane._readout == win.session.overlay_readout()
+
+
+def test_clicking_the_colour_bar_reverses_it_and_shift_click_thresholds(win, qapp):
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    bar = win.rangebar.bar
+    layer = lambda: win.session.state.layers.overlay  # noqa: E731
+    before = layer().threshold
+    QTest.mouseClick(bar, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(10, 5))
+    qapp.processEvents()
+    assert layer().colormap_reversed
+    assert layer().threshold == before
+    QTest.mouseClick(bar, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(10, 5))
+    qapp.processEvents()
+    assert not layer().colormap_reversed
+
+    QTest.mouseClick(
+        bar,
+        QtCore.Qt.MouseButton.LeftButton,
+        QtCore.Qt.KeyboardModifier.ShiftModifier,
+        QtCore.QPoint(10, 5),
+    )
+    qapp.processEvents()
+    assert not layer().colormap_reversed
+    assert layer().threshold != before

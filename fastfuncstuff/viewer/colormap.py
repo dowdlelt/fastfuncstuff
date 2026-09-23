@@ -104,15 +104,20 @@ def build_lut(
     *,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
+    reverse: bool = False,
 ) -> Tensor:
-    """A ``(size, 3)`` RGB lookup table for one colour scale."""
+    """A ``(size, 3)`` RGB lookup table for one colour scale.
+
+    ``reverse`` runs it top to bottom. One flag rather than a ``_r`` twin of
+    every scale, which would double the picker to say one thing.
+    """
     try:
         stops = _SCALES[name]
     except KeyError:
         raise KeyError(
             f"unknown colormap {name!r}; have {', '.join(available_colormaps())}"
         ) from None
-    anchors = torch.tensor(stops, dtype=dtype, device=device)
+    anchors = torch.tensor(stops[::-1] if reverse else stops, dtype=dtype, device=device)
     n = anchors.shape[0]
     if size < 2:
         raise ValueError("LUT size must be at least 2")

@@ -61,6 +61,11 @@ def test_cyclic_scales_close_on_themselves(name):
     assert torch.allclose(lut[0], lut[-1], atol=0.03)
 
 
+def test_reverse_runs_the_scale_backwards():
+    forward = build_lut("RdBu", 256, device=CPU)
+    assert torch.allclose(build_lut("RdBu", 256, device=CPU, reverse=True), forward.flip(0))
+
+
 def test_lut_endpoints_match_the_scale_definition():
     lut = build_lut("gray", 256, device=CPU)
     assert torch.allclose(lut[0], torch.zeros(3), atol=1e-6)

@@ -35,14 +35,16 @@ from fastfuncstuff.viewer.state import Plane, ViewerState
 #: against every scale in the palette, warm or cool.
 BOX_RGB = (0.96, 0.96, 0.92)
 
-_LUT_CACHE: dict[tuple[str, str, int], Tensor] = {}
+_LUT_CACHE: dict[tuple[str, str, int, bool], Tensor] = {}
 
 
-def cached_lut(name: str, device: torch.device, size: int = 256) -> Tensor:
-    key = (name, str(device), size)
+def cached_lut(
+    name: str, device: torch.device, size: int = 256, *, reverse: bool = False
+) -> Tensor:
+    key = (name, str(device), size, reverse)
     lut = _LUT_CACHE.get(key)
     if lut is None:
-        lut = build_lut(name, size, device=device)
+        lut = build_lut(name, size, device=device, reverse=reverse)
         _LUT_CACHE[key] = lut
     return lut
 
@@ -157,7 +159,7 @@ def render_plane(
         hi = layer.range_hi if layer.range_hi is not None else 1.0
         rgb = apply_colormap(
             values,
-            lut=cached_lut(layer.colormap, values.device),
+            lut=cached_lut(layer.colormap, values.device, reverse=layer.colormap_reversed),
             lo=float(lo),
             hi=float(hi),
             sign_mode=layer.sign_mode,

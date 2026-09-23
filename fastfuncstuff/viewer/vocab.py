@@ -661,6 +661,17 @@ class SetColormap(Command):
 
 @command
 @dataclass(frozen=True)
+class SetColormapReversed(Command):
+    """Run the colour scale top to bottom. Set, not toggled, so a script replays."""
+
+    name = "SET_COLORMAP_REVERSED"
+    aspects = Aspect.COLORMAP
+    key: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetPanes(Command):
     """Number of discrete colour panes; 0 for a continuous scale."""
 
@@ -1232,6 +1243,14 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, colormap=cmd.colormap)
         return SetColormap.aspects
+
+    @bus.handle(SetColormapReversed.name)
+    def _set_colormap_reversed(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetColormapReversed)
+        if st.layers.get(cmd.key).colormap_reversed == bool(cmd.on):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, colormap_reversed=bool(cmd.on))
+        return SetColormapReversed.aspects
 
     @bus.handle(SetThreshold.name)
     def _set_threshold(cmd: Command, st: ViewerState) -> Aspect:

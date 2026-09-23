@@ -856,7 +856,7 @@ class ViewerSession:
             hi = layer.range_hi if layer.range_hi is not None else 1.0
             rgb = apply_colormap(
                 values,
-                lut=cached_lut(layer.colormap, values.device),
+                lut=cached_lut(layer.colormap, values.device, reverse=layer.colormap_reversed),
                 lo=float(lo),
                 hi=float(hi),
                 sign_mode=layer.sign_mode,
@@ -1132,6 +1132,7 @@ class ViewerSession:
                 visible=source.visible if visible is None else visible,
                 opacity=source.opacity,
                 colormap=colormap or source.colormap,
+                colormap_reversed=source.colormap_reversed if colormap is None else False,
                 # The same display range as its source, so the two are
                 # comparable at a glance rather than each auto-scaled to
                 # itself -- which would hide exactly the difference you made

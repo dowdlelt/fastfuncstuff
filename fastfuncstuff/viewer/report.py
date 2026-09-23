@@ -84,7 +84,8 @@ def _layer_block(session: ViewerSession, layer: Layer, *, index: int, is_grid: b
     ]
     resample = session.resample_mode(layer)
     out.append(
-        f"      drawn     {resample} resample, colormap {layer.colormap}, "
+        f"      drawn     {resample} resample, colormap {layer.colormap}"
+        f"{' reversed' if layer.colormap_reversed else ''}, "
         f"opacity {layer.opacity:.2f}, sign {layer.sign_mode}"
     )
     lo = "auto" if layer.range_lo is None else f"{layer.range_lo:.6g}"

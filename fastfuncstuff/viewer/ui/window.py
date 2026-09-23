@@ -75,6 +75,7 @@ from fastfuncstuff.viewer.vocab import (
     SetBoxed,
     SetCarpetOrder,
     SetColormap,
+    SetColormapReversed,
     SetIJK,
     SetIndex,
     SetInput,
@@ -1191,6 +1192,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rangebar.range_changed.connect(self._range_changed)
         self.rangebar.threshold_changed.connect(self._threshold_changed)
         self.rangebar.autorange_requested.connect(self._autorange)
+        self.rangebar.reverse_requested.connect(self._reverse_colormap)
         self.rangebar.mirror_changed.connect(lambda on: self._apply(SetRangeMirror, on=on))
 
         # Kept as attributes so the rest of the window (and the tests) address
@@ -1639,6 +1641,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         key = self.current_key()
         if key is not None:
             self._dispatch(SetThreshold(key, value))
+
+    def _reverse_colormap(self) -> None:
+        layer = self.session.state.layers.find(self.current_key() or "")
+        if layer is not None:
+            self._dispatch(SetColormapReversed(layer.key, not layer.colormap_reversed))
 
     def _autorange(self) -> None:
         key = self.current_key()

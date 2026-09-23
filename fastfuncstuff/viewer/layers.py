@@ -75,6 +75,8 @@ class Layer:
     visible: bool = True
     opacity: float = 1.0
     colormap: str = "gray"
+    #: Run the scale top to bottom -- RdBu with blue at the low end.
+    colormap_reversed: bool = False
     n_panes: int = 0  # 0 = continuous; >0 = AFNI-style discrete colour bar
     sign_mode: SignMode = SignMode.BOTH
     volume_index: int = 0
