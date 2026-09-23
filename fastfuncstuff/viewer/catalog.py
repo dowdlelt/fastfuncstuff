@@ -1,7 +1,7 @@
 """Reading a directory into a pickable list of datasets.
 
 This is what sits behind **Read**. Everything else in the viewer is modular, but
-the data selector is not: underlay, overlay and every mode draw from the same
+the data selector is not: every layer and every mode's input come from the same
 catalog, so it has to be cheap enough to run the moment a directory is named.
 
 It is: every field here comes from the header, which for a ``.nii.gz`` is a few
@@ -32,7 +32,7 @@ class Kind(StrEnum):
     """What a dataset is *for*, which is what the picker sorts by.
 
     A guess from the header, not a guarantee -- but it is the difference between
-    a picker that shows a useful default underlay and one that shows an
+    a picker that opens with the base image near the top and one that shows an
     alphabetical list where ``all_runs`` sorts above ``anat``.
     """
 

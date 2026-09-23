@@ -112,14 +112,6 @@ def test_a_derivative_basis_names_its_columns_with_the_condition(events):
     assert task.shape[1] == 4
 
 
-def test_ortvec_derivatives_are_backward_differences(events):
-    ort = np.cumsum(np.ones((N_TIME, 1)), axis=0)
-    model = ig.build_model(n_time=N_TIME, tr=TR, ort=ort, ort_labels=["roll"], ort_derivatives=True)
-    deriv = model.matrix[:, model.index_of("roll'")]
-    assert deriv[0] == 0.0
-    assert np.allclose(deriv[1:], 1.0)
-
-
 def test_an_empty_model_is_an_error():
     with pytest.raises(ValueError, match="empty model"):
         ig.build_model(n_time=N_TIME, tr=TR, polort=-1)
@@ -442,3 +434,97 @@ def test_a_design_of_the_wrong_length_is_an_error(prepared):
     model = ig.build_model(n_time=N_TIME + 5, tr=TR, polort=2)
     with pytest.raises(ValueError, match="but the run has"):
         ig.fit_model(prepared, model, device=CPU)
+
+
+# -- conditioning -----------------------------------------------------------
+
+
+def test_the_residual_stays_orthogonal_to_the_design_when_a_regressor_carries_drift():
+    """The invariant that caught a real bug, and the one an OLS fit exists to keep.
+
+    Least squares makes the residual orthogonal to every column of the design.
+    Break that and the drift columns stop absorbing the drift: an uncancelled
+    polynomial trend walks into the fitted line and into InstaGLM's `signal`
+    trace, which is what a user sees as "the fit grew a trend the data does not
+    have". It bit specifically on `polort >= 1` plus a motion file, because a
+    motion file *contains* drift -- adding one takes cond(X) from about 7 to
+    130, and normal equations square that to 1.7e4, which is more than float32
+    has to give. The design is solved through an SVD for this reason.
+
+    Set at BOLD scale on purpose. A series sitting at 10000 with tens of signal
+    in it is where float32 runs out of digits, and a test on mean-zero data
+    would have passed throughout.
+    """
+    rng = np.random.default_rng(7)
+    n_time, tr = 200, 2.0
+    clock = np.arange(n_time, dtype=np.float64)
+
+    # A nuisance regressor shaped like a motion parameter: mostly a slow drift,
+    # a little jitter on top. This is the collinearity, not a contrivance.
+    drifting = 0.4 * (clock / n_time) + 0.02 * rng.normal(size=n_time)
+    ort = np.stack([drifting, np.roll(drifting, 3)], axis=1)
+
+    task = np.zeros((n_time, 1))
+    for onset in range(10, n_time - 20, 40):
+        task[onset : onset + 10, 0] = 1.0
+
+    model = ig.build_model(
+        n_time=n_time, tr=tr, task=task, task_labels=["block"], polort=2, ort=ort
+    )
+    assert model.n_columns == 6
+
+    series = (
+        10000.0
+        + 300.0 * (clock / n_time)
+        + 40.0 * task[:, 0]
+        + 120.0 * drifting
+        + rng.normal(0.0, 5.0, n_time)
+    )
+    data = np.tile(series.astype(np.float32), (4, 5, 3, 1))
+    prepared = ig.prepare(data, affine=np.eye(4), tr=tr, mask=np.ones((4, 5, 3), bool), device=CPU)
+    fit = ig.fit_model(prepared, model, device=CPU)
+
+    x = np.asarray(model.matrix)
+    residual = prepared.y.numpy().astype(np.float64).T - x @ fit.betas.numpy().astype(np.float64)
+
+    # Orthogonality, scaled so the tolerance means the same thing for every
+    # column: a column's correlation with what the model could not explain.
+    leak = np.abs(x.T @ residual) / (
+        np.linalg.norm(x, axis=0)[:, None] * np.linalg.norm(residual, axis=0) + 1e-30
+    )
+    assert leak.max() < 1e-4, f"residual is not orthogonal to the design: {leak.max():.2e}"
+
+    # And the drift subspace specifically, which is where the symptom showed.
+    basis = np.linalg.qr(x[:, model.indices("drift")])[0]
+    into_drift = np.linalg.norm(basis.T @ residual, axis=0) / np.linalg.norm(residual, axis=0)
+    assert into_drift.max() < 1e-4
+
+
+def test_a_drifting_regressor_does_not_change_what_the_drift_columns_absorb():
+    """The betas agree with an honest float64 solve of the same design.
+
+    A weaker statement than orthogonality but a more direct one: whatever the
+    arithmetic does inside, the answer has to be the least-squares answer.
+    """
+    rng = np.random.default_rng(11)
+    n_time, tr = 180, 2.0
+    clock = np.arange(n_time, dtype=np.float64)
+    # Nearly a polynomial: this is what a real motion parameter looks like, and
+    # it is the case that makes the normal equations unusable in float32.
+    ort = np.stack([0.3 * clock / n_time + 0.004 * rng.normal(size=n_time)], axis=1)
+    task = np.zeros((n_time, 1))
+    task[20:40, 0] = task[90:110, 0] = 1.0
+
+    model = ig.build_model(
+        n_time=n_time, tr=tr, task=task, task_labels=["block"], polort=3, ort=ort
+    )
+    series = 9000.0 + 250.0 * clock / n_time + 30.0 * task[:, 0] + rng.normal(0.0, 4.0, n_time)
+    data = np.tile(series.astype(np.float32), (3, 3, 2, 1))
+    prepared = ig.prepare(data, affine=np.eye(4), tr=tr, mask=np.ones((3, 3, 2), bool), device=CPU)
+    fit = ig.fit_model(prepared, model, device=CPU)
+
+    x = np.asarray(model.matrix)
+    reference = np.linalg.lstsq(x, prepared.y.numpy().astype(np.float64).T, rcond=None)[0]
+    got = fit.betas.numpy().astype(np.float64)
+    scale = np.abs(reference).max()
+    assert np.abs(got - reference).max() / scale < 1e-5

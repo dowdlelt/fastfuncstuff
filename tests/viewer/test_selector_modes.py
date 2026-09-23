@@ -24,6 +24,7 @@ from fastfuncstuff.viewer.modes.base import (
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
+    Load,
     Read,
     SetMode,
     SetOverlay,
@@ -146,6 +147,58 @@ def test_read_command_populates_the_session_catalog(session, datadir):
 # ---------------------------------------------------------------------------
 # underlay / overlay / +1
 # ---------------------------------------------------------------------------
+
+
+def test_loading_puts_a_layer_on_top_and_selects_it(session, datadir):
+    """One verb. Loading twice stacks two layers rather than replacing one."""
+    session.do(Load(str(datadir / "anat.nii.gz")))
+    session.do(Load(str(datadir / "stats_tstat.nii.gz")))
+    assert [ly.name for ly in session.state.layers] == ["anat.nii.gz", "stats_tstat.nii.gz"]
+    assert session.state.selected == session.state.layers.layers[-1].key
+
+
+def test_loading_the_same_file_twice_gives_two_layers(session, datadir):
+    """The same map at two thresholds is a real thing to want."""
+    session.do(Load(str(datadir / "stats_tstat.nii.gz")))
+    session.do(Load(str(datadir / "stats_tstat.nii.gz")))
+    assert len(session.state.layers) == 2
+    assert len(set(session.state.layers.keys)) == 2
+
+
+def test_the_first_thing_loaded_defines_the_grid(session, datadir):
+    session.do(Load(str(datadir / "anat.nii.gz")))
+    assert session.state.grid.shape == (12, 14, 10)
+    # Not re-established by the next one: that is what the stack order is for.
+    session.do(Load(str(datadir / "mean_epi.nii.gz")))
+    assert session.state.grid.shape == (12, 14, 10)
+
+
+def test_the_first_thing_loaded_is_not_thresholded(session, datadir):
+    """An anatomical opened as the base image must not arrive half cut away."""
+    session.do(Load(str(datadir / "anat.nii.gz")))
+    assert session.state.layers.base.threshold == 0.0
+    session.do(Load(str(datadir / "stats_tstat.nii.gz")))
+    assert session.state.layers.layers[-1].threshold > 0.0
+
+
+def test_promoting_a_loaded_layer_re_establishes_the_grid(session, datadir):
+    """LOAD plus the stack list does what SET_UNDERLAY used to do in one step."""
+    from fastfuncstuff.viewer.vocab import MoveLayer
+
+    session.do(Load(str(datadir / "anat.nii.gz")))
+    session.do(Load(str(datadir / "mean_epi.nii.gz")))
+    epi = session.state.layers.layers[-1].key
+    session.do(MoveLayer(epi, 0))
+    assert session.state.grid.shape == (8, 9, 7)
+
+
+def test_load_replays_through_a_script(session, datadir):
+    session.do(Load(str(datadir / "anat.nii.gz")))
+    assert "LOAD " in session.to_script()
+
+
+# The three legacy load verbs. Nothing in the interface issues them any more,
+# but a recorded script does, and it has to keep meaning what it meant.
 
 
 def test_underlay_becomes_the_bottom_layer(session, datadir):

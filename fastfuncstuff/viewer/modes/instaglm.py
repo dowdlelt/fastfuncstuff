@@ -25,22 +25,30 @@ required its own fit rather than ``glm/core.py:fit_glm``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+
 import numpy as np
 import torch
 
 from fastfuncstuff.viewer import instaglm as engine
+from fastfuncstuff.viewer import ortvec
 from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
+    FULL,
+    HALF,
+    THIRD,
     ActionControl,
-    BoolControl,
     ChoiceControl,
     ComputedOverlay,
     Control,
     FloatControl,
     IntControl,
     Mode,
+    OptionalFloatControl,
     OverlayKind,
     PathControl,
+    PathListControl,
     ProgressFn,
     Trace,
     mode,
@@ -59,6 +67,12 @@ PRESENTATION: dict[str, tuple[str, OverlayKind, tuple[float, float] | None, floa
     "resid sd": ("hot", OverlayKind.VALUE, None, 0.0),
 }
 
+#: Maps that are of one regressor rather than of the whole model. Named once
+#: because three places have to agree about it: what the layer is called, which
+#: maps the column picker means anything for, and what the graph's column line
+#: is drawing.
+PER_COLUMN = ("beta", "t", "unique R2")
+
 #: Lines the mode contributes at every graphed voxel, and what each is for.
 LINE_HELP = {
     "data": "the measurement, as it came off disk",
@@ -67,6 +81,28 @@ LINE_HELP = {
     "resid": "what the model did not account for",
     "column": "the selected column's own contribution",
 }
+
+
+def _short_labels(path: str, labels: Sequence[str], *, distinguish: bool) -> list[str]:
+    """Name a regressor file's columns in something a picker can show.
+
+    ``read_nuisance`` names a plain 1D file's columns after its stem, which for
+    a pipeline output is the whole provenance --
+    ``stage02.moco.ses-01.task-dynaloc.run-01.motion#0``. Forty-five characters
+    of it is the same on every column, and it is the last word that says what
+    the regressor *is*. An xmat's own labels are left alone; they were chosen.
+    """
+    stem = Path(path).name
+    for ext in (".1D", ".txt", ".tsv"):
+        stem = stem.removesuffix(ext)
+    short = stem.rsplit(".", 1)[-1] or stem
+    out = []
+    for label in labels:
+        # Only the names this reader invented, which are exactly the ones that
+        # start with the stem it invented them from.
+        name = f"{short}{label[len(stem) :]}" if label.startswith(stem) else str(label)
+        out.append(f"{short}:{name}" if distinguish and not label.startswith(stem) else name)
+    return out
 
 
 @mode
@@ -80,6 +116,8 @@ class InstaGLMMode(Mode):
         self._prepared: engine.Prepared | None = None
         self._fit: engine.Fit | None = None
         self._source_key: str | None = None
+        #: The blur the prepared run was gathered at, so a change is detectable.
+        self._blur = 0.0
         self._source_name = ""
         self._tr = 0.0
         self._hrf: np.ndarray | None = None
@@ -87,7 +125,7 @@ class InstaGLMMode(Mode):
         #: The convolved task block and the inputs it was built from. Keyed
         #: rather than rebuilt because convolving events at microtime costs
         #: 0.5 s on a real run -- sixteen times the fit it feeds -- and
-        #: stepping polort, ticking the ortvec derivatives on or asking for
+        #: stepping polort, ticking an ortvec on or asking for
         #: another noise PC changes none of its inputs. Without this, the one
         #: gesture the mode exists for ("step up through the polynomials and
         #: watch the fit improve") pays for a convolution per step.
@@ -96,7 +134,7 @@ class InstaGLMMode(Mode):
         self._message = ""
         #: What was last installed, so a switch between two different questions
         #: can be told from a refit of the same one.
-        self._shown: tuple[str, str] | None = None
+        self._shown: tuple[str, str, str] | None = None
         super().__init__()
 
     # -- declaration ---------------------------------------------------
@@ -104,11 +142,64 @@ class InstaGLMMode(Mode):
         # Built per call rather than fixed, so the column picker offers the
         # model that is actually loaded. The panel is rebuilt on LAYERS, which
         # is exactly what a refit dirties.
+        #
+        # The view row comes first, above everything that refits. What you are
+        # looking at is the question; the design is the apparatus. Putting the
+        # apparatus on top made the one row that changes on every glance the
+        # one furthest from the map.
+        columns = self._column_choices()
         return (
+            ChoiceControl(
+                name="show",
+                label="show",
+                choices=engine.MAPS,
+                default="beta",
+                span=HALF,
+                newline=True,
+                help="What to colour the brain with. The colour bar and its range "
+                "belong to this map. Changing it does not refit.",
+            ),
+            ChoiceControl(
+                name="thresh",
+                label="thresh",
+                choices=("same", *engine.MAPS),
+                default="same",
+                span=HALF,
+                help="What to cut on, when that is not what you are looking at. "
+                "Colour by a beta and threshold on its t is the ordinary GLM "
+                "picture, and it is the one a single map cannot draw: the "
+                "threshold slider, the p-value and the cluster table all read "
+                "this map, while the colours read 'show'. 'same' thresholds on "
+                "what is displayed.",
+            ),
+            ChoiceControl(
+                name="column",
+                label="column",
+                choices=columns,
+                default=columns[0],
+                span=FULL,
+                newline=True,
+                help="Which regressor the beta, t and unique-R2 maps are of -- "
+                "for both 'show' and 'thresh', since a beta and its own t are "
+                "the pair worth seeing together.",
+            ),
+            ChoiceControl(
+                name="psc",
+                label="units",
+                choices=engine.PSC_MODES,
+                default="swing",
+                style="radio",
+                span=HALF,
+                newline=True,
+                help="'swing' scales a beta by its own regressor's excursion, so a "
+                "condition and a motion column are comparable on one colour bar. "
+                "'per unit' is the plain beta/mean reading, in the regressor's own units.",
+            ),
             PathControl(
                 name="events",
                 label="events",
                 filter="events (*.tsv *.1D *.txt);;All (*)",
+                newline=True,
                 help="A BIDS *_events.tsv, or an AFNI timing file as a single condition. "
                 "Without one the model is drift and nuisance only, which is still worth "
                 "looking at.",
@@ -118,6 +209,8 @@ class InstaGLMMode(Mode):
                 label="HRF",
                 choices=("spmg1", "spmg2", "spmg3", "library", "custom"),
                 default="spmg1",
+                span=THIRD,
+                newline=True,
                 help="spmg1/2/3 add the time and dispersion derivatives; library steps the "
                 "20 canonical curves ffs fits with; custom is the three sliders below.",
             ),
@@ -127,6 +220,8 @@ class InstaGLMMode(Mode):
                 lo=0,
                 hi=max(engine.library_size() - 1, 0),
                 default=0,
+                span=THIRD,
+                visible_when=("basis", ("library",)),
                 help="Which curve of the canonical library. Only read when HRF is 'library'.",
             ),
             FloatControl(
@@ -137,6 +232,9 @@ class InstaGLMMode(Mode):
                 default=6.0,
                 step=0.25,
                 unit=" s",
+                span=HALF,
+                newline=True,
+                visible_when=("basis", ("custom",)),
                 help="Time to peak of the custom double gamma. Only read when HRF is 'custom'.",
             ),
             FloatControl(
@@ -146,6 +244,8 @@ class InstaGLMMode(Mode):
                 hi=3.0,
                 default=1.0,
                 step=0.05,
+                span=HALF,
+                visible_when=("basis", ("custom",)),
                 help="Dispersion of the custom double gamma. Only read when HRF is 'custom'.",
             ),
             FloatControl(
@@ -155,8 +255,27 @@ class InstaGLMMode(Mode):
                 hi=0.6,
                 default=0.167,
                 step=0.01,
+                span=HALF,
+                newline=True,
+                visible_when=("basis", ("custom",)),
                 help="Depth of the custom double gamma's undershoot, as a fraction of the "
                 "peak. Only read when HRF is 'custom'.",
+            ),
+            OptionalFloatControl(
+                name="blur",
+                on_value=4.0,
+                label="blur",
+                lo=0.0,
+                hi=12.0,
+                default=0.0,
+                step=0.5,
+                unit=" mm",
+                span=THIRD,
+                newline=True,
+                help="Spatial smoothing, in mm FWHM, applied to the run before it is "
+                "fitted -- so every map, t and R2 comes from smoothed data. Blurred "
+                "inside the brain mask, and the mask is found on the unsmoothed run, "
+                "so turning this up does not also grow what is fitted.",
             ),
             IntControl(
                 name="polort",
@@ -164,23 +283,9 @@ class InstaGLMMode(Mode):
                 lo=-1,
                 hi=9,
                 default=2,
+                span=THIRD,
                 help="Legendre drift order; -1 removes the baseline entirely, which is worth "
                 "doing once to see what it was holding up.",
-            ),
-            PathControl(
-                name="ortvec",
-                label="ortvec",
-                filter="1D / xmat (*.1D *.txt);;All (*)",
-                help="Extra regressors, one column each -- a motion file, a respiration "
-                "trace. Every column is pickable as a map of its own.",
-            ),
-            BoolControl(
-                name="ort_deriv",
-                label="+ deriv",
-                default=False,
-                help="Also fit each ortvec column's backward difference. A motion column "
-                "removes signal that tracks where the head is; its derivative removes "
-                "signal that tracks the head moving, which is usually the bigger one.",
             ),
             IntControl(
                 name="pcs",
@@ -188,31 +293,24 @@ class InstaGLMMode(Mode):
                 lo=0,
                 hi=10,
                 default=0,
+                span=THIRD,
                 help="Principal components of the noise pool -- bright voxels the task "
                 "explains no better than chance -- added as regressors, GLMdenoise style.",
             ),
-            ChoiceControl(
-                name="show",
-                label="show",
-                choices=engine.MAPS,
-                default="beta",
-                help="What to colour the brain with. Changing this does not refit.",
-            ),
-            ChoiceControl(
-                name="column",
-                label="column",
-                choices=self._column_choices(),
-                default=self._column_choices()[0],
-                help="Which regressor the beta, t and unique-R2 maps are of.",
-            ),
-            ChoiceControl(
-                name="psc",
-                label="units",
-                choices=engine.PSC_MODES,
-                default="swing",
-                help="'swing' scales a beta by its own regressor's excursion, so a "
-                "condition and a motion column are comparable on one colour bar. "
-                "'per unit' is the plain beta/mean reading, in the regressor's own units.",
+            PathListControl(
+                name="ortvec",
+                label="ortvec",
+                filter="1D / xmat (*.1D *.txt);;All (*)",
+                newline=True,
+                transforms=True,
+                sample_interval=self._run_tr(),
+                help="Extra regressors, one column each -- a motion file, a respiration "
+                "trace, a set of physio terms. Add as many as you like and untick one "
+                "to see what it was buying; every column is pickable as a map of its "
+                "own. d/dt adds the selected entry's derivative as an entry of its "
+                "own -- a motion column removes signal that tracks where the head is, "
+                "its derivative signal that tracks the head moving. BANDS splits an "
+                "entry by frequency, one entry per band.",
             ),
         )
 
@@ -245,8 +343,8 @@ class InstaGLMMode(Mode):
                 "width",
                 "undershoot",
                 "polort",
+                "blur",
                 "ortvec",
-                "ort_deriv",
                 "pcs",
             }
         )
@@ -261,20 +359,13 @@ class InstaGLMMode(Mode):
         return ("hrf",)
 
     # -- the run -------------------------------------------------------
-    def source_layer(self):
-        """The selected layer if it is a run, else the topmost run."""
-        if self.session is None:
-            return None
-        state = self.session.state
-        chosen = state.layers.find(state.selected) if state.selected else None
-        if chosen is not None and chosen.time_linked and chosen.n_volumes > 1:
-            return chosen
-        for layer in reversed(list(state.layers)):
-            if layer.time_linked and layer.n_volumes > 1:
-                return layer
-        return None
-
     def input_layer_key(self) -> str | None:
+        """The run the cached fit belongs to, not the one now chosen.
+
+        They differ for exactly one refresh after the input is changed, and
+        that is the refresh in which freeing the old array would leave the
+        prepared fit pointing at nothing.
+        """
         return self._source_key
 
     def attach(self, session) -> None:
@@ -317,6 +408,13 @@ class InstaGLMMode(Mode):
             return False
         device = self.session.store.device
 
+        # Blur is the one parameter that changes the *gather* rather than the
+        # design, so it has to drop the prepared run and not merely the fit --
+        # otherwise moving the slider refits smoothed betas onto unsmoothed
+        # data and nothing on screen says which one you are looking at.
+        if self._prepared is not None and float(self.params.get("blur") or 0.0) != self._blur:
+            self._prepared = None
+            self._fit = None
         if self._prepared is None and not self._gather(device, progress):
             return False
         assert self._prepared is not None
@@ -360,9 +458,11 @@ class InstaGLMMode(Mode):
             data,
             affine=np.asarray(layer.affine, dtype=float),
             tr=tr,
+            blur_fwhm=float(self.params.get("blur") or 0.0),
             device=device,
             progress=progress,
         )
+        self._blur = float(self.params.get("blur") or 0.0)
         self._source_key = layer.key
         self._source_name = layer.name
         self._tr = tr
@@ -377,20 +477,9 @@ class InstaGLMMode(Mode):
         if events_path:
             task, task_labels = self._task_block(events_path, n_time, tr, device, progress)
 
-        ort, ort_labels = None, []
-        ortvec_path = str(self.params.get("ortvec") or "").strip()
-        if ortvec_path:
-            from fastfuncstuff.viewer.derive import read_nuisance
-
-            # Through derive's reader, so an xmat contributes its ColumnGroups
-            # nuisance and a plain 1D file contributes all of itself -- the same
-            # rule DERIVE applies, rather than a second opinion about what
-            # counts as a regressor file.
-            read = read_nuisance(ortvec_path, n_time=n_time, polort=-1)
-            ort, ort_labels = read.columns, list(read.labels)
+        ort, ort_labels = self._ort_block(n_time, tr)
 
         polort = int(self.params.get("polort", 2))
-        deriv = bool(self.params.get("ort_deriv", False))
         n_pcs = int(self.params.get("pcs", 0))
 
         pcs = None
@@ -409,7 +498,6 @@ class InstaGLMMode(Mode):
                 polort=polort,
                 ort=ort,
                 ort_labels=ort_labels,
-                ort_derivatives=deriv,
             )
             first = engine.fit_model(self._prepared, base, device=device)
             pool = engine.noise_pool(first)
@@ -423,9 +511,54 @@ class InstaGLMMode(Mode):
             polort=polort,
             ort=ort,
             ort_labels=ort_labels,
-            ort_derivatives=deriv,
             pcs=pcs,
         )
+
+    def _ort_block(self, n_time: int, tr: float) -> tuple[np.ndarray | None, list[str]]:
+        """Every ticked ortvec entry, read, transformed and laid side by side.
+
+        Concatenated rather than fitted one entry at a time, because the whole
+        reason to hold several is to ask what each buys *given* the others.
+        A label carries its file's stem when there is more than one file, so
+        two motion estimates in the same model stay tellable apart in the
+        column picker. A file is read once however many entries derive from it.
+        """
+        entries = PathListControl.enabled(self.params.get("ortvec"))
+        parsed = [ortvec.parse_entry(e) for e in entries]
+        distinguish = len({path for path, _ in parsed}) > 1
+        files: dict[str, tuple[np.ndarray, list[str]]] = {}
+        blocks, labels = [], []
+        for path, ops in parsed:
+            if path not in files:
+                columns, names = ortvec.read_columns(path)
+                if columns.shape[0] != n_time:
+                    raise ValueError(
+                        f"{path} has {columns.shape[0]} rows but the run has {n_time} volumes"
+                    )
+                files[path] = (columns, _short_labels(path, names, distinguish=distinguish))
+            columns, names = ortvec.apply_ops(*files[path], ops, tr)
+            if columns.size == 0:
+                continue
+            blocks.append(columns)
+            labels += names
+        if not blocks:
+            return None, []
+        return np.concatenate(blocks, axis=1), labels
+
+    def _run_tr(self) -> float:
+        """The TR of the run that will be fitted, before it is fitted.
+
+        What the band splitter draws its frequency axis in. Read from the header
+        rather than the prepared fit, so the splitter works before the first FIT
+        -- choosing the bands is part of deciding what to fit.
+        """
+        layer = self.source_layer()
+        if layer is None or self.session is None:
+            return self._tr
+        try:
+            return float(self.session.store.get(layer.key).info.tr or 0.0) or self._tr
+        except (KeyError, AttributeError):
+            return self._tr
 
     def _task_block(
         self,
@@ -436,8 +569,6 @@ class InstaGLMMode(Mode):
         progress: ProgressFn | None,
     ) -> tuple[np.ndarray, list[str]]:
         """The convolved condition columns, rebuilt only when their inputs move."""
-        from pathlib import Path
-
         try:
             stamp = Path(events_path).stat().st_mtime_ns
         except OSError:
@@ -505,42 +636,86 @@ class InstaGLMMode(Mode):
         found = self._fit.model.index_of(chosen)
         return found if found is not None else 0
 
+    def _map_detail(self, kind: str, column: int) -> str:
+        """``Faces beta`` for a per-column map, ``R2`` for a whole-model one."""
+        assert self._fit is not None
+        if kind not in PER_COLUMN or not self._fit.model.n_columns:
+            return kind
+        return f"{self._fit.model.labels[column]} {kind}"
+
+    def _stat_spec(self, kind: str) -> tuple[str, float | tuple[float, float] | None] | None:
+        """What distribution the threshold map is drawn from, if any.
+
+        Handed over so the colour bar can offer a p. The dof is the fit's, and
+        it moves with the design -- which is the point: adding six motion
+        columns costs six degrees of freedom and the p at a given t goes up.
+        Quoting a p that did not follow the model would be worse than none.
+        """
+        assert self._fit is not None
+        if kind == "t":
+            return ("fitt", float(self._fit.dof))
+        if kind == "task F" and self._fit.n_task > 0:
+            return ("fift", (float(self._fit.n_task), float(self._fit.dof)))
+        return None
+
     def compute(self) -> ComputedOverlay | None:
         if self._fit is None:
             return None
         kind = str(self.params.get("show") or "beta")
+        # "same" is the one-volume case: what is shown is what is cut on, which
+        # is what every other mode does and what a plain intensity map wants.
+        cut = str(self.params.get("thresh") or "same")
+        if cut == "same":
+            cut = kind
         column = self._column_index()
-        colormap, overlay_kind, span, threshold = PRESENTATION.get(
+        colormap, overlay_kind, span, _ = PRESENTATION.get(
             kind, ("redblue", OverlayKind.VALUE, None, 0.0)
         )
+        _cmap, cut_kind, _span, threshold = PRESENTATION.get(
+            cut, ("redblue", OverlayKind.VALUE, None, 0.0)
+        )
         # An instance attribute, not the class one: what the threshold slider
-        # should call itself depends on which map is up, and a t map and an R2
-        # map are not the same question.
-        self.overlay_kind = overlay_kind
+        # should call itself depends on which map is *cut on*, not which is
+        # drawn. Colouring a beta and thresholding its t is a statistic even
+        # though the colours are in percent signal change, and labelling the
+        # slider after the beta would invite a threshold in the wrong units.
+        self.overlay_kind = cut_kind
 
         psc = str(self.params.get("psc") or "swing")
         values = self._fit.volume(kind, column=column, psc=psc)
-        label = self._fit.model.labels[column] if self._fit.model.n_columns else ""
-        detail = f"{label} {kind}" if kind in ("beta", "t", "unique R2") else kind
+        detail = self._map_detail(kind, column)
+        cut_values = None if cut == kind else self._fit.volume(cut, column=column, psc=psc)
+        labels = () if cut_values is None else (detail, self._map_detail(cut, column))
 
         # A t map, a beta map in percent signal change and an R2 map are three
         # different questions living under one layer, and a threshold set on
         # one of them describes none of the others. So the scale follows a
         # change of question -- but not a refit, where the map still means what
-        # it meant and the threshold is the gesture being made.
-        was, self._shown = self._shown, (kind, psc)
+        # it meant and the threshold is the gesture being made. The cut map
+        # counts as part of the question: moving the threshold from an R2 to a
+        # t leaves a number that means nothing on the new scale.
+        was, self._shown = self._shown, (kind, psc, cut)
         return ComputedOverlay(
             values=values,
             affine=self._fit.prepared.affine,
-            name=self.output_name(detail),
-            kind=overlay_kind,
+            name=self.output_name(detail if cut == kind else f"{detail} / {cut}"),
+            kind=cut_kind,
             colormap=colormap,
             display_range=span,
             threshold=threshold,
+            threshold_values=cut_values,
+            volume_labels=labels,
+            threshold_stat=self._stat_spec(cut),
             rescale=was is not None and was != self._shown,
         )
 
     # -- graph lines ---------------------------------------------------
+    def _to_run(self, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        """A display-grid voxel as a voxel of the run that was fitted."""
+        if self.session is None or self._prepared is None:
+            return ijk
+        return self.session.layer_voxel(self._prepared.affine, ijk)
+
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
         """The model pulled apart at this voxel.
 
@@ -556,7 +731,15 @@ class InstaGLMMode(Mode):
         """
         if self._fit is None:
             return []
-        lines = self._fit.decompose(ijk, column=self._column_index())
+        # The crosshair is in display-grid indices and the fit is on the run's
+        # grid. They are the same grid only while the run is at the bottom of
+        # the stack; with a 1 mm anatomy under it they are not, and indexing
+        # the fit directly loses every line -- which looks like the model
+        # having failed rather than the lookup having missed.
+        lines = self._fit.decompose(
+            self._to_run(ijk) if self.session is not None else ijk,
+            column=self._column_index(),
+        )
         if not lines:
             return []
         label = self._fit.model.labels[self._column_index()] if self._fit.model.n_columns else ""

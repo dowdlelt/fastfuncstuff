@@ -77,6 +77,12 @@ def _layer_alpha(layer: Layer, values: Tensor, stat: Tensor) -> tuple[Tensor, Te
     return alpha, edges
 
 
+#: The viewer's words for resampling, and what ``grid_sample`` calls them.
+#: "linear" rather than "bilinear" in the interface, because the sampling is
+#: three-dimensional and the ``bi`` is an artefact of torch's 2-D naming.
+_GRID_SAMPLE = {"nearest": "nearest", "linear": "bilinear"}
+
+
 def render_plane(
     session,
     plane: Plane,
@@ -117,7 +123,10 @@ def render_plane(
         volume = session.display_volume(layer.key)
         if volume is None:
             continue
-        values = extract_plane(volume, grid, layer.affine, plane, pos, view=view)
+        # Display only: how the voxels are painted into the grid, never what
+        # they are. session.resample_mode is the single place that is decided.
+        how = _GRID_SAMPLE[session.resample_mode(layer)]
+        values = extract_plane(volume, grid, layer.affine, plane, pos, view=view, mode=how)
 
         # The threshold statistic may live in a different sub-brick than the one
         # being displayed -- that is the normal case for a stats dataset, where
@@ -129,7 +138,7 @@ def render_plane(
             stat = (
                 values
                 if stat_vol is None
-                else extract_plane(stat_vol, grid, layer.affine, plane, pos, view=view)
+                else extract_plane(stat_vol, grid, layer.affine, plane, pos, view=view, mode=how)
             )
 
         # A label layer is coloured by identity rather than by magnitude, and

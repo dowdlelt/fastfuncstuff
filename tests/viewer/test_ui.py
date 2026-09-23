@@ -9,6 +9,7 @@ be restored, a control that desynchronises from the state it displays.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -173,13 +174,18 @@ def test_a_repaint_does_not_write_back_into_the_recording(win, qapp):
 
 
 def test_tiling_gives_every_window_a_rectangle(win, qapp):
+    before = len(
+        [ln for ln in win.session.to_script().splitlines() if ln.startswith("SET_VIEW_GEOM")]
+    )
     win._tile()
     qapp.processEvents()
     rects = [v.geometry for v in win.session.state.viewports]
     assert all(r is not None for r in rects)
     # Recorded per window: collapsing on command type alone would leave one.
+    # Counted as a delta, because opening a window now records where it was
+    # put as well, and those lines are in the script before tiling runs.
     lines = [ln for ln in win.session.to_script().splitlines() if ln.startswith("SET_VIEW_GEOM")]
-    assert len(lines) == len(rects)
+    assert len(lines) - before == len(rects)
 
 
 def test_tiling_does_not_cover_the_controller(win, qapp):
@@ -271,32 +277,119 @@ def test_the_threshold_label_follows_the_mode(win, qapp):
 
 
 # ---------------------------------------------------------------------------
+# the mode's input row
+# ---------------------------------------------------------------------------
+
+
+def test_a_mode_that_reads_nothing_shows_no_input_row(win, qapp):
+    """View has no input; a box saying "(auto: anat)" would invent a fit."""
+    assert win.session.mode.name == "plain"
+    assert not win.input_row_host.isVisible()
+
+
+def test_the_input_row_lists_the_runs_and_names_the_default(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    assert win4d.input_row_host.isVisible()
+    texts = [win4d.input_box.itemText(i) for i in range(win4d.input_box.count())]
+    assert texts[0].startswith("(auto: bold.nii.gz")
+    assert any("bold.nii.gz" in t for t in texts[1:])
+    # The 3-D anatomical is not offered: InstaCorr cannot correlate it.
+    assert not any("anat.nii.gz" in t for t in texts)
+
+
+def test_picking_an_input_re_points_the_mode(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    row = next(i for i in range(1, win4d.input_box.count()) if win4d.input_box.itemData(i))
+    key = win4d.input_box.itemData(row)
+    win4d.input_box.setCurrentIndex(row)
+    win4d.input_box.activated.emit(row)
+    qapp.processEvents()
+    assert win4d.session.state.input_key == key
+    assert f"SET_INPUT {key}" in win4d.session.to_script()
+
+
+def test_the_input_row_says_so_when_there_is_nothing_to_read(win, qapp):
+    """An empty drop-down invites a click that cannot be answered."""
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win.refresh(win.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    assert win.input_row_host.isVisible()
+    assert not win.input_box.isEnabled()
+    assert "load" in win.input_box.currentText()
+
+
+def test_an_unticked_run_is_still_offered_as_an_input(win4d, qapp):
+    """The whole point: hiding a run is about the picture, not the data."""
+    from fastfuncstuff.viewer.vocab import SetLayerVisible, SetMode
+
+    run = next(ly for ly in win4d.session.state.layers if ly.n_volumes > 1)
+    win4d.refresh(win4d.session.do(SetLayerVisible(run.key, on=False)))
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    keys = [win4d.input_box.itemData(i) for i in range(win4d.input_box.count())]
+    assert run.key in keys
+
+
+# ---------------------------------------------------------------------------
 # the pickers must agree with what is on screen
 # ---------------------------------------------------------------------------
 
 
-def test_a_fresh_read_selects_nothing(qapp, datadir):
-    """A picker naming a file while the panes are empty reads as a failed load."""
+def test_a_fresh_read_loads_nothing(qapp, datadir):
+    """Reading a directory fills the picker; it does not open anything."""
     session = ViewerSession(device=CPU)
     w = ViewerWindow(session)
     try:
         w.read_directory(datadir)
         qapp.processEvents()
-        assert w.underlay_box.currentText() == "(none)"
-        assert w.overlay_box.currentText() == "(none)"
+        assert w.data_box.currentIndex() == 0
+        assert w.data_box.count() == 3  # the prompt plus two datasets
         assert len(session.state.layers) == 0
     finally:
         w.close()
 
 
-def test_the_pickers_follow_what_is_loaded(win):
-    assert win.underlay_box.currentText().startswith("anat.nii.gz")
-    assert win.overlay_box.currentText().startswith("stats.nii.gz")
+def test_picking_a_dataset_loads_it_on_top(qapp, datadir):
+    """One verb. Picking twice stacks two layers rather than replacing one."""
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    try:
+        w.read_directory(datadir)
+        qapp.processEvents()
+        for name in ("anat.nii.gz", "stats.nii.gz"):
+            row = next(i for i in range(w.data_box.count()) if name in w.data_box.itemText(i))
+            w.data_box.setCurrentIndex(row)
+            w.data_box.activated.emit(row)
+            qapp.processEvents()
+        assert [ly.name for ly in session.state.layers] == ["anat.nii.gz", "stats.nii.gz"]
+        # The first one in defines the grid, because it is the bottom of the stack.
+        assert session.state.grid.shape == session.state.layers.layers[0].shape
+        assert session.state.selected == session.state.layers.layers[-1].key
+    finally:
+        w.close()
+
+
+def test_the_picker_offers_only_files_on_disk(win4d, qapp):
+    """It says what LOAD will open, so a derived layer has no row in it.
+
+    The old picker mirrored the stack and grew a row per file-less layer, which
+    offered to re-open something that was never on disk.
+    """
+    texts = [win4d.data_box.itemText(i) for i in range(win4d.data_box.count())]
+    assert all(t.startswith("(") or ".nii" in t for t in texts)
+    assert not any("C1" in t for t in texts)
 
 
 def test_picker_rows_are_two_columns(win):
     """Dimensions and volume count must be scannable, not truncated."""
-    row = win.underlay_box.itemText(1)
+    row = win.data_box.itemText(1)
     assert "anat.nii.gz" in row
     assert "10x12x8" in row
 
@@ -305,12 +398,11 @@ def test_pickers_are_wide_enough_for_their_widest_row(win):
     """Qt sizes a combo to its current item, which truncates the rest on macOS."""
     from PySide6 import QtGui
 
-    metrics = QtGui.QFontMetrics(win.underlay_box.font())
+    metrics = QtGui.QFontMetrics(win.data_box.font())
     widest = max(
-        metrics.horizontalAdvance(win.underlay_box.itemText(i))
-        for i in range(win.underlay_box.count())
+        metrics.horizontalAdvance(win.data_box.itemText(i)) for i in range(win.data_box.count())
     )
-    assert win.underlay_box.minimumWidth() >= widest
+    assert win.data_box.minimumWidth() >= widest
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1450,7 @@ def test_clicking_a_layer_does_not_disable_the_keyboard(win, qapp):
     win.layer_list.setCurrentRow(0)
     qapp.processEvents()
     assert win.layer_list.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
-    for box in (win.cmap_box, win.mode_box, win.underlay_box):
+    for box in (win.cmap_box, win.mode_box, win.data_box):
         assert box.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
 
 
@@ -1495,8 +1587,8 @@ def test_a_selection_can_be_saved_and_read_back(win4d, qapp, tmp_path):
     assert np.array_equal(np.asarray(img.dataobj) > 0.5, win4d.session.volume(layer.key, 0) > 0.5)
 
 
-def test_a_layer_with_no_file_is_named_once_in_the_picker(win4d, qapp):
-    """Every sync used to append another copy of the name to the picker."""
+def test_a_selection_layer_never_enters_the_picker(win4d, qapp):
+    """The picker used to grow a row per file-less layer, once per sync."""
     carpet = _carpet(win4d, qapp)
     carpet.resize(600, 400)
     qapp.processEvents()
@@ -1504,12 +1596,12 @@ def test_a_layer_with_no_file_is_named_once_in_the_picker(win4d, qapp):
     stack = win4d.session.state.layers
     from fastfuncstuff.viewer.vocab import MoveLayer
 
-    win4d._dispatch(MoveLayer(stack.layers[-1].key, 1))  # make it overlay-prime
+    win4d._dispatch(MoveLayer(stack.layers[-1].key, 1))
     for _ in range(3):
         win4d.refresh(Aspect.LAYERS)
-    name = stack.overlay.name
-    texts = [win4d.overlay_box.itemText(i) for i in range(win4d.overlay_box.count())]
-    assert texts.count(name) == 1
+    name = stack.layers[1].name
+    texts = [win4d.data_box.itemText(i) for i in range(win4d.data_box.count())]
+    assert texts.count(name) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2381,7 +2473,6 @@ def test_instaglm_declares_its_whole_panel(win_glm, qapp):
         "undershoot",
         "polort",
         "ortvec",
-        "ort_deriv",
         "pcs",
         "show",
         "column",
@@ -2443,3 +2534,47 @@ def test_switching_the_shown_map_redraws_without_a_refit(win_glm, qapp):
     assert win_glm.session.mode._fit is before
     layer = win_glm.session.state.layers.find_by_source("mode:instaglm")
     assert layer is not None and layer.name.endswith(" t")
+
+
+# ---------------------------------------------------------------------------
+# drawing mode and the debug report
+# ---------------------------------------------------------------------------
+
+
+def test_the_draw_box_names_which_way_auto_went(win, qapp):
+    """ "auto" alone is a question; the useful thing is knowing the answer."""
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert win.resample_box.itemText(0).startswith("auto (")
+    assert win.resample_box.currentText().startswith("auto")
+
+
+def test_e_cycles_how_the_layer_is_drawn(win, qapp):
+    from fastfuncstuff.viewer.ui.shortcuts import Binding  # noqa: F401
+
+    key = win.current_key()
+    assert win.session.state.layers.get(key).resample == "auto"
+    for expected in ("nearest", "linear", "auto"):
+        win._cycle_resample()
+        qapp.processEvents()
+        assert win.session.state.layers.get(key).resample == expected
+
+
+def test_the_debug_button_writes_a_report_and_says_where(win, qapp, tmp_path):
+    win._write_debug_report()
+    qapp.processEvents()
+    message = win.statusBar().currentMessage()
+    assert message.startswith("wrote ") and "path copied" in message
+    written = Path(message[len("wrote ") :].split(" (")[0])
+    assert written.exists()
+    text = written.read_text()
+    assert "# ffs viewer session report" in text
+    assert "DEFINES DISPLAY GRID" in text
+    assert "## script" in text
+
+
+def test_the_debug_report_covers_every_controller(win, qapp):
+    win.new_controller()
+    qapp.processEvents()
+    text = win.debug_report()
+    assert text.count("# ffs viewer session report") == len(win.controllers)

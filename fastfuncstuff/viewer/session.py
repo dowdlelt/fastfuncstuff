@@ -8,7 +8,7 @@ This is what a UI, a CLI or a test drives. Nothing above this layer touches
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -117,10 +117,62 @@ def _brick_name(layer: Layer, index: int) -> str:
     return f"#{index} " if layer.n_volumes > 1 and not layer.time_linked else ""
 
 
+def _overlay_array(overlay: ComputedOverlay) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """A mode's output as the ``(nx, ny, nz, nv)`` block the store adopts.
+
+    Two volumes when the mode wants to colour one thing and cut on another,
+    stacked shown-first so that ``volume_index`` 0 and ``threshold_index`` 1
+    are the same convention a stats bucket off disk already uses.
+    """
+    values = np.asarray(overlay.values, dtype=np.float32)
+    nx, ny, nz = (int(v) for v in values.shape[:3])
+    shape = (nx, ny, nz)
+    if overlay.threshold_values is None:
+        return values[..., None], shape
+    cut = np.asarray(overlay.threshold_values, dtype=np.float32)
+    if cut.shape[:3] != shape:
+        raise ValueError(f"threshold volume {cut.shape[:3]} does not match the overlay {shape}")
+    return np.stack([values, cut], axis=3), shape
+
+
+def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
+    """Layer fields that say where this overlay's threshold reads from."""
+    if overlay.threshold_values is None:
+        # Back to cutting on what is shown. Said explicitly because a layer
+        # that was two volumes a moment ago still points at sub-brick 1.
+        return {"threshold_index": None, "threshold_follow": "same", "stataux": {}}
+    stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
+    if overlay.threshold_stat is not None:
+        from fastfuncstuff.io.afni import stat_type_to_stataux
+
+        name, params = overlay.threshold_stat
+        flat = () if params is None else (params if isinstance(params, tuple) else (params,))
+        try:
+            stataux[1] = stat_type_to_stataux(name, flat)
+        except ValueError:
+            stataux = {}
+    # ``fixed``, not ``next``: the threshold brick is where the mode put it,
+    # and the shown brick never moves off 0, so following would be a rule
+    # describing something that cannot happen.
+    return {"threshold_index": 1, "threshold_follow": "fixed", "stataux": stataux}
+
+
 def _short(name: str, limit: int = 24) -> str:
     for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
         name = name.removesuffix(ext)
     return name if len(name) <= limit else "…" + name[-(limit - 1) :]
+
+
+def _voxel_size(affine: np.ndarray) -> float:
+    """One number for how big this grid's voxels are: the cube root of one
+    voxel's volume.
+
+    A single scalar rather than three, because the question it answers --
+    is this layer coarser than the grid -- has one answer. ``abs(det)`` rather
+    than the diagonal so an oblique or anisotropic grid is measured by the
+    volume it actually covers.
+    """
+    return float(abs(np.linalg.det(np.asarray(affine, dtype=float)[:3, :3])) ** (1.0 / 3.0))
 
 
 class ViewerSession:
@@ -472,18 +524,23 @@ class ViewerSession:
                 return found
         return available[-1]
 
-    def carpet_overlay(self, source: Layer) -> Layer | None:
-        """Which layer labels a carpet's rows.
+    def top_visible(self, *, besides: str | None = None) -> Layer | None:
+        """The topmost drawn layer, optionally ignoring one.
 
-        The topmost visible layer that is not the run being drawn -- not
-        "overlay-prime". In a stack of anat, run and stats the thing worth
-        drawing beside the rows is the stats map on top, and overlay-prime is
-        the run itself.
+        "What is on top" rather than "overlay-prime": in a stack of anat, run
+        and stats the thing worth reading a colour off is the stats map, and
+        index 1 is the run. Asked by everything that has to colour something
+        outside the panes -- a carpet's sidebar, a graph cell's wash -- so that
+        all of them agree with the picture and with each other.
         """
         for layer in reversed(list(self.state.layers)):
-            if layer.key != source.key and layer.visible:
+            if layer.visible and layer.key != besides:
                 return layer
         return None
+
+    def carpet_overlay(self, source: Layer) -> Layer | None:
+        """Which layer labels a carpet's rows: whatever is on top of the run."""
+        return self.top_visible(besides=source.key)
 
     def build_carpet(self, viewport, *, progress=None):
         """Render one carpet window's picture. Slow; runs on the worker.
@@ -585,6 +642,80 @@ class ViewerSession:
         volume = self.volume(layer.key)
         return np.asarray(volume, dtype=np.float32)
 
+    # -- how a layer is drawn into the grid --------------------------------
+
+    #: Beyond this ratio of layer voxel to display voxel, ``auto`` calls it
+    #: upsampling. Not 1.0, because two grids that differ by a rounding error
+    #: are the same grid, and flipping interpolation on that is noise.
+    UPSAMPLE_RATIO = 1.2
+
+    def resample_mode(self, layer: Layer) -> str:
+        """``"nearest"`` or ``"linear"`` for one layer. Display only.
+
+        This changes how the layer is *drawn* and nothing else. The voxels in
+        the store are untouched, every readout, graph, carpet, cluster table
+        and mode input still reads the layer's own array on the layer's own
+        grid, and switching it does not invalidate a fit.
+
+        ``auto`` decides by direction; see :attr:`Layer.resample` for why that
+        is the axis that matters.
+        """
+        if layer.resample in ("nearest", "linear"):
+            return layer.resample
+        grid = self.state.grid
+        if grid is None:
+            return "linear"
+        return (
+            "nearest"
+            if _voxel_size(layer.affine) > _voxel_size(grid.affine) * self.UPSAMPLE_RATIO
+            else "linear"
+        )
+
+    # -- what a mode reads -----------------------------------------------
+
+    def input_candidates(self, mode: Mode | None = None) -> list[Layer]:
+        """Every layer the mode could read, topmost first.
+
+        Every *loaded* layer, not every visible one. Unticking a run is how you
+        get it out of the picture once its stats map is drawn over the anatomy,
+        and it would be a strange viewer in which that also stopped you fitting
+        the run.
+        """
+        mode = self.mode if mode is None else mode
+        return [ly for ly in reversed(list(self.state.layers)) if mode.accepts(ly)]
+
+    def input_layer(self, mode: Mode | None = None) -> Layer | None:
+        """The layer the mode reads: the named one, else the best candidate.
+
+        The fallback is recomputed rather than written back, unlike
+        :meth:`ViewerState.selected_layer`, and the difference is deliberate.
+        A selection is a gesture and has to stay where it was put; an input
+        nobody has named is a default, and a default that froze onto the first
+        run loaded would mean the second run could never be fitted without
+        first being found in a menu.
+        """
+        mode = self.mode if mode is None else mode
+        named = self.state.layers.find(self.state.input_key) if self.state.input_key else None
+        if named is not None and mode.accepts(named):
+            return named
+        return mode.default_input(self.input_candidates(mode))
+
+    def set_input(self, key: str | None) -> Aspect:
+        """Name the layer the mode reads, or clear it back to the default."""
+        key = key or None
+        if key is not None and self.state.layers.find(key) is None:
+            raise KeyError(f"no layer {key!r} to use as input")
+        before = self.input_layer()
+        self.state.input_key = key
+        after = self.input_layer()
+        if before is not None and after is not None and before.key == after.key:
+            return Aspect.NOTHING
+        # The prepared array belongs to the old input, so it is not merely
+        # stale -- recomputing without re-preparing would draw the last run's
+        # map and label it with this one's name.
+        self.mode.invalidate()
+        return Aspect.LAYERS | Aspect.GRAPH | self.mode.refresh()
+
     def set_mode(self, name: str) -> Aspect:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:
@@ -671,7 +802,7 @@ class ViewerSession:
     def overlay_colors(
         self, cells: list[tuple[int, int, int]]
     ) -> list[tuple[float, float, float] | None] | None:
-        """The primary overlay's colour at each display voxel, or ``None`` where it is cut.
+        """The topmost drawn layer's colour at each display voxel, or ``None`` where cut.
 
         Drawn exactly as the slices draw it -- the same LUT, range, sign mode
         and threshold sub-brick -- so a cell's colour and the voxel under the
@@ -689,8 +820,13 @@ class ViewerSession:
         from fastfuncstuff.viewer.compose import cached_lut
 
         st = self.state
-        layer = st.layers.overlay
-        if layer is None or not layer.visible or st.grid is None or not cells:
+        layer = self.top_visible()
+        base = st.layers.base
+        if layer is not None and base is not None and layer.key == base.key:
+            # Only the base image is drawn, and washing a graph in the anatomy
+            # it is already sitting on says nothing.
+            layer = None
+        if layer is None or st.grid is None or not cells:
             return None
         volume = self.display_volume(layer.key)
         if volume is None:
@@ -1015,17 +1151,20 @@ class ViewerSession:
         return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
 
     # -- computed overlays ---------------------------------------------
-    def _add_on_top(self, layer: Layer) -> None:
-        """Push a made layer on top, selected, with other overlays hidden.
+    def _add_on_top(self, layer: Layer, *, hide: Iterable[str] = ()) -> None:
+        """Push a made layer on top, selected, hiding the layers named.
 
-        Hidden only here, on creation: whatever it was computed from -- a run,
-        usually -- drawn under a correlation map is noise over the anatomy. A
-        layer switched back on by hand stays on while the output is refined.
+        Only on creation, and only the ones named: a result is worth looking
+        at, and a 4-D run left drawn under its own correlation map is noise
+        over the anatomy, but those are the two facts -- everything else in the
+        stack was put there on purpose. This used to hide every visible layer
+        above the underlay, which made a second map impossible to keep beside
+        the first without switching it back on after every recompute.
         """
-        base = self.state.layers.base
-        for other in list(self.state.layers):
-            if other.visible and (base is None or other.key != base.key):
-                self.state.layers.update(other.key, visible=False)
+        for key in hide:
+            found = self.state.layers.find(key)
+            if found is not None and found.visible and found.key != layer.key:
+                self.state.layers.update(key, visible=False)
         self.state.layers.add(layer)
         self.state.selected = layer.key
         if self.state.grid is None:
@@ -1046,10 +1185,12 @@ class ViewerSession:
         """
         existing = self.state.layers.find_by_source(source)
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
-        self.store.adopt(key, overlay.values, name=overlay.name)
+        array, shape_of = _overlay_array(overlay)
+        self.store.adopt(key, array, name=overlay.name)
         self.invalidate(key)
 
         lo, hi = overlay.display_range or derive_range(overlay.values)
+        cut = _overlay_cut(overlay)
         if existing is not None:
             # The name is identity -- showing "IC 0" while displaying IC 4 is a
             # lie. Range and threshold deliberately do NOT follow: stepping
@@ -1060,6 +1201,18 @@ class ViewerSession:
             changes: dict[str, object] = {}
             if existing.name != overlay.name:
                 changes["name"] = overlay.name
+            # The shape of the output can change under one layer: ticking a
+            # threshold map on turns a one-volume overlay into two. Restated
+            # every time rather than only on creation, because a layer left
+            # claiming one volume while the store holds two thresholds on a
+            # brick that is no longer there.
+            changes.update(
+                n_volumes=int(array.shape[3]),
+                shape=shape_of,
+                labels=overlay.volume_labels,
+                volume_index=0,
+                **cut,
+            )
             if overlay.rescale:
                 changes.update(
                     colormap=overlay.colormap,
@@ -1070,20 +1223,24 @@ class ViewerSession:
             if changes:
                 self.state.layers.update(key, **changes)
         else:
+            consumed = self.mode.input_layer_key() if self.mode.layer_source == source else None
             self._add_on_top(
-                Layer(
+                hide=[consumed] if consumed else [],
+                layer=Layer(
                     key=key,
                     name=overlay.name,
                     path=f"<{overlay.name}>",
-                    shape=tuple(int(v) for v in overlay.values.shape[:3]),
-                    n_volumes=1,
+                    shape=shape_of,
+                    n_volumes=int(array.shape[3]),
+                    labels=overlay.volume_labels,
                     affine=np.asarray(overlay.affine, dtype=float),
                     colormap=overlay.colormap,
                     range_lo=lo,
                     range_hi=hi,
                     threshold=overlay.threshold or 0.0,
                     source=source,
-                )
+                    **cut,
+                ),
             )
         return key
 
@@ -1451,7 +1608,7 @@ class ViewerSession:
         one.
 
         On creation it goes on top, is selected, and every other visible layer
-        above the underlay is hidden: the selected voxels may be scattered
+        above the bottom of the stack is hidden: the selected voxels may be scattered
         across the brain, and a stat map drawn over them hides exactly where
         they went. Only on creation, so an overlay turned back on by hand stays
         on while the selection is refined.
@@ -1465,8 +1622,10 @@ class ViewerSession:
             self.state.layers.update(key, name=name, path=f"<{name}>")
             return key, Aspect.LAYERS | Aspect.SLICES
 
+        base = self.state.layers.base
         self._add_on_top(
-            Layer(
+            hide=[ly.key for ly in self.state.layers if base is None or ly.key != base.key],
+            layer=Layer(
                 key=key,
                 name=name,
                 path=f"<{name}>",
@@ -1479,7 +1638,7 @@ class ViewerSession:
                 range_hi=1.0,
                 threshold=0.5,
                 source=source,
-            )
+            ),
         )
         return key, Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
 
@@ -1532,8 +1691,29 @@ class ViewerSession:
                 return layer, found
         return None
 
+    def layer_voxel(self, affine: np.ndarray, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        """A display-grid voxel as the nearest voxel of a layer on ``affine``.
+
+        Through millimetres, because the display grid belongs to the bottom of
+        the stack and nothing else is obliged to share it. **Anything that
+        reads a layer's array at "where the crosshair is" has to come through
+        here.** Indexing a 3 mm run with an index into a 1 mm anatomy is out of
+        bounds near the far edge -- which reads as "the graph stopped working"
+        -- and, worse, *in* bounds near the origin, where it silently returns a
+        voxel three times too close to the corner.
+
+        Nearest rather than interpolated: a plotted time course should be one
+        the scanner measured.
+        """
+        grid = self.state.grid
+        if grid is None:
+            return ijk
+        mm = grid.ijk_to_mm(ijk)
+        v = np.linalg.inv(np.asarray(affine, dtype=float)) @ np.array([*mm, 1.0])
+        return (int(round(float(v[0]))), int(round(float(v[1]))), int(round(float(v[2]))))
+
     def timeseries(self, key: str, ijk: tuple[int, int, int] | None = None) -> np.ndarray:
-        """The time course at a voxel, or an empty array if not yet resident.
+        """The time course at a display-grid voxel, empty if not yet resident.
 
         Returns empty rather than blocking: the graph pane asks on every
         crosshair move, and waiting seconds for an inflate would be exactly the
@@ -1542,7 +1722,9 @@ class ViewerSession:
         res = self.store.get(key)
         if res.array is None:
             return np.empty(0, dtype=np.float32)
-        i, j, k = ijk if ijk is not None else self.state.crosshair
+        layer = self.state.layers.find(key)
+        ijk = self.state.crosshair if ijk is None else ijk
+        i, j, k = ijk if layer is None else self.layer_voxel(layer.affine, ijk)
         nx, ny, nz = res.array.shape[:3]
         if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
             return np.empty(0, dtype=np.float32)

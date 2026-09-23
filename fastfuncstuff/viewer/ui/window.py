@@ -1,7 +1,15 @@
 """The controller: a data selector, driving N companion windows.
 
-The core is one row -- Read, Underlay, Overlay, +1, Mode. That is the whole
-viewer; images and graphs are things you turn on beside it.
+The core is one row -- Read, Data, Load, Mode -- over a stack list. That is the
+whole viewer; images and graphs are things you turn on beside it.
+
+It used to be Read, Underlay, Overlay, +1, Mode, which made you say what kind
+of thing a file was before you had opened it. The answer changes with the
+question: an anatomical is an overlay when you are checking alignment, a run is
+an underlay while you set its mask, and a GLM result wants the run loaded but
+not drawn. So there is one load, and where a layer sits, whether it is drawn
+and whether a mode reads it are three separate things decided afterwards -- the
+first in the stack list, the second by its tick box, the third by INPUT.
 
 This window holds no brain. Every image and every graph is a top-level window
 described by a :class:`~viewer.viewports.Viewport` and reconciled by
@@ -48,14 +56,16 @@ from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
+from fastfuncstuff.viewer.ui.flow import FlowBar
 from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
+from fastfuncstuff.viewer.ui.widgets import RowSizedList
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
-    AddOverlay,
+    Load,
     ModeAction,
     MoveLayer,
     Read,
@@ -67,15 +77,16 @@ from fastfuncstuff.viewer.vocab import (
     SetColormap,
     SetIJK,
     SetIndex,
+    SetInput,
     SetLayerOpacity,
     SetLayerRoi,
     SetLayerVisible,
     SetMatrixOrder,
     SetMode,
     SetModeParam,
-    SetOverlay,
     SetRange,
     SetRangeMirror,
+    SetResample,
     SetSeed,
     SetSign,
     SetTheme,
@@ -83,7 +94,6 @@ from fastfuncstuff.viewer.vocab import (
     SetThresholdFollow,
     SetThresholdIndex,
     SetTimeLinked,
-    SetUnderlay,
     SetViewDetrend,
     SetViewRois,
     SetViewScaling,
@@ -108,7 +118,10 @@ BUILT_SETTINGS = (
 
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
 #: displayed reads as a load that failed.
-NONE_LABEL = "(none)"
+#: The picker's first row. It names what LOAD will open next rather than what
+#: is on screen -- the stack list below says that -- so it prompts rather than
+#: reporting "(none)" over a window full of data.
+NONE_LABEL = "(choose a dataset)"
 
 
 class _Bridge(QtCore.QObject):
@@ -134,6 +147,10 @@ class Controller:
 
 #: How long a directory has to stay quiet before a rescan runs.
 RESCAN_QUIET_MS = 1200
+#: Layers shown before the list scrolls. Six covers an anatomy, a run, a mode's
+#: output and a couple of kept copies -- past that the list is being used as a
+#: workspace and scrolling it is better than spending the panel on it.
+LAYER_ROWS = 6
 BACKGROUND = QtCore.Qt.ItemDataRole.BackgroundRole
 FOREGROUND = QtCore.Qt.ItemDataRole.ForegroundRole
 
@@ -146,7 +163,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
-        self.resize(430, 820)
+        # Wide enough that the panel never scrolls sideways. The layer form
+        # beside the colour bar needs ~480 once a stats layer gives the
+        # sub-brick pickers something to show, and a controller that clips its
+        # own range numbers to save twenty pixels is saving the wrong thing.
+        self.resize(500, 820)
 
         # Watching the directory. A pipeline writes a file in bursts, so a
         # change starts a quiet period and the rescan runs once it ends,
@@ -448,44 +469,59 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
 
+        # Pushed to the right end of the row: it is not part of the load
+        # gesture and should not sit in the middle of it.
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred
+        )
+        bar.addWidget(spacer)
+
+        self.debug_button = QtWidgets.QPushButton("DEBUG")
+        self.debug_button.setToolTip(
+            "Write everything about this session to a text file and copy the\n"
+            "path: every layer's grid, affine and voxel size, which one is\n"
+            "defining the display, what the mode is reading, and the full\n"
+            "recorded script -- which replays the session against the same\n"
+            "files. For handing to someone who cannot see your screen."
+        )
+        self.debug_button.clicked.connect(self._write_debug_report)
+        bar.addWidget(self.debug_button)
+
         picks = QtWidgets.QToolBar("data")
         picks.setMovable(False)
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, picks)
 
+        # One row, not the UNDERLAY / OVERLAY / [+]1 grid this replaces. Those
+        # three asked which of two kinds of thing a file was before it had been
+        # opened, and the answer was mostly wrong: an anatomical is an overlay
+        # when you are checking alignment, a run is an underlay while you set
+        # its mask. Loading is loading; where it sits and whether it is drawn
+        # are answered afterwards, in the stack, by the layer it became.
         grid_host = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(grid_host)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(5)
+        row = QtWidgets.QHBoxLayout(grid_host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
 
-        grid.addWidget(self._head("UNDERLAY"), 0, 0)
-        self.underlay_box = QtWidgets.QComboBox()
-        self.underlay_box.setFont(QtGui.QFont(MONO))
-        self.underlay_box.addItem(NONE_LABEL, userData=None)
-        self.underlay_box.activated.connect(lambda _: self._pick(self.underlay_box, SetUnderlay))
-        grid.addWidget(self.underlay_box, 0, 1)
+        row.addWidget(self._head("DATA"))
+        self.data_box = QtWidgets.QComboBox()
+        self.data_box.setFont(QtGui.QFont(MONO))
+        self.data_box.addItem(NONE_LABEL, userData=None)
+        # Picking is loading: the extra click on LOAD would be a confirmation
+        # of something already unambiguous, and the button stays for the second
+        # copy -- the same file over itself, at two thresholds.
+        self.data_box.activated.connect(lambda _: self._pick(self.data_box, Load))
+        row.addWidget(self.data_box, 1)
 
-        grid.addWidget(self._head("OVERLAY"), 1, 0)
-        self.overlay_box = QtWidgets.QComboBox()
-        self.overlay_box.setFont(QtGui.QFont(MONO))
-        self.overlay_box.addItem(NONE_LABEL, userData=None)
-        self.overlay_box.activated.connect(lambda _: self._pick(self.overlay_box, SetOverlay))
-        grid.addWidget(self.overlay_box, 1, 1)
+        self.load_button = QtWidgets.QPushButton(key_label("LOAD", "^L"))
+        self.load_button.setToolTip(
+            "Put the chosen dataset on top of the stack (ctrl+L).\n"
+            "Press it again for a second copy of the same file."
+        )
+        self.load_button.clicked.connect(lambda: self._pick(self.data_box, Load))
+        row.addWidget(self.load_button)
 
-        self.plus_button = QtWidgets.QPushButton("[+]1")
-        self.plus_button.setToolTip("Add the selected dataset on top, keeping the current overlay")
-        self.plus_button.clicked.connect(lambda: self._pick(self.overlay_box, AddOverlay))
-        grid.addWidget(self.plus_button, 1, 2)
-
-        grid.addWidget(self._head("MODE"), 2, 0)
-        self.mode_box = QtWidgets.QComboBox()
-        labels = registry.labels()
-        for name in registry.names():
-            self.mode_box.addItem(labels[name], userData=name)
-        self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
-        self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
-        grid.addWidget(self.mode_box, 2, 1)
-        grid.setColumnStretch(1, 1)
         picks.addWidget(grid_host)
 
         self._build_window_bar()
@@ -496,7 +532,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
         bar.setMovable(False)
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, bar)
-        bar.addWidget(self._head("WINDOWS"))
+
+        # The mode picker lives here rather than as a third row of the dataset
+        # grid. That grid's value column is stretched to fit a forty-character
+        # filename, and the mode names are the six shortest strings in the
+        # interface -- so MODE was the widest control in the window and said
+        # the least. Here it is sized to its own text and the row it used to
+        # occupy goes back to the window buttons, several of which were being
+        # pushed into the toolbar's overflow menu and so were not findable at
+        # all.
+        # Expanding, or the toolbar hands the host only its size hint -- which
+        # a flow layout reports as its widest single item, because it can
+        # always wrap. The buttons then flow one per row down a 104-pixel
+        # column, which is worse than the overflow menu this replaces.
+        flow = FlowBar(spacing=4)
+        bar.addWidget(flow)
+
+        flow.addWidget(self._head("MODE"))
+        self.mode_box = QtWidgets.QComboBox()
+        labels = registry.labels()
+        for name in registry.names():
+            self.mode_box.addItem(labels[name], userData=name)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
+        self.mode_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
+        flow.addWidget(self.mode_box)
 
         for text, key, tip, slot in (
             ("+IMAGE", "n", "Open another image window", self._new_image),
@@ -524,29 +584,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
+            b.setObjectName("tool")
             b.setToolTip(f"{tip} ({key})")
             b.clicked.connect(slot)
-            bar.addWidget(b)
+            flow.addWidget(b)
 
-        bar.addSeparator()
         # Names the palette you would switch *to*, not the one you are in: a
         # button labelled with the current state reads as a status light and
         # gets pressed by people who wanted it to stay that way.
         self.theme_button = QtWidgets.QPushButton("")
         self.theme_button.setToolTip("Switch between the dark and light palette (d)")
+        self.theme_button.setObjectName("tool")
         self.theme_button.clicked.connect(self._toggle_theme)
-        bar.addWidget(self.theme_button)
+        flow.addWidget(self.theme_button)
 
-        bar.addSeparator()
-        bar.addWidget(self._head("T"))
+        flow.addWidget(self._head("T"))
         self.time_spin = QtWidgets.QSpinBox()
         self.time_spin.setToolTip("Jump to a volume ( , and . step, v plays )")
         self.time_spin.setKeyboardTracking(False)
         self.time_spin.setMaximumWidth(84)
         self.time_spin.valueChanged.connect(self._time_spin_changed)
-        bar.addWidget(self.time_spin)
+        flow.addWidget(self.time_spin)
         self.time_label = QtWidgets.QLabel("")
-        bar.addWidget(self.time_label)
+        flow.addWidget(self.time_label)
 
     @staticmethod
     def _fit_picker(box: QtWidgets.QComboBox) -> None:
@@ -573,11 +633,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         A sub-brick label can be forty characters, and a form column sized to
         it pushes the colour bar off the side of the controller.
+
+        Five characters rather than eight: eight still left the THR ON row --
+        a picker plus two tick boxes -- as the widest thing in the panel, so
+        the panel scrolled sideways and clipped the range numbers off the far
+        edge. The popup is where a long label is read, and that is not elided.
         """
         box.setSizeAdjustPolicy(
             QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        box.setMinimumContentsLength(8)
+        box.setMinimumContentsLength(5)
         view = box.view()
         if view is not None:
             view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
@@ -698,7 +763,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # Two columns, monospaced and padded, so a directory can be scanned by
         # dimensions and volume count rather than read name by name.
         width = max((len(e.name) for e in entries), default=0)
-        for box in (self.underlay_box, self.overlay_box):
+        for box in (self.data_box,):
             box.blockSignals(True)
             box.clear()
             # Nothing is loaded until something is picked; an entry showing in
@@ -719,7 +784,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.setCurrentIndex(0)
             box.blockSignals(False)
             self._fit_picker(box)
-        self._sync_pickers()
 
     # ------------------------------------------------------------------
     # companion windows
@@ -948,12 +1012,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _build_panel(self) -> None:
         panel = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(panel)
-        v.setContentsMargins(9, 9, 9, 9)
-        v.setSpacing(8)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(5)
 
         v.addWidget(self._head("LAYERS  [ / ]"))
-        self.layer_list = QtWidgets.QListWidget()
-        self.layer_list.setMaximumHeight(190)
+        # Sized to the stack rather than to the space available. Four layers is
+        # the common case and nine is a lot; a fixed 190-pixel box spent most of
+        # itself on blank rows, and those pixels came out of the sections below
+        # it -- which is how changing a mode parameter pushed the colour bar off
+        # the bottom of the controller. Past the cap it scrolls, which is the
+        # right thing for the list to give up rather than the whole panel.
+        self.layer_list = RowSizedList(max_rows=LAYER_ROWS, min_rows=2)
         self.layer_list.setToolTip(
             "[ and ] step through the stack; space or the tick box hides a layer.\n"
             "A soloed image window draws whichever one is selected here."
@@ -990,7 +1059,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setToolTip(f"{tip} ({key})")
-            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
             b.clicked.connect(slot)
             stack_row.addWidget(b, *divmod(position, 3))
         v.addLayout(stack_row)
@@ -1000,9 +1069,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # column of space the form's labels leave free instead of claiming a
         # full-width band of their own below it.
         controls = QtWidgets.QHBoxLayout()
-        controls.setSpacing(8)
+        controls.setSpacing(6)
         form = QtWidgets.QFormLayout()
-        form.setSpacing(7)
+        form.setSpacing(4)
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # A stats bucket is a stack of named contrasts, and the names are in
@@ -1090,6 +1159,30 @@ class ViewerWindow(QtWidgets.QMainWindow):
         alpha_row.addStretch(1)
         form.addRow(self._head(key_label("ALPHA", "a")), self.alpha_row)
 
+        # Display only, and the label says so, because the obvious worry on
+        # seeing an interpolation control next to a statistic map is that it is
+        # touching the numbers. It is not: the voxels, the graphs, the cluster
+        # table and the mode's input all read the layer's own array on the
+        # layer's own grid whatever this says.
+        self.resample_box = QtWidgets.QComboBox()
+        self.resample_box.setToolTip(
+            "How this layer is PAINTED into the display grid. Nothing else --\n"
+            "the data, the graphs, the cluster table and what a mode fits are\n"
+            "untouched by it.\n\n"
+            "auto: nearest when the layer is coarser than the grid, linear when\n"
+            "finer. So a 3 mm run drawn on a 1 mm anatomy keeps its own voxels\n"
+            "instead of being smoothed into a resolution it does not have.\n"
+            "Press 'e' to cycle."
+        )
+        for label, value in (("auto", "auto"), ("nearest", "nearest"), ("linear", "linear")):
+            self.resample_box.addItem(label, userData=value)
+        self.resample_box.activated.connect(
+            lambda i: self._apply(SetResample, how=str(self.resample_box.itemData(i)))
+        )
+        self._shrinkable(self.resample_box)
+        self.resample_head = self._head(key_label("DRAW", "e"))
+        form.addRow(self.resample_head, self.resample_box)
+
         # Min, threshold and max are edited on the bar itself. Splitting the
         # number from the picture of the number is what let the bar go stale.
         self.rangebar = RangeBar()
@@ -1153,6 +1246,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
         bar_column.addWidget(self.rangebar, 1)
         controls.addLayout(bar_column)
         v.addLayout(controls)
+
+        # Above the MODE PARAMETERS header, not under it: the input is not a
+        # parameter, it is the thing the parameters are all about, and it is
+        # the first question the mode asks. Its own row rather than a declared
+        # control, since every mode that reads anything asks it and none of
+        # them should have to say so.
+        input_row = QtWidgets.QHBoxLayout()
+        input_row.setSpacing(6)
+        self.input_head = self._head("INPUT")
+        input_row.addWidget(self.input_head)
+        self.input_box = QtWidgets.QComboBox()
+        self.input_box.setFont(QtGui.QFont(MONO))
+        self.input_box.setToolTip(
+            "Which loaded dataset this mode computes from.\n"
+            "Independent of what is drawn: a run can be unticked in the stack,\n"
+            "or sitting under the anatomy, and still be what the fit reads."
+        )
+        self.input_box.activated.connect(
+            lambda i: self._dispatch_input(self.input_box.itemData(i) or "")
+        )
+        self._shrinkable(self.input_box)
+        input_row.addWidget(self.input_box, 1)
+        self.input_row_host = QtWidgets.QWidget()
+        self.input_row_host.setLayout(input_row)
+        v.addWidget(self.input_row_host)
 
         self.mode_head = self._head("MODE PARAMETERS")
         v.addWidget(self.mode_head)
@@ -1306,6 +1424,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("s", "next sign mode", self._cycle_sign, group="layer"),
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
+                Binding(
+                    "e",
+                    "cycle how it is drawn (auto / nearest / linear)",
+                    self._cycle_resample,
+                    group="layer",
+                ),
                 Binding("{", "move layer down the stack", lambda: self._reorder(-1), group="layer"),
                 Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
                 Binding("u", "make it the underlay", self._make_underlay, group="layer"),
@@ -1332,6 +1456,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     for n, letter in enumerate(LETTERS[:5], start=1)
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
+                Binding(
+                    "ctrl+l",
+                    "load the chosen dataset",
+                    lambda: self._pick(self.data_box, Load),
+                    group="session",
+                ),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
                 Binding("h", "this list", self.help.toggle, group="session"),
             ]
@@ -1568,10 +1698,49 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.session.save_script(path, header="nexus session")
             self.statusBar().showMessage(f"wrote {path}", 4000)
 
+    def debug_report(self) -> str:
+        """This controller's state as text, with every other controller after it.
+
+        All of them, because a question about one tab is usually a question
+        about how it differs from the tab beside it.
+        """
+        from fastfuncstuff.viewer import report
+
+        parts = [report.describe(self.session)]
+        for ctl in self.controllers:
+            if ctl.session is not self.session:
+                parts.append(report.describe(ctl.session))
+        return ("\n\n" + "=" * 78 + "\n\n").join(parts)
+
+    def _write_debug_report(self) -> None:
+        """Write the report beside the data, or to a temp file, and say where.
+
+        Beside the data because that is the directory already open in the
+        terminal the question is going to be asked from. The path goes on the
+        clipboard as well as into the status bar: it exists to be pasted.
+        """
+        import tempfile
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"ffs_viewer_state_{stamp}.txt"
+        directory = self.session.catalog_dir
+        out = Path(directory) / name if directory else Path(tempfile.gettempdir()) / name
+        try:
+            out.write_text(self.debug_report())
+        except OSError:
+            # A read-only results directory is normal; the report is worth more
+            # than the placement.
+            out = Path(tempfile.gettempdir()) / name
+            out.write_text(self.debug_report())
+        clip = QtWidgets.QApplication.clipboard()
+        if clip is not None:
+            clip.setText(str(out))
+        self.statusBar().showMessage(f"wrote {out} (path copied)", 8000)
+
     def open_path(self, path: str | Path) -> None:
-        """Open one dataset: as the underlay if there is none, else on top."""
-        cmd = SetUnderlay if not len(self.session.state.layers) else AddOverlay
-        self._dispatch(cmd(str(path)))
+        """Open one dataset, on top of whatever is already loaded."""
+        self._dispatch(Load(str(path)))
         self._sync_layer_list()
 
     # ------------------------------------------------------------------
@@ -1639,7 +1808,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._apply_theme()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
             self._sync_layer_list()
-            self._sync_pickers()
             self._sync_mode_panel()
         elif dirty & (Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.SLICES):
             # The bar is a view of colormap, range and threshold, so it has to
@@ -1665,42 +1833,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if dirty & (Aspect.THRESHOLD | Aspect.LAYERS | Aspect.GRID):
             self.refresh_clusters(ctl=ctl)
         ctl.manager.redraw(dirty)
-
-    def _sync_pickers(self) -> None:
-        """Point each picker at the layer it currently governs.
-
-        A picker reading "(none)" while that layer is on screen is the same
-        confusion as one naming a file while nothing is displayed -- in both
-        cases the control disagrees with the view.
-        """
-        base = self.session.state.layers.base
-        overlay = self.session.state.layers.overlay
-        for box, layer in ((self.underlay_box, base), (self.overlay_box, overlay)):
-            box.blockSignals(True)
-            index = 0  # (none)
-            if layer is not None and not layer.is_computed:
-                for i in range(1, box.count()):
-                    entry = box.itemData(i)
-                    if entry is not None and str(entry.path) == layer.path:
-                        index = i
-                        break
-                else:
-                    # Loaded from outside the catalog: name it rather than lie.
-                    # Reused rather than appended, or every sync grows the
-                    # picker by one more copy of the same name.
-                    index = next(
-                        (
-                            i
-                            for i in range(1, box.count())
-                            if box.itemData(i) is None and box.itemText(i) == layer.name
-                        ),
-                        -1,
-                    )
-                    if index < 0:
-                        box.addItem(layer.name, userData=None)
-                        index = box.count() - 1
-            box.setCurrentIndex(index)
-            box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
         self._watch()
@@ -1728,7 +1860,51 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # state is a refresh that dispatches, which puts a SELECT_LAYER into
         # the recording for every repaint and can recurse.
         self.layer_list.blockSignals(False)
+        self.layer_list.rows_changed()
         self._sync_layer_controls()
+
+    def _dispatch_input(self, key: str) -> None:
+        self._dispatch(SetInput(key))
+        self._prepare_then_refresh()
+
+    def _sync_input_box(self) -> None:
+        """List what the mode could read, and point at what it does read.
+
+        Hidden entirely for a mode that reads nothing from the stack, and shown
+        disabled with a reason when there is nothing it could read -- an empty
+        drop-down says "pick one" about a list with nothing in it.
+        """
+        mode = self.session.mode
+        if mode.input_kind == "none":
+            self.input_row_host.setVisible(False)
+            return
+        self.input_row_host.setVisible(True)
+        candidates = self.session.input_candidates()
+        current = self.session.input_layer()
+        self.input_box.blockSignals(True)
+        self.input_box.clear()
+        if not candidates:
+            wanted = "a 4-D time series" if mode.input_kind == "4d" else "a dataset"
+            self.input_box.addItem(f"(load {wanted})", userData="")
+            self.input_box.setEnabled(False)
+        else:
+            self.input_box.setEnabled(True)
+            # "(auto)" names the default rather than hiding it, so a stack with
+            # two runs in it does not silently fit one of them.
+            head = candidates[0].name if candidates else ""
+            self.input_box.addItem(f"(auto: {head})", userData="")
+            for layer in candidates:
+                self.input_box.addItem(f"{layer.name} [{layer.key}]", userData=layer.key)
+            named = self.session.state.input_key
+            index = self.input_box.findData(named) if named else 0
+            self.input_box.setCurrentIndex(index if index >= 0 else 0)
+        self.input_box.blockSignals(False)
+        self.input_box.setToolTip(
+            "Which loaded dataset this mode computes from"
+            + (f" -- now {current.name}.\n" if current is not None else ".\n")
+            + "Independent of what is drawn: a run can be unticked in the stack,\n"
+            "or sitting under the anatomy, and still be what the fit reads."
+        )
 
     def _sync_mode_panel(self) -> None:
         mode = self.session.mode
@@ -1736,11 +1912,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
         has = bool(mode.controls()) or bool(mode.actions())
         self.mode_head.setVisible(has)
         self.mode_panel.setVisible(has)
+        self._sync_input_box()
         idx = self.mode_box.findData(mode.name)
         if idx >= 0 and idx != self.mode_box.currentIndex():
             self.mode_box.blockSignals(True)
             self.mode_box.setCurrentIndex(idx)
             self.mode_box.blockSignals(False)
+
+    def _cycle_resample(self) -> None:
+        """auto -> nearest -> linear -> auto on the selected layer.
+
+        A cycle rather than a toggle because the useful gesture is comparing
+        the two against the automatic choice, and three states is one key.
+        """
+        layer = self.session.state.selected_layer()
+        if layer is None:
+            return
+        order = ("auto", "nearest", "linear")
+        nxt = (
+            order[(order.index(layer.resample) + 1) % len(order)]
+            if layer.resample in order
+            else "auto"
+        )
+        self._apply(SetResample, how=nxt)
 
     def _sync_layer_controls(self) -> None:
         key = self.current_key()
@@ -1755,6 +1949,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.rangebar,
             self.opacity_slider,
             self.boxed_check,
+            self.resample_box,
         ):
             widget.setEnabled(key is not None)
         if key is None:
@@ -1780,6 +1975,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setChecked(value)
             check.setEnabled(enabled)
             check.blockSignals(False)
+        # "auto (nearest)" rather than "auto": the whole value of the automatic
+        # setting is knowing which way it went, and a layer that looks blocky
+        # while the box says "auto" is a question rather than an answer.
+        resolved = self.session.resample_mode(layer)
+        self.resample_box.blockSignals(True)
+        self.resample_box.setItemText(0, f"auto ({resolved})")
+        index = self.resample_box.findData(layer.resample)
+        self.resample_box.setCurrentIndex(max(index, 0))
+        self.resample_box.blockSignals(False)
         self._sync_brick_pickers(layer)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))

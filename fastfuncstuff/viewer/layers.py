@@ -110,6 +110,19 @@ class Layer:
     threshold_follow: str = "same"
     alpha_mode: AlphaMode = AlphaMode.OFF
     boxed: bool = False
+    #: How this layer is sampled into the display grid: ``auto``, ``nearest``
+    #: or ``linear``.
+    #:
+    #: ``auto`` decides by direction, which is the thing that actually matters.
+    #: Drawing a 3 mm functional on a 1 mm anatomical's grid is *upsampling*,
+    #: and interpolating it there paints a resolution the data does not have --
+    #: a thresholded cluster's edge lands between real voxels, and a map you
+    #: are about to believe looks smoother and larger than it is. So a layer
+    #: coarser than the grid is sampled nearest, and its voxels stay visible as
+    #: voxels. A layer finer than the grid is being downsampled, where nearest
+    #: aliases and linear is right. Override when the guess is wrong: a smooth
+    #: coarse field -- a warp, a bias estimate -- reads better interpolated.
+    resample: str = "auto"
 
     def with_(self, **changes: object) -> Layer:
         """Return a copy with fields replaced."""
@@ -262,9 +275,13 @@ class LayerStack:
     # -- underlay / overlay roles --------------------------------------
     #
     # Position is the truth: index 0 is drawn first, so "the underlay" is
-    # simply the bottom of the stack and "the overlay" the one above it. These
-    # helpers exist because that is how people think and how the buttons are
-    # labelled, not because the stack has a second notion of identity.
+    # simply the bottom of the stack and "the overlay" the one above it.
+    #
+    # The two *replacing* helpers below are legacy. Nothing in the interface
+    # calls them any more -- LOAD adds a layer and the stack list arranges it
+    # -- but SET_UNDERLAY and SET_OVERLAY still have to mean what they meant
+    # when a recorded script was written, and that is replacement. The plain
+    # accessors are position, which is not legacy and not going anywhere.
 
     def set_underlay(self, layer: Layer) -> Layer:
         """Replace the bottom layer, keeping everything stacked above it."""

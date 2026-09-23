@@ -159,10 +159,10 @@ def set_theme(name: str) -> bool:
 # something else has your hands, not leaned into.
 
 MONO = "Menlo" if sys.platform == "darwin" else "monospace"
-FONT_BODY = 13
-FONT_HEAD = 12
-FONT_SMALL = 11
-FONT_READOUT = 14
+FONT_BODY = 12
+FONT_HEAD = 11
+FONT_SMALL = 10
+FONT_READOUT = 13
 
 
 def key_label(text: str, key: str | None) -> str:
@@ -188,11 +188,11 @@ def stylesheet() -> str:
     return f"""
 QMainWindow, QWidget {{ background: {c.bg}; color: {c.text};
     font-family: {MONO}; font-size: {FONT_BODY}px; }}
-QDockWidget::title {{ background: {c.panel}; padding: 7px 9px;
+QDockWidget::title {{ background: {c.panel}; padding: 5px 7px;
     font-size: {FONT_HEAD}px; letter-spacing: 2px; color: {c.head}; }}
 QListWidget {{ background: {c.panel}; border: 1px solid {c.edge}; outline: none;
     font-family: {MONO}; font-size: {FONT_BODY}px; }}
-QListWidget::item {{ padding: 5px 8px; }}
+QListWidget::item {{ padding: 2px 6px; }}
 QListWidget::item:selected {{ background: {c.select}; color: {c.accent}; }}
 QLabel {{ color: {c.dim}; font-size: {FONT_HEAD}px; letter-spacing: 1px; }}
 QLabel#value {{ color: {c.text}; font-family: {MONO}; font-size: {FONT_READOUT}px;
@@ -204,12 +204,13 @@ QLabel#group {{ color: {c.head}; font-size: {FONT_HEAD}px; letter-spacing: 2px; 
 QSlider::groove:horizontal {{ height: 2px; background: {c.edge}; }}
 QSlider::handle:horizontal {{ background: {c.accent}; width: 9px; margin: -6px 0; }}
 QComboBox, QSpinBox, QDoubleSpinBox {{ background: {c.panel}; border: 1px solid {c.edge};
-    padding: 4px 7px; font-family: {MONO}; font-size: {FONT_BODY}px; color: {c.text}; }}
+    padding: 2px 5px; font-family: {MONO}; font-size: {FONT_BODY}px; color: {c.text}; }}
 QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {c.edge_lit}; }}
 QComboBox QAbstractItemView {{ background: {c.panel}; color: {c.text};
     selection-background-color: {c.select}; selection-color: {c.accent}; }}
-QPushButton {{ background: {c.panel}; border: 1px solid {c.edge}; padding: 5px 11px;
+QPushButton {{ background: {c.panel}; border: 1px solid {c.edge}; padding: 3px 7px;
     font-family: {MONO}; font-size: {FONT_BODY}px; letter-spacing: 1px; color: {c.text}; }}
+QPushButton#tool {{ padding: 1px 3px; letter-spacing: 0px; }}
 QPushButton:hover {{ background: {c.select}; border-color: {c.edge_lit}; }}
 QPushButton:checked {{ background: {c.select}; border-color: {c.edge_lit}; color: {c.accent}; }}
 QPushButton:disabled {{ color: {c.faint}; border-color: {c.edge}; }}
@@ -224,7 +225,7 @@ QStatusBar::item {{ border: 0; }}
 QProgressBar {{ background: {c.panel}; border: 1px solid {c.edge}; height: 14px;
     text-align: center; font-size: {FONT_SMALL}px; color: {c.dim}; }}
 QProgressBar::chunk {{ background: {c.head}; }}
-QToolBar {{ background: {c.panel}; border: 0; spacing: 6px; padding: 6px 8px; }}
+QToolBar {{ background: {c.panel}; border: 0; spacing: 4px; padding: 4px 6px; }}
 QScrollArea {{ background: {c.bg}; }}
 QToolTip {{ background: {c.panel}; color: {c.text}; border: 1px solid {c.edge_lit};
     font-family: {MONO}; font-size: {FONT_SMALL}px; padding: 4px; }}

@@ -318,20 +318,6 @@ def task_columns(
     return np.asarray(design.detach().cpu().numpy(), dtype=np.float64), labels
 
 
-def derivative_columns(columns: np.ndarray) -> np.ndarray:
-    """Backward differences, first row zero.
-
-    AFNI's ``-derivative`` convention, and the reason to want it: a motion
-    regressor removes signal that tracks *where* the head is, while its
-    derivative removes signal that tracks the head *moving*, which is what a
-    spin-history artefact actually is. The two are close to orthogonal and the
-    second is usually the one doing the work.
-    """
-    out = np.zeros_like(columns)
-    out[1:] = np.diff(columns, axis=0)
-    return out
-
-
 def build_model(
     *,
     n_time: int,
@@ -341,7 +327,6 @@ def build_model(
     polort: int = 2,
     ort: np.ndarray | None = None,
     ort_labels: Sequence[str] = (),
-    ort_derivatives: bool = False,
     pcs: np.ndarray | None = None,
 ) -> Model:
     """Assemble the design: task, then ortvecs, then noise PCs, then drift."""
@@ -354,8 +339,6 @@ def build_model(
         ort = np.asarray(ort, dtype=np.float64)
         names = list(ort_labels) or [f"ort#{i}" for i in range(ort.shape[1])]
         blocks.append((ort, names, ORT))
-        if ort_derivatives:
-            blocks.append((derivative_columns(ort), [f"{n}'" for n in names], ORT))
 
     if pcs is not None and pcs.shape[1]:
         pcs = np.asarray(pcs, dtype=np.float64)
@@ -462,12 +445,61 @@ class Prepared:
         return int(self.y.numel() * self.y.element_size())
 
 
+def _blurred_rows(
+    data: np.ndarray,
+    mask: np.ndarray,
+    sigma_vox: tuple[float, float, float],
+    device: torch.device,
+    progress: ProgressFn | None = None,
+) -> torch.Tensor:
+    """``(V, T)`` of the run smoothed *within* the mask.
+
+    Within, as ``3dBlurInMask`` does it: ``blur(x . m) / blur(m)``. A plain
+    blur mixes the zeros outside the brain into every edge voxel, which pulls
+    the rim of the map toward nothing and is indistinguishable from a real
+    drop-off in activation there.
+
+    Chunked over time rather than blurring the whole 4-D run at once, because
+    a real run is a gigabyte and this is the interactive path -- the smoothed
+    copy would be a second one. Peak is one chunk of volumes on top of the
+    ``(V, T)`` output, which has to exist regardless.
+    """
+    from fastfuncstuff.memory import get_available_memory
+    from fastfuncstuff.stats.smooth3d import gaussian3d_batched
+
+    nx, ny, nz, nt = data.shape
+    keep = torch.as_tensor(np.flatnonzero(mask.reshape(-1)), device=device, dtype=torch.long)
+    out = torch.empty((int(keep.numel()), nt), dtype=torch.float32, device=device)
+
+    m = torch.as_tensor(mask.astype(np.float32), device=device).unsqueeze(0)
+    # Once, not per chunk: the denominator is the same for every time point.
+    denom = gaussian3d_batched(m, sigma_vox).clamp_min(1e-6)
+
+    # Four volumes per time point in flight -- the block, it masked, the blur's
+    # working copy and the result -- so budget for that and keep at least one.
+    per_t = 4 * nx * ny * nz * 4
+    budget = get_available_memory(device, empty_cache=False)
+    chunk = max(1, min(nt, int(budget // max(per_t, 1))))
+    for t0 in range(0, nt, chunk):
+        t1 = min(t0 + chunk, nt)
+        if progress is not None:
+            progress(0.05 + 0.25 * (t0 / nt), f"blurring {t0}-{t1} of {nt}")
+        block = torch.as_tensor(
+            np.ascontiguousarray(data[..., t0:t1], dtype=np.float32), device=device
+        ).permute(3, 0, 1, 2)
+        smoothed = gaussian3d_batched(block * m, sigma_vox) / denom
+        out[:, t0:t1] = smoothed.reshape(t1 - t0, -1)[:, keep].T
+        del block, smoothed
+    return out
+
+
 def prepare(
     data: np.ndarray,
     *,
     affine: np.ndarray,
     tr: float,
     mask: np.ndarray | None = None,
+    blur_fwhm: float = 0.0,
     device: torch.device | None = None,
     progress: ProgressFn | None = None,
 ) -> Prepared:
@@ -477,6 +509,11 @@ def prepare(
     signal change is a division by noise and the colour scale ends up set by
     air. The mask is AFNI's, through ``series.py:automask_from_series``, which
     is the same brain this viewer's carpets find.
+
+    ``blur_fwhm`` smooths in millimetres before gathering. The mask is found on
+    the *unsmoothed* run, so turning the blur up does not quietly grow the
+    brain -- which would change how many voxels are fitted as well as what
+    they contain, and make two fits at two blurs not comparable.
     """
     if data.ndim != 4:
         raise ValueError(f"InstaGLM needs one 4-D run; got shape {tuple(data.shape)}")
@@ -496,14 +533,22 @@ def prepare(
     lookup = np.full(mask.shape, -1, dtype=np.int32)
     lookup[mask] = np.arange(int(mask.sum()), dtype=np.int32)
 
-    if progress is not None:
-        progress(0.35, "gathering")
-    flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
-    y = torch.as_tensor(flat[mask.reshape(-1)])
-    if device.type != "cpu":
+    if blur_fwhm > 0:
+        from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox
+
+        zooms = tuple(
+            float(np.linalg.norm(np.asarray(affine, float)[:3, i])) or 1.0 for i in range(3)
+        )
+        y = _blurred_rows(data, mask, fwhm_mm_to_sigma_vox(blur_fwhm, zooms), device, progress)
+    else:
         if progress is not None:
-            progress(0.7, "to device")
-        y = y.to(device)
+            progress(0.35, "gathering")
+        flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
+        y = torch.as_tensor(flat[mask.reshape(-1)])
+        if device.type != "cpu":
+            if progress is not None:
+                progress(0.7, "to device")
+            y = y.to(device)
     if progress is not None:
         progress(1.0, "ready")
     return Prepared(
@@ -643,24 +688,56 @@ def fit_model(
     exactly the shape the GLM memory model already plans for.
     """
     from fastfuncstuff.memory import estimate_chunk_size
-    from fastfuncstuff.utils import pinv_f64, to_linalg_f64
+    from fastfuncstuff.utils import factor_device, pinv_f64
 
     device = device or prepared.y.device
     n_time, k = model.matrix.shape
     if n_time != prepared.n_time:
         raise ValueError(f"the design has {n_time} rows but the run has {prepared.n_time} volumes")
-    x = torch.as_tensor(model.matrix, dtype=torch.float32, device=prepared.y.device)
+    home = prepared.y.device
+    x64 = torch.as_tensor(np.asarray(model.matrix, dtype=np.float64), device=factor_device(home))
+    x = x64.to(device=home, dtype=torch.float32)
 
-    # G and its inverse are (k, k) -- design sized, never voxel sized -- so they
-    # go to float64 unconditionally. This is the step where a near-collinear
-    # ortvec, which is the interesting case, decides whether the betas mean
-    # anything. See [[Float32 vs float64]].
-    gram = to_linalg_f64(x.T @ x)
-    ginv64 = pinv_f64(gram)
+    # Through an SVD of the design rather than the normal equations.
+    #
+    # X'X squares the condition number, and the interesting designs are exactly
+    # the ill-conditioned ones: a motion file *contains* drift, so adding one to
+    # a polort 2 model takes cond(X) from 7 to 133 and cond(X'X) to 1.8e4. Solved
+    # in float32 -- which is what casting the float64 inverse back to the data's
+    # dtype amounted to -- that left the residual no longer orthogonal to the
+    # drift columns, and an uncancelled polynomial trend walked into the fit and
+    # the signal trace. Measured on a real run, the residual's leak into the
+    # drift subspace was 1.6e-3 against 1e-14 for an honest float64 solve.
+    #
+    # U is orthonormal, so the one big matmul stays perfectly conditioned even in
+    # float32, and every ill-conditioned step is (k, k) and done in float64. The
+    # cost is identical: the same two matmuls of the same two shapes.
+    u64, sv64, vh64 = torch.linalg.svd(x64, full_matrices=False)
+    keep = sv64 > sv64.max().clamp(min=1e-300) * RANK_TOL
+    u64, sv64, vh64 = u64[:, keep], sv64[keep], vh64[keep]
+
+    gram = x64.T @ x64
+    ginv64 = pinv_f64(gram).to(device=x64.device)
     rank = int(torch.linalg.matrix_rank(gram, rtol=RANK_TOL))
     dof = max(int(n_time - rank), 1)
-    ginv = ginv64.to(device=x.device, dtype=x.dtype)
-    ginv_diag = torch.diagonal(ginv).clamp(min=1e-12)
+    ginv_diag = torch.diagonal(ginv64).clamp(min=1e-12).to(device=home, dtype=x.dtype)
+
+    # V S^-1 and U, the two halves of the pseudo-inverse, kept apart so the
+    # residual can be formed from U alone.
+    vs = (vh64.T / sv64).to(device=home, dtype=x.dtype)
+    u = u64.to(device=home, dtype=x.dtype)
+
+    # Taking each voxel's mean out before the solve is worth another two orders
+    # of magnitude (7e-8 against 6e-6), because a BOLD series sits at 11000 while
+    # the signal in it is tens, and float32 has seven digits to cover both. It is
+    # only legitimate when a constant is in the design's span -- polort >= 0 --
+    # since otherwise the model cannot put the mean back. ``restore`` is
+    # pinv(X) @ 1, the coefficients that rebuild a constant, so the betas come
+    # back exactly as if the mean had never been removed.
+    ones = torch.ones(n_time, dtype=torch.float64, device=x64.device)
+    restore64 = vh64.T @ ((u64.T @ ones) / sv64)
+    centre = bool(torch.linalg.vector_norm(x64 @ restore64 - ones) < 1e-8 * float(n_time) ** 0.5)
+    restore = restore64.to(device=home, dtype=x.dtype).unsqueeze(1)
 
     n_voxels = prepared.n_voxels
     chunk = estimate_chunk_size(
@@ -678,11 +755,16 @@ def fit_model(
     for start in range(0, n_voxels, chunk):
         stop = min(start + chunk, n_voxels)
         block = prepared.y[start:stop].T  # (T, c) -- time contiguous for the matmuls
-        b = ginv @ (x.T @ block)  # (k, c)
-        residual = block - x @ b
+        mean = block.mean(dim=0, keepdim=True)
+        centred = block - mean
+        work = centred if centre else block
+        z = u.T @ work  # (r, c) -- the fit in the design's orthonormal frame
+        residual = work - u @ z
+        b = vs @ z
+        if centre:
+            b = b + restore * mean
         betas[:, start:stop] = b
         rss[start:stop] = (residual * residual).sum(dim=0)
-        centred = block - block.mean(dim=0, keepdim=True)
         tss[start:stop] = (centred * centred).sum(dim=0)
         if progress is not None:
             progress(stop / n_voxels, f"fitting {k} regressors")
@@ -700,7 +782,7 @@ def fit_model(
         # The block form of the same identity: b_A' (G^-1_AA)^-1 b_A. One
         # (k_task, k_task) inverse and a quadratic form per voxel, so the joint
         # task map costs a reduction over k rather than a second fit.
-        sub = pinv_f64(ginv64[np.ix_(task, task)]).to(device=x.device, dtype=x.dtype)
+        sub = pinv_f64(ginv64[np.ix_(task, task)]).to(device=home, dtype=x.dtype)
         b_task = betas[task]
         task_ss = torch.einsum("iv,ij,jv->v", b_task, sub, b_task)
 
@@ -793,7 +875,6 @@ __all__ = [
     "Model",
     "Prepared",
     "build_model",
-    "derivative_columns",
     "fit_model",
     "hrf_bases",
     "library_size",

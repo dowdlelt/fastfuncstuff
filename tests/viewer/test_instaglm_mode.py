@@ -166,8 +166,8 @@ def test_stepping_polort_does_not_reconvolve_the_events(glm_session):
     block = mode._task
     assert block is not None
 
-    for changed in ("polort", "ort_deriv", "pcs"):
-        glm_session.set_mode_param(changed, "3" if changed == "polort" else "1")
+    for changed, value in (("polort", "3"), ("pcs", "1")):
+        glm_session.set_mode_param(changed, value)
         assert glm_session.mode._task is block, f"{changed} reconvolved the events"
 
 
@@ -202,17 +202,47 @@ def test_a_derivative_basis_adds_a_column_per_condition(glm_session):
     assert mode._fit.model.labels[:2] == ("faces", "faces'")
 
 
-def test_an_ortvec_is_fitted_and_its_derivative_is_optional(glm_session):
+def test_an_ortvec_derivative_is_an_entry_of_its_own(glm_session):
+    """The derivative is a second tick, not a switch on the first: raw and
+    differenced motion each have to be removable alone to ask what each buys."""
     path = glm_session.tmp / "motion.1D"
     rng = np.random.default_rng(2)
     np.savetxt(path, rng.normal(size=(N_TIME, 3)))
 
     mode = _enter(glm_session, ortvec=str(path))
     assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
-    glm_session.set_mode_param("ort_deriv", "1")
+    glm_session.set_mode_param("ortvec", f"+{path}|+{path}:deriv")
     labels = glm_session.mode._fit.model.labels
     assert sum(c.group == "ort" for c in glm_session.mode._fit.model.columns) == 6
-    assert any(lab.endswith("'") for lab in labels)
+    assert "motion#0'" in labels
+
+    glm_session.set_mode_param("ortvec", f"-{path}|+{path}:deriv")
+    columns = glm_session.mode._fit.model.columns
+    assert [c.label for c in columns if c.group == "ort"] == ["motion#0'", "motion#1'", "motion#2'"]
+
+
+def test_a_band_split_is_one_entry_per_band_and_sums_to_its_source(glm_session):
+    """Each band is its own tickable entry, and together they are the column --
+    which is what lets a split replace its source instead of sitting beside it."""
+    path = glm_session.tmp / "motion.1D"
+    rng = np.random.default_rng(3)
+    raw = np.cumsum(rng.normal(size=(N_TIME, 2)), axis=0)
+    np.savetxt(path, raw)
+
+    cut = 0.25 / TR
+    split = f"-{path}|+{path}:band=0-{cut:g}|+{path}:band={cut:g}-nyq"
+    mode = _enter(glm_session, ortvec=split)
+    model = mode._fit.model
+    labels = [c.label for c in model.columns if c.group == "ort"]
+    assert labels == [
+        f"motion#0 <{cut:g}Hz",
+        f"motion#1 <{cut:g}Hz",
+        f"motion#0 >{cut:g}Hz",
+        f"motion#1 >{cut:g}Hz",
+    ]
+    low = model.matrix[:, [model.index_of(lab) for lab in labels[:2]]]
+    high = model.matrix[:, [model.index_of(lab) for lab in labels[2:]]]
+    assert np.allclose(low + high, raw, atol=1e-8)
 
 
 def test_an_ortvec_of_the_wrong_length_is_reported_not_raised(glm_session):
@@ -356,3 +386,233 @@ def test_dragging_the_hrf_peak_moves_the_curve_and_the_map(glm_session):
 
 def test_the_panel_is_named_so_a_window_opens_for_it(glm_session):
     assert _enter(glm_session).panel_names() == ("hrf",)
+
+
+# -- show, thresh and column ------------------------------------------------
+#
+# Colouring by one map and cutting on another is the ordinary GLM picture and
+# the one a single-volume overlay cannot draw. What is tested here is that the
+# two halves stay attached to the right things: the colour scale to what is
+# shown, the p-value and the slider's reach to what is cut on.
+
+
+def _layer(session):
+    layer = session.state.layers.find_by_source(SOURCE)
+    assert layer is not None, "the mode installed no overlay"
+    return layer
+
+
+def test_thresholding_on_a_different_map_installs_it_as_a_second_sub_brick(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    layer = _layer(glm_session)
+    assert layer.n_volumes == 2
+    assert layer.volume_index == 0 and layer.threshold_index == 1
+    assert layer.labels == ("faces beta", "faces t")
+    stored = glm_session.store.get(layer.key).array
+    np.testing.assert_allclose(stored[..., 0], mode._fit.volume("beta", column=0))
+    np.testing.assert_allclose(stored[..., 1], mode._fit.volume("t", column=0))
+
+
+def test_the_p_value_is_read_from_the_threshold_map_not_the_shown_one(glm_session):
+    """A beta carries no distribution. Offering a p for one would be inviting a
+    number that means nothing, and the whole point of the pair is that the t
+    beside it does carry one."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="same")
+    assert _layer(glm_session).stat_spec() is None
+
+    glm_session.set_mode_param("thresh", "t")
+    spec = _layer(glm_session).stat_spec()
+    assert spec is not None
+    name, dof = spec
+    assert name == "fitt"
+    assert dof == float(glm_session.mode._fit.dof)
+
+
+def test_the_threshold_slider_reaches_the_cut_map_not_the_coloured_one(glm_session):
+    """Colouring a beta of 0.3 and cutting on its t of 12: a slider spanning
+    the beta can never reach the t."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    layer = _layer(glm_session)
+    scale = glm_session.threshold_scale(layer.key)
+    stored = glm_session.store.get(layer.key).array
+    assert scale == pytest.approx(np.abs(stored[..., 1]).max())
+    assert scale != pytest.approx(np.abs(stored[..., 0]).max())
+
+
+def test_changing_only_the_threshold_map_does_not_refit(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, show="beta")
+    before = mode._fit
+    glm_session.set_mode_param("thresh", "t")
+    assert glm_session.mode._fit is before
+
+
+def test_going_back_to_same_drops_the_second_volume(glm_session):
+    """The layer is updated in place, so a stale threshold_index would cut on a
+    sub-brick that is no longer there."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    assert _layer(glm_session).n_volumes == 2
+    glm_session.set_mode_param("thresh", "same")
+    layer = _layer(glm_session)
+    assert layer.n_volumes == 1
+    assert layer.threshold_index is None
+    assert layer.stat_spec() is None
+
+
+def test_both_maps_follow_one_column_picker(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, show="beta", thresh="t", column="Pol#1")
+    stored = glm_session.store.get(_layer(glm_session).key).array
+    k = mode._fit.model.index_of("Pol#1")
+    np.testing.assert_allclose(stored[..., 0], mode._fit.volume("beta", column=k))
+    np.testing.assert_allclose(stored[..., 1], mode._fit.volume("t", column=k))
+
+
+def test_moving_the_threshold_map_rescales_but_a_refit_does_not(glm_session):
+    """A threshold set on an R2 means nothing on a t. A refit of the same pair
+    leaves it alone, because holding a threshold while the design moves is the
+    gesture the mode exists for."""
+    _enter(glm_session, events=glm_session.events, show="beta", thresh="t")
+    glm_session.state.layers.update(_layer(glm_session).key, threshold=7.5)
+
+    glm_session.set_mode_param("polort", "3")
+    assert _layer(glm_session).threshold == pytest.approx(7.5)
+
+    glm_session.set_mode_param("thresh", "R2")
+    assert _layer(glm_session).threshold == pytest.approx(0.05)
+
+
+# -- several ortvecs, ticked and unticked -----------------------------------
+
+
+def _ortvec(session, name, n_columns, seed=0):
+    path = session.tmp / name
+    np.savetxt(path, np.random.default_rng(seed).normal(size=(N_TIME, n_columns)))
+    return str(path)
+
+
+def test_several_ortvec_files_are_fitted_side_by_side(glm_session):
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    b = _ortvec(glm_session, "physio.1D", 2, seed=2)
+    mode = _enter(glm_session, ortvec=f"+{a}|+{b}")
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 5
+    # Named for their file, since two motion estimates in one model are
+    # otherwise two sets of columns called the same thing -- but by the last
+    # word of the name, not the whole pipeline stem it came with.
+    labels = mode._fit.model.labels
+    assert [lab for lab in labels if lab.startswith("motion#")] == [f"motion#{i}" for i in range(3)]
+    assert [lab for lab in labels if lab.startswith("physio#")] == [f"physio#{i}" for i in range(2)]
+
+
+def test_unticking_a_file_drops_its_columns_without_forgetting_it(glm_session):
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    b = _ortvec(glm_session, "physio.1D", 2, seed=2)
+    _enter(glm_session, ortvec=f"+{a}|+{b}")
+    glm_session.set_mode_param("ortvec", f"+{a}|-{b}")
+    mode = glm_session.mode
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
+    # Still in the parameter, so ticking it back is one click and not a retype.
+    assert b in str(mode.params["ortvec"])
+
+
+def test_a_single_unprefixed_path_still_works(glm_session):
+    """What a script written before the list existed passes, and what someone
+    types by hand."""
+    a = _ortvec(glm_session, "motion.1D", 3, seed=1)
+    mode = _enter(glm_session, ortvec=a)
+    assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
+
+
+def test_a_pipeline_stem_is_not_carried_into_every_column_name(glm_session):
+    """`stage02.moco.ses-01.task-dynaloc.run-01.motion#0` is forty-five
+    characters of provenance repeated on every column, and the last word is
+    the only part that says what the regressor is."""
+    path = glm_session.tmp / "stage02.moco.ses-01.task-face.run-01.motion.1D"
+    np.savetxt(path, np.random.default_rng(5).normal(size=(N_TIME, 6)))
+    mode = _enter(glm_session, ortvec=f"+{path}")
+    ort = [c.label for c in mode._fit.model.columns if c.group == "ort"]
+    assert ort == [f"motion#{i}" for i in range(6)]
+
+
+# -- spatial smoothing ------------------------------------------------------
+
+
+def test_blur_is_off_by_default_and_changes_nothing(glm_session):
+    mode = _enter(glm_session, events=glm_session.events)
+    assert mode.params["blur"] == 0.0
+    assert mode._blur == 0.0
+
+
+def test_blur_smooths_the_map(glm_session):
+    """The point of asking for it: neighbouring voxels stop disagreeing."""
+    _enter(glm_session, events=glm_session.events, show="beta", column="faces")
+    sharp = np.array(_map(glm_session), copy=True)
+    glm_session.set_mode_param("blur", "6")
+    glm_session.mode.refresh()
+    smooth = _map(glm_session)
+
+    def roughness(v):
+        v = np.asarray(v, dtype=np.float64)
+        return float(np.abs(np.diff(v, axis=0)).mean())
+
+    assert roughness(smooth) < roughness(sharp)
+
+
+def test_blur_regathers_rather_than_only_refitting(glm_session):
+    """It changes the data, not the design, so the cached run has to go.
+
+    Without this the slider refits smoothed betas onto unsmoothed data and
+    nothing on screen says which one you are looking at.
+    """
+    mode = _enter(glm_session, events=glm_session.events)
+    before = mode._prepared
+    glm_session.set_mode_param("blur", "5")
+    assert mode._prepared is not before
+    assert mode._blur == 5.0
+    # And back again, rather than sticking at the smoothed copy.
+    glm_session.set_mode_param("blur", "0")
+    assert mode._blur == 0.0
+
+
+def test_blur_does_not_change_which_voxels_are_fitted(glm_session):
+    """The mask comes off the unsmoothed run, so two blurs stay comparable."""
+    mode = _enter(glm_session, events=glm_session.events)
+    n_before = mode._prepared.n_voxels
+    mask_before = np.array(mode._prepared.mask, copy=True)
+    glm_session.set_mode_param("blur", "6")
+    assert mode._prepared.n_voxels == n_before
+    assert np.array_equal(mode._prepared.mask, mask_before)
+
+
+def test_blur_does_not_drag_air_into_the_brain_edge():
+    """Blur-in-mask leaves a constant exactly constant, edge voxels included.
+
+    That is the defining property -- blur(c.m)/blur(m) is c everywhere -- and
+    it is what a plain blur does not have: outside the mask the data is zero,
+    so a plain blur pulls every rim voxel down toward it, which is
+    indistinguishable from a real drop-off in activation at the brain's edge.
+    """
+    from fastfuncstuff.viewer import instaglm as engine
+
+    mask = np.zeros((12, 12, 10), dtype=bool)
+    mask[3:9, 3:9, 2:8] = True
+    data = np.where(mask[..., None], 100.0, 0.0).astype(np.float32).repeat(4, axis=3)
+
+    rows = engine._blurred_rows(data, mask, (2.0, 2.0, 2.0), CPU)
+    assert np.allclose(np.asarray(rows), 100.0, atol=1e-3), "the edge was pulled toward the air"
+
+    # What it would have been without the correction, at the same sigma.
+    from fastfuncstuff.stats.smooth3d import gaussian3d_batched
+
+    plain = gaussian3d_batched(torch.as_tensor(data[..., 0]).unsqueeze(0), (2.0, 2.0, 2.0)).squeeze(
+        0
+    )
+    assert float(np.asarray(plain)[mask].min()) < 70.0, "a plain blur is expected to sag here"
+
+
+def test_blur_is_recorded_in_the_script(glm_session):
+    """Through the bus, which is the path a click takes and the one replay reads."""
+    from fastfuncstuff.viewer.vocab import SetModeParam
+
+    _enter(glm_session, events=glm_session.events)
+    glm_session.do(SetModeParam("blur", "4"))
+    assert "SET_MODE_PARAM blur 4" in glm_session.to_script()
+    assert glm_session.mode.params["blur"] == 4.0

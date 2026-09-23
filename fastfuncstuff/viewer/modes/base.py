@@ -1,9 +1,16 @@
-"""Modes: where the overlay comes from.
+"""Modes: where a computed layer comes from.
 
-The viewer's core is the data selector -- underlay, overlay, +1. A mode changes
-only one thing about that core: instead of the overlay being a file you picked,
-it is something computed from what is loaded. InstaCorr computes a correlation,
-calc evaluates an expression, GLM fits a model, ICA reads a decomposition.
+The viewer's core is the data selector: load a dataset, and it is a layer. A
+mode changes one thing about that -- instead of a layer being a file you
+picked, it is something computed from one that is loaded. InstaCorr computes a
+correlation, calc evaluates an expression, GLM fits a model, ICA reads a
+decomposition.
+
+Which loaded layer a mode reads is :attr:`ViewerState.input_key`, set by the
+INPUT picker and resolved by :meth:`ViewerSession.input_layer`. It is a
+separate question from what is drawn and from what is selected, so a run can be
+switched off in the stack -- or buried under the anatomy -- and still be the
+data the fit is made of.
 
 Everything else a mode needs is declared, not coded:
 
@@ -63,6 +70,13 @@ class OverlayKind(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+#: Width units in one row of a control panel. Six so that halves and thirds
+#: both divide it, which is the whole vocabulary a parameter form needs: a
+#: path wants the row, three pickers share it, two spinners split it.
+ROW_UNITS = 6
+FULL, HALF, THIRD = 6, 3, 2
+
+
 @dataclass(frozen=True)
 class Control:
     """Base for a mode parameter the UI should offer."""
@@ -70,6 +84,21 @@ class Control:
     name: str
     label: str
     help: str = ""
+    #: How much of a row this control asks for, out of :data:`ROW_UNITS`.
+    #: Controls are packed left to right and wrap when the budget runs out.
+    #: The default is the whole row, because that is what every control did
+    #: before spans existed and a mode that has not thought about layout
+    #: should not get a surprising one.
+    span: int = FULL
+    #: Start a new row even if this control would have fitted on the last.
+    #: Grouping is meaning, not just width: ``show`` / ``thresh`` / ``column``
+    #: are one thought and belong together on a line of their own.
+    newline: bool = False
+    #: ``(other parameter, values that reveal this one)``. Hidden otherwise --
+    #: but the space is kept, so revealing a control does not shove the rest of
+    #: the panel down. A library index beside an HRF set to 'custom' is a knob
+    #: that does nothing, and a knob that does nothing is worse than no knob.
+    visible_when: tuple[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +138,12 @@ class IntControl(Control):
 class ChoiceControl(Control):
     choices: tuple[str, ...] = ()
     default: str = ""
+    #: ``"combo"`` for a drop-down, ``"radio"`` for the choices side by side.
+    #: Radio for a short, stable set whose options are worth reading without a
+    #: click -- two units, three colour rules. A drop-down hides how many
+    #: choices there are and costs a click to find out, which is the wrong
+    #: trade for a set of two.
+    style: str = "combo"
 
 
 @dataclass(frozen=True)
@@ -125,6 +160,61 @@ class PathControl(Control):
     filter: str = "All (*)"
     #: Browse for a folder rather than a file.
     directory: bool = False
+
+
+#: Separates entries in a :class:`PathListControl` value. A parameter has to
+#: survive being written down as one string -- that is what makes it
+#: replayable through ``SET_MODE_PARAM`` -- so the list is encoded rather than
+#: held as a list. Each entry is ``+path`` or ``-path``, ticked or not.
+PATH_LIST_SEP = "|"
+
+
+@dataclass(frozen=True)
+class PathListControl(Control):
+    """Several files, each of which can be ticked off without being removed.
+
+    The point is the comparison. One motion file, one respiration trace, one
+    set of physio regressors: the question is never "which of these do I want"
+    but "what does each of them do to the map", and answering it by deleting a
+    path and typing it back in is answering it badly. Unticking keeps the entry
+    where it is, so the next fit is one click away and the click is reversible.
+    """
+
+    default: str = ""
+    filter: str = "All (*)"
+    #: Entries are regressor files that can be transformed in place: the list
+    #: offers a derivative button and a band splitter, each of which adds
+    #: entries in :mod:`fastfuncstuff.viewer.ortvec`'s grammar.
+    transforms: bool = False
+    #: Seconds per row of those files, for the band splitter's Hz axis. Zero
+    #: when the run has no TR, and the splitter says so rather than guessing.
+    sample_interval: float = 0.0
+
+    @staticmethod
+    def parse(value: object) -> list[tuple[str, bool]]:
+        """``"+a.1D|-b.1D"`` to ``[("a.1D", True), ("b.1D", False)]``."""
+        out: list[tuple[str, bool]] = []
+        for entry in str(value or "").split(PATH_LIST_SEP):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if entry[0] in "+-":
+                out.append((entry[1:], entry[0] == "+"))
+            else:
+                # An unprefixed path is one a person typed or a script wrote
+                # by hand. Taking it as enabled is the reading that does what
+                # they meant.
+                out.append((entry, True))
+        return out
+
+    @staticmethod
+    def encode(entries: Sequence[tuple[str, bool]]) -> str:
+        return PATH_LIST_SEP.join(f"{'+' if on else '-'}{p}" for p, on in entries if p)
+
+    @staticmethod
+    def enabled(value: object) -> list[str]:
+        """Just the ticked paths, in order -- what a mode actually reads."""
+        return [p for p, on in PathListControl.parse(value) if on]
 
 
 @dataclass(frozen=True)
@@ -182,6 +272,20 @@ class ComputedOverlay:
     colormap: str = "redblue"
     display_range: tuple[float, float] | None = None
     threshold: float | None = None
+    #: A second volume to cut on, when what you want to *see* and what you
+    #: want to *believe* are different numbers. That is the ordinary case for
+    #: a GLM -- colour by effect size, threshold on the t -- and the layer
+    #: stack already knows how to do it for a stats bucket read off disk, so a
+    #: mode says which volume is which and everything downstream follows:
+    #: the colour bar scales the shown one, the p spinner reads the cut one.
+    threshold_values: np.ndarray | None = None
+    #: What the two volumes are called, once there are two of them to tell
+    #: apart -- ``("Faces beta", "Faces t")``.
+    volume_labels: tuple[str, ...] = ()
+    #: ``("fitt", dof)`` for the threshold volume, in the same shape
+    #: :meth:`Layer.stat_spec` returns, so a computed t map earns the p
+    #: spinner a loaded one gets. ``None`` when the cut is on a plain value.
+    threshold_stat: tuple[str, float | tuple[float, float] | None] | None = None
     #: Whether this output means something different from the last one, so the
     #: colour scale must follow it. Off by default, because the usual update is
     #: the *same* quantity recomputed -- the next seed, the next component --
@@ -235,6 +339,15 @@ class Mode(ABC):
     #: Whether this mode owns an overlay layer at all. Plain mode does not --
     #: its overlay is whatever the user picked.
     produces_overlay: ClassVar[bool] = True
+    #: What this mode can read, as a declaration rather than a search, in the
+    #: same words :attr:`~fastfuncstuff.viewer.tools.base.Tool.input_kind`
+    #: uses: ``"4d"`` for a time series, ``"any"`` for any loaded layer,
+    #: ``"none"`` for a mode that reads nothing from the stack. Each mode used
+    #: to find its own input with its own rule -- "the selected layer if it is
+    #: a run, else the topmost run" in one, "the first time-linked layer" in
+    #: another -- so two modes could silently disagree about what they were
+    #: looking at, and neither could be told otherwise.
+    input_kind: ClassVar[str] = "4d"
 
     #: Set by a UI that runs preparation on a worker. When true, a refresh
     #: that would need the slow path does nothing instead, and the UI is
@@ -328,15 +441,46 @@ class Mode(ABC):
         """Mark cached preparation stale, so the next refresh redoes it."""
         self._dirty = True
 
+    def accepts(self, layer: Any) -> bool:
+        """Whether this mode could read that layer. Drives the input picker.
+
+        Visibility and selection are deliberately not consulted: whether a run
+        is ticked is a statement about the picture, not about what the numbers
+        are good for, and the whole point of naming an input is to be able to
+        fit one thing while looking at another.
+        """
+        if self.input_kind == "none" or layer.is_computed:
+            # A mode's own live output is not an input. A ``derived:`` layer --
+            # a denoised copy of a run -- is, which is what lets one mode's
+            # result be the next one's data.
+            return False
+        if self.input_kind == "4d":
+            return bool(layer.time_linked and layer.n_volumes > 1)
+        return True
+
+    def default_input(self, candidates: Sequence[Any]) -> Any | None:
+        """Which candidate to read when nobody has named one. Topmost first.
+
+        A hook rather than a fixed rule because "the obvious one" is
+        mode-specific: Denoise walks past a run it denoised itself, since
+        denoising a denoise is almost never what was meant -- while still
+        offering it, because chaining is not forbidden, just not the default.
+        """
+        return candidates[0] if candidates else None
+
+    def source_layer(self) -> Any | None:
+        """The layer this mode reads: the named input, or the best candidate."""
+        return None if self.session is None else self.session.input_layer(self)
+
     def input_layer_key(self) -> str | None:
         """The layer this mode consumes, if any.
 
-        An input is not a display layer: once InstaCorr is showing a
-        correlation, drawing the 4-D series it was computed from on top of the
-        anatomy is just noise. The session hides the input while the mode is
-        active and restores it on the way out.
+        What :meth:`~ViewerSession.forget` will not free. Modes that cache a
+        prepared array override this to report the key they prepared *from*,
+        which can lag the current answer by one re-preparation.
         """
-        return None
+        layer = self.source_layer()
+        return None if layer is None else layer.key
 
     # -- reaction ------------------------------------------------------
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
@@ -460,6 +604,12 @@ __all__ = [
     "Mode",
     "OptionalFloatControl",
     "PathControl",
+    "PathListControl",
+    "PATH_LIST_SEP",
+    "ROW_UNITS",
+    "FULL",
+    "HALF",
+    "THIRD",
     "ActionControl",
     "ProgressFn",
     "ModeRegistry",

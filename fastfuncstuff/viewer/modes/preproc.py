@@ -75,6 +75,10 @@ class PreprocMode(Mode):
     # It makes datasets, not overlays. Without this the framework would mint an
     # empty A_PREPROC layer and offer a KEEP button for it.
     produces_overlay = False
+    # Each tool picks its own input in its own dialog, so the mode as a whole
+    # has none: one INPUT box at the top of the panel would be a second, always
+    # wrong, answer to a question the dialogs already ask.
+    input_kind = "none"
 
     def __init__(self) -> None:
         #: Panels from the last tool that ran, by window title. Kept on the mode

@@ -112,7 +112,11 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.stepped.connect(self._step)
         self.pane.panned.connect(self._pan_by)
         v.addWidget(self.pane, 1)
-        self.resize(420, 420)
+        # Two thirds of what it used to be. An EPI slice is 64 to 100 voxels
+        # across, so a 420-pixel window was showing it at four times its own
+        # resolution and spending most of the screen on interpolation -- and
+        # three of them left nowhere to put a graph or an HRF curve.
+        self.resize(280, 280)
         self.setMinimumSize(64, 64)
 
         self.help = ShortcutHelp(self, f"image · {vid}")
@@ -159,7 +163,7 @@ class ImageWindow(QtWidgets.QWidget):
         b = QtWidgets.QPushButton(full)
         b.setCheckable(True)
         b.setToolTip(f"{tip}  ({key})")
-        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
         self._labels.append((b, full, bare))
         return b
 
