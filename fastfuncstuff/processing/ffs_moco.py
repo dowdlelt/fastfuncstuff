@@ -275,6 +275,30 @@ def _unweighted_rms(base: Tensor, source: Tensor) -> float:
     return float(rms.item())
 
 
+def _prefer_wls_incumbent(
+    base_flat: Tensor,
+    source: Tensor,
+    weight_flat: Tensor,
+    incumbent: Tensor,
+    candidate: Tensor,
+    coords: Tensor,
+    interp: str,
+    output_shape: tuple[int, int, int],
+    resample_fn=resample_affine_fast,
+) -> Tensor:
+    """Return the candidate only when it improves on a stage's incoming transform."""
+    with torch.no_grad():
+        incumbent_warped = resample_fn(
+            source, params_to_matrix(incumbent), coords, interp, output_shape
+        )
+        candidate_warped = resample_fn(
+            source, params_to_matrix(candidate), coords, interp, output_shape
+        )
+        incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
+        candidate_rms = _weighted_rms(base_flat, candidate_warped.reshape(-1), weight_flat)
+    return incumbent.clone() if incumbent_rms < candidate_rms else candidate
+
+
 def _gram_normal_eq(WJ: Tensor, device: torch.device) -> Tensor:
     """Form the (6, 6) registration normal-equation matrix J'WJ.
 
@@ -525,6 +549,7 @@ def batched_gn_estimate(
         params = identity_params(device=device, dtype=dtype)[None].repeat(B, 1)
     else:
         params = init_params.clone()
+    incumbent = params.clone()
     active = torch.ones(B, dtype=torch.bool, device=device)
     n_iters = torch.full((B,), max_iter, dtype=torch.int32, device=device)
     invalid = torch.zeros(B, dtype=torch.bool, device=device)
@@ -550,6 +575,25 @@ def batched_gn_estimate(
             if not bool(active.any()):
                 break
 
+    # Retain the stage's incoming transform volume by volume when the attempted
+    # solve finishes worse. This protects both identity -> coarse and coarse ->
+    # fine hand-offs without changing how Gauss-Newton takes its steps.
+    incumbent_warped, incumbent_valid = shear_resample_triton(
+        sources, params_to_matrix_batched(incumbent), shape, interp
+    )
+    candidate_warped, candidate_valid = shear_resample_triton(
+        sources, params_to_matrix_batched(params), shape, interp
+    )
+    denom = weight_flat_1d.sum().clamp_min(1e-10)
+    incumbent_mse = (
+        weight_flat_1d[None] * (base_flat[None] - incumbent_warped.reshape(B, N)) ** 2
+    ).sum(1) / denom
+    candidate_mse = (
+        weight_flat_1d[None] * (base_flat[None] - candidate_warped.reshape(B, N)) ** 2
+    ).sum(1) / denom
+    keep_incumbent = incumbent_valid & (~candidate_valid | (incumbent_mse < candidate_mse))
+    params = torch.where(keep_incumbent[:, None], incumbent, params)
+    invalid = invalid | ~incumbent_valid | ~candidate_valid
     return params, n_iters, invalid
 
 
@@ -887,7 +931,7 @@ def _run_batched_estimation(
                     weight_flat_1d,
                     WJ,
                     JtWJ,
-                    identity.clone(),
+                    init_params[j] if init_params is not None else identity.clone(),
                     config,
                     coords=homo,
                 )
@@ -1424,6 +1468,7 @@ def moco(
         # Twopass: coarse blur first, then fine
         if config.twopass and config.cost == "wls":
             source_coarse = _blur_volume(source, coarse_fwhm)
+            coarse_incumbent = init_params.clone()
             if config.fixed_iter:
                 init_params = _gn_fixed(
                     bf_coarse,
@@ -1450,8 +1495,20 @@ def moco(
                     p2m_fn=_p2m,
                     resample_fn=_resample,
                 )
+            init_params = _prefer_wls_incumbent(
+                bf_coarse,
+                source_coarse,
+                wf1_coarse,
+                coarse_incumbent,
+                init_params,
+                homo_coords,
+                config.interp,
+                vol_shape,
+                resample_fn=_resample,
+            )
 
         # Main alignment
+        fine_incumbent = init_params.clone()
         if config.cost == "wls":
             if config.fixed_iter:
                 if use_masked:
@@ -1546,6 +1603,19 @@ def moco(
                     dxy_thresh=config.dxy_thresh,
                     dph_thresh=config.dph_thresh,
                 )
+
+        if config.twopass and config.cost == "wls":
+            params = _prefer_wls_incumbent(
+                base_flat,
+                source_est,
+                weight_flat_1d,
+                fine_incumbent,
+                params,
+                homo_coords,
+                config.interp,
+                vol_shape,
+                resample_fn=_resample,
+            )
 
         # Fallback: if result is worse than identity, retry from identity (skip in fixed_iter mode)
         if not config.fixed_iter:

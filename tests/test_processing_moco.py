@@ -17,6 +17,7 @@ from fastfuncstuff.processing.ffs_moco import (
     _get_voxel_sizes,
     _gram_normal_eq,
     _normal_solve,
+    _prefer_wls_incumbent,
     _prepare_normal_solve,
     _unweighted_rms,
     _weighted_rms,
@@ -114,6 +115,27 @@ class TestRMSFunctions:
         b = torch.ones(10, 10, 10) * 2.0
         rms = _unweighted_rms(a, b)
         assert rms == pytest.approx(2.0, abs=1e-5)
+
+    def test_wls_stage_keeps_a_better_incoming_transform(self):
+        shape = (10, 10, 10)
+        base = _make_gaussian_blob(shape)
+        coords = _build_homo_coords(shape, DEV, torch.float32)
+        incumbent = identity_params(device=DEV)
+        candidate = incumbent.clone()
+        candidate[0] = 2.0
+
+        kept = _prefer_wls_incumbent(
+            base.reshape(-1),
+            base,
+            torch.ones(base.numel()),
+            incumbent,
+            candidate,
+            coords,
+            "linear",
+            shape,
+        )
+
+        torch.testing.assert_close(kept, incumbent)
 
 
 # ---------------------------------------------------------------------------
