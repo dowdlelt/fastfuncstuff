@@ -34,15 +34,17 @@ def task_design_from_events(args, n_timepoints: int, tr: float, device):
     )
     # Catch a wrong TR HERE, where the numbers are still interpretable, rather than
     # letting an all-zero design fall through to an empty condition list far downstream.
+    # The EARLIEST onset: a run cut short keeps its full events file, so some
+    # events past the end are expected; all of them past it is a wrong TR.
     run_seconds = n_timepoints * tr
-    latest = max(
-        (float(o.max()) for cond in onsets for o in cond if len(o)),
+    earliest = min(
+        (float(o.min()) for cond in onsets for o in cond if len(o)),
         default=0.0,
     )
-    if latest >= run_seconds:
+    if earliest >= run_seconds:
         raise ValueError(
-            f"every event starts at or after the end of the run: last onset "
-            f"{latest:g}s, run length {run_seconds:g}s ({n_timepoints} frames x "
+            f"every event starts at or after the end of the run: first onset "
+            f"{earliest:g}s, run length {run_seconds:g}s ({n_timepoints} frames x "
             f"{tr:g}s TR). The TR is almost certainly wrong — pass -tr SEC."
         )
 
