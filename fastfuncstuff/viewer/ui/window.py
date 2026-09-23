@@ -54,7 +54,7 @@ from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.colorbar import RangeBar, thresholds_itself
+from fastfuncstuff.viewer.ui.colorbar import RangeBar, colormap_icon, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.flow import FlowBar
 from fastfuncstuff.viewer.ui.manager import WindowManager
@@ -1127,7 +1127,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         form.addRow(self.thrbrick_head, self.thrbrick_row)
 
         self.cmap_box = QtWidgets.QComboBox()
-        self.cmap_box.addItems(available_colormaps())
+        self.cmap_box.setIconSize(QtCore.QSize(40, 10))
+        for name in available_colormaps():
+            self.cmap_box.addItem(colormap_icon(name), name)
         self.cmap_box.activated.connect(
             lambda _: self._apply(SetColormap, colormap=self.cmap_box.currentText())
         )

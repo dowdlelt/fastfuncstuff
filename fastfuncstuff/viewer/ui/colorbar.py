@@ -32,6 +32,16 @@ BAR_MIN_HEIGHT = 150
 TICKS = 1000
 
 
+def colormap_icon(name: str, width: int = 64, height: int = 12) -> QtGui.QIcon:
+    """A left-to-right swatch of one scale, for a picker to show beside its name."""
+    lut = build_lut(name, width, device=torch.device("cpu"))
+    rgb = (lut * 255).round().to(torch.uint8).unsqueeze(0).expand(height, -1, -1).contiguous()
+    image = QtGui.QImage(
+        rgb.numpy().data, width, height, 3 * width, QtGui.QImage.Format.Format_RGB888
+    ).copy()
+    return QtGui.QIcon(QtGui.QPixmap.fromImage(image))
+
+
 def thresholds_itself(layer) -> bool:
     """Whether the threshold reads the sub-brick being coloured."""
     return layer.threshold_brick == layer.volume_index
