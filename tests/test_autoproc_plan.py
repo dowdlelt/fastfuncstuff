@@ -699,7 +699,8 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc)
         # No NORDIC: noise volumes must come off BOTH before unwrapping, and
         # ROMEO needs real files rather than [0..n] selectors.
         assert 'tp="stage00.trim.${FRAG[$k]}.part-phase.nii$PHASE_FMT"' in s
-        assert '-input "${ph}[0..$last]"' in s
+        assert 'mag="${mag}[0..$last]"; ph="${ph}[0..$last]"' in s
+        assert '-input "$ph" -expr a -prefix "$tp"' in s
 
     # Slice timing done up front must be applied to the phase too, and that
     # tshifted phase is what reaches stage10.
@@ -2549,3 +2550,126 @@ def test_motsim_replaces_the_motion_params_only_in_a_default_set():
     assert apply_motsim_default(swapped) == swapped
     assert apply_motsim_default(["locomoco"]) == ["locomoco"]
     assert apply_motsim_default([]) == []
+
+
+def _bids_uneven_runs(tmp_path: Path, phase: bool = False):
+    """task 'floc' with runs of 14/13/11 volumes (events include a 'tail' trial at
+    23 s, past a 12-volume cut in NO run), plus a 14-volume 'rest' run."""
+    import nibabel as nib
+    import numpy as np
+
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    func.mkdir(parents=True)
+    for task, lens in (("floc", (14, 13, 11)), ("rest", (14,))):
+        for i, n in enumerate(lens, 1):
+            base = f"sub-ME1_ses-SM_task-{task}_run-0{i}"
+            img = nib.Nifti1Image(np.zeros((2, 2, 2, n), dtype=np.float32), np.eye(4))
+            img.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+            parts = ("mag", "phase") if phase else ("mag",)
+            for part in parts:
+                nib.save(img, func / f"{base}_part-{part}_bold.nii.gz")
+                (func / f"{base}_part-{part}_bold.json").write_text(
+                    '{"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}'
+                )
+            if task == "floc":
+                (func / f"{base}_events.tsv").write_text(
+                    "onset\tduration\ttrial_type\n2\t4\tface\n10\t4\tplace\n23\t2\ttail\n"
+                )
+    return func
+
+
+def test_cut_task_vols_trims_only_the_longer_runs_of_that_task(tmp_path: Path):
+    """-cut_task_vols floc 12 puts a [0..11] selector on the 14- and 13-volume floc
+    runs, leaves the 11-volume run and the other task alone, sizes the design to
+    the cut runs, and lets ffs_reml drop events past the new end for that task only."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_uneven_runs(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    opt = Options(run_glm=True, go_to_anat=False, cut_task_vols={"floc": 12})
+    plan = build_plan(subj, opt)
+    s = write_script(plan, str(tmp_path / "wd"), bids_root=str(tmp_path))
+
+    mags = dict(re.findall(r"^MAG\[SM:(\w+:\d+)\]=(.*)$", s, flags=re.M))
+    assert mags["floc:01"].endswith("run-01_part-mag_bold.nii.gz[0..11]'")
+    assert mags["floc:02"].endswith("run-02_part-mag_bold.nii.gz[0..11]'")
+    assert mags["floc:03"].endswith("run-03_part-mag_bold.nii.gz")
+    assert mags["rest:01"].endswith("run-01_part-mag_bold.nii.gz")
+    assert "# -cut_task_vols: 14 -> 12 volumes" in s
+    assert "# -cut_task_vols: 13 -> 12 volumes" in s
+
+    glm = s[s.index("stage12") :]
+    floc_cmd = glm[glm.index("task-floc: model") :]
+    floc_cmd = floc_cmd[: floc_cmd.index("-device")]
+    assert "-allow_late_events" in floc_cmd
+    rest_cmd = glm[glm.index("TODO task-rest") :]
+    assert "-allow_late_events" not in rest_cmd[: rest_cmd.index("-device")]
+
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+    spec = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert spec.meta.n_timepoints_per_run == [12, 12, 11]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_cut_task_vols_reaches_the_phase_and_romeo_gets_real_files(tmp_path: Path):
+    """The cut rides PHASE[] too (the pair must stay the same length), and without
+    NORDIC the unwrap stage materialises the selected pair, since ROMEO reads files."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+
+    _bids_uneven_runs(tmp_path, phase=True)
+    subj = scan_subject(tmp_path, "ME1")
+    opt = Options(go_to_anat=False, phase_proc=True, cut_task_vols={"floc": 12})
+    s = write_script(build_plan(subj, opt), str(tmp_path / "wd"), bids_root=str(tmp_path))
+
+    assert re.search(r"^PHASE\[SM:floc:01\]=.*part-phase_bold\.nii\.gz\[0\.\.11\]'$", s, re.M)
+    assert '[[ "$mag" == *"]" ]]' in s
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+
+
+def test_cut_event_warnings_name_the_dropped_events_and_a_lost_condition(tmp_path: Path):
+    from fastfuncstuff.autoproc.bids import find_events, scan_subject
+    from fastfuncstuff.autoproc.glm import cut_event_warnings
+
+    _bids_uneven_runs(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    runs = [
+        (r, find_events(r.mag_path, str(tmp_path)))
+        for sess in subj.sessions
+        for r in sess.bold_runs
+        if r.task == "floc"
+    ]
+
+    # Cut at 12 vols = 24 s: 'tail' at 23 s survives in the two cut runs; the
+    # 11-volume run (22 s) was never cut but loses it too, and says so.
+    warns = cut_event_warnings("floc", runs, Options(cut_task_vols={"floc": 12}))
+    assert len(warns) == 1
+    assert "run-03_events.tsv: 1 event(s) start after the run end" in warns[0]
+    assert "run not cut" in warns[0] and "tail x1" in warns[0]
+
+    # Cut at 11 vols = 22 s: 'tail' is gone from every run — an all-zero column.
+    warns = cut_event_warnings("floc", runs, Options(cut_task_vols={"floc": 11}))
+    assert sum("start after the cut" in w for w in warns) == 2
+    assert "condition(s) tail have NO events" in warns[-1]
+
+    assert cut_event_warnings("floc", runs, Options()) == []
+
+
+def test_cut_task_vols_refuses_noise_vols(tmp_path: Path, capsys):
+    from fastfuncstuff.cli.autoproc import main
+
+    _bids_uneven_runs(tmp_path)
+    argv = ["-bids_dir", str(tmp_path), "-subject", "ME1", "-no_anat"]
+    argv += ["-out", str(tmp_path / "p.sh"), "-work_dir", str(tmp_path / "wd")]
+    assert main([*argv, "-cut_task_vols", "floc", "12", "-noise_vols", "2"]) == 1
+    assert "-cut_task_vols is not compatible with -noise_vols" in capsys.readouterr().err
+    assert not (tmp_path / "p.sh").exists()
+
+    assert main([*argv, "-cut_task_vols", "task-floc", "12"]) == 0
+    assert "[0..11]" in (tmp_path / "p.sh").read_text()

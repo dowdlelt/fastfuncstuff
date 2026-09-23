@@ -30,6 +30,7 @@ from fastfuncstuff.autoproc.plan import (
     run_average_chain,
     session_fmap_ids,
     session_ref_mode,
+    task_cut,
 )
 
 _TOOLS = [
@@ -1147,6 +1148,14 @@ def _invocation_note(invocation: str | None) -> str:
     )
 
 
+def _cut_header_note(plan: Plan) -> str:
+    cuts = plan.options.cut_task_vols
+    if not cuts:
+        return ""
+    body = ", ".join(f"task-{t} {n}" for t, n in sorted(cuts.items()))
+    return f"\n#   cut to N vols     : {body} (-cut_task_vols; MAG[...] selectors below)"
+
+
 def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
     opt = plan.options
     # Phase working files are plain gzip whatever FMT is: ROMEO (and every other
@@ -1170,7 +1179,7 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   reference session : {plan.ref_session}
 #   sessions          : {"multi" if plan.multi_session else "single"}
 #   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {opt.distortion}   slice-timing : {opt.slicetiming_method}
-#   phase  : {_phase_on(plan)}{_timing_header_note(plan)}
+#   phase  : {_phase_on(plan)}{_timing_header_note(plan)}{_cut_header_note(plan)}
 #   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
 #   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
 #   ref image         : {opt.ref_image or "grandmean"} (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{_qc_header_note(plan)}
@@ -1235,9 +1244,16 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         k = _key(pr)
         q = shlex.quote
         lines.append(f"# {k}")
-        lines.append(f"MAG[{q(k)}]={q(str(b.mag_path))}")
+        # -cut_task_vols rides on the source as a sub-brick selector, so every
+        # reader (NORDIC, slice timing, moco, the final resample) sees one cut.
+        cut = task_cut(pr, plan.options)
+        sel = ""
+        if cut:
+            lines.append(f"# -cut_task_vols: {cut[0]} -> {cut[1]} volumes")
+            sel = f"[0..{cut[1] - 1}]"
+        lines.append(f"MAG[{q(k)}]={q(str(b.mag_path) + sel)}")
         if b.phase_path:
-            lines.append(f"PHASE[{q(k)}]={q(str(b.phase_path))}")
+            lines.append(f"PHASE[{q(k)}]={q(str(b.phase_path) + sel)}")
         if b.sbref_path:
             lines.append(f"SBREF[{q(k)}]={q(str(b.sbref_path))}")
         lines.append(f"JSON[{q(k)}]={q(str(_sidecar(b.mag_path)))}")
@@ -3174,25 +3190,31 @@ def _stage_unwrap(plan: Plan) -> str:
         src = f'  mag="{_nordic_mag(plan)}"; ph="{_nordic_phase()}"'
         note = "# Inputs: the NORDIC-denoised pair (noise volumes already trimmed)."
     else:
+        # A -cut_task_vols run arrives with its selector already on MAG/PHASE;
+        # the noise-volume trim adds one here. Either way ROMEO gets a real file.
         trim = (
             f'    tm="{_phase_file("trim", part=False)}"\n'
             f'    tp="{_phase_file("trim")}"\n'
-            f'    nv=$(ffs_info -nv "$mag"); last=$((nv - NOISE_VOLS - 1))\n'
-            f'    [ -f "$tm" ] || ffs_util_3dmath -input "${{mag}}[0..$last]" -expr a '
+            f'    [ -f "$tm" ] || ffs_util_3dmath -input "$mag" -expr a '
             f'-prefix "$tm" -device cpu\n'
-            f'    [ -f "$tp" ] || ffs_util_3dmath -input "${{ph}}[0..$last]" -expr a '
+            f'    [ -f "$tp" ] || ffs_util_3dmath -input "$ph" -expr a '
             f'-prefix "$tp" -device cpu\n'
             f'    mag="$tm"; ph="$tp"\n'
         )
         src = (
             '  mag="${MAG[$k]}"; ph="${PHASE[$k]}"\n'
             '  if [ "$NOISE_VOLS" -gt 0 ]; then\n'
+            '    nv=$(ffs_info -nv "$mag"); last=$((nv - NOISE_VOLS - 1))\n'
+            '    mag="${mag}[0..$last]"; ph="${ph}[0..$last]"\n'
+            "  fi\n"
+            '  if [[ "$mag" == *"]" ]]; then\n'
             f"{trim}"
             "  fi"
         )
         note = (
-            "# Inputs: the raw BIDS pair. With NOISE_VOLS>0 both are trimmed into\n"
-            "# stage00.trim.* first (ROMEO takes files, not [0..n] selectors)."
+            "# Inputs: the raw BIDS pair. With NOISE_VOLS>0 (or -cut_task_vols) both\n"
+            "# are trimmed into stage00.trim.* first (ROMEO takes files, not [0..n]\n"
+            "# selectors)."
         )
     return f"""
 # ============================ stage00: phase unwrap (ROMEO) =================
@@ -3488,6 +3510,9 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
             *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
             *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
+            # Events past a deliberate -cut_task_vols end are expected, not the
+            # mispaired-timing-file symptom ffs_reml otherwise stops for.
+            *(["-allow_late_events"] if task in opt.cut_task_vols else []),
             *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
             *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
             '-device "$DEVICE"',

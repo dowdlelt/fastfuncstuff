@@ -256,6 +256,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
     g.add_argument(
+        "-cut_task_vols",
+        "-cut-task-vols",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("TASK", "N"),
+        help="keep only the first N volumes of every run of TASK; runs already at or "
+        "below N are left alone. For runs that ended a few volumes apart (390, 395, "
+        "402 -> -cut_task_vols TASK 390). The cut is a sub-brick selector on the "
+        "source, so every stage (NORDIC included) sees the cut series, and the GLM "
+        "drops events past the new end. Repeat for more tasks. Not compatible with "
+        "-noise_vols: those volumes sit at the end of the run the cut removes.",
+    )
+    g.add_argument(
         "-phase_proc",
         "-phase-proc",
         action="store_true",
@@ -887,6 +901,15 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     errors: list[str] = []
     warnings: list[str] = []
 
+    # The noise volumes are the last N of the raw run -- the very tail the cut
+    # throws away -- so the two cannot both describe the same file. Separate noise
+    # scans for ffs_nordic would lift this.
+    if opt.cut_task_vols and opt.noise_vols > 0:
+        errors.append(
+            "-cut_task_vols is not compatible with -noise_vols: the noise volumes are "
+            "the last volumes of each run, which is what the cut removes. Drop one."
+        )
+
     # Typo in an override: catch it now, not when the script reaches that stage.
     # A nonlinear stage is checked against the engine that will actually run it.
     nl_module = {
@@ -1157,6 +1180,16 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     f"{flag} names task '{task}', which is not in this subject/scope "
                     f"({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
                 )
+    for task in sorted(opt.cut_task_vols):
+        if task not in all_tasks:
+            warnings.append(
+                f"-cut_task_vols names task '{task}', which is not in this subject/scope "
+                f"({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
+            )
+        elif not opt.events:
+            from fastfuncstuff.autoproc.glm import cut_event_warnings
+
+            warnings += cut_event_warnings(task, _events_by_run(args.bids_dir, task, subject), opt)
     for task in sorted(opt.sep_glm_blur):
         if task not in all_tasks:
             warnings.append(
@@ -1342,6 +1375,24 @@ def _resolve_glm_blur(args) -> tuple[float | None, dict[str, float]]:
             task = entry[1]
             per_task[task[len("task-") :] if task.startswith("task-") else task] = fwhm
     return wide, per_task
+
+
+def _resolve_cut_task_vols(args) -> dict[str, int]:
+    """``{task: N}`` from repeated ``-cut_task_vols TASK N``; a task named twice
+    keeps the last."""
+    out: dict[str, int] = {}
+    for task, n in args.cut_task_vols or []:
+        try:
+            n_keep = int(n)
+        except ValueError:
+            raise SystemExit(
+                f"ffs_autoproc: -cut_task_vols {task} {n!r}: N must be a whole number "
+                "of volumes. The task comes first: -cut_task_vols TASK 390."
+            ) from None
+        if n_keep <= 0:
+            raise SystemExit(f"ffs_autoproc: -cut_task_vols {task} {n}: N must be positive.")
+        out[task[len("task-") :] if task.startswith("task-") else task] = n_keep
+    return out
 
 
 def _resolve_event_cols(
@@ -1660,6 +1711,7 @@ def main(argv: list[str] | None = None) -> int:
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
         noise_vols=args.noise_vols,
+        cut_task_vols=_resolve_cut_task_vols(args),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),
         slicetiming_file=args.slicetiming,
         tr=args.tr,

@@ -153,6 +153,67 @@ def resolve_event_cols(
     )
 
 
+def cut_event_warnings(task: str, runs_events: list, opt) -> list[str]:
+    """Warnings for events a -cut_task_vols cut leaves past their run's new end.
+
+    ``runs_events`` is ``[(BoldRun, events path or None)]`` for every run of
+    ``task``. One line per cut run that loses events, plus a louder one for any
+    condition left with no events in ANY run: ffs_reml -allow_late_events drops
+    the late rows, and a condition with nothing left is an all-zero column.
+    """
+    from fastfuncstuff.design.bids_events import read_tsv_rows
+    from fastfuncstuff.design.spec import bold_header
+
+    n_keep = opt.cut_task_vols.get(task)
+    paths = [ev for _, ev in runs_events if ev is not None]
+    if n_keep is None or not paths:
+        return []
+    cols, _ = resolve_event_cols(task, paths, opt)
+    onset_col, dur_col, tt_col = cols or DEFAULT_EVENT_COLUMNS
+    filters = opt.event_filters.get(task)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    kept: set[str] = set()
+    for run, ev in runs_events:
+        if ev is None:
+            continue
+        tr = opt.tr if opt.tr is not None else run.tr
+        n_raw, hdr_tr = bold_header(run.mag_path)
+        tr = tr or hdr_tr
+        end_sec = min(n_raw, n_keep) * tr
+        try:
+            rows, _ = read_tsv_rows(ev, onset_col, dur_col, tt_col, event_filters=filters)
+        except (OSError, ValueError) as exc:
+            out.append(f"-cut_task_vols task-{task}: cannot read {Path(ev).name} ({exc})")
+            continue
+        late: dict[str, int] = {}
+        for row in rows:
+            seen.add(row["_trial_type"])
+            if row["_onset"] >= end_sec:
+                late[row["_trial_type"]] = late.get(row["_trial_type"], 0) + 1
+            else:
+                kept.add(row["_trial_type"])
+        if late:
+            detail = ", ".join(f"{t} x{n}" for t, n in sorted(late.items()))
+            # The flag is task-wide, so a run the cut never touched also has its
+            # past-the-end events dropped rather than stopping the GLM.
+            cut = n_raw > n_keep
+            out.append(
+                f"-cut_task_vols task-{task} {Path(ev).name}: {sum(late.values())} event(s) "
+                f"start after {'the cut' if cut else 'the run end'} ({min(n_raw, n_keep)} "
+                f"vols = {end_sec:g}s{'' if cut else ', run not cut'}) and are dropped: {detail}"
+            )
+    lost = sorted(seen - kept)
+    if lost:
+        out.append(
+            f"-cut_task_vols task-{task}: condition(s) {', '.join(lost)} have NO events "
+            "left before the cut in any run — each is an all-zero design column. Cut "
+            "later, or remove the condition from the design TOML."
+        )
+    return out
+
+
 def nuisance_specs(task: str, opt) -> tuple[list, list[str]]:
     """``([NuisanceSpec], [skipped_name])`` for the named sources in
     ``opt.glm_ortvec``. A source whose ``requires`` option is off is skipped —
@@ -215,13 +276,16 @@ def round_modes(task: str, opt) -> tuple[int | str | None, int | str | None]:
     )
 
 
-def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
+def _n_timepoints(pr: PlanRun, opt) -> int:
     """Timepoints the preprocessed run will have: the raw header's count minus
-    any trailing noise volumes the pipeline trims up front."""
+    any trailing noise volumes the pipeline trims up front, capped by
+    -cut_task_vols for this run's task."""
     from fastfuncstuff.design.spec import bold_header
 
     n_tp, _ = bold_header(pr.bold.mag_path)
-    return max(int(n_tp) - int(noise_vols), 0)
+    n_tp = max(int(n_tp) - int(opt.noise_vols), 0)
+    cut = opt.cut_task_vols.get(pr.bold.task)
+    return min(n_tp, cut) if cut is not None else n_tp
 
 
 def _kept_status(dest: Path, task: str, opt) -> str:
@@ -364,7 +428,7 @@ def write_design_specs(
                 [Path(f"stage10.final.{_frag(pr)}.nii{opt.final_fmt}") for pr in prs],
                 scan_paths,
                 tr=trs.pop() if len(trs) == 1 else None,
-                n_timepoints_per_run=[_n_timepoints(pr, opt.noise_vols) for pr in prs],
+                n_timepoints_per_run=[_n_timepoints(pr, opt) for pr in prs],
                 event_cols=event_cols,
                 nuisance=nuisance,
                 stim_vec=stim_vecs,

@@ -48,6 +48,12 @@ class Options:
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
     noise_vols: int = 0
+    # {task: N} from -cut_task_vols: every run of that task keeps its first N
+    # volumes (a shorter run is left alone). Applied as a sub-brick selector on the
+    # source in the data table, so NORDIC, moco and the final resample all read the
+    # same cut series. Incompatible with noise_vols: those sit at the END of the
+    # run, which is exactly what the cut throws away.
+    cut_task_vols: dict[str, int] = field(default_factory=dict)
     # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
     # locomoco_detask is: the stage00 -events diagnostic MEASURES how much of the task
     # went out with the noise, and this ACTS on it. Read the report first.
@@ -326,6 +332,18 @@ class Plan:
         that has SBRefs at all normally has one per BOLD run.
         """
         return bool(self.runs) and all(pr.use_sbref for pr in self.runs)
+
+
+def task_cut(pr: PlanRun, opt: Options) -> tuple[int, int] | None:
+    """``(raw volumes, kept volumes)`` when -cut_task_vols shortens this run, else
+    None: its task has no cut, or the run is already at or below it."""
+    n_keep = opt.cut_task_vols.get(pr.bold.task)
+    if n_keep is None:
+        return None
+    from fastfuncstuff.design.spec import bold_header
+
+    n_raw, _ = bold_header(pr.bold.mag_path)
+    return (n_raw, n_keep) if n_raw > n_keep else None
 
 
 def run_average_chain(pr: PlanRun) -> list[str]:
