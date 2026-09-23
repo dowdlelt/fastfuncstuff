@@ -39,7 +39,7 @@ All of these are spelled out under `../fmri_wiki/principles/`. Don't re-derive t
 ## Testing
 
 ```bash
-/home/logan/miniconda3/envs/py312_movie_tasks/bin/python -m pytest tests/ -q
+/home/logan/miniconda3/envs/py314_ffs/bin/python -m pytest tests/ -q
 ```
 
 Per-module tests are colocated under `tests/`. Add a test for any new primitive — synthetic data is fine; we're verifying correctness, not benchmarking. The bar is "the test would have caught a real bug we hit", not coverage for its own sake.
