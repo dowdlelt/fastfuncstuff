@@ -22,6 +22,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff.viewer.colormap_tables import SAMPLED_SCALES
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 
 #: Colour scales as control points, interpolated into a LUT on demand. Held as
@@ -43,13 +44,6 @@ _SCALES: dict[str, tuple[tuple[float, float, float], ...]] = {
     # One colour at every value. For a mask -- a carpet selection -- where
     # "in" is the whole message and a ramp would invent a magnitude.
     "red": ((0.95, 0.12, 0.1), (0.95, 0.12, 0.1)),
-    "viridis": (
-        (0.267, 0.005, 0.329),
-        (0.229, 0.322, 0.545),
-        (0.128, 0.567, 0.551),
-        (0.369, 0.789, 0.383),
-        (0.993, 0.906, 0.144),
-    ),
     "spectrum": (
         (0.6, 0.0, 0.7),
         (0.0, 0.0, 1.0),
@@ -59,13 +53,49 @@ _SCALES: dict[str, tuple[tuple[float, float, float], ...]] = {
         (1.0, 0.4, 0.0),
         (1.0, 0.0, 0.0),
     ),
+    # Hue once round the wheel at full saturation, so both ends are red: the
+    # cyclic scale for a phase or an angle when twilight is too subdued.
+    # matplotlib's hsv adds short plateaus at each primary; this is the plain
+    # wheel.
+    "hsv": (
+        (1, 0, 0),
+        (1, 1, 0),
+        (0, 1, 0),
+        (0, 1, 1),
+        (0, 0, 1),
+        (1, 0, 1),
+        (1, 0, 0),
+    ),
+    **SAMPLED_SCALES,
 }
+
+#: The order the picker lists them in: by family rather than alphabet, so a
+#: diverging scale sits beside the other diverging ones.
+_ORDER = (
+    "gray",
+    "hot",
+    "cool",
+    "red",
+    "viridis",
+    "plasma",
+    "inferno",
+    "magma",
+    "cividis",
+    "turbo",
+    "spectrum",
+    "redblue",
+    "RdBu",
+    "RdYlBu",
+    "hsv",
+    "twilight",
+    "twilight_shifted",
+)
 
 DEFAULT_LUT_SIZE = 256
 
 
 def available_colormaps() -> list[str]:
-    return sorted(_SCALES)
+    return [*_ORDER, *sorted(set(_SCALES) - set(_ORDER))]
 
 
 def build_lut(

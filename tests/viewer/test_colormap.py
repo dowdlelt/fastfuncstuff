@@ -39,6 +39,28 @@ def test_every_advertised_colormap_builds():
         assert (lut >= 0).all() and (lut <= 1).all()
 
 
+def test_the_picker_order_lists_every_scale_once():
+    from fastfuncstuff.viewer.colormap import _SCALES
+
+    names = available_colormaps()
+    assert len(names) == len(set(names)) == len(_SCALES)
+
+
+@pytest.mark.parametrize("name", ["viridis", "turbo", "RdBu", "RdYlBu", "twilight"])
+def test_sampled_scales_match_matplotlib(name):
+    """A mistyped stop would still build a valid LUT, just not the named one."""
+    mpl = pytest.importorskip("matplotlib")
+    ours = build_lut(name, 256, device=CPU).numpy()
+    theirs = mpl.colormaps[name](torch.linspace(0, 1, 256).numpy())[:, :3]
+    assert abs(ours - theirs).max() < 0.03
+
+
+@pytest.mark.parametrize("name", ["hsv", "twilight", "twilight_shifted"])
+def test_cyclic_scales_close_on_themselves(name):
+    lut = build_lut(name, 256, device=CPU)
+    assert torch.allclose(lut[0], lut[-1], atol=0.03)
+
+
 def test_lut_endpoints_match_the_scale_definition():
     lut = build_lut("gray", 256, device=CPU)
     assert torch.allclose(lut[0], torch.zeros(3), atol=1e-6)
