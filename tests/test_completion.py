@@ -19,10 +19,13 @@ from fastfuncstuff.completion import (
     OptionSpec,
     _completion_kind,
     describe,
+    flag_help_texts,
     load_parser,
     render_bash,
     render_fish,
+    render_fish_help_key,
     render_zsh,
+    write_flag_help,
 )
 
 
@@ -354,3 +357,74 @@ def test_describe_leaves_an_unexpandable_token_alone():
     action.help = "uses %(nosuchfield)s"  # argparse rejects this at add_argument
     spec = next(s for s in describe(p) if "-thing" in s.option_strings)
     assert spec.help == "uses %(nosuchfield)s"
+
+
+# --- full per-flag help on a key -------------------------------------------
+
+_LONG = "word " * 60  # far past the 90-char completion description
+
+
+def _help_parser():
+    from fastfuncstuff.cli_help import FfsArgumentParser
+
+    p = FfsArgumentParser(prog="ffs_demo")
+    p.add_argument("-cut_task_vols", nargs=2, metavar=("TASK", "N"), help=_LONG.strip())
+    p.add_argument("-glm_drop_first", type=int, default=3, metavar="N", help="drop first")
+    p.add_argument("-glm_drop_last", type=int, default=0, metavar="N", help="drop last")
+    p.add_argument("-hidden", help=argparse.SUPPRESS)
+    return p
+
+
+def test_flag_help_is_the_whole_entry_under_every_spelling():
+    texts = flag_help_texts(_help_parser())
+    # The -foo-bar twin FfsArgumentParser adds lands on the same key.
+    assert texts["cuttaskvols"].startswith("-cut_task_vols TASK N")
+    assert texts["cuttaskvols"].count("word") == 60  # nothing truncated
+    assert "(default: 3)" in texts["glmdropfirst"]
+    assert "hidden" not in texts
+
+
+def test_write_flag_help_drops_a_removed_flags_stale_file(tmp_path):
+    (tmp_path / "ffs_demo").mkdir()
+    (tmp_path / "ffs_demo" / "renamedaway.txt").write_text("old")
+    assert write_flag_help(tmp_path, "ffs_demo", _help_parser()) == 5  # 3 flags + -h/-help
+    assert not (tmp_path / "ffs_demo" / "renamedaway.txt").exists()
+    assert (tmp_path / "ffs_demo" / "glmdroplast.txt").is_file()
+
+
+@pytest.mark.skipif(shutil.which("fish") is None, reason="fish not installed")
+def test_fish_help_key_finds_the_flag_at_the_cursor(tmp_path):
+    write_flag_help(tmp_path / "help", "ffs_demo", _help_parser())
+    snippet = tmp_path / "ffs_flag_help.fish"
+    snippet.write_text(render_fish_help_key(str(tmp_path / "help")))
+
+    def lookup(*tokens):
+        r = subprocess.run(  # noqa: S603
+            [
+                "fish",
+                "--no-config",
+                "-c",
+                f"source {snippet}; __ffs_flag_help_lookup ffs_demo $argv",
+                "--",
+                *tokens,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return r.returncode, r.stdout
+
+    # On the flag, in either spelling.
+    for tok in ("-cut_task_vols", "-cut-task-vols"):
+        rc, out = lookup(tok)
+        assert rc == 0 and out.startswith("-cut_task_vols TASK N")
+    # On its value: the nearest flag before the cursor.
+    rc, out = lookup("floc", "-i", "x", "-cut_task_vols")
+    assert rc == 0 and out.startswith("-cut_task_vols TASK N")
+    # A partial flag lists what it could be; an exact name beats being a prefix.
+    rc, out = lookup("-glm_drop")
+    assert rc == 0 and "2 flags start with -glm_drop" in out
+    assert out.count("-glm_drop_") == 2
+    rc, out = lookup("-zzz")
+    assert rc == 1 and "no flag matches -zzz" in out
+    rc, out = lookup("")
+    assert rc == 1 and "put the cursor on a flag" in out

@@ -29,7 +29,9 @@ test:
 completions:
 	@# Uses THIS environment's python on purpose: the tool list comes from its
 	@# installed metadata, so generating from another env writes a partial set.
-	python -m fastfuncstuff.cli.completion -shell fish -o $(HOME)/.config/fish/completions
+	python -m fastfuncstuff.cli.completion -shell fish -o $(HOME)/.config/fish/completions \
+		-help_dir $(HOME)/.local/share/ffs/flag_help \
+		-keybind $(HOME)/.config/fish/conf.d/ffs_flag_help.fish
 	python -m fastfuncstuff.cli.completion -shell bash -o $(HOME)/.local/share/bash-completion/completions
 	python -m fastfuncstuff.cli.completion -shell zsh  -o $(HOME)/.zfunc
 
