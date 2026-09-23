@@ -266,8 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
         "below N are left alone. For runs that ended a few volumes apart (390, 395, "
         "402 -> -cut_task_vols TASK 390). The cut is a sub-brick selector on the "
         "source, so every stage (NORDIC included) sees the cut series, and the GLM "
-        "drops events past the new end. Repeat for more tasks. Not compatible with "
-        "-noise_vols: those volumes sit at the end of the run the cut removes.",
+        "drops events past the new end. Repeat for more tasks. A cut task is taken "
+        "to have NO noise volumes (a run that needs cutting was stopped before the "
+        "noise scans): -noise_vols still applies to every other task, and NORDIC "
+        "sets the cut task's threshold from its g-factor normalisation alone, as "
+        "MATLAB NORDIC does without noise scans.",
     )
     g.add_argument(
         "-phase_proc",
@@ -900,15 +903,6 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
     warnings: list[str] = []
-
-    # The noise volumes are the last N of the raw run -- the very tail the cut
-    # throws away -- so the two cannot both describe the same file. Separate noise
-    # scans for ffs_nordic would lift this.
-    if opt.cut_task_vols and opt.noise_vols > 0:
-        errors.append(
-            "-cut_task_vols is not compatible with -noise_vols: the noise volumes are "
-            "the last volumes of each run, which is what the cut removes. Drop one."
-        )
 
     # Typo in an override: catch it now, not when the script reaches that stage.
     # A nonlinear stage is checked against the engine that will actually run it.

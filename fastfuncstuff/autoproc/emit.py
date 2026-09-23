@@ -28,6 +28,7 @@ from fastfuncstuff.autoproc.plan import (
     effective_anat_source,
     ref_anchor,
     run_average_chain,
+    run_noise_vols,
     session_fmap_ids,
     session_ref_mode,
     task_cut,
@@ -1153,7 +1154,8 @@ def _cut_header_note(plan: Plan) -> str:
     if not cuts:
         return ""
     body = ", ".join(f"task-{t} {n}" for t, n in sorted(cuts.items()))
-    return f"\n#   cut to N vols     : {body} (-cut_task_vols; MAG[...] selectors below)"
+    noise = " — no noise vols (NOISE[...]=0)" if plan.options.noise_vols else ""
+    return f"\n#   cut to N vols     : {body} (-cut_task_vols; MAG[...] selectors below){noise}"
 
 
 def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
@@ -1190,8 +1192,7 @@ OUT={shlex.quote(out_dir)}
 DEVICE={shlex.quote(opt.device)}          # compute device for every ffs stage; -device
 FMT={opt.fmt}           # working intermediates (read many times); -format
 FINAL_FMT={opt.final_fmt}     # final timeseries (portable); -final_format
-GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format
-NOISE_VOLS={opt.noise_vols}{phase_fmt}
+GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format{phase_fmt}
 
 mkdir -p "$OUT"; cd "$OUT"
 
@@ -1230,7 +1231,7 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
     # lane's image is on the run's own geometry, so they share one target grid.
     moco_arrays = " ".join(f"MOCO_{ln.upper()}" for ln in _lanes(plan) if ln != LANE_SBREF)
     lines.append(
-        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN AVGCHAIN XRUNBASE EVENTS "
+        "declare -A MAG PHASE NOISE SBREF TR PEDIR JSON FRAG CHAIN AVGCHAIN XRUNBASE EVENTS "
         f"{moco_arrays} PRECHAIN REFGRID JAC"
     )
 
@@ -1252,6 +1253,7 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
             lines.append(f"# -cut_task_vols: {cut[0]} -> {cut[1]} volumes")
             sel = f"[0..{cut[1] - 1}]"
         lines.append(f"MAG[{q(k)}]={q(str(b.mag_path) + sel)}")
+        lines.append(f"NOISE[{q(k)}]={run_noise_vols(pr, plan.options)}")
         if b.phase_path:
             lines.append(f"PHASE[{q(k)}]={q(str(b.phase_path) + sel)}")
         if b.sbref_path:
@@ -1409,8 +1411,8 @@ def _pre_stc_source(plan: Plan, indent: str = "  ") -> str:
         return f'{indent}raw="{_nordic_mag(plan)}"'
     return (
         f'{indent}raw="${{MAG[$k]}}"\n'
-        f'{indent}if [ "$NOISE_VOLS" -gt 0 ]; then '
-        f'nv=$(ffs_info -nv "$raw"); raw="${{raw}}[0..$((nv - NOISE_VOLS - 1))]"; fi'
+        f'{indent}if [ "${{NOISE[$k]}}" -gt 0 ]; then '
+        f'nv=$(ffs_info -nv "$raw"); raw="${{raw}}[0..$((nv - ${{NOISE[$k]}} - 1))]"; fi'
     )
 
 
@@ -1533,7 +1535,7 @@ def _stage_nordic(plan: Plan) -> str:
             '-input_magn "${MAG[$k]}"',
             '"${phase_arg[@]}"',
             '-prefix "$outf"',
-            '-noise-volume-last "$NOISE_VOLS"',
+            '-noise-volume-last "${NOISE[$k]}"',
             *_split_flags(config.DEFAULT_OPTS["nordic"]),
             resid,
             numcomps,
@@ -3203,8 +3205,8 @@ def _stage_unwrap(plan: Plan) -> str:
         )
         src = (
             '  mag="${MAG[$k]}"; ph="${PHASE[$k]}"\n'
-            '  if [ "$NOISE_VOLS" -gt 0 ]; then\n'
-            '    nv=$(ffs_info -nv "$mag"); last=$((nv - NOISE_VOLS - 1))\n'
+            '  if [ "${NOISE[$k]}" -gt 0 ]; then\n'
+            '    nv=$(ffs_info -nv "$mag"); last=$((nv - ${NOISE[$k]} - 1))\n'
             '    mag="${mag}[0..$last]"; ph="${ph}[0..$last]"\n'
             "  fi\n"
             '  if [[ "$mag" == *"]" ]]; then\n'
@@ -3212,7 +3214,7 @@ def _stage_unwrap(plan: Plan) -> str:
             "  fi"
         )
         note = (
-            "# Inputs: the raw BIDS pair. With NOISE_VOLS>0 (or -cut_task_vols) both\n"
+            "# Inputs: the raw BIDS pair. With NOISE[$k]>0 (or -cut_task_vols) both\n"
             "# are trimmed into stage00.trim.* first (ROMEO takes files, not [0..n]\n"
             "# selectors)."
         )

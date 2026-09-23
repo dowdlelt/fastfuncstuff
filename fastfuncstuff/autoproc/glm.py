@@ -21,7 +21,7 @@ from pathlib import Path
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import find_events
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS
-from fastfuncstuff.autoproc.plan import Plan, PlanRun
+from fastfuncstuff.autoproc.plan import Plan, PlanRun, run_noise_vols
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
@@ -283,7 +283,7 @@ def _n_timepoints(pr: PlanRun, opt) -> int:
     from fastfuncstuff.design.spec import bold_header
 
     n_tp, _ = bold_header(pr.bold.mag_path)
-    n_tp = max(int(n_tp) - int(opt.noise_vols), 0)
+    n_tp = max(int(n_tp) - run_noise_vols(pr, opt), 0)
     cut = opt.cut_task_vols.get(pr.bold.task)
     return min(n_tp, cut) if cut is not None else n_tp
 

@@ -2661,15 +2661,27 @@ def test_cut_event_warnings_name_the_dropped_events_and_a_lost_condition(tmp_pat
     assert cut_event_warnings("floc", runs, Options()) == []
 
 
-def test_cut_task_vols_refuses_noise_vols(tmp_path: Path, capsys):
+def test_cut_task_vols_task_has_no_noise_vols(tmp_path: Path):
+    """A cut task was stopped early, so its trailing volumes are task data, not noise
+    scans: every run of it -- the uncut 11-volume one too -- gets NOISE=0, while the
+    other task keeps -noise_vols for NORDIC, the trims and the design length."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
     from fastfuncstuff.cli.autoproc import main
+    from fastfuncstuff.design.spec import load_spec
 
     _bids_uneven_runs(tmp_path)
     argv = ["-bids_dir", str(tmp_path), "-subject", "ME1", "-no_anat"]
     argv += ["-out", str(tmp_path / "p.sh"), "-work_dir", str(tmp_path / "wd")]
-    assert main([*argv, "-cut_task_vols", "floc", "12", "-noise_vols", "2"]) == 1
-    assert "-cut_task_vols is not compatible with -noise_vols" in capsys.readouterr().err
-    assert not (tmp_path / "p.sh").exists()
+    assert main([*argv, "-cut_task_vols", "task-floc", "12", "-noise_vols", "2"]) == 0
+    s = (tmp_path / "p.sh").read_text()
+    noise = dict(re.findall(r"^NOISE\[SM:(\w+:\d+)\]=(\d+)$", s, flags=re.M))
+    assert noise == {"floc:01": "0", "floc:02": "0", "floc:03": "0", "rest:01": "2"}
+    assert "[0..11]" in s
+    assert "NOISE_VOLS" not in s  # no global left for a stage to read by mistake
 
-    assert main([*argv, "-cut_task_vols", "task-floc", "12"]) == 0
-    assert "[0..11]" in (tmp_path / "p.sh").read_text()
+    opt = Options(run_glm=True, go_to_anat=False, noise_vols=2, cut_task_vols={"floc": 12})
+    subj = scan_subject(tmp_path, "ME1")
+    rows = write_design_specs(build_plan(subj, opt), str(tmp_path), str(tmp_path / "wd2"))
+    paths = {task: path for task, path, _ in rows}
+    assert load_spec(paths["floc"]).meta.n_timepoints_per_run == [12, 12, 11]

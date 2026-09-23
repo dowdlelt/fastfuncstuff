@@ -51,8 +51,9 @@ class Options:
     # {task: N} from -cut_task_vols: every run of that task keeps its first N
     # volumes (a shorter run is left alone). Applied as a sub-brick selector on the
     # source in the data table, so NORDIC, moco and the final resample all read the
-    # same cut series. Incompatible with noise_vols: those sit at the END of the
-    # run, which is exactly what the cut throws away.
+    # same cut series. A cut task is taken to have NO noise volumes (see
+    # run_noise_vols): a run that needs cutting was usually stopped early, before
+    # the noise scans were acquired.
     cut_task_vols: dict[str, int] = field(default_factory=dict)
     # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
     # locomoco_detask is: the stage00 -events diagnostic MEASURES how much of the task
@@ -344,6 +345,17 @@ def task_cut(pr: PlanRun, opt: Options) -> tuple[int, int] | None:
 
     n_raw, _ = bold_header(pr.bold.mag_path)
     return (n_raw, n_keep) if n_raw > n_keep else None
+
+
+def run_noise_vols(pr: PlanRun, opt: Options) -> int:
+    """Trailing noise volumes in this run: -noise_vols, or 0 for a -cut_task_vols task.
+
+    The whole task, not just the runs the cut shortens: a task that needs cutting
+    was stopped early at least once, so its trailing volumes cannot be trusted to
+    be noise scans in any of its runs, and trimming "noise" off an early-stopped
+    run would throw away task volumes and hand them to NORDIC as noise.
+    """
+    return 0 if pr.bold.task in opt.cut_task_vols else opt.noise_vols
 
 
 def run_average_chain(pr: PlanRun) -> list[str]:
