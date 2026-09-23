@@ -1400,6 +1400,21 @@ class TestDerivativeFreeRefinement:
         start_cost = float(cost(_batched_cost_matrix(start, device)).item())
         assert costs[0] >= start_cost, "refinement returned a worse point than it started from"
 
+    def test_cmaes_keeps_an_already_optimal_start(self):
+        """A stage hand-off must remain a candidate in the next stage's search."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = self._bowl(_normalize(start, bounds), bounds, device)
+
+        out, costs = _refine_cmaes_batched(
+            [start], config, bounds, device, cost, verb=0, n_iters=1
+        )
+
+        np.testing.assert_array_equal(out[0], start)
+        assert costs[0] == pytest.approx(0.0)
+
     def test_cmaes_is_reproducible(self):
         """Seeded sampling: an alignment that moves run to run is unusable downstream."""
         device = torch.device("cpu")

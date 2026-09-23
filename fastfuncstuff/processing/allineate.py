@@ -1922,9 +1922,13 @@ def _refine_cmaes_batched(
     gen = torch.Generator(device=device).manual_seed(0x0A11)
 
     best_x = x0.clone()
-    best_c = torch.full((T,), -float("inf"), device=device)
+    # The incoming point is part of the search, not merely the centre of its first
+    # random population.  Without this evaluation the first sampled point replaced a
+    # possibly exact optimum simply because the incumbent started at -inf.
+    start_phys = _denormalize_t(x0, bmin, span)
+    best_c = batched_cost_fn(params_to_matrix_batched(start_phys)).detach()
     alive = torch.ones(T, dtype=torch.bool, device=device)
-    n_eval = 0
+    n_eval = T
 
     # Stagnation stop. sigma alone does not end this search: once the samples
     # are within the cost's own reproducibility (~7.5e-5, from the blok scatter's
@@ -1956,7 +1960,7 @@ def _refine_cmaes_batched(
     rel_tol, abs_tol = 1e-4, 1e-6
     patience = int(_os.environ.get("FFS_CMA_PATIENCE", "60"))
     stalled = torch.zeros(T, dtype=torch.long, device=device)
-    prev_best = torch.full((T,), -float("inf"), device=device)
+    prev_best = best_c.clone()
 
     def _evaluate(cand_free: Tensor) -> Tensor:
         """(T, L, n) free-subspace points -> (T, L) costs, in one batched call."""
