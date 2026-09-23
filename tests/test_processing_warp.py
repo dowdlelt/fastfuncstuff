@@ -1028,6 +1028,40 @@ class TestPatchWriteBackDedup:
         torch.testing.assert_close(yd, zero)
         torch.testing.assert_close(zd, zero)
 
+    def test_level_zero_rollback_still_runs_finer_levels(self, monkeypatch):
+        """A rejected global pass must not skip the patch polish of the hand-off."""
+        import fastfuncstuff.processing.warp as warp_mod
+
+        base = torch.rand(24, 24, 24) + 0.1
+        zero = torch.zeros_like(base)
+        levels_seen: list[int] = []
+
+        def worsen_level_zero_only(*args, **kwargs):
+            state = args[4]
+            levels_seen.append(state.last_level)
+            if state.last_level == 0:
+                state.xd = torch.full_like(state.xd, 4.0)
+                state.warped_source = torch.zeros_like(state.warped_source)
+
+        monkeypatch.setattr(warp_mod, "_improve_warp_batched", worsen_level_zero_only)
+        _, xd, _, _ = warp_mod.qwarp(
+            base,
+            base.clone(),
+            initial_warp=(zero, zero, zero),
+            config=QwarpConfig(
+                max_level=1,
+                minpatch=5,
+                reject_worse_levels=True,
+                batch_optimizer_iters_lev0=1,
+                verb=0,
+            ),
+            device=torch.device("cpu"),
+            pad=False,
+        )
+
+        assert 1 in levels_seen, "level 1 never ran after the level-0 rollback"
+        torch.testing.assert_close(xd, zero)
+
     # ---------------------------------------------------------------------------
     # WarpState mutation patterns
     # ---------------------------------------------------------------------------

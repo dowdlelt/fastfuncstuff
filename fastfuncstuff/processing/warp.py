@@ -1341,7 +1341,10 @@ def _warpomatic(
         # An initial warp is already a fitted solution.  Level 0 re-solves the
         # global deformation and therefore needs the same incumbent protection as
         # every finer level; otherwise an optiwarp/iniwarp hand-off can be lost
-        # before the guarded level loop even begins.
+        # before the guarded level loop even begins.  Unlike a finer level, a
+        # rejected level 0 does not stop refinement: "finer levels over-warp first"
+        # says nothing about local patches when the global basis is what lost, and
+        # stopping here would skip the whole patch polish of a good hand-off.
         rejected_lev0 = config.reject_worse_levels and state.cost > first_cost + 1e-4
         if rejected_lev0:
             worsened = state.cost
@@ -1382,8 +1385,6 @@ def _warpomatic(
                 ),
                 pinned=True,
             )
-        if rejected_lev0:
-            return
 
     # --- Levels 1..N: progressively smaller patches (batched GPU) ---
     xwid0 = ittt - ibbb + 1
