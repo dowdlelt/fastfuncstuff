@@ -47,6 +47,15 @@ def task_design_from_events(args, n_timepoints: int, tr: float, device):
             f"{earliest:g}s, run length {run_seconds:g}s ({n_timepoints} frames x "
             f"{tr:g}s TR). The TR is almost certainly wrong — pass -tr SEC."
         )
+    late = {
+        labels[c]: int(sum((o >= run_seconds).sum() for o in cond)) for c, cond in enumerate(onsets)
+    }
+    if any(late.values()):
+        detail = ", ".join(f"{k} x{n}" for k, n in late.items() if n)
+        print(
+            f"  ⚠️  {sum(late.values())} event(s) start at/after the run end "
+            f"({run_seconds:g}s) and are ignored: {detail}"
+        )
 
     dt = commensurate_microtime_dt(tr)
     hrf = torch.tensor(spm_canonical_hrf(tr=dt), dtype=torch.float64, device=device)

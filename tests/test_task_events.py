@@ -19,13 +19,17 @@ def _args(tmp_path: Path, onsets) -> Namespace:
     return Namespace(events=[str(ev)], event_ignore=None, event_cols=None)
 
 
-def test_events_past_a_shortened_run_end_are_dropped_not_fatal(tmp_path):
+def test_events_past_a_shortened_run_end_are_dropped_not_fatal(tmp_path, capsys):
     # A run cut short (ffs_autoproc -cut_task_vols) keeps its full events file: the
-    # tail events fall past the new end. That is not the wrong-TR symptom.
+    # tail events fall past the new end. That is not the wrong-TR symptom, but the
+    # user is told what was left out.
     args = _args(tmp_path, [10.0, 40.0, 190.0])
     design, labels = task_design_from_events(args, 50, 2.0, torch.device("cpu"))
     assert design.shape == (50, 1)
     assert labels == ["stim"]
+    assert "1 event(s) start at/after the run end (100s) and are ignored: stim x1" in (
+        capsys.readouterr().out
+    )
 
 
 def test_every_event_past_the_end_still_names_the_tr(tmp_path):
