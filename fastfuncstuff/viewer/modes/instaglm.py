@@ -32,13 +32,13 @@ import numpy as np
 import torch
 
 from fastfuncstuff.viewer import instaglm as engine
+from fastfuncstuff.viewer import ortvec
 from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
     FULL,
     HALF,
     THIRD,
     ActionControl,
-    BoolControl,
     ChoiceControl,
     ComputedOverlay,
     Control,
@@ -125,7 +125,7 @@ class InstaGLMMode(Mode):
         #: The convolved task block and the inputs it was built from. Keyed
         #: rather than rebuilt because convolving events at microtime costs
         #: 0.5 s on a real run -- sixteen times the fit it feeds -- and
-        #: stepping polort, ticking the ortvec derivatives on or asking for
+        #: stepping polort, ticking an ortvec on or asking for
         #: another noise PC changes none of its inputs. Without this, the one
         #: gesture the mode exists for ("step up through the polynomials and
         #: watch the fit improve") pays for a convolution per step.
@@ -297,24 +297,20 @@ class InstaGLMMode(Mode):
                 help="Principal components of the noise pool -- bright voxels the task "
                 "explains no better than chance -- added as regressors, GLMdenoise style.",
             ),
-            BoolControl(
-                name="ort_deriv",
-                label="+ deriv",
-                default=False,
-                span=THIRD,
-                help="Also fit each ortvec column's backward difference. A motion column "
-                "removes signal that tracks where the head is; its derivative removes "
-                "signal that tracks the head moving, which is usually the bigger one.",
-            ),
             PathListControl(
                 name="ortvec",
                 label="ortvec",
                 filter="1D / xmat (*.1D *.txt);;All (*)",
                 newline=True,
+                transforms=True,
+                sample_interval=self._run_tr(),
                 help="Extra regressors, one column each -- a motion file, a respiration "
                 "trace, a set of physio terms. Add as many as you like and untick one "
                 "to see what it was buying; every column is pickable as a map of its "
-                "own.",
+                "own. d/dt adds the selected entry's derivative as an entry of its "
+                "own -- a motion column removes signal that tracks where the head is, "
+                "its derivative signal that tracks the head moving. BANDS splits an "
+                "entry by frequency, one entry per band.",
             ),
         )
 
@@ -349,7 +345,6 @@ class InstaGLMMode(Mode):
                 "polort",
                 "blur",
                 "ortvec",
-                "ort_deriv",
                 "pcs",
             }
         )
@@ -482,10 +477,9 @@ class InstaGLMMode(Mode):
         if events_path:
             task, task_labels = self._task_block(events_path, n_time, tr, device, progress)
 
-        ort, ort_labels = self._ort_block(n_time)
+        ort, ort_labels = self._ort_block(n_time, tr)
 
         polort = int(self.params.get("polort", 2))
-        deriv = bool(self.params.get("ort_deriv", False))
         n_pcs = int(self.params.get("pcs", 0))
 
         pcs = None
@@ -504,7 +498,6 @@ class InstaGLMMode(Mode):
                 polort=polort,
                 ort=ort,
                 ort_labels=ort_labels,
-                ort_derivatives=deriv,
             )
             first = engine.fit_model(self._prepared, base, device=device)
             pool = engine.noise_pool(first)
@@ -518,36 +511,54 @@ class InstaGLMMode(Mode):
             polort=polort,
             ort=ort,
             ort_labels=ort_labels,
-            ort_derivatives=deriv,
             pcs=pcs,
         )
 
-    def _ort_block(self, n_time: int) -> tuple[np.ndarray | None, list[str]]:
-        """Every ticked ortvec file, read and laid side by side.
+    def _ort_block(self, n_time: int, tr: float) -> tuple[np.ndarray | None, list[str]]:
+        """Every ticked ortvec entry, read, transformed and laid side by side.
 
-        Concatenated rather than fitted one file at a time, because the whole
+        Concatenated rather than fitted one entry at a time, because the whole
         reason to hold several is to ask what each buys *given* the others.
         A label carries its file's stem when there is more than one file, so
         two motion estimates in the same model stay tellable apart in the
-        column picker.
+        column picker. A file is read once however many entries derive from it.
         """
-        from fastfuncstuff.viewer.derive import read_nuisance
-
-        paths = PathListControl.enabled(self.params.get("ortvec"))
+        entries = PathListControl.enabled(self.params.get("ortvec"))
+        parsed = [ortvec.parse_entry(e) for e in entries]
+        distinguish = len({path for path, _ in parsed}) > 1
+        files: dict[str, tuple[np.ndarray, list[str]]] = {}
         blocks, labels = [], []
-        for path in paths:
-            # Through derive's reader, so an xmat contributes its ColumnGroups
-            # nuisance and a plain 1D file contributes all of itself -- the same
-            # rule DERIVE applies, rather than a second opinion about what
-            # counts as a regressor file.
-            read = read_nuisance(path, n_time=n_time, polort=-1)
-            if read.columns is None or read.columns.size == 0:
+        for path, ops in parsed:
+            if path not in files:
+                columns, names = ortvec.read_columns(path)
+                if columns.shape[0] != n_time:
+                    raise ValueError(
+                        f"{path} has {columns.shape[0]} rows but the run has {n_time} volumes"
+                    )
+                files[path] = (columns, _short_labels(path, names, distinguish=distinguish))
+            columns, names = ortvec.apply_ops(*files[path], ops, tr)
+            if columns.size == 0:
                 continue
-            blocks.append(np.asarray(read.columns, dtype=float))
-            labels += _short_labels(path, read.labels, distinguish=len(paths) > 1)
+            blocks.append(columns)
+            labels += names
         if not blocks:
             return None, []
         return np.concatenate(blocks, axis=1), labels
+
+    def _run_tr(self) -> float:
+        """The TR of the run that will be fitted, before it is fitted.
+
+        What the band splitter draws its frequency axis in. Read from the header
+        rather than the prepared fit, so the splitter works before the first FIT
+        -- choosing the bands is part of deciding what to fit.
+        """
+        layer = self.source_layer()
+        if layer is None or self.session is None:
+            return self._tr
+        try:
+            return float(self.session.store.get(layer.key).info.tr or 0.0) or self._tr
+        except (KeyError, AttributeError):
+            return self._tr
 
     def _task_block(
         self,

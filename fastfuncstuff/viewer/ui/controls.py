@@ -43,6 +43,7 @@ from fastfuncstuff.viewer.modes.base import (
     PathControl,
     PathListControl,
 )
+from fastfuncstuff.viewer.ortvec import describe_entry, with_op
 from fastfuncstuff.viewer.ui.widgets import RowSizedList
 
 #: How long to wait after the last change before applying it. Long enough to
@@ -347,7 +348,8 @@ class ControlPanel(QtWidgets.QWidget):
             listing.blockSignals(True)
             listing.clear()
             for path, on in entries:
-                item = QtWidgets.QListWidgetItem(path.rsplit("/", 1)[-1])
+                text = describe_entry(path) if spec.transforms else path.rsplit("/", 1)[-1]
+                item = QtWidgets.QListWidgetItem(text)
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
                 item.setToolTip(path)
                 item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
@@ -390,15 +392,71 @@ class ControlPanel(QtWidgets.QWidget):
             fill([e for i, e in enumerate(entries()) if i not in chosen])
             commit()
 
+        def derive(_=False) -> None:
+            # Each derivative lands under its source and ticked, so pressing
+            # the button is the whole gesture; pressing it on a derivative
+            # gives the second one.
+            chosen = {listing.row(i) for i in listing.selectedItems()}
+            if not chosen:
+                return
+            have = {p for p, _ in entries()}
+            out = []
+            for i, (path, on) in enumerate(entries()):
+                out.append((path, on))
+                derived = with_op(path, "deriv")
+                if i in chosen and derived not in have:
+                    out.append((derived, True))
+            fill(out)
+            commit()
+
+        def split(_=False) -> None:
+            from fastfuncstuff.viewer.ui.bandsplit import split_interactively
+
+            rows = sorted(listing.row(i) for i in listing.selectedItems())
+            if not rows:
+                return
+            current = entries()
+            source = current[rows[0]][0]
+            added = split_interactively(source, spec.sample_interval, self)
+            if not added:
+                return
+            # The source goes off, not away: its bands sum back to it, so
+            # leaving it on makes the design collinear, but it stays one tick
+            # from the before-and-after comparison the split was made for.
+            have = {p for p, _ in current}
+            out = []
+            for i, (path, on) in enumerate(current):
+                out.append((path, False if i == rows[0] else on))
+                if i == rows[0]:
+                    out += [(e, True) for e in added if e not in have]
+            fill(out)
+            commit()
+
         listing.itemChanged.connect(lambda _item: commit())
 
-        buttons = QtWidgets.QVBoxLayout()
+        buttons = QtWidgets.QGridLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.setSpacing(2)
-        for text, slot, tip in (
+        tools = [
             ("+", add, "Add one or more files."),
             ("−", drop, "Remove the selected files. Untick instead to keep them handy."),
-        ):
+        ]
+        if spec.transforms:
+            tools += [
+                (
+                    "∂",
+                    derive,
+                    "Add the derivative of each selected entry, as an entry of its own. "
+                    "Press it on a derivative for the second derivative.",
+                ),
+                (
+                    "≋",
+                    split,
+                    "Split the selected entry by frequency: pick cuts on each column's "
+                    "spectrum, and get one entry per band.",
+                ),
+            ]
+        for position, (text, slot, tip) in enumerate(tools):
             button = QtWidgets.QPushButton(text)
             button.setObjectName("tool")
             # Square and small: two stacked buttons otherwise set the row's
@@ -407,7 +465,8 @@ class ControlPanel(QtWidgets.QWidget):
             button.setFixedSize(22, 22)
             button.setToolTip(tip)
             button.clicked.connect(slot)
-            buttons.addWidget(button)
+            # Two columns: four stacked buttons would set the list's height.
+            buttons.addWidget(button, *divmod(position, 2))
 
         fill(PathListControl.parse(value if value is not None else spec.default))
         h.addWidget(listing, 1)

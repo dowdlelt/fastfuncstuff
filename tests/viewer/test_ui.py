@@ -2473,7 +2473,6 @@ def test_instaglm_declares_its_whole_panel(win_glm, qapp):
         "undershoot",
         "polort",
         "ortvec",
-        "ort_deriv",
         "pcs",
         "show",
         "column",

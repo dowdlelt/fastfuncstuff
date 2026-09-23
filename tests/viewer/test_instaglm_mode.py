@@ -166,8 +166,8 @@ def test_stepping_polort_does_not_reconvolve_the_events(glm_session):
     block = mode._task
     assert block is not None
 
-    for changed in ("polort", "ort_deriv", "pcs"):
-        glm_session.set_mode_param(changed, "3" if changed == "polort" else "1")
+    for changed, value in (("polort", "3"), ("pcs", "1")):
+        glm_session.set_mode_param(changed, value)
         assert glm_session.mode._task is block, f"{changed} reconvolved the events"
 
 
@@ -202,17 +202,47 @@ def test_a_derivative_basis_adds_a_column_per_condition(glm_session):
     assert mode._fit.model.labels[:2] == ("faces", "faces'")
 
 
-def test_an_ortvec_is_fitted_and_its_derivative_is_optional(glm_session):
+def test_an_ortvec_derivative_is_an_entry_of_its_own(glm_session):
+    """The derivative is a second tick, not a switch on the first: raw and
+    differenced motion each have to be removable alone to ask what each buys."""
     path = glm_session.tmp / "motion.1D"
     rng = np.random.default_rng(2)
     np.savetxt(path, rng.normal(size=(N_TIME, 3)))
 
     mode = _enter(glm_session, ortvec=str(path))
     assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
-    glm_session.set_mode_param("ort_deriv", "1")
+    glm_session.set_mode_param("ortvec", f"+{path}|+{path}:deriv")
     labels = glm_session.mode._fit.model.labels
     assert sum(c.group == "ort" for c in glm_session.mode._fit.model.columns) == 6
-    assert any(lab.endswith("'") for lab in labels)
+    assert "motion#0'" in labels
+
+    glm_session.set_mode_param("ortvec", f"-{path}|+{path}:deriv")
+    columns = glm_session.mode._fit.model.columns
+    assert [c.label for c in columns if c.group == "ort"] == ["motion#0'", "motion#1'", "motion#2'"]
+
+
+def test_a_band_split_is_one_entry_per_band_and_sums_to_its_source(glm_session):
+    """Each band is its own tickable entry, and together they are the column --
+    which is what lets a split replace its source instead of sitting beside it."""
+    path = glm_session.tmp / "motion.1D"
+    rng = np.random.default_rng(3)
+    raw = np.cumsum(rng.normal(size=(N_TIME, 2)), axis=0)
+    np.savetxt(path, raw)
+
+    cut = 0.25 / TR
+    split = f"-{path}|+{path}:band=0-{cut:g}|+{path}:band={cut:g}-nyq"
+    mode = _enter(glm_session, ortvec=split)
+    model = mode._fit.model
+    labels = [c.label for c in model.columns if c.group == "ort"]
+    assert labels == [
+        f"motion#0 <{cut:g}Hz",
+        f"motion#1 <{cut:g}Hz",
+        f"motion#0 >{cut:g}Hz",
+        f"motion#1 >{cut:g}Hz",
+    ]
+    low = model.matrix[:, [model.index_of(lab) for lab in labels[:2]]]
+    high = model.matrix[:, [model.index_of(lab) for lab in labels[2:]]]
+    assert np.allclose(low + high, raw, atol=1e-8)
 
 
 def test_an_ortvec_of_the_wrong_length_is_reported_not_raised(glm_session):

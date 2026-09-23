@@ -218,6 +218,107 @@ def test_unticking_an_entry_keeps_it_in_the_value(qapp):
     assert seen == ["+/tmp/a.1D|-/tmp/b.1D"]
 
 
+def _button(panel, name, text):
+    return next(
+        b for b in panel._widgets[name].findChildren(QtWidgets.QPushButton) if b.text() == text
+    )
+
+
+def test_the_derivative_button_adds_an_entry_under_its_source(qapp):
+    spec = PathListControl(name="ortvec", label="ortvec", transforms=True, sample_interval=2.0)
+    panel = _panel(qapp, [spec], {"ortvec": "+/tmp/motion.1D|+/tmp/resp.1D"})
+    seen = []
+    panel.changed.connect(lambda n, v: seen.append(v))
+    listing = panel._widgets["ortvec"].findChild(QtWidgets.QListWidget)
+
+    listing.item(0).setSelected(True)
+    _button(panel, "ortvec", "∂").click()
+    qapp.processEvents()
+    assert seen[-1] == "+/tmp/motion.1D|+/tmp/motion.1D:deriv|+/tmp/resp.1D"
+    assert listing.item(1).text() == "motion.1D  d/dt"
+
+    # Pressed on the derivative, it gives the second one.
+    listing.item(1).setSelected(True)
+    _button(panel, "ortvec", "∂").click()
+    qapp.processEvents()
+    assert "+/tmp/motion.1D:deriv:deriv" in seen[-1].split("|")
+    assert listing.item(2).text() == "motion.1D  d²/dt²"
+
+
+def test_the_split_button_swaps_the_source_for_its_bands(qapp, monkeypatch):
+    from fastfuncstuff.viewer.ui import bandsplit
+
+    monkeypatch.setattr(
+        bandsplit,
+        "split_interactively",
+        lambda entry, tr, parent: [f"{entry}:band=0-0.05", f"{entry}:band=0.05-nyq"],
+    )
+    spec = PathListControl(name="ortvec", label="ortvec", transforms=True, sample_interval=2.0)
+    panel = _panel(qapp, [spec], {"ortvec": "+/tmp/motion.1D|+/tmp/resp.1D"})
+    seen = []
+    panel.changed.connect(lambda n, v: seen.append(v))
+    listing = panel._widgets["ortvec"].findChild(QtWidgets.QListWidget)
+    listing.item(0).setSelected(True)
+    _button(panel, "ortvec", "≋").click()
+    qapp.processEvents()
+    assert seen[-1].split("|") == [
+        "-/tmp/motion.1D",
+        "+/tmp/motion.1D:band=0-0.05",
+        "+/tmp/motion.1D:band=0.05-nyq",
+        "+/tmp/resp.1D",
+    ]
+    assert listing.item(1).text() == "motion.1D  <0.05Hz"
+
+
+def test_a_plain_path_list_has_no_transform_buttons(qapp):
+    spec = PathListControl(name="files", label="files")
+    panel = _panel(qapp, [spec], {"files": ""})
+    texts = {b.text() for b in panel._widgets["files"].findChildren(QtWidgets.QPushButton)}
+    assert texts == {"+", "−"}
+
+
+def test_the_band_dialog_turns_clicks_into_entries(qapp):
+    """Cuts placed on the spectrum and cuts typed are the same cuts, and only
+    the ticked columns are split -- the rest come along unsplit."""
+    import numpy as np
+
+    from fastfuncstuff.viewer.ui.bandsplit import BandSplitDialog
+
+    rng = np.random.default_rng(0)
+    columns = np.cumsum(rng.normal(size=(100, 3)), axis=0)
+    dialog = BandSplitDialog("m.1D", columns, ["x", "y", "z"], tr=1.0)
+    ok = dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+    assert not ok.isEnabled(), "no cuts yet, nothing to add"
+
+    dialog.cut_edit.setText("0.1, 0.3")
+    dialog._cuts_from_text()
+    assert dialog.cutoffs() == [0.1, 0.3]
+    assert ok.isEnabled()
+    dialog.column_list.item(1).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    assert dialog.entries() == [
+        "m.1D:cols=0,2:band=0-0.1",
+        "m.1D:cols=0,2:band=0.1-0.3",
+        "m.1D:cols=0,2:band=0.3-nyq",
+        "m.1D:cols=1",
+    ]
+
+    # A click on the plot adds a cut where it lands; the text follows.
+    dialog.resize(800, 500)
+    dialog.show()
+    qapp.processEvents()
+    view = dialog.spectrum
+    x = view._to_x(0.2)
+    from PySide6.QtTest import QTest
+
+    QTest.mouseClick(view, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(int(x), 60))
+    assert len(dialog.cutoffs()) == 3
+    assert abs(dialog.cutoffs()[1] - 0.2) < 0.01
+    assert dialog.cut_edit.text().count(",") == 2
+    QTest.mouseClick(view, QtCore.Qt.MouseButton.RightButton, pos=QtCore.QPoint(int(x), 60))
+    assert dialog.cutoffs() == [0.1, 0.3]
+    dialog.close()
+
+
 def test_a_path_list_is_as_tall_as_its_rows(qapp):
     """Measured after styling, not when the items are added: a row's height is
     not known until the theme's stylesheet has arrived."""

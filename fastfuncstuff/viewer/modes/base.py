@@ -182,6 +182,13 @@ class PathListControl(Control):
 
     default: str = ""
     filter: str = "All (*)"
+    #: Entries are regressor files that can be transformed in place: the list
+    #: offers a derivative button and a band splitter, each of which adds
+    #: entries in :mod:`fastfuncstuff.viewer.ortvec`'s grammar.
+    transforms: bool = False
+    #: Seconds per row of those files, for the band splitter's Hz axis. Zero
+    #: when the run has no TR, and the splitter says so rather than guessing.
+    sample_interval: float = 0.0
 
     @staticmethod
     def parse(value: object) -> list[tuple[str, bool]]:

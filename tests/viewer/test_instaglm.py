@@ -112,14 +112,6 @@ def test_a_derivative_basis_names_its_columns_with_the_condition(events):
     assert task.shape[1] == 4
 
 
-def test_ortvec_derivatives_are_backward_differences(events):
-    ort = np.cumsum(np.ones((N_TIME, 1)), axis=0)
-    model = ig.build_model(n_time=N_TIME, tr=TR, ort=ort, ort_labels=["roll"], ort_derivatives=True)
-    deriv = model.matrix[:, model.index_of("roll'")]
-    assert deriv[0] == 0.0
-    assert np.allclose(deriv[1:], 1.0)
-
-
 def test_an_empty_model_is_an_error():
     with pytest.raises(ValueError, match="empty model"):
         ig.build_model(n_time=N_TIME, tr=TR, polort=-1)

@@ -318,20 +318,6 @@ def task_columns(
     return np.asarray(design.detach().cpu().numpy(), dtype=np.float64), labels
 
 
-def derivative_columns(columns: np.ndarray) -> np.ndarray:
-    """Backward differences, first row zero.
-
-    AFNI's ``-derivative`` convention, and the reason to want it: a motion
-    regressor removes signal that tracks *where* the head is, while its
-    derivative removes signal that tracks the head *moving*, which is what a
-    spin-history artefact actually is. The two are close to orthogonal and the
-    second is usually the one doing the work.
-    """
-    out = np.zeros_like(columns)
-    out[1:] = np.diff(columns, axis=0)
-    return out
-
-
 def build_model(
     *,
     n_time: int,
@@ -341,7 +327,6 @@ def build_model(
     polort: int = 2,
     ort: np.ndarray | None = None,
     ort_labels: Sequence[str] = (),
-    ort_derivatives: bool = False,
     pcs: np.ndarray | None = None,
 ) -> Model:
     """Assemble the design: task, then ortvecs, then noise PCs, then drift."""
@@ -354,8 +339,6 @@ def build_model(
         ort = np.asarray(ort, dtype=np.float64)
         names = list(ort_labels) or [f"ort#{i}" for i in range(ort.shape[1])]
         blocks.append((ort, names, ORT))
-        if ort_derivatives:
-            blocks.append((derivative_columns(ort), [f"{n}'" for n in names], ORT))
 
     if pcs is not None and pcs.shape[1]:
         pcs = np.asarray(pcs, dtype=np.float64)
@@ -892,7 +875,6 @@ __all__ = [
     "Model",
     "Prepared",
     "build_model",
-    "derivative_columns",
     "fit_model",
     "hrf_bases",
     "library_size",
