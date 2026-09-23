@@ -43,9 +43,15 @@ class PlotView(QtWidgets.QWidget):
     why translation and rotation are two panels and not one.
     """
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self, parent: QtWidgets.QWidget | None = None, *, legend_outside: bool = False
+    ) -> None:
         super().__init__(parent)
         self._traces: list[Trace] = []
+        #: Key to the right of the plot rather than over it. For a plot whose
+        #: every line is the subject -- the band splitter's column and its
+        #: bands -- a key laid over the lines hides exactly what it labels.
+        self._legend_outside = legend_outside
         self._cursor: int | None = None
         self._empty = "nothing to plot"
         self.setMinimumSize(120, 80)
@@ -86,10 +92,13 @@ class PlotView(QtWidgets.QWidget):
             else np.asarray(t.x, dtype=np.float64)
             for t, v in zip(traces, series, strict=True)
         ]
+        key_width = (
+            self._legend_width(p, traces) + 6 if self._legend_outside and len(traces) > 1 else 0.0
+        )
         plot = QtCore.QRectF(
             MARGIN_LEFT,
             MARGIN_TOP,
-            max(self.width() - MARGIN_LEFT - 8, 1),
+            max(self.width() - MARGIN_LEFT - 8 - key_width, 1),
             max(self.height() - MARGIN_TOP - MARGIN_BOTTOM, 1),
         )
 
@@ -160,13 +169,18 @@ class PlotView(QtWidgets.QWidget):
     def _colour(c, index: int, total: int) -> QtGui.QColor:
         return QtGui.QColor.fromRgbF(*c.series[index % len(c.series)])
 
-    def _draw_legend(self, p: QtGui.QPainter, c, plot: QtCore.QRectF, traces) -> None:
-        """A key inside the top-right of the plot, one row per line."""
+    @staticmethod
+    def _legend_width(p: QtGui.QPainter, traces) -> float:
         metrics = QtGui.QFontMetrics(p.font())
+        return max(metrics.horizontalAdvance(t.legend) for t in traces) + SWATCH + 10
+
+    def _draw_legend(self, p: QtGui.QPainter, c, plot: QtCore.QRectF, traces) -> None:
+        """A key in the top-right of the plot, or beside it, one row per line."""
         rows = [t.legend for t in traces]
-        width = max(metrics.horizontalAdvance(r) for r in rows) + SWATCH + 10
+        width = self._legend_width(p, traces)
         height = len(rows) * LEGEND_ROW + 6
-        box = QtCore.QRectF(plot.right() - width - 6, plot.top() + 5, width, height)
+        left = plot.right() + 6 if self._legend_outside else plot.right() - width - 6
+        box = QtCore.QRectF(left, plot.top() + (0 if self._legend_outside else 5), width, height)
 
         # Over the lines, so it needs its own ground to stay readable.
         p.fillRect(box, QtGui.QColor(c.panel))

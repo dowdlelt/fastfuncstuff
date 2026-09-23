@@ -73,7 +73,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._drag: int | None = None
         self._hover: float | None = None
         self.setMouseTracking(True)
-        self.setMinimumSize(320, 180)
+        self.setMinimumSize(420, 260)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
@@ -295,7 +295,7 @@ class BandSplitDialog(QtWidgets.QDialog):
 
         body = QtWidgets.QHBoxLayout()
         self.column_list = QtWidgets.QListWidget()
-        self.column_list.setMaximumWidth(170)
+        self.column_list.setMaximumWidth(190)
         for k, label in enumerate(self._labels):
             item = QtWidgets.QListWidgetItem(label)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
@@ -310,7 +310,7 @@ class BandSplitDialog(QtWidgets.QDialog):
         self.spectrum = SpectrumView()
         self.spectrum.set_spectra(freqs, power)
         plots.addWidget(self.spectrum, 3)
-        self.preview = PlotView()
+        self.preview = PlotView(legend_outside=True)
         plots.addWidget(self.preview, 2)
         body.addLayout(plots, 1)
         v.addLayout(body, 1)
@@ -342,7 +342,7 @@ class BandSplitDialog(QtWidgets.QDialog):
         self.cut_edit.editingFinished.connect(self._cuts_from_text)
         self.log_x.toggled.connect(self.spectrum.set_log_x)
         self.column_list.setCurrentRow(0)
-        self.resize(820, 520)
+        self.resize(1180, 760)
         self._refresh()
 
     # -- state ---------------------------------------------------------
