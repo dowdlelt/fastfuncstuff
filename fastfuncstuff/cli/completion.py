@@ -10,10 +10,14 @@ introspected offline rather than completed dynamically.
     ffs_completion -shell zsh  -o ~/.zfunc          # then: fpath+=~/.zfunc; compinit
     ffs_completion -shell bash -tool ffs_deconvolve      # to stdout
 
-    # full help of the flag at the cursor on alt-h (fish):
+    # full help of the flag at the cursor on alt-h:
     ffs_completion -shell fish -o ~/.config/fish/completions \
         -help_dir ~/.local/share/ffs/flag_help \
         -keybind ~/.config/fish/conf.d/ffs_flag_help.fish
+    ffs_completion -shell bash -o ~/.local/share/bash-completion/completions \
+        -help_dir ~/.local/share/ffs/flag_help \
+        -keybind ~/.local/share/ffs/flag_help/keybind.bash   # source from ~/.bashrc
+    (zsh: the same, with keybind.zsh, sourced from ~/.zshrc)
 
 Run it with the SAME interpreter the ffs_* scripts on PATH belong to: the tool
 list comes from that interpreter's installed metadata, so a second environment
@@ -29,10 +33,12 @@ from pathlib import Path
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.completion import (
+    HELP_KEY_RENDERERS,
+    HELP_LOOKUP_SCRIPT,
     RENDERERS,
     describe,
     load_parser,
-    render_fish_help_key,
+    render_help_lookup_sh,
     write_flag_help,
 )
 
@@ -133,10 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-keybind",
         metavar="FILE",
         default=None,
-        help="fish only: write a conf.d snippet binding alt-h to the full help of "
-        "the ffs_* flag at the cursor (needs -help_dir). Other commands keep "
-        "alt-h's man-page lookup. ~/.config/fish/conf.d/ffs_flag_help.fish is "
-        "the usual place.",
+        help="Write a snippet binding alt-h to the full help of the ffs_* flag at "
+        "the cursor (needs -help_dir). fish: put it in ~/.config/fish/conf.d/ and "
+        "it loads itself; bash/zsh: source it from ~/.bashrc / ~/.zshrc. On other "
+        "commands alt-h keeps what it did (fish man page, zsh run-help; unbound "
+        "in bash).",
     )
     parser.add_argument(
         "-verb",
@@ -166,9 +173,6 @@ def main() -> int:
 
     if args.keybind and not args.help_dir:
         print("ERROR: -keybind needs -help_dir (that is what it looks up).", file=sys.stderr)
-        return 1
-    if args.keybind and args.shell != "fish":
-        print("ERROR: -keybind is fish-only for now.", file=sys.stderr)
         return 1
     help_dir = Path(args.help_dir).expanduser().resolve() if args.help_dir else None
 
@@ -204,14 +208,22 @@ def main() -> int:
             print(f"zsh: add 'fpath+=({outdir})' before compinit in ~/.zshrc, then rehash.")
         else:
             print("bash: ensure bash-completion is enabled, then start a new shell.")
-    if help_dir is not None and args.verb >= 1:
-        print(f"Wrote per-flag help to {help_dir}")
-    if args.keybind:
-        kb = Path(args.keybind).expanduser()
-        kb.parent.mkdir(parents=True, exist_ok=True)
-        kb.write_text(render_fish_help_key(str(help_dir)))
+    if help_dir is not None:
+        help_dir.mkdir(parents=True, exist_ok=True)
+        (help_dir / HELP_LOOKUP_SCRIPT).write_text(render_help_lookup_sh())
         if args.verb >= 1:
-            print(f"Wrote {kb}: alt-h on an ffs_* flag shows its full help (new shells).")
+            print(f"Wrote per-flag help to {help_dir}")
+    if args.keybind:
+        kb = Path(args.keybind).expanduser().resolve()
+        kb.parent.mkdir(parents=True, exist_ok=True)
+        kb.write_text(HELP_KEY_RENDERERS[args.shell](str(help_dir)))
+        if args.verb >= 1:
+            how = {
+                "fish": "new shells pick it up",
+                "bash": f"add 'source {kb}' to ~/.bashrc",
+                "zsh": f"add 'source {kb}' to ~/.zshrc",
+            }[args.shell]
+            print(f"Wrote {kb}: alt-h on an ffs_* flag shows its full help ({how}).")
     if skipped:
         print(f"WARNING: no parser recovered for: {', '.join(skipped)}", file=sys.stderr)
     return 0

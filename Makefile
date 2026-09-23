@@ -32,8 +32,12 @@ completions:
 	python -m fastfuncstuff.cli.completion -shell fish -o $(HOME)/.config/fish/completions \
 		-help_dir $(HOME)/.local/share/ffs/flag_help \
 		-keybind $(HOME)/.config/fish/conf.d/ffs_flag_help.fish
-	python -m fastfuncstuff.cli.completion -shell bash -o $(HOME)/.local/share/bash-completion/completions
-	python -m fastfuncstuff.cli.completion -shell zsh  -o $(HOME)/.zfunc
+	python -m fastfuncstuff.cli.completion -shell bash -o $(HOME)/.local/share/bash-completion/completions \
+		-help_dir $(HOME)/.local/share/ffs/flag_help \
+		-keybind $(HOME)/.local/share/ffs/flag_help/keybind.bash
+	python -m fastfuncstuff.cli.completion -shell zsh  -o $(HOME)/.zfunc \
+		-help_dir $(HOME)/.local/share/ffs/flag_help \
+		-keybind $(HOME)/.local/share/ffs/flag_help/keybind.zsh
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

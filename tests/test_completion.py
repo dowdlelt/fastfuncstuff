@@ -16,15 +16,19 @@ import pytest
 
 from fastfuncstuff.cli_help import suggest
 from fastfuncstuff.completion import (
+    HELP_LOOKUP_SCRIPT,
     OptionSpec,
     _completion_kind,
     describe,
     flag_help_texts,
     load_parser,
     render_bash,
+    render_bash_help_key,
     render_fish,
     render_fish_help_key,
+    render_help_lookup_sh,
     render_zsh,
+    render_zsh_help_key,
     write_flag_help,
 )
 
@@ -392,26 +396,38 @@ def test_write_flag_help_drops_a_removed_flags_stale_file(tmp_path):
     assert (tmp_path / "ffs_demo" / "glmdroplast.txt").is_file()
 
 
-@pytest.mark.skipif(shutil.which("fish") is None, reason="fish not installed")
-def test_fish_help_key_finds_the_flag_at_the_cursor(tmp_path):
-    write_flag_help(tmp_path / "help", "ffs_demo", _help_parser())
-    snippet = tmp_path / "ffs_flag_help.fish"
-    snippet.write_text(render_fish_help_key(str(tmp_path / "help")))
+def _lookup_runner(shell: str, tmp_path):
+    """Call one shell's lookup the way its key binding does: tool, the token at
+    the cursor, then the tokens before it."""
+    help_dir = tmp_path / "help"
+    write_flag_help(help_dir, "ffs_demo", _help_parser())
+    if shell == "fish":
+        snippet = tmp_path / "ffs_flag_help.fish"
+        snippet.write_text(render_fish_help_key(str(help_dir)))
+        prefix = [
+            "fish",
+            "--no-config",
+            "-c",
+            f"source {snippet}; __ffs_flag_help_lookup ffs_demo $argv",
+            "--",
+        ]
+    else:  # bash and zsh share the POSIX script
+        script = help_dir / HELP_LOOKUP_SCRIPT
+        script.write_text(render_help_lookup_sh())
+        prefix = ["sh", str(script), str(help_dir), "ffs_demo"]
 
     def lookup(*tokens):
-        r = subprocess.run(  # noqa: S603
-            [
-                "fish",
-                "--no-config",
-                "-c",
-                f"source {snippet}; __ffs_flag_help_lookup ffs_demo $argv",
-                "--",
-                *tokens,
-            ],
-            capture_output=True,
-            text=True,
-        )
+        r = subprocess.run([*prefix, *tokens], capture_output=True, text=True)  # noqa: S603
         return r.returncode, r.stdout
+
+    return lookup
+
+
+@pytest.mark.parametrize("shell", ["fish", "sh"])
+def test_help_key_lookup_finds_the_flag_at_the_cursor(shell, tmp_path):
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} not installed")
+    lookup = _lookup_runner(shell, tmp_path)
 
     # On the flag, in either spelling.
     for tok in ("-cut_task_vols", "-cut-task-vols"):
@@ -428,3 +444,43 @@ def test_fish_help_key_finds_the_flag_at_the_cursor(tmp_path):
     assert rc == 1 and "no flag matches -zzz" in out
     rc, out = lookup("")
     assert rc == 1 and "put the cursor on a flag" in out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize(
+    ("line", "point", "expect"),
+    [
+        ("ffs_demo -i x -cut_task_vols floc", None, "-cut_task_vols TASK N"),  # on a value
+        ("ffs_demo -glm_drop_first 3", 14, "-glm_drop_first N"),  # mid-flag
+        ("ffs_demo -glm_drop_last ", None, "-glm_drop_last N"),  # after the flag's space
+        ("ls -la", None, ""),  # not an ffs tool: prints nothing
+    ],
+)
+def test_bash_help_key_reads_the_token_under_the_cursor(tmp_path, line, point, expect):
+    """The binding's own job: split READLINE_LINE at READLINE_POINT into the
+    token under the cursor and the tokens before it."""
+    _lookup_runner("sh", tmp_path)  # writes the help files and lookup.sh
+    snippet = tmp_path / "keybind.bash"
+    snippet.write_text(render_bash_help_key(str(tmp_path / "help")))
+    point = len(line) if point is None else point
+    r = subprocess.run(  # noqa: S603
+        [
+            "bash",
+            "-c",
+            f'source {snippet} 2>/dev/null; READLINE_LINE="$1"; READLINE_POINT=$2; __ffs_flag_help',
+            "_",
+            line,
+            str(point),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert r.stdout.strip().startswith(expect) if expect else r.stdout == ""
+
+
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh not installed")
+def test_zsh_help_key_snippet_parses(tmp_path):
+    snippet = tmp_path / "keybind.zsh"
+    snippet.write_text(render_zsh_help_key(str(tmp_path)))
+    r = subprocess.run(["zsh", "-n", str(snippet)], capture_output=True, text=True)  # noqa: S603
+    assert r.returncode == 0, r.stderr
