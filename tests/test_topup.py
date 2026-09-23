@@ -283,6 +283,14 @@ def test_spline_field_shape_and_smoothness():
     assert (fld - fld2).abs().max() < 1e-3 * fld.abs().max().clamp(min=1.0)
 
 
+def test_subsampled_schedule_is_rejected_until_handoffs_are_unit_correct():
+    cfg = T.TopupConfig(
+        warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[2, 1]
+    )
+    with pytest.raises(ValueError, match="supports only 1"):
+        cfg.validate()
+
+
 # ---------------------------------------------------------------------------
 # Rigid movement estimation (joint with the field)
 # ---------------------------------------------------------------------------

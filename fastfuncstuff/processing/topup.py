@@ -210,7 +210,7 @@ class TopupConfig:
     """Max Gauss-Newton iterations per level."""
 
     subsamp: list[int] = _dc_field(default_factory=lambda: [1] * len(_LADDER_DEFAULT.warpres))
-    """Integer subsampling factor per level (1 = full resolution)."""
+    """Reserved schedule field; only 1 is currently supported."""
 
     estmov: list[bool] | None = None
     """Per-level "estimate rigid movement" flag; ``None`` = auto.
@@ -295,6 +295,11 @@ class TopupConfig:
             raise ValueError(
                 f"TopupConfig.estmov has length {len(self.estmov)}, expected {n} "
                 "(all schedule lists must match warpres)"
+            )
+        if any(s != 1 for s in self.subsamp):
+            raise ValueError(
+                "TopupConfig.subsamp currently supports only 1: subsampled levels do not "
+                "yet preserve displacement units and grid geometry across hand-offs"
             )
         if self.reg_mode not in ("bending", "membrane"):
             raise ValueError(f"reg_mode must be 'bending' or 'membrane', got {self.reg_mode}")

@@ -216,7 +216,8 @@ def create_parser() -> argparse.ArgumentParser:
         "-subsamp",
         type=_int_list,
         metavar="K,...",
-        help="Integer subsampling factor (1 = full resolution)." + _per_level,
+        help="Reserved schedule field; only 1 (full resolution) is currently supported."
+        + _per_level,
     )
     sched.add_argument(
         "-min_update",
