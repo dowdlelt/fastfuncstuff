@@ -543,3 +543,13 @@ def test_clicking_the_colour_bar_reverses_it_and_shift_click_thresholds(win, qap
     qapp.processEvents()
     assert not layer().colormap_reversed
     assert layer().threshold != before
+
+
+def test_the_colormap_picker_changes_the_layer(win, qapp):
+    from fastfuncstuff.viewer.ui.widgets import open_combo_picker
+
+    picker = open_combo_picker(win.cmap_box)
+    picker.filter.setText("twilight_sh")
+    picker._choose_current()
+    qapp.processEvents()
+    assert win.session.state.layers.overlay.colormap == "twilight_shifted"

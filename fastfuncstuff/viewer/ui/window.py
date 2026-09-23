@@ -61,7 +61,7 @@ from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
-from fastfuncstuff.viewer.ui.widgets import RowSizedList
+from fastfuncstuff.viewer.ui.widgets import RowSizedList, install_combo_pickers
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
@@ -162,6 +162,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def __init__(self, session: ViewerSession) -> None:
         super().__init__()
+        install_combo_pickers(QtWidgets.QApplication.instance())
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
         # Wide enough that the panel never scrolls sideways. The layer form
