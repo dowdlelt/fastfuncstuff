@@ -91,9 +91,13 @@ def test_a_lone_half_width_control_keeps_half_the_row(qapp):
 
 
 def test_a_dependent_control_is_hidden_but_keeps_its_place(qapp):
+    """Within a row that still shows something. A row with nothing left in it
+    collapses instead -- see the test after next."""
     specs = [
-        ChoiceControl(name="basis", label="HRF", choices=("spmg1", "custom"), default="spmg1"),
-        FloatControl(name="peak", label="peak", visible_when=("basis", ("custom",))),
+        ChoiceControl(
+            name="basis", label="HRF", choices=("spmg1", "custom"), default="spmg1", span=HALF
+        ),
+        FloatControl(name="peak", label="peak", visible_when=("basis", ("custom",)), span=HALF),
         BoolControl(name="after", label="after"),
     ]
     panel = _panel(qapp, specs, {"basis": "spmg1"})
@@ -135,12 +139,14 @@ def test_an_unchanged_rebuild_keeps_the_same_widgets(qapp):
     assert panel._widgets["a"] is before
 
 
-def test_a_changed_choice_list_does_rebuild(qapp):
-    """The column picker's choices follow the model, so this rebuild is real."""
+def test_a_changed_choice_list_updates_the_same_widget(qapp):
+    """The column picker's choices follow the model; the combo takes them in
+    place rather than being rebuilt, along with everything beside it."""
     panel = _panel(qapp, [ChoiceControl(name="a", label="a", choices=("x",))], {})
     before = panel._widgets["a"]
     panel.rebuild([ChoiceControl(name="a", label="a", choices=("x", "y"))], {})
-    assert panel._widgets["a"] is not before
+    assert panel._widgets["a"] is before
+    assert [before.itemText(i) for i in range(before.count())] == ["x", "y"]
 
 
 def test_a_rebuild_writes_new_state_into_the_widgets(qapp):
@@ -317,6 +323,44 @@ def test_the_band_dialog_turns_clicks_into_entries(qapp):
     QTest.mouseClick(view, QtCore.Qt.MouseButton.RightButton, pos=QtCore.QPoint(int(x), 60))
     assert dialog.cutoffs() == [0.1, 0.3]
     dialog.close()
+
+
+def test_a_refit_that_only_changes_choices_keeps_every_widget(qapp):
+    """Ticking an ortvec refits, and the refit changes the column picker's
+    choices. Rebuilding for that recreated the list under the pointer and
+    scrolled it back to the top mid-comparison."""
+    entries = "|".join(f"+/tmp/m{i}.1D" for i in range(12))
+    listed = PathListControl(name="ortvec", label="ortvec", transforms=True, sample_interval=2.0)
+    picker = ChoiceControl(name="column", label="column", choices=("a", "b"), default="a")
+    panel = _panel(qapp, [picker, listed], {"ortvec": entries, "column": "b"})
+    listing = panel._widgets["ortvec"].findChild(QtWidgets.QListWidget)
+    listing.verticalScrollBar().setValue(listing.verticalScrollBar().maximum())
+    scrolled = listing.verticalScrollBar().value()
+    assert scrolled > 0
+
+    refit = ChoiceControl(name="column", label="column", choices=("a", "b", "c"), default="a")
+    later = PathListControl(name="ortvec", label="ortvec", transforms=True, sample_interval=1.5)
+    panel.rebuild([refit, later], {"ortvec": entries, "column": "b"})
+    assert panel._widgets["ortvec"].findChild(QtWidgets.QListWidget) is listing
+    assert listing.verticalScrollBar().value() == scrolled
+    combo = panel._widgets["column"]
+    assert [combo.itemText(i) for i in range(combo.count())] == ["a", "b", "c"]
+    assert combo.currentText() == "b"
+    assert panel.spec("ortvec").sample_interval == 1.5
+
+
+def test_a_row_with_every_control_hidden_gives_its_height_back(qapp):
+    basis = ChoiceControl(name="basis", label="HRF", choices=("spmg1", "custom"), default="spmg1")
+    peak = FloatControl(
+        name="peak", label="peak", visible_when=("basis", ("custom",)), newline=True
+    )
+    panel = _panel(qapp, [basis, peak], {"basis": "spmg1"})
+    panel.show()
+    qapp.processEvents()
+    row = panel._cells["peak"].parentWidget()
+    assert row.isHidden()
+    panel.sync_values({"basis": "custom"})
+    assert not row.isHidden()
 
 
 def test_a_path_list_is_as_tall_as_its_rows(qapp):

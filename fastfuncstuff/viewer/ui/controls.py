@@ -28,6 +28,7 @@ one would queue a minute of work to answer a gesture that took a second.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 from PySide6 import QtCore, QtWidgets
 
@@ -53,9 +54,25 @@ DEBOUNCE_MS = 250
 #: Sliders are integers, so a float control is quantised into this many steps.
 FLOAT_TICKS = 1000
 
-#: Rows a path list shows before it scrolls. Three is enough to see that there
-#: is more than one and short enough that the list is not the panel.
-PATH_LIST_ROWS = 3
+#: Rows a path list shows before it scrolls. A motion file, its derivative and
+#: a four-way band split is six entries, and selecting among them by scrolling
+#: a three-row window was most of the work of comparing them.
+PATH_LIST_ROWS = 6
+
+
+def _shape(spec: Control) -> Control:
+    """A declaration with the parts a refit may change blanked out.
+
+    Two declarations of the same shape are served by the same widgets: a
+    drop-down's choices can be replaced in place, and a path list reads its
+    sample interval when a button is pressed rather than when it was built.
+    A radio row's choices are its buttons, so those still count as shape.
+    """
+    if isinstance(spec, ChoiceControl) and spec.style != "radio":
+        return replace(spec, choices=(), default="")
+    if isinstance(spec, PathListControl):
+        return replace(spec, sample_interval=0.0)
+    return spec
 
 
 def _decimals(step: float) -> int:
@@ -78,7 +95,7 @@ class _Cell(QtWidgets.QWidget):
         super().__init__()
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(6)
+        h.setSpacing(4)
         self.caption = QtWidgets.QLabel(label.upper())
         h.addWidget(self.caption)
         h.addWidget(body, 1)
@@ -102,9 +119,12 @@ class ControlPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._rows = QtWidgets.QVBoxLayout(self)
         self._rows.setContentsMargins(0, 0, 0, 0)
-        self._rows.setSpacing(6)
+        self._rows.setSpacing(4)
         self._widgets: dict[str, QtWidgets.QWidget] = {}
         self._cells: dict[str, _Cell] = {}
+        #: Each row widget and the controls in it, so a row whose every control
+        #: is hidden can give its height back.
+        self._row_members: list[tuple[QtWidgets.QWidget, list[str]]] = []
         self._setters: dict[str, Callable[[object], None]] = {}
         self._specs: tuple[Control, ...] = ()
         self._actions: tuple[ActionControl, ...] = ()
@@ -136,6 +156,17 @@ class ControlPanel(QtWidgets.QWidget):
         if controls == self._specs and actions == self._actions and self._widgets:
             self.sync_values(values)
             return
+        if (
+            self._widgets
+            and actions == self._actions
+            and [_shape(c) for c in controls] == [_shape(c) for c in self._specs]
+        ):
+            # A refit changes the column picker's choices and nothing else, and
+            # rebuilding for that recreated every widget -- so ticking an ortvec
+            # entry scrolled its own list back to the top under the pointer,
+            # just as the before-and-after comparison was being made.
+            self._update_in_place(controls, values)
+            return
 
         while self._rows.count():
             item = self._rows.takeAt(0)
@@ -146,6 +177,7 @@ class ControlPanel(QtWidgets.QWidget):
                 w.deleteLater()
         self._widgets.clear()
         self._cells.clear()
+        self._row_members.clear()
         self._setters.clear()
         self._pending.clear()
         self._specs, self._actions = controls, actions
@@ -166,6 +198,7 @@ class ControlPanel(QtWidgets.QWidget):
                 body.setToolTip(spec.help)
             self._widgets[spec.name] = body
             self._cells[spec.name] = cell
+            self._row_members[-1][1].append(spec.name)
             row.layout().addWidget(cell, span)
             used += span
         self._close_row(row, used)
@@ -203,7 +236,7 @@ class ControlPanel(QtWidgets.QWidget):
         row = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(10)
+        h.setSpacing(8)
         # Rows are as tall as what is in them. Left to grow, a row holding
         # anything vertically expandable -- a path list -- takes the whole
         # panel and pushes everything under it off the bottom.
@@ -211,7 +244,28 @@ class ControlPanel(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
         )
         self._rows.addWidget(row)
+        self._row_members.append((row, []))
         return row
+
+    def _update_in_place(self, controls: tuple[Control, ...], values: dict[str, object]) -> None:
+        """Take new declarations that differ only in their data, keeping every widget."""
+        for old, new in zip(self._specs, controls, strict=True):
+            if old == new or not isinstance(new, ChoiceControl):
+                continue
+            combo = self._widgets.get(new.name)
+            if not isinstance(combo, QtWidgets.QComboBox):
+                continue
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(list(new.choices))
+            combo.setCurrentText(str(values.get(new.name, new.default)))
+            combo.blockSignals(False)
+        self._specs = controls
+        self.sync_values(values)
+
+    def spec(self, name: str) -> Control | None:
+        """The current declaration of a control, which may be newer than its widget."""
+        return next((c for c in self._specs if c.name == name), None)
 
     def _close_row(self, row: QtWidgets.QWidget, used: int) -> None:
         """Pad a part-filled row so its controls keep the width they asked for.
@@ -231,6 +285,11 @@ class ControlPanel(QtWidgets.QWidget):
                 continue
             other, wanted = spec.visible_when
             cell.setVisible(str(self._values.get(other, "")) in wanted)
+        # A cell keeps its space when hidden, so a row with anything left in it
+        # holds its layout. A row with nothing left is only a gap -- the custom
+        # HRF's two rows of sliders cost two blank rows under every other basis.
+        for row, names in self._row_members:
+            row.setVisible(any(not self._cells[n].isHidden() for n in names if n in self._cells))
 
     @staticmethod
     def _being_edited(widget: QtWidgets.QWidget | None) -> bool:
@@ -417,7 +476,9 @@ class ControlPanel(QtWidgets.QWidget):
                 return
             current = entries()
             source = current[rows[0]][0]
-            added = split_interactively(source, spec.sample_interval, self)
+            live = self.spec(spec.name)
+            tr = live.sample_interval if isinstance(live, PathListControl) else 0.0
+            added = split_interactively(source, tr, self)
             if not added:
                 return
             # The source goes off, not away: its bands sum back to it, so
