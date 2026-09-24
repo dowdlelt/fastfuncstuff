@@ -149,6 +149,35 @@ class TestQwarpConfig:
         assert cfg.pyramid_factor == 1
         assert cfg.reject_worse_levels is False
 
+    def test_interlevel_warp_is_not_smoothed(self, monkeypatch):
+        """AFNI composes patch updates without blurring the displacement field."""
+        import fastfuncstuff.processing.warp as warp_mod
+        import fastfuncstuff.processing.weight as weight_mod
+
+        def fail_smoothing(*args, **kwargs):
+            raise AssertionError("qwarp smoothed the accumulated warp between levels")
+
+        monkeypatch.setattr(weight_mod, "_gaussian_smooth_3d", fail_smoothing)
+        base = torch.rand(20, 20, 20) + 0.1
+        weight = torch.ones_like(base)
+        warp_mod.qwarp(
+            base,
+            base.clone(),
+            weight=weight,
+            mask=weight.byte(),
+            config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
+                minpatch=9,
+                max_level=1,
+                batch_optimizer_iters_lev0=1,
+                gn_iters=1,
+                verb=0,
+            ),
+            device=torch.device("cpu"),
+            pad=False,
+        )
+
     def test_custom_values(self):
         cfg = QwarpConfig(
             minpatch=9,

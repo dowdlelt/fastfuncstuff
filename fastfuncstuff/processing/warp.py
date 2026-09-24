@@ -1668,25 +1668,17 @@ def _warpomatic(
                         f"phase {phase_order.index(phase_idx) + 1}/8",
                     )
 
-        # Light warp smoothing to reduce patch boundary artifacts
-        # Sigma scales with patch overlap: half the overlap width
-        # xdel is the step between patches, (nxh - xdel) is the overlap
-        smooth_sigma = 1.5
-        with torch.no_grad():
-            from .weight import _gaussian_smooth_3d
-
-            state.xd = _gaussian_smooth_3d(state.xd, smooth_sigma)
-            state.yd = _gaussian_smooth_3d(state.yd, smooth_sigma)
-            state.zd = _gaussian_smooth_3d(state.zd, smooth_sigma)
-            # Optional max displacement clamp
-            if config.maxdisp > 0:
+        # AFNI composes the overlapping patch updates directly; it does not blur
+        # the accumulated displacement field between levels.  Refresh only when
+        # an explicit displacement clamp changed that field.
+        if config.maxdisp > 0:
+            with torch.no_grad():
                 state.xd.clamp_(-config.maxdisp, config.maxdisp)
                 state.yd.clamp_(-config.maxdisp, config.maxdisp)
                 state.zd.clamp_(-config.maxdisp, config.maxdisp)
-            # Refresh warped_source with smoothed warp
-            state.warped_source = warp_image(
-                source, state.xd, state.yd, state.zd, mode=config.interp
-            )
+                state.warped_source = warp_image(
+                    source, state.xd, state.yd, state.zd, mode=config.interp
+                )
 
         # Compute actual global correlation after this level
         with torch.no_grad():
@@ -2568,7 +2560,7 @@ def _improve_warp_batched(
 # Correctness contract: qwarp_batch reproduces N independent qwarp() calls to
 # sub-voxel. The only thing that couples the batch is gradient clipping, which is
 # made per-volume-group in the optimizer (clip_group_size=P); everything else
-# (Adam, per-patch convergence, penalty, smoothing, reject-worse-levels) is
+# (Adam, per-patch convergence, penalty, reject-worse-levels) is
 # per-volume, with a per-volume active mask so a volume that would stop early in
 # the single path stops here too.
 
@@ -2839,15 +2831,13 @@ def _warpomatic_multi(
     """Source-batched multi-level loop; N volumes share one reference.
 
     Structurally identical to :func:`_warpomatic` but every per-volume decision
-    (cost readout, penalty, level smoothing, reject-worse-levels, early stop) is
+    (cost readout, penalty, reject-worse-levels, early stop) is
     made per volume via an ``active`` mask, so each volume follows the same level
     schedule it would under a solo :func:`qwarp` call.
     """
     N = mstate.xd_all.shape[0]
     nx, ny, nz = mstate.nx, mstate.ny, mstate.nz
     t0 = time.time()
-    from .weight import _gaussian_smooth_3d
-
     do_x = not (config.warp_flags & 1)
     do_y = not (config.warp_flags & 2)
     do_z = not (config.warp_flags & 4)
@@ -3169,24 +3159,22 @@ def _warpomatic_multi(
                 if lev_pbar is not None:
                     lev_pbar.update(len(phase_patches) * int(active_idx.numel()))
 
-        # Per-volume level smoothing + cost + reject/early-stop.
+        # Per-volume clamp + cost + reject/early-stop. AFNI does not smooth the
+        # accumulated displacement field between levels.
         newly_inactive = []
         with torch.no_grad():
             for ai, v in enumerate(active_idx.tolist()):
-                mstate.xd_all[v] = _gaussian_smooth_3d(mstate.xd_all[v], 1.5)
-                mstate.yd_all[v] = _gaussian_smooth_3d(mstate.yd_all[v], 1.5)
-                mstate.zd_all[v] = _gaussian_smooth_3d(mstate.zd_all[v], 1.5)
                 if config.maxdisp > 0:
                     mstate.xd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                     mstate.yd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                     mstate.zd_all[v].clamp_(-config.maxdisp, config.maxdisp)
-                mstate.warped_all[v] = warp_image(
-                    sources_all[v],
-                    mstate.xd_all[v],
-                    mstate.yd_all[v],
-                    mstate.zd_all[v],
-                    mode=config.interp,
-                )
+                    mstate.warped_all[v] = warp_image(
+                        sources_all[v],
+                        mstate.xd_all[v],
+                        mstate.yd_all[v],
+                        mstate.zd_all[v],
+                        mode=config.interp,
+                    )
                 new_cost = _vol_cost(v)
                 if config.reject_worse_levels and new_cost > cost_at_start[v] + 1e-4:
                     mstate.xd_all[v] = saved[0][ai]
