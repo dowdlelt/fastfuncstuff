@@ -125,6 +125,9 @@ class DatasetInfo:
     tr: float = 0.0
     slice_timing: list[float] | None = None
     slice_order: str | None = None
+    #: Time origin of the series (s): NIfTI ``toffset`` / AFNI ttorg.  After
+    #: slice-timing correction it is the ``-tzero`` every slice was moved to.
+    time_offset: float = 0.0
 
     affine: np.ndarray = field(default_factory=lambda: np.eye(4))
     orient: str = "???"
@@ -315,6 +318,33 @@ def _slice_timing_from(header: Any, ext_text: str, n_slices: int) -> list[float]
     return [0.0 if t is None else float(t) for t in times][:n_slices]
 
 
+def _time_offset_from(header: Any, ext_text: str, units: Any) -> float:
+    """Series time origin: the AFNI extension's ttorg, else NIfTI ``toffset``."""
+    floats = _afni_atr(ext_text, "TAXIS_FLOATS")
+    if floats and floats.split():
+        return float(floats.split()[0])
+    toff = float(header["toffset"]) if np.isfinite(header["toffset"]) else 0.0
+    if units and len(units) > 1 and units[1] == "msec":
+        toff /= 1000.0
+    elif units and len(units) > 1 and units[1] == "usec":
+        toff /= 1e6
+    return toff
+
+
+def sample_time_offset(info: DatasetInfo) -> float | None:
+    """Within-TR time (s) every voxel of this series was sampled at, if uniform.
+
+    A slice-time-corrected series carries no per-slice offsets (or identical
+    ones) and a time origin at its ``-tzero``; the sample time is origin +
+    the shared offset.  ``None`` when slices still have distinct acquisition
+    times: there is no single sample time to give a design.
+    """
+    st = info.slice_timing
+    if st and max(st) - min(st) > 1e-6:
+        return None
+    return info.time_offset + (st[0] if st else 0.0)
+
+
 def read_info(path: str | Path) -> DatasetInfo:
     """Describe a dataset from its header alone (no image payload is read).
 
@@ -398,6 +428,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     info.tr = tr if n_vol > 1 or tr > 0 else 0.0
 
     info.slice_timing = _slice_timing_from(hdr, ext_text, shape3[2])
+    info.time_offset = _time_offset_from(hdr, ext_text, units)
     slice_code = int(hdr["slice_code"]) if "slice_code" in hdr.keys() else 0
     info.slice_order = _SLICE_ORDER_NAMES.get(slice_code) if slice_code else None
 
@@ -449,6 +480,8 @@ def _read_afni_info(p: Path, iname: str, indices: list[int] | None) -> DatasetIn
     info.tr = float(hinfo.get("TAXIS_FLOATS", [0, 0])[1]) if "TAXIS_FLOATS" in hinfo else 0.0
     offsets = hinfo.get("TAXIS_OFFSETS")
     info.slice_timing = [float(x) for x in offsets] if offsets else None
+    if "TAXIS_FLOATS" in hinfo:
+        info.time_offset = float(hinfo["TAXIS_FLOATS"][0])
     info.space = str(hinfo.get("TEMPLATE_SPACE", "ORIG"))
     # A BRIK wears its view in the filename; the AFNI extension's SCENE_DATA
     # agrees, but the name is what AFNI itself dispatches on.

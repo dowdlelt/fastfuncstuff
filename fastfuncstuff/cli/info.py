@@ -191,6 +191,8 @@ def format_report(info: DatasetInfo, st: _Style, show_history: bool = True) -> s
             t = info.slice_timing
             pattern = f", {info.slice_order}" if info.slice_order else ""
             time_bits.append(f"slice timing: {len(t)} slices {min(t):.3f}–{max(t):.3f} s{pattern}")
+        if info.time_offset:
+            time_bits.append(f"time origin {info.time_offset:.4g} s")
         rows.append(("time", " · ".join(time_bits)))
 
     axes = " ".join(

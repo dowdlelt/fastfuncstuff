@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
-from fastfuncstuff.io.afni import get_tr_from_file
+from fastfuncstuff.io.afni import get_tr_from_file, mark_slice_time_corrected
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.slicetime import (
     load_slice_timing,
@@ -122,7 +122,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Target time within TR to align to (seconds). "
-        "Default: mean of slice times (3dTshift default)",
+        "Default: mean of slice times (3dTshift default). Written to the output "
+        "header as its time origin (NIfTI toffset / AFNI ttorg), where ffs GLM "
+        "tools read it back as -microtime_offset; -tzero 0 needs no offset.",
     )
     parser.add_argument(
         "-ignore",
@@ -263,12 +265,16 @@ def main(argv: list[str] | None = None) -> None:
             f"{nz} slices. These must match."
         )
 
+    # Resolved here, not inside slicetime_correct, because the header records it:
+    # downstream GLMs read it back as the within-TR time every volume now sits at.
+    tzero = args.tzero if args.tzero is not None else sum(slice_timing) / len(slice_timing)
+
     # Run correction
     corrected = slicetime_correct(
         vol,
         slice_timing=slice_timing,
         tr=tr,
-        tzero=args.tzero,
+        tzero=tzero,
         method=args.method,
         ignore=args.ignore,
         device=device,
@@ -297,6 +303,7 @@ def main(argv: list[str] | None = None) -> None:
     if header is not None and header.get("header") is not None:
         header["header"].set_xyzt_units(xyz="mm", t="sec")
         header["header"]["pixdim"][4] = output_tr
+        mark_slice_time_corrected(header["header"], tzero)
 
     # Save
     with spinner(f"Writing {Path(args.prefix).name}"):

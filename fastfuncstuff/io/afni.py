@@ -2853,6 +2853,44 @@ def _update_afni_extension(
     extensions[afni_idx] = new_ext
 
 
+def mark_slice_time_corrected(header: Any, tzero: float) -> None:
+    """Record, as ``3dTshift`` does, that every slice now sits at ``tzero``.
+
+    Per-slice offsets are dropped and the time origin becomes ``tzero``:
+    NIfTI ``toffset`` plus a cleared ``slice_code``/``slice_duration``, and in
+    the AFNI extension ``TAXIS_FLOATS[0]`` (ttorg) = ``tzero``,
+    ``TAXIS_NUMS[1]`` (nsl) = 0, no ``TAXIS_OFFSETS``.  AFNI maps ``toffset``
+    and ttorg onto each other, so both 3dinfo and a downstream GLM can read
+    the within-TR sample time back off the file.
+    """
+    header["toffset"] = float(tzero)
+    header["slice_code"] = 0
+    header["slice_duration"] = 0.0
+    header["slice_start"] = 0
+    header["slice_end"] = 0
+    try:
+        extensions = header.extensions
+    except AttributeError:
+        return
+    for i, ext in enumerate(extensions):
+        if ext.get_code() != _NIFTI_ECODE_AFNI:
+            continue
+        xml = ext.get_content().decode("utf-8", errors="replace")
+        xml = re.sub(
+            r'<AFNI_atr\s[^>]*atr_name="TAXIS_OFFSETS"[^>]*>.*?</AFNI_atr>\s*',
+            "",
+            xml,
+            flags=re.DOTALL,
+        )
+        xml = re.sub(r'(atr_name="TAXIS_NUMS"[^>]*>\s*\S+\s+)(\S+)', r"\g<1>0", xml, count=1)
+        xml = re.sub(
+            r'(atr_name="TAXIS_FLOATS"[^>]*>\s*)(\S+)', rf"\g<1>{float(tzero):g}", xml, count=1
+        )
+        import nibabel as nib
+
+        extensions[i] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+
+
 def _set_afni_brick_labels(header: Any, labels: list[str]) -> None:
     """Set per-sub-brick labels (BRICK_LABS) so AFNI viewers show them.
 

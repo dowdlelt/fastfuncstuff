@@ -131,3 +131,43 @@ def test_microtime_offset_must_land_on_the_microtime_grid():
         microtime_offset_bins(0.25, 2.0, 0.1)
     with pytest.raises(ValueError, match="TR"):
         microtime_offset_bins(2.0, 2.0, 0.1)
+
+
+_AFNI_TAXIS = (
+    "<?xml version='1.0' ?>\n<AFNI_attributes\n  ni_form=\"ni_group\" >\n"
+    '<AFNI_atr\n  ni_type="int"\n  ni_dimen="8"\n  atr_name="TAXIS_NUMS" >\n'
+    " 10\n 4\n 77002\n -999\n -999\n -999\n -999\n -999\n</AFNI_atr>\n"
+    '<AFNI_atr\n  ni_type="float"\n  ni_dimen="8"\n  atr_name="TAXIS_FLOATS" >\n'
+    " 0\n 2\n 0\n 0\n 1\n -999999\n -999999\n -999999\n</AFNI_atr>\n"
+    '<AFNI_atr\n  ni_type="float"\n  ni_dimen="4"\n  atr_name="TAXIS_OFFSETS" >\n'
+    " 0\n 1\n 0.5\n 1.5\n</AFNI_atr>\n</AFNI_attributes>\n\x00"
+)
+
+
+@pytest.mark.parametrize("with_afni_ext", [False, True])
+def test_slice_time_corrected_header_round_trips_the_sample_time(tmp_path, with_afni_ext):
+    import nibabel as nib
+
+    from fastfuncstuff.io.afni import mark_slice_time_corrected, save_nifti
+    from fastfuncstuff.io.dsetinfo import read_info, sample_time_offset
+
+    img = nib.Nifti1Image(np.zeros((3, 3, 4, 10), np.float32), np.eye(4))
+    hdr = img.header
+    hdr.set_zooms((2, 2, 2, 2.0))
+    hdr.set_dim_info(slice=2)
+    hdr.set_xyzt_units("mm", "sec")
+    hdr["slice_code"] = 3  # alt+z
+    hdr["slice_duration"] = 0.5
+    hdr.set_slice_times([0.0, 1.0, 0.5, 1.5])
+    if with_afni_ext:
+        hdr.extensions.append(nib.nifti1.Nifti1Extension(4, _AFNI_TAXIS.encode()))
+    raw = tmp_path / "raw.nii"
+    save_nifti(np.asarray(img.dataobj), raw, header=hdr)
+    assert sample_time_offset(read_info(raw)) is None  # slices still differ
+
+    mark_slice_time_corrected(hdr, 0.75)
+    fixed = tmp_path / "st.nii"
+    save_nifti(np.asarray(img.dataobj), fixed, header=hdr)
+    info = read_info(fixed)
+    assert info.time_offset == pytest.approx(0.75)
+    assert sample_time_offset(info) == pytest.approx(0.75)
