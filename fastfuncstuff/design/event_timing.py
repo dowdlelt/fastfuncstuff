@@ -282,3 +282,57 @@ def aligned_knot_start(report: TimingReport) -> float | None:
     if min(p, 1.0 - p) * report.tr < 0.02:
         return None
     return (1.0 - p) * report.tr
+
+
+def assess_design(
+    per_run_designs: list[torch.Tensor],
+    n_basis_per_condition: list[int],
+    onsets: list[list[np.ndarray]],
+    n_timepoints_per_run: list[int],
+    tr: float,
+    *,
+    window_top: float,
+    microtime_offset: float = 0.0,
+    polort: int = 2,
+) -> DesignGain:
+    """Noise gain of the design a tool is about to fit, vs rounding to plain FIR."""
+    n_events = [int(sum(np.asarray(o).size for o in runs)) for runs in onsets]
+    gain = design_gain(per_run_designs, n_basis_per_condition, n_events, polort)
+    ref = build_per_run_task_designs(
+        rounded_to_samples(onsets, tr, microtime_offset),
+        n_timepoints_per_run,
+        tr,
+        basis="FIR",
+        fir_window_s=max(window_top, tr),
+        microtime_offset=microtime_offset,
+        device=torch.device("cpu"),
+    )
+    ref_gain = design_gain(ref.per_run, list(ref.n_basis_per_condition), n_events, polort)
+    if gain.identifiable and ref_gain.identifiable:
+        gain.amplification = max(gain.worst_gain) / max(ref_gain.worst_gain)
+    elif not gain.identifiable:
+        gain.amplification = float("inf")
+    return gain
+
+
+def design_risk_message(gain: DesignGain, smoothing: bool, smooth_flag: str) -> str | None:
+    """One line on a design that will amplify noise; ``None`` when it will not."""
+    if gain.status == "ok":
+        return None
+    if gain.status == "unidentifiable":
+        problem = "has knot combinations the event timing never observes"
+    else:
+        problem = f"amplifies noise {gain.amplification:.1f}x in its worst knot direction"
+    if smoothing:
+        return f"  Note: the unpenalized design {problem}; the roughness penalty covers it."
+    if gain.status == "unidentifiable":
+        return (
+            f"  ⚠ Design is SINGULAR: it {problem} (e.g. every onset at one sub-TR phase), so "
+            "the response carries an arbitrary up-down component. Use "
+            f"{smooth_flag}, knots aligned to the samples, or see ffs_util_eventcheck."
+        )
+    severity = "expect up-down artefacts" if gain.status == "unstable" else "estimates are noisy"
+    return (
+        f"  ⚠ Design {problem} vs rounding to FIR (onsets bunched mid-TR?): {severity}. "
+        f"Consider {smooth_flag}; ffs_util_eventcheck shows the timing."
+    )

@@ -492,6 +492,34 @@ def parse_args():
     add_verbose_arg(out_opts, default=0)
 
     # Hardware options
+    model_opts.add_argument(
+        "-tent-smooth",
+        "-fir-smooth",
+        dest="tent_smooth",
+        nargs="?",
+        const="reml",
+        default=None,
+        metavar="METHOD",
+        help=(
+            "Estimate the FIR/TENT/CSPLIN response with a roughness penalty on "
+            "neighbouring knots (smooth FIR), strength chosen PER VOXEL. "
+            "METHOD: reml (default; restricted likelihood, no held-out data), "
+            "gcv (generalized cross-validation), or a number (one fixed relative "
+            "lambda everywhere). Fixes the up-down artefact of onsets bunched "
+            "mid-TR and makes knots finer than the TR solvable "
+            "(-window/-tent-n-basis). Writes <prefix>_smooth_edf (effective "
+            "knots used) and <prefix>_smooth_log10lambda. -fir-smooth is the "
+            "same flag."
+        ),
+    )
+    model_opts.add_argument(
+        "-smooth-order",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Difference order of the -tent-smooth penalty: 2 (curvature, default) "
+        "leaves straight lines free; 1 leaves constants free.",
+    )
     add_microtime_offset_arg(model_opts)
 
     hw_opts = parser.add_argument_group("Hardware Options")
@@ -1168,6 +1196,33 @@ def main():
         if args.verb >= 1:
             print(f"\nUsing {model} model")
 
+    smooth_method: str | None = None
+    smooth_lam: float | None = None
+    if args.tent_smooth is not None:
+        if model not in ("FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+            print(
+                f"ERROR: -tent-smooth needs a FIR/TENT/CSPLIN model, not {model}", file=sys.stderr
+            )
+            return 1
+        choice = str(args.tent_smooth).lower()
+        if choice in ("reml", "gcv"):
+            smooth_method = choice
+        else:
+            try:
+                smooth_lam = float(choice)
+            except ValueError:
+                smooth_lam = -1.0
+            if smooth_lam <= 0:
+                print(
+                    f"ERROR: -tent-smooth takes reml, gcv or a positive lambda, got {args.tent_smooth!r}",
+                    file=sys.stderr,
+                )
+                return 1
+            smooth_method = "fixed"
+        if args.smooth_order < 1:
+            print("ERROR: -smooth-order must be >= 1", file=sys.stderr)
+            return 1
+
     # ── FLOBS branch ─────────────────────────────────────────────────────────
     # **DEPRECATED 2026-05-17**: -model FLOBS in ffs_deconvolve is
     # kept working for backwards compatibility, but the canonical
@@ -1607,6 +1662,13 @@ def main():
                         )
 
     # ── Per-voxel window selection ────────────────────────────────────────────
+    if _do_per_voxel and smooth_method is not None:
+        print(
+            "ERROR: -per-voxel window selection and -tent-smooth are not combined yet; "
+            "the smoothed fit already adapts the response shape per voxel.",
+            file=sys.stderr,
+        )
+        return 1
     if _do_per_voxel:
         zero_edges_pv = model in ("TENTzero", "CSPLINzero")
 
@@ -1838,6 +1900,23 @@ def main():
 
     per_run_designs = design_result.per_run
     n_basis_per_condition_list = list(design_result.n_basis_per_condition)
+
+    if model != "FIR" or smooth_method is not None:
+        from fastfuncstuff.design.event_timing import assess_design, design_risk_message
+
+        risk = assess_design(
+            per_run_designs,
+            n_basis_per_condition_list,
+            onsets_per_condition,
+            list(n_timepoints_per_run),
+            tr,
+            window_top=max(top for _, top in design_result.fir_window_s or [(0.0, tr)]),
+            microtime_offset=microtime_offset,
+            polort=max(args.polort, 0),
+        )
+        message = design_risk_message(risk, smooth_method is not None, "-tent-smooth")
+        if message:
+            print(message, file=sys.stderr if smooth_method is None else sys.stdout)
     column_labels = list(design_result.column_labels)
     n_stimulus_regressors = sum(n_basis_per_condition_list)
 
@@ -2078,18 +2157,44 @@ def main():
         )
         print("\nFitting GLM (chunked for GPU memory)...")
 
-    results = fit_glm(
-        data=packed.data_concat,
-        design=packed.design_concat,
-        tr=tr,
-        max_poly_degree=-1,  # polys already packed in
-        device=device,
-        preload_data_to_device=False,  # stream chunks to GPU
-        chunk_size=None,  # auto-estimate
-        verbose=args.verb >= 1,
-        debug_memory=args.debug_memory,
-        debug_design=args.debug_design,
-    )
+    smooth_fit = None
+    if smooth_method is not None:
+        from fastfuncstuff.glm.smooth_basis import fit_smooth_basis, roughness_penalty
+
+        smooth_penalty = roughness_penalty(
+            n_basis_per_condition_list,
+            order=args.smooth_order,
+            zero_edges=model in ("TENTzero", "CSPLINzero"),
+        )
+        smooth_fit = fit_smooth_basis(
+            packed.data_concat,
+            packed.design_concat,
+            packed.n_task_cols,
+            smooth_penalty,
+            method=smooth_method,
+            lam=smooth_lam,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        results = smooth_fit
+        if args.verb >= 1:
+            print(
+                f"  Smoothing ({smooth_method}): median effective knots "
+                f"{float(smooth_fit.edf.median()):.1f} of {packed.n_task_cols}"
+            )
+    else:
+        results = fit_glm(
+            data=packed.data_concat,
+            design=packed.design_concat,
+            tr=tr,
+            max_poly_degree=-1,  # polys already packed in
+            device=device,
+            preload_data_to_device=False,  # stream chunks to GPU
+            chunk_size=None,  # auto-estimate
+            verbose=args.verb >= 1,
+            debug_memory=args.debug_memory,
+            debug_design=args.debug_design,
+        )
 
     if args.verb >= 1:
         print("  ✓ GLM fit complete")
@@ -2109,16 +2214,49 @@ def main():
                 print(f"      in-sample, mean R² = {float(results.r2.mean()):.4f}")
             del r2_vol
 
+    if smooth_fit is not None:
+        for name, values in (
+            ("smooth_edf", smooth_fit.edf),
+            ("smooth_log10lambda", torch.log10(smooth_fit.lam)),
+        ):
+            path = f"{args.prefix}_{name}{_nii_ext}"
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
+                save_nifti(
+                    _to_volume(values.numpy().reshape(-1, 1)).squeeze(-1),
+                    path,
+                    reference_img=input_files[0],
+                )
+            _announce_written(path, time.perf_counter() - t_write, args.verb)
+
     if args.save_xval_r2:
-        xval_r2_map = _compute_xval_r2_map(
-            packed=packed,
-            run_starts=run_starts,
-            n_runs=n_runs,
-            cv_strategy=args.cv_strategy,
-            metric=args.cv_metric,
-            device=device,
-            verbose=args.verb >= 1,
-        )
+        if smooth_fit is not None:
+            from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+
+            if args.verb >= 1 and (args.cv_strategy != "loro" or args.cv_metric != "cod"):
+                print("  note: the smoothed cross-validation is leave-one-run-out COD")
+            loro = loro_r2_smooth(
+                packed.data_concat,
+                packed.design_concat,
+                packed.n_task_cols,
+                smooth_penalty,
+                list(run_starts),
+                method=smooth_method,
+                lam=smooth_lam,
+                device=device,
+                verbose=args.verb >= 1,
+            )
+            xval_r2_map = None if loro is None else loro.numpy()
+        else:
+            xval_r2_map = _compute_xval_r2_map(
+                packed=packed,
+                run_starts=run_starts,
+                n_runs=n_runs,
+                cv_strategy=args.cv_strategy,
+                metric=args.cv_metric,
+                device=device,
+                verbose=args.verb >= 1,
+            )
         if xval_r2_map is None:
             print(
                 "WARNING: -save-xval-r2 needs ≥2 runs; skipping.",
