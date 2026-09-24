@@ -1903,6 +1903,7 @@ def _resolve_basis_auto(
     onsets_per_cond_per_run: list[list[np.ndarray]],
     tr: float,
     threshold: float,
+    microtime_offset: float = 0.0,
 ) -> str:
     """Pick FIR (TR-locked) or TENT (not TR-locked) for ``basis='auto'``.
 
@@ -1911,7 +1912,7 @@ def _resolve_basis_auto(
     degenerate empty input falls back to FIR (the no-op case).
     """
     all_t = [
-        float(t)
+        float(t) - microtime_offset
         for cond_runs in onsets_per_cond_per_run
         for run_onsets in cond_runs
         for t in (run_onsets.tolist() if run_onsets.size else [])
@@ -1990,6 +1991,32 @@ def _resolve_windows(
     return [(0.0, top_max)] * n_conditions
 
 
+def _fir_onset_vector(
+    onset_times: np.ndarray,
+    n_run_tp: int,
+    tr: float,
+    microtime_offset: float,
+    duration: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """(n_run_tp, 1) TR-grid onset train: each event at its nearest sample.
+
+    A positive ``duration`` also marks every later TR its boxcar reaches,
+    matching :func:`fastfuncstuff.design.matrices.onsets_to_tr_matrix`.
+    """
+    onset_vec = torch.zeros(n_run_tp, 1, device=device)
+    for onset in np.asarray(onset_times, dtype=np.float64).ravel():
+        rel = float(onset) - microtime_offset
+        first = int(round(rel / tr))
+        if first < 0 or first >= n_run_tp:
+            continue
+        last = first
+        if duration > 0:
+            last = min(n_run_tp - 1, int(np.floor((rel + duration) / tr)))
+        onset_vec[first : max(first, last) + 1, 0] = 1.0
+    return onset_vec
+
+
 def _lag_times_for(basis: str, window: tuple[float, float], n_basis: int) -> np.ndarray:
     """Return the time grid corresponding to a basis' knots/lags."""
     bot, top = window
@@ -2020,6 +2047,8 @@ def build_per_run_task_designs(
     tent_n_basis: int | list[int] | None = None,
     hrf: torch.Tensor | np.ndarray | None = None,
     tr_locked_threshold: float = 0.1,
+    microtime_offset: float = 0.0,
+    fir_fill_durations: bool = False,
     device: torch.device | None = None,
 ) -> TaskDesignResult:
     """Build per-run task-only design tensors for FIR / TENT / CSPLIN / assumed.
@@ -2074,6 +2103,18 @@ def build_per_run_task_designs(
     tr_locked_threshold : float, default 0.1
         Tolerance (fraction of TR) used by :func:`is_tr_locked` when
         ``basis="auto"``.
+    microtime_offset : float, default 0.0
+        Within-TR time (s) at which each volume was sampled: sample ``n``
+        of a run sits at ``n * tr + microtime_offset`` in that run's
+        onset clock.  0 matches ``ffs_slicetime -tzero 0``.  FIR rounds
+        ``onset - microtime_offset`` to the TR grid; TENT/CSPLIN evaluate
+        their knots at the true sample times.
+    fir_fill_durations : bool, default False
+        FIR only: mark every TR an event's ``durations_per_condition``
+        boxcar covers, so each lag regressor is a shifted block rather
+        than a shifted impulse.  The GLM-family tools (reml/denoise) have
+        always modelled FIR blocks this way; deconvolve/librarian use
+        impulses.
     device : torch.device, optional
         Where to materialize the design tensors.  ``None`` → CPU.
 
@@ -2135,7 +2176,9 @@ def build_per_run_task_designs(
     # ----- Resolve basis ('auto' → FIR/TENT) ----------------------------
     resolved = basis
     if basis == "auto":
-        resolved = _resolve_basis_auto(onsets_per_cond_per_run, tr, tr_locked_threshold)
+        resolved = _resolve_basis_auto(
+            onsets_per_cond_per_run, tr, tr_locked_threshold, microtime_offset
+        )
         notes.append(
             f"Auto-resolved basis to {resolved} "
             f"(TR-lock tolerance {tr_locked_threshold:.2f} of TR={tr}s)."
@@ -2152,6 +2195,7 @@ def build_per_run_task_designs(
             hrf=hrf,
             device=device,
             notes=notes,
+            microtime_offset=microtime_offset,
         )
 
     # ----- Per-condition windows (bot, top) -----------------------------
@@ -2202,11 +2246,12 @@ def build_per_run_task_designs(
             if resolved == "FIR":
                 # Quantize to nearest TR; build (n_run_tp, 1) onset
                 # vector; expand to (n_run_tp, n_lags) via shifts.
-                onset_vec = torch.zeros(n_run_tp, 1, device=device)
-                if onset_times.size > 0:
-                    idx = np.round(onset_times / tr).astype(int)
-                    idx = idx[(idx >= 0) & (idx < n_run_tp)]
-                    onset_vec[idx, 0] = 1.0
+                duration = 0.0
+                if fir_fill_durations and durations_per_condition is not None:
+                    duration = float(durations_per_condition[c])
+                onset_vec = _fir_onset_vector(
+                    onset_times, n_run_tp, tr, microtime_offset, duration, device
+                )
                 block = make_fir_design(onset_vec, n_basis_per_cond[c], n_run_tp, device=device)
             elif resolved in ("TENT", "TENTzero"):
                 n_knots = n_basis_per_cond[c] + 2 if resolved == "TENTzero" else n_basis_per_cond[c]
@@ -2219,6 +2264,7 @@ def build_per_run_task_designs(
                     n_basis=n_knots,
                     zero_edges=(resolved == "TENTzero"),
                     device=device,
+                    microtime_offset=microtime_offset,
                 )
             elif resolved in ("CSPLIN", "CSPLINzero"):
                 n_knots = (
@@ -2233,6 +2279,7 @@ def build_per_run_task_designs(
                     n_basis=n_knots,
                     zero_edges=(resolved == "CSPLINzero"),
                     device=device,
+                    microtime_offset=microtime_offset,
                 )
             else:
                 raise ValueError(
@@ -2526,6 +2573,7 @@ def _build_assumed_designs(
     hrf: torch.Tensor | np.ndarray,
     device: torch.device,
     notes: list[str],
+    microtime_offset: float = 0.0,
 ) -> TaskDesignResult:
     """Assumed-HRF design: one regressor per condition = onsets ⊛ HRF.
 
@@ -2542,11 +2590,7 @@ def _build_assumed_designs(
         cond_cols: list[torch.Tensor] = []
         for c in range(n_conditions):
             onset_times = np.asarray(onsets_per_cond_per_run[c][r], dtype=np.float64)
-            onset_vec = torch.zeros(n_run_tp, 1, device=device)
-            if onset_times.size > 0:
-                idx = np.round(onset_times / tr).astype(int)
-                idx = idx[(idx >= 0) & (idx < n_run_tp)]
-                onset_vec[idx, 0] = 1.0
+            onset_vec = _fir_onset_vector(onset_times, n_run_tp, tr, microtime_offset, 0.0, device)
             conv = convolve_hrf(onset_vec, hrf_t, n_run_tp, device=device)
             cond_cols.append(conv)
         per_run.append(torch.cat(cond_cols, dim=1))

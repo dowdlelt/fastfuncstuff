@@ -913,6 +913,7 @@ def make_tent_design(
     n_basis: int | None = None,
     zero_edges: bool = False,
     device: torch.device | None = None,
+    microtime_offset: float = 0.0,
 ) -> torch.Tensor:
     """
     Create TENT basis function design matrix for non-TR-locked onsets
@@ -946,6 +947,11 @@ def make_tent_design(
         If False, use TENT (standard tent functions)
     device : torch.device, optional
         Device for computation
+    microtime_offset : float, default 0.0
+        Time (s) within each TR at which the data were sampled: sample ``n``
+        sits at ``n * tr + microtime_offset``. 0 is the start of the volume
+        (``ffs_slicetime -tzero 0``); slice-time-corrected data aligned to
+        another ``-tzero`` needs that value here or every response is shifted.
 
     Returns
     -------
@@ -1010,7 +1016,9 @@ def make_tent_design(
     design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
     # Create time vector for each TR (in seconds)
-    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
+    tr_times = (
+        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
+    )
 
     # Combine all onset times from all conditions
     all_onset_times = []
@@ -1065,6 +1073,7 @@ def make_csplin_design(
     n_basis: int | None = None,
     zero_edges: bool = False,
     device: torch.device | None = None,
+    microtime_offset: float = 0.0,
 ) -> torch.Tensor:
     """
     Create CSPLIN basis function design matrix for non-TR-locked onsets
@@ -1092,6 +1101,8 @@ def make_csplin_design(
         If True, use CSPLINzero (force HRF to start and end at zero)
     device : torch.device, optional
         Device for computation
+    microtime_offset : float, default 0.0
+        Within-TR sample time (s); see :func:`make_tent_design`.
 
     Returns
     -------
@@ -1159,7 +1170,9 @@ def make_csplin_design(
     onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
 
     # Create time vector for each TR (in seconds)
-    tr_times = torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr
+    tr_times = (
+        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
+    )
 
     # For each basis function
     basis_col_idx = 0
