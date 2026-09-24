@@ -71,6 +71,9 @@ class Options:
     nordic_events: bool = True
     locomoco_events: bool = True
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
+    # Within-TR time (s) slice timing aligns every slice to; the GLM samples its
+    # model there (ffs_reml -microtime_offset).  0 = the first slice.
+    tzero: float = 0.0
     # One slice-timing file (text, one offset per slice in seconds, or a JSON with
     # SliceTiming) used for EVERY run, in place of each run's BIDS sidecar. For
     # data whose sidecars carry no SliceTiming. None → per-run sidecar.

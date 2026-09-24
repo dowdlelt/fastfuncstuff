@@ -344,3 +344,20 @@ def test_main_exec_runs_the_script_and_returns_its_status(tmp_path, monkeypatch,
     assert f"tee {shlex.quote(str(out.with_suffix('.log')))}" in cmd[2]
     out_lines = capsys.readouterr().out.splitlines()
     assert out_lines[-1].startswith("  running: bash ")
+
+
+@pytest.mark.parametrize("method", ["first", "integrate"])
+def test_tzero_reaches_slice_timing_and_the_glm_sample_time(method):
+    subj = _st_subject(slice_timing=[True], tr=2.0)
+    s = write_script(
+        build_plan(subj, Options(slicetiming_method=method, tzero=0.8)), "wd", bids_root="/bids"
+    )
+    assert "-tzero 0.8" in s and "-tzero 0 " not in s
+    assert "-microtime_offset 0.8" in s  # ffs_reml samples the model at tzero
+
+
+def test_default_tzero_zero_adds_no_glm_offset():
+    subj = _st_subject(slice_timing=[True], tr=2.0)
+    s = write_script(build_plan(subj, Options(slicetiming_method="first")), "wd", bids_root="/bids")
+    assert "-tzero 0" in s
+    assert "-microtime_offset" not in s

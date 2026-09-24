@@ -348,6 +348,15 @@ def build_parser() -> argparse.ArgumentParser:
         "SliceTiming field. Use when the sidecars have no SliceTiming.",
     )
     g.add_argument(
+        "-tzero",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="within-TR time slice timing aligns every slice to (default 0, the first "
+        "slice). Both -slicetiming_method paths use it, and the GLM stage gets it as "
+        "-microtime_offset so the model is sampled where the data now are.",
+    )
+    g.add_argument(
         "-TR",
         "-tr",
         dest="tr",
@@ -1707,6 +1716,7 @@ def main(argv: list[str] | None = None) -> int:
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),
+        tzero=float(args.tzero if args.tzero is not None else rget("tzero", 0.0)),
         slicetiming_file=args.slicetiming,
         tr=args.tr,
         distortion=(False if args.no_distortion else rget("distortion", True)),

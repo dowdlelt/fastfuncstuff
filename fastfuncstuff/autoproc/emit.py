@@ -1429,6 +1429,12 @@ def _raw_source(plan: Plan, indent: str = "  ") -> str:
     return _pre_stc_source(plan, indent)
 
 
+def _tshift_flags(plan: Plan) -> list[str]:
+    """-tshift_opts with the plan's tzero in force (-tzero wins over the opts)."""
+    rest = [f for f in _split_flags(config.DEFAULT_OPTS["tshift"]) if f.split()[0] != "-tzero"]
+    return [f"-tzero {plan.options.tzero:g}", *rest]
+
+
 def _stage_tshift(plan: Plan) -> str:
     if plan.options.slicetiming_method != "first":
         return ""
@@ -1439,7 +1445,7 @@ def _stage_tshift(plan: Plan) -> str:
             '-prefix "$outf"',
             f"-tpattern {_tpattern(plan)}",
             '-TR "${TR[$k]}"',
-            *_split_flags(config.DEFAULT_OPTS["tshift"]),
+            *_tshift_flags(plan),
             '-device "$DEVICE"',
         ],
     )
@@ -1455,7 +1461,7 @@ def _stage_tshift(plan: Plan) -> str:
                 '-prefix "$phout"',
                 f"-tpattern {_tpattern(plan)}",
                 '-TR "${TR[$k]}"',
-                *_split_flags(config.DEFAULT_OPTS["tshift"]),
+                *_tshift_flags(plan),
                 '-device "$DEVICE"',
             ],
         )
@@ -3027,7 +3033,8 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
     if opt.slicetiming_method == "integrate":
         st = (
             f"  tp={_tpattern(plan)}; " + 'tr="${TR[$k]}"\n'
-            '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" -tzero 0"; '
+            '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" '
+            f'-tzero {opt.tzero:g}"; '
             'else st_str=""; fi'
         )
     else:
@@ -3510,6 +3517,14 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             # -TR only when the user gave one: a 3D acquisition's header TR is the
             # per-partition time, not the volume TR the design is sampled at.
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
+            # The slice timing above aligned every slice to tzero; sample the
+            # model there too (explicit: the final resample's header may not
+            # carry the time origin through).
+            *(
+                [f"-microtime_offset {opt.tzero:g}"]
+                if opt.slicetiming_method != "none" and opt.tzero
+                else []
+            ),
             *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
             *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
             # Events past a deliberate -cut_task_vols end are expected, not the

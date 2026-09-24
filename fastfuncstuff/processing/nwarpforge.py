@@ -2592,6 +2592,12 @@ def nwarpforge(
             view=master_space_info["view"],
             space=master_space_info["space"],
         )
+        if slice_times is not None and tzero is not None:
+            # Slices were realigned to tzero in this resample: record it the
+            # way ffs_slicetime/3dTshift do, so a GLM can read the sample time.
+            from fastfuncstuff.io.afni import mark_slice_time_corrected
+
+            mark_slice_time_corrected(out_hdr, tzero)
     except Exception as exc:
         import warnings
 
