@@ -3589,6 +3589,21 @@ def _fir_family_design(
                 f"(largest shift {max(shifts):.3f}s of a {tr:.3f}s TR). "
                 f"Use TENT/TENTZERO to keep sub-TR onset timing."
             )
+    else:
+        from fastfuncstuff.design.event_timing import assess_design, design_risk_message
+
+        risk = assess_design(
+            result.per_run,
+            list(result.n_basis_per_condition),
+            per_cond_per_run,
+            run_lengths,
+            tr,
+            window_top=float(fir_top),
+            microtime_offset=microtime_offset,
+        )
+        message = design_risk_message(risk, False, "ffs_deconvolve -tent_smooth")
+        if message:
+            print(message)
     return torch.cat(result.per_run, dim=0)
 
 
