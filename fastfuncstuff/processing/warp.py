@@ -1026,22 +1026,21 @@ def _get_basis_config(
     return basis, half_widths, param_max
 
 
-def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 1.0) -> float:
+def _compute_hfactor(patch_size: int, reference_patch_size: int, hfactor_q: float = 1.0) -> float:
     """AFNI-style Hfactor scaling on param_max.
 
-    AFNI's Hfactor_from_patchsize_ratio uses prat = psize / psize0 where
-    psize0 is the lev=1 (coarsest non-global) patch size. At lev=1 prat=1
-    so hfactor=1; at finer levels prat<1 so hfactor<1, tightening the
-    per-patch displacement bound. hfactor = prat^alpha with
-    alpha = log(hfactor_q) / log(0.1).
+    AFNI's Hfactor_from_patchsize_ratio uses ``prat = psize / psize0``, where
+    ``psize0`` is the level-0 global patch width. At finer levels ``prat < 1``,
+    tightening the per-patch displacement bound as
+    ``hfactor = prat ** (log(hfactor_q) / log(0.1))``.
     """
     import math
 
-    if hfactor_q >= 1.0 or hfactor_q < 0.1 or patch_size_lev1 <= 0:
+    if hfactor_q >= 1.0 or hfactor_q < 0.1 or reference_patch_size <= 0:
         return 1.0
-    if patch_size >= patch_size_lev1:
+    if patch_size >= reference_patch_size:
         return 1.0
-    prat = patch_size / patch_size_lev1
+    prat = patch_size / reference_patch_size
     alpha = math.log(hfactor_q) / math.log(0.1)
     return prat**alpha
 
@@ -1444,8 +1443,8 @@ def _warpomatic(
     ywid0 = jttt - jbbb + 1
     zwid0 = kttt - kbbb + 1
 
-    # Lev=1 patch size, the reference for Hfactor scaling
-    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
+    # AFNI scales fine-level bounds against the level-0 global patch width.
+    max_patch_lev0 = max(xwid0, ywid0, zwid0)
 
     ngmin = max(config.minpatch, 5)
     if ngmin % 2 == 0:
@@ -1585,7 +1584,7 @@ def _warpomatic(
         nyh = ywid
         nzh = zwid
         max_patch = max(nxh, nyh, nzh)
-        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev0, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type,
             nxh,
@@ -3057,7 +3056,7 @@ def _warpomatic_multi(
 
     # --- Levels 1..N ---
     xwid0, ywid0, zwid0 = ittt - ibbb + 1, jttt - jbbb + 1, kttt - kbbb + 1
-    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
+    max_patch_lev0 = max(xwid0, ywid0, zwid0)
     ngmin = max(config.minpatch, 5)
     if ngmin % 2 == 0:
         ngmin -= 1
@@ -3186,7 +3185,7 @@ def _warpomatic_multi(
 
         nxh, nyh, nzh = xwid, ywid, zwid
         max_patch = max(nxh, nyh, nzh)
-        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev0, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type,
             nxh,
@@ -3779,7 +3778,7 @@ def _build_mescaled_plan(
         if len(widths) >= 32:  # a runaway guard; shrink < 1 makes this unreachable
             break
     widths = widths[::-1]  # coarsest first
-    max_patch_lev1 = widths[0]
+    reference_patch_size = widths[0]
 
     basis_type = "cubic_lite" if config.use_lite else "cubic"
     ny_nx = ny * nx
@@ -3823,7 +3822,7 @@ def _build_mescaled_plan(
         if nz == 1:
             kbbb = kttt = 0
 
-        hfactor = _compute_hfactor(pw, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(pw, reference_patch_size, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type, xwid, ywid, zwid, device, hfactor=hfactor
         )

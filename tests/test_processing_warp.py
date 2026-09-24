@@ -683,16 +683,12 @@ class TestFilterPatches:
 
 
 class TestComputeHfactor:
-    # Signature: _compute_hfactor(patch_size, patch_size_lev1, hfactor_q).
-    # patch_size_lev1 is the COARSEST (level-1) patch size; finer levels
-    # use smaller patch_size, yielding prat<1 and hfactor<1 (tighter bound).
+    # Signature: _compute_hfactor(patch_size, level-0 patch size, hfactor_q).
 
-    def test_at_lev1(self):
-        """At level 1 (patch_size == lev1), hfactor should be 1.0."""
+    def test_at_reference_width(self):
         assert _compute_hfactor(25, 25, 0.5) == pytest.approx(1.0)
 
-    def test_above_lev1_clamps_to_one(self):
-        """patch_size >= patch_size_lev1 clamps hfactor to 1.0."""
+    def test_above_reference_width_clamps_to_one(self):
         assert _compute_hfactor(50, 25, 0.5) == pytest.approx(1.0)
 
     def test_hfactor_q_1(self):
@@ -704,21 +700,26 @@ class TestComputeHfactor:
         assert _compute_hfactor(10, 25, 0.05) == pytest.approx(1.0)
 
     def test_finer_patch_smaller_hfactor(self):
-        """Finer (smaller) patches than lev1 should get smaller hfactor."""
         h10 = _compute_hfactor(10, 25, 0.5)
         h5 = _compute_hfactor(5, 25, 0.5)
         assert h10 < 1.0
         assert h5 < h10
 
     def test_known_value(self):
-        """Check against the formula at a finer-than-lev1 patch."""
+        """Check AFNI's psize / level-0 psize0 formula."""
         patch_size = 10
-        patch_size_lev1 = 25
+        patch_size_lev0 = 25
         hfactor_q = 0.5
-        prat = patch_size / patch_size_lev1
+        prat = patch_size / patch_size_lev0
         alpha = math.log(hfactor_q) / math.log(0.1)
         expected = prat**alpha
-        assert _compute_hfactor(patch_size, patch_size_lev1, hfactor_q) == pytest.approx(expected)
+        assert _compute_hfactor(patch_size, patch_size_lev0, hfactor_q) == pytest.approx(expected)
+
+    def test_level_one_uses_level_zero_reference(self):
+        """AFNI already scales level 1 by its ratio to the global patch."""
+        lev0, lev1, q = 100, 75, 0.5
+        alpha = math.log(q) / math.log(0.1)
+        assert _compute_hfactor(lev1, lev0, q) == pytest.approx((lev1 / lev0) ** alpha)
 
 
 # ---------------------------------------------------------------------------
