@@ -25,6 +25,7 @@ def compute_weight_image(
     median_radius: float = 0.0,
     clusterize: bool = False,
     hist_cliplevel: bool = False,
+    edge_before_smoothing: bool = False,
 ) -> Tensor:
     """Create a weight image from the base image.
 
@@ -37,6 +38,10 @@ def compute_weight_image(
             component and erode (AFNI's cleanup that drops the background).
         hist_cliplevel: If True, use AFNI's histogram ``THD_cliplevel`` for the
             clip thresholds instead of a plain quantile.
+        edge_before_smoothing: Zero the face bands before filtering, matching
+            3dQwarp's ``mri_weightize`` ordering. The default preserves the
+            existing moco/allineate behavior and guarantees exactly zero output
+            faces after filtering.
 
     Returns:
         (nz, ny, nx) weight image in [0, 1].
@@ -44,11 +49,8 @@ def compute_weight_image(
     w = base.abs().clone()
     fades = _edge_fades(base.shape, edge_fraction)
 
-    # NB: the border is zeroed *after* smoothing (below), not before. The base is
-    # a single 3D volume with no motion-driven edge artifacts to suppress (those
-    # live in the timeseries), and zeroing before the blur would just let the
-    # Gaussian bleed interior weight back into the border anyway. AFNI's -edging
-    # guarantees the final weight is zero in the border band.
+    if edge_before_smoothing:
+        w = _zero_edges(w, fades)
 
     # Clip super-large values (squash spikes to reasonability).
     cliplev = _thd_cliplevel(w, 0.5) if hist_cliplevel else _clip_level(w)
@@ -78,9 +80,11 @@ def compute_weight_image(
         mask = largest_cluster_6conn(mask)
         w = w * mask.to(w.dtype)
 
-    # Re-zero the border after smoothing/clustering so it is exactly zero in the
-    # output (the blur above spreads interior weight into the faded band).
-    w = _zero_edges(w, fades)
+    if not edge_before_smoothing:
+        # The moco/allineate policy guarantees exactly zero output faces. AFNI
+        # qwarp instead zeros before filtering and lets clustering remove any
+        # insignificant Gaussian bleed, selected by edge_before_smoothing.
+        w = _zero_edges(w, fades)
 
     # Normalize to [0, 1]
     w_max = w.max()

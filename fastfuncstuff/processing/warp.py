@@ -627,6 +627,18 @@ def _blur_for_patch(
     return vol
 
 
+def _compute_qwarp_weight(base: Tensor) -> Tensor:
+    """AFNI 3dQwarp's default ``mri_weightize`` pipeline."""
+    return compute_weight_image(
+        base,
+        gauss_fwhm=4.5,
+        median_radius=2.25,
+        clusterize=True,
+        hist_cliplevel=True,
+        edge_before_smoothing=True,
+    )
+
+
 def qwarp(
     base: Tensor,
     source: Tensor,
@@ -723,7 +735,9 @@ def qwarp(
         )
 
     if weight is None:
-        weight_p = add_background_band(compute_weight_image(base_p), base_p, config.background_band)
+        weight_p = add_background_band(
+            _compute_qwarp_weight(base_p), base_p, config.background_band
+        )
     else:
         weight_p = (
             _pad_volume_faces(weight.float().to(device), padding)
@@ -3447,7 +3461,9 @@ def qwarp_batch(
         )
 
     if weight is None:
-        weight_p = add_background_band(compute_weight_image(base_p), base_p, config.background_band)
+        weight_p = add_background_band(
+            _compute_qwarp_weight(base_p), base_p, config.background_band
+        )
     else:
         w = weight.float().to(device)
         weight_p = _pad_volume_faces(w, padding) if do_pad else w
@@ -3733,6 +3749,8 @@ def _build_mescaled_plan(
     nz, ny, nx = base_p.shape[1:]
 
     if weight is None:
+        # The joint multi-echo EPI polish is not AFNI 3dQwarp: its low-resolution
+        # base and axis-restricted objective rely on the broader smooth weight.
         weight_p = compute_weight_image(base_p.mean(0))
     else:
         w = weight.float().to(device)

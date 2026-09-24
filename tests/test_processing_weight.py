@@ -45,7 +45,7 @@ def test_clusterize_drops_background_keeps_brain():
 
 
 def test_default_weight_unchanged_fills_fov():
-    """Default path (moco/qwarp) stays Gaussian-only: background not clustered out."""
+    """Default reusable path stays Gaussian-only for existing moco callers."""
     img = _brain_with_background()
     w = compute_weight_image(img)  # defaults: no median, no clusterize
     # Without clusterize the smoothed weight still covers most of the interior
@@ -54,6 +54,33 @@ def test_default_weight_unchanged_fills_fov():
     assert int((w > 0).sum()) > 0.5 * w.numel()
     # The edge band is exactly zero (post-smooth -edging).
     assert float(w[:3].abs().sum()) == 0.0  # first z-faces zeroed
+
+
+def test_afni_edge_order_zeros_before_filtering():
+    img = torch.ones(24, 24, 24)
+    before = compute_weight_image(
+        img, gauss_fwhm=4.5, edge_before_smoothing=True, hist_cliplevel=True
+    )
+    after = compute_weight_image(img, gauss_fwhm=4.5, edge_before_smoothing=False)
+    assert float(before[0].sum()) > 0.0  # AFNI permits Gaussian bleed back into the face
+    assert float(after[0].sum()) == 0.0
+
+
+def test_qwarp_weight_selects_full_afni_pipeline():
+    from fastfuncstuff.processing.warp import _compute_qwarp_weight
+
+    img = _brain_with_background()
+    got = _compute_qwarp_weight(img)
+    expected = compute_weight_image(
+        img,
+        gauss_fwhm=4.5,
+        median_radius=2.25,
+        clusterize=True,
+        hist_cliplevel=True,
+        edge_before_smoothing=True,
+    )
+    torch.testing.assert_close(got, expected)
+    assert int((got > 0).sum()) < 0.3 * got.numel()
 
 
 def test_thd_cliplevel_separates_brain_from_background():
