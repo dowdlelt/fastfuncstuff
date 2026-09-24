@@ -337,6 +337,7 @@ def create_single_trial_design(
     device: torch.device | None = None,
     hrf_model_name: str = "spmg1",
     n_basis: int = 1,
+    microtime_onset: int = 0,
 ) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create single-trial design matrix with optional per-voxel HRFs
@@ -362,6 +363,9 @@ def create_single_trial_design(
     hrf_index_per_voxel : torch.Tensor, optional
         HRF index for each voxel (0-indexed). Shape (n_voxels,).
         If provided, creates per-voxel design matrices.
+    microtime_onset : int, default=0
+        Microtime bin each TR is sampled at (the within-TR sample time as a
+        bin index; see ``cli_utils.microtime_offset_bins``).
     microtime_dt : float, default=0.1
         Microtime resolution in seconds for non-TR-locked onsets
     condition_labels : list of str, optional
@@ -444,6 +448,7 @@ def create_single_trial_design(
             n_timepoints_per_run=n_timepoints_per_run,
             tr=tr,
             microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
             device=device,
             return_single_trials=True,
         )

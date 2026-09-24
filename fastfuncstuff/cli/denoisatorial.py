@@ -51,6 +51,7 @@ try:
         LoadResult,
         add_device_arg,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_trim_args,
@@ -60,10 +61,12 @@ try:
         auto_polort,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        microtime_offset_bins,
         parse_input_files,
         parse_prefix,
         print_cli_header,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         setup_device,
         trim_spec_from_args,
@@ -564,6 +567,7 @@ Notes:
         default=None,
         help="Apply 3D Gaussian spatial smoothing with FWHM in mm",
     )
+    add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
@@ -888,6 +892,7 @@ def build_task_designs(
     hrf_library: torch.Tensor | None = None,
     hrf_indices: torch.Tensor | None = None,
     n_voxels: int | None = None,
+    microtime_offset: float = 0.0,
 ) -> tuple[torch.Tensor | None, dict | None]:
     """Build the task design (or per-HRF designs) for one set of runs.
 
@@ -932,6 +937,7 @@ def build_task_designs(
         hrf_library=hrf_library,
         hrf_indices=hrf_indices,
         n_voxels=n_voxels,
+        microtime_offset=microtime_offset,
     )
 
 
@@ -1123,6 +1129,13 @@ def main():
         args.tr = load_result.tr
 
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, input_files, args.tr
+        )
+        microtime_offset_bins(args.microtime_offset, args.tr, args.microtime_dt)  # validate
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
     # Timing was parsed before the load, so the -drop_first shift lands here.
     trim = trim_spec_from_args(args, tr=args.tr)
     apply_trim_to_timing(
@@ -1338,6 +1351,7 @@ def main():
         hrf_library=hrf_library,
         hrf_indices=hrf_indices,
         n_voxels=n_voxels if args.hrf_opt else None,
+        microtime_offset=args.microtime_offset,
     )
 
     # Build nuisance per run (polynomials + ortvec)
@@ -1813,6 +1827,7 @@ def main():
             hrf_library=hrf_library,
             hrf_indices=hrf_indices,
             n_voxels=n_voxels if args.hrf_opt else None,
+            microtime_offset=args.microtime_offset,
         )
         test_task_design, test_designs_by_hrf = test_designs
 

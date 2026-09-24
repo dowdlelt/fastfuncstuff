@@ -42,6 +42,7 @@ try:
         add_cv_strategy_arg,
         add_device_arg,
         add_event_filter_arguments,
+        add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_trim_args,
@@ -52,12 +53,14 @@ try:
         collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
+        microtime_offset_bins,
         parse_cv_strategy,
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
         resolve_event_filters,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
@@ -864,6 +867,7 @@ Examples:
         choices=["nii", "nii.gz", "afni"],
         help="Force output format (default: match input)",
     )
+    add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
@@ -1747,6 +1751,15 @@ def main():
         args.tr = tr
         print(f"⏱️  TR: {tr:.3f} seconds (from header)")
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, input_files, args.tr
+        )
+        microtime_onset_bin = microtime_offset_bins(
+            args.microtime_offset, args.tr, args.microtime_dt
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     trim = trim_spec_from_args(args, tr=tr)
     if trim.active and args.matrix and not _matrix_from_spec:
@@ -1975,8 +1988,15 @@ def main():
         if args.round_onsets is not None:
             from fastfuncstuff.design.builder import round_onsets
 
-            all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
-            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
+            all_onsets = round_onsets(
+                all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+            )
+            where = (
+                f" (sample times, {args.microtime_offset:g} s into each TR)"
+                if args.microtime_offset
+                else ""
+            )
+            print(f"\nOnsets rounded to TR boundaries{where} (threshold={args.round_onsets:.2f})")
 
         print(f"  Runs: {n_runs}")
         print(f"  Total timepoints: {n_timepoints}")
@@ -2103,6 +2123,7 @@ def main():
             hrf_library=hrf_library_obj,
             hrf_indices=hrf_indices_obj,
             n_voxels=hrf_indices_obj.numel() if hrf_indices_obj is not None else None,
+            microtime_offset=args.microtime_offset,
         )
 
         per_voxel_hrf_mode = designs_by_hrf is not None
@@ -2161,6 +2182,7 @@ def main():
                     n_basis=n_basis if n_basis else 1,
                     hrf_library=hrf_library_obj if per_voxel_hrf_mode else None,
                     hrf_index_per_voxel=hrf_indices_obj if per_voxel_hrf_mode else None,
+                    microtime_onset=microtime_onset_bin,
                 )
             )
 
@@ -2246,6 +2268,7 @@ def main():
                     microtime_dt=args.microtime_dt,
                     run_starts=run_starts,
                     device=device,
+                    microtime_onset=microtime_onset_bin,
                 )
             )
             if per_voxel_hrf_mode:
@@ -2401,6 +2424,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 condition_labels=condition_labels,
                 device=device,
+                microtime_onset=microtime_onset_bin,
             )
         )
         print(f"  Single-trial design: {st_design.shape}")
@@ -2430,6 +2454,7 @@ def main():
                 hrf_bases=st_hrf_bases,
                 run_starts=run_starts,
                 device=device,
+                microtime_onset=microtime_onset_bin,
             )
             st_design = torch.cat([st_design, st_vec_design], dim=1)
             print(f"  + {len(st_vec_labels)} stim vector column(s)")

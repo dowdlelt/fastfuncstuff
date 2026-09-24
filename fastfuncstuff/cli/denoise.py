@@ -49,6 +49,7 @@ try:
         add_device_arg,
         add_hrf_library_args,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
@@ -59,12 +60,14 @@ try:
         blur_masked_data,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        microtime_offset_bins,
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_cv_design,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         save_4d_nifti,
         save_r2_ceiling_stack,
@@ -685,6 +688,7 @@ Notes:
             "pool in a different place; check the reported noise-pool size."
         ),
     )
+    add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
@@ -2061,6 +2065,15 @@ def main():
     # side by side (7.2 GiB + 2.9 GiB on a 5-run 763k-voxel dataset).
     del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, input_files, args.tr
+        )
+        microtime_onset_bin = microtime_offset_bins(
+            args.microtime_offset, args.tr, args.microtime_dt
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     # Timing was parsed before the load, so the -drop_first shift lands here,
     # before the HRF/design machinery reads the onsets.
@@ -2282,7 +2295,9 @@ def main():
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 
-        all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
+        all_onsets = _round_onsets(
+            all_onsets, args.tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+        )
 
     # Build onset matrix at microtime resolution (shared function ensures
     # grid-consistent bin placement matching convolve_hrf_microtime)
@@ -2318,6 +2333,7 @@ def main():
         hrf_library=hrf_library,
         hrf_indices=hrf_indices,
         n_voxels=n_voxels,
+        microtime_offset=args.microtime_offset,
     )
 
     # --- Continuous stimulus vectors (-stim_event_vec / -stim_vec) ---
@@ -2356,6 +2372,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 run_starts=run_starts,
                 device=device,
+                microtime_onset=microtime_onset_bin,
             )
         )
         # condition_labels itself must stay pristine -- it is the CONDITION list,
@@ -2584,6 +2601,7 @@ def main():
                 device=device,
                 hrf_model_name=hrf_model_name,
                 n_basis=n_basis if not is_fir_model else 1,  # FIR incompatible with single-trial
+                microtime_onset=microtime_onset_bin,
             )
         )
         # Companion table describing every single-trial volume, in design order.
@@ -2619,6 +2637,7 @@ def main():
             run_starts=run_starts,
             device=device,
             verbose=True,
+            microtime_onset=microtime_onset_bin,
         )
         n_stim_vec_cols = int(st_design.shape[-1]) - n_trial_cols
 
