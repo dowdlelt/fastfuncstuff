@@ -41,33 +41,8 @@ def compute_weight_image(
     Returns:
         (nz, ny, nx) weight image in [0, 1].
     """
-    nz, ny, nx = base.shape
-
     w = base.abs().clone()
-
-    # Edge fade widths (AFNI -edging: a border band that gets zero weight).
-    xfade = max(2, int(edge_fraction * nx + 2))
-    yfade = max(2, int(edge_fraction * ny + 2))
-    zfade = max(2, int(edge_fraction * nz + 2))
-
-    if 6 * xfade >= nx:
-        xfade = (nx - 1) // 6
-    if 6 * yfade >= ny:
-        yfade = (ny - 1) // 6
-    if 6 * zfade >= nz:
-        zfade = (nz - 1) // 6
-
-    def _zero_edges(vol: Tensor) -> Tensor:
-        if zfade > 0 and nz > 1:
-            vol[:zfade, :, :] = 0.0
-            vol[-zfade:, :, :] = 0.0
-        if xfade > 0:
-            vol[:, :, :xfade] = 0.0
-            vol[:, :, -xfade:] = 0.0
-        if yfade > 0:
-            vol[:, :yfade, :] = 0.0
-            vol[:, -yfade:, :] = 0.0
-        return vol
+    fades = _edge_fades(base.shape, edge_fraction)
 
     # NB: the border is zeroed *after* smoothing (below), not before. The base is
     # a single 3D volume with no motion-driven edge artifacts to suppress (those
@@ -105,7 +80,7 @@ def compute_weight_image(
 
     # Re-zero the border after smoothing/clustering so it is exactly zero in the
     # output (the blur above spreads interior weight into the faded band).
-    w = _zero_edges(w)
+    w = _zero_edges(w, fades)
 
     # Normalize to [0, 1]
     w_max = w.max()
@@ -115,6 +90,71 @@ def compute_weight_image(
         w = torch.ones_like(w)
 
     return w
+
+
+def _edge_fades(shape: tuple[int, ...], edge_fraction: float) -> tuple[int, int, int]:
+    """Per-axis (z, y, x) widths of the zero-weight border band (AFNI -edging)."""
+    fades = []
+    for n in shape[-3:]:
+        fade = max(2, int(edge_fraction * n + 2))
+        if 6 * fade >= n:
+            fade = (n - 1) // 6
+        fades.append(fade)
+    return fades[0], fades[1], fades[2]
+
+
+def _zero_edges(vol: Tensor, fades: tuple[int, int, int]) -> Tensor:
+    zfade, yfade, xfade = fades
+    if zfade > 0 and vol.shape[-3] > 1:
+        vol[..., :zfade, :, :] = 0.0
+        vol[..., -zfade:, :, :] = 0.0
+    if xfade > 0:
+        vol[..., :, :, :xfade] = 0.0
+        vol[..., :, :, -xfade:] = 0.0
+    if yfade > 0:
+        vol[..., :, :yfade, :] = 0.0
+        vol[..., :, -yfade:, :] = 0.0
+    return vol
+
+
+def add_background_band(
+    weight: Tensor,
+    base: Tensor,
+    radius: int,
+    level: float = 1.0,
+    edge_fraction: float = 0.04,
+) -> Tensor:
+    """Give the empty background around a masked base real weight.
+
+    Correlation costs cannot see source tissue pushed onto voxels a weight of
+    zero excludes, and a skull-stripped template's weight is zero just outside
+    the brain -- so a strong optimizer is free to squeeze anatomy past the
+    template edge. Flooring the weight in a ``radius``-voxel band around the
+    base's nonzero support at ``level`` times the median in-support weight puts
+    those template zeros back into the cost: tissue smeared onto them lowers the
+    correlation.
+
+    The support is the base's exact-nonzero voxels, so a base with a noisy
+    (nonzero) background has no band and the weight is returned unchanged. The
+    AFNI border band stays zero.
+    """
+    support = base != 0
+    if radius <= 0 or not support.any() or support.all():
+        return weight
+    from .mask import _dilate_6conn_once
+
+    # Alternating 6- and 26-connected steps approximate a ball (an octagonal
+    # cross-section) rather than the cube that max-pooling alone would grow.
+    grown = support.float()[None, None]
+    for step in range(radius):
+        if step % 2:
+            grown = F.max_pool3d(grown, 3, stride=1, padding=1)
+        else:
+            grown = _dilate_6conn_once(grown)
+    band = (grown[0, 0] > 0.5) & ~support
+    floor = level * float(weight[support].median())
+    out = torch.where(band, weight.clamp(min=floor), weight)
+    return _zero_edges(out, _edge_fades(base.shape, edge_fraction))
 
 
 def _clip_level(vol: Tensor, frac: float = 0.5) -> float:

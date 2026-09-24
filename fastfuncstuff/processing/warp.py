@@ -80,7 +80,7 @@ from .optimizer import (
     optimize_warp_params_torch,
 )
 from .penalty import compute_hexahedron_energy, compute_penalty_batched, penalty_energy
-from .weight import _thd_cliplevel, compute_weight_image
+from .weight import _thd_cliplevel, add_background_band, compute_weight_image
 
 try:
     from .gn_triton import gn_normal_eqs_triton
@@ -210,6 +210,13 @@ class QwarpConfig:
 
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
+
+    background_band: int = 15
+    """Voxels of empty background around a masked (skull-stripped) base that the
+    automatic weight keeps at the median brain weight; 0 disables it. Not AFNI:
+    3dQwarp's weight is zero there, which lets Gauss-Newton squeeze tissue past
+    the template edge at no cost. A base whose background is not exactly zero
+    gets no band. Wider than 15 measured no further gain on anat->MNI."""
 
     hybrid_polish_iters: int = 10
     """Adam steps after the Gauss-Newton pass when ``optimizer="hybrid"``. Short by
@@ -716,7 +723,7 @@ def qwarp(
         )
 
     if weight is None:
-        weight_p = compute_weight_image(base_p)
+        weight_p = add_background_band(compute_weight_image(base_p), base_p, config.background_band)
     else:
         weight_p = (
             _pad_volume_faces(weight.float().to(device), padding)
@@ -3440,7 +3447,7 @@ def qwarp_batch(
         )
 
     if weight is None:
-        weight_p = compute_weight_image(base_p)
+        weight_p = add_background_band(compute_weight_image(base_p), base_p, config.background_band)
     else:
         w = weight.float().to(device)
         weight_p = _pad_volume_faces(w, padding) if do_pad else w

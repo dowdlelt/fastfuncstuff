@@ -2,7 +2,11 @@
 
 import torch
 
-from fastfuncstuff.processing.weight import _thd_cliplevel, compute_weight_image
+from fastfuncstuff.processing.weight import (
+    _thd_cliplevel,
+    add_background_band,
+    compute_weight_image,
+)
 
 
 def _brain_with_background(seed=0):
@@ -57,3 +61,36 @@ def test_thd_cliplevel_separates_brain_from_background():
     img = _brain_with_background()
     cl = _thd_cliplevel(img, 0.5)
     assert 40.0 < cl < 1000.0  # above background (~40), below brain peak (1000)
+
+
+def _skull_stripped_ball(n=48, radius=12.0):
+    """A textured ball on an exactly-zero background, like a stripped template."""
+    torch.manual_seed(0)
+    kk, jj, ii = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    r = ((ii - n / 2) ** 2 + (jj - n / 2) ** 2 + (kk - n / 2) ** 2).sqrt()
+    return torch.where(r <= radius, 500 + 100 * torch.rand(n, n, n), torch.zeros(n, n, n)), r
+
+
+def test_background_band_weights_the_zeros_around_a_stripped_base():
+    """Without the band the zeros just outside a stripped template carry ~no
+    weight, so tissue pushed onto them is free; qwarp squeezed anat->MNI brains
+    past the template edge that way."""
+    base, r = _skull_stripped_ball()
+    w = compute_weight_image(base)
+    banded = add_background_band(w, base, radius=6)
+    floor = float(w[base != 0].median())
+
+    shell = (r > 13.5) & (r < 17.5)  # outside the ball, well inside the band
+    assert float(w[shell].max()) < 0.5 * floor
+    assert float(banded[shell].min()) >= floor - 1e-6
+    assert float(banded[r > 12 + 6 * 1.5].max()) == float(w[r > 12 + 6 * 1.5].max())
+    assert torch.equal(banded[base != 0], w[base != 0])
+    assert float(banded[:3].abs().max()) == 0.0  # AFNI border band stays zero
+
+
+def test_background_band_is_a_no_op_without_an_exact_zero_background():
+    img = _brain_with_background()
+    w = compute_weight_image(img)
+    assert torch.equal(add_background_band(w, img, radius=15), w)
+    base, _ = _skull_stripped_ball()
+    assert torch.equal(add_background_band(w := compute_weight_image(base), base, radius=0), w)

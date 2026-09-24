@@ -780,6 +780,17 @@ def parse_args(
         "the base image (nonzero voxels)",
     )
     g_wt.add_argument(
+        "-background_band",
+        type=int,
+        default=QwarpConfig().background_band,
+        metavar="VOXELS",
+        help="Keep this many voxels of empty background around a skull-stripped "
+        "base in the automatic weight, at the median brain weight, so tissue "
+        "pushed past the template edge costs correlation. 0 disables it (AFNI's "
+        "weight). No effect when the base background is not exactly zero or "
+        "with -useweight/-autoweight [default: %(default)s]",
+    )
+    g_wt.add_argument(
         "-autoweight",
         action="store_true",
         help="Use automask of the base image (blurred) as the weight mask. "
@@ -921,6 +932,8 @@ def parse_args(
         p.error("-blur accepts one or two values")
     if args.pblur is not None and len(args.pblur) > 2:
         p.error("-pblur accepts zero, one, or two values")
+    if args.background_band < 0:
+        p.error("-background_band must be non-negative")
     if not 0.1 <= args.hfactor_q <= 1.0:
         p.error("-hfactor_q/-warpscale must be in [0.1, 1.0]")
     # After parsing, so that "did the user type this flag" is answerable from
@@ -1869,6 +1882,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         workhard=tuple(args.workhard) if args.workhard else None,
         cost_method=_resolve_cost(args),
         penalty_factor=args.penfac,
+        background_band=args.background_band,
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
         axis_weights=axis_weights,
