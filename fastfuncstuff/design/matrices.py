@@ -1357,9 +1357,6 @@ def build_glm_design(
     mode: str = "assumed",
     n_fir_lags: int = 30,
     tr: float = 1.0,
-    tent_bot: float = 0.0,
-    tent_top: float = 15.0,
-    tent_n_basis: int | None = None,
     single_trial: bool = False,
     device: torch.device | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
@@ -1383,19 +1380,13 @@ def build_glm_design(
         Design mode:
         - 'assumed': Convolve with assumed HRF
         - 'fir': FIR design (no HRF assumption, TR-locked onsets)
-        - 'tent': TENT basis (piecewise linear, for non-TR-locked onsets)
-        - 'tentzero': TENTzero basis (forces HRF to start/end at zero)
+        - TENT lives in :func:`fastfuncstuff.design.builder.build_per_run_task_designs`,
+          which keeps the onset times TENT needs
         - 'onoff': Simple boxcar (summed onsets)
     n_fir_lags : int
         Number of lags for FIR design (default: 30)
     tr : float
-        Repetition time in seconds (default: 1.0, required for tent/tentzero)
-    tent_bot : float
-        TENT start time in seconds after stimulus (default: 0.0)
-    tent_top : float
-        TENT end time in seconds after stimulus (default: 15.0)
-    tent_n_basis : int, optional
-        Number of TENT basis functions (default: None, auto-calculated for TR spacing)
+        Repetition time in seconds (default: 1.0)
     single_trial : bool
         If True, create single-trial design (one regressor per trial)
     device : torch.device, optional
@@ -1447,33 +1438,17 @@ def build_glm_design(
             elif mode == "fir":
                 design = make_fir_design(onset, n_fir_lags, n_tp, device=device)
 
-            elif mode == "tent":
-                design = make_tent_design(
-                    onset,
-                    tent_bot,
-                    tent_top,
-                    tr,
-                    n_tp,
-                    n_basis=tent_n_basis,
-                    zero_edges=False,
-                    device=device,
-                )
-
-            elif mode == "tentzero":
-                design = make_tent_design(
-                    onset,
-                    tent_bot,
-                    tent_top,
-                    tr,
-                    n_tp,
-                    n_basis=tent_n_basis,
-                    zero_edges=True,
-                    device=device,
+            elif mode in ("tent", "tentzero"):
+                # TENT needs onset TIMES; this function only has a TR-sampled
+                # onset matrix, which already threw the sub-TR timing away.
+                raise ValueError(
+                    "build_glm_design cannot build TENT from an onset matrix; use "
+                    "fastfuncstuff.design.builder.build_per_run_task_designs with onset times"
                 )
 
             else:
                 raise ValueError(
-                    f"Unknown mode: {mode}. Valid modes: assumed, fir, tent, tentzero, onoff"
+                    f"Unknown mode: {mode}. Valid modes: assumed, fir, onoff"
                 )
 
         designs.append(design)
