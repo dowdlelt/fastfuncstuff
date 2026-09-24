@@ -59,7 +59,7 @@ def test_tent_smooth_writes_maps_and_smoothed_cross_validation(monkeypatch, tmp_
     monkeypatch.setattr(sys, "argv", argv)
     assert deconvolve.main() == 0
     out = capsys.readouterr().out
-    assert "Smoothing (reml)" in out and "roughness penalty covers it" in out
+    assert "Smoothing (reml, diff2)" in out and "roughness penalty covers it" in out
     for name in ("smooth_edf", "smooth_log10lambda", "xval_r2"):
         vol = nib.load(f"{prefix}_{name}.nii.gz").get_fdata()
         assert np.isfinite(vol).all()
@@ -125,3 +125,39 @@ def test_explicit_window_is_not_snapped_so_aligned_knots_stay_on_the_samples(
     captured = capsys.readouterr()
     assert "1.0s–17.0s" in captured.out
     assert "SINGULAR" not in captured.err
+
+
+def test_loro_rule_with_two_penalties_writes_the_choice_map(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "sel")
+    argv = [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        timing,
+        "-model",
+        "TENT",
+        "-window",
+        "0",
+        "16",
+        "-prefix",
+        prefix,
+        "-device",
+        "cpu",
+        "-verb",
+        "1",
+        "-tent-smooth",
+        "loro",
+        "-smooth-penalty",
+        "diff2,gp:3",
+        "-save-xval-r2",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    out = capsys.readouterr().out
+    assert "Penalty chosen by held-out runs" in out and "optimistically biased" in out
+    choice = nib.load(f"{prefix}_smooth_penalty.nii.gz").get_fdata()
+    assert set(np.unique(choice)) <= {0.0, 1.0}

@@ -499,26 +499,31 @@ def parse_args():
         nargs="?",
         const="reml",
         default=None,
-        metavar="METHOD",
+        metavar="RULE",
         help=(
-            "Estimate the FIR/TENT/CSPLIN response with a roughness penalty on "
-            "neighbouring knots (smooth FIR), strength chosen PER VOXEL. "
-            "METHOD: reml (default; restricted likelihood, no held-out data), "
-            "gcv (generalized cross-validation), or a number (one fixed relative "
-            "lambda everywhere). Fixes the up-down artefact of onsets bunched "
-            "mid-TR and makes knots finer than the TR solvable "
-            "(-window/-tent-n-basis). Writes <prefix>_smooth_edf (effective "
-            "knots used) and <prefix>_smooth_log10lambda. -fir-smooth is the "
-            "same flag."
+            "Estimate the FIR/TENT/CSPLIN response with a smoothness penalty "
+            "(smooth FIR), its strength chosen PER VOXEL. RULE picks the strength: "
+            "reml (default; restricted likelihood, no held-out data), gcv "
+            "(generalized cross-validation), loro (best leave-one-run-out "
+            "prediction), or a number (one fixed relative lambda everywhere). "
+            "Fixes the up-down artefact of onsets bunched mid-TR and makes knots "
+            "finer than the TR solvable (-window/-tent-n-basis). Writes "
+            "<prefix>_smooth_edf (effective knots used) and "
+            "<prefix>_smooth_log10lambda. -fir-smooth is the same flag."
         ),
     )
     model_opts.add_argument(
-        "-smooth-order",
-        type=int,
-        default=2,
-        metavar="N",
-        help="Difference order of the -tent-smooth penalty: 2 (curvature, default) "
-        "leaves straight lines free; 1 leaves constants free.",
+        "-smooth-penalty",
+        default="diff2",
+        metavar="SPEC[,SPEC...]",
+        help="Penalty shape for -tent-smooth: diffN = N-th difference of "
+        "neighbouring knots (diff2, curvature, leaves straight lines free; diff1 "
+        "constants; diff3 parabolas), gp:SEC = Gaussian-process prior, smooth on "
+        "a SEC-second length scale whatever the knot spacing. Several, "
+        "comma-separated, are compared PER VOXEL by leave-one-run-out prediction "
+        "(the choice is written to <prefix>_smooth_penalty, 0-based in the order "
+        "given): -tent-smooth reml -smooth-penalty diff2,gp:4 picks each "
+        "penalty's lambda by REML and the penalty by held-out runs.",
     )
     add_microtime_offset_arg(model_opts)
 
@@ -1205,7 +1210,7 @@ def main():
             )
             return 1
         choice = str(args.tent_smooth).lower()
-        if choice in ("reml", "gcv"):
+        if choice in ("reml", "gcv", "loro"):
             smooth_method = choice
         else:
             try:
@@ -1214,13 +1219,23 @@ def main():
                 smooth_lam = -1.0
             if smooth_lam <= 0:
                 print(
-                    f"ERROR: -tent-smooth takes reml, gcv or a positive lambda, got {args.tent_smooth!r}",
+                    "ERROR: -tent-smooth takes reml, gcv, loro or a positive lambda, "
+                    f"got {args.tent_smooth!r}",
                     file=sys.stderr,
                 )
                 return 1
             smooth_method = "fixed"
-        if args.smooth_order < 1:
-            print("ERROR: -smooth-order must be >= 1", file=sys.stderr)
+        from fastfuncstuff.glm.smooth_basis import parse_penalty_spec
+
+        smooth_specs = [p for p in args.smooth_penalty.split(",") if p.strip()]
+        try:
+            for spec in smooth_specs:
+                parse_penalty_spec(spec)
+        except ValueError as exc:
+            print(f"ERROR: -smooth-penalty: {exc}", file=sys.stderr)
+            return 1
+        if (smooth_method == "loro" or len(smooth_specs) > 1) and n_runs < 2:
+            print("ERROR: choosing by held-out runs needs at least two runs", file=sys.stderr)
             return 1
 
     # ── FLOBS branch ─────────────────────────────────────────────────────────
@@ -2167,30 +2182,47 @@ def main():
         print("\nFitting GLM (chunked for GPU memory)...")
 
     smooth_fit = None
+    smooth_sel = None
     if smooth_method is not None:
-        from fastfuncstuff.glm.smooth_basis import fit_smooth_basis, roughness_penalty
+        from fastfuncstuff.glm.smooth_basis import fit_smooth_selected, penalty_matrix
 
-        smooth_penalty = roughness_penalty(
-            n_basis_per_condition_list,
-            order=args.smooth_order,
-            zero_edges=model in ("TENTzero", "CSPLINzero"),
-        )
-        smooth_fit = fit_smooth_basis(
+        knot_dt = [
+            float(np.diff(lags)[0]) if len(lags) > 1 else tr
+            for lags in (design_result.lag_times_s or [])
+        ]
+        smooth_pens = [
+            penalty_matrix(
+                spec, n_basis_per_condition_list, knot_dt, model in ("TENTzero", "CSPLINzero")
+            )
+            for spec in smooth_specs
+        ]
+        smooth_sel = fit_smooth_selected(
             packed.data_concat,
             packed.design_concat,
             packed.n_task_cols,
-            smooth_penalty,
-            method=smooth_method,
+            smooth_pens,
+            list(run_starts),
+            rule=smooth_method,
             lam=smooth_lam,
+            xval=bool(args.save_xval_r2),
             device=device,
             verbose=args.verb >= 1,
         )
+        smooth_fit = smooth_sel.fit
         results = smooth_fit
         if args.verb >= 1:
             print(
-                f"  Smoothing ({smooth_method}): median effective knots "
-                f"{float(smooth_fit.edf.median()):.1f} of {packed.n_task_cols}"
+                f"  Smoothing ({smooth_method}, {','.join(smooth_specs)}): median effective "
+                f"knots {float(smooth_fit.edf[smooth_fit.edf > 0].median()) if bool((smooth_fit.edf > 0).any()) else 0.0:.1f} "
+                f"of {packed.n_task_cols}"
             )
+            if len(smooth_specs) > 1:
+                counts = torch.bincount(smooth_sel.penalty_index, minlength=len(smooth_specs))
+                share = ", ".join(
+                    f"{spec} {100 * int(c) / max(int(counts.sum()), 1):.0f}%"
+                    for spec, c in zip(smooth_specs, counts, strict=True)
+                )
+                print(f"  Penalty chosen by held-out runs: {share}")
     else:
         results = fit_glm(
             data=packed.data_concat,
@@ -2224,10 +2256,13 @@ def main():
             del r2_vol
 
     if smooth_fit is not None:
-        for name, values in (
+        maps = [
             ("smooth_edf", smooth_fit.edf),
             ("smooth_log10lambda", torch.log10(smooth_fit.lam)),
-        ):
+        ]
+        if smooth_sel is not None and len(smooth_specs) > 1:
+            maps.append(("smooth_penalty", smooth_sel.penalty_index.float()))
+        for name, values in maps:
             path = f"{args.prefix}_{name}{_nii_ext}"
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
@@ -2239,23 +2274,16 @@ def main():
             _announce_written(path, time.perf_counter() - t_write, args.verb)
 
     if args.save_xval_r2:
-        if smooth_fit is not None:
-            from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
-
+        if smooth_sel is not None:
             if args.verb >= 1 and (args.cv_strategy != "loro" or args.cv_metric != "cod"):
                 print("  note: the smoothed cross-validation is leave-one-run-out COD")
-            loro = loro_r2_smooth(
-                packed.data_concat,
-                packed.design_concat,
-                packed.n_task_cols,
-                smooth_penalty,
-                list(run_starts),
-                method=smooth_method,
-                lam=smooth_lam,
-                device=device,
-                verbose=args.verb >= 1,
-            )
-            xval_r2_map = None if loro is None else loro.numpy()
+            if smooth_sel.xval_selection_biased and args.verb >= 1:
+                print(
+                    "  note: held-out runs also chose the smoothing, so this R² of the "
+                    "winner is optimistically biased (compare configurations, not levels)"
+                )
+            xval = smooth_sel.xval_r2
+            xval_r2_map = None if xval is None else xval.numpy()
         else:
             xval_r2_map = _compute_xval_r2_map(
                 packed=packed,

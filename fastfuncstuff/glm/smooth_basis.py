@@ -40,6 +40,12 @@ from fastfuncstuff.memory import estimate_chunk_size
 #: so the same grid spans "no smoothing" to "straight lines" for any design.
 DEFAULT_LOG10_GRID = np.linspace(-5.0, 7.0, 49)
 SELECTION_METHODS = ("reml", "gcv", "fixed")
+#: Rules for choosing lambda (and, with several penalties, the penalty).
+SMOOTH_RULES = ("reml", "gcv", "loro", "fixed")
+#: Relative jitter on a Gaussian-process prior covariance before inverting it:
+#: a floor on the prior variance of rough components, which also keeps the
+#: precision matrix finite for fine knots and long length scales.
+GP_JITTER = 1e-4
 
 
 def roughness_penalty(
@@ -61,6 +67,51 @@ def roughness_penalty(
         if zero_edges:
             d = d[:, 1:-1]
         blocks.append(d.T @ d)
+    return block_diag(*blocks)
+
+
+def parse_penalty_spec(spec: str) -> tuple[str, float]:
+    """``"diff2"`` -> ("diff", 2); ``"gp:4"`` -> ("gp", 4.0 s length scale)."""
+    text = spec.strip().lower()
+    if text.startswith("diff") and text[4:].isdigit() and int(text[4:]) >= 1:
+        return "diff", float(int(text[4:]))
+    if text.startswith("gp:"):
+        try:
+            scale = float(text[3:])
+        except ValueError:
+            scale = -1.0
+        if scale > 0:
+            return "gp", scale
+    raise ValueError(f"penalty must be diffN (N >= 1) or gp:SECONDS, got {spec!r}")
+
+
+def penalty_matrix(
+    spec: str,
+    n_basis_per_condition: list[int],
+    knot_dt_per_condition: list[float],
+    zero_edges: bool = False,
+) -> np.ndarray:
+    """Block-diagonal penalty for one spec over each condition's knots.
+
+    ``diffN`` is the N-th difference roughness penalty (:func:`roughness_penalty`;
+    its null space is polynomials of degree < N per condition).  ``gp:L`` is
+    the precision of a squared-exponential Gaussian-process prior with length
+    scale ``L`` seconds on the knot values (Goutte, Nielsen & Hansen 2000):
+    full rank, shrinking toward zero, smooth on the scale ``L`` regardless of
+    how finely the knots are spaced.  ``zero_edges`` conditions on the pinned
+    edge knots of TENTzero/CSPLINzero in both cases.
+    """
+    kind, value = parse_penalty_spec(spec)
+    if kind == "diff":
+        return roughness_penalty(n_basis_per_condition, order=int(value), zero_edges=zero_edges)
+    blocks = []
+    for n, dt in zip(n_basis_per_condition, knot_dt_per_condition, strict=True):
+        full = n + 2 if zero_edges else n
+        t = np.arange(full) * dt
+        cov = np.exp(-0.5 * ((t[:, None] - t[None, :]) / value) ** 2)
+        prec = np.linalg.inv(cov + GP_JITTER * np.eye(full))
+        prec = (prec + prec.T) / 2
+        blocks.append(prec[1:-1, 1:-1] if zero_edges else prec)
     return block_diag(*blocks)
 
 
@@ -161,7 +212,7 @@ def fit_smooth_basis(
     penalty: np.ndarray,
     *,
     method: str = "reml",
-    lam: float | None = None,
+    lam: float | torch.Tensor | None = None,
     log10_grid: np.ndarray | None = None,
     device: torch.device | None = None,
     chunk_size: int | None = None,
@@ -172,15 +223,15 @@ def fit_smooth_basis(
 
     ``data`` is ``(V, T)``, ``design`` ``(T, n_task + n_nuisance)`` -- the packed
     concatenated GLM form (task block first, block-diagonal nuisance after).
-    ``method="fixed"`` uses ``lam`` everywhere; ``"reml"``/``"gcv"`` pick it
-    per voxel on ``log10_grid``.  The decomposition is float64 on the CPU
+    ``method="fixed"`` uses ``lam`` -- one value, or one per voxel (a ``(V,)``
+    tensor); ``"reml"``/``"gcv"`` pick it per voxel on ``log10_grid``.  The decomposition is float64 on the CPU
     (K x K, tiny); voxel work streams in chunks on ``device``.  ``time_index``
     fits a subset of timepoints (``design`` already sliced to it) without
     copying ``data``: the slice is taken per chunk.
     """
     if method not in SELECTION_METHODS:
         raise ValueError(f"method must be one of {SELECTION_METHODS}, got {method!r}")
-    if method == "fixed" and (lam is None or lam <= 0):
+    if method == "fixed" and (lam is None or bool((torch.as_tensor(lam) <= 0).any())):
         raise ValueError("method='fixed' needs a positive lam")
     device = device if device is not None else torch.device("cpu")
     spec = _spectrum(design.detach().cpu().double().numpy(), n_task, penalty)
@@ -219,7 +270,9 @@ def fit_smooth_basis(
         z2 = z * z
         yy = (y_t.double() ** 2).sum(dim=1)
         if method == "fixed":
-            log_lam = torch.full((b - a,), float(np.log(lam)), dtype=torch.float64, device=device)
+            lam_t = torch.as_tensor(lam, dtype=torch.float64)
+            lam_t = lam_t[a:b] if lam_t.ndim else lam_t.expand(b - a)
+            log_lam = torch.log(lam_t).to(device)
         else:
             crit = _criterion(method, z2, yy, s, torch.exp(log_grid), spec.n_eff, spec.rank_penalty)
             log_lam = _refine_log_lambda(crit, log_grid)
@@ -238,75 +291,207 @@ def fit_smooth_basis(
     return SmoothBasisFit(betas=out_b, lam=out_lam, edf=out_edf, r2=out_r2, method=method)
 
 
-def loro_r2_smooth(
+@dataclass
+class SmoothSelection:
+    """Result of :func:`fit_smooth_selected`."""
+
+    fit: SmoothBasisFit
+    #: Index into the candidate penalties, per voxel.
+    penalty_index: torch.Tensor
+    #: Leave-one-run-out COD of the chosen configuration (None without a LORO pass).
+    xval_r2: torch.Tensor | None
+    #: True when held-out runs also CHOSE something (lambda or penalty): the
+    #: xval R^2 of the winner is then optimistically biased.
+    xval_selection_biased: bool
+
+
+@dataclass
+class _FoldPenalty:
+    spec: _Spectrum
+    m_gram: torch.Tensor  # (K, K) M'M, M = X_test W
+    m: torch.Tensor  # (T_test, K)
+    q_test: torch.Tensor  # (T_test, p) held-out run's nuisance basis
+    train: torch.Tensor
+    test: torch.Tensor
+
+
+def _fold_penalty(design64: np.ndarray, n_task: int, penalty, train, test, device) -> _FoldPenalty:
+    spec = _spectrum(design64[train.numpy()], n_task, penalty)
+    x_test = design64[test.numpy(), :n_task]
+    nuis = design64[test.numpy(), n_task:]
+    nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
+    q = np.zeros((test.numel(), 0))
+    if nuis.shape[1]:
+        u, sv, _ = np.linalg.svd(nuis, full_matrices=False)
+        q = u[:, sv > sv.max() * 1e-10]
+        x_test = x_test - q @ (q.T @ x_test)
+    m = x_test @ spec.w
+    return _FoldPenalty(
+        spec=spec,
+        m_gram=torch.as_tensor(m.T @ m, dtype=torch.float64, device=device),
+        m=torch.as_tensor(m, dtype=torch.float64, device=device),
+        q_test=torch.as_tensor(q, dtype=torch.float64, device=device),
+        train=train,
+        test=test,
+    )
+
+
+def _heldout_ss(v: torch.Tensor, u: torch.Tensor, yy_test: torch.Tensor, m_gram: torch.Tensor):
+    """||y - M v||^2 for per-voxel coefficient vectors v, via M'y and M'M."""
+    return yy_test - 2.0 * (v * u).sum(dim=-1) + ((v @ m_gram) * v).sum(dim=-1)
+
+
+def fit_smooth_selected(
     data: torch.Tensor,
     design: torch.Tensor,
     n_task: int,
-    penalty: np.ndarray,
+    penalties: list[np.ndarray],
     run_starts: list[int],
     *,
-    method: str = "reml",
+    rule: str = "reml",
     lam: float | None = None,
+    xval: bool = False,
+    log10_grid: np.ndarray | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
-) -> torch.Tensor | None:
-    """Leave-one-run-out COD of the penalized fit, lambda re-chosen in every fold.
+) -> SmoothSelection:
+    """Smooth FIR/TENT fit choosing lambda by ``rule`` and, with several
+    ``penalties``, the penalty by held-out runs -- per voxel.
 
-    Each held-out run is predicted from betas fitted (and smoothed) on the
-    other runs; its nuisance is projected fold-locally from the held-out run
-    alone, never from the full series ([[LORO cross-validation]]).  One COD
-    per voxel over the concatenated held-out series, as ``compute_xval_r2``.
-    ``None`` with fewer than two runs.
+    ``rule``: ``reml``/``gcv`` choose lambda inside each penalty from the data
+    being fitted; ``loro`` chooses it (jointly with the penalty) by
+    leave-one-run-out prediction error; ``fixed`` uses ``lam``.  A LORO pass
+    runs when the rule is ``loro``, when there is more than one penalty, or
+    when ``xval`` is asked for; its held-out COD of the winning configuration
+    comes back as ``xval_r2`` for free.  Held-out error for every lambda is a
+    closed form in the fold's shared spectrum -- ``||y - M d.z||^2`` from
+    ``M'y`` and ``M'M`` -- so the grid costs no refits.  The final betas are
+    refitted on all runs with the chosen configuration.
     """
-    n_vox, n_t = data.shape
-    bounds = list(run_starts) + [n_t]
-    if len(run_starts) < 2:
-        return None
+    if rule not in SMOOTH_RULES:
+        raise ValueError(f"rule must be one of {SMOOTH_RULES}, got {rule!r}")
+    if not penalties:
+        raise ValueError("need at least one penalty")
     device = device if device is not None else torch.device("cpu")
-    design64 = design.detach().cpu().double()
-    ss_res = torch.zeros(n_vox, dtype=torch.float64)
-    total = torch.zeros(n_vox, dtype=torch.float64)
-    total_sq = torch.zeros(n_vox, dtype=torch.float64)
-    n_total = 0
-    chunk = estimate_chunk_size(n_vox, n_t, n_task, device, operation="glm")
-    folds = range(len(run_starts))
-    for r in tqdm(folds, desc="  LORO (smoothed)", unit="fold", leave=True, disable=not verbose):
-        test = torch.arange(bounds[r], bounds[r + 1])
-        train = torch.cat([torch.arange(0, bounds[r]), torch.arange(bounds[r + 1], n_t)])
+    n_vox, n_t = data.shape
+    n_pen = len(penalties)
+    need_loro = rule == "loro" or n_pen > 1 or xval
+    if need_loro and len(run_starts) < 2:
+        if rule == "loro" or n_pen > 1:
+            raise ValueError("choosing by held-out runs needs at least two runs")
+        need_loro = False
+    fit_method = "fixed" if rule in ("fixed", "loro") else rule
+    if not need_loro:
         fit = fit_smooth_basis(
             data,
-            design64[train],
+            design,
             n_task,
-            penalty,
-            method=method,
+            penalties[0],
+            method=fit_method,
             lam=lam,
+            log10_grid=log10_grid,
             device=device,
-            time_index=train,
+            verbose=verbose,
         )
-        x_test = design64[test, :n_task].numpy()
-        nuis = design64[test, n_task:].numpy()
-        nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
-        q = np.zeros((test.numel(), 0))
-        if nuis.shape[1]:
-            u, sv, _ = np.linalg.svd(nuis, full_matrices=False)
-            q = u[:, sv > sv.max() * 1e-10]
-            x_test = x_test - q @ (q.T @ x_test)
-        q_t = torch.as_tensor(q, dtype=torch.float64, device=device)
-        x_t = torch.as_tensor(x_test, dtype=torch.float64, device=device)
-        for a in range(0, n_vox, chunk):
-            b = min(a + chunk, n_vox)
-            y = data[a:b][:, test].to(device=device, dtype=torch.float64)
-            if q_t.shape[1]:
-                y = y - (y @ q_t) @ q_t.T
-            pred = fit.betas[a:b].to(device=device, dtype=torch.float64) @ x_t.T
-            ss_res[a:b] += ((y - pred) ** 2).sum(dim=1).cpu()
-            total[a:b] += y.sum(dim=1).cpu()
-            total_sq[a:b] += (y * y).sum(dim=1).cpu()
-        n_total += test.numel()
-    ss_tot = total_sq - total * total / n_total
-    # A voxel with nothing to explain (outside the brain, masked to zero) scores
-    # 0, as compute_xval_r2 does -- 0/0 would otherwise read as a perfect R^2.
-    live = ss_tot > 1e-12 * n_total
-    r2 = torch.zeros(n_vox, dtype=torch.float64)
-    r2[live] = 1.0 - ss_res[live] / ss_tot[live]
-    return r2.float()
+        return SmoothSelection(fit, torch.zeros(n_vox, dtype=torch.long), None, False)
+
+    log_grid = torch.as_tensor(
+        DEFAULT_LOG10_GRID if log10_grid is None else log10_grid, dtype=torch.float64
+    ).to(device) * np.log(10.0)
+    lams = torch.exp(log_grid)
+    bounds = list(run_starts) + [n_t]
+    design64 = design.detach().cpu().double().numpy()
+    folds = []
+    for r in range(len(run_starts)):
+        test = torch.arange(bounds[r], bounds[r + 1])
+        train = torch.cat([torch.arange(0, bounds[r]), torch.arange(bounds[r + 1], n_t)])
+        folds.append(
+            [_fold_penalty(design64, n_task, pen, train, test, device) for pen in penalties]
+        )
+
+    n_lam = int(lams.numel()) if rule == "loro" else 1
+    chunk = estimate_chunk_size(n_vox, n_t, n_task * (1 + n_pen * n_lam), device, operation="glm")
+    choice_pen = torch.zeros(n_vox, dtype=torch.long)
+    choice_lam = torch.ones(n_vox, dtype=torch.float64)
+    ss_best = torch.zeros(n_vox, dtype=torch.float64)
+    ss_tot = torch.zeros(n_vox, dtype=torch.float64)
+    starts = range(0, n_vox, chunk)
+    for a in tqdm(starts, desc="  LORO selection", unit="chunk", leave=True, disable=not verbose):
+        b = min(a + chunk, n_vox)
+        ss = torch.zeros((b - a, n_pen, n_lam), dtype=torch.float64, device=device)
+        total = torch.zeros(b - a, dtype=torch.float64, device=device)
+        total_sq = torch.zeros(b - a, dtype=torch.float64, device=device)
+        n_test = 0
+        y_all = data[a:b].to(device=device, dtype=torch.float64)
+        for fold in folds:
+            y_te = y_all[:, fold[0].test.to(device)]
+            if fold[0].q_test.shape[1]:
+                y_te = y_te - (y_te @ fold[0].q_test) @ fold[0].q_test.T
+            yy_te = (y_te * y_te).sum(dim=1)
+            total += y_te.sum(dim=1)
+            total_sq += yy_te
+            n_test += y_te.shape[1]
+            y_tr = y_all[:, fold[0].train.to(device)]
+            for p, fp in enumerate(fold):
+                sp = fp.spec
+                q_tr = torch.as_tensor(sp.q_nuis, dtype=torch.float64, device=device)
+                y_trp = y_tr - (y_tr @ q_tr) @ q_tr.T if q_tr.shape[1] else y_tr
+                z = y_trp @ torch.as_tensor(sp.g, dtype=torch.float64, device=device)
+                s_t = torch.as_tensor(sp.s, dtype=torch.float64, device=device)
+                u = y_te @ fp.m
+                if rule == "loro":
+                    for li in range(n_lam):
+                        d = 1.0 / ((1.0 - s_t) + lams[li] * s_t)
+                        ss[:, p, li] += _heldout_ss(d * z, u, yy_te, fp.m_gram)
+                    continue
+                if rule == "fixed":
+                    lam_v = torch.full((b - a,), float(lam), dtype=torch.float64, device=device)
+                else:
+                    yy_tr = (y_trp * y_trp).sum(dim=1)
+                    crit = _criterion(rule, z * z, yy_tr, s_t, lams, sp.n_eff, sp.rank_penalty)
+                    lam_v = torch.exp(_refine_log_lambda(crit, log_grid))
+                d = 1.0 / ((1.0 - s_t)[None, :] + lam_v[:, None] * s_t[None, :])
+                ss[:, p, 0] += _heldout_ss(d * z, u, yy_te, fp.m_gram)
+        flat = ss.reshape(b - a, -1)
+        best = flat.argmin(dim=1)
+        rows = torch.arange(b - a, device=device)
+        choice_pen[a:b] = (best // n_lam).cpu()
+        if rule == "loro":
+            curve = ss[rows, best // n_lam, :]
+            choice_lam[a:b] = torch.exp(_refine_log_lambda(curve, log_grid)).cpu()
+        ss_best[a:b] = flat[rows, best].cpu()
+        ss_tot[a:b] = (total_sq - total * total / n_test).cpu()
+
+    live = ss_tot > 1e-12 * n_t
+    xval_r2 = torch.zeros(n_vox, dtype=torch.float64)
+    xval_r2[live] = 1.0 - ss_best[live] / ss_tot[live]
+
+    # Final fit on all runs, one pass per penalty over the voxels that chose it.
+    betas = torch.zeros((n_vox, n_task), dtype=torch.float32)
+    out_lam = torch.ones(n_vox, dtype=torch.float32)
+    out_edf = torch.zeros(n_vox, dtype=torch.float32)
+    out_r2 = torch.zeros(n_vox, dtype=torch.float32)
+    for p, pen in enumerate(penalties):
+        idx = torch.nonzero(choice_pen == p).flatten()
+        if idx.numel() == 0:
+            continue
+        sub = fit_smooth_basis(
+            data[idx],
+            design,
+            n_task,
+            pen,
+            method=fit_method,
+            lam=choice_lam[idx] if rule == "loro" else lam,
+            log10_grid=log10_grid,
+            device=device,
+            verbose=verbose,
+        )
+        betas[idx], out_lam[idx], out_edf[idx], out_r2[idx] = sub.betas, sub.lam, sub.edf, sub.r2
+    empty = ~live
+    out_lam[empty], out_edf[empty] = 1.0, 0.0
+    return SmoothSelection(
+        fit=SmoothBasisFit(betas=betas, lam=out_lam, edf=out_edf, r2=out_r2, method=rule),
+        penalty_index=choice_pen,
+        xval_r2=xval_r2.float(),
+        xval_selection_biased=rule == "loro" or n_pen > 1,
+    )

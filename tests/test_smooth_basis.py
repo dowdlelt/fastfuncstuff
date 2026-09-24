@@ -106,31 +106,82 @@ def _loro_ols(y, design, k):
 
 
 def test_loro_at_tiny_lambda_matches_the_ols_cross_validation():
-    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+    from fastfuncstuff.glm.smooth_basis import fit_smooth_selected
 
     y, design, k, _, res = _problem(0.0, amp=2.0)
     pen = roughness_penalty(res.n_basis_per_condition)
-    smooth = loro_r2_smooth(y, design, k, pen, [0, T], method="fixed", lam=1e-9).numpy()
+    sel = fit_smooth_selected(y, design, k, [pen], [0, T], rule="fixed", lam=1e-9, xval=True)
+    smooth = sel.xval_r2.numpy()
+    assert not sel.xval_selection_biased
     np.testing.assert_allclose(smooth, _loro_ols(y, design, k), atol=2e-3)
 
 
 def test_smoothing_raises_held_out_r2_where_timing_is_poor():
-    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+    from fastfuncstuff.glm.smooth_basis import fit_smooth_selected
 
     y, design, k, _, res = _problem(RNG.uniform(0.4, 0.6, BASE[0].size), amp=2.0)
     pen = roughness_penalty(res.n_basis_per_condition)
-    smooth = loro_r2_smooth(y, design, k, pen, [0, T]).numpy()
+    smooth = fit_smooth_selected(y, design, k, [pen], [0, T], xval=True).xval_r2.numpy()
     assert np.median(smooth) > np.median(_loro_ols(y, design, k))
 
 
 def test_loro_scores_empty_voxels_zero_not_one():
     """Unmasked runs fit zero-valued out-of-brain voxels; 0/0 must not read as R^2 = 1."""
-    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+    from fastfuncstuff.glm.smooth_basis import fit_smooth_selected
 
     y, design, k, _, res = _problem(0.0, amp=2.0)
     y[:5] = 0.0
-    r2 = loro_r2_smooth(y, design, k, roughness_penalty(res.n_basis_per_condition), [0, T])
+    pen = roughness_penalty(res.n_basis_per_condition)
+    r2 = fit_smooth_selected(y, design, k, [pen], [0, T], xval=True).xval_r2
     assert (r2[:5] == 0).all()
     np.testing.assert_allclose(r2[:5].numpy(), _loro_ols(y, design, k)[:5])
     fit = fit_smooth_basis(y, design, k, roughness_penalty(res.n_basis_per_condition))
     assert (fit.edf[:5] == 0).all() and (fit.lam[:5] == 1).all()
+
+
+def test_loro_rule_chooses_lambda_by_held_out_error_and_flags_the_bias():
+    from fastfuncstuff.glm.smooth_basis import fit_smooth_selected
+
+    y, design, k, truth, res = _problem(RNG.uniform(0.4, 0.6, BASE[0].size), amp=2.0)
+    pen = roughness_penalty(res.n_basis_per_condition)
+    sel = fit_smooth_selected(y, design, k, [pen], [0, T], rule="loro")
+    assert sel.xval_selection_biased and sel.xval_r2 is not None
+    assert np.sqrt(np.mean((sel.fit.betas.numpy() - truth) ** 2)) < 0.3
+    reml = fit_smooth_selected(y, design, k, [pen], [0, T], xval=True).xval_r2
+    # Chosen on the same folds it is scored on, LORO cannot score below REML's lambda.
+    assert float(sel.xval_r2.median()) >= float(reml.median()) - 1e-6
+
+
+def test_several_penalties_are_chosen_per_voxel_by_held_out_runs():
+    from fastfuncstuff.glm.smooth_basis import fit_smooth_selected, penalty_matrix
+
+    y, design, k, truth, res = _problem(0.0, amp=2.0)
+    n = res.n_basis_per_condition
+    pens = [penalty_matrix(spec, n, [TR], False) for spec in ("diff1", "diff2", "gp:3")]
+    sel = fit_smooth_selected(y, design, k, pens, [0, T], rule="reml")
+    assert sel.xval_selection_biased
+    assert set(sel.penalty_index.unique().tolist()) <= {0, 1, 2}
+    assert np.sqrt(np.mean((sel.fit.betas.numpy() - truth) ** 2)) < 0.3
+
+
+@pytest.mark.parametrize("zero_edges", [False, True])
+def test_gp_penalty_is_full_rank_and_fits(zero_edges):
+    from fastfuncstuff.glm.smooth_basis import penalty_matrix
+
+    p = penalty_matrix("gp:4", [16], [1.0], zero_edges)
+    assert p.shape == (16, 16) and np.linalg.matrix_rank(p) == 16
+    np.testing.assert_allclose(p, p.T)
+    if not zero_edges:
+        y, design, k, truth, res = _problem(0.5)
+        fit = fit_smooth_basis(y, design, k, p)
+        assert np.sqrt(np.mean((fit.betas.numpy() - truth) ** 2)) < 0.2  # singular design
+
+
+def test_penalty_specs_parse_and_reject():
+    from fastfuncstuff.glm.smooth_basis import parse_penalty_spec
+
+    assert parse_penalty_spec("DIFF3") == ("diff", 3.0)
+    assert parse_penalty_spec("gp:2.5") == ("gp", 2.5)
+    for bad in ("diff0", "gp:0", "gp:x", "spline"):
+        with pytest.raises(ValueError):
+            parse_penalty_spec(bad)
