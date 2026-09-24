@@ -86,3 +86,38 @@ def test_zero_edge_penalty_differences_through_the_pinned_ends():
     d = np.diff(np.eye(5), 2, axis=0)[:, 1:-1]
     np.testing.assert_allclose(p, d.T @ d)
     assert np.linalg.matrix_rank(p) == 3  # pinned ends leave no free line
+
+
+def _loro_ols(y, design, k):
+    from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+
+    splits = generate_cv_splits(n_runs=RUNS, strategy=1)
+    out = compute_xval_r2(
+        y,
+        design.float(),
+        [0, T],
+        list(range(k)),
+        list(range(k, design.shape[1])),
+        splits,
+        device=CPU,
+        verbose=False,
+    )
+    return out["r2"].numpy()
+
+
+def test_loro_at_tiny_lambda_matches_the_ols_cross_validation():
+    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+
+    y, design, k, _, res = _problem(0.0, amp=2.0)
+    pen = roughness_penalty(res.n_basis_per_condition)
+    smooth = loro_r2_smooth(y, design, k, pen, [0, T], method="fixed", lam=1e-9).numpy()
+    np.testing.assert_allclose(smooth, _loro_ols(y, design, k), atol=2e-3)
+
+
+def test_smoothing_raises_held_out_r2_where_timing_is_poor():
+    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+
+    y, design, k, _, res = _problem(RNG.uniform(0.4, 0.6, BASE[0].size), amp=2.0)
+    pen = roughness_penalty(res.n_basis_per_condition)
+    smooth = loro_r2_smooth(y, design, k, pen, [0, T]).numpy()
+    assert np.median(smooth) > np.median(_loro_ols(y, design, k))

@@ -166,6 +166,7 @@ def fit_smooth_basis(
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = False,
+    time_index: torch.Tensor | None = None,
 ) -> SmoothBasisFit:
     """Penalized fit of the first ``n_task`` design columns, lambda per voxel.
 
@@ -173,7 +174,9 @@ def fit_smooth_basis(
     concatenated GLM form (task block first, block-diagonal nuisance after).
     ``method="fixed"`` uses ``lam`` everywhere; ``"reml"``/``"gcv"`` pick it
     per voxel on ``log10_grid``.  The decomposition is float64 on the CPU
-    (K x K, tiny); voxel work streams in chunks on ``device``.
+    (K x K, tiny); voxel work streams in chunks on ``device``.  ``time_index``
+    fits a subset of timepoints (``design`` already sliced to it) without
+    copying ``data``: the slice is taken per chunk.
     """
     if method not in SELECTION_METHODS:
         raise ValueError(f"method must be one of {SELECTION_METHODS}, got {method!r}")
@@ -190,7 +193,8 @@ def fit_smooth_basis(
     s = torch.as_tensor(spec.s, dtype=torch.float64, device=device)
     w = torch.as_tensor(spec.w, dtype=torch.float64, device=device)
 
-    n_vox, n_t = data.shape
+    n_vox = data.shape[0]
+    n_t = design.shape[0]
     if chunk_size is None:
         chunk_size = estimate_chunk_size(
             n_vox, n_t, n_task + int(log_grid.numel()), device, operation="glm"
@@ -208,7 +212,8 @@ def fit_smooth_basis(
         disable=not verbose or len(starts) < 2,
     ):
         b = min(a + chunk_size, n_vox)
-        y = data[a:b].to(device=device, dtype=torch.float32)
+        y = data[a:b] if time_index is None else data[a:b][:, time_index]
+        y = y.to(device=device, dtype=torch.float32)
         y_t = y - (y @ q) @ q.T if q.shape[1] else y
         z = (y_t @ g).double()
         z2 = z * z
@@ -227,3 +232,72 @@ def fit_smooth_basis(
         out_edf[a:b] = ((1.0 - s)[None, :] * d).sum(dim=1).float().cpu()
         out_r2[a:b] = cod_from_ss_residual(y, rss.float()).cpu()
     return SmoothBasisFit(betas=out_b, lam=out_lam, edf=out_edf, r2=out_r2, method=method)
+
+
+def loro_r2_smooth(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    penalty: np.ndarray,
+    run_starts: list[int],
+    *,
+    method: str = "reml",
+    lam: float | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> torch.Tensor | None:
+    """Leave-one-run-out COD of the penalized fit, lambda re-chosen in every fold.
+
+    Each held-out run is predicted from betas fitted (and smoothed) on the
+    other runs; its nuisance is projected fold-locally from the held-out run
+    alone, never from the full series ([[LORO cross-validation]]).  One COD
+    per voxel over the concatenated held-out series, as ``compute_xval_r2``.
+    ``None`` with fewer than two runs.
+    """
+    n_vox, n_t = data.shape
+    bounds = list(run_starts) + [n_t]
+    if len(run_starts) < 2:
+        return None
+    device = device if device is not None else torch.device("cpu")
+    design64 = design.detach().cpu().double()
+    ss_res = torch.zeros(n_vox, dtype=torch.float64)
+    total = torch.zeros(n_vox, dtype=torch.float64)
+    total_sq = torch.zeros(n_vox, dtype=torch.float64)
+    n_total = 0
+    chunk = estimate_chunk_size(n_vox, n_t, n_task, device, operation="glm")
+    folds = range(len(run_starts))
+    for r in tqdm(folds, desc="  LORO (smoothed)", unit="fold", leave=True, disable=not verbose):
+        test = torch.arange(bounds[r], bounds[r + 1])
+        train = torch.cat([torch.arange(0, bounds[r]), torch.arange(bounds[r + 1], n_t)])
+        fit = fit_smooth_basis(
+            data,
+            design64[train],
+            n_task,
+            penalty,
+            method=method,
+            lam=lam,
+            device=device,
+            time_index=train,
+        )
+        x_test = design64[test, :n_task].numpy()
+        nuis = design64[test, n_task:].numpy()
+        nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
+        q = np.zeros((test.numel(), 0))
+        if nuis.shape[1]:
+            u, sv, _ = np.linalg.svd(nuis, full_matrices=False)
+            q = u[:, sv > sv.max() * 1e-10]
+            x_test = x_test - q @ (q.T @ x_test)
+        q_t = torch.as_tensor(q, dtype=torch.float64, device=device)
+        x_t = torch.as_tensor(x_test, dtype=torch.float64, device=device)
+        for a in range(0, n_vox, chunk):
+            b = min(a + chunk, n_vox)
+            y = data[a:b][:, test].to(device=device, dtype=torch.float64)
+            if q_t.shape[1]:
+                y = y - (y @ q_t) @ q_t.T
+            pred = fit.betas[a:b].to(device=device, dtype=torch.float64) @ x_t.T
+            ss_res[a:b] += ((y - pred) ** 2).sum(dim=1).cpu()
+            total[a:b] += y.sum(dim=1).cpu()
+            total_sq[a:b] += (y * y).sum(dim=1).cpu()
+        n_total += test.numel()
+    ss_tot = (total_sq - total * total / n_total).clamp_min(1e-30)
+    return (1.0 - ss_res / ss_tot).float()
