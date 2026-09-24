@@ -161,3 +161,58 @@ def test_loro_rule_with_two_penalties_writes_the_choice_map(monkeypatch, tmp_pat
     assert "Penalty chosen by held-out runs" in out and "optimistically biased" in out
     choice = nib.load(f"{prefix}_smooth_penalty.nii.gz").get_fdata()
     assert set(np.unique(choice)) <= {0.0, 1.0}
+
+
+def test_pool_conditions_fits_one_average_response(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    rows = (tmp_path / "stim.1D").read_text().splitlines()
+    half = [" ".join(r.split()[::2]) for r in rows]
+    other = [" ".join(r.split()[1::2]) for r in rows]
+    (tmp_path / "a.1D").write_text("\n".join(half) + "\n")
+    (tmp_path / "b.1D").write_text("\n".join(other) + "\n")
+    prefix = str(tmp_path / "pool")
+    argv = [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        str(tmp_path / "a.1D"),
+        str(tmp_path / "b.1D"),
+        "-model",
+        "TENT",
+        "-window",
+        "1",
+        "17",
+        "-tent-n-basis",
+        "9",
+        "-prefix",
+        prefix,
+        "-device",
+        "cpu",
+        "-verb",
+        "1",
+        "-pool-conditions",
+        "face",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    assert "Pooled every condition into 'face' (42 events)" in capsys.readouterr().out
+    assert nib.load(f"{prefix}_iresp_face.nii.gz").shape[-1] == 9
+    assert not list(tmp_path.glob("pool_iresp_a*"))
+
+
+def test_pool_timing_merges_runs_and_keeps_the_longest_duration():
+    from fastfuncstuff.cli_utils import TimingSpec, pool_timing
+
+    timing = TimingSpec(
+        all_onsets=[[np.array([5.0, 1.0]), np.array([3.0])], [np.array([2.0]), np.array([])]],
+        durations=[1.0, 2.0],
+        condition_labels=["a", "b"],
+        from_events=True,
+    )
+    pooled, note = pool_timing(timing, "all")
+    assert pooled.condition_labels == ["all"] and pooled.durations == [2.0]
+    assert [o.tolist() for o in pooled.all_onsets[0]] == [[1.0, 2.0, 5.0], [3.0]]
+    assert note is not None and "2 s" in note

@@ -2619,6 +2619,36 @@ class TimingSpec:
         return len(self.condition_labels)
 
 
+def pool_timing(timing: TimingSpec, label: str = "all") -> tuple[TimingSpec, str | None]:
+    """Every condition's events as ONE condition: the average event response.
+
+    Onsets merge (sorted) run by run.  Durations that differ across conditions
+    cannot all be kept, so the longest wins -- it sets the response window --
+    and the returned note says so; ``None`` when nothing was lost.
+    """
+    import dataclasses
+
+    n_runs = len(timing.all_onsets[0]) if timing.all_onsets else 0
+    merged = [
+        np.sort(np.concatenate([np.asarray(c[r], dtype=np.float64) for c in timing.all_onsets]))
+        for r in range(n_runs)
+    ]
+    durations = sorted(set(float(d) for d in timing.durations))
+    note = None
+    if timing.durations_given and len(durations) > 1:
+        note = (
+            f"pooled conditions have durations {durations} s; the pooled condition "
+            f"uses the longest ({durations[-1]:g} s)"
+        )
+    pooled = dataclasses.replace(
+        timing,
+        all_onsets=[merged],
+        durations=[durations[-1] if durations else 0.0],
+        condition_labels=[label],
+    )
+    return pooled, note
+
+
 def add_event_filter_arguments(parser_or_group) -> None:
     """Register ``-event_filter_in`` / ``-event_filter_out COLUMN VALUE [VALUE ...]``."""
     for action, verb in (("in", "keep only"), ("out", "drop")):

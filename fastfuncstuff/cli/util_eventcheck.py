@@ -25,6 +25,7 @@ from fastfuncstuff.cli_utils import (
     add_microtime_offset_arg,
     parse_input_files,
     parse_timing_spec,
+    pool_timing,
     resolve_microtime_offset,
 )
 from fastfuncstuff.design.event_timing import (
@@ -96,6 +97,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
     add_microtime_offset_arg(runs)
     model = parser.add_argument_group("Response model")
+    model.add_argument(
+        "-pool_conditions",
+        nargs="?",
+        const="all",
+        default=None,
+        metavar="LABEL",
+        help="Treat every condition as one (the average event response).",
+    )
     model.add_argument(
         "-window",
         nargs=2,
@@ -290,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
             allow_missing_durations=True,
         )
         offset = resolve_microtime_offset(args.microtime_offset, input_files, tr, verbose=False)
+        if args.pool_conditions is not None:
+            timing, _ = pool_timing(timing, args.pool_conditions)
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

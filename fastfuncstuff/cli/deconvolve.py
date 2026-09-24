@@ -83,6 +83,7 @@ try:
         parse_input_files,
         parse_prefix,
         parse_timing_spec,
+        pool_timing,
         preflight_check,
         print_cli_header,
         resolve_microtime_offset,
@@ -524,6 +525,16 @@ def parse_args():
         "(the choice is written to <prefix>_smooth_penalty, 0-based in the order "
         "given): -tent-smooth reml -smooth-penalty diff2,gp:4 picks each "
         "penalty's lambda by REML and the penalty by held-out runs.",
+    )
+    model_opts.add_argument(
+        "-pool-conditions",
+        nargs="?",
+        const="all",
+        default=None,
+        metavar="LABEL",
+        help="Model every condition's events as ONE condition (named LABEL, default "
+        "'all'): the average response to an event, one curve per task, without "
+        "editing the events files. Differing durations: the longest is used.",
     )
     add_microtime_offset_arg(model_opts)
 
@@ -1010,6 +1021,14 @@ def main():
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    if args.pool_conditions is not None:
+        timing, pool_note = pool_timing(timing, args.pool_conditions)
+        if args.verb >= 1:
+            n_ev = sum(np.asarray(o).size for o in timing.all_onsets[0])
+            print(f"  Pooled every condition into '{args.pool_conditions}' ({n_ev} events)")
+        if pool_note:
+            print(f"  note: {pool_note}")
 
     n_conditions = timing.n_conditions
     # Stimulus durations drive auto-window estimation; None means "not known",
