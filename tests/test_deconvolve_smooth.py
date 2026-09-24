@@ -90,3 +90,38 @@ def test_plain_tent_warns_that_mid_tr_timing_is_singular(monkeypatch, tmp_path, 
     monkeypatch.setattr(sys, "argv", argv)
     assert deconvolve.main() == 0
     assert "SINGULAR" in capsys.readouterr().err
+
+
+def test_explicit_window_is_not_snapped_so_aligned_knots_stay_on_the_samples(
+    monkeypatch, tmp_path, capsys
+):
+    """-window 1 17 at TR 2 used to become 1-16 (round(8.5) == 8), knocking the
+    knots aligned to mid-TR samples off them again."""
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    argv = [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        timing,
+        "-model",
+        "TENT",
+        "-window",
+        "1",
+        "17",
+        "-tent-n-basis",
+        "9",
+        "-prefix",
+        str(tmp_path / "al"),
+        "-device",
+        "cpu",
+        "-verb",
+        "1",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    captured = capsys.readouterr()
+    assert "1.0s–17.0s" in captured.out
+    assert "SINGULAR" not in captured.err

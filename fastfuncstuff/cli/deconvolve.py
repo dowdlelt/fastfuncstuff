@@ -1502,12 +1502,21 @@ def main():
     else:
         add_lag_list = [0] * n_conditions
 
-    def _apply_add_lag(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        """Adjust per-condition (bot, top) windows by add_lag (TR units)."""
+    def _apply_add_lag(
+        windows: list[tuple[float, float]], snap: bool = True
+    ) -> list[tuple[float, float]]:
+        """Adjust per-condition (bot, top) windows by add_lag (TR units).
+
+        ``snap`` rounds derived windows onto whole TRs so their knots land on
+        the TR grid.  An explicit -window is the user's knot placement (e.g.
+        knots aligned to off-grid samples) and is never moved, only extended.
+        """
         result = []
         for (bot, top), lag in zip(windows, add_lag_list, strict=False):
-            n_trs = max(1, round(top / tr) + lag)
-            result.append((bot, float(n_trs) * tr))
+            if snap:
+                result.append((bot, float(max(1, round(top / tr) + lag)) * tr))
+            else:
+                result.append((bot, top + lag * tr))
         return result
 
     # Priority: 1) explicit -window, 2) auto from condition_durations, 3) -duration fallback
@@ -1518,7 +1527,7 @@ def main():
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
-        tent_windows = _apply_add_lag(tent_windows)
+        tent_windows = _apply_add_lag(tent_windows, snap=False)
         window_source = "explicit -window"
 
     elif condition_durations is not None:
