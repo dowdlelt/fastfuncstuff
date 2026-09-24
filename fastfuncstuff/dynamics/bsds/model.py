@@ -636,7 +636,7 @@ def decode(
     viterbi = [hmm.viterbi(lo, trans, init) for lo in log_obs]
     return DecodeResult(
         n_states=g.n_states,
-        responsibilities=gammas,
-        viterbi_states=viterbi,
+        responsibilities=[r.cpu() for r in gammas],
+        viterbi_states=[v.cpu() for v in viterbi],
         loglik=float(loglik),
     )

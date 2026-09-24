@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.dynamics.bsds.model import fit_bsds
@@ -225,6 +226,22 @@ def test_decode_reproduces_training_and_generalizes():
     assert dec_h.responsibilities[0].shape == (sessions[2].shape[1], k)
     acc, _ = _best_accuracy(dec_h.viterbi_states[0].numpy(), true_states[2], k)
     assert acc > 0.8, f"held-out decode accuracy too low: {acc:.3f}"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_decode_returns_host_tensors_like_fit():
+    """A GPU fit hands back CPU paths; decode used to hand back CUDA ones, so the
+    same ``.numpy()`` that works on the fit broke on the decode."""
+    from fastfuncstuff.dynamics.bsds.model import decode
+
+    sessions, _, _, _ = _simulate(k=3, d=6, n_sessions=2, t=200, seed=1)
+    model = fit_bsds(
+        sessions, n_states=3, max_ldim=3, n_init=2, n_iter=20, device=torch.device("cuda")
+    )
+    dec = decode(model, sessions[:1])
+    assert dec.viterbi_states[0].device.type == "cpu"
+    assert dec.responsibilities[0].device.type == "cpu"
 
 
 def test_fit_bsds_auto_ldim():
