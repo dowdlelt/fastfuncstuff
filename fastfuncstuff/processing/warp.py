@@ -79,7 +79,7 @@ from .optimizer import (
     optimize_warp_params_gauss_newton,
     optimize_warp_params_torch,
 )
-from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
+from .penalty import compute_hexahedron_energy, compute_penalty_batched, penalty_energy
 from .weight import _thd_cliplevel, compute_weight_image
 
 try:
@@ -2269,7 +2269,7 @@ def _improve_warp_batched(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
+            je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
             energy_global = penalty_energy(je_global, se_global)
             global_energy_sum = energy_global.sum()
             # Per-patch energy sums via the same summed-area table _filter_patches
@@ -2770,7 +2770,7 @@ def _improve_warp_batched_multi(
         with torch.no_grad():
             for a in range(Na):
                 v = int(active_idx[a])
-                je, se = compute_jacobian_energy(
+                je, se = compute_hexahedron_energy(
                     mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
                 )
                 energy = penalty_energy(je, se).reshape(-1)
@@ -3968,7 +3968,7 @@ def _improve_warp_batched_mescaled(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_g, se_g = compute_jacobian_energy(state.xd, state.yd, state.zd)
+            je_g, se_g = compute_hexahedron_energy(state.xd, state.yd, state.zd)
             energy_g = penalty_energy(je_g, se_g).reshape(-1)
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
@@ -4554,7 +4554,7 @@ def _improve_warp_serial(
 
     pen_external = 0.0
     if use_penalty:
-        je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
+        je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
         je_ext = je_global.clone()
         se_ext = se_global.clone()
         je_ext[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = 0.0

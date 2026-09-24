@@ -8,7 +8,7 @@ from fastfuncstuff.processing.cost import (
     pearson_correlation,
 )
 from fastfuncstuff.processing.penalty import (
-    compute_jacobian_energy,
+    compute_hexahedron_energy,
     compute_penalty,
     compute_penalty_batched,
 )
@@ -87,7 +87,7 @@ class TestPenalty:
         xd = torch.zeros(5, 5, 5)
         yd = torch.zeros(5, 5, 5)
         zd = torch.zeros(5, 5, 5)
-        je, se = compute_jacobian_energy(xd, yd, zd)
+        je, se = compute_hexahedron_energy(xd, yd, zd)
         assert je.max().item() == pytest.approx(0.0, abs=1e-6)
         assert se.max().item() == pytest.approx(0.0, abs=1e-6)
 
@@ -104,6 +104,31 @@ class TestPenalty:
         zd = torch.randn(5, 5, 5) * 0.5
         p = compute_penalty(xd, yd, zd)
         assert p > 0.0
+
+    def test_isotropic_scaling_matches_afni_hexahedron_energy(self):
+        n = 6
+        z, y, x = torch.meshgrid(torch.arange(n), torch.arange(n), torch.arange(n), indexing="ij")
+        scale = 0.5
+        xd = (scale - 1.0) * x.float()
+        yd = (scale - 1.0) * y.float()
+        zd = (scale - 1.0) * z.float()
+        je, se = compute_hexahedron_energy(xd, yd, zd)
+
+        det = scale**3
+        expected_bulk = (1.0 / 3.0) * (det - 1.0 / det) ** 2
+        interior = (slice(None, -1),) * 3
+        torch.testing.assert_close(
+            je[interior], torch.full_like(je[interior], expected_bulk), rtol=1e-6, atol=1e-6
+        )
+        torch.testing.assert_close(se[interior], torch.zeros_like(se[interior]), atol=1e-6, rtol=0)
+
+    def test_compression_below_half_is_penalized(self):
+        """The old (J-1)^2 energy left near-collapse inside the deadband."""
+        n = 6
+        z, y, x = torch.meshgrid(torch.arange(n), torch.arange(n), torch.arange(n), indexing="ij")
+        scale = 0.4
+        fields = tuple((scale - 1.0) * v.float() for v in (x, y, z))
+        assert compute_penalty(*fields, pen_fac=0.033) > 0.0
 
     def test_penalty_batched_zero(self):
         B = 3
