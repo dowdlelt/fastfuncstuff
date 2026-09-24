@@ -98,7 +98,7 @@ them together rather than substituting one for another:
                          level as lev^0.333 (capped at 3.21x), so it bites hardest
                          at the fine levels.
   -penalty_first_level 3 Levels below this run unpenalized (half strength at N).
-  -hfactor_q 0.5         Shrinks the per-patch displacement bound as patches get
+  -hfactor_q 1.0         Shrinks the per-patch displacement bound as patches get
                          small. This, not -penfac, is what stops fine-scale
                          rippling. 1.0 disables it.
 
@@ -126,7 +126,7 @@ NOT ENOUGH WARP (structures still visibly misaligned)
 
 TOO MUCH WARP (anatomy distorted, ripples, folding)
 ---------------------------------------------------
-  * High-frequency ripple at the finest scale: lower -hfactor_q (0.5 -> 0.3) and/or
+  * High-frequency ripple at the finest scale: lower -hfactor_q (1.0 -> 0.5) and/or
     raise -minpatch. This is the fine-level regime; -penfac helps less here.
   * Broad implausible deformation: raise -penfac (0.033 -> 0.1+), lower
     -penalty_first_level (3 -> 1) so the penalty engages earlier, cap with
@@ -871,14 +871,15 @@ def parse_args(
     )
     g_opt.add_argument(
         "-hfactor_q",
+        "-warpscale",
         type=float,
-        default=0.5,
+        default=QwarpConfig().hfactor_q,
         metavar="Q",
         help="AFNI-style Hfactor scaling on per-patch displacement bound. "
         "At the lev=1 (coarsest) patch size hfactor=1.0; at finer "
-        "patches it shrinks toward Q, tightening param_max. This "
-        "is AFNI's primary defense against fine-scale rippling. "
-        "1.0 disables the mechanism. Range: 0.1-1.0 "
+        "patches it shrinks toward Q, tightening param_max. "
+        "1.0 disables the mechanism, matching AFNI's default; "
+        "-warpscale is an AFNI-compatible alias. Range: 0.1-1.0 "
         "[default: %(default)s]",
     )
 
@@ -920,6 +921,8 @@ def parse_args(
         p.error("-blur accepts one or two values")
     if args.pblur is not None and len(args.pblur) > 2:
         p.error("-pblur accepts zero, one, or two values")
+    if not 0.1 <= args.hfactor_q <= 1.0:
+        p.error("-hfactor_q/-warpscale must be in [0.1, 1.0]")
     # After parsing, so that "did the user type this flag" is answerable from
     # argv rather than guessed by comparing values against defaults.
     apply_recipe_preset(

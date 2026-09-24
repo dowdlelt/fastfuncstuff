@@ -333,12 +333,11 @@ class QwarpConfig:
     larger budget than the per-phase fine patches. CPU still uses the serial
     derivative-free optimizer (no launch overhead to amortize there)."""
 
-    hfactor_q: float = 0.5
+    hfactor_q: float = 1.0
     """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
     Hfactor=1.0, and as patches shrink Hfactor decreases toward hfactor_q.
-    This tightens the per-patch displacement bound at deep levels, which is
-    AFNI's primary defense against high-frequency over-warping. 1.0 disables
-    the mechanism. Range [0.1, 1.0]."""
+    Values below 1 tighten the per-patch displacement bound at deep levels;
+    AFNI's default 1.0 disables the mechanism. Range [0.1, 1.0]."""
 
     maxdisp: float = 0.0
     """Maximum allowed displacement in voxels. 0 = no limit (default).
@@ -1027,7 +1026,7 @@ def _get_basis_config(
     return basis, half_widths, param_max
 
 
-def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 0.5) -> float:
+def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 1.0) -> float:
     """AFNI-style Hfactor scaling on param_max.
 
     AFNI's Hfactor_from_patchsize_ratio uses prat = psize / psize0 where

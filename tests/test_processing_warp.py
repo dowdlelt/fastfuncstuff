@@ -143,7 +143,7 @@ class TestQwarpConfig:
         assert cfg.verb == 1
         assert cfg.batch_optimizer_lr == pytest.approx(0.008)
         assert cfg.batch_optimizer_iters == 60
-        assert cfg.hfactor_q == 0.5
+        assert cfg.hfactor_q == 1.0
         assert cfg.maxdisp == 0.0
         assert cfg.lpa_sigma == 4.0
         assert cfg.lpa_kernel == "gauss"

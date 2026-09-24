@@ -686,6 +686,17 @@ def test_qwarp_blur_options_accept_afni_forms():
         parse_args(["-pblur", "0.01", "0.02", "0.03"])
 
 
+def test_qwarp_warpscale_matches_afni_default_and_alias():
+    from fastfuncstuff.cli.qwarp import parse_args
+
+    assert parse_args([]).hfactor_q == pytest.approx(1.0)
+    assert parse_args(["-warpscale", "0.5"]).hfactor_q == pytest.approx(0.5)
+    assert parse_args(["-hfactor_q", "0.7"]).hfactor_q == pytest.approx(0.7)
+
+    with pytest.raises(SystemExit):
+        parse_args(["-warpscale", "0.05"])
+
+
 # --------------------------------------------------------------------------
 # Outer flags are per-run defaults
 # --------------------------------------------------------------------------
