@@ -2208,6 +2208,7 @@ def _fit_voxelwise_hrf_single_trial(
     device: torch.device,
     verbose: bool = False,
     stim_vec_blocks: list | None = None,
+    microtime_onset: int = 0,
 ) -> GLMResults:
     """
     Fit single-trial GLM with per-voxel optimal HRFs, grouped by HRF for efficiency.
@@ -2280,6 +2281,7 @@ def _fit_voxelwise_hrf_single_trial(
             microtime_dt=microtime_dt,
             condition_labels=condition_labels,
             device="cpu",  # Create on CPU to save GPU memory
+            microtime_onset=microtime_onset,
         )
     )
     n_trials = len(trial_labels)
@@ -2322,6 +2324,7 @@ def _fit_voxelwise_hrf_single_trial(
             condition_labels=condition_labels,
             hrf_library=[hrf],  # Convolve with this HRF
             device=device,
+            microtime_onset=microtime_onset,
         )
         # st_design is (n_timepoints, n_trials) for this HRF
         # Stim vectors ride along after the trials; the beta extraction below
@@ -2335,6 +2338,7 @@ def _fit_voxelwise_hrf_single_trial(
             microtime_dt=microtime_dt,
             run_starts=run_starts,
             device=device,
+            microtime_onset=microtime_onset,
         )
 
         # Build full design: [single_trial | nuisance] so drift is modeled

@@ -82,6 +82,7 @@ try:
     from fastfuncstuff.cli_utils import (
         add_device_arg,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
@@ -89,10 +90,12 @@ try:
         apply_trim_to_timing,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        microtime_offset_bins,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         setup_device,
         trim_spec_from_args,
@@ -976,6 +979,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-run polynomial drift order.  None → auto from run duration.",
     )
+    add_microtime_offset_arg(proc)
     add_device_arg(proc, default="auto")
     proc.add_argument(
         "-debug-design",
@@ -1547,6 +1551,7 @@ def _build_block_bases(
 
 def _shape_readout(
     *,
+    microtime_offset: float = 0.0,
     n_deriv: int,
     betas_ols: np.ndarray,
     per_run_designs: list[np.ndarray],
@@ -1614,6 +1619,7 @@ def _shape_readout(
                 tr=tr,
                 n_timepoints_per_run=n_tp_per_run,
                 basis=basis_mode,
+                microtime_offset=microtime_offset,
             ),
             axis=0,
         ).astype(np.float64)
@@ -1637,6 +1643,7 @@ def _shape_readout(
 
 def _fit_shape_groups(
     *,
+    microtime_offset: float = 0.0,
     hrf_index: np.ndarray,
     shapes: np.ndarray,
     n_basis: int,
@@ -1698,6 +1705,7 @@ def _fit_shape_groups(
                     tr=tr,
                     n_timepoints_per_run=[n_tp_per_run[r]],
                     basis=basis_mode,
+                    microtime_offset=microtime_offset,
                 )[0]
                 for b in range(n_blocks)
             ]
@@ -1735,6 +1743,7 @@ def _fit_shape_groups(
 
 def _select_hrf_per_voxel(
     *,
+    microtime_offset: float = 0.0,
     shapes: np.ndarray,
     per_run_data: list[torch.Tensor],
     all_onsets: list[list[np.ndarray]],
@@ -1795,6 +1804,7 @@ def _select_hrf_per_voxel(
         # own derivative basis, so the engine's own full refit is discarded.
         skip_final_fit=True,
         event_onsets=all_onsets,
+        microtime_onset=microtime_offset_bins(microtime_offset, tr, dt),
     )
     idx = res.hrf_index.detach().cpu().numpy().astype(np.int64)
     score = res.xval_r2_best.detach().cpu().numpy().astype(np.float32)
@@ -2552,6 +2562,14 @@ def main() -> int:
     # -flobs-dt is both the HRF sampling grid and the convolution grid here,
     # so snapping it keeps the curves and the design on the same bins.
     args.flobs_dt = resolve_microtime_dt(args.tr, args.flobs_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, list(input_files), args.tr
+        )
+        microtime_offset_bins(args.microtime_offset, args.tr, args.flobs_dt)  # validate
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Shift timing onto the retained window before rounding touches the onsets.
     trim = trim_spec_from_args(args, tr=tr)
@@ -2566,7 +2584,9 @@ def main() -> int:
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 
-        all_onsets = _round_onsets(all_onsets, tr, threshold=args.round_onsets)
+        all_onsets = _round_onsets(
+            all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+        )
         print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f}).")
 
     print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
@@ -2852,6 +2872,7 @@ def main() -> int:
                 tr=tr,
                 n_timepoints_per_run=[n_tp_per_run[r]],
                 basis=basis_mode,
+                microtime_offset=args.microtime_offset,
             )
             block_designs.append(bd[0])
         concat = np.concatenate(block_designs, axis=1).astype(np.float32)
@@ -2926,6 +2947,7 @@ def main() -> int:
                         tr=tr,
                         n_timepoints_per_run=[n_tp_per_run[r]],
                         basis=basis_mode,
+                        microtime_offset=args.microtime_offset,
                     )
                     cond_blocks.append(bd[0])
                 pc_concat = np.concatenate(cond_blocks, axis=1).astype(np.float32)
@@ -3145,6 +3167,7 @@ def main() -> int:
                     select_mode=args.hrf_select,
                     device=device,
                     verbose=args.verb >= 1,
+                    microtime_offset=args.microtime_offset,
                 )
             occupied = np.bincount(hrf_index, minlength=hrf_shapes.shape[0])
             print(
@@ -3591,6 +3614,7 @@ def main() -> int:
             tr=tr,
             n_tp_per_run=n_tp_per_run,
             fit_one=_fit_one,
+            microtime_offset=args.microtime_offset,
         )
         print(
             f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
@@ -3764,6 +3788,7 @@ def main() -> int:
                 if str(args.hrf).strip().lower() == "canonical"
                 else _resolve_shift_hrf(args.hrf, basis.dt, basis.duration),
                 **readout_kw,
+                microtime_offset=args.microtime_offset,
             )
         else:
             # The ratio a given latency produces depends on the curve the
@@ -3787,6 +3812,7 @@ def main() -> int:
                     per_run_designs=group_designs[k],
                     base_hrf=hrf_shapes[k],
                     **readout_kw,
+                    microtime_offset=args.microtime_offset,
                 )
                 for b in range(n_blocks):
                     for key in keys:

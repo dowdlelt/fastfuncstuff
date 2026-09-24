@@ -54,6 +54,7 @@ try:
         add_device_arg,
         add_hrf_library_args,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_trim_args,
         add_verbose_arg,
@@ -63,10 +64,12 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        microtime_offset_bins,
         parse_cv_strategy,
         parse_prefix,
         preflight_check,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         save_4d_nifti,
         save_r2_ceiling_stack,
@@ -347,6 +350,7 @@ Notes:
         "SPMG3 = canonical + time + dispersion derivatives (3 basis per trial). "
         "NOTE: FIR/TENT not supported in single-trial mode - use 3dDenoisefast instead.",
     )
+    add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-chunk_size",
@@ -500,6 +504,15 @@ def main():
     # shrink of *data* can actually free the pre-mask copy.
     del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, list(input_files), args.tr
+        )
+        microtime_onset_bin = microtime_offset_bins(
+            args.microtime_offset, args.tr, args.microtime_dt
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     # Shift event timing to the retained window before anything else touches the
     # onsets (rounding below included) -- see design/trim.py.
@@ -519,7 +532,9 @@ def main():
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 
-        all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
+        all_onsets = _round_onsets(
+            all_onsets, args.tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+        )
 
     # ========================================================================
     # 4. HRF model args and validation
@@ -649,6 +664,7 @@ def main():
             device=device,
             hrf_model_name=hrf_model_name,
             n_basis=n_basis,
+            microtime_onset=microtime_onset_bin,
         )
     )
 
@@ -794,6 +810,7 @@ def main():
                 hrf_bases=bases,
                 run_starts=run_starts,
                 device=device,
+                microtime_onset=microtime_onset_bin,
             )
             return vec
 

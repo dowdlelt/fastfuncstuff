@@ -1157,6 +1157,7 @@ def build_pc_basis_design_per_run(
     tr: float,
     n_timepoints_per_run: list[int],
     basis: str = "FIR",
+    microtime_offset: float = 0.0,
 ) -> list[np.ndarray]:
     """Build per-run PC-basis design (for NSD's refit step).
 
@@ -1193,6 +1194,9 @@ def build_pc_basis_design_per_run(
     basis : {"FIR", "TENT", "TENTzero"}
         Whether onsets should be quantized to TR (FIR) or evaluated at
         the exact onset time (TENT family).
+    microtime_offset : float, default 0.0
+        Within-TR sample time (s): sample ``n`` sits at ``n * tr + offset``
+        (see :func:`fastfuncstuff.design.matrices.make_tent_design`).
 
     Returns
     -------
@@ -1226,7 +1230,7 @@ def build_pc_basis_design_per_run(
             designs.append(block)
             continue
 
-        tr_times = np.arange(n_run_tp, dtype=np.float64) * tr
+        tr_times = np.arange(n_run_tp, dtype=np.float64) * tr + microtime_offset
 
         if basis == "FIR":
             # TR-locked path: round onsets to nearest TR, then convolve
@@ -1235,7 +1239,7 @@ def build_pc_basis_design_per_run(
             # already TR-spaced when basis="FIR", but they may not start
             # at exactly 0 or be precisely tr-spaced; interpolate to be
             # safe).
-            idx = np.round(onset_times / tr).astype(int)
+            idx = np.round((onset_times - microtime_offset) / tr).astype(int)
             idx = idx[(idx >= 0) & (idx < n_run_tp)]
             onset_vec = np.zeros(n_run_tp, dtype=np.float64)
             onset_vec[idx] = 1.0

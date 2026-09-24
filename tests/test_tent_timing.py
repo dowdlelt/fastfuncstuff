@@ -206,3 +206,38 @@ def test_resolve_microtime_offset_prefers_flag_then_header(tmp_path):
     assert resolve_microtime_offset(0.0, [a], 2.0, verbose=False) == 0.0
     with pytest.raises(ValueError, match="different sample times"):
         resolve_microtime_offset(None, [a, plain], 2.0, verbose=False)
+
+
+def test_pc_basis_design_offset_equals_shifting_onsets_earlier():
+    from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+
+    lags = np.arange(0, 16, 0.5)
+    pcs = np.stack([np.exp(-0.5 * ((lags - 6) / 2) ** 2), np.sin(lags / 3)])
+    onsets = [np.array([3.3, 21.7, 40.1])]
+    for basis in ("TENT", "FIR"):
+        a = build_pc_basis_design_per_run(
+            onsets, pcs, lags, 2.0, [40], basis=basis, microtime_offset=1.0
+        )
+        b = build_pc_basis_design_per_run([onsets[0] - 1.0], pcs, lags, 2.0, [40], basis=basis)
+        np.testing.assert_allclose(a[0], b[0], atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("module", "builder"),
+    [
+        ("deconvolve", "parse_args"),
+        ("reml", "create_parser"),
+        ("denoise", "create_parser"),
+        ("denoisatorial", "create_parser"),
+        ("hrfopt", "create_parser"),
+        ("ridge", "create_parser"),
+        ("librarian", "create_parser"),
+        ("fitbasis", "create_parser"),
+        ("util_eventcheck", "create_parser"),
+    ],
+)
+def test_every_event_glm_tool_takes_microtime_offset(module, builder):
+    import importlib
+
+    parser = getattr(importlib.import_module(f"fastfuncstuff.cli.{module}"), builder)()
+    assert "-microtime_offset" in parser._option_string_actions

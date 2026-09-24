@@ -58,6 +58,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
@@ -69,6 +70,7 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         spinner,
         trim_spec_from_args,
@@ -268,6 +270,7 @@ Notes:
             "with -events."
         ),
     )
+    add_microtime_offset_arg(onset_grp)
     onset_grp.add_argument(
         "-round-onsets",
         nargs="?",
@@ -2063,6 +2066,10 @@ def main() -> None:
     del load_result
     if args.tr is None:
         args.tr = tr
+    try:
+        args.microtime_offset = resolve_microtime_offset(args.microtime_offset, input_files, tr)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     if args.automask:
         data, _, mask_flat, n_voxels = apply_automask(
@@ -2092,7 +2099,9 @@ def main() -> None:
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 
-        all_onsets = _round_onsets(all_onsets, tr, threshold=args.round_onsets)
+        all_onsets = _round_onsets(
+            all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+        )
         print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f} of TR).")
 
     # --- Pool onsets per group ------------------------------------------------
@@ -2132,6 +2141,7 @@ def main() -> None:
         fir_window_min_s=float(args.fir_duration_min),
         tr_locked_threshold=0.1,
         device=device,
+        microtime_offset=args.microtime_offset,
     )
     for note in design_result.notes:
         print(f"  {note}")
@@ -2499,6 +2509,7 @@ def main() -> None:
             tr=tr,
             n_timepoints_per_run=n_tp_per_run_local,
             basis=args.basis,
+            microtime_offset=args.microtime_offset,
         )
         pc_designs_torch = [
             torch.from_numpy(d.astype(np.float32)).to(device) for d in pc_designs_np

@@ -45,6 +45,7 @@ try:
         add_device_arg,
         add_hrf_library_args,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
@@ -58,12 +59,14 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        microtime_offset_bins,
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_cv_design,
         resolve_microtime_dt,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         save_r2_ceiling_stack,
         setup_device,
@@ -496,6 +499,7 @@ Notes:
         "'glmsingle' (GLMsingle/nilearn-style double-gamma). "
         "The baseline comparison shows improvement from HRF optimization.",
     )
+    add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
@@ -867,6 +871,15 @@ def main():
     else:
         print(f"  TR (specified): {args.tr}s")
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
+    try:
+        args.microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, input_files, args.tr
+        )
+        microtime_onset_bin = microtime_offset_bins(
+            args.microtime_offset, args.tr, args.microtime_dt
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     print(f"  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")
@@ -894,7 +907,9 @@ def main():
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 
-        all_onsets = _round_onsets(all_onsets, args.tr, threshold=args.round_onsets)
+        all_onsets = _round_onsets(
+            all_onsets, args.tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
+        )
 
     # Build microtime onset matrix
     # This creates a (n_microtime, n_conditions) matrix with boxcar values
@@ -1010,6 +1025,7 @@ def main():
         vif_max=oso_vif_max,
         device=device,
         verbose=args.oso_mode != "off",
+        microtime_onset=microtime_onset_bin,
     )
 
     # One label per task COLUMN for the output writers. condition_labels itself
@@ -1153,6 +1169,7 @@ def main():
                 microtime_dt=args.microtime_dt,
                 condition_labels=condition_labels,
                 device=device,
+                microtime_onset=microtime_onset_bin,
             )
 
             # Stim vectors ride along, convolved with THIS candidate HRF, but
@@ -1169,6 +1186,7 @@ def main():
                 run_starts=run_starts,
                 device=device,
                 verbose=False,
+                microtime_onset=microtime_onset_bin,
             )
 
             # Project nuisance from single-trial design (per-run, matching data projection)
@@ -1369,7 +1387,7 @@ def main():
                 nuisance_design=nuisance_design,
                 tr=tr,
                 microtime_dt=args.microtime_dt,
-                microtime_onset=0,  # Default: sample at start of TR
+                microtime_onset=microtime_onset_bin,
                 device=device,
                 verbose=args.verb >= 1,
                 stim_vec_blocks=stim_vec_blocks,
@@ -1414,6 +1432,7 @@ def main():
             oso_vif_max=oso_vif_max,
             oso_gain=args.oso_gain,
             oso_plan=oso_plan,
+            microtime_onset=microtime_onset_bin,
         )
 
         # ========== -delta_denoise: second pass without ortvec ==========
@@ -1460,6 +1479,7 @@ def main():
                 # across the two passes -- computing it twice would only pay for
                 # a second selection pass to answer the same question.
                 oso_gain=False,
+                microtime_onset=microtime_onset_bin,
             )
 
     if cv_data is not data:
@@ -1496,6 +1516,7 @@ def main():
             device=device,
             verbose=args.verb >= 1,
             stim_vec_blocks=stim_vec_blocks,
+            microtime_onset=microtime_onset_bin,
         )
 
         results.final_results = final_results
