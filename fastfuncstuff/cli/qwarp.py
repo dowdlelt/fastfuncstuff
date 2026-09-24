@@ -98,7 +98,7 @@ them together rather than substituting one for another:
                          level as lev^0.333 (capped at 3.21x), so it bites hardest
                          at the fine levels.
   -penalty_first_level 3 Levels below this run unpenalized (half strength at N).
-  -hfactor_q 0.5         Shrinks the per-patch displacement bound as patches get
+  -hfactor_q 1.0         Shrinks the per-patch displacement bound as patches get
                          small. This, not -penfac, is what stops fine-scale
                          rippling. 1.0 disables it.
 
@@ -126,7 +126,7 @@ NOT ENOUGH WARP (structures still visibly misaligned)
 
 TOO MUCH WARP (anatomy distorted, ripples, folding)
 ---------------------------------------------------
-  * High-frequency ripple at the finest scale: lower -hfactor_q (0.5 -> 0.3) and/or
+  * High-frequency ripple at the finest scale: lower -hfactor_q (1.0 -> 0.5) and/or
     raise -minpatch. This is the fine-level regime; -penfac helps less here.
   * Broad implausible deformation: raise -penfac (0.033 -> 0.1+), lower
     -penalty_first_level (3 -> 1) so the penalty engages earlier, cap with
@@ -134,7 +134,7 @@ TOO MUCH WARP (anatomy distorted, ripples, folding)
   * The last level or two makes things worse: -early_stop rolls back and stops at
     the first level that degrades the global cost (off by default -- AFNI runs every
     level). -maxlev N is the deterministic version once you know where it turns.
-  * Noise being chased: -blur BASE SRC (FWHM mm) or -pblur to blur proportionally
+  * Noise being chased: -blur BASE SRC (FWHM voxels) or -pblur to blur proportionally
     to the patch size at each level.
   * Distortion correction only: turn off the axes that cannot physically move
     (-noXdis/-noZdis for an AP phase encode), or soften with -axweight; with a
@@ -746,20 +746,23 @@ def parse_args(
     )
     g_blur.add_argument(
         "-blur",
-        nargs=2,
+        nargs="+",
         type=float,
         default=None,
-        metavar=("BASE_FWHM", "SRC_FWHM"),
-        help="Gaussian blur FWHM in mm applied to base and source. E.g. -blur 2.0 2.0",
+        metavar="FWHM",
+        help="Registration-only blur FWHM in voxels. One value applies to both base "
+        "and source; two set them separately. Negative values select AFNI's median "
+        "filter [default: 2.345 2.345]",
     )
     g_blur.add_argument(
         "-pblur",
-        nargs=2,
+        nargs="*",
         type=float,
         default=None,
-        metavar=("BASE_FRAC", "SRC_FRAC"),
-        help="Progressive blur: fraction of patch size used as blur FWHM "
-        "at each level. Blur decreases as patches get smaller",
+        metavar="FRACTION",
+        help="Progressive blur fraction of geometric patch width. Zero, one, or two "
+        "values are accepted like AFNI; bare -pblur means 0.09 0.09. Values above "
+        "0.25 are clamped [default: off]",
     )
 
     # ── Weight Image ────────────────────────────────────────────────────
@@ -775,6 +778,17 @@ def parse_args(
         help="3D weight image (same grid as base). Voxels with weight=0 "
         "are ignored. If omitted, a weight mask is auto-generated from "
         "the base image (nonzero voxels)",
+    )
+    g_wt.add_argument(
+        "-background_band",
+        type=int,
+        default=QwarpConfig().background_band,
+        metavar="VOXELS",
+        help="Keep this many voxels of empty background around a skull-stripped "
+        "base in the automatic weight, at the median brain weight, so tissue "
+        "pushed past the template edge costs correlation. 0 disables it (AFNI's "
+        "weight). No effect when the base background is not exactly zero or "
+        "with -useweight/-autoweight [default: %(default)s]",
     )
     g_wt.add_argument(
         "-autoweight",
@@ -868,14 +882,15 @@ def parse_args(
     )
     g_opt.add_argument(
         "-hfactor_q",
+        "-warpscale",
         type=float,
-        default=0.5,
+        default=QwarpConfig().hfactor_q,
         metavar="Q",
         help="AFNI-style Hfactor scaling on per-patch displacement bound. "
         "At the lev=1 (coarsest) patch size hfactor=1.0; at finer "
-        "patches it shrinks toward Q, tightening param_max. This "
-        "is AFNI's primary defense against fine-scale rippling. "
-        "1.0 disables the mechanism. Range: 0.1-1.0 "
+        "patches it shrinks toward Q, tightening param_max. "
+        "1.0 disables the mechanism, matching AFNI's default; "
+        "-warpscale is an AFNI-compatible alias. Range: 0.1-1.0 "
         "[default: %(default)s]",
     )
 
@@ -913,6 +928,14 @@ def parse_args(
     )
 
     args = p.parse_args(argv, namespace or argparse.Namespace())
+    if args.blur is not None and len(args.blur) not in (1, 2):
+        p.error("-blur accepts one or two values")
+    if args.pblur is not None and len(args.pblur) > 2:
+        p.error("-pblur accepts zero, one, or two values")
+    if args.background_band < 0:
+        p.error("-background_band must be non-negative")
+    if not 0.1 <= args.hfactor_q <= 1.0:
+        p.error("-hfactor_q/-warpscale must be in [0.1, 1.0]")
     # After parsing, so that "did the user type this flag" is answerable from
     # argv rather than guessed by comparing values against defaults.
     apply_recipe_preset(
@@ -1859,6 +1882,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         workhard=tuple(args.workhard) if args.workhard else None,
         cost_method=_resolve_cost(args),
         penalty_factor=args.penfac,
+        background_band=args.background_band,
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
         axis_weights=axis_weights,
@@ -1884,10 +1908,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     if args.blur is not None:
         config.blur_base = args.blur[0]
-        config.blur_source = args.blur[1]
+        config.blur_source = args.blur[-1]
     if args.pblur is not None:
-        config.pblur_base = args.pblur[0]
-        config.pblur_source = args.pblur[1]
+        pblur = args.pblur or [0.09]
+        config.pblur_base = min(0.25, max(0.0, pblur[0]))
+        config.pblur_source = min(0.25, max(0.0, pblur[-1]))
 
     # Load motion parameters for dynamic axis weighting
     motion_params = None

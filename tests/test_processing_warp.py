@@ -15,6 +15,7 @@ from fastfuncstuff.processing.warp import (
     QwarpConfig,
     WarpState,
     _autobox,
+    _blur_for_patch,
     _checkerboard_phases,
     _compute_hfactor,
     _compute_support_padding,
@@ -125,8 +126,10 @@ class TestQwarpConfig:
     def test_defaults(self):
         cfg = QwarpConfig()
         assert cfg.minpatch == 25
-        assert cfg.blur_base == 0.0
-        assert cfg.blur_source == 0.0
+        assert cfg.blur_base == pytest.approx(2.345)
+        assert cfg.blur_source == pytest.approx(2.345)
+        assert cfg.pblur_base == 0.0
+        assert cfg.pblur_source == 0.0
         assert cfg.use_quintic is False
         assert cfg.use_lite is True
         assert cfg.cost_method == "pearclp"
@@ -140,7 +143,7 @@ class TestQwarpConfig:
         assert cfg.verb == 1
         assert cfg.batch_optimizer_lr == pytest.approx(0.008)
         assert cfg.batch_optimizer_iters == 60
-        assert cfg.hfactor_q == 0.5
+        assert cfg.hfactor_q == 1.0
         assert cfg.maxdisp == 0.0
         assert cfg.lpa_sigma == 4.0
         assert cfg.lpa_kernel == "gauss"
@@ -148,6 +151,35 @@ class TestQwarpConfig:
         assert cfg.compile is False
         assert cfg.pyramid_factor == 1
         assert cfg.reject_worse_levels is False
+
+    def test_interlevel_warp_is_not_smoothed(self, monkeypatch):
+        """AFNI composes patch updates without blurring the displacement field."""
+        import fastfuncstuff.processing.warp as warp_mod
+        import fastfuncstuff.processing.weight as weight_mod
+
+        def fail_smoothing(*args, **kwargs):
+            raise AssertionError("qwarp smoothed the accumulated warp between levels")
+
+        monkeypatch.setattr(weight_mod, "_gaussian_smooth_3d", fail_smoothing)
+        base = torch.rand(20, 20, 20) + 0.1
+        weight = torch.ones_like(base)
+        warp_mod.qwarp(
+            base,
+            base.clone(),
+            weight=weight,
+            mask=weight.byte(),
+            config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
+                minpatch=9,
+                max_level=1,
+                batch_optimizer_iters_lev0=1,
+                gn_iters=1,
+                verb=0,
+            ),
+            device=torch.device("cpu"),
+            pad=False,
+        )
 
     def test_custom_values(self):
         cfg = QwarpConfig(
@@ -162,6 +194,40 @@ class TestQwarpConfig:
         assert cfg.cost_method == "lpa"
         assert cfg.warp_flags == 3
         assert cfg.axis_weights == (0.5, 1.0, 0.5)
+
+
+class TestRegistrationBlur:
+    def test_progressive_fwhm_matches_afni_quadrature(self, monkeypatch):
+        import fastfuncstuff.processing.weight as weight_mod
+
+        seen = []
+
+        def fake_gaussian(vol, sigma):
+            seen.append(sigma)
+            return vol + 1
+
+        monkeypatch.setattr(weight_mod, "_gaussian_smooth_3d", fake_gaussian)
+        vol = torch.zeros(9, 16, 25)
+        out = _blur_for_patch(vol, 2.0, 0.1, (8, 27, 64))
+        progressive = 0.1 * (8 * 27 * 64) ** (1 / 3)
+        expected_fwhm = math.hypot(2.0, progressive)
+        assert seen == [pytest.approx(expected_fwhm / 2.355)]
+        torch.testing.assert_close(out, vol + 1)
+
+    def test_negative_fixed_blur_selects_median_filter(self, monkeypatch):
+        import fastfuncstuff.processing.weight as weight_mod
+
+        seen = []
+
+        def fake_median(vol, radius):
+            seen.append(radius)
+            return vol + 1
+
+        monkeypatch.setattr(weight_mod, "_median_filter_ball", fake_median)
+        vol = torch.zeros(5, 5, 5)
+        out = _blur_for_patch(vol, -2.0, 0.0, (5, 5, 5))
+        assert seen == [pytest.approx(2.0)]
+        torch.testing.assert_close(out, vol + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -617,16 +683,12 @@ class TestFilterPatches:
 
 
 class TestComputeHfactor:
-    # Signature: _compute_hfactor(patch_size, patch_size_lev1, hfactor_q).
-    # patch_size_lev1 is the COARSEST (level-1) patch size; finer levels
-    # use smaller patch_size, yielding prat<1 and hfactor<1 (tighter bound).
+    # Signature: _compute_hfactor(patch_size, level-0 patch size, hfactor_q).
 
-    def test_at_lev1(self):
-        """At level 1 (patch_size == lev1), hfactor should be 1.0."""
+    def test_at_reference_width(self):
         assert _compute_hfactor(25, 25, 0.5) == pytest.approx(1.0)
 
-    def test_above_lev1_clamps_to_one(self):
-        """patch_size >= patch_size_lev1 clamps hfactor to 1.0."""
+    def test_above_reference_width_clamps_to_one(self):
         assert _compute_hfactor(50, 25, 0.5) == pytest.approx(1.0)
 
     def test_hfactor_q_1(self):
@@ -638,21 +700,26 @@ class TestComputeHfactor:
         assert _compute_hfactor(10, 25, 0.05) == pytest.approx(1.0)
 
     def test_finer_patch_smaller_hfactor(self):
-        """Finer (smaller) patches than lev1 should get smaller hfactor."""
         h10 = _compute_hfactor(10, 25, 0.5)
         h5 = _compute_hfactor(5, 25, 0.5)
         assert h10 < 1.0
         assert h5 < h10
 
     def test_known_value(self):
-        """Check against the formula at a finer-than-lev1 patch."""
+        """Check AFNI's psize / level-0 psize0 formula."""
         patch_size = 10
-        patch_size_lev1 = 25
+        patch_size_lev0 = 25
         hfactor_q = 0.5
-        prat = patch_size / patch_size_lev1
+        prat = patch_size / patch_size_lev0
         alpha = math.log(hfactor_q) / math.log(0.1)
         expected = prat**alpha
-        assert _compute_hfactor(patch_size, patch_size_lev1, hfactor_q) == pytest.approx(expected)
+        assert _compute_hfactor(patch_size, patch_size_lev0, hfactor_q) == pytest.approx(expected)
+
+    def test_level_one_uses_level_zero_reference(self):
+        """AFNI already scales level 1 by its ratio to the global patch."""
+        lev0, lev1, q = 100, 75, 0.5
+        alpha = math.log(q) / math.log(0.1)
+        assert _compute_hfactor(lev1, lev0, q) == pytest.approx((lev1 / lev0) ** alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1082,8 @@ class TestPatchWriteBackDedup:
             base.clone(),
             initial_warp=(zero, zero, zero),
             config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
                 max_level=0,
                 reject_worse_levels=True,
                 batch_optimizer_iters_lev0=1,
@@ -1049,6 +1118,8 @@ class TestPatchWriteBackDedup:
             base.clone(),
             initial_warp=(zero, zero, zero),
             config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
                 max_level=1,
                 minpatch=5,
                 reject_worse_levels=True,

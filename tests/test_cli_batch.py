@@ -672,6 +672,31 @@ def test_qwarp_batch_is_not_shadowed_by_its_optimizer_flags():
     assert a.batch == "runs.txt" and a.batch_iters == 7
 
 
+def test_qwarp_blur_options_accept_afni_forms():
+    from fastfuncstuff.cli.qwarp import parse_args
+
+    one = parse_args(["-blur", "3", "-pblur"])
+    two = parse_args(["-blur", "1", "2", "-pblur", "0.05", "0.1"])
+    assert one.blur == [3.0] and one.pblur == []
+    assert two.blur == [1.0, 2.0] and two.pblur == [0.05, 0.1]
+
+    with pytest.raises(SystemExit):
+        parse_args(["-blur", "1", "2", "3"])
+    with pytest.raises(SystemExit):
+        parse_args(["-pblur", "0.01", "0.02", "0.03"])
+
+
+def test_qwarp_warpscale_matches_afni_default_and_alias():
+    from fastfuncstuff.cli.qwarp import parse_args
+
+    assert parse_args([]).hfactor_q == pytest.approx(1.0)
+    assert parse_args(["-warpscale", "0.5"]).hfactor_q == pytest.approx(0.5)
+    assert parse_args(["-hfactor_q", "0.7"]).hfactor_q == pytest.approx(0.7)
+
+    with pytest.raises(SystemExit):
+        parse_args(["-warpscale", "0.05"])
+
+
 # --------------------------------------------------------------------------
 # Outer flags are per-run defaults
 # --------------------------------------------------------------------------

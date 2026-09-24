@@ -1,7 +1,8 @@
 """Warp distortion penalty functions.
 
-Implements the energy-based penalty from AFNI's IW3D_load_energy(), which
-penalizes excessive bulk distortion (Jacobian deviation) and shear/vorticity.
+Implements AFNI's eight-corner ``hexahedron_energy`` from
+``IW3D_load_energy()``, which penalizes excessive bulk distortion and
+determinant-normalized shear/vorticity.
 The penalty encourages the warp to be a smooth diffeomorphism.
 
 The penalty has two components:
@@ -38,37 +39,55 @@ def _set_penalty_triton_unavailable(message: str) -> None:
 
 
 def _central_diff_batched(vol: Tensor, dim: int) -> Tensor:
-    """Central difference derivative along a dimension.
-
-    Works for both single volumes (..., nz, ny, nx) and batched (B, nz, ny, nx).
-    Uses forward/backward differences at boundaries.
-    The `dim` argument refers to spatial dims: 0=z(-3), 1=y(-2), 2=x(-1).
-    """
-    # Map spatial dim to tensor dim (last 3 dims are z, y, x)
-    tdim = dim - 3  # -3, -2, or -1
-
+    """Central difference with one-sided differences on the volume faces."""
+    tdim = dim - 3
     n = vol.shape[tdim]
     if n < 2:
         return torch.zeros_like(vol)
-
     result = torch.zeros_like(vol)
-
-    # Interior: central difference
     result.narrow(tdim, 1, n - 2).copy_(
         0.5 * (vol.narrow(tdim, 2, n - 2) - vol.narrow(tdim, 0, n - 2))
     )
-
-    # Boundary: forward difference at start
     result.narrow(tdim, 0, 1).copy_(vol.narrow(tdim, 1, 1) - vol.narrow(tdim, 0, 1))
-
-    # Boundary: backward difference at end
     result.narrow(tdim, n - 1, 1).copy_(vol.narrow(tdim, n - 1, 1) - vol.narrow(tdim, n - 2, 1))
-
     return result
 
 
 def compute_jacobian_energy(xd: Tensor, yd: Tensor, zd: Tensor) -> tuple[Tensor, Tensor]:
-    """Compute Jacobian-based energy fields for a displacement warp.
+    """Legacy central-difference energy used by formwarp's sparse fold guard."""
+    dxd_di = _central_diff_batched(xd, dim=2)
+    dxd_dj = _central_diff_batched(xd, dim=1)
+    dxd_dk = _central_diff_batched(xd, dim=0)
+    dyd_di = _central_diff_batched(yd, dim=2)
+    dyd_dj = _central_diff_batched(yd, dim=1)
+    dyd_dk = _central_diff_batched(yd, dim=0)
+    dzd_di = _central_diff_batched(zd, dim=2)
+    dzd_dj = _central_diff_batched(zd, dim=1)
+    dzd_dk = _central_diff_batched(zd, dim=0)
+
+    a11, a12, a13 = 1.0 + dxd_di, dxd_dj, dxd_dk
+    a21, a22, a23 = dyd_di, 1.0 + dyd_dj, dyd_dk
+    a31, a32, a33 = dzd_di, dzd_dj, 1.0 + dzd_dk
+    det = (
+        a11 * (a22 * a33 - a23 * a32)
+        - a12 * (a21 * a33 - a23 * a31)
+        + a13 * (a21 * a32 - a22 * a31)
+    )
+    je = (det - 1.0).square()
+    se = (
+        (0.5 * (a12 + a21)).square()
+        + (0.5 * (a13 + a31)).square()
+        + (0.5 * (a23 + a32)).square()
+        + (0.5 * (a12 - a21)).square()
+        + (0.5 * (a13 - a31)).square()
+        + (0.5 * (a23 - a32)).square()
+        + 0.5 * ((a11 - 1.0).square() + (a22 - 1.0).square() + (a33 - 1.0).square())
+    )
+    return je, se
+
+
+def compute_hexahedron_energy(xd: Tensor, yd: Tensor, zd: Tensor) -> tuple[Tensor, Tensor]:
+    """Compute AFNI's hexahedral bulk and shear energy fields.
 
     Works for both single volumes (nz, ny, nx) and batched (B, nz, ny, nx).
 
@@ -78,63 +97,63 @@ def compute_jacobian_energy(xd: Tensor, yd: Tensor, zd: Tensor) -> tuple[Tensor,
     Returns:
         (je, se): Bulk distortion and shear/vorticity energy, same shape.
     """
-    dxd_di = _central_diff_batched(xd, dim=2)
-    dxd_dj = _central_diff_batched(xd, dim=1)
-    dxd_dk = _central_diff_batched(xd, dim=0)
+    if xd.shape != yd.shape or xd.shape != zd.shape or xd.ndim < 3:
+        raise ValueError("displacement components must share at least three spatial dimensions")
 
-    dyd_di = _central_diff_batched(yd, dim=2)
-    dyd_dj = _central_diff_batched(yd, dim=1)
-    dyd_dk = _central_diff_batched(yd, dim=0)
+    shape = xd.shape
 
-    dzd_di = _central_diff_batched(zd, dim=2)
-    dzd_dj = _central_diff_batched(zd, dim=1)
-    dzd_dk = _central_diff_batched(zd, dim=0)
+    def _corners(vol: Tensor) -> tuple[Tensor, ...]:
+        flat = vol.reshape(-1, 1, *shape[-3:])
+        p = torch.nn.functional.pad(flat, (0, 1, 0, 1, 0, 1), mode="replicate")[:, 0]
+        nz, ny, nx = shape[-3:]
+        return (
+            p[:, :nz, :ny, :nx],
+            p[:, :nz, :ny, 1 : nx + 1],
+            p[:, :nz, 1 : ny + 1, :nx],
+            p[:, :nz, 1 : ny + 1, 1 : nx + 1],
+            p[:, 1 : nz + 1, :ny, :nx],
+            p[:, 1 : nz + 1, :ny, 1 : nx + 1],
+            p[:, 1 : nz + 1, 1 : ny + 1, :nx],
+            p[:, 1 : nz + 1, 1 : ny + 1, 1 : nx + 1],
+        )
 
-    a11 = 1.0 + dxd_di
-    a12 = dxd_dj
-    a13 = dxd_dk
-    a21 = dyd_di
-    a22 = 1.0 + dyd_dj
-    a23 = dyd_dk
-    a31 = dzd_di
-    a32 = dzd_dj
-    a33 = 1.0 + dzd_dk
+    xc, yc, zc = _corners(xd), _corners(yd), _corners(zd)
+
+    # Average first differences at the 000 and opposite 111 corners, exactly
+    # as AFNI's hexahedron_energy(). Its matrix is transposed relative to the
+    # conventional displacement-gradient layout; determinant and energy are
+    # invariant to that transpose.
+    fxx = 0.5 * ((xc[1] - xc[0]) + (xc[7] - xc[6])) + 1.0
+    fxy = 0.5 * ((yc[1] - yc[0]) + (yc[7] - yc[6]))
+    fxz = 0.5 * ((zc[1] - zc[0]) + (zc[7] - zc[6]))
+    fyx = 0.5 * ((xc[2] - xc[0]) + (xc[7] - xc[5]))
+    fyy = 0.5 * ((yc[2] - yc[0]) + (yc[7] - yc[5])) + 1.0
+    fyz = 0.5 * ((zc[2] - zc[0]) + (zc[7] - zc[5]))
+    fzx = 0.5 * ((xc[4] - xc[0]) + (xc[7] - xc[3]))
+    fzy = 0.5 * ((yc[4] - yc[0]) + (yc[7] - yc[3]))
+    fzz = 0.5 * ((zc[4] - zc[0]) + (zc[7] - zc[3])) + 1.0
 
     det = (
-        a11 * (a22 * a33 - a23 * a32)
-        - a12 * (a21 * a33 - a23 * a31)
-        + a13 * (a21 * a32 - a22 * a31)
-    )
+        fxx * (fyy * fzz - fyz * fzy)
+        - fxy * (fyx * fzz - fyz * fzx)
+        + fxz * (fyx * fzy - fyy * fzx)
+    ).clamp(0.1, 10.0)
 
-    je = (det - 1.0) ** 2
+    je = (1.0 / 3.0) * (det - det.reciprocal()).square()
+    matrix_norm = sum(f.square() for f in (fxx, fxy, fxz, fyx, fyy, fyz, fzx, fzy, fzz))
+    vorticity = 2.0 * ((fyz - fzy).square() + (fxz - fzx).square() + (fxy - fyx).square())
+    se = ((matrix_norm + vorticity) / det.pow(2.0 / 3.0) - 3.0).clamp_min(0.0)
 
-    e12 = 0.5 * (a12 + a21)
-    e13 = 0.5 * (a13 + a31)
-    e23 = 0.5 * (a23 + a32)
-    w12 = 0.5 * (a12 - a21)
-    w13 = 0.5 * (a13 - a31)
-    w23 = 0.5 * (a23 - a32)
-    e11 = a11 - 1.0
-    e22 = a22 - 1.0
-    e33 = a33 - 1.0
-
-    se = (
-        e12 * e12
-        + e13 * e13
-        + e23 * e23
-        + w12 * w12
-        + w13 * w13
-        + w23 * w23
-        + 0.5 * (e11 * e11 + e22 * e22 + e33 * e33)
-    )
+    je = je.reshape(shape)
+    se = se.reshape(shape)
 
     return je, se
 
 
 # Voxel-wise energy below this contributes NOTHING to the penalty (AFNI's
-# Hpen_cut, mri_nwarp.c:2241). Since je = (det(J) - 1)^2, a cut of 1.0 means a
-# voxel is ignored until |det(J) - 1| > 1 -- that is, until it has inverted or
-# more than doubled in volume. Ordinary deformation is free.
+# Hpen_cut, mri_nwarp.c:2241). AFNI's reciprocal-Jacobian bulk energy is steep
+# under compression: expansion above ~2.19 or compression below ~0.46 crosses
+# this deadband. Ordinary deformation is free.
 HPEN_CUT = 1.0
 
 
@@ -170,7 +189,7 @@ def compute_penalty(
     external_sum: float = 0.0,
 ) -> float:
     """Compute total warp distortion penalty (single volume, serial path)."""
-    je, se = compute_jacobian_energy(xd, yd, zd)
+    je, se = compute_hexahedron_energy(xd, yd, zd)
     hsum = external_sum + float(penalty_energy(je, se).sum().item())
     if hsum > 0:
         return pen_fac * (hsum**0.25)
@@ -222,7 +241,7 @@ def compute_penalty_batched(
 
     if patch_sums is None:
         # Batched Jacobian energy: (B, nz, ny, nx)
-        je, se = compute_jacobian_energy(xd, yd, zd)
+        je, se = compute_hexahedron_energy(xd, yd, zd)
         # Sum over spatial dims, keep batch: (B,)
         patch_sums = penalty_energy(je, se).sum(dim=(-3, -2, -1))
 

@@ -22,6 +22,7 @@ Key speedups vs serial version:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -78,8 +79,8 @@ from .optimizer import (
     optimize_warp_params_gauss_newton,
     optimize_warp_params_torch,
 )
-from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
-from .weight import _thd_cliplevel, compute_weight_image
+from .penalty import compute_hexahedron_energy, compute_penalty_batched, penalty_energy
+from .weight import _thd_cliplevel, add_background_band, compute_weight_image
 
 try:
     from .gn_triton import gn_normal_eqs_triton
@@ -161,17 +162,17 @@ class QwarpConfig:
     air. See :func:`_compute_support_padding`.
     """
 
-    blur_base: float = 0.0
-    """Gaussian FWHM blur for base image (voxels)."""
+    blur_base: float = 2.345
+    """Fixed base-image blur FWHM in voxels. Matches AFNI's default."""
 
-    blur_source: float = 0.0
-    """Gaussian FWHM blur for source image (voxels)."""
+    blur_source: float = 2.345
+    """Fixed source-image blur FWHM in voxels. Matches AFNI's default."""
 
     pblur_base: float = 0.0
-    """Progressive blur fraction for base (0 = off)."""
+    """Progressive base blur fraction of geometric patch width (0 = off)."""
 
     pblur_source: float = 0.0
-    """Progressive blur fraction for source (0 = off)."""
+    """Progressive source blur fraction of geometric patch width (0 = off)."""
 
     use_quintic: bool = False
     """Use quintic (5th order) basis at final level."""
@@ -209,6 +210,13 @@ class QwarpConfig:
 
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
+
+    background_band: int = 15
+    """Voxels of empty background around a masked (skull-stripped) base that the
+    automatic weight keeps at the median brain weight; 0 disables it. Not AFNI:
+    3dQwarp's weight is zero there, which lets Gauss-Newton squeeze tissue past
+    the template edge at no cost. A base whose background is not exactly zero
+    gets no band. Wider than 15 measured no further gain on anat->MNI."""
 
     hybrid_polish_iters: int = 10
     """Adam steps after the Gauss-Newton pass when ``optimizer="hybrid"``. Short by
@@ -332,12 +340,11 @@ class QwarpConfig:
     larger budget than the per-phase fine patches. CPU still uses the serial
     derivative-free optimizer (no launch overhead to amortize there)."""
 
-    hfactor_q: float = 0.5
+    hfactor_q: float = 1.0
     """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
     Hfactor=1.0, and as patches shrink Hfactor decreases toward hfactor_q.
-    This tightens the per-patch displacement bound at deep levels, which is
-    AFNI's primary defense against high-frequency over-warping. 1.0 disables
-    the mechanism. Range [0.1, 1.0]."""
+    Values below 1 tighten the per-patch displacement bound at deep levels;
+    AFNI's default 1.0 disables the mechanism. Range [0.1, 1.0]."""
 
     maxdisp: float = 0.0
     """Maximum allowed displacement in voxels. 0 = no limit (default).
@@ -583,6 +590,55 @@ def _crop_padding(vol: Tensor, padding: Padding3D, shape: tuple[int, int, int]) 
     return _pad_volume(vol, (-px0, -px1), (-py0, -py1), (-pz0, -pz1))
 
 
+def _blur_for_patch(
+    vol: Tensor,
+    fixed_fwhm: float,
+    progressive_fraction: float,
+    patch_shape: tuple[int, int, int],
+) -> Tensor:
+    """Return AFNI's registration-only blur for one patch level.
+
+    ``patch_shape`` is ``(nz, ny, nx)``.  AFNI defines progressive FWHM as the
+    fraction times the geometric mean patch width, then combines it in quadrature
+    with the fixed FWHM. Negative fixed values select its ball-median filter.
+    """
+    from .weight import _gaussian_smooth_3d, _median_filter_ball
+
+    nz, ny, nx = patch_shape
+    progressive_fraction = min(0.25, max(0.0, progressive_fraction))
+    if progressive_fraction > 0.0:
+        if nz >= 5:
+            progressive_fwhm = progressive_fraction * (nx * ny * nz) ** (1.0 / 3.0)
+        else:
+            progressive_fwhm = progressive_fraction * math.sqrt(nx * ny)
+    else:
+        progressive_fwhm = 0.0
+
+    # AFNI substitutes 0.1 when progressive blur is requested with a zero fixed
+    # blur, preserving Gaussian (rather than median) mode without materially
+    # changing the requested progressive width.
+    fixed = 0.1 if progressive_fraction > 0.0 and fixed_fwhm == 0.0 else fixed_fwhm
+    sign = 1.0 if fixed >= 0.0 else -1.0
+    actual_fwhm = sign * math.hypot(progressive_fwhm, fixed)
+    if actual_fwhm >= 0.5:
+        return _gaussian_smooth_3d(vol, actual_fwhm / 2.355)
+    if actual_fwhm <= -1.0:
+        return _median_filter_ball(vol, -actual_fwhm)
+    return vol
+
+
+def _compute_qwarp_weight(base: Tensor) -> Tensor:
+    """AFNI 3dQwarp's default ``mri_weightize`` pipeline."""
+    return compute_weight_image(
+        base,
+        gauss_fwhm=4.5,
+        median_radius=2.25,
+        clusterize=True,
+        hist_cliplevel=True,
+        edge_before_smoothing=True,
+    )
+
+
 def qwarp(
     base: Tensor,
     source: Tensor,
@@ -679,7 +735,9 @@ def qwarp(
         )
 
     if weight is None:
-        weight_p = compute_weight_image(base_p)
+        weight_p = add_background_band(
+            _compute_qwarp_weight(base_p), base_p, config.background_band
+        )
     else:
         weight_p = (
             _pad_volume_faces(weight.float().to(device), padding)
@@ -989,22 +1047,21 @@ def _get_basis_config(
     return basis, half_widths, param_max
 
 
-def _compute_hfactor(patch_size: int, patch_size_lev1: int, hfactor_q: float = 0.5) -> float:
+def _compute_hfactor(patch_size: int, reference_patch_size: int, hfactor_q: float = 1.0) -> float:
     """AFNI-style Hfactor scaling on param_max.
 
-    AFNI's Hfactor_from_patchsize_ratio uses prat = psize / psize0 where
-    psize0 is the lev=1 (coarsest non-global) patch size. At lev=1 prat=1
-    so hfactor=1; at finer levels prat<1 so hfactor<1, tightening the
-    per-patch displacement bound. hfactor = prat^alpha with
-    alpha = log(hfactor_q) / log(0.1).
+    AFNI's Hfactor_from_patchsize_ratio uses ``prat = psize / psize0``, where
+    ``psize0`` is the level-0 global patch width. At finer levels ``prat < 1``,
+    tightening the per-patch displacement bound as
+    ``hfactor = prat ** (log(hfactor_q) / log(0.1))``.
     """
     import math
 
-    if hfactor_q >= 1.0 or hfactor_q < 0.1 or patch_size_lev1 <= 0:
+    if hfactor_q >= 1.0 or hfactor_q < 0.1 or reference_patch_size <= 0:
         return 1.0
-    if patch_size >= patch_size_lev1:
+    if patch_size >= reference_patch_size:
         return 1.0
-    prat = patch_size / patch_size_lev1
+    prat = patch_size / reference_patch_size
     alpha = math.log(hfactor_q) / math.log(0.1)
     return prat**alpha
 
@@ -1168,6 +1225,7 @@ def _warpomatic(
     """
     nx, ny, nz = state.nx, state.ny, state.nz
     t0 = time.time()
+    base_original, source_original = base, source
 
     do_x = not (config.warp_flags & 1)
     do_y = not (config.warp_flags & 2)
@@ -1183,9 +1241,6 @@ def _warpomatic(
             f"autobox={imin}..{imax} {jmin}..{jmax} {kmin}..{kmax}"
         )
 
-    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-    source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
-
     # AFNI-faithful local Pearson (lpc/lpa): one global truncated-octahedron
     # blok lattice over the whole grid; each patch is later scored over the
     # bloks that fall inside it. Built once per grid (so once per pyramid octave).
@@ -1195,10 +1250,6 @@ def _warpomatic(
         bs = assign_bloks((nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0))
         blok_index_vol = bs.index.reshape(nz, ny, nx)
         nblok = bs.nblok
-
-    # Compute initial cost so it's never the 666.666 sentinel
-    with torch.no_grad():
-        state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
 
     # --- Level 0 bounds (always computed for level 1+ patch sizing) ---
     xwid = (imax - imin) // 8
@@ -1214,6 +1265,28 @@ def _warpomatic(
 
     if nz == 1:
         kbbb = kttt = 0
+
+    level0_shape = (kttt - kbbb + 1, jttt - jbbb + 1, ittt - ibbb + 1)
+    base_fixed = _blur_for_patch(base_original, config.blur_base, 0.0, level0_shape)
+    source_fixed = _blur_for_patch(source_original, config.blur_source, 0.0, level0_shape)
+    base = (
+        _blur_for_patch(base_original, config.blur_base, config.pblur_base, level0_shape)
+        if config.pblur_base > 0.0
+        else base_fixed
+    )
+    source = (
+        _blur_for_patch(source_original, config.blur_source, config.pblur_source, level0_shape)
+        if config.pblur_source > 0.0
+        else source_fixed
+    )
+    with torch.no_grad():
+        state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
+    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+    source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+
+    # Compute initial cost so it's never the 666.666 sentinel.
+    with torch.no_grad():
+        state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
 
     # --- Level 0: global warp (single patch) ---
     if config.start_level == 0:
@@ -1391,8 +1464,8 @@ def _warpomatic(
     ywid0 = jttt - jbbb + 1
     zwid0 = kttt - kbbb + 1
 
-    # Lev=1 patch size, the reference for Hfactor scaling
-    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
+    # AFNI scales fine-level bounds against the level-0 global patch width.
+    max_patch_lev0 = max(xwid0, ywid0, zwid0)
 
     ngmin = max(config.minpatch, 5)
     if ngmin % 2 == 0:
@@ -1463,6 +1536,25 @@ def _warpomatic(
         if nz == 1:
             kbbb = kttt = 0
 
+        patch_shape = (zwid, ywid, xwid)
+        base = (
+            _blur_for_patch(base_original, config.blur_base, config.pblur_base, patch_shape)
+            if config.pblur_base > 0.0
+            else base_fixed
+        )
+        source = (
+            _blur_for_patch(source_original, config.blur_source, config.pblur_source, patch_shape)
+            if config.pblur_source > 0.0
+            else source_fixed
+        )
+        with torch.no_grad():
+            state.warped_source = warp_image(
+                source, state.xd, state.yd, state.zd, mode=config.interp
+            )
+        base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+        source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+        state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
+
         # Penalty settings. Ramp with ABSOLUTE level (finer patches => stronger
         # anti-over-warp pressure), not levels-into-this-pass: a pyramid or
         # -inilev run resumes at a high lev_start, and the old (lev-lev_start+1)
@@ -1513,7 +1605,7 @@ def _warpomatic(
         nyh = ywid
         nzh = zwid
         max_patch = max(nxh, nyh, nzh)
-        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev0, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type,
             nxh,
@@ -1668,25 +1760,17 @@ def _warpomatic(
                         f"phase {phase_order.index(phase_idx) + 1}/8",
                     )
 
-        # Light warp smoothing to reduce patch boundary artifacts
-        # Sigma scales with patch overlap: half the overlap width
-        # xdel is the step between patches, (nxh - xdel) is the overlap
-        smooth_sigma = 1.5
-        with torch.no_grad():
-            from .weight import _gaussian_smooth_3d
-
-            state.xd = _gaussian_smooth_3d(state.xd, smooth_sigma)
-            state.yd = _gaussian_smooth_3d(state.yd, smooth_sigma)
-            state.zd = _gaussian_smooth_3d(state.zd, smooth_sigma)
-            # Optional max displacement clamp
-            if config.maxdisp > 0:
+        # AFNI composes the overlapping patch updates directly; it does not blur
+        # the accumulated displacement field between levels.  Refresh only when
+        # an explicit displacement clamp changed that field.
+        if config.maxdisp > 0:
+            with torch.no_grad():
                 state.xd.clamp_(-config.maxdisp, config.maxdisp)
                 state.yd.clamp_(-config.maxdisp, config.maxdisp)
                 state.zd.clamp_(-config.maxdisp, config.maxdisp)
-            # Refresh warped_source with smoothed warp
-            state.warped_source = warp_image(
-                source, state.xd, state.yd, state.zd, mode=config.interp
-            )
+                state.warped_source = warp_image(
+                    source, state.xd, state.yd, state.zd, mode=config.interp
+                )
 
         # Compute actual global correlation after this level
         with torch.no_grad():
@@ -2206,7 +2290,7 @@ def _improve_warp_batched(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
+            je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
             energy_global = penalty_energy(je_global, se_global)
             global_energy_sum = energy_global.sum()
             # Per-patch energy sums via the same summed-area table _filter_patches
@@ -2568,7 +2652,7 @@ def _improve_warp_batched(
 # Correctness contract: qwarp_batch reproduces N independent qwarp() calls to
 # sub-voxel. The only thing that couples the batch is gradient clipping, which is
 # made per-volume-group in the optimizer (clip_group_size=P); everything else
-# (Adam, per-patch convergence, penalty, smoothing, reject-worse-levels) is
+# (Adam, per-patch convergence, penalty, reject-worse-levels) is
 # per-volume, with a per-volume active mask so a volume that would stop early in
 # the single path stops here too.
 
@@ -2707,7 +2791,7 @@ def _improve_warp_batched_multi(
         with torch.no_grad():
             for a in range(Na):
                 v = int(active_idx[a])
-                je, se = compute_jacobian_energy(
+                je, se = compute_hexahedron_energy(
                     mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
                 )
                 energy = penalty_energy(je, se).reshape(-1)
@@ -2839,15 +2923,14 @@ def _warpomatic_multi(
     """Source-batched multi-level loop; N volumes share one reference.
 
     Structurally identical to :func:`_warpomatic` but every per-volume decision
-    (cost readout, penalty, level smoothing, reject-worse-levels, early stop) is
+    (cost readout, penalty, reject-worse-levels, early stop) is
     made per volume via an ``active`` mask, so each volume follows the same level
     schedule it would under a solo :func:`qwarp` call.
     """
     N = mstate.xd_all.shape[0]
     nx, ny, nz = mstate.nx, mstate.ny, mstate.nz
     t0 = time.time()
-    from .weight import _gaussian_smooth_3d
-
+    base_original, sources_original = base, sources_all
     do_x = not (config.warp_flags & 1)
     do_y = not (config.warp_flags & 2)
     do_z = not (config.warp_flags & 4)
@@ -2855,10 +2938,6 @@ def _warpomatic_multi(
     axis_w = config.axis_weights
 
     imin, imax, jmin, jmax, kmin, kmax = _autobox(weight)
-    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-    # Source clip is per-volume in the single path; use each volume's own but a
-    # shared base clip. Compute per-volume source clips up front.
-    source_clips = [_auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)]
 
     blok_index_vol = None
     nblok = 0
@@ -2866,16 +2945,6 @@ def _warpomatic_multi(
         bs = assign_bloks((nz, ny, nx), (1.0, 1.0, 1.0), "tohd", config.blok_rad, mask=(mask > 0))
         blok_index_vol = bs.index.reshape(nz, ny, nx)
         nblok = bs.nblok
-
-    # Per-volume global cost (negated correlation).
-    def _vol_cost(v: int) -> float:
-        with torch.no_grad():
-            return _global_correlation(
-                base, mstate.warped_all[v], weight, base_clip, source_clips[v]
-            )
-
-    costs = [_vol_cost(v) for v in range(N)]
-    active = torch.ones(N, dtype=torch.bool, device=device)
 
     # --- Level 0 bounds (also used to size level 1+) ---
     xwid = (imax - imin) // 8
@@ -2889,6 +2958,53 @@ def _warpomatic_multi(
     kttt = min(nz - 2, kmax + zwid)
     if nz == 1:
         kbbb = kttt = 0
+
+    level0_shape = (kttt - kbbb + 1, jttt - jbbb + 1, ittt - ibbb + 1)
+    base_fixed = _blur_for_patch(base_original, config.blur_base, 0.0, level0_shape)
+    sources_fixed = torch.stack(
+        [
+            _blur_for_patch(sources_original[v], config.blur_source, 0.0, level0_shape)
+            for v in range(N)
+        ]
+    )
+    base = (
+        _blur_for_patch(base_original, config.blur_base, config.pblur_base, level0_shape)
+        if config.pblur_base > 0.0
+        else base_fixed
+    )
+    sources_all = (
+        torch.stack(
+            [
+                _blur_for_patch(
+                    sources_original[v], config.blur_source, config.pblur_source, level0_shape
+                )
+                for v in range(N)
+            ]
+        )
+        if config.pblur_source > 0.0
+        else sources_fixed
+    )
+    with torch.no_grad():
+        for v in range(N):
+            mstate.warped_all[v] = warp_image(
+                sources_all[v],
+                mstate.xd_all[v],
+                mstate.yd_all[v],
+                mstate.zd_all[v],
+                mode=config.interp,
+            )
+    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+    source_clips = [_auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)]
+
+    # Per-volume global cost (negated correlation).
+    def _vol_cost(v: int) -> float:
+        with torch.no_grad():
+            return _global_correlation(
+                base, mstate.warped_all[v], weight, base_clip, source_clips[v]
+            )
+
+    costs = [_vol_cost(v) for v in range(N)]
+    active = torch.ones(N, dtype=torch.bool, device=device)
 
     # --- Level 0: global warp (single patch), all volumes ---
     if config.start_level == 0:
@@ -2961,7 +3077,7 @@ def _warpomatic_multi(
 
     # --- Levels 1..N ---
     xwid0, ywid0, zwid0 = ittt - ibbb + 1, jttt - jbbb + 1, kttt - kbbb + 1
-    max_patch_lev1 = max(1, int(max(xwid0, ywid0, zwid0) * config.shrink))
+    max_patch_lev0 = max(xwid0, ywid0, zwid0)
     ngmin = max(config.minpatch, 5)
     if ngmin % 2 == 0:
         ngmin -= 1
@@ -3015,6 +3131,44 @@ def _warpomatic_multi(
         if nz == 1:
             kbbb = kttt = 0
 
+        patch_shape = (zwid, ywid, xwid)
+        base = (
+            _blur_for_patch(base_original, config.blur_base, config.pblur_base, patch_shape)
+            if config.pblur_base > 0.0
+            else base_fixed
+        )
+        sources_all = (
+            torch.stack(
+                [
+                    _blur_for_patch(
+                        sources_original[v],
+                        config.blur_source,
+                        config.pblur_source,
+                        patch_shape,
+                    )
+                    for v in range(N)
+                ]
+            )
+            if config.pblur_source > 0.0
+            else sources_fixed
+        )
+        active_now = torch.nonzero(active, as_tuple=False).flatten()
+        with torch.no_grad():
+            for v in active_now.tolist():
+                mstate.warped_all[v] = warp_image(
+                    sources_all[v],
+                    mstate.xd_all[v],
+                    mstate.yd_all[v],
+                    mstate.zd_all[v],
+                    mode=config.interp,
+                )
+        base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+        source_clips = [
+            _auto_clip(sources_all[v].reshape(-1), weight.reshape(-1)) for v in range(N)
+        ]
+        for v in active_now.tolist():
+            costs[v] = _vol_cost(v)
+
         pen_lev = lev**0.333
         pen_fff = config.penalty_factor * min(3.21, pen_lev)
         use_pen = pen_fff > 0 and lev >= config.penalty_first_level
@@ -3052,7 +3206,7 @@ def _warpomatic_multi(
 
         nxh, nyh, nzh = xwid, ywid, zwid
         max_patch = max(nxh, nyh, nzh)
-        hfactor = _compute_hfactor(max_patch, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(max_patch, max_patch_lev0, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type,
             nxh,
@@ -3169,24 +3323,22 @@ def _warpomatic_multi(
                 if lev_pbar is not None:
                     lev_pbar.update(len(phase_patches) * int(active_idx.numel()))
 
-        # Per-volume level smoothing + cost + reject/early-stop.
+        # Per-volume clamp + cost + reject/early-stop. AFNI does not smooth the
+        # accumulated displacement field between levels.
         newly_inactive = []
         with torch.no_grad():
             for ai, v in enumerate(active_idx.tolist()):
-                mstate.xd_all[v] = _gaussian_smooth_3d(mstate.xd_all[v], 1.5)
-                mstate.yd_all[v] = _gaussian_smooth_3d(mstate.yd_all[v], 1.5)
-                mstate.zd_all[v] = _gaussian_smooth_3d(mstate.zd_all[v], 1.5)
                 if config.maxdisp > 0:
                     mstate.xd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                     mstate.yd_all[v].clamp_(-config.maxdisp, config.maxdisp)
                     mstate.zd_all[v].clamp_(-config.maxdisp, config.maxdisp)
-                mstate.warped_all[v] = warp_image(
-                    sources_all[v],
-                    mstate.xd_all[v],
-                    mstate.yd_all[v],
-                    mstate.zd_all[v],
-                    mode=config.interp,
-                )
+                    mstate.warped_all[v] = warp_image(
+                        sources_all[v],
+                        mstate.xd_all[v],
+                        mstate.yd_all[v],
+                        mstate.zd_all[v],
+                        mode=config.interp,
+                    )
                 new_cost = _vol_cost(v)
                 if config.reject_worse_levels and new_cost > cost_at_start[v] + 1e-4:
                     mstate.xd_all[v] = saved[0][ai]
@@ -3309,7 +3461,9 @@ def qwarp_batch(
         )
 
     if weight is None:
-        weight_p = compute_weight_image(base_p)
+        weight_p = add_background_band(
+            _compute_qwarp_weight(base_p), base_p, config.background_band
+        )
     else:
         w = weight.float().to(device)
         weight_p = _pad_volume_faces(w, padding) if do_pad else w
@@ -3595,6 +3749,8 @@ def _build_mescaled_plan(
     nz, ny, nx = base_p.shape[1:]
 
     if weight is None:
+        # The joint multi-echo EPI polish is not AFNI 3dQwarp: its low-resolution
+        # base and axis-restricted objective rely on the broader smooth weight.
         weight_p = compute_weight_image(base_p.mean(0))
     else:
         w = weight.float().to(device)
@@ -3647,7 +3803,7 @@ def _build_mescaled_plan(
         if len(widths) >= 32:  # a runaway guard; shrink < 1 makes this unreachable
             break
     widths = widths[::-1]  # coarsest first
-    max_patch_lev1 = widths[0]
+    reference_patch_size = widths[0]
 
     basis_type = "cubic_lite" if config.use_lite else "cubic"
     ny_nx = ny * nx
@@ -3691,7 +3847,7 @@ def _build_mescaled_plan(
         if nz == 1:
             kbbb = kttt = 0
 
-        hfactor = _compute_hfactor(pw, max_patch_lev1, config.hfactor_q)
+        hfactor = _compute_hfactor(pw, reference_patch_size, config.hfactor_q)
         basis, half_widths, param_max = _get_basis_config(
             basis_type, xwid, ywid, zwid, device, hfactor=hfactor
         )
@@ -3837,7 +3993,7 @@ def _improve_warp_batched_mescaled(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_g, se_g = compute_jacobian_energy(state.xd, state.yd, state.zd)
+            je_g, se_g = compute_hexahedron_energy(state.xd, state.yd, state.zd)
             energy_g = penalty_energy(je_g, se_g).reshape(-1)
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
@@ -4423,7 +4579,7 @@ def _improve_warp_serial(
 
     pen_external = 0.0
     if use_penalty:
-        je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
+        je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
         je_ext = je_global.clone()
         se_ext = se_global.clone()
         je_ext[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1] = 0.0

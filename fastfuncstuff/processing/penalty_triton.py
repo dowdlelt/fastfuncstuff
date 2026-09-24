@@ -1,7 +1,7 @@
 """Fused CUDA kernel for the batched qwarp deformation penalty.
 
-The portable path builds nine central-difference fields, then some forty
-elementwise expressions over them, then reduces -- roughly eighty full
+The portable path builds eight hexahedron corners per displacement component,
+then the bulk/shear expressions, then reduces -- many full
 ``(B, nz, ny, nx)` passes to produce one number per patch. It measured 15% of a
 0.7 mm run, more than the interpolation it guards.
 
@@ -13,8 +13,8 @@ partial sums torch adds, so the result does not depend on atomic ordering and
 qwarp stays bit-reproducible run to run.
 
 Reference: :mod:`fastfuncstuff.processing.penalty`, which this must match
-exactly -- including AFNI's forward/backward differences at the patch faces and
-the ``HPEN_CUT`` deadband (mri_nwarp.c:2241).
+exactly -- including AFNI's clamped hexahedron corners and ``HPEN_CUT`` deadband
+(``mri_nwarp.c:2164-2284``).
 """
 
 from __future__ import annotations
@@ -29,14 +29,6 @@ from fastfuncstuff.triton_key import install_triton_key_cache
 install_triton_key_cache()
 
 _TARGET_PROGRAMS = 1024
-
-
-@triton.jit
-def _axis_diff(ptr, off_p, off_m, sc, mask):
-    """One central (or one-sided, at a face) difference along a prepared axis."""
-    vp = tl.load(ptr + off_p, mask=mask, other=0.0)
-    vm = tl.load(ptr + off_m, mask=mask, other=0.0)
-    return sc * (vp - vm)
 
 
 @triton.jit
@@ -71,61 +63,78 @@ def _penalty_kernel(
         j = (offs // nx) % ny
         k = offs // plane
 
-        # AFNI takes a central difference inside and a one-sided difference on
-        # each face; both are two loads and a scale, so they are expressed the
-        # same way and only the pair of indices and the scale differ.
-        ip = tl.where(i == 0, 1, tl.where(i == nx - 1, nx - 1, i + 1))
-        im = tl.where(i == 0, 0, tl.where(i == nx - 1, nx - 2, i - 1))
-        sx = tl.where((i == 0) | (i == nx - 1), 1.0, 0.5) * (nx > 1)
-        jp = tl.where(j == 0, 1, tl.where(j == ny - 1, ny - 1, j + 1))
-        jm = tl.where(j == 0, 0, tl.where(j == ny - 1, ny - 2, j - 1))
-        sy = tl.where((j == 0) | (j == ny - 1), 1.0, 0.5) * (ny > 1)
-        kp = tl.where(k == 0, 1, tl.where(k == nz - 1, nz - 1, k + 1))
-        km = tl.where(k == 0, 0, tl.where(k == nz - 1, nz - 2, k - 1))
-        sz = tl.where((k == 0) | (k == nz - 1), 1.0, 0.5) * (nz > 1)
+        ip = tl.minimum(i + 1, nx - 1)
+        jp = tl.minimum(j + 1, ny - 1)
+        kp = tl.minimum(k + 1, nz - 1)
 
-        row = base + k * plane + j * nx
-        x_p, x_m = row + ip, row + im
-        y_p = base + k * plane + jp * nx + i
-        y_m = base + k * plane + jm * nx + i
-        z_p = base + kp * plane + j * nx + i
-        z_m = base + km * plane + j * nx + i
+        o0 = base + k * plane + j * nx + i
+        o1 = base + k * plane + j * nx + ip
+        o2 = base + k * plane + jp * nx + i
+        o3 = base + k * plane + jp * nx + ip
+        o4 = base + kp * plane + j * nx + i
+        o5 = base + kp * plane + j * nx + ip
+        o6 = base + kp * plane + jp * nx + i
+        o7 = base + kp * plane + jp * nx + ip
 
-        a11 = 1.0 + _axis_diff(xd_ptr, x_p, x_m, sx, mask)
-        a12 = _axis_diff(xd_ptr, y_p, y_m, sy, mask)
-        a13 = _axis_diff(xd_ptr, z_p, z_m, sz, mask)
-        a21 = _axis_diff(yd_ptr, x_p, x_m, sx, mask)
-        a22 = 1.0 + _axis_diff(yd_ptr, y_p, y_m, sy, mask)
-        a23 = _axis_diff(yd_ptr, z_p, z_m, sz, mask)
-        a31 = _axis_diff(zd_ptr, x_p, x_m, sx, mask)
-        a32 = _axis_diff(zd_ptr, y_p, y_m, sy, mask)
-        a33 = 1.0 + _axis_diff(zd_ptr, z_p, z_m, sz, mask)
+        x0 = tl.load(xd_ptr + o0, mask=mask, other=0.0)
+        x1 = tl.load(xd_ptr + o1, mask=mask, other=0.0)
+        x2 = tl.load(xd_ptr + o2, mask=mask, other=0.0)
+        x3 = tl.load(xd_ptr + o3, mask=mask, other=0.0)
+        x4 = tl.load(xd_ptr + o4, mask=mask, other=0.0)
+        x5 = tl.load(xd_ptr + o5, mask=mask, other=0.0)
+        x6 = tl.load(xd_ptr + o6, mask=mask, other=0.0)
+        x7 = tl.load(xd_ptr + o7, mask=mask, other=0.0)
+        y0 = tl.load(yd_ptr + o0, mask=mask, other=0.0)
+        y1 = tl.load(yd_ptr + o1, mask=mask, other=0.0)
+        y2 = tl.load(yd_ptr + o2, mask=mask, other=0.0)
+        y3 = tl.load(yd_ptr + o3, mask=mask, other=0.0)
+        y4 = tl.load(yd_ptr + o4, mask=mask, other=0.0)
+        y5 = tl.load(yd_ptr + o5, mask=mask, other=0.0)
+        y6 = tl.load(yd_ptr + o6, mask=mask, other=0.0)
+        y7 = tl.load(yd_ptr + o7, mask=mask, other=0.0)
+        z0 = tl.load(zd_ptr + o0, mask=mask, other=0.0)
+        z1 = tl.load(zd_ptr + o1, mask=mask, other=0.0)
+        z2 = tl.load(zd_ptr + o2, mask=mask, other=0.0)
+        z3 = tl.load(zd_ptr + o3, mask=mask, other=0.0)
+        z4 = tl.load(zd_ptr + o4, mask=mask, other=0.0)
+        z5 = tl.load(zd_ptr + o5, mask=mask, other=0.0)
+        z6 = tl.load(zd_ptr + o6, mask=mask, other=0.0)
+        z7 = tl.load(zd_ptr + o7, mask=mask, other=0.0)
+
+        fxx = 0.5 * ((x1 - x0) + (x7 - x6)) + 1.0
+        fxy = 0.5 * ((y1 - y0) + (y7 - y6))
+        fxz = 0.5 * ((z1 - z0) + (z7 - z6))
+        fyx = 0.5 * ((x2 - x0) + (x7 - x5))
+        fyy = 0.5 * ((y2 - y0) + (y7 - y5)) + 1.0
+        fyz = 0.5 * ((z2 - z0) + (z7 - z5))
+        fzx = 0.5 * ((x4 - x0) + (x7 - x3))
+        fzy = 0.5 * ((y4 - y0) + (y7 - y3))
+        fzz = 0.5 * ((z4 - z0) + (z7 - z3)) + 1.0
 
         det = (
-            a11 * (a22 * a33 - a23 * a32)
-            - a12 * (a21 * a33 - a23 * a31)
-            + a13 * (a21 * a32 - a22 * a31)
+            fxx * (fyy * fzz - fyz * fzy)
+            - fxy * (fyx * fzz - fyz * fzx)
+            + fxz * (fyx * fzy - fyy * fzx)
         )
-        je = (det - 1.0) * (det - 1.0)
+        det = tl.maximum(0.1, tl.minimum(det, 10.0))
+        bulk = det - 1.0 / det
+        je = (1.0 / 3.0) * bulk * bulk
 
-        e12 = 0.5 * (a12 + a21)
-        e13 = 0.5 * (a13 + a31)
-        e23 = 0.5 * (a23 + a32)
-        w12 = 0.5 * (a12 - a21)
-        w13 = 0.5 * (a13 - a31)
-        w23 = 0.5 * (a23 - a32)
-        e11 = a11 - 1.0
-        e22 = a22 - 1.0
-        e33 = a33 - 1.0
-        se = (
-            e12 * e12
-            + e13 * e13
-            + e23 * e23
-            + w12 * w12
-            + w13 * w13
-            + w23 * w23
-            + 0.5 * (e11 * e11 + e22 * e22 + e33 * e33)
+        matrix_norm = (
+            fxx * fxx
+            + fxy * fxy
+            + fxz * fxz
+            + fyx * fyx
+            + fyy * fyy
+            + fyz * fyz
+            + fzx * fzx
+            + fzy * fzy
+            + fzz * fzz
         )
+        vorticity = 2.0 * (
+            (fyz - fzy) * (fyz - fzy) + (fxz - fzx) * (fxz - fzx) + (fxy - fyx) * (fxy - fyx)
+        )
+        se = tl.maximum((matrix_norm + vorticity) / tl.exp((2.0 / 3.0) * tl.log(det)) - 3.0, 0.0)
 
         ej = tl.maximum(je - CUT, 0.0)
         es = tl.maximum(se - CUT, 0.0)
