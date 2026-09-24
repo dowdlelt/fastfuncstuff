@@ -808,6 +808,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         vid = self.manager.open(ViewKind.CLUSTERS, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
         self.refresh_clusters(vid)
+        self.manager.redraw(Aspect.SLICES)  # HIDE SMALL starts on
 
     def refresh_clusters(self, vid: str | None = None, ctl: Controller | None = None) -> None:
         """Recompute one cluster table, or every one, from the current threshold.
@@ -824,16 +825,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if vid is None
             else [w for w in [ctl.manager.windows.get(vid)] if isinstance(w, ClusterWindow)]
         )
+        session = ctl.session
         for window in targets:
+            layer = session.state.selected_layer()
+            window.sync_layers(list(session.state.layers), layer.key if layer else None)
+            within = None
             try:
-                source, table = ctl.session.clusterize(
-                    None, nn=window.nn, min_voxels=window.min_voxels
+                if layer is not None and window.within is not None:
+                    within = session.mask_from_layer(window.within, layer)
+                source, table = session.clusterize(
+                    None, nn=window.nn, min_voxels=window.min_voxels, mask=within
                 )
             except (ValueError, KeyError, FileNotFoundError) as exc:
                 # On the window, not the status bar: the thing that could not
-                # be clustered is the thing you are looking at.
+                # be clustered is the thing you are looking at. The WITHIN mask
+                # still applies -- "just show me the brain" needs no threshold.
+                session.set_display_mask(window.vid, layer.key if layer else None, within)
                 window.show_table("", None, str(exc))
                 continue
+            keep = within
+            if window.hide_small and table.dropped is not None:
+                keep = ~table.dropped if keep is None else keep & ~table.dropped
+            session.set_display_mask(window.vid, source.key, keep)
             window.show_table(source.key, table, f"{source.name}   {table.summary()}")
 
     def _clusters_to_rois(self, vid: str) -> None:
@@ -930,6 +943,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # its NN and MIN controls asked a question nobody answered.
         if isinstance(window, ClusterWindow):
             self.refresh_clusters(vid)
+            # Its mask changes the picture, and nothing else is going to ask
+            # the images to redraw after a click on HIDE SMALL or WITHIN.
+            self.manager.redraw(Aspect.SLICES)
             return
         viewport = self.session.state.viewports.find(vid)
         if viewport is None or self.runner.busy:

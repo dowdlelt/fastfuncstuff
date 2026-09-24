@@ -284,3 +284,48 @@ def test_a_4d_layer_is_not_pending_once_loaded(session, tmp_path):
     key = session.load(path)
     session.store.ensure_ram(key)
     assert not session.resident(key).pending
+
+
+# ---------------------------------------------------------------------------
+# display masks
+# ---------------------------------------------------------------------------
+
+
+def test_a_display_mask_hides_the_overlay_and_only_the_overlay(session, anat, stats):
+    """Masked-out overlay voxels show the underlay, as if never drawn; the
+    underlay itself is untouched."""
+    session.load(anat)
+    key = session.load(stats)
+    session.do(SetColormap(key, "redblue"))
+    session.do(SetThreshold(key, 4.0))
+    session.do(SetIJK(4, 5, 4))
+    shown = render_plane(session, Plane.AXIAL)
+
+    layer = session.state.layers.get(key)
+    session.set_display_mask("K1", key, np.zeros(layer.shape, dtype=bool))
+    masked = render_plane(session, Plane.AXIAL)
+    session.do(SetLayerVisible(key, False))
+    underlay_only = render_plane(session, Plane.AXIAL)
+    assert shown is not None and masked is not None and underlay_only is not None
+    assert not torch.equal(shown.rgba, masked.rgba)
+    assert torch.equal(masked.rgba, underlay_only.rgba)
+
+    session.do(SetLayerVisible(key, True))
+    session.set_display_mask("K1", None, None)  # the owner letting go restores it
+    assert torch.equal(render_plane(session, Plane.AXIAL).rgba, shown.rgba)
+
+
+def test_mask_resampling_lands_a_fine_mask_on_a_coarse_grid():
+    """A 1 mm anat's mask on a 3 mm map: voxel centres, not corners."""
+    from fastfuncstuff.viewer.session import resample_mask_nearest
+
+    fine = np.zeros((30, 30, 30), dtype=bool)
+    fine[:15] = True  # the left half, in 1 mm voxels
+    coarse_aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    coarse_aff[:3, 3] = 1.0  # coarse voxel centres sit on fine voxels 1, 4, 7, ...
+    out = resample_mask_nearest(fine, np.eye(4), (10, 10, 10), coarse_aff)
+    assert out[:5].all() and not out[5:].any()
+    # Outside the source is outside the mask, not wrapped or clamped in.
+    shifted = coarse_aff.copy()
+    shifted[0, 3] = -15.0
+    assert not resample_mask_nearest(fine, np.eye(4), (10, 10, 10), shifted)[:2].any()

@@ -160,9 +160,41 @@ class ClusterWindow(QtWidgets.QWidget):
         )
         self.rois_button.clicked.connect(lambda: self.rois_requested.emit(self.vid))
         bar.addWidget(self.rois_button)
+        # The mask row: what the picture hides, as opposed to what the table
+        # lists. Both are display only -- readouts and graphs still see every
+        # voxel.
+        mask_bar = QtWidgets.QHBoxLayout()
+        mask_bar.setSpacing(5)
+        self.hide_check = QtWidgets.QCheckBox("HIDE SMALL")
+        self.hide_check.setChecked(True)
+        self.hide_check.setToolTip(
+            "Hide suprathreshold voxels in clusters below MIN, so the picture "
+            "shows what the table lists. Sub-threshold fading is left alone."
+        )
+        self.hide_check.toggled.connect(lambda _: self.rebuild_requested.emit(self.vid))
+        mask_bar.addWidget(self.hide_check)
+        mask_bar.addSpacing(8)
+        mask_bar.addWidget(QtWidgets.QLabel("WITHIN"))
+        self.within_box = QtWidgets.QComboBox()
+        self.within_box.setToolTip(
+            "Cluster and draw only inside another layer's brain: an automask of "
+            "an image (the anat, a mean EPI), or an ROI layer as drawn. Resampled "
+            "nearest onto the map's grid."
+        )
+        self.within_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.within_box.activated.connect(lambda _: self.rebuild_requested.emit(self.vid))
+        mask_bar.addWidget(self.within_box)
+        mask_bar.addStretch(1)
+
+        rows = QtWidgets.QVBoxLayout()
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(4)
+        rows.addLayout(bar)
+        rows.addLayout(mask_bar)
         self.controls = QtWidgets.QWidget()
-        self.controls.setLayout(bar)
+        self.controls.setLayout(rows)
         v.addWidget(self.controls)
+        self.sync_layers([], None)
 
         self.table = QtWidgets.QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(list(COLUMNS))
@@ -209,6 +241,35 @@ class ClusterWindow(QtWidgets.QWidget):
     @property
     def min_voxels(self) -> int:
         return int(self.min_spin.value())
+
+    @property
+    def hide_small(self) -> bool:
+        return self.hide_check.isChecked()
+
+    @property
+    def within(self) -> str | None:
+        """The layer whose brain bounds the map, or ``None`` for everywhere."""
+        return self.within_box.currentData() or None
+
+    def sync_layers(self, layers, clustered: str | None) -> None:
+        """Offer every layer but the clustered one, keeping the current pick.
+
+        A pick whose layer has gone falls back to none rather than to whatever
+        slid into its row -- masking by the wrong image is quiet.
+        """
+        current = self.within
+        entries = [("none", None)] + [(ly.name, ly.key) for ly in layers if ly.key != clustered]
+        if [self.within_box.itemData(i) for i in range(self.within_box.count())] == [
+            key for _, key in entries
+        ]:
+            return
+        self.within_box.blockSignals(True)
+        self.within_box.clear()
+        for name, key in entries:
+            self.within_box.addItem(name, userData=key)
+        index = self.within_box.findData(current) if current else 0
+        self.within_box.setCurrentIndex(max(index, 0))
+        self.within_box.blockSignals(False)
 
     # -- input ---------------------------------------------------------
     def _select(self, row: int) -> None:
@@ -313,6 +374,10 @@ class ClusterWindow(QtWidgets.QWidget):
         super().resizeEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
+        # Before `closed`: the redraw that follows the close has to see the
+        # map unmasked, or the hidden clusters stay hidden with no window
+        # left to say why.
+        self.session.set_display_mask(self.vid, None, None)
         self.closed.emit(self.vid)
         super().closeEvent(event)
 

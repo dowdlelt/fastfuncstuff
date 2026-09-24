@@ -1858,6 +1858,52 @@ def test_changing_the_cluster_minimum_recomputes_the_table(win4d, qapp, tmp_path
     assert window.table.rowCount() == 1
 
 
+def test_hide_small_hides_what_the_table_left_out(win4d, qapp, tmp_path):
+    """The picture shows what the table lists: the 4-voxel blob under MIN goes,
+    the kept cluster and the sub-threshold background stay drawable."""
+    key, window = _clusters(win4d, qapp, tmp_path)
+    assert window.hide_small  # on by default
+    window.min_spin.setValue(10)
+    qapp.processEvents()
+    keep = win4d.session.display_mask(key)
+    assert keep is not None
+    keep = keep.cpu().numpy() > 0.5
+    assert not keep[8:10, 9:11, 1].any()  # the dropped blob
+    assert keep[1:5, 1:5, 1:3].all() and keep[0, 0, 0]
+
+    window.hide_check.setChecked(False)
+    qapp.processEvents()
+    assert win4d.session.display_mask(key) is None
+
+
+def test_within_bounds_clustering_and_drawing_by_another_layer(win4d, qapp, tmp_path):
+    """Pick a brain from the stack: clusters are cut to it, and closing the
+    window gives the picture back."""
+    from fastfuncstuff.viewer.vocab import AddOverlay, SelectLayer
+
+    key, window = _clusters(win4d, qapp, tmp_path)
+    brain = np.zeros((10, 12, 8), dtype=np.int16)
+    brain[:3] = 1  # half of the big blob, none of the small one
+    path = tmp_path / "brain.nii.gz"
+    nib.save(nib.Nifti1Image(brain, np.diag([3.0, 3.0, 3.0, 1.0])), str(path))
+    win4d.refresh(win4d.session.do(AddOverlay(str(path))))
+    brain_key = win4d.session.state.layers.layers[-1].key
+    win4d.refresh(win4d.session.do(SelectLayer(key)))
+    qapp.processEvents()
+
+    window.within_box.setCurrentIndex(window.within_box.findData(brain_key))
+    window.within_box.activated.emit(window.within_box.currentIndex())
+    qapp.processEvents()
+    assert window.within == brain_key
+    assert [window.table.item(r, 1).text() for r in range(window.table.rowCount())] == ["16"]
+    keep = win4d.session.display_mask(key).cpu().numpy() > 0.5
+    assert keep[:3].all() and not keep[3:].any()
+
+    window.close()
+    qapp.processEvents()
+    assert win4d.session.display_mask(key) is None
+
+
 # ---------------------------------------------------------------------------
 # controllers: A, B, ... as tabs
 # ---------------------------------------------------------------------------

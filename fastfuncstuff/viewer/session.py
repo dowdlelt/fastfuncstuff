@@ -163,6 +163,37 @@ def _short(name: str, limit: int = 24) -> str:
     return name if len(name) <= limit else "…" + name[-(limit - 1) :]
 
 
+def resample_mask_nearest(
+    mask: np.ndarray,
+    affine: np.ndarray,
+    shape: tuple[int, int, int],
+    target_affine: np.ndarray,
+) -> np.ndarray:
+    """A boolean volume on another grid, nearest neighbour, False outside it.
+
+    One z-slab at a time so a fine target grid never materialises every
+    voxel's source index at once.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    to_source = np.linalg.inv(np.asarray(affine, dtype=float)) @ np.asarray(
+        target_affine, dtype=float
+    )
+    rot, shift = to_source[:3, :3], to_source[:3, 3]
+    nx, ny, nz = (int(n) for n in shape)
+    ii, jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    plane = np.stack([ii.ravel(), jj.ravel(), np.zeros(ii.size)]).astype(float)
+    out = np.zeros((nx, ny, nz), dtype=bool)
+    bounds = np.asarray(mask.shape)[:, None]
+    for k in range(nz):
+        plane[2] = k
+        src = np.rint(rot @ plane + shift[:, None]).astype(np.int64)
+        inside = np.all((src >= 0) & (src < bounds), axis=0)
+        slab = np.zeros(plane.shape[1], dtype=bool)
+        slab[inside] = mask[src[0, inside], src[1, inside], src[2, inside]]
+        out[:, :, k] = slab.reshape(nx, ny)
+    return out
+
+
 def _voxel_size(affine: np.ndarray) -> float:
     """One number for how big this grid's voxels are: the cube root of one
     voxel's volume.
@@ -211,6 +242,12 @@ class ViewerSession:
         self._roi_sets: dict[str, RoiSet] = {}
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._clustsim: dict[str, dict] = {}
+        #: Display-only masks, ``{owner: {layer key: keep}}`` on each layer's own
+        #: grid. Keyed by owner so two windows masking one layer compose (AND)
+        #: and closing one takes away only its own.
+        self._display_masks: dict[str, dict[str, np.ndarray]] = {}
+        self._display_mask_tensors: dict[str, torch.Tensor] = {}
+        self._source_masks: dict[tuple[str, int], np.ndarray] = {}
         self._threshold_scales: dict[tuple[str, int], float] = {}
         #: Designs offered in graph windows, by resolved path.
         self.designs: dict[str, Design] = {}
@@ -1303,6 +1340,8 @@ class ViewerSession:
         self.invalidate(key)
         for stale in [k for k in self._threshold_scales if k[0] == key]:
             del self._threshold_scales[stale]
+        for stale in [k for k in self._source_masks if k[0] == key]:
+            del self._source_masks[stale]
         self.store.close(key)
 
     def run_script(self, text: str) -> Aspect:
@@ -1500,7 +1539,14 @@ class ViewerSession:
             self._clustsim[key] = cache
         return cache.get((int(nn), sidedness))
 
-    def clusterize(self, key: str | None = None, *, nn: int = 1, min_voxels: int = 1):
+    def clusterize(
+        self,
+        key: str | None = None,
+        *,
+        nn: int = 1,
+        min_voxels: int = 1,
+        mask: np.ndarray | None = None,
+    ):
         """Cluster one layer at the threshold it is currently drawn with.
 
         The layer's own threshold, not one passed in: a table computed at a
@@ -1542,7 +1588,62 @@ class ViewerSession:
             voxel_mm3=float(abs(np.linalg.det(affine[:3, :3]))),
             table=table,
             pthr=pthr,
+            mask=mask,
         )
+
+    # -- display masks -----------------------------------------------------
+    def mask_from_layer(self, source_key: str, like: Layer) -> np.ndarray:
+        """Where ``source_key`` has brain, as a boolean on ``like``'s grid.
+
+        An ROI layer already is a mask, so it is used as drawn (nonzero); any
+        other layer goes through ``processing/mask.py:automask`` on the
+        sub-brick it is showing. Nearest-neighbour onto ``like``'s grid, since
+        a mask interpolated is a mask with a fuzzy, made-up edge -- the anat's
+        1 mm brain boundary on a 3 mm map lands where the map's voxels are.
+        """
+        source = self.state.layers.get(source_key)
+        index = self.state.time_index if source.time_linked else source.volume_index
+        cache_key = (source_key, int(index))
+        native = self._source_masks.get(cache_key)
+        if native is None:
+            values = np.nan_to_num(np.asarray(self.volume(source_key, index), dtype=np.float32))
+            if source.roi:
+                native = values != 0
+            else:
+                from fastfuncstuff.processing.mask import automask
+
+                native = automask(torch.as_tensor(values)).cpu().numpy().astype(bool)
+            for stale in [k for k in self._source_masks if k[0] == source_key]:
+                del self._source_masks[stale]
+            self._source_masks[cache_key] = native
+        return resample_mask_nearest(native, source.affine, like.shape, like.affine)
+
+    def set_display_mask(self, owner: str, key: str | None, keep: np.ndarray | None) -> None:
+        """Hide one layer's voxels outside ``keep``, on behalf of ``owner``.
+
+        Display only, like :meth:`resample_mode`: readouts, graphs and cluster
+        tables still read every voxel. ``keep=None`` (or ``key=None``) drops
+        whatever ``owner`` was masking, so a window points its mask at a new
+        layer by setting it, and takes it away by closing.
+        """
+        before = self._display_masks.pop(owner, {})
+        if key is not None and keep is not None:
+            self._display_masks[owner] = {key: np.asarray(keep, dtype=bool)}
+        for stale in set(before) | ({key} if key else set()):
+            self._display_mask_tensors.pop(stale, None)
+
+    def display_mask(self, key: str) -> torch.Tensor | None:
+        """Every owner's mask on one layer, ANDed, as a float display tensor."""
+        hit = self._display_mask_tensors.get(key)
+        if hit is not None:
+            return hit
+        masks = [m[key] for m in self._display_masks.values() if key in m]
+        if not masks:
+            return None
+        keep = np.logical_and.reduce(masks) if len(masks) > 1 else masks[0]
+        tensor = torch.as_tensor(keep.astype(np.float32)).to(self.display_device)
+        self._display_mask_tensors[key] = tensor
+        return tensor
 
     def cluster_series(self, table, index: int) -> np.ndarray | None:
         """Mean time course of one cluster, from a run on the same grid.

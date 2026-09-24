@@ -138,3 +138,24 @@ def test_many_tiny_clusters_are_measured_like_a_few_big_ones():
         assert cluster.mean == pytest.approx(float(inside.mean()), rel=1e-5)
         w = np.abs(inside) / np.abs(inside).sum()
         assert np.allclose(cluster.com_ijk, (np.argwhere(picked) * w[:, None]).sum(0), atol=1e-4)
+
+
+def test_a_mask_bounds_clustering_like_3dclusterize_mask():
+    """A blob that runs out of the brain is sized by the part inside it, and
+    speckle outside is never a cluster at all."""
+    mask = np.zeros((12, 12, 6), dtype=bool)
+    mask[:3, :, :] = True  # cuts the big blob to 2 of its 4 columns, drops the small one
+    table = clusterize(_two_blobs(), threshold=2.0, mask=mask)
+    assert [c.n_voxels for c in table] == [16]
+    assert not table.labels[~mask].any()
+
+
+def test_dropped_marks_exactly_the_speckle_under_min_voxels():
+    """What HIDE SMALL hides: suprathreshold voxels whose cluster was too
+    small -- not the kept clusters, not the sub-threshold background."""
+    v = _two_blobs()
+    table = clusterize(v, threshold=2.0, min_voxels=10)
+    assert table.dropped is not None
+    assert int(table.dropped.sum()) == 4
+    assert np.all(v[table.dropped] == -6.0)
+    assert not (table.dropped & (table.labels > 0)).any()

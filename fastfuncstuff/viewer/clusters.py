@@ -85,6 +85,11 @@ class ClusterTable:
     alpha_range: tuple[float, float] | None = None
     #: Why there are no alphas, when there are none. Empty when there are.
     note: str = ""
+    #: Suprathreshold voxels whose cluster fell under ``min_voxels``. Hiding
+    #: exactly these -- rather than showing only ``labels`` -- is what lets a
+    #: display mask drop the speckle and still leave the sub-threshold alpha
+    #: ramp around the clusters that survived.
+    dropped: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.clusters)
@@ -120,6 +125,7 @@ def clusterize(
     voxel_mm3: float = 1.0,
     table=None,
     pthr: float | None = None,
+    mask: np.ndarray | None = None,
 ) -> ClusterTable:
     """Label a thresholded volume and measure every blob.
 
@@ -131,6 +137,10 @@ def clusterize(
     ``table`` is a :class:`~fastfuncstuff.stats.clustsim.ClustSimTable` from the
     dataset's own header; with it, and with a ``pthr`` to index it by, every
     cluster gets a corrected alpha.
+
+    ``mask`` restricts clustering to its nonzero voxels, as ``3dClusterize
+    -mask`` does: a blob that runs out of the brain is sized by the part
+    inside it, and speckle outside the brain is never a cluster at all.
     """
     from fastfuncstuff.stats.cluster import cluster_map
 
@@ -144,6 +154,10 @@ def clusterize(
         raise ValueError(
             f"the threshold sub-brick is {cut.shape} and the displayed one is {volume.shape}"
         )
+    if mask is not None:
+        if mask.shape != volume.shape:
+            raise ValueError(f"the mask is {mask.shape} and the map is {volume.shape}")
+        cut = np.where(np.asarray(mask, dtype=bool), cut, np.float32(0.0))
 
     # A negative-only map is the positive case on a flipped volume: one code
     # path for the labelling, and the peaks are still read off the original so
@@ -160,6 +174,7 @@ def clusterize(
     renumber = np.zeros(int(labels.max()) + 1, dtype=np.int32)
     for position, label in enumerate(keep):
         renumber[label] = position + 1
+    dropped = (labels > 0) & (renumber[labels] == 0)
     labels = renumber[labels]
 
     note = ""
@@ -188,6 +203,7 @@ def clusterize(
         pthr=pthr,
         alpha_range=None if table is None or pthr is None else table.alpha_range,
         note=note,
+        dropped=dropped,
     )
 
 

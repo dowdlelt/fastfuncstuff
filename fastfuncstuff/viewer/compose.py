@@ -165,7 +165,16 @@ def render_plane(
             sign_mode=layer.sign_mode,
             n_panes=layer.n_panes,
         )
+        # Zero the stat as well as the alpha: boxed edges are traced on the
+        # stat, and a cluster cut by the mask should be outlined where it is cut.
+        keep = session.display_mask(layer.key)
+        if keep is not None:
+            inside = extract_plane(keep, grid, layer.affine, plane, pos, view=view, mode="nearest")
+            inside = inside > 0.5
+            stat = torch.where(inside, stat, torch.zeros_like(stat))
         alpha, edges = _layer_alpha(layer, values, stat)
+        if keep is not None:
+            alpha = alpha * inside
         stacked.append((rgb, alpha))
         if edges is not None:
             box_overlays.append(edges)
