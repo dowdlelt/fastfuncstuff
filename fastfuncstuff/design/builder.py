@@ -2223,7 +2223,7 @@ def build_per_run_task_designs(
         bot, top = windows[c]
         if resolved == "FIR":
             # FIR samples at integer TR offsets.
-            n = max(1, int(np.ceil((top - bot) / tr)))
+            n = max(1, int(np.ceil((top - bot) / tr - 1e-9)))
         else:
             # TENT/CSPLIN: one knot per TR + 1 edge knot, unless overridden.
             if tent_n_basis_list[c] is not None:

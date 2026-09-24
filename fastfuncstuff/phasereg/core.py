@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from fastfuncstuff.phasereg.deming import deming_regression, ols_regression
@@ -163,26 +164,17 @@ def _build_task_design_tent(
     device: torch.device,
 ) -> list[torch.Tensor]:
     """Build per-run TENT design matrices for task removal."""
-    from fastfuncstuff.design.matrices import make_tent_design
+    from fastfuncstuff.design.builder import build_per_run_task_designs
 
     n_conditions = len(onsets_per_condition)
-    designs = []
-    for run_idx, n_tp in enumerate(n_timepoints_per_run):
-        cond_parts = []
-        for cond_idx in range(n_conditions):
-            onset_times = onsets_per_condition[cond_idx][run_idx]
-            tent = make_tent_design(
-                onset_times_list=[onset_times],
-                bot=0.0,
-                top=window,
-                tr=tr,
-                n_timepoints=n_tp,
-                zero_edges=False,
-                device=device,
-            )
-            cond_parts.append(tent)
-        designs.append(torch.cat(cond_parts, dim=1))
-    return designs
+    return build_per_run_task_designs(
+        [[np.asarray(o, dtype=np.float64) for o in runs] for runs in onsets_per_condition],
+        list(n_timepoints_per_run),
+        tr,
+        basis="TENT",
+        fir_window_s=[(0.0, float(window))] * n_conditions,
+        device=device,
+    ).per_run
 
 
 def _build_task_design_canonical(

@@ -2772,6 +2772,30 @@ def apply_trim_to_timing(
     return report
 
 
+def fir_lag_times(
+    model: str, bot: float, top: float, tr: float, n_knots: int | None = None
+) -> np.ndarray:
+    """Times (s) of each design column of a FIR / TENT / TENTZERO condition.
+
+    FIR lags sit on the TR grid from 0 up to (not including) ``top``.  TENT
+    knots span ``[bot, top]`` inclusive — ``n_knots`` of them, or one per TR
+    when unset; TENTZERO keeps only the interior knots (its edges are pinned
+    to zero).  The single place these counts are derived, so the design
+    builder, the labels and the beta slicing cannot disagree.
+    """
+    name = model.upper()
+    if name == "FIR":
+        return np.arange(max(1, int(np.ceil((top - bot) / tr - 1e-9)))) * tr
+    if n_knots is None:
+        n_knots = max(2, int(round((top - bot) / tr)) + 1)
+    knots = np.linspace(bot, top, int(n_knots))
+    if name == "TENTZERO":
+        if n_knots < 3:
+            raise ValueError(f"TENTzero needs at least 3 knots, got {n_knots}")
+        return knots[1:-1]
+    return knots
+
+
 def parse_hrf_model_args(
     hrf_model_arg: str,
     canonical_arg: str | None,
@@ -2859,15 +2883,11 @@ def parse_hrf_model_args(
             fir_bot = hrf_params["bot"]
             fir_top = hrf_params["top"]
             window_source = f"{hrf_model_str}"
-            if "n_basis" in hrf_params:
-                n_basis = hrf_params["n_basis"]
-            else:
-                # Default: 1 basis per TR
-                n_basis = int(np.ceil((fir_top - fir_bot) / tr))
+            n_knots = hrf_params["n_basis"] if "n_basis" in hrf_params else None
         elif fir_window_s is not None:
             fir_bot = 0.0
             fir_top = float(fir_window_s)
-            n_basis = max(1, int(np.ceil(fir_top / tr)))
+            n_knots = None
             window_source = "-fir_duration"
         else:
             # The response to a D-second block does not end at D seconds — the
@@ -2879,9 +2899,16 @@ def parse_hrf_model_args(
             from fastfuncstuff.design.hrf import estimate_hrf_window
 
             fir_bot = 0.0
-            n_basis = max(1, estimate_hrf_window(max(durations), tr))
-            fir_top = n_basis * tr
+            fir_top = max(1, estimate_hrf_window(max(durations), tr)) * tr
+            n_knots = None
             window_source = "estimated from durations"
+
+        # n_basis is the number of design COLUMNS per condition, which every
+        # consumer (labels, stim_bots, betas) indexes by.  FIR has one lag per
+        # TR; TENT has one knot per TR plus the closing edge unless the spec
+        # names the knot count; TENTZERO drops its two edge knots.
+        lag_times = fir_lag_times(hrf_model_name, fir_bot, fir_top, tr, n_knots)
+        n_basis = len(lag_times)
 
         print(
             f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, "
@@ -2891,8 +2918,7 @@ def parse_hrf_model_args(
         # Expand condition labels for FIR: cond1_t0.0s, cond1_t1.5s, ..., cond2_t0.0s, ...
         fir_condition_labels = []
         for cond_label in condition_labels:
-            for lag_idx in range(n_basis):
-                lag_time = fir_bot + lag_idx * (fir_top - fir_bot) / max(1, n_basis - 1)
+            for lag_time in lag_times:
                 fir_condition_labels.append(f"{cond_label}_t{lag_time:.1f}s")
         condition_labels_full = fir_condition_labels
     elif is_spm_deriv:
@@ -3425,6 +3451,91 @@ def resolve_cv_design(
     return resolved
 
 
+def microtime_offset_bins(microtime_offset: float, tr: float, microtime_dt: float) -> int:
+    """``microtime_offset`` (s) as the microtime bin a convolved HRF is sampled at.
+
+    The microtime grid has to land on the offset, or the model is sampled
+    somewhere the data were not; refuse rather than round silently.
+    """
+    if not 0.0 <= microtime_offset < tr:
+        raise ValueError(f"microtime offset must be in [0, TR={tr}) s, got {microtime_offset}")
+    bins = microtime_offset / microtime_dt
+    if abs(bins - round(bins)) > 1e-6:
+        raise ValueError(
+            f"microtime offset {microtime_offset} s is not a multiple of the "
+            f"{microtime_dt} s microtime step; choose a microtime step that divides it"
+        )
+    return int(round(bins))
+
+
+def _fir_family_design(
+    model: str,
+    *,
+    fir_bot: float | None,
+    fir_top: float | None,
+    n_basis: int | None,
+    all_onsets: list,
+    stim_durations: list[float],
+    run_starts: list[int],
+    n_timepoints: int,
+    tr: float,
+    microtime_offset: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """FIR / TENT / TENTZERO task block for the concatenated GLM timeline.
+
+    Built run by run through the shared per-run builder (the one deconvolve
+    and librarian use) and stacked, so a late event's lags never spill into
+    the next run and each condition gets its own columns.  ``n_basis`` is the
+    column count per condition (see :func:`fir_lag_times`).
+    """
+    from fastfuncstuff.design.builder import build_per_run_task_designs
+    from fastfuncstuff.design.matrices import run_lengths_from_starts
+
+    if fir_bot is None or fir_top is None or n_basis is None:
+        raise ValueError(f"{model} needs a window (bot, top) and a basis count")
+    n_conditions = len(all_onsets)
+    run_lengths = run_lengths_from_starts(run_starts, n_timepoints)
+    if model == "FIR":
+        basis = "FIR"
+        window: float | list[tuple[float, float]] = n_basis * tr
+        n_knots = None
+    else:
+        basis = "TENTzero" if model == "TENTZERO" else "TENT"
+        window = [(float(fir_bot), float(fir_top))] * n_conditions
+        n_knots = n_basis + 2 if basis == "TENTzero" else n_basis
+    per_cond_per_run = [
+        [np.asarray(o, dtype=np.float64) for o in cond_runs] for cond_runs in all_onsets
+    ]
+    result = build_per_run_task_designs(
+        per_cond_per_run,
+        run_lengths,
+        tr,
+        basis=basis,
+        durations_per_condition=list(stim_durations),
+        fir_window_s=window,
+        tent_n_basis=n_knots,
+        microtime_offset=microtime_offset,
+        # The GLM-family tools model a FIR block's lags as shifted boxcars.
+        fir_fill_durations=True,
+        device=device,
+    )
+    if basis == "FIR":
+        shifts = [
+            abs(round((float(t) - microtime_offset) / tr) * tr + microtime_offset - float(t))
+            for cond_runs in per_cond_per_run
+            for run_onsets in cond_runs
+            for t in run_onsets
+        ]
+        if shifts and max(shifts) > 1e-6:
+            print(
+                f"  FIR lags are whole TRs: onsets rounded to the TR grid "
+                f"(largest shift {max(shifts):.3f}s of a {tr:.3f}s TR). "
+                f"Use TENT/TENTZERO to keep sub-TR onset timing."
+            )
+    return torch.cat(result.per_run, dim=0)
+
+
 def build_task_design_from_args(
     hrf_model_name: str,
     is_fir_model: bool,
@@ -3444,6 +3555,7 @@ def build_task_design_from_args(
     hrf_library: torch.Tensor | None = None,
     hrf_indices: torch.Tensor | None = None,
     n_voxels: int | None = None,
+    microtime_offset: float = 0.0,
 ) -> tuple[torch.Tensor | None, dict | None]:
     """
     Build task design matrix based on HRF model type.
@@ -3489,6 +3601,10 @@ def build_task_design_from_args(
         HRF indices per voxel (n_voxels,)
     n_voxels : int | None, optional
         Number of voxels (for reporting with per-voxel HRFs)
+    microtime_offset : float, default 0.0
+        Within-TR time (s) each volume was sampled at (the ``-tzero`` the data
+        were slice-time corrected to).  Convolved models sample their microtime
+        HRF at this offset; FIR/TENT place their lags against it.
 
     Returns
     -------
@@ -3505,12 +3621,9 @@ def build_task_design_from_args(
     import sys
 
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
-    from fastfuncstuff.design.matrices import (
-        build_task_design,
-        make_fir_design,
-        make_tent_design,
-        onsets_to_tr_matrix,
-    )
+    from fastfuncstuff.design.matrices import build_task_design
+
+    microtime_onset = microtime_offset_bins(microtime_offset, tr, microtime_dt)
 
     def _event_design(hrf_bases: torch.Tensor) -> torch.Tensor:
         return build_task_design(
@@ -3519,6 +3632,7 @@ def build_task_design_from_args(
             run_starts,
             tr=tr,
             microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
             event_onsets=all_onsets,
             durations=stim_durations,
             device=device,
@@ -3555,52 +3669,22 @@ def build_task_design_from_args(
                 f"  Building {hrf_model_name} design matrix ({n_basis} basis functions per condition)"
             )
 
-            if hrf_model_name == "FIR":
-                onset_matrix_tr, max_shift = onsets_to_tr_matrix(
-                    all_onsets=all_onsets,
-                    run_starts=run_starts,
-                    n_timepoints=n_timepoints,
-                    tr=tr,
-                    durations=stim_durations,
-                    device=device,
-                )
-                if max_shift > 1e-6:
-                    print(
-                        f"  FIR lags are whole TRs: onsets rounded to the TR grid "
-                        f"(largest shift {max_shift:.3f}s of a {tr:.3f}s TR). "
-                        f"Use TENT/TENTZERO to keep sub-TR onset timing."
-                    )
-                task_design = make_fir_design(
-                    onsets=onset_matrix_tr,
-                    n_lags=n_basis,
-                    n_timepoints=n_timepoints,
-                    device=device,
-                )
-            elif hrf_model_name in ("TENT", "TENTZERO"):
-                onset_times_list = []
-                for cond_idx in range(n_conditions):
-                    cond_all_runs = []
-                    for run_idx, run_onsets in enumerate(all_onsets[cond_idx]):
-                        if len(run_onsets) > 0:
-                            cond_all_runs.append(run_onsets + run_starts[run_idx] * tr)
-                    if len(cond_all_runs) > 0:
-                        onset_times_list.append(np.concatenate(cond_all_runs))
-                    else:
-                        onset_times_list.append(np.array([], dtype=float))
-
-                task_design = make_tent_design(
-                    onset_times_list=onset_times_list,
-                    bot=fir_bot,
-                    top=fir_top,
-                    n_basis=n_basis,
-                    tr=tr,
-                    n_timepoints=n_timepoints,
-                    zero_edges=(hrf_model_name == "TENTZERO"),
-                    device=device,
-                )
-            else:
+            if hrf_model_name not in ("FIR", "TENT", "TENTZERO"):
                 print(f"ERROR: Unknown FIR model: {hrf_model_name}")
                 sys.exit(1)
+            task_design = _fir_family_design(
+                hrf_model_name,
+                fir_bot=fir_bot,
+                fir_top=fir_top,
+                n_basis=n_basis,
+                all_onsets=all_onsets,
+                stim_durations=stim_durations,
+                run_starts=run_starts,
+                n_timepoints=n_timepoints,
+                tr=tr,
+                microtime_offset=microtime_offset,
+                device=device,
+            )
 
             print(
                 f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors"
