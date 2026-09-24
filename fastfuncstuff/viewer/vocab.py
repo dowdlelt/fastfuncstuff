@@ -724,6 +724,17 @@ class SetRangeMirror(Command):
 
 @command
 @dataclass(frozen=True)
+class SetRangeFixed(Command):
+    """Keep a layer's colour scale when its displayed values change."""
+
+    name = "SET_RANGE_FIXED"
+    aspects = Aspect.COLORMAP
+    key: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetThresholdFollow(Command):
     """How the threshold sub-brick moves with the displayed one.
 
@@ -1288,7 +1299,12 @@ def install(
         changes: dict[str, object] = {"volume_index": value}
         if layer.threshold_follow == "next":
             changes["threshold_index"] = _next_brick(layer, value)
-        if session is not None and not layer.time_linked and layer.source == "file":
+        if (
+            session is not None
+            and not layer.time_linked
+            and layer.source == "file"
+            and not layer.range_fixed
+        ):
             # A bucket's sub-bricks are different quantities: an F's range is
             # no range for a beta, and a signed map drawn in "hot" hides half
             # of itself. So the colour scale is re-derived for the new one.
@@ -1324,6 +1340,14 @@ def install(
             changes.update(range_lo=-top, range_hi=top)
         st.layers.update(cmd.key, **changes)
         return SetRangeMirror.aspects
+
+    @bus.handle(SetRangeFixed.name)
+    def _set_range_fixed(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetRangeFixed)
+        if st.layers.get(cmd.key).range_fixed == bool(cmd.on):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, range_fixed=bool(cmd.on))
+        return SetRangeFixed.aspects
 
     @bus.handle(SetThresholdFollow.name)
     def _set_threshold_follow(cmd: Command, st: ViewerState) -> Aspect:

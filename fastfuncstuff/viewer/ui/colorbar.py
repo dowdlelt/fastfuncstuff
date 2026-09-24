@@ -217,6 +217,7 @@ class RangeBar(QtWidgets.QWidget):
 
     range_changed = QtCore.Signal(float, float)
     mirror_changed = QtCore.Signal(bool)
+    fixed_changed = QtCore.Signal(bool)
     threshold_changed = QtCore.Signal(float)
     autorange_requested = QtCore.Signal()
     reverse_requested = QtCore.Signal()
@@ -273,7 +274,17 @@ class RangeBar(QtWidgets.QWidget):
         self.mirror_check = QtWidgets.QCheckBox("mirror")
         self.mirror_check.setToolTip("Hold min at -max, so zero stays in the middle of the bar")
         self.mirror_check.clicked.connect(lambda on: self.mirror_changed.emit(bool(on)))
-        numbers.addWidget(self.mirror_check)
+        self.fixed_check = QtWidgets.QCheckBox("fixed")
+        self.fixed_check.setToolTip(
+            "Keep min and max when the values change -- another sub-brick, an\n"
+            "InstaGLM setting. Off re-derives the scale each time; auto always does."
+        )
+        self.fixed_check.clicked.connect(lambda on: self.fixed_changed.emit(bool(on)))
+        checks = QtWidgets.QHBoxLayout()
+        checks.setSpacing(4)
+        checks.addWidget(self.mirror_check)
+        checks.addWidget(self.fixed_check)
+        numbers.addLayout(checks)
         numbers.addStretch(1)
         numbers.addWidget(self._caption("min"))
         numbers.addWidget(self.min_spin)
@@ -371,6 +382,7 @@ class RangeBar(QtWidgets.QWidget):
                 spin.setSingleStep(step)
                 spin.setValue(value)
             self.mirror_check.setChecked(bool(layer.range_mirror))
+            self.fixed_check.setChecked(bool(layer.range_fixed))
             # Faded rather than hidden: the number is still true, just not yours to set.
             self.min_spin.setEnabled(not layer.range_mirror)
             self._thresholds_itself = thresholds_itself(layer)

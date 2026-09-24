@@ -288,13 +288,30 @@ def test_the_overlay_kind_follows_the_map_being_shown(glm_session):
 def test_switching_to_a_different_question_takes_the_new_scale(glm_session):
     """A beta in percent signal change, a t and an R2 are three questions under
     one layer, and a threshold set on one of them describes none of the others.
-    Keeping the beta range would render the R2 map flat."""
+    Keeping the beta range would render the R2 map flat -- unless FIXED says
+    the scale is the user's, which the next test covers."""
     _enter(glm_session, events=glm_session.events, show="beta")
+    key = glm_session.state.layers.find_by_source(SOURCE).key
+    glm_session.state.layers.update(key, range_fixed=False)
     glm_session.set_mode_param("show", "R2")
     layer = glm_session.state.layers.find_by_source(SOURCE)
     assert (layer.range_lo, layer.range_hi) == (0.0, 1.0)
     assert layer.threshold == pytest.approx(0.05)
     assert layer.colormap == "hot"
+
+
+def test_a_fixed_scale_survives_switching_the_question(glm_session):
+    """FIXED (the default) is the user saying the scale is theirs: a range they
+    typed stays through a change of map. The threshold still follows, since a
+    t cut left on an R2 map would hide all of it."""
+    _enter(glm_session, events=glm_session.events, show="beta")
+    key = glm_session.state.layers.find_by_source(SOURCE).key
+    assert glm_session.state.layers.get(key).range_fixed
+    glm_session.state.layers.update(key, range_lo=-5.0, range_hi=5.0)
+    glm_session.set_mode_param("show", "R2")
+    layer = glm_session.state.layers.get(key)
+    assert (layer.range_lo, layer.range_hi) == (-5.0, 5.0)
+    assert layer.threshold == pytest.approx(0.05)
 
 
 def test_a_refit_leaves_the_threshold_you_set_alone(glm_session):

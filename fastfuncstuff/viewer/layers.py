@@ -100,6 +100,11 @@ class Layer:
     range_hi: float | None = None
     #: Hold min at -max, so a signed map's zero stays mid-bar while max moves.
     range_mirror: bool = False
+    #: Keep min/max (and the colormap) when the layer's values change under
+    #: it: a bucket stepped to another sub-brick, a mode's output switching
+    #: kind. On by default, because a scale you typed is a decision and every
+    #: automatic re-derive undid it; AUTO still re-derives when asked.
+    range_fixed: bool = True
 
     threshold: float = 0.0
     #: Sub-brick supplying the threshold statistic. ``None`` thresholds on the

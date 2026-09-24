@@ -86,6 +86,7 @@ from fastfuncstuff.viewer.vocab import (
     SetMode,
     SetModeParam,
     SetRange,
+    SetRangeFixed,
     SetRangeMirror,
     SetResample,
     SetSeed,
@@ -1213,6 +1214,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rangebar.autorange_requested.connect(self._autorange)
         self.rangebar.reverse_requested.connect(self._reverse_colormap)
         self.rangebar.mirror_changed.connect(lambda on: self._apply(SetRangeMirror, on=on))
+        self.rangebar.fixed_changed.connect(lambda on: self._apply(SetRangeFixed, on=on))
 
         # Kept as attributes so the rest of the window (and the tests) address
         # them by the name of the thing they control, not through the composite.

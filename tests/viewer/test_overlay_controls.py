@@ -61,8 +61,16 @@ def _brick(session, index):
 
 
 # ---------------------------------------------------------------------------
-# the colour scale follows the sub-brick shown
+# the colour scale follows the sub-brick shown -- when it is not FIXED
 # ---------------------------------------------------------------------------
+
+
+def _unfixed(session):
+    from fastfuncstuff.viewer.vocab import SetRangeFixed
+
+    key = _stats(session).key
+    session.do(SetRangeFixed(key, False))
+    return key
 
 
 def test_an_f_starts_hot_from_zero_with_alpha_off(session):
@@ -75,7 +83,7 @@ def test_an_f_starts_hot_from_zero_with_alpha_off(session):
 def test_a_signed_sub_brick_turns_red_blue_and_symmetric(session):
     from fastfuncstuff.viewer.vocab import SetVolume
 
-    session.do(SetVolume(_stats(session).key, 1))
+    session.do(SetVolume(_unfixed(session), 1))
     layer = _stats(session)
     assert layer.colormap == "redblue"
     assert layer.range_lo == pytest.approx(-layer.range_hi)
@@ -95,11 +103,27 @@ def test_a_colormap_someone_chose_survives_a_sub_brick_change(session):
     assert _stats(session).colormap == "viridis"
 
 
+def test_a_fixed_scale_stays_through_sub_brick_changes(session):
+    """FIXED is the default: a range someone typed is not re-derived when they
+    step through a bucket's conditions. AUTO still re-derives on request."""
+    from fastfuncstuff.viewer.vocab import SetRange, SetVolume
+
+    key = _stats(session).key
+    assert _stats(session).range_fixed
+    session.do(SetRange(key, 0.0, 5.0))
+    before = _stats(session).colormap
+    for index in (1, 2, 0):
+        session.do(SetVolume(key, index))
+        layer = _stats(session)
+        assert (layer.range_lo, layer.range_hi) == (0.0, 5.0)
+        assert layer.colormap == before
+
+
 def test_the_range_ignores_the_zeros_outside_the_mask(session):
     """Counting them put the 98th percentile of a masked beta near nothing."""
     from fastfuncstuff.viewer.vocab import SetVolume
 
-    session.do(SetVolume(_stats(session).key, 2))
+    session.do(SetVolume(_unfixed(session), 2))
     beta_t = np.abs(_brick(session, 2))
     assert _stats(session).range_hi > np.percentile(beta_t[beta_t > 0], 50)
 
@@ -308,6 +332,14 @@ def test_mirror_fades_min_and_tracks_max(win, qapp):
     layer = win.session.state.layers.overlay
     assert (layer.range_lo, layer.range_hi) == (-3.5, 3.5)
     assert win.min_spin.value() == -3.5
+
+
+def test_the_fixed_box_starts_ticked_and_drives_the_layer(win, qapp):
+    assert win.rangebar.fixed_check.isChecked()
+    win.rangebar.fixed_check.click()
+    qapp.processEvents()
+    assert not win.session.state.layers.overlay.range_fixed
+    assert not win.rangebar.fixed_check.isChecked()
 
 
 def test_a_tiny_p_reads_and_types_in_scientific_notation(qapp, tmp_path):

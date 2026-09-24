@@ -1252,12 +1252,11 @@ class ViewerSession:
                 **cut,
             )
             if overlay.rescale:
-                changes.update(
-                    colormap=overlay.colormap,
-                    range_lo=lo,
-                    range_hi=hi,
-                    threshold=overlay.threshold or 0.0,
-                )
+                changes["threshold"] = overlay.threshold or 0.0
+                # FIXED is the user saying the scale is theirs; the threshold
+                # still follows, since a t cut left on an R2 map hides it all.
+                if not existing.range_fixed:
+                    changes.update(colormap=overlay.colormap, range_lo=lo, range_hi=hi)
             if changes:
                 self.state.layers.update(key, **changes)
         else:
