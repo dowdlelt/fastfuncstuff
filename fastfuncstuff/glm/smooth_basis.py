@@ -315,10 +315,12 @@ class _FoldPenalty:
     test: torch.Tensor
 
 
-def _fold_penalty(design64: np.ndarray, n_task: int, penalty, train, test, device) -> _FoldPenalty:
+def _fold_penalty(
+    design64: np.ndarray, n_task: int, penalty, train, test, device, score64: np.ndarray
+) -> _FoldPenalty:
     spec = _spectrum(design64[train.numpy()], n_task, penalty)
-    x_test = design64[test.numpy(), :n_task]
-    nuis = design64[test.numpy(), n_task:]
+    x_test = score64[test.numpy(), :n_task]
+    nuis = score64[test.numpy(), n_task:]
     nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
     q = np.zeros((test.numel(), 0))
     if nuis.shape[1]:
@@ -354,6 +356,8 @@ def fit_smooth_selected(
     log10_grid: np.ndarray | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
+    score_data: torch.Tensor | None = None,
+    score_design: torch.Tensor | None = None,
 ) -> SmoothSelection:
     """Smooth FIR/TENT fit choosing lambda by ``rule`` and, with several
     ``penalties``, the penalty by held-out runs -- per voxel.
@@ -367,6 +371,11 @@ def fit_smooth_selected(
     closed form in the fold's shared spectrum -- ``||y - M d.z||^2`` from
     ``M'y`` and ``M'M`` -- so the grid costs no refits.  The final betas are
     refitted on all runs with the chosen configuration.
+
+    ``score_data``/``score_design`` (same shapes as ``data``/``design``) are
+    what held-out runs are scored against, when that differs from what is
+    fitted -- prewhitened fits are trained on whitened data but scored on the
+    raw series, so their R^2 compares with an unwhitened fit's.
     """
     if rule not in SMOOTH_RULES:
         raise ValueError(f"rule must be one of {SMOOTH_RULES}, got {rule!r}")
@@ -401,12 +410,17 @@ def fit_smooth_selected(
     lams = torch.exp(log_grid)
     bounds = list(run_starts) + [n_t]
     design64 = design.detach().cpu().double().numpy()
+    score64 = design64 if score_design is None else score_design.detach().cpu().double().numpy()
+    score_src = data if score_data is None else score_data
     folds = []
     for r in range(len(run_starts)):
         test = torch.arange(bounds[r], bounds[r + 1])
         train = torch.cat([torch.arange(0, bounds[r]), torch.arange(bounds[r + 1], n_t)])
         folds.append(
-            [_fold_penalty(design64, n_task, pen, train, test, device) for pen in penalties]
+            [
+                _fold_penalty(design64, n_task, pen, train, test, device, score64)
+                for pen in penalties
+            ]
         )
 
     n_lam = int(lams.numel()) if rule == "loro" else 1
@@ -423,8 +437,9 @@ def fit_smooth_selected(
         total_sq = torch.zeros(b - a, dtype=torch.float64, device=device)
         n_test = 0
         y_all = data[a:b].to(device=device, dtype=torch.float64)
+        y_score = y_all if score_data is None else score_src[a:b].to(device, torch.float64)
         for fold in folds:
-            y_te = y_all[:, fold[0].test.to(device)]
+            y_te = y_score[:, fold[0].test.to(device)]
             if fold[0].q_test.shape[1]:
                 y_te = y_te - (y_te @ fold[0].q_test) @ fold[0].q_test.T
             yy_te = (y_te * y_te).sum(dim=1)
@@ -495,3 +510,158 @@ def fit_smooth_selected(
         xval_r2=xval_r2.float(),
         xval_selection_biased=rule == "loro" or n_pen > 1,
     )
+
+
+def _residual_autocorr(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    betas: torch.Tensor,
+    run_starts: list[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Within-run lag-1/lag-2 autocorrelation of the fit's residuals, and its R^2.
+
+    Residual = the data minus the task fit, projected off the nuisance.  Lags
+    never pair samples across a run boundary.
+    """
+    n_vox, n_t = data.shape
+    design64 = design.detach().cpu().double().numpy()
+    nuis = design64[:, n_task:]
+    nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
+    q = np.zeros((n_t, 0))
+    if nuis.shape[1]:
+        u, sv, _ = np.linalg.svd(nuis, full_matrices=False)
+        q = u[:, sv > sv.max() * 1e-10]
+    q_t = torch.as_tensor(q, dtype=torch.float64, device=device)
+    x_t = torch.as_tensor(design64[:, :n_task], dtype=torch.float64, device=device)
+    same_run = torch.ones(n_t - 1, dtype=torch.bool)
+    same_run2 = torch.ones(max(n_t - 2, 0), dtype=torch.bool)
+    for start in list(run_starts)[1:]:
+        same_run[start - 1] = False
+        same_run2[max(start - 2, 0) : start] = False
+    same_run, same_run2 = same_run.to(device), same_run2.to(device)
+    rho1 = torch.zeros(n_vox, dtype=torch.float64)
+    rho2 = torch.zeros(n_vox, dtype=torch.float64)
+    r2 = torch.zeros(n_vox, dtype=torch.float32)
+    chunk = estimate_chunk_size(n_vox, n_t, n_task, device, operation="glm")
+    for a in range(0, n_vox, chunk):
+        b = min(a + chunk, n_vox)
+        y = data[a:b].to(device=device, dtype=torch.float64)
+        res = y - betas[a:b].to(device, torch.float64) @ x_t.T
+        if q_t.shape[1]:
+            res = res - (res @ q_t) @ q_t.T
+        var = (res * res).sum(dim=1).clamp_min(1e-30)
+        rho1[a:b] = ((res[:, 1:] * res[:, :-1])[:, same_run].sum(dim=1) / var).cpu()
+        rho2[a:b] = ((res[:, 2:] * res[:, :-2])[:, same_run2].sum(dim=1) / var).cpu()
+        r2[a:b] = cod_from_ss_residual(y.float(), (res * res).sum(dim=1).float()).cpu()
+    return rho1, rho2, r2
+
+
+#: ARMA(1,1) grid the voxels are binned on for prewhitening.
+ARMA_A_GRID = np.round(np.arange(0.0, 0.91, 0.1), 2)
+ARMA_B_GRID = np.round(np.arange(-0.8, 0.81, 0.1), 2)
+
+
+def arma_bins(rho1: torch.Tensor, rho2: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest ARMA(1,1) grid pair per voxel from its lag-1/lag-2 autocorrelation.
+
+    ARMA(1,1) correlations are ``[1, lam, lam*a, lam*a^2, ...]``, so the moments
+    give ``lam = rho1`` and ``a = rho2 / rho1``.  Returns ``(grid, index)``:
+    the ``(n_pairs, 2)`` grid and each voxel's row in it.
+    """
+    from fastfuncstuff.glm.arma import compute_arma_lambda
+
+    pairs = [
+        (a, b)
+        for a in ARMA_A_GRID
+        for b in ARMA_B_GRID
+        if compute_arma_lambda(float(a), float(b)) >= 0
+    ]
+    grid = np.array(pairs)
+    lam_grid = np.array([compute_arma_lambda(float(a), float(b)) for a, b in pairs])
+    lam = rho1.clamp(0.0, 0.95).numpy()
+    a_hat = np.where(lam > 1e-3, rho2.numpy() / np.maximum(lam, 1e-3), 0.0).clip(0.0, 0.9)
+    cost = (grid[None, :, 0] - a_hat[:, None]) ** 2 + (lam_grid[None, :] - lam[:, None]) ** 2
+    return grid, cost.argmin(axis=1)
+
+
+def fit_smooth_arma(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    penalties: list[np.ndarray],
+    run_starts: list[int],
+    *,
+    rule: str = "reml",
+    lam: float | None = None,
+    xval: bool = False,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> tuple[SmoothSelection, torch.Tensor]:
+    """:func:`fit_smooth_selected` under ARMA(1,1) noise, prewhitened per voxel group.
+
+    REML and GCV assume white noise; autocorrelated noise looks like signal to
+    them.  Pass 1 fits white; its residuals give each voxel's within-run
+    lag-1/lag-2 autocorrelation, which sets an ARMA(1,1) bin
+    (:func:`arma_bins`).  Each bin's data and design are prewhitened with the
+    run-block-diagonal ARMA covariance (``glm.arma.build_arma11_covariance``,
+    ffs_reml's noise model) and refitted.  Whitening never mixes runs, so
+    held-out runs stay held out; they are scored on the RAW series, so
+    ``xval_r2`` compares directly with a white fit's.  Returns the selection
+    and each voxel's ``(a, b)`` as ``(V, 2)``.
+    """
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+
+    device = device if device is not None else torch.device("cpu")
+    n_vox, n_t = data.shape
+    white = fit_smooth_selected(
+        data, design, n_task, penalties, run_starts, rule=rule, lam=lam, device=device
+    )
+    rho1, rho2, _ = _residual_autocorr(data, design, n_task, white.fit.betas, run_starts, device)
+    grid, which = arma_bins(rho1, rho2)
+    design64 = design.detach().cpu().double()
+    betas = torch.zeros((n_vox, n_task), dtype=torch.float32)
+    out_lam = torch.ones(n_vox, dtype=torch.float32)
+    out_edf = torch.zeros(n_vox, dtype=torch.float32)
+    pen_idx = torch.zeros(n_vox, dtype=torch.long)
+    xval_r2 = torch.zeros(n_vox, dtype=torch.float32) if xval else None
+    for k in tqdm(
+        np.unique(which), desc="  ARMA bins", unit="bin", leave=True, disable=not verbose
+    ):
+        idx = torch.as_tensor(np.nonzero(which == k)[0])
+        a, b = float(grid[k, 0]), float(grid[k, 1])
+        cov = build_arma11_covariance(
+            a, b, n_t, torch.device("cpu"), dtype=torch.float64, run_starts=list(run_starts)
+        )
+        chol = (
+            torch.eye(n_t, dtype=torch.float64)
+            if cov is None or (a == 0.0 and b == 0.0)
+            else torch.linalg.cholesky(cov)
+        )
+        design_w = torch.linalg.solve_triangular(chol, design64, upper=False)
+        sub_w = torch.linalg.solve_triangular(chol, data[idx].double().T, upper=False).T
+        sel = fit_smooth_selected(
+            sub_w.float(),
+            design_w,
+            n_task,
+            penalties,
+            run_starts,
+            rule=rule,
+            lam=lam,
+            xval=xval,
+            device=device,
+            score_data=data[idx],
+            score_design=design64,
+        )
+        betas[idx] = sel.fit.betas
+        out_lam[idx] = sel.fit.lam
+        out_edf[idx] = sel.fit.edf
+        pen_idx[idx] = sel.penalty_index
+        if xval_r2 is not None and sel.xval_r2 is not None:
+            xval_r2[idx] = sel.xval_r2
+    _, _, r2 = _residual_autocorr(data, design, n_task, betas, run_starts, device)
+    arma = torch.as_tensor(grid[which], dtype=torch.float32)
+    fit = SmoothBasisFit(betas=betas, lam=out_lam, edf=out_edf, r2=r2, method=rule)
+    biased = rule == "loro" or len(penalties) > 1
+    return SmoothSelection(fit, pen_idx, xval_r2, biased), arma

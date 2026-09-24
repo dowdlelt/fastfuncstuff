@@ -249,3 +249,35 @@ def test_ffs_tps_is_a_smoothed_csplin_preset_with_passthrough(tmp_path, capsys):
     assert "Smoothing (reml, gp:3)" in capsys.readouterr().out
     for name in ("iresp_face", "smooth_edf", "xval_r2"):
         assert np.isfinite(nib.load(f"{prefix}_{name}.nii.gz").get_fdata()).all()
+
+
+def test_smooth_noise_arma_writes_the_ab_map(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "ar")
+    argv = [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        timing,
+        "-model",
+        "TENT",
+        "-window",
+        "0",
+        "16",
+        "-prefix",
+        prefix,
+        "-device",
+        "cpu",
+        "-tent-smooth",
+        "-smooth-noise",
+        "arma",
+        "-save-xval-r2",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    ab = nib.load(f"{prefix}_smooth_arma.nii.gz").get_fdata()
+    assert ab.shape[-1] == 2 and np.isfinite(ab).all()
+    assert np.isfinite(nib.load(f"{prefix}_xval_r2.nii.gz").get_fdata()).all()

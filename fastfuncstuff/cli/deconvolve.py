@@ -527,6 +527,16 @@ def parse_args():
         "penalty's lambda by REML and the penalty by held-out runs.",
     )
     model_opts.add_argument(
+        "-smooth-noise",
+        choices=["white", "arma"],
+        default="white",
+        help="Noise model for -tent-smooth. arma: estimate each voxel's ARMA(1,1) "
+        "autocorrelation from a first white fit's residuals, prewhiten (per run, "
+        "ffs_reml's model) and refit, so REML/GCV see white noise; held-out R² is "
+        "still scored on the raw data. Writes <prefix>_smooth_arma (a, b). Costs a "
+        "second fit per ARMA bin.",
+    )
+    model_opts.add_argument(
         "-pool-conditions",
         nargs="?",
         const="all",
@@ -2202,6 +2212,7 @@ def main(argv: list[str] | None = None):
 
     smooth_fit = None
     smooth_sel = None
+    smooth_arma = None
     if smooth_method is not None:
         from fastfuncstuff.glm.smooth_basis import fit_smooth_selected, penalty_matrix
 
@@ -2215,18 +2226,26 @@ def main(argv: list[str] | None = None):
             )
             for spec in smooth_specs
         ]
-        smooth_sel = fit_smooth_selected(
-            packed.data_concat,
-            packed.design_concat,
-            packed.n_task_cols,
-            smooth_pens,
-            list(run_starts),
+        smooth_kwargs = dict(
             rule=smooth_method,
             lam=smooth_lam,
             xval=bool(args.save_xval_r2),
             device=device,
             verbose=args.verb >= 1,
         )
+        smooth_args = (
+            packed.data_concat,
+            packed.design_concat,
+            packed.n_task_cols,
+            smooth_pens,
+            list(run_starts),
+        )
+        if args.smooth_noise == "arma":
+            from fastfuncstuff.glm.smooth_basis import fit_smooth_arma
+
+            smooth_sel, smooth_arma = fit_smooth_arma(*smooth_args, **smooth_kwargs)
+        else:
+            smooth_sel = fit_smooth_selected(*smooth_args, **smooth_kwargs)
         smooth_fit = smooth_sel.fit
         results = smooth_fit
         if args.verb >= 1:
@@ -2281,15 +2300,16 @@ def main(argv: list[str] | None = None):
         ]
         if smooth_sel is not None and len(smooth_specs) > 1:
             maps.append(("smooth_penalty", smooth_sel.penalty_index.float()))
+        if smooth_arma is not None:
+            maps.append(("smooth_arma", smooth_arma))
         for name, values in maps:
             path = f"{args.prefix}_{name}{_nii_ext}"
             t_write = time.perf_counter()
+            vol = _to_volume(values.numpy().reshape(values.shape[0], -1))
+            if vol.shape[-1] == 1:
+                vol = vol[..., 0]
             with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(
-                    _to_volume(values.numpy().reshape(-1, 1)).squeeze(-1),
-                    path,
-                    reference_img=input_files[0],
-                )
+                save_nifti(vol, path, reference_img=input_files[0])
             _announce_written(path, time.perf_counter() - t_write, args.verb)
 
     if args.save_xval_r2:

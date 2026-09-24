@@ -185,3 +185,10 @@ def test_penalty_specs_parse_and_reject():
     for bad in ("diff0", "gp:0", "gp:x", "spline"):
         with pytest.raises(ValueError):
             parse_penalty_spec(bad)
+
+
+def test_arma_bins_recover_ar1_from_its_moments():
+    from fastfuncstuff.glm.smooth_basis import arma_bins
+
+    grid, which = arma_bins(torch.tensor([0.0, 0.7, 0.4]), torch.tensor([0.0, 0.49, 0.16]))
+    np.testing.assert_allclose(grid[which], [[0.0, 0.0], [0.7, 0.0], [0.4, 0.0]], atol=1e-9)
