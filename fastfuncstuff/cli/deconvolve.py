@@ -70,6 +70,7 @@ try:
         add_cv_strategy_arg,
         add_device_arg,
         add_load_threads_arg,
+        add_microtime_offset_arg,
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
@@ -84,19 +85,19 @@ try:
         parse_timing_spec,
         preflight_check,
         print_cli_header,
+        resolve_microtime_offset,
         run_lengths_from_starts,
         setup_device,
         spinner,
         trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
+        build_per_run_task_designs,
         legendre_polynomials,
         pack_for_shared_task_glm,
     )
     from fastfuncstuff.design.matrices import (
         is_tr_locked,
-        make_csplin_design,
-        make_tent_design,
         save_iresp,
     )
     from fastfuncstuff.glm.core import fit_glm
@@ -491,6 +492,8 @@ def parse_args():
     add_verbose_arg(out_opts, default=0)
 
     # Hardware options
+    add_microtime_offset_arg(model_opts)
+
     hw_opts = parser.add_argument_group("Hardware Options")
     hw_opts.add_argument(
         "--cpu",
@@ -675,6 +678,7 @@ def _compute_loro_r2_matrix(
     device: torch.device,
     verbose: bool,
     max_voxels: int = 500_000,
+    microtime_offset: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute LORO-CV R² for each candidate window top, for each active voxel.
@@ -739,28 +743,19 @@ def _compute_loro_r2_matrix(
             Q_per_run.append(None)
         data_clean.append(data_r.cpu())
 
-    use_csplin = model in ("CSPLIN", "CSPLINzero")
-    zero_edges = model in ("TENTzero", "CSPLINzero")
-
     def _build_designs_clean(top_val: float) -> list[torch.Tensor]:
         """Build poly-projected TENT/CSPLIN designs for one window top."""
         out = []
-        for run_idx, n_tp in enumerate(n_tp_per_run):
-            cond_parts = []
-            for c in range(n_conditions):
-                fn = make_csplin_design if use_csplin else make_tent_design
-                cond_parts.append(
-                    fn(
-                        [onsets_per_condition[c][run_idx]],
-                        bot,
-                        top_val,
-                        tr,
-                        n_tp,
-                        zero_edges=zero_edges,
-                        device=device,
-                    )
-                )
-            design_r = torch.cat(cond_parts, dim=1)
+        per_run = build_per_run_task_designs(
+            onsets_per_condition,
+            n_tp_per_run,
+            tr,
+            basis=model,
+            fir_window_s=[(bot, top_val)] * n_conditions,
+            microtime_offset=microtime_offset,
+            device=device,
+        ).per_run
+        for run_idx, design_r in enumerate(per_run):
             Q = Q_per_run[run_idx]
             if Q is not None:
                 design_r = design_r - Q @ (Q.T @ design_r)
@@ -790,6 +785,7 @@ def _xval_tent_top(
     polort: int,
     device: torch.device,
     verbose: bool,
+    microtime_offset: float = 0.0,
 ) -> tuple[float, float]:
     """
     Select the best shared window top via LORO CV.
@@ -811,6 +807,7 @@ def _xval_tent_top(
         device,
         verbose,
         max_voxels=50_000,
+        microtime_offset=microtime_offset,
     )
     n_vox = len(vox_idx)
 
@@ -1052,6 +1049,13 @@ def main():
 
     if args.verb >= 1:
         print(f"  Total timepoints: {n_timepoints} across {n_runs} runs")
+    try:
+        microtime_offset = resolve_microtime_offset(
+            args.microtime_offset, input_files, tr, verbose=args.verb >= 1
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Resolve polort: "A" → AFNI auto formula based on run duration
     polort_str = str(args.polort).strip().upper()
@@ -1116,9 +1120,14 @@ def main():
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets
 
-        onsets_per_condition = round_onsets(onsets_per_condition, tr, threshold=args.round_onsets)
+        onsets_per_condition = round_onsets(
+            onsets_per_condition, tr, threshold=args.round_onsets, microtime_offset=microtime_offset
+        )
         if args.verb >= 1:
-            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
+            where = (
+                f" (sample times, {microtime_offset:g} s into each TR)" if microtime_offset else ""
+            )
+            print(f"\nOnsets rounded to TR boundaries{where} (threshold={args.round_onsets:.2f})")
 
     # For BIDS, round_durations was already applied per-event inside parse_bids_events
     if args.round_durations is not None and condition_durations is not None and not args.events:
@@ -1137,7 +1146,7 @@ def main():
     all_onset_times = []
     for cond_onsets in onsets_per_condition:
         for run_onsets in cond_onsets:
-            all_onset_times.extend(run_onsets.tolist())
+            all_onset_times.extend((run_onsets - microtime_offset).tolist())
 
     # Determine model type
     if args.model == "AUTO":
@@ -1581,6 +1590,7 @@ def main():
                         polort=args.polort,
                         device=device,
                         verbose=args.verb >= 1,
+                        microtime_offset=microtime_offset,
                     )
 
                     tent_windows = [(nom_bot, best_top)] * n_conditions
@@ -1599,7 +1609,6 @@ def main():
     # ── Per-voxel window selection ────────────────────────────────────────────
     if _do_per_voxel:
         zero_edges_pv = model in ("TENTzero", "CSPLINzero")
-        use_csplin_pv = model in ("CSPLIN", "CSPLINzero")
 
         # 1. LORO R² for every candidate window, all active voxels (no subsampling cap)
         if args.verb >= 1:
@@ -1616,6 +1625,7 @@ def main():
             device=device,
             verbose=args.verb >= 1,
             max_voxels=500_000,
+            microtime_offset=microtime_offset,
         )
         # r2_matrix: (n_candidates, n_vox); vox_idx indexes the LOADED voxel axis
 
@@ -1691,25 +1701,16 @@ def main():
 
         def _per_run_designs_for_top(top_val: float) -> list[torch.Tensor]:
             """Per-run task-only designs for one candidate window top."""
-            out = []
-            for run_idx, n_tp in enumerate(n_timepoints_per_run):
-                cond_parts = []
-                fn = make_csplin_design if use_csplin_pv else make_tent_design
-                for cond_idx in range(n_conditions):
-                    cond_parts.append(
-                        fn(
-                            onset_times_list=[onsets_per_condition[cond_idx][run_idx]],
-                            bot=_pv_bot,
-                            top=top_val,
-                            tr=tr,
-                            n_timepoints=n_tp,
-                            n_basis=args.tent_n_basis,
-                            zero_edges=zero_edges_pv,
-                            device=torch.device("cpu"),
-                        )
-                    )
-                out.append(torch.cat(cond_parts, dim=1))
-            return out
+            return build_per_run_task_designs(
+                onsets_per_condition,
+                list(n_timepoints_per_run),
+                tr,
+                basis=model,
+                fir_window_s=[(_pv_bot, top_val)] * n_conditions,
+                tent_n_basis=args.tent_n_basis,
+                microtime_offset=microtime_offset,
+                device=torch.device("cpu"),
+            ).per_run
 
         for top_k in tqdm(unique_tops_pv, desc="  Fitting", disable=not args.verb >= 1):
             vox_this_top = np.where(full_best_top == top_k)[0]
@@ -1806,8 +1807,6 @@ def main():
     if args.verb >= 1:
         print("\nBuilding design matrices...")
 
-    from fastfuncstuff.design.builder import build_per_run_task_designs
-
     # The shared builder accepts (bot, top) windows per condition for
     # TENT/CSPLIN, or a scalar `top` for FIR (bot=0 always).
     if model == "FIR":
@@ -1833,6 +1832,7 @@ def main():
         condition_labels=list(condition_labels),
         fir_window_s=per_cond_window,
         tent_n_basis=args.tent_n_basis,
+        microtime_offset=microtime_offset,
         device=device,
     )
 

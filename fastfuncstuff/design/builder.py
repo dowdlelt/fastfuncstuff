@@ -1708,9 +1708,10 @@ def round_onsets(
     all_onsets: list[list[np.ndarray]],
     tr: float,
     threshold: float = 0.7,
+    microtime_offset: float = 0.0,
 ) -> list[list[np.ndarray]]:
     """
-    Snap onset times to TR boundaries.
+    Snap onset times to the sample grid ``n * tr + microtime_offset``.
 
     For each onset *t*:
 
@@ -1731,6 +1732,11 @@ def round_onsets(
         Repetition time in seconds.
     threshold : float, default=0.7
         Fractional position within a TR above which an onset rounds up.
+    microtime_offset : float, default=0.0
+        Within-TR time (s) the volumes were sampled at.  Snapping to ``n * tr``
+        instead would leave every event ``microtime_offset`` off the samples —
+        at ~TR/2 exactly the mid-TR timing TENT cannot resolve — so events go
+        onto the samples, and rounding + TENT stays the FIR it is meant to be.
 
     Returns
     -------
@@ -1745,13 +1751,14 @@ def round_onsets(
             if arr.size == 0:
                 cond_result.append(arr)
                 continue
+            arr = arr - microtime_offset
             remainder = arr % tr
             rounded = np.where(
                 remainder / tr >= threshold,
                 np.ceil(arr / tr) * tr,
                 np.floor(arr / tr) * tr,
             )
-            cond_result.append(rounded)
+            cond_result.append(rounded + microtime_offset)
         result.append(cond_result)
     return result
 

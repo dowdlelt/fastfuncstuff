@@ -171,3 +171,38 @@ def test_slice_time_corrected_header_round_trips_the_sample_time(tmp_path, with_
     info = read_info(fixed)
     assert info.time_offset == pytest.approx(0.75)
     assert sample_time_offset(info) == pytest.approx(0.75)
+
+
+def test_round_onsets_snaps_to_sample_times_so_round_plus_tent_is_fir():
+    from fastfuncstuff.design.builder import round_onsets
+
+    onsets = [[np.array([3.1, 10.9, 20.4])]]
+    rounded = round_onsets(onsets, 2.0, threshold=0.5, microtime_offset=1.0)[0][0]
+    np.testing.assert_allclose(rounded, [3.0, 11.0, 21.0])  # on n*2 + 1
+    tent = make_tent_design([rounded], 0.0, 8.0, 2.0, 20, device=CPU, microtime_offset=1.0)
+    # Each event now sits on a sample: every row holds a single 1, i.e. FIR.
+    assert set(tent[tent != 0].tolist()) == {1.0}
+    assert round_onsets(onsets, 2.0, threshold=0.5)[0][0].tolist() == [4.0, 10.0, 20.0]
+
+
+def test_resolve_microtime_offset_prefers_flag_then_header(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.cli_utils import resolve_microtime_offset
+    from fastfuncstuff.io.afni import mark_slice_time_corrected, save_nifti
+
+    def run(name, tzero):
+        img = nib.Nifti1Image(np.zeros((2, 2, 2, 5), np.float32), np.eye(4))
+        img.header.set_xyzt_units("mm", "sec")
+        if tzero is not None:
+            mark_slice_time_corrected(img.header, tzero)
+        path = tmp_path / name
+        save_nifti(np.asarray(img.dataobj), path, header=img.header)
+        return str(path)
+
+    a, b, plain = run("a.nii", 0.5), run("b.nii", 0.5), run("c.nii", None)
+    assert resolve_microtime_offset(None, [a, b], 2.0, verbose=False) == 0.5
+    assert resolve_microtime_offset(None, [plain], 2.0, verbose=False) == 0.0
+    assert resolve_microtime_offset(0.0, [a], 2.0, verbose=False) == 0.0
+    with pytest.raises(ValueError, match="different sample times"):
+        resolve_microtime_offset(None, [a, plain], 2.0, verbose=False)

@@ -2394,6 +2394,62 @@ def add_load_threads_arg(parser_or_group) -> None:
     )
 
 
+def add_microtime_offset_arg(parser_or_group) -> None:
+    """Register ``-microtime_offset``; resolve with :func:`resolve_microtime_offset`."""
+    parser_or_group.add_argument(
+        "-microtime_offset",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Within-TR time (s) each volume was sampled at, i.e. the -tzero the data "
+        "were slice-time corrected to. Every model (convolved, FIR, TENT) is sampled "
+        "there, and -round_onsets snaps onto it. Default: read from the input header "
+        "(ffs_slicetime and 3dTshift record it as the time origin); 0 when the header "
+        "has none or still lists per-slice times. 0 = start of the volume "
+        "(ffs_slicetime -tzero 0, what autoproc uses).",
+    )
+
+
+def resolve_microtime_offset(
+    explicit: float | None,
+    input_files: list[str],
+    tr: float,
+    verbose: bool = True,
+) -> float:
+    """The within-TR sample time (s) a design should use.
+
+    An explicit value wins.  Otherwise every input header is asked for its
+    uniform sample time (:func:`fastfuncstuff.io.dsetinfo.sample_time_offset`):
+    runs that disagree are refused, since one design offset cannot serve both;
+    a header with per-slice times (not slice-time corrected) gives 0, the
+    first-slice convention every design used before this existed.
+    """
+    from fastfuncstuff.io.dsetinfo import read_info, sample_time_offset
+
+    if explicit is not None:
+        offset, source = float(explicit), "-microtime_offset"
+    else:
+        found = {}
+        for path in input_files:
+            try:
+                found[path] = sample_time_offset(read_info(path))
+            except Exception:  # an unreadable header is the loader's error to report
+                found[path] = None
+        uniform = {round(v, 6) for v in found.values() if v is not None}
+        if len(uniform) > 1:
+            listing = ", ".join(f"{Path(p).name}={v:g}s" for p, v in found.items())
+            raise ValueError(
+                f"input runs record different sample times ({listing}); pass "
+                "-microtime_offset to choose one, or slice-time correct them alike"
+            )
+        offset, source = (uniform.pop() if uniform else 0.0), "input header"
+    if not 0.0 <= offset < tr:
+        raise ValueError(f"-microtime_offset must be in [0, TR={tr}) s, got {offset}")
+    if verbose and (offset or explicit is not None):
+        print(f"  Microtime offset: volumes sampled {offset:g} s into each TR ({source})")
+    return offset
+
+
 def add_device_arg(
     parser_or_group,
     *,
