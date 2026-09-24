@@ -966,10 +966,10 @@ def _compute_xval_r2_map(
     return r2.cpu().numpy().astype(np.float32)
 
 
-def main():
-    """Main CLI entry point"""
+def main(argv: list[str] | None = None):
+    """Main CLI entry point (``argv`` lets presets such as ffs_tps call in)."""
     parser = parse_args()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem  # overwrite with clean stem

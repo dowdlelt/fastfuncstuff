@@ -14,7 +14,7 @@ Analysis tools:
   ffs_pathfinder    - Joint HRF + denoising optimization
   ffs_reml          - ARMA(1,1) prewhitened GLM (like AFNI 3dREMLfit)
   ffs_ridge         - Fractional ridge regression with per-voxel regularization
-  ffs_tps           - Thin-plate spline HRF estimation
+  ffs_tps           - Smooth spline HRF (preset of ffs_deconvolve -model CSPLIN -tent-smooth)
   ffs_xval_r2       - Cross-validated R-squared computation
 
 Image processing tools:

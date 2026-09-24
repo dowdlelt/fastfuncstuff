@@ -216,3 +216,36 @@ def test_pool_timing_merges_runs_and_keeps_the_longest_duration():
     assert pooled.condition_labels == ["all"] and pooled.durations == [2.0]
     assert [o.tolist() for o in pooled.all_onsets[0]] == [[1.0, 2.0, 5.0], [3.0]]
     assert note is not None and "2 s" in note
+
+
+def test_ffs_tps_is_a_smoothed_csplin_preset_with_passthrough(tmp_path, capsys):
+    from fastfuncstuff.cli import tps
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "tps")
+    rc = tps.main(
+        [
+            "-input",
+            *runs,
+            "-stim-times",
+            timing,
+            "-stim-labels",
+            "face",
+            "-tps-window",
+            "0",
+            "16",
+            "-output-prefix",
+            prefix,
+            "-penalty",
+            "gp:3",
+            "-verb",
+            "1",
+            "-device",
+            "cpu",
+            "-save-xval-r2",
+        ]
+    )
+    assert rc == 0
+    assert "Smoothing (reml, gp:3)" in capsys.readouterr().out
+    for name in ("iresp_face", "smooth_edf", "xval_r2"):
+        assert np.isfinite(nib.load(f"{prefix}_{name}.nii.gz").get_fdata()).all()

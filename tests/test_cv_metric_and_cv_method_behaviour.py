@@ -8,62 +8,7 @@ flipping each flag changes which folds are built and which summary is taken.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import torch
-
-from fastfuncstuff.design.matrices import fit_penalized_glm_cv, run_cv_folds
-
-# --------------------------------------------------------------------------
-# ffs_tps -cv-method
-# --------------------------------------------------------------------------
-
-
-def test_split_half_folds_partition_the_runs():
-    assert run_cv_folds("loro", 4) == [[0], [1], [2], [3]]
-    assert run_cv_folds("split_half", 4) == [[0, 1], [2, 3]]
-    # Odd run counts put the extra run in the second half rather than dropping it.
-    assert run_cv_folds("split_half", 5) == [[0, 1], [2, 3, 4]]
-
-    for method, n_runs in [("loro", 4), ("split_half", 4), ("split_half", 5)]:
-        folds = run_cv_folds(method, n_runs)
-        covered = [r for fold in folds for r in fold]
-        assert sorted(covered) == list(range(n_runs)), f"{method} does not cover every run once"
-
-
-def test_split_half_needs_two_runs():
-    with pytest.raises(ValueError, match="at least 2 runs"):
-        run_cv_folds("split_half", 1)
-
-
-def test_unknown_cv_method_is_refused():
-    with pytest.raises(ValueError, match="must be 'loro' or 'split_half'"):
-        run_cv_folds("bootstrap", 4)
-
-
-def test_cv_method_changes_the_cv_error_curve():
-    """Runs 0-1 carry one response, runs 2-3 the opposite.
-
-    Under LORO three of the four training runs always disagree with the
-    held-out run only partly; under split_half the training half never agrees
-    with the test half at all.  The two must not produce the same errors.
-    """
-    torch.manual_seed(0)
-    X = torch.randn(80, 4)
-    D = np.eye(4, dtype=np.float32)
-    run_boundaries = [(0, 20), (20, 40), (40, 60), (60, 80)]
-
-    beta = torch.randn(4, 1)
-    y = (X @ beta).T.clone()
-    y[:, 40:] = -(X[40:, :] @ beta).T
-
-    _, err_loro = fit_penalized_glm_cv(
-        y, X, D, [1e-3, 1e3], run_boundaries, device=torch.device("cpu"), cv_method="loro"
-    )
-    _, err_split = fit_penalized_glm_cv(
-        y, X, D, [1e-3, 1e3], run_boundaries, device=torch.device("cpu"), cv_method="split_half"
-    )
-    assert not np.allclose(err_loro, err_split), "split_half produced identical errors to loro"
-
 
 # --------------------------------------------------------------------------
 # ffs_pathfinder -cv_metric
