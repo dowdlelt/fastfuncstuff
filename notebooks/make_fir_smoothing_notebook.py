@@ -315,6 +315,10 @@ For each outer fold, λ is picked by:
 | `loro_biased` | the sum of held-out errors over **all** outer folds, including the one scored (what `-tent-smooth loro -save-xval-r2` reports) | **no**: optimistic |
 | fixed λ curve | one λ for every voxel (a single number chosen from the whole brain costs ~nothing) | yes |
 
+"REML" and "GCV" here are criteria for the **smoothing strength λ**: a restricted
+likelihood with white noise (`-smooth-noise white`, the default). They are *not*
+`ffs_reml`'s ARMA(1,1) autocorrelation model; `-smooth-noise arma` is not used here.
+
 With 3 runs the inner LORO trains on **one** run, so it tends to over-smooth (less
 data wants more smoothing). That makes `loro_nested` a conservative lower bound
 for LORO.
