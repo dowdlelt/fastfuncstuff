@@ -228,8 +228,12 @@ def fit_smooth_basis(
         betas = (d * z) @ w.T
         rss = (yy - (z2 * (2 * d - d * d * (1.0 - s)[None, :])).sum(dim=1)).clamp_min(0.0)
         out_b[a:b] = betas.float().cpu()
-        out_lam[a:b] = lam_v.float().cpu()
-        out_edf[a:b] = ((1.0 - s)[None, :] * d).sum(dim=1).float().cpu()
+        # Empty voxels (nothing left after the nuisance) have no lambda to choose:
+        # report lambda 1 / edf 0 rather than the grid edge a flat criterion lands on.
+        empty = yy <= 1e-12 * n_t
+        out_lam[a:b] = torch.where(empty, torch.ones_like(lam_v), lam_v).float().cpu()
+        edf = ((1.0 - s)[None, :] * d).sum(dim=1)
+        out_edf[a:b] = torch.where(empty, torch.zeros_like(edf), edf).float().cpu()
         out_r2[a:b] = cod_from_ss_residual(y, rss.float()).cpu()
     return SmoothBasisFit(betas=out_b, lam=out_lam, edf=out_edf, r2=out_r2, method=method)
 
@@ -299,5 +303,10 @@ def loro_r2_smooth(
             total[a:b] += y.sum(dim=1).cpu()
             total_sq[a:b] += (y * y).sum(dim=1).cpu()
         n_total += test.numel()
-    ss_tot = (total_sq - total * total / n_total).clamp_min(1e-30)
-    return (1.0 - ss_res / ss_tot).float()
+    ss_tot = total_sq - total * total / n_total
+    # A voxel with nothing to explain (outside the brain, masked to zero) scores
+    # 0, as compute_xval_r2 does -- 0/0 would otherwise read as a perfect R^2.
+    live = ss_tot > 1e-12 * n_total
+    r2 = torch.zeros(n_vox, dtype=torch.float64)
+    r2[live] = 1.0 - ss_res[live] / ss_tot[live]
+    return r2.float()

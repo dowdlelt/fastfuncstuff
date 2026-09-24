@@ -121,3 +121,16 @@ def test_smoothing_raises_held_out_r2_where_timing_is_poor():
     pen = roughness_penalty(res.n_basis_per_condition)
     smooth = loro_r2_smooth(y, design, k, pen, [0, T]).numpy()
     assert np.median(smooth) > np.median(_loro_ols(y, design, k))
+
+
+def test_loro_scores_empty_voxels_zero_not_one():
+    """Unmasked runs fit zero-valued out-of-brain voxels; 0/0 must not read as R^2 = 1."""
+    from fastfuncstuff.glm.smooth_basis import loro_r2_smooth
+
+    y, design, k, _, res = _problem(0.0, amp=2.0)
+    y[:5] = 0.0
+    r2 = loro_r2_smooth(y, design, k, roughness_penalty(res.n_basis_per_condition), [0, T])
+    assert (r2[:5] == 0).all()
+    np.testing.assert_allclose(r2[:5].numpy(), _loro_ols(y, design, k)[:5])
+    fit = fit_smooth_basis(y, design, k, roughness_penalty(res.n_basis_per_condition))
+    assert (fit.edf[:5] == 0).all() and (fit.lam[:5] == 1).all()
