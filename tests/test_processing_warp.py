@@ -15,6 +15,7 @@ from fastfuncstuff.processing.warp import (
     QwarpConfig,
     WarpState,
     _autobox,
+    _blur_for_patch,
     _checkerboard_phases,
     _compute_hfactor,
     _compute_support_padding,
@@ -125,8 +126,10 @@ class TestQwarpConfig:
     def test_defaults(self):
         cfg = QwarpConfig()
         assert cfg.minpatch == 25
-        assert cfg.blur_base == 0.0
-        assert cfg.blur_source == 0.0
+        assert cfg.blur_base == pytest.approx(2.345)
+        assert cfg.blur_source == pytest.approx(2.345)
+        assert cfg.pblur_base == 0.0
+        assert cfg.pblur_source == 0.0
         assert cfg.use_quintic is False
         assert cfg.use_lite is True
         assert cfg.cost_method == "pearclp"
@@ -191,6 +194,40 @@ class TestQwarpConfig:
         assert cfg.cost_method == "lpa"
         assert cfg.warp_flags == 3
         assert cfg.axis_weights == (0.5, 1.0, 0.5)
+
+
+class TestRegistrationBlur:
+    def test_progressive_fwhm_matches_afni_quadrature(self, monkeypatch):
+        import fastfuncstuff.processing.weight as weight_mod
+
+        seen = []
+
+        def fake_gaussian(vol, sigma):
+            seen.append(sigma)
+            return vol + 1
+
+        monkeypatch.setattr(weight_mod, "_gaussian_smooth_3d", fake_gaussian)
+        vol = torch.zeros(9, 16, 25)
+        out = _blur_for_patch(vol, 2.0, 0.1, (8, 27, 64))
+        progressive = 0.1 * (8 * 27 * 64) ** (1 / 3)
+        expected_fwhm = math.hypot(2.0, progressive)
+        assert seen == [pytest.approx(expected_fwhm / 2.355)]
+        torch.testing.assert_close(out, vol + 1)
+
+    def test_negative_fixed_blur_selects_median_filter(self, monkeypatch):
+        import fastfuncstuff.processing.weight as weight_mod
+
+        seen = []
+
+        def fake_median(vol, radius):
+            seen.append(radius)
+            return vol + 1
+
+        monkeypatch.setattr(weight_mod, "_median_filter_ball", fake_median)
+        vol = torch.zeros(5, 5, 5)
+        out = _blur_for_patch(vol, -2.0, 0.0, (5, 5, 5))
+        assert seen == [pytest.approx(2.0)]
+        torch.testing.assert_close(out, vol + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1081,8 @@ class TestPatchWriteBackDedup:
             base.clone(),
             initial_warp=(zero, zero, zero),
             config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
                 max_level=0,
                 reject_worse_levels=True,
                 batch_optimizer_iters_lev0=1,
@@ -1078,6 +1117,8 @@ class TestPatchWriteBackDedup:
             base.clone(),
             initial_warp=(zero, zero, zero),
             config=QwarpConfig(
+                blur_base=0.0,
+                blur_source=0.0,
                 max_level=1,
                 minpatch=5,
                 reject_worse_levels=True,

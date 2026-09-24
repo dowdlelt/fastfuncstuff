@@ -134,7 +134,7 @@ TOO MUCH WARP (anatomy distorted, ripples, folding)
   * The last level or two makes things worse: -early_stop rolls back and stops at
     the first level that degrades the global cost (off by default -- AFNI runs every
     level). -maxlev N is the deterministic version once you know where it turns.
-  * Noise being chased: -blur BASE SRC (FWHM mm) or -pblur to blur proportionally
+  * Noise being chased: -blur BASE SRC (FWHM voxels) or -pblur to blur proportionally
     to the patch size at each level.
   * Distortion correction only: turn off the axes that cannot physically move
     (-noXdis/-noZdis for an AP phase encode), or soften with -axweight; with a
@@ -746,20 +746,23 @@ def parse_args(
     )
     g_blur.add_argument(
         "-blur",
-        nargs=2,
+        nargs="+",
         type=float,
         default=None,
-        metavar=("BASE_FWHM", "SRC_FWHM"),
-        help="Gaussian blur FWHM in mm applied to base and source. E.g. -blur 2.0 2.0",
+        metavar="FWHM",
+        help="Registration-only blur FWHM in voxels. One value applies to both base "
+        "and source; two set them separately. Negative values select AFNI's median "
+        "filter [default: 2.345 2.345]",
     )
     g_blur.add_argument(
         "-pblur",
-        nargs=2,
+        nargs="*",
         type=float,
         default=None,
-        metavar=("BASE_FRAC", "SRC_FRAC"),
-        help="Progressive blur: fraction of patch size used as blur FWHM "
-        "at each level. Blur decreases as patches get smaller",
+        metavar="FRACTION",
+        help="Progressive blur fraction of geometric patch width. Zero, one, or two "
+        "values are accepted like AFNI; bare -pblur means 0.09 0.09. Values above "
+        "0.25 are clamped [default: off]",
     )
 
     # ── Weight Image ────────────────────────────────────────────────────
@@ -913,6 +916,10 @@ def parse_args(
     )
 
     args = p.parse_args(argv, namespace or argparse.Namespace())
+    if args.blur is not None and len(args.blur) not in (1, 2):
+        p.error("-blur accepts one or two values")
+    if args.pblur is not None and len(args.pblur) > 2:
+        p.error("-pblur accepts zero, one, or two values")
     # After parsing, so that "did the user type this flag" is answerable from
     # argv rather than guessed by comparing values against defaults.
     apply_recipe_preset(
@@ -1884,10 +1891,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     if args.blur is not None:
         config.blur_base = args.blur[0]
-        config.blur_source = args.blur[1]
+        config.blur_source = args.blur[-1]
     if args.pblur is not None:
-        config.pblur_base = args.pblur[0]
-        config.pblur_source = args.pblur[1]
+        pblur = args.pblur or [0.09]
+        config.pblur_base = min(0.25, max(0.0, pblur[0]))
+        config.pblur_source = min(0.25, max(0.0, pblur[-1]))
 
     # Load motion parameters for dynamic axis weighting
     motion_params = None
