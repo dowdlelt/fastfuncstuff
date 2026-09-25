@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Command
@@ -134,6 +135,8 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         self.pane.stepped.connect(self._step)
         self.pane.panned.connect(self._pan_by)
+        self.pane.slid.connect(self._slide)
+        self.pane.turned.connect(self._turn)
         v.addWidget(self.pane, 1)
         # Two thirds of what it used to be. An EPI slice is 64 to 100 voxels
         # across, so a 420-pixel window was showing it at four times its own
@@ -180,6 +183,13 @@ class ImageWindow(QtWidgets.QWidget):
                     "opacity slider for the selected layer",
                     self._toggle_opacity,
                     group="layer",
+                ),
+                Binding("drag the ring", "turn the moving image", None, group="align mode"),
+                Binding(
+                    "drag the centre",
+                    "slide it (or shift-drag anywhere)",
+                    None,
+                    group="align mode",
                 ),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
@@ -259,6 +269,70 @@ class ImageWindow(QtWidgets.QWidget):
         self.opacity_slider.blockSignals(False)
         self.opacity_name.setText("" if layer is None else layer.name)
         self.opacity_value.setText(f"{pct}%")
+
+    # -- align mode ----------------------------------------------------
+    def _align_mode(self):
+        """The active align mode, when it has an image to move."""
+        mode = self.session.mode
+        if mode.name != "align" or mode.moving() is None:
+            return None
+        return mode
+
+    def _screen_axes(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """World millimetres per image pixel down the rows and along the columns.
+
+        Through the plane's layout, flips included, so a drag moves the image
+        the way the hand moved on screen whichever way the grid is stored.
+        """
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return None
+        layout = plane_layout(state.grid.affine, vp.plane)
+        linear = np.asarray(state.grid.affine, dtype=float)[:3, :3]
+        down = linear[:, layout.row] * (-1.0 if layout.row_flip else 1.0)
+        right = linear[:, layout.col] * (-1.0 if layout.col_flip else 1.0)
+        return down, right
+
+    def _slide(self, d_row: float, d_col: float) -> None:
+        mode, axes = self._align_mode(), self._screen_axes()
+        if mode is None or axes is None:
+            return
+        down, right = axes
+        command = mode.move_to(mode.shifted(d_row * down + d_col * right))
+        if command is not None:
+            self._dispatch(command)
+
+    def _turn(self, degrees: float) -> None:
+        """Clockwise on screen: about ``right x down``, which points at the viewer."""
+        mode, axes = self._align_mode(), self._screen_axes()
+        if mode is None or axes is None:
+            return
+        down, right = axes
+        command = mode.move_to(mode.turned(np.cross(right, down), degrees))
+        if command is not None:
+            self._dispatch(command)
+
+    def _handle_position(self) -> tuple[float, float] | None:
+        """The pivot, projected into this window's image, in (row, col) pixels."""
+        mode = self._align_mode()
+        state = self.session.state
+        vp = self._viewport()
+        if mode is None or state.grid is None or vp is None:
+            return None
+        centre = mode.pivot_mm()
+        view = plane_view(state, vp)
+        if centre is None or view is None:
+            return None
+        ijk = np.linalg.inv(state.grid.affine) @ np.append(centre, 1.0)
+        layout = view.layout
+        row, col = float(ijk[layout.row]), float(ijk[layout.col])
+        if layout.row_flip:
+            row = state.grid.shape[layout.row] - 1 - row
+        if layout.col_flip:
+            col = state.grid.shape[layout.col] - 1 - col
+        r0, c0 = view.origin
+        return (row - r0, col - c0)
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
@@ -392,6 +466,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_zoomed(not view.is_identity)
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
         self.pane.set_readout(self.session.overlay_readout())
+        self.pane.set_handle(self._handle_position())
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
         """Footprints of the graphs reading this plane, in image indices.

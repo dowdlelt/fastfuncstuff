@@ -34,6 +34,16 @@ class ImagePane(QtWidgets.QWidget):
     #: Right-button drag, in image pixels. Left stays the crosshair, because
     #: moving where you are looking is the gesture you make most.
     panned = QtCore.Signal(float, float)
+    #: Align-mode drags. ``slid`` is in image pixels (row, col); ``turned`` in
+    #: degrees, positive clockwise on screen. ``released`` ends a drag.
+    slid = QtCore.Signal(float, float)
+    turned = QtCore.Signal(float)
+    released = QtCore.Signal()
+
+    #: The rotation ring's radius as a fraction of the drawn image's short side,
+    #: and how close to it (widget pixels) a press counts as grabbing it.
+    RING = 0.32
+    GRAB = 9.0
 
     def __init__(self, plane: Plane, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -48,6 +58,12 @@ class ImagePane(QtWidgets.QWidget):
         self._labels: tuple[str, str, str, str] | None = None
         self._readout: list[str] = []
         self._zoomed = False
+        #: Where the align handle sits, as fractional (row, col) image indices,
+        #: or ``None`` outside align mode. The ring is drawn around it.
+        self._handle: tuple[float, float] | None = None
+        self._grab: str | None = None
+        self._grab_at: QtCore.QPointF | None = None
+        self._grab_angle = 0.0
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -99,6 +115,13 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_handle(self, where: tuple[float, float] | None) -> None:
+        """Show the align ring around an image point, or hide it (``None``)."""
+        where = None if where is None else (float(where[0]), float(where[1]))
+        if where != self._handle:
+            self._handle = where
+            self.update()
 
     def set_coverage(self, boxes: list[tuple[int, int, int, int]]) -> None:
         """Say which voxels the open graphs are reading, in image indices.
@@ -169,6 +192,8 @@ class ImagePane(QtWidgets.QWidget):
 
         if self._cross is not None:
             self._paint_crosshair(p, rect)
+        if self._handle is not None:
+            self._paint_handle(p, rect)
 
         p.setPen(QtGui.QColor.fromRgbF(*c.label))
         font = p.font()
@@ -223,6 +248,63 @@ class ImagePane(QtWidgets.QWidget):
                 row, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, text
             )
 
+    def _handle_geometry(self) -> tuple[QtCore.QPointF, float] | None:
+        """The handle's centre and the ring's radius, in widget pixels."""
+        rect = self._target_rect()
+        if self._handle is None or self._image is None or rect.isEmpty():
+            return None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        row, col = self._handle
+        centre = QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy)
+        return centre, self.RING * min(rect.width(), rect.height())
+
+    def _paint_handle(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        geometry = self._handle_geometry()
+        if geometry is None:
+            return
+        centre, radius = geometry
+        colour = QtGui.QColor.fromRgbF(0.35, 0.85, 1.0, 0.9)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        ring = QtGui.QPen(colour)
+        ring.setWidthF(3.0 if self._grab == "turn" else 1.5)
+        p.setPen(ring)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawEllipse(centre, radius, radius)
+        # Ticks on the ring, so a turn is visible as the ring's own motion.
+        for k in range(4):
+            angle = k * np.pi / 2 + np.pi / 4
+            inner = centre + QtCore.QPointF(np.cos(angle), np.sin(angle)) * (radius - 5)
+            outer = centre + QtCore.QPointF(np.cos(angle), np.sin(angle)) * (radius + 5)
+            p.drawLine(QtCore.QLineF(inner, outer))
+        dot = QtGui.QPen(colour)
+        dot.setWidthF(3.0 if self._grab == "slide" else 1.5)
+        p.setPen(dot)
+        p.drawEllipse(centre, 6.0, 6.0)
+        p.drawLine(QtCore.QLineF(centre.x() - 3, centre.y(), centre.x() + 3, centre.y()))
+        p.drawLine(QtCore.QLineF(centre.x(), centre.y() - 3, centre.x(), centre.y() + 3))
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+
+    def _grab_kind(self, pos: QtCore.QPointF, shift: bool) -> str | None:
+        """What a left press here takes hold of: the ring, the handle, or nothing."""
+        geometry = self._handle_geometry()
+        if geometry is None:
+            return None
+        centre, radius = geometry
+        distance = float(np.hypot(pos.x() - centre.x(), pos.y() - centre.y()))
+        if abs(distance - radius) <= self.GRAB:
+            return "turn"
+        if distance <= self.GRAB + 4 or shift:
+            return "slide"
+        return None
+
+    def _angle(self, pos: QtCore.QPointF) -> float:
+        geometry = self._handle_geometry()
+        if geometry is None:
+            return 0.0
+        centre, _ = geometry
+        return float(np.degrees(np.arctan2(pos.y() - centre.y(), pos.x() - centre.x())))
+
     def _paint_crosshair(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
         assert self._cross is not None and self._image is not None
         row, col = self._cross
@@ -273,10 +355,19 @@ class ImagePane(QtWidgets.QWidget):
                 return
             self._drag_from = event.position()
             return
+        mods = event.modifiers()
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+            kind = self._grab_kind(event.position(), shift)
+            if kind is not None:
+                self._grab = kind
+                self._grab_at = event.position()
+                self._grab_angle = self._angle(event.position())
+                self.update()
+                return
         idx = self._to_indices(event.position())
         if idx is None:
             return
-        mods = event.modifiers()
         if mods & (
             QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier
         ):
@@ -296,9 +387,31 @@ class ImagePane(QtWidgets.QWidget):
             return
         if not (event.buttons() & QtCore.Qt.MouseButton.LeftButton):
             return
+        if self._grab is not None and self._grab_at is not None:
+            if self._grab == "slide":
+                scale = self._image_scale()
+                delta = event.position() - self._grab_at
+                self._grab_at = event.position()
+                self.slid.emit(delta.y() / scale, delta.x() / scale)
+            else:
+                angle = self._angle(event.position())
+                step = (angle - self._grab_angle + 180.0) % 360.0 - 180.0
+                self._grab_angle = angle
+                if step:
+                    self.turned.emit(step)
+            return
         idx = self._to_indices(event.position())
         if idx is not None:
             self.picked.emit(*idx)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._grab is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._grab = None
+            self._grab_at = None
+            self.update()
+            self.released.emit()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 (Qt)
         delta = event.angleDelta().y()
