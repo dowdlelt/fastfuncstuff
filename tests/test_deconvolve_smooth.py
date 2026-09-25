@@ -309,7 +309,6 @@ def _per_run_argv(runs, timing, prefix, *extra):
 
 def test_per_run_writes_one_curve_per_run_with_se_and_xval(monkeypatch, tmp_path, capsys):
     from fastfuncstuff.cli import deconvolve
-    from fastfuncstuff.io.headers import read_brick_labels
 
     runs, timing = _dataset(tmp_path)
     prefix = str(tmp_path / "pr")
@@ -321,17 +320,19 @@ def test_per_run_writes_one_curve_per_run_with_se_and_xval(monkeypatch, tmp_path
     out = capsys.readouterr().out
     assert "one run predicting the others (fold lambda)" in out
     pooled = nib.load(f"{prefix}_iresp_stim.nii.gz").get_fdata()
-    curves = nib.load(f"{prefix}_perrun_iresp_stim.nii.gz").get_fdata()
-    se = nib.load(f"{prefix}_perrun_se_stim.nii.gz").get_fdata()
-    n_lags = pooled.shape[-1]
-    assert curves.shape[-1] == 3 * n_lags and se.shape == curves.shape
-    per_run = curves.reshape(*curves.shape[:3], 3, n_lags)
+    per_run = np.stack(
+        [nib.load(f"{prefix}_perrun_iresp_stim_run0{r}.nii.gz").get_fdata() for r in (1, 2, 3)],
+        axis=3,
+    )
+    se = np.stack(
+        [nib.load(f"{prefix}_perrun_se_stim_run0{r}.nii.gz").get_fdata() for r in (1, 2, 3)],
+        axis=3,
+    )
+    assert per_run.shape == (*pooled.shape[:3], 3, pooled.shape[-1]) == se.shape
     # zero edges padded back like the pooled iresp; the runs average near the pooled curve
     assert np.all(per_run[..., 0] == 0) and np.all(per_run[..., -1] == 0)
     assert np.corrcoef(per_run.mean(axis=3).ravel(), pooled.ravel())[0, 1] > 0.9
-    assert (se.reshape(per_run.shape)[..., 1:-1] > 0).all()
-    labels = read_brick_labels(nib.load(f"{prefix}_perrun_iresp_stim.nii.gz"))
-    assert labels[0] == "run01#0" and labels[-1] == f"run03#{n_lags - 1}"
+    assert (se[..., 1:-1] > 0).all()
     smooth_r2 = nib.load(f"{prefix}_perrun_xval_r2.nii.gz").get_fdata()
     ols_r2 = nib.load(f"{prefix}_perrun_xval_r2_ols.nii.gz").get_fdata()
     assert np.median(smooth_r2) > np.median(ols_r2)
@@ -362,3 +363,11 @@ def test_per_run_flags_need_per_run_and_smoothing(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(sys, "argv", argv)
     assert deconvolve.main() == 1
     assert "need -per-run" in capsys.readouterr().err
+
+
+def test_run_tags_widen_past_99_runs_so_names_sort():
+    from fastfuncstuff.cli.deconvolve import _run_tags
+
+    assert _run_tags(3) == ["run01", "run02", "run03"]
+    tags = _run_tags(120)
+    assert tags[0] == "run001" and tags[-1] == "run120" and tags == sorted(tags)

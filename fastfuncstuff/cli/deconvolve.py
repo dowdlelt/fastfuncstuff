@@ -542,8 +542,8 @@ def parse_args():
         action="store_true",
         help="Also fit one smoothed curve PER RUN (needs -tent-smooth, >= 2 runs), for "
         "statistics across runs; lambda, penalty and noise model come from the pooled "
-        "fit. Writes <prefix>_perrun_iresp_<label>: runs x knots, run-major, bricks "
-        "runNN#k. Test area or fixed-lag values: peak height and argmax latency are "
+        "fit. Writes one <prefix>_perrun_iresp_<label>_runNN per run and condition "
+        "(runNNN past 99 runs). Test area or fixed-lag values: peak height and argmax latency are "
         "biased by noise for ANY estimator, so a noise trend across runs fakes an "
         "effect in them. Runs with different event timing smooth the same curve "
         "slightly differently.",
@@ -579,7 +579,7 @@ def parse_args():
         "-per-run-se",
         dest="per_run_se",
         action="store_true",
-        help="With -per-run, also write <prefix>_perrun_se_<label>: each knot's "
+        help="With -per-run, also write <prefix>_perrun_se_<label>_runNN: each knot's "
         "standard error about the SMOOTHED curve (smoothing bias excluded). For error "
         "bars; test across runs with the spread of the curves themselves.",
     )
@@ -954,6 +954,12 @@ def _xval_tent_top(
             print(f"    {bot:.1f}–{top_k:.2f}s  R²={r2_k:.4f}{marker}")
 
     return best_top, best_r2
+
+
+def _run_tags(n_runs: int) -> list[str]:
+    """run01..runNN, widened past 99 runs so file names still sort in run order."""
+    width = max(2, len(str(n_runs)))
+    return [f"run{r + 1:0{width}d}" for r in range(n_runs)]
 
 
 def _announce_written(paths: list[str] | str, elapsed: float, verb: int) -> None:
@@ -2337,6 +2343,7 @@ def main(argv: list[str] | None = None):
         print("  ✓ GLM fit complete")
 
     per_run_fit = None
+    run_tags = _run_tags(n_runs)
     if args.per_run and smooth_fit is not None and smooth_sel is not None:
         from fastfuncstuff.glm.smooth_basis import fit_smooth_per_run
 
@@ -2444,8 +2451,7 @@ def main(argv: list[str] | None = None):
                 ("perrun_xval_r2_ols", per_run_fit.xval_r2_ols, None),
             ]
         if args.per_run_lambda == "run":
-            run_labels = [f"run{r + 1:02d}" for r in range(n_runs)]
-            run_maps.append(("perrun_log10lambda", per_run_fit.log10_lambda, run_labels))
+            run_maps.append(("perrun_log10lambda", per_run_fit.log10_lambda, run_tags))
         for name, values, labels in run_maps:
             path = f"{args.prefix}_{name}{_nii_ext}"
             vol = _to_volume(values.numpy().reshape(values.shape[0], -1))
@@ -2540,15 +2546,22 @@ def main(argv: list[str] | None = None):
                 curves = values[:, :, start:beta_col_idx].numpy()
                 if model in ("TENTzero", "CSPLINzero"):
                     curves = np.pad(curves, ((0, 0), (0, 0), (1, 1)))
-                n_lags = curves.shape[2]
-                labels = [f"run{r + 1:02d}#{k}" for r in range(n_runs) for k in range(n_lags)]
-                path = f"{args.prefix}_{name}_{condition_labels[cond_idx]}{_nii_ext}"
-                vol = _to_volume(curves.reshape(curves.shape[0], -1))
+                stem = f"{args.prefix}_{name}_{condition_labels[cond_idx]}"
+                paths = [f"{stem}_{run_tags[r]}{_nii_ext}" for r in range(n_runs)]
                 t_write = time.perf_counter()
-                with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
-                    save_nifti(vol, path, reference_img=input_files[0], brick_labels=labels)
-                _announce_written(path, time.perf_counter() - t_write, args.verb)
-                output_files.append(path)
+                with spinner(
+                    f"Writing {Path(stem).name}_run*", enabled=args.verb >= 1, leave=False
+                ):
+                    for r, path in enumerate(paths):
+                        save_nifti(
+                            _to_volume(curves[:, r]), path, reference_img=input_files[0], tr=tr
+                        )
+                if args.verb >= 1:
+                    print(
+                        f"  ✓ {stem}_{run_tags[0]}..{run_tags[-1]}{_nii_ext}  "
+                        f"({n_runs} files, {time.perf_counter() - t_write:.1f}s)"
+                    )
+                output_files.extend(paths)
 
     if args.verb < 1:
         print("Created HRF estimate files:")
