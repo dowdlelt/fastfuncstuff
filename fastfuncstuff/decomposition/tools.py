@@ -211,26 +211,12 @@ def _apply_high_pass_single(
     transition_width: float,
 ) -> torch.Tensor:
     """High-pass filter a single contiguous segment."""
+    from fastfuncstuff.processing.temporal_filter import fft_gain
+
     n_t = data_vox_t.shape[1]
     freqs = torch.fft.rfftfreq(n_t, d=tr).to(data_vox_t.device)
-    spec = torch.fft.rfft(data_vox_t, dim=1)
-
-    cutoff = float(high_pass_hz)
-    tw = cutoff * transition_width
-    if tw < 1e-10:
-        # Brick wall
-        filt = (freqs >= cutoff).float()
-    else:
-        # Raised-cosine transition: 0 below (cutoff - tw), 1 above cutoff
-        low = cutoff - tw
-        filt = torch.clamp((freqs - low) / tw, 0.0, 1.0)
-        # Smooth with cosine shape
-        filt = 0.5 * (1.0 - torch.cos(filt * torch.pi))
-
-    # Always zero DC
-    filt[0] = 0.0
-
-    spec = spec * filt.unsqueeze(0)
+    filt = fft_gain(freqs, float(high_pass_hz), None, transition_width)
+    spec = torch.fft.rfft(data_vox_t, dim=1) * filt.unsqueeze(0)
     return torch.fft.irfft(spec, n=n_t, dim=1)
 
 
