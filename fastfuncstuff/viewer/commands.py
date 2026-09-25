@@ -361,7 +361,9 @@ def _target(cmd: Command) -> tuple[Any, ...]:
     different target is two separate actions.
     """
     return tuple(
-        getattr(cmd, f.name) for f in fields(cmd) if f.name in ("key", "view", "which", "name")
+        getattr(cmd, f.name)
+        for f in fields(cmd)
+        if f.name in ("key", "view", "which", "name", "param")
     )
 
 

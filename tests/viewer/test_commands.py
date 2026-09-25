@@ -283,6 +283,22 @@ def test_slider_drags_collapse_to_their_final_value():
     assert lines == ["SET_THRESHOLD L1 19.0"]
 
 
+def test_two_mode_parameters_in_a_row_are_both_kept():
+    """Each parameter is its own target; only repeats of one supersede.
+
+    Setting a GLM's HRF and then its polort used to save only the polort, so a
+    replayed session fitted a different model from the one that was looked at.
+    """
+    from fastfuncstuff.viewer.commands import _collapse
+    from fastfuncstuff.viewer.vocab import SetModeParam
+
+    log = [SetModeParam("a", "1"), SetModeParam("a", "2"), SetModeParam("b", "3")]
+    assert [c.to_line() for c in _collapse(log)] == [
+        "SET_MODE_PARAM a 2",
+        "SET_MODE_PARAM b 3",
+    ]
+
+
 def test_major_events_are_not_collapsed_away():
     bus = _session()
     bus.dispatch(AddLayer("/data/a.nii.gz", "L1"))
