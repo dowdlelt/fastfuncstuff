@@ -36,7 +36,6 @@ import numpy as np
 from fastfuncstuff.viewer import align
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
-    THIRD,
     ActionControl,
     BoolControl,
     ChoiceControl,
@@ -87,6 +86,8 @@ class AlignMode(Mode):
 
     # -- declaration ---------------------------------------------------
     def controls(self) -> tuple[Control, ...]:
+        # One per row: three to a row does not fit the controller's width, and
+        # a long slider is what fine hand adjustment wants anyway.
         shift = "mm the image centre has moved along +{}".format
         turn = "degrees about the {} axis, through the pivot".format
         return (
@@ -99,7 +100,6 @@ class AlignMode(Mode):
                     default=0.0,
                     step=0.1,
                     unit="mm",
-                    span=THIRD,
                     help=shift(axis),
                 )
                 for n, label, axis in (("tx", "R", "R"), ("ty", "A", "A"), ("tz", "S", "S"))
@@ -113,8 +113,6 @@ class AlignMode(Mode):
                     default=0.0,
                     step=0.1,
                     unit="°",
-                    span=THIRD,
-                    newline=n == "rx",
                     help=turn(axis),
                 )
                 for n, label, axis in (
