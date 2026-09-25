@@ -71,6 +71,14 @@ class Layer:
     #: layer is what a correlation matrix's rows are made of. Guessed on load
     #: for a 3-D integer volume; SET_LAYER_ROI corrects the guess.
     roi: bool = False
+    #: The file's own affine, while the layer is drawn somewhere else. ``None``
+    #: for a layer that has not been moved, which is nearly all of them; set,
+    #: ``affine`` is where it is drawn and the difference is the transform
+    #: :mod:`fastfuncstuff.viewer.align` applied.
+    native_affine: np.ndarray | None = None
+    #: The key of a layer whose transform this one shares -- a stat map riding
+    #: on the run it came from. See :func:`fastfuncstuff.viewer.align.set_follows`.
+    follows: str | None = None
 
     visible: bool = True
     opacity: float = 1.0
@@ -143,6 +151,10 @@ class Layer:
     @property
     def is_4d(self) -> bool:
         return self.n_volumes > 1
+
+    @property
+    def is_moved(self) -> bool:
+        return self.native_affine is not None
 
     @property
     def is_computed(self) -> bool:

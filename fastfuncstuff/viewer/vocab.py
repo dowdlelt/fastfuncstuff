@@ -16,6 +16,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
+from fastfuncstuff.viewer import align
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
 from fastfuncstuff.viewer.state import Plane, ViewerState
@@ -584,6 +587,58 @@ class SetLayerOpacity(Command):
     aspects = Aspect.SLICES
     key: str
     opacity: float
+
+
+@command
+@dataclass(frozen=True)
+class SetLayerXform(Command):
+    """Draw a layer (and its followers) through a world transform.
+
+    The top three rows of a 4x4 in RAS millimetres, taking where the header
+    puts a point to where it is drawn. The identity puts it back.
+    """
+
+    name = "SET_LAYER_XFORM"
+    # Not LAYERS: that drops the on-device volumes, and a drag sends one of
+    # these per mouse move. Moving a layer changes where it is sampled, never
+    # what it holds.
+    aspects = Aspect.SLICES | Aspect.CROSSHAIR | Aspect.GRAPH
+    key: str
+    m00: float
+    m01: float
+    m02: float
+    m03: float
+    m10: float
+    m11: float
+    m12: float
+    m13: float
+    m20: float
+    m21: float
+    m22: float
+    m23: float
+
+    @classmethod
+    def of(cls, key: str, xform) -> SetLayerXform:
+        m = np.asarray(xform, dtype=float)
+        return cls(key, *(float(v) for v in m[:3, :4].ravel()))
+
+    def matrix(self) -> np.ndarray:
+        m = np.eye(4)
+        m[:3, :4] = np.array(
+            [getattr(self, f"m{r}{c}") for r in range(3) for c in range(4)]
+        ).reshape(3, 4)
+        return m
+
+
+@command
+@dataclass(frozen=True)
+class SetLayerFollows(Command):
+    """Make one layer share another's transform; an empty parent detaches it."""
+
+    name = "SET_LAYER_FOLLOWS"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    key: str
+    parent: str
 
 
 @command
@@ -1241,6 +1296,9 @@ def install(
         assert isinstance(cmd, RemoveLayer)
         was = st.layers.base.key if st.layers.base is not None else None
         st.layers.remove(cmd.key)
+        # Followers stay where they were drawn; they just stop following.
+        for follower in align.followers(st.layers, cmd.key):
+            align.set_follows(st.layers, follower.key, None)
         if session is not None:
             # Release the voxels too. forget() declines for anything the active
             # mode is using or has displaced, which is the one case where the
@@ -1427,6 +1485,18 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, boxed=bool(cmd.on))
         return SetBoxed.aspects
+
+    @bus.handle(SetLayerXform.name)
+    def _set_layer_xform(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetLayerXform)
+        align.set_xform(st.layers, cmd.key, cmd.matrix())
+        return SetLayerXform.aspects
+
+    @bus.handle(SetLayerFollows.name)
+    def _set_layer_follows(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetLayerFollows)
+        align.set_follows(st.layers, cmd.key, cmd.parent or None)
+        return SetLayerFollows.aspects
 
     @bus.handle(SetEdges.name)
     def _set_edges(cmd: Command, st: ViewerState) -> Aspect:
