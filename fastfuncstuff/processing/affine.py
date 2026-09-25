@@ -1395,6 +1395,25 @@ def load_matrix_1D(
     return M
 
 
+def read_aff12_rows(path: str | Path) -> np.ndarray:
+    """Every matrix in an ``.aff12.1D``, as ``(n, 4, 4)`` float64 DICOM mm.
+
+    One per non-comment line: a single alignment has one, a moco file one per
+    volume. Float64 and unconverted, for callers that do their own geometry --
+    :func:`load_matrix_1D` is the one that goes to voxel indices.
+    """
+    rows = [
+        [float(v) for v in line.split()]
+        for line in Path(path).read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not rows or any(len(r) != 12 for r in rows):
+        raise ValueError(f"{path}: expected rows of 12 numbers (an .aff12.1D)")
+    out = np.tile(np.eye(4), (len(rows), 1, 1))
+    out[:, :3, :4] = np.asarray(rows).reshape(-1, 3, 4)
+    return out
+
+
 def load_matrix_chain(
     paths: list[str] | str,
     base_affine: np.ndarray,

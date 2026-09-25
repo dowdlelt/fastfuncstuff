@@ -259,22 +259,13 @@ def save_aff12(path, xform, base_affine, source_native, *, header: str | None = 
 
 
 def load_aff12(path, base_affine, source_native) -> np.ndarray:
-    """Read the first matrix of an ``.aff12.1D``, in float64.
+    """The world transform for the first matrix in an ``.aff12.1D``.
 
-    Parsed here rather than by ``load_matrix_1D``, which reads into float32 and
-    refuses a file holding a matrix per volume -- the first row of a moco file
-    is a perfectly good starting point.
+    The first, so a moco file (one row per volume) still gives a starting point.
     """
-    rows = [
-        [float(v) for v in line.split()]
-        for line in open(path).read().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    if not rows or len(rows[0]) != 12:
-        raise ValueError(f"{path} does not hold a 12-number .aff12.1D row")
-    dicom = np.eye(4)
-    dicom[:3, :4] = np.asarray(rows[0]).reshape(3, 4)
-    return from_aff12(dicom, base_affine, source_native)
+    from fastfuncstuff.processing.affine import read_aff12_rows
+
+    return from_aff12(read_aff12_rows(path)[0], base_affine, source_native)
 
 
 __all__ = [

@@ -167,6 +167,13 @@ class AffineAlignConfig:
     # estimate and uses these directly, so you can reproduce or hand-tune the
     # initial placement (manual positioning) instead of relying on COM matching.
     cmass_direct: tuple[float, float, float] | None = None
+    # Starting transform, as an .aff12.1D would hold it: 4x4, base->source, AFNI
+    # DICOM mm. Baked into the pre-resample exactly where the header grid map
+    # goes, so the optimiser starts from it and searches only a residual -- the
+    # hand-off for a coarse alignment done by eye (the viewer's align mode) or a
+    # previous run. Needs both headers; the cmass estimate is skipped, since the
+    # placement is the point of passing one.
+    init_matrix: np.ndarray | None = None
 
     # Interpolation
     interp: str = "linear"  # "linear" or "cubic"
@@ -3025,10 +3032,24 @@ def _prepare_grid(
         # A decimated base is a different grid from the source by construction,
         # even in the rare case the shapes happen to match.
         cross_grid = True
+    if config.init_matrix is not None:
+        if base_header is None or source_header is None:
+            raise ValueError("init_matrix needs both base and source headers")
+        cross_grid = True
     if cross_grid:
         if verb >= 1:
             print(f"Resampling source {source_native.shape} to base grid {base.shape}")
-        grid_matrix = _compute_grid_matrix(source_header["affine"], base_header["affine"], device)
+        if config.init_matrix is not None:
+            from .affine import dicom_matrix_to_voxel
+
+            dicom = torch.as_tensor(np.asarray(config.init_matrix), dtype=torch.float32)
+            grid_matrix = dicom_matrix_to_voxel(
+                dicom, base_header["affine"], source_header["affine"]
+            ).to(device)
+        else:
+            grid_matrix = _compute_grid_matrix(
+                source_header["affine"], base_header["affine"], device
+            )
 
     cmass_shift = np.zeros(3)
     if config.cmass_direct is not None:
@@ -3036,7 +3057,7 @@ def _prepare_grid(
         if verb >= 1:
             t = cmass_shift
             print(f"  Direct cmass shift: dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
-    elif config.cmass:
+    elif config.cmass and config.init_matrix is None:
         translation = _cmass_translation(base, source_native, grid_matrix=grid_matrix)
         cmass_shift = translation.cpu().numpy()
         if verb >= 1:

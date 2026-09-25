@@ -264,6 +264,16 @@ Examples:
         "that run. (.aff12.1D is in mm, so the inverse needs no grid of its own.)",
     )
     io_group.add_argument(
+        "-1Dmatrix_init",
+        default=None,
+        metavar="MAT.aff12.1D",
+        help="Start the search from this base->source matrix instead of the headers "
+        "(and skip -cmass). For data that starts too far off for the search to "
+        "find: line it up roughly by hand in ffs_viewer's align mode, save the "
+        "matrix, and let this refine it. Pair with -smallrange when the start is "
+        "already close. The first row is used if the file holds one per volume.",
+    )
+    io_group.add_argument(
         "-1Dmatrix_apply", default=None, help="Apply existing matrix (skip alignment)"
     )
     io_group.add_argument("-base_index", type=int, default=None, help="Use volume N from 4D base")
@@ -878,6 +888,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     powell_maxfev = 500 if (args.polish or _is_zz) and not args.no_polish else 0
     twopass = not args.onepass
 
+    init_matrix = None
+    init_path = getattr(args, "1Dmatrix_init", None)
+    if init_path is not None:
+        from fastfuncstuff.processing.affine import read_aff12_rows
+
+        init_matrix = read_aff12_rows(init_path)[0]
+
     # Apply presets
     preset = "standard"
     if args.superfast:
@@ -937,7 +954,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         adam_iters_2x=adam_iters_2x,
         adam_iters_1x=adam_iters_1x,
         powell_maxfev=powell_maxfev,
-        cmass=not args.nocmass,
+        cmass=not args.nocmass and init_matrix is None,
         cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
         interp=args.interp,
         final_interp=args.final_interp,
@@ -945,6 +962,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         autoweight=not args.noautoweight,
         autocrop=not args.noautocrop,
         work_dxyz=_parse_work_dxyz(args.work_dxyz),
+        init_matrix=init_matrix,
         device=str(device),
         verb=verb,
     )
@@ -956,7 +974,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         print(f"  Preset: {preset}")
         print(f"  Optimizer: {args.optimizer}")
         print(f"  Search: {'two-pass' if twopass else 'one-pass'}")
-        print(f"  Center of mass: {'off' if args.nocmass else 'on'}")
+        if init_path is not None:
+            print(f"  Start: {init_path} (center of mass off)")
+        else:
+            print(f"  Center of mass: {'off' if args.nocmass else 'on'}")
         print(f"  Estimation interpolation: {args.interp}")
         print(f"  Final interpolation: {args.final_interp}")
         print(f"  Device: {device}")
