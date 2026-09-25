@@ -1,5 +1,6 @@
 """Viewer modes. Importing the package registers every built-in mode."""
 
+from fastfuncstuff.viewer.modes.align import AlignMode  # noqa: E402
 from fastfuncstuff.viewer.modes.base import (
     BoolControl,
     ChoiceControl,
@@ -25,6 +26,7 @@ from fastfuncstuff.viewer.modes.plain import PlainMode  # noqa: E402
 from fastfuncstuff.viewer.modes.preproc import PreprocMode  # noqa: E402
 
 __all__ = [
+    "AlignMode",
     "BoolControl",
     "ChoiceControl",
     "ComputedOverlay",

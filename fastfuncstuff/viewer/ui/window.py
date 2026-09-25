@@ -1854,6 +1854,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # follow those aspects and not only LAYERS -- listening for the
             # wrong one is what left it showing the previous colour scale.
             self._sync_layer_controls()
+            # A mode's parameters can be a reading of the picture rather than
+            # an input to it -- Align's sliders follow a drag in an image
+            # window -- so they are re-read whenever the picture moves.
+            self.mode_panel.sync_values(self.session.mode.params)
         self._refresh_windows(self._active, dirty)
         self._sync_readout()
 

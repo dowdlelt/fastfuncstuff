@@ -191,6 +191,8 @@ class ToolDialog(QtWidgets.QDialog):
             self._say("busy with something else; try again in a moment")
 
     def _made(self) -> str:
+        if self._spec.done:
+            return self._spec.done
         chosen = str(self._params.get("input") or "")
         return f"new layer above {chosen}" if chosen else "new layer added"
 

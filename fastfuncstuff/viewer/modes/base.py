@@ -254,6 +254,10 @@ class DialogSpec:
     run_label: str = "run"
     #: Why the dialog cannot run right now, or empty when it can.
     blocked: str = ""
+    #: What finishing did, for the status line. Empty says a layer was made,
+    #: which is what a preproc tool does; a dialog that writes a file or moves
+    #: an existing layer says so instead.
+    done: str = ""
 
 
 # ---------------------------------------------------------------------------

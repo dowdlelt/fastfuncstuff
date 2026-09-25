@@ -153,3 +153,146 @@ def test_chains_are_refused(session):
     session.do(SetLayerFollows("stat", "epi"))
     with pytest.raises(ValueError):
         session.do(SetLayerFollows("anat", "stat"))
+
+
+# ---------------------------------------------------------------------------
+# the mode
+# ---------------------------------------------------------------------------
+
+
+def _align(session, moving="epi"):
+    from fastfuncstuff.viewer.vocab import SetInput, SetMode
+
+    session.do(SetMode("align"))
+    if moving is not None:
+        session.do(SetInput(moving))
+    return session.mode
+
+
+def test_the_moving_image_is_never_the_underlay_or_a_follower(session):
+    session.do(SetLayerFollows("stat", "epi"))
+    mode = _align(session, moving=None)
+    offered = [ly.key for ly in session.input_candidates()]
+    assert offered == ["epi"]
+    assert mode.moving().key == "epi"
+
+
+def test_a_slider_moves_the_image_and_what_rides_on_it(session):
+    from fastfuncstuff.viewer.vocab import SetModeParam
+
+    session.do(SetLayerFollows("stat", "epi"))
+    mode = _align(session)
+    session.do(SetModeParam("tx", "5"))
+    session.do(SetModeParam("rz", "10"))
+    pivot = mode.pivot()
+    for key in ("epi", "stat"):
+        xform = align.layer_xform(session.state.layers.get(key))
+        assert np.allclose(align.decompose(xform, pivot), (5, 0, 0, 0, 0, 10), atol=1e-6)
+
+
+def test_the_sliders_read_back_a_drag(session):
+    mode = _align(session)
+    session.do(mode.move_to(mode.shifted((0.0, 3.0, 0.0))))
+    session.do(mode.move_to(mode.turned((0, 0, 1), 7.0)))
+    assert mode.params["ty"] == pytest.approx(3.0)
+    assert mode.params["rz"] == pytest.approx(7.0)
+
+
+def test_turning_leaves_the_pivot_where_it_is_drawn(session):
+    mode = _align(session)
+    session.do(mode.move_to(mode.shifted((4.0, -2.0, 1.0))))
+    before = mode.pivot_mm()
+    session.do(mode.move_to(mode.turned((0.3, 1.0, 0.2), 25.0)))
+    assert np.allclose(mode.pivot_mm(), before)
+
+
+def test_pivot_here_turns_about_the_crosshair(session):
+    from fastfuncstuff.viewer.vocab import ModeAction, SetIJK
+
+    mode = _align(session)
+    session.do(SetIJK(2, 3, 4))
+    here = np.array(session.state.crosshair_mm)
+    session.do(ModeAction("pivot"))
+    session.do(mode.move_to(mode.turned((0, 0, 1), 30.0)))
+    assert np.allclose(mode.pivot_mm(), here)
+
+
+def test_the_automatic_moving_image_stays_put_while_another_is_selected(session):
+    """Selecting the stat map to attach it must not make it the moving image."""
+    from fastfuncstuff.viewer.vocab import ModeAction, SelectLayer, SetLayerVisible
+
+    session.do(SetLayerVisible("stat", False))
+    mode = _align(session, moving=None)
+    first = mode.moving().key
+    other = "epi" if first == "stat" else "stat"
+    session.do(SelectLayer(other))
+    session.do(ModeAction("attach"))
+    assert mode.moving().key == first
+    assert session.state.layers.get(other).follows == first
+
+
+def test_a_slider_session_replays(session):
+    from fastfuncstuff.viewer.vocab import SetModeParam
+
+    _align(session)
+    session.do(SetModeParam("tx", "4"))
+    session.do(SetModeParam("ry", "-6"))
+    again = ViewerSession(device=CPU)
+    try:
+        again.run_script(session.to_script())
+        assert np.allclose(
+            again.state.layers.get("epi").affine, session.state.layers.get("epi").affine
+        )
+    finally:
+        again.close()
+
+
+def test_save_then_load_gives_back_the_same_placement(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    mode = _align(session)
+    placed = align.compose((3, -4, 5, 6, -7, 8), mode.pivot())
+    session.do(mode.move_to(placed))
+    path = tmp_path / "hand.aff12.1D"
+    save = mode.dialog_for("save")
+    save.install(save.run({"path": str(path)}, None))
+    session.do(ModeAction("reset"))
+    assert not session.state.layers.get("epi").is_moved
+    load = mode.dialog_for("load")
+    load.install(load.run({"path": str(path)}, None))
+    assert np.allclose(align.layer_xform(session.state.layers.get("epi")), placed, atol=1e-6)
+    # And the load is in the recording, not only on screen.
+    assert "SET_LAYER_XFORM epi" in session.to_script()
+
+
+def test_the_allineate_button_refines_from_the_hand_placement(tmp_path):
+    """A 2 mm / 3 degree hand placement goes to the truth."""
+    rng = np.random.default_rng(4)
+    vol = np.zeros((32, 32, 32), np.float32)
+    vol[8:24, 10:22, 12:26] = 80.0
+    vol[12:18, 14:18, 16:20] = 160.0
+    vol += rng.normal(0, 1, vol.shape).astype(np.float32)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = -32.0
+    nib.save(nib.Nifti1Image(vol, aff), str(tmp_path / "fixed.nii"))
+    nib.save(
+        nib.Nifti1Image(np.pad(vol, 1), aff @ align.translation((-1, -1, -1))),
+        str(tmp_path / "moving.nii"),
+    )
+
+    s = ViewerSession(device=CPU)
+    try:
+        s.load(tmp_path / "fixed.nii", key="fixed")
+        s.load(tmp_path / "moving.nii", key="moving")
+        mode = _align(s, moving=None)
+        off = align.compose((2.0, -1.5, 1.0, 3.0, 0.0, -2.0), mode.pivot())
+        s.do(mode.move_to(off))
+        spec = mode.dialog_for("allineate")
+        assert not spec.blocked
+        spec.install(spec.run({"cost": "ls", "dof": "rigid", "small": True}, None))
+        xform = align.layer_xform(s.state.layers.get("moving"))
+        corners = np.array([[x, y, z] for x in (-30, 30) for y in (-30, 30) for z in (-30, 30)])
+        moved = (xform[:3, :3] @ corners.T).T + xform[:3, 3]
+        assert np.abs(moved - corners).max() < 1.0
+    finally:
+        s.close()
