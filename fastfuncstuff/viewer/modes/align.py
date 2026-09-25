@@ -138,6 +138,12 @@ class AlignMode(Mode):
                 help="Turn about the crosshair rather than the image centre.",
             ),
             ActionControl(
+                name="cmass",
+                label="cmass",
+                help="Slide the moving image so its centre of mass sits on the underlay's "
+                "(the same centroid as ffs_allineate -cmass). Keeps any rotation.",
+            ),
+            ActionControl(
                 name="reset", label="reset", help="Put the moving image back where its header says."
             ),
             ActionControl(
@@ -269,6 +275,15 @@ class AlignMode(Mode):
         layer = self.moving()
         if name == "reset":
             return self._apply(align.IDENTITY)
+        if name == "cmass":
+            if layer is None or self.fixed() is None:
+                return Aspect.NOTHING
+            moving, fixed, base, source = self._volumes()
+            target = align.centre_of_mass_mm(base, fixed.affine)
+            drawn = self.xform() @ np.append(
+                align.centre_of_mass_mm(source, align.native_affine(moving)), 1.0
+            )
+            return self._apply(self.shifted(target - drawn[:3]))
         if name == "pivot":
             here = self.session.state.crosshair_mm
             if layer is None or here is None:
@@ -390,6 +405,20 @@ class AlignMode(Mode):
             raise ValueError(self._blocked())
         return moving, fixed, np.asarray(fixed.affine, float), align.native_affine(moving)
 
+    def _volumes(self) -> tuple[Any, Any, np.ndarray, np.ndarray]:
+        """``(moving, fixed, fixed voxels, moving voxels)``, each ``(nx, ny, nz)``.
+
+        The displayed sub-brick of each: for a run, the volume on screen, which
+        is the one that was just lined up by eye.
+        """
+        moving, fixed, _, _ = self._pair()
+        assert self.session is not None
+        base = self.session.volume(fixed.key, fixed.volume_index)
+        source = self.session.volume(
+            moving.key, None if moving.time_linked else moving.volume_index
+        )
+        return moving, fixed, np.asarray(base, np.float32), np.asarray(source, np.float32)
+
     def _save(self, params: dict[str, Any], progress: ProgressFn | None) -> None:
         moving, fixed, base_aff, native = self._pair()
         path = str(params.get("path") or "").strip()
@@ -424,12 +453,7 @@ class AlignMode(Mode):
         moving, fixed, base_aff, native = self._pair()
         if progress is not None:
             progress(0.0, f"aligning {moving.name} to {fixed.name}…")
-        # The displayed sub-brick of each: for a run that is the volume on
-        # screen, which is the one that was just lined up by eye.
-        base = self.session.volume(fixed.key, fixed.volume_index)
-        source = self.session.volume(
-            moving.key, None if moving.time_linked else moving.volume_index
-        )
+        _, _, base, source = self._volumes()
         to_zyx = lambda v: torch.from_numpy(np.ascontiguousarray(v.transpose(2, 1, 0)))  # noqa: E731
         config = AffineAlignConfig(
             dof=str(params.get("dof") or "rigid"),

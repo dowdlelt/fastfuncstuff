@@ -154,6 +154,20 @@ def centre_mm(layer: Layer) -> np.ndarray:
     return (native_affine(layer) @ np.append(mid, 1.0))[:3]
 
 
+def centre_of_mass_mm(volume: np.ndarray, affine: np.ndarray) -> np.ndarray:
+    """Value-weighted centre of an ``(nx, ny, nz)`` volume, in world millimetres.
+
+    Allineate's own centroid, so the viewer's CMASS and ``-cmass`` agree.
+    """
+    import torch
+
+    from fastfuncstuff.processing.allineate import _center_of_mass
+
+    zyx = torch.from_numpy(np.ascontiguousarray(np.nan_to_num(volume).transpose(2, 1, 0)))
+    ijk = _center_of_mass(zyx.double()).numpy()
+    return (np.asarray(affine, dtype=float) @ np.append(ijk, 1.0))[:3]
+
+
 def followers(stack: LayerStack, key: str) -> list[Layer]:
     return [ly for ly in stack if ly.follows == key]
 
@@ -273,6 +287,7 @@ __all__ = [
     "about",
     "axis_rotation",
     "centre_mm",
+    "centre_of_mass_mm",
     "compose",
     "decompose",
     "euler_angles",

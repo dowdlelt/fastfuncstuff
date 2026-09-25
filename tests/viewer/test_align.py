@@ -296,3 +296,33 @@ def test_the_allineate_button_refines_from_the_hand_placement(tmp_path):
         assert np.abs(moved - corners).max() < 1.0
     finally:
         s.close()
+
+
+def test_cmass_puts_the_moving_centroid_on_the_fixed_one_and_keeps_the_turn(tmp_path):
+    """An off-centre object, so the centroid is not just the box centre."""
+    vol = np.zeros((30, 30, 30), np.float32)
+    vol[4:14, 6:12, 18:26] = 50.0
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = -30.0
+    moved = aff.copy()
+    moved[:3, 3] += (18.0, -7.0, 5.0)  # the header is off
+    nib.save(nib.Nifti1Image(vol, aff), str(tmp_path / "fixed.nii"))
+    nib.save(nib.Nifti1Image(vol, moved), str(tmp_path / "moving.nii"))
+    s = ViewerSession(device=CPU)
+    try:
+        s.load(tmp_path / "fixed.nii", key="fixed")
+        s.load(tmp_path / "moving.nii", key="moving")
+        mode = _align(s, moving="moving")
+        from fastfuncstuff.viewer.vocab import ModeAction, SetModeParam
+
+        s.do(SetModeParam("rz", "15"))
+        turn = align.layer_xform(s.state.layers.get("moving"))[:3, :3].copy()
+        s.do(ModeAction("cmass"))
+        xform = align.layer_xform(s.state.layers.get("moving"))
+        target = align.centre_of_mass_mm(vol, aff)
+        drawn = xform @ np.append(align.centre_of_mass_mm(vol, moved), 1.0)
+        assert np.allclose(drawn[:3], target, atol=1e-6)
+        assert np.allclose(xform[:3, :3], turn)
+        assert mode.params["rz"] == pytest.approx(15.0)
+    finally:
+        s.close()
