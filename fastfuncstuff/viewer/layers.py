@@ -117,6 +117,11 @@ class Layer:
     threshold_follow: str = "same"
     alpha_mode: AlphaMode = AlphaMode.OFF
     boxed: bool = False
+    #: Draw the layer as its thin edges instead of its intensities -- AFNI's
+    #: image-window ``e``. The alignment check: edges of one image laid over
+    #: another say at a glance whether the boundaries coincide, which two
+    #: blended intensities cannot.
+    edges: bool = False
     #: How this layer is sampled into the display grid: ``auto``, ``nearest``
     #: or ``linear``.
     #:

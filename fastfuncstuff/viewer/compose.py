@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from fastfuncstuff.viewer.colormap import (
@@ -28,7 +30,13 @@ from fastfuncstuff.viewer.colormap import (
     to_rgba8,
 )
 from fastfuncstuff.viewer.layers import Layer
-from fastfuncstuff.viewer.slicing import PlaneView, extract_plane, plane_layout, plane_shape
+from fastfuncstuff.viewer.slicing import (
+    PlaneView,
+    extract_plane,
+    plane_coverage,
+    plane_layout,
+    plane_shape,
+)
 from fastfuncstuff.viewer.state import Plane, ViewerState
 
 #: Colour drawn around suprathreshold voxels in boxed mode. Near-white reads
@@ -77,6 +85,50 @@ def _layer_alpha(layer: Layer, values: Tensor, stat: Tensor) -> tuple[Tensor, Te
     if layer.boxed and layer.threshold > 0.0:
         edges = suprathreshold_edges(stat, layer.threshold, sign_mode=layer.sign_mode)
     return alpha, edges
+
+
+def _voxel_mm(affine: np.ndarray) -> float:
+    return float(abs(np.linalg.det(np.asarray(affine, dtype=float)[:3, :3])) ** (1.0 / 3.0))
+
+
+def edge_colors(values: Tensor, inside: Tensor, sigma: float) -> tuple[Tensor, Tensor]:
+    """A plane drawn as its thin edges: ``(H, W, 3)`` colour and ``(H, W)`` alpha.
+
+    The same detector and colour ramp as the warp movies' edge overlay, so an
+    edge on screen and an edge in a QC movie mean the same thing. Found in 2-D on
+    the displayed plane: a 3-D edge map cut by a slice shows filled patches
+    wherever a surface runs parallel to the cut.
+
+    ``sigma`` is in display pixels. ``inside`` marks where the layer has data;
+    the step from data to the zero outside its field of view is an edge of the
+    sampling, not of the anatomy, and is dropped.
+    """
+    from fastfuncstuff.processing.edges import edge_map
+    from fastfuncstuff.viz.compose import _EDGE_RAMP
+
+    rgb = torch.zeros((*values.shape, 3), dtype=values.dtype, device=values.device)
+    alpha = torch.zeros_like(values)
+    if min(values.shape) < 3:
+        return rgb, alpha
+    strength = edge_map(values, sigma=sigma, threshold=0.1)
+    if not bool(inside.all()):
+        reach = int(np.ceil(2.0 * sigma)) + 1
+        outside = (~inside).to(values.dtype)[None, None]
+        near = F.max_pool2d(outside, 2 * reach + 1, stride=1, padding=reach)[0, 0] > 0
+        strength = torch.where(near, torch.zeros_like(strength), strength)
+    kept = strength[strength > 0]
+    if kept.numel() == 0:
+        return rgb, alpha
+    # Saturate at the 33rd percentile of the kept edges, as AFNI's edge QC does:
+    # most edges draw at full colour and only the weakest third fade to red.
+    vmax = torch.quantile(kept, 0.33).clamp_min(torch.finfo(values.dtype).tiny)
+    ramp = torch.as_tensor(_EDGE_RAMP, dtype=values.dtype, device=values.device)
+    t = (strength / vmax).clamp(0.0, 1.0) * (len(ramp) - 1)
+    lo = t.floor().long()
+    hi = (lo + 1).clamp(max=len(ramp) - 1)
+    frac = (t - lo.to(t.dtype)).unsqueeze(-1)
+    rgb = ramp[lo] * (1.0 - frac) + ramp[hi] * frac
+    return rgb, (strength > 0).to(values.dtype)
 
 
 #: The viewer's words for resampling, and what ``grid_sample`` calls them.
@@ -128,7 +180,21 @@ def render_plane(
         # Display only: how the voxels are painted into the grid, never what
         # they are. session.resample_mode is the single place that is decided.
         how = _GRID_SAMPLE[session.resample_mode(layer)]
+        if layer.edges:
+            # Edges of a nearest-sampled coarse layer would trace the voxel
+            # staircase rather than the anatomy.
+            how = "bilinear"
         values = extract_plane(volume, grid, layer.affine, plane, pos, view=view, mode=how)
+
+        if layer.edges:
+            inside = plane_coverage(
+                layer.shape, grid, layer.affine, plane, pos, view=view, device=values.device
+            )
+            # One native voxel of smoothing, however far the grid magnifies it.
+            sigma = max(1.0, _voxel_mm(layer.affine) / max(_voxel_mm(grid.affine), 1e-6))
+            rgb, alpha = edge_colors(values, inside, sigma)
+            stacked.append((rgb, alpha * float(layer.opacity)))
+            continue
 
         # The threshold statistic may live in a different sub-brick than the one
         # being displayed -- that is the normal case for a stats dataset, where
@@ -261,6 +327,7 @@ __all__ = [
     "BOX_RGB",
     "PaneImage",
     "cached_lut",
+    "edge_colors",
     "empty_pane",
     "plane_position",
     "plane_view",

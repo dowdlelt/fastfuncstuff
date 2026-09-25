@@ -76,6 +76,7 @@ from fastfuncstuff.viewer.vocab import (
     SetCarpetOrder,
     SetColormap,
     SetColormapReversed,
+    SetEdges,
     SetIJK,
     SetIndex,
     SetInput,
@@ -1242,7 +1243,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.boxed_check = QtWidgets.QCheckBox(key_label("boxed", "b"))
         self.boxed_check.toggled.connect(lambda on: self._apply(SetBoxed, on=bool(on)))
-        form.addRow(QtWidgets.QLabel(""), self.boxed_check)
+        self.edges_check = QtWidgets.QCheckBox("edges")
+        self.edges_check.setToolTip(
+            "Draw the layer as its thin edges, over whatever is below it -- the "
+            "alignment check. (e in an image window)"
+        )
+        self.edges_check.toggled.connect(lambda on: self._apply(SetEdges, on=bool(on)))
+        look_row = QtWidgets.QHBoxLayout()
+        look_row.setSpacing(12)
+        look_row.addWidget(self.boxed_check)
+        look_row.addWidget(self.edges_check)
+        look_row.addStretch(1)
+        form.addRow(QtWidgets.QLabel(""), look_row)
 
         self.roi_check = QtWidgets.QCheckBox("is ROIs")
         self.roi_check.setToolTip(
@@ -1977,6 +1989,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.rangebar,
             self.opacity_slider,
             self.boxed_check,
+            self.edges_check,
             self.resample_box,
         ):
             widget.setEnabled(key is not None)
@@ -1994,6 +2007,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.blockSignals(False)
         for check, value, enabled in (
             (self.boxed_check, layer.boxed, True),
+            (self.edges_check, layer.edges, True),
             (self.alpha_linear_check, layer.alpha_mode is AlphaMode.LINEAR, True),
             (self.alpha_quad_check, layer.alpha_mode is AlphaMode.QUADRATIC, True),
             (self.roi_check, layer.roi, not layer.is_computed),

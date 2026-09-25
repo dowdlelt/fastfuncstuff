@@ -332,6 +332,27 @@ def extract_plane(
     return sample_volume(volume, layer_ijk, mode=mode, fill=fill)
 
 
+def plane_coverage(
+    shape: tuple[int, int, int],
+    grid: DisplayGrid,
+    layer_affine: np.ndarray,
+    plane: Plane,
+    position: int,
+    *,
+    view: PlaneView | None = None,
+    device: torch.device | None = None,
+) -> Tensor:
+    """``(H, W)`` bool: which pixels of a plane fall inside a layer's volume.
+
+    The sampled values cannot say this themselves -- outside reads as 0, and so
+    does plenty of real background.
+    """
+    ijk = plane_indices(grid, plane, position, view=view, device=device)
+    layer_ijk = display_to_layer(ijk, grid.affine, layer_affine)
+    upper = torch.tensor([n - 1 for n in shape], dtype=layer_ijk.dtype, device=layer_ijk.device)
+    return ((layer_ijk >= 0) & (layer_ijk <= upper)).all(dim=-1)
+
+
 def voxel_value(
     volume: Tensor, grid: DisplayGrid, layer_affine: np.ndarray, ijk: tuple[int, int, int]
 ) -> float | None:

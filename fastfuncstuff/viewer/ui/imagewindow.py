@@ -26,7 +26,9 @@ from fastfuncstuff.viewer.ui.panes import ImagePane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
+    SetEdges,
     SetIJK,
+    SetLayerOpacity,
     SetPan,
     SetSeed,
     SetViewLocked,
@@ -106,6 +108,27 @@ class ImageWindow(QtWidgets.QWidget):
         bar.addWidget(self.slice_label)
         v.addWidget(self.header)
 
+        # Opacity of the selected layer, one key away from the image it changes.
+        # A row of its own rather than a header button, so it survives the
+        # header being shed on a narrow window.
+        self.opacity_bar = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(self.opacity_bar)
+        row.setContentsMargins(6, 0, 6, 2)
+        row.setSpacing(4)
+        self.opacity_name = QtWidgets.QLabel("")
+        self.opacity_name.setObjectName("value")
+        row.addWidget(self.opacity_name)
+        self.opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.opacity_slider.valueChanged.connect(self._opacity_moved)
+        row.addWidget(self.opacity_slider, 1)
+        self.opacity_value = QtWidgets.QLabel("")
+        self.opacity_value.setObjectName("value")
+        row.addWidget(self.opacity_value)
+        self.opacity_bar.setVisible(False)
+        v.addWidget(self.opacity_bar)
+
         self.pane = ImagePane(Plane.AXIAL)
         self.pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
@@ -151,6 +174,13 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding("click", "move the crosshair", None, group="view"),
                 Binding("ctrl+click", "set the InstaCorr seed", None, group="view"),
+                Binding("e", "draw the selected layer as edges", self._toggle_edges, group="layer"),
+                Binding(
+                    "6",
+                    "opacity slider for the selected layer",
+                    self._toggle_opacity,
+                    group="layer",
+                ),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]
@@ -190,6 +220,45 @@ class ImageWindow(QtWidgets.QWidget):
             if pane_pos is not None:
                 self._dispatch(SetViewPosition(self.vid, int(pane_pos)))
         self._dispatch(SetViewLocked(self.vid, bool(on)))
+
+    def _selected(self):
+        return self.session.state.selected_layer()
+
+    def _toggle_edges(self) -> None:
+        layer = self._selected()
+        if layer is not None:
+            self._dispatch(SetEdges(layer.key, not layer.edges))
+
+    def _toggle_opacity(self) -> None:
+        """Show or hide the slider; opening it on an opaque layer halves it.
+
+        Halved so the key does something visible on its own -- a slider that
+        appears over a layer still drawn at 100% has changed nothing yet.
+        """
+        showing = not self.opacity_bar.isVisible()
+        self.opacity_bar.setVisible(showing)
+        layer = self._selected()
+        if showing and layer is not None and layer.opacity >= 1.0:
+            self._dispatch(SetLayerOpacity(layer.key, 0.5))
+        self._sync_opacity()
+
+    def _opacity_moved(self, value: int) -> None:
+        layer = self._selected()
+        if layer is not None:
+            self.opacity_value.setText(f"{value}%")
+            self._dispatch(SetLayerOpacity(layer.key, value / 100.0))
+
+    def _sync_opacity(self) -> None:
+        if not self.opacity_bar.isVisible():
+            return
+        layer = self._selected()
+        self.opacity_slider.setEnabled(layer is not None)
+        pct = 0 if layer is None else int(round(layer.opacity * 100))
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(pct)
+        self.opacity_slider.blockSignals(False)
+        self.opacity_name.setText("" if layer is None else layer.name)
+        self.opacity_value.setText(f"{pct}%")
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
@@ -298,6 +367,7 @@ class ImageWindow(QtWidgets.QWidget):
         if vp is None:
             return
         self.pane.set_pane(render_viewport(self.session, vp))
+        self._sync_opacity()
         state = self.session.state
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)

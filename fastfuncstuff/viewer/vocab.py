@@ -773,6 +773,17 @@ class SetBoxed(Command):
 
 @command
 @dataclass(frozen=True)
+class SetEdges(Command):
+    """Draw a layer as its edges rather than its intensities."""
+
+    name = "SET_EDGES"
+    aspects = Aspect.SLICES
+    key: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetResample(Command):
     """How a layer is painted into the display grid: auto, nearest or linear.
 
@@ -1416,6 +1427,14 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, boxed=bool(cmd.on))
         return SetBoxed.aspects
+
+    @bus.handle(SetEdges.name)
+    def _set_edges(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetEdges)
+        if st.layers.get(cmd.key).edges == bool(cmd.on):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, edges=bool(cmd.on))
+        return SetEdges.aspects
 
     @bus.handle(SetResample.name)
     def _set_resample(cmd: Command, st: ViewerState) -> Aspect:
