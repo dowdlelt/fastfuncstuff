@@ -224,7 +224,6 @@ def test_per_run_lambda_fakes_a_trend_when_noise_rises_and_global_does_not():
                 [PEN],
                 STARTS,
                 pooled.lam,
-                pooled_edf=pooled.edf,
                 lambda_mode=mode,
                 device=CPU,
             )
@@ -243,15 +242,55 @@ def test_per_run_lambda_fakes_a_trend_when_noise_rises_and_global_does_not():
     assert abs(shared_mean) < 0.5 * abs(run_mean)
 
 
-def test_global_lambda_is_the_median_over_voxels_the_pooled_fit_bent():
-    y, design, _, _ = _problem(n_vox=6)
-    lam = torch.tensor([1e-2, 1e-1, 1.0, 1e6, 1e6, 1e6])
-    edf = torch.tensor([6.0, 5.0, 4.0, 2.0, 2.0, 2.0])  # diff2 null space = 2
+GRID = np.linspace(-3.0, 5.0, 9)
+
+
+def _signal_and_noise():
+    sig, design, _, _ = _problem(n_vox=60, amp=1.0, seed=2)
+    noise, _, _, _ = _problem(n_vox=200, amp=0.0, seed=2)  # same onsets, no response
+    return torch.cat([sig, noise]), design
+
+
+def test_global_lambda_maximizes_the_signal_voxels_median_heldout_r2():
+    from fastfuncstuff.glm.smooth_basis import choose_global_lambda, fit_smooth_selected
+
+    y, design = _signal_and_noise()
+
+    def xval(rule, lam=None):
+        return fit_smooth_selected(
+            y, design, K, [PEN], STARTS, rule=rule, lam=lam, xval=True, device=CPU
+        ).xval_r2
+
+    signal = (xval("fixed", 1e-6) > 0.05) | (xval("reml") > 0.05)
+    curve = torch.stack([xval("fixed", 10.0**g) for g in GRID], dim=1)
+    med = curve[signal].median(dim=0).values.numpy()
+    out = choose_global_lambda(y, design, K, PEN, STARTS, log10_grid=GRID, device=CPU)
+    assert out.n_signal == int(signal.sum()) and not out.fallback
+    assert 50 <= out.n_signal <= 75  # the 60 responsive voxels, not the 200 silent ones
+    np.testing.assert_allclose(out.median_curve, med, atol=2e-4)
+    assert abs(np.log10(out.lam) - GRID[med.argmax()]) <= GRID[1] - GRID[0]
+
+
+def test_per_run_global_mode_fits_every_run_with_the_chosen_lambda():
+    from fastfuncstuff.glm.smooth_basis import choose_global_lambda
+
+    y, design = _signal_and_noise()
+    chosen = choose_global_lambda(y, design, K, PEN, STARTS, device=CPU).lam
     out = fit_smooth_per_run(
-        y, design, K, [PEN], STARTS, lam, pooled_edf=edf, lambda_mode="global", device=CPU
+        y, design, K, [PEN], STARTS, torch.ones(y.shape[0]), lambda_mode="global", device=CPU
     )
-    shared = fit_smooth_per_run(y, design, K, [PEN], STARTS, torch.full((6,), 0.1), device=CPU)
-    torch.testing.assert_close(out.betas, shared.betas)
+    ref = fit_smooth_per_run(
+        y, design, K, [PEN], STARTS, torch.full((y.shape[0],), chosen), device=CPU
+    )
+    torch.testing.assert_close(out.betas, ref.betas)
+
+
+def test_global_lambda_falls_back_to_every_voxel_without_signal():
+    from fastfuncstuff.glm.smooth_basis import choose_global_lambda
+
+    y, design, _, _ = _problem(n_vox=50, amp=0.0, seed=4)
+    out = choose_global_lambda(y, design, K, PEN, STARTS, device=CPU)
+    assert out.fallback and out.n_signal == 50
 
 
 def test_rejects_unknown_modes_and_single_runs():

@@ -506,7 +506,10 @@ def parse_args():
             "(smooth FIR), its strength chosen PER VOXEL. RULE picks the strength: "
             "reml (default; restricted likelihood, no held-out data), gcv "
             "(generalized cross-validation), loro (best leave-one-run-out "
-            "prediction), or a number (one fixed relative lambda everywhere). "
+            "prediction), global (ONE lambda for every voxel: the best median "
+            "leave-one-run-out R² over signal voxels, see -smooth-signal-r2; a linear "
+            "estimator, so amplitude bias does not vary with SNR), or a number (one "
+            "fixed relative lambda everywhere). "
             "Fixes the up-down artefact of onsets bunched mid-TR and makes knots "
             "finer than the TR solvable (-window/-tent-n-basis). Writes "
             "<prefix>_smooth_edf (effective knots used) and "
@@ -525,6 +528,17 @@ def parse_args():
         "(the choice is written to <prefix>_smooth_penalty, 0-based in the order "
         "given): -tent-smooth reml -smooth-penalty diff2,gp:4 picks each "
         "penalty's lambda by REML and the penalty by held-out runs.",
+    )
+    model_opts.add_argument(
+        "-smooth-signal-r2",
+        dest="smooth_signal_r2",
+        type=float,
+        default=0.05,
+        metavar="R2",
+        help="Signal voxels for a global lambda (-tent-smooth global, -per-run-lambda "
+        "global): held-out R² above this under OLS or REML. The median over them "
+        "keeps the far more numerous silent voxels, which all favour heavy "
+        "smoothing, from setting the lambda.",
     )
     model_opts.add_argument(
         "-smooth-noise",
@@ -555,9 +569,10 @@ def parse_args():
         default="shared",
         help="Smoothing strength of each -per-run fit. shared: each voxel's pooled "
         "lambda at the same absolute strength in every run, so a noisier run is not "
-        "smoothed harder. global: one lambda (median over voxels the pooled fit did "
-        "not flatten); exactly linear, removing shared's small bias from choosing "
-        "lambda on the same noise, but not adapted per voxel. run: each run's own "
+        "smoothed harder. global: one lambda, the best median held-out R² over "
+        "signal voxels (as -tent-smooth global); exactly linear, removing shared's "
+        "small bias from choosing lambda on the same noise, but not adapted per "
+        "voxel. run: each run's own "
         "REML lambda; noisier runs are smoothed harder, which FAKES run effects "
         "(e.g. habituation) when noise differs across runs. Diagnostic only; writes "
         "<prefix>_perrun_log10lambda.",
@@ -1292,7 +1307,7 @@ def main(argv: list[str] | None = None):
             )
             return 1
         choice = str(args.tent_smooth).lower()
-        if choice in ("reml", "gcv", "loro"):
+        if choice in ("reml", "gcv", "loro", "global"):
             smooth_method = choice
         else:
             try:
@@ -1301,7 +1316,7 @@ def main(argv: list[str] | None = None):
                 smooth_lam = -1.0
             if smooth_lam <= 0:
                 print(
-                    "ERROR: -tent-smooth takes reml, gcv, loro or a positive lambda, "
+                    "ERROR: -tent-smooth takes reml, gcv, loro, global or a positive lambda, "
                     f"got {args.tent_smooth!r}",
                     file=sys.stderr,
                 )
@@ -1316,8 +1331,11 @@ def main(argv: list[str] | None = None):
         except ValueError as exc:
             print(f"ERROR: -smooth-penalty: {exc}", file=sys.stderr)
             return 1
-        if (smooth_method == "loro" or len(smooth_specs) > 1) and n_runs < 2:
+        if (smooth_method in ("loro", "global") or len(smooth_specs) > 1) and n_runs < 2:
             print("ERROR: choosing by held-out runs needs at least two runs", file=sys.stderr)
+            return 1
+        if smooth_method == "global" and len(smooth_specs) > 1:
+            print("ERROR: -tent-smooth global uses one penalty", file=sys.stderr)
             return 1
     if args.per_run and (smooth_method is None or n_runs < 2):
         print("ERROR: -per-run needs -tent-smooth and at least two runs", file=sys.stderr)
@@ -2290,6 +2308,31 @@ def main(argv: list[str] | None = None):
             )
             for spec in smooth_specs
         ]
+        if smooth_method == "global":
+            from fastfuncstuff.glm.smooth_basis import choose_global_lambda
+
+            chosen = choose_global_lambda(
+                packed.data_concat,
+                packed.design_concat,
+                packed.n_task_cols,
+                smooth_pens[0],
+                list(run_starts),
+                signal_r2=args.smooth_signal_r2,
+                device=device,
+                verbose=args.verb >= 1,
+            )
+            smooth_method, smooth_lam = "fixed", chosen.lam
+            if chosen.fallback:
+                print(
+                    f"WARNING: no voxel reached held-out R² {args.smooth_signal_r2:g}; the "
+                    "global lambda uses every voxel",
+                    file=sys.stderr,
+                )
+            if args.verb >= 1:
+                print(
+                    f"  Global lambda: 10^{np.log10(chosen.lam):.2f} (best median held-out "
+                    f"R² {chosen.median_curve.max():.4f} over {chosen.n_signal:,} signal voxels)"
+                )
         smooth_kwargs = dict(
             rule=smooth_method,
             lam=smooth_lam,
@@ -2356,7 +2399,7 @@ def main(argv: list[str] | None = None):
             smooth_pens,
             list(run_starts),
             smooth_fit.lam,
-            pooled_edf=smooth_fit.edf,
+            signal_r2=args.smooth_signal_r2,
             penalty_index=smooth_sel.penalty_index,
             arma=smooth_arma,
             rule=smooth_method or "reml",

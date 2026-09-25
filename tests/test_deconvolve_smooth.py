@@ -371,3 +371,17 @@ def test_run_tags_widen_past_99_runs_so_names_sort():
     assert _run_tags(3) == ["run01", "run02", "run03"]
     tags = _run_tags(120)
     assert tags[0] == "run001" and tags[-1] == "run120" and tags == sorted(tags)
+
+
+def test_global_rule_fits_every_voxel_with_one_lambda(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "glob")
+    argv = _per_run_argv(runs, timing, prefix, "-per-run-lambda", "global")
+    argv.insert(argv.index("-tent-smooth") + 1, "global")
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    assert "Global lambda: 10^" in capsys.readouterr().out
+    lam = nib.load(f"{prefix}_smooth_log10lambda.nii.gz").get_fdata()
+    assert np.ptp(lam) < 1e-5

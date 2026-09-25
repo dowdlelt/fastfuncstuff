@@ -519,6 +519,134 @@ def fit_smooth_selected(
     )
 
 
+#: Held-out R^2 a voxel needs, under OLS or honest REML, to count as signal
+#: when choosing one global lambda.
+GLOBAL_SIGNAL_R2 = 0.05
+#: The unpenalized reference fit's lambda (relative): OLS for any usable design.
+OLS_LAMBDA = 1e-6
+
+
+@dataclass
+class GlobalLambda:
+    """Result of :func:`choose_global_lambda`."""
+
+    lam: float  # relative, like every lambda here
+    n_signal: int
+    #: Median held-out R^2 of the signal voxels at each grid lambda.
+    median_curve: np.ndarray
+    log10_grid: np.ndarray
+    #: Fell back to every live voxel because none reached ``signal_r2``.
+    fallback: bool
+
+
+def choose_global_lambda(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    penalty: np.ndarray,
+    run_starts: list[int],
+    *,
+    signal_r2: float = GLOBAL_SIGNAL_R2,
+    rule: str = "reml",
+    log10_grid: np.ndarray | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> GlobalLambda:
+    """One lambda for every voxel: the grid value that maximizes the median
+    leave-one-run-out R^2 over signal voxels.
+
+    Signal voxels are those whose held-out R^2 exceeds ``signal_r2`` under
+    OLS or under ``rule`` (REML/GCV, lambda from the training runs only), so
+    neither the smoothed nor the unsmoothed fit decides alone.  Taking the
+    median over them keeps the choice from being set by the noise voxels,
+    which outnumber them and all prefer heavy smoothing.  One scalar chosen
+    from many voxels carries negligible selection bias, and applying it
+    everywhere makes the fit a linear estimator.  One pass over the data:
+    every fold's held-out error at every grid lambda is a closed form.
+    """
+    if len(run_starts) < 2:
+        raise ValueError("choosing a global lambda by held-out runs needs at least two runs")
+    device = device if device is not None else torch.device("cpu")
+    n_vox, n_t = data.shape
+    grid10 = np.asarray(DEFAULT_LOG10_GRID if log10_grid is None else log10_grid, dtype=float)
+    log_grid = torch.as_tensor(grid10, dtype=torch.float64, device=device) * np.log(10.0)
+    lams = torch.exp(log_grid)
+    bounds = list(run_starts) + [n_t]
+    design64 = design.detach().cpu().double().numpy()
+    folds = []
+    for r in range(len(run_starts)):
+        test = torch.arange(bounds[r], bounds[r + 1])
+        train = torch.cat([torch.arange(0, bounds[r]), torch.arange(bounds[r + 1], n_t)])
+        folds.append(_fold_penalty(design64, n_task, penalty, train, test, device, design64))
+    n_lam = int(lams.numel())
+    curve = torch.zeros((n_vox, n_lam), dtype=torch.float32)
+    r2_ols = torch.zeros(n_vox, dtype=torch.float32)
+    r2_rule = torch.zeros(n_vox, dtype=torch.float32)
+    live_all = torch.zeros(n_vox, dtype=torch.bool)
+    chunk = estimate_chunk_size(n_vox, n_t, n_task * (n_lam + 2), device, operation="glm")
+    starts = range(0, n_vox, chunk)
+    for a in tqdm(
+        starts,
+        desc="  Global lambda",
+        unit="chunk",
+        leave=True,
+        disable=not verbose or len(starts) < 2,
+    ):
+        b = min(a + chunk, n_vox)
+        y = data[a:b].to(device=device, dtype=torch.float64)
+        ss = torch.zeros((b - a, n_lam), dtype=torch.float64, device=device)
+        ss_ols = torch.zeros(b - a, dtype=torch.float64, device=device)
+        ss_rule = torch.zeros(b - a, dtype=torch.float64, device=device)
+        total = torch.zeros(b - a, dtype=torch.float64, device=device)
+        total_sq = torch.zeros(b - a, dtype=torch.float64, device=device)
+        n_test = 0
+        for fp in folds:
+            y_te = y[:, fp.test.to(device)]
+            if fp.q_test.shape[1]:
+                y_te = y_te - (y_te @ fp.q_test) @ fp.q_test.T
+            yy_te = (y_te * y_te).sum(dim=1)
+            total += y_te.sum(dim=1)
+            total_sq += yy_te
+            n_test += y_te.shape[1]
+            sp = fp.spec
+            q_tr = torch.as_tensor(sp.q_nuis, dtype=torch.float64, device=device)
+            y_tr = y[:, fp.train.to(device)]
+            y_tr = y_tr - (y_tr @ q_tr) @ q_tr.T if q_tr.shape[1] else y_tr
+            z = y_tr @ torch.as_tensor(sp.g, dtype=torch.float64, device=device)
+            s_t = torch.as_tensor(sp.s, dtype=torch.float64, device=device)
+            u = y_te @ fp.m
+            for li in range(n_lam):
+                d = 1.0 / ((1.0 - s_t) + lams[li] * s_t)
+                ss[:, li] += _heldout_ss(d * z, u, yy_te, fp.m_gram)
+            d = _shrink(torch.full((b - a,), OLS_LAMBDA, dtype=torch.float64, device=device), s_t)
+            ss_ols += _heldout_ss(d * z, u, yy_te, fp.m_gram)
+            crit = _criterion(
+                rule, z * z, (y_tr * y_tr).sum(dim=1), s_t, lams, sp.n_eff, sp.rank_penalty
+            )
+            d = _shrink(torch.exp(_refine_log_lambda(crit, log_grid)), s_t)
+            ss_rule += _heldout_ss(d * z, u, yy_te, fp.m_gram)
+        ss_tot = total_sq - total * total / n_test
+        live = ss_tot > 1e-12 * n_t
+        safe = torch.where(live, ss_tot, torch.ones_like(ss_tot))
+        curve[a:b] = torch.where(live[:, None], 1 - ss / safe[:, None], 0.0).float().cpu()
+        r2_ols[a:b] = torch.where(live, 1 - ss_ols / safe, 0.0).float().cpu()
+        r2_rule[a:b] = torch.where(live, 1 - ss_rule / safe, 0.0).float().cpu()
+        live_all[a:b] = live.cpu()
+    signal = (r2_ols > signal_r2) | (r2_rule > signal_r2)
+    fallback = not bool(signal.any())
+    if fallback:
+        signal = live_all if bool(live_all.any()) else torch.ones(n_vox, dtype=torch.bool)
+    med = curve[signal].median(dim=0).values.double()
+    log_best = _refine_log_lambda(-med[None, :], log_grid.cpu())[0]
+    return GlobalLambda(
+        lam=float(torch.exp(log_best)),
+        n_signal=int(signal.sum()),
+        median_curve=med.numpy(),
+        log10_grid=grid10,
+        fallback=fallback,
+    )
+
+
 def _residual_autocorr(
     data: torch.Tensor,
     design: torch.Tensor,
@@ -788,7 +916,7 @@ def fit_smooth_per_run(
     run_starts: list[int],
     pooled_lam: torch.Tensor,
     *,
-    pooled_edf: torch.Tensor | None = None,
+    signal_r2: float = GLOBAL_SIGNAL_R2,
     penalty_index: torch.Tensor | None = None,
     arma: torch.Tensor | None = None,
     rule: str = "reml",
@@ -808,9 +936,10 @@ def fit_smooth_per_run(
     strength: ``lam_run = lam_pool * tr(G_pool) / tr(G_run)``, so a noisier
     run is not shrunk harder.  The voxel's pooled lambda was itself chosen from
     its data, which leaves a small bias (a noisy run that looks peaky lowers
-    it).  ``"global"`` removes that: one lambda per penalty -- the median pooled
-    lambda over voxels the pooled fit did not flatten (``pooled_edf`` above the
-    penalty's null space) -- makes each run's fit exactly linear.  Runs with
+    it).  ``"global"`` removes that: one lambda per penalty, chosen by
+    :func:`choose_global_lambda` (best median held-out R^2 over the voxels
+    whose OLS or ``rule`` R^2 beats ``signal_r2``), makes each run's fit
+    exactly linear.  Under ARMA noise it is chosen on the unwhitened series.  Runs with
     different event timing still smooth the same curve slightly differently.
     ``"run"`` picks each
     run's own lambda by REML/GCV -- noisier runs are then shrunk harder, which
@@ -870,12 +999,19 @@ def fit_smooth_per_run(
         pooled_lam64 = pooled_lam64.clone()
         for p_i, penalty in enumerate(penalties):
             sel = pen_idx == p_i
-            bent = sel.clone()
-            if pooled_edf is not None:
-                bent &= pooled_edf.cpu() > (n_task - _penalty_rank(penalty)) + 0.5
-            src = pooled_lam64[bent] if bool(bent.any()) else pooled_lam64[sel]
-            if src.numel():
-                pooled_lam64[sel] = torch.exp(torch.log(src).median())
+            if bool(sel.any()):
+                pooled_lam64[sel] = choose_global_lambda(
+                    data[sel],
+                    design,
+                    n_task,
+                    penalty,
+                    run_starts,
+                    signal_r2=signal_r2,
+                    rule=run_rule,
+                    log10_grid=log10_grid,
+                    device=device,
+                    verbose=verbose,
+                ).lam
 
     chunk = estimate_chunk_size(n_vox, n_t, n_task * (4 * n_runs + 2), device, operation="glm")
     groups = tqdm(
