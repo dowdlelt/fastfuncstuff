@@ -530,6 +530,19 @@ def parse_args():
         "penalty's lambda by REML and the penalty by held-out runs.",
     )
     model_opts.add_argument(
+        "-temporal-filter",
+        dest="temporal_filter",
+        default=None,
+        metavar="SPEC",
+        help="Filter the DATA in time, run by run, before the fit: lowpass:HZ, "
+        "highpass:HZ, bandpass:LO,HI (FFT, raised-cosine edges, mirror-extended runs) "
+        "or movavg:N (centred, N odd samples). The FIR/TENT design is never filtered, "
+        "so the curve is the true response blurred by the filter: lower, wider, later "
+        "with a low cutoff. -save-xval-r2 then scores held-out runs on the UNFILTERED "
+        "data (a filtered target has lost its noise and flatters R²); in-sample -save-r2 "
+        "is on the filtered data. Composes with -tent-smooth.",
+    )
+    model_opts.add_argument(
         "-smooth-signal-r2",
         dest="smooth_signal_r2",
         type=float,
@@ -1340,6 +1353,39 @@ def main(argv: list[str] | None = None):
     if args.per_run and (smooth_method is None or n_runs < 2):
         print("ERROR: -per-run needs -tent-smooth and at least two runs", file=sys.stderr)
         return 1
+    temporal_filter = None
+    if args.temporal_filter is not None:
+        from fastfuncstuff.processing.temporal_filter import parse_temporal_filter
+
+        try:
+            temporal_filter = parse_temporal_filter(args.temporal_filter)
+        except ValueError as exc:
+            print(f"ERROR: -temporal-filter: {exc}", file=sys.stderr)
+            return 1
+        nyquist = 0.5 / tr
+        if any(
+            hz is not None and hz >= nyquist
+            for hz in (temporal_filter.low_hz, temporal_filter.high_hz)
+        ):
+            print(
+                f"ERROR: -temporal-filter edge at or above Nyquist ({nyquist:g} Hz at TR {tr:g} s)",
+                file=sys.stderr,
+            )
+            return 1
+        if model not in ("FIR", "TENT", "TENTzero", "CSPLIN", "CSPLINzero"):
+            print(
+                f"ERROR: -temporal-filter is for FIR/TENT/CSPLIN models, not {model} (an "
+                "assumed-shape model would need its design filtered too)",
+                file=sys.stderr,
+            )
+            return 1
+        if args.xval_tr_range > 0:
+            print(
+                "ERROR: -temporal-filter and -xval-tr-range are not combined yet (window "
+                "selection would score on the filtered data)",
+                file=sys.stderr,
+            )
+            return 1
     if not args.per_run and (
         args.per_run_se or args.per_run_lambda != "shared" or args.per_run_xval_lambda != "fold"
     ):
@@ -2113,6 +2159,25 @@ def main(argv: list[str] | None = None):
     # The save-design / save-plot artefacts below are written from the fully
     # augmented (task + polys + external nuisance) packed form, so what lands
     # on disk is exactly what fit_glm sees.
+    # Data only: the FIR/TENT knots are the estimate, so the design stays as built.
+    # Held-out runs are scored on the unfiltered series.
+    unfiltered = None
+    if temporal_filter is not None:
+        from fastfuncstuff.processing.temporal_filter import apply_temporal_filter
+
+        if args.save_xval_r2:
+            unfiltered = packed.data_concat  # the filter returns a new tensor
+        packed.data_concat = apply_temporal_filter(
+            packed.data_concat,
+            tr,
+            temporal_filter,
+            run_starts=list(run_starts),
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        if args.verb >= 1:
+            print(f"  Temporal filter: {temporal_filter.describe()}, per run (data only)")
+
     design_full = packed.design_concat
     column_labels = packed.column_labels
     n_stimulus_regressors = packed.n_task_cols
@@ -2339,6 +2404,7 @@ def main(argv: list[str] | None = None):
             xval=bool(args.save_xval_r2),
             device=device,
             verbose=args.verb >= 1,
+            score_data=unfiltered,
         )
         smooth_args = (
             packed.data_concat,
@@ -2410,6 +2476,7 @@ def main(argv: list[str] | None = None):
             se=args.per_run_se,
             device=device,
             verbose=args.verb >= 1,
+            score_data=unfiltered,
         )
 
     # ── R² maps ──────────────────────────────────────────────────────────────
@@ -2456,6 +2523,36 @@ def main(argv: list[str] | None = None):
                     "winner is optimistically biased (compare configurations, not levels)"
                 )
             xval = smooth_sel.xval_r2
+            xval_r2_map = None if xval is None else xval.numpy()
+        elif unfiltered is not None:
+            from fastfuncstuff.glm.smooth_basis import (
+                OLS_LAMBDA,
+                fit_smooth_selected,
+                roughness_penalty,
+            )
+
+            if args.verb >= 1:
+                print(
+                    "  note: filtered fit, scored leave-one-run-out (COD) on the "
+                    "unfiltered held-out runs"
+                )
+            xval = fit_smooth_selected(
+                packed.data_concat,
+                packed.design_concat,
+                packed.n_task_cols,
+                [
+                    roughness_penalty(
+                        n_basis_per_condition_list,
+                        zero_edges=model in ("TENTzero", "CSPLINzero"),
+                    )
+                ],
+                list(run_starts),
+                rule="fixed",
+                lam=OLS_LAMBDA,
+                xval=True,
+                device=device,
+                score_data=unfiltered,
+            ).xval_r2
             xval_r2_map = None if xval is None else xval.numpy()
         else:
             xval_r2_map = _compute_xval_r2_map(

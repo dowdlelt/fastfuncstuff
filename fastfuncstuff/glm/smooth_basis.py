@@ -733,6 +733,7 @@ def fit_smooth_arma(
     xval: bool = False,
     device: torch.device | None = None,
     verbose: bool = False,
+    score_data: torch.Tensor | None = None,
 ) -> tuple[SmoothSelection, torch.Tensor]:
     """:func:`fit_smooth_selected` under ARMA(1,1) noise, prewhitened per voxel group.
 
@@ -744,7 +745,9 @@ def fit_smooth_arma(
     ffs_reml's noise model) and refitted.  Whitening never mixes runs, so
     held-out runs stay held out; they are scored on the RAW series, so
     ``xval_r2`` compares directly with a white fit's.  Returns the selection
-    and each voxel's ``(a, b)`` as ``(V, 2)``.
+    and each voxel's ``(a, b)`` as ``(V, 2)``.  ``score_data`` replaces the
+    raw series held-out runs are scored on (e.g. unfiltered data behind a
+    temporally filtered fit).
     """
     from fastfuncstuff.glm.arma import build_arma11_covariance
 
@@ -786,7 +789,7 @@ def fit_smooth_arma(
             lam=lam,
             xval=xval,
             device=device,
-            score_data=data[idx],
+            score_data=(data if score_data is None else score_data)[idx],
             score_design=design64,
         )
         betas[idx] = sel.fit.betas
@@ -928,6 +931,7 @@ def fit_smooth_per_run(
     log10_grid: np.ndarray | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
+    score_data: torch.Tensor | None = None,
 ) -> PerRunFit:
     """One smoothed FIR/TENT curve per run, for statistics ACROSS runs.
 
@@ -957,7 +961,9 @@ def fit_smooth_per_run(
     ``"all"``, and so does ``"global"`` (its one lambda comes from every
     voxel and run).  A penalty chosen per voxel by held-out runs stays chosen with
     every run.  ``se`` gives the standard error of each knot about the smoothed
-    truth (smoothing bias not included).
+    truth (smoothing bias not included).  ``score_data`` (same shape as
+    ``data``) is the series held-out runs are scored on, when that is not the
+    fitted data -- unfiltered data behind a temporally filtered fit.
     """
     if lambda_mode not in PER_RUN_LAMBDA:
         raise ValueError(f"lambda_mode must be one of {PER_RUN_LAMBDA}, got {lambda_mode!r}")
@@ -1047,11 +1053,13 @@ def fit_smooth_per_run(
         for c0 in range(0, idx_all.numel(), chunk):
             idx = idx_all[c0 : c0 + chunk]
             y = data[idx].to(device=device, dtype=torch.float64)
+            y_sc = y if score_data is None else score_data[idx].to(device, torch.float64)
             nv = y.shape[0]
             c_fit, yy_fit, c_raw, yy_raw, sum_raw = [], [], [], [], []
             for blk in blocks:
                 y_r = y[:, blk.rows[0] : blk.rows[-1] + 1]
-                y_s = y_r - (y_r @ blk.q_raw) @ blk.q_raw.T if blk.q_raw.shape[1] else y_r
+                y_s = y_sc[:, blk.rows[0] : blk.rows[-1] + 1]
+                y_s = y_s - (y_s @ blk.q_raw) @ blk.q_raw.T if blk.q_raw.shape[1] else y_s
                 c_raw.append(y_s @ blk.x_raw)
                 yy_raw.append((y_s * y_s).sum(dim=1))
                 sum_raw.append(y_s.sum(dim=1))

@@ -385,3 +385,77 @@ def test_global_rule_fits_every_voxel_with_one_lambda(monkeypatch, tmp_path, cap
     assert "Global lambda: 10^" in capsys.readouterr().out
     lam = nib.load(f"{prefix}_smooth_log10lambda.nii.gz").get_fdata()
     assert np.ptp(lam) < 1e-5
+
+
+def _plain_argv(runs, timing, prefix, *extra):
+    return [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        timing,
+        "-model",
+        "TENT",
+        "-window",
+        "0",
+        "16",
+        "-prefix",
+        prefix,
+        "-device",
+        "cpu",
+        "-verb",
+        "1",
+        *extra,
+    ]
+
+
+def test_identity_filter_scores_like_the_unfiltered_cross_validation(monkeypatch, tmp_path, capsys):
+    """movavg:1 changes nothing, so the filtered route's held-out R² (fit on the
+    filtered runs, scored on the unfiltered ones) must equal the plain LORO map."""
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    maps = {}
+    for name, extra in (("plain", []), ("ident", ["-temporal-filter", "movavg:1"])):
+        prefix = str(tmp_path / name)
+        # knots aligned to the mid-TR samples: identifiable, so OLS is well defined
+        argv = _plain_argv(runs, timing, prefix, "-tent-n-basis", "9", "-save-xval-r2", *extra)
+        argv[argv.index("-window") + 1 : argv.index("-window") + 3] = ["1", "17"]
+        monkeypatch.setattr(sys, "argv", argv)
+        assert deconvolve.main() == 0
+        maps[name] = nib.load(f"{prefix}_xval_r2.nii.gz").get_fdata()
+    assert "unfiltered held-out runs" in capsys.readouterr().out
+    np.testing.assert_allclose(maps["ident"], maps["plain"], atol=2e-4)
+
+
+def test_lowpass_filter_blurs_the_curve_and_is_scored_on_raw_data(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "lp")
+    argv = _plain_argv(
+        runs,
+        timing,
+        prefix,
+        "-tent-smooth",
+        "-per-run",
+        "-save-xval-r2",
+        "-temporal-filter",
+        "lowpass:0.08",
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    assert "Temporal filter: low-pass 0.08 Hz" in capsys.readouterr().out
+    for name in ("xval_r2", "perrun_xval_r2", "iresp_stim"):
+        assert np.isfinite(nib.load(f"{prefix}_{name}.nii.gz").get_fdata()).all()
+
+
+def test_temporal_filter_rejects_bad_specs_and_nyquist(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)  # TR 2 s: Nyquist 0.25 Hz
+    for spec, msg in (("lowpass:0.3", "Nyquist"), ("movavg:4", "temporal filter must be")):
+        argv = _plain_argv(runs, timing, str(tmp_path / "bad"), "-temporal-filter", spec)
+        monkeypatch.setattr(sys, "argv", argv)
+        assert deconvolve.main() == 1
+        assert msg in capsys.readouterr().err

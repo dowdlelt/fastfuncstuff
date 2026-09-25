@@ -299,3 +299,24 @@ def test_rejects_unknown_modes_and_single_runs():
         fit_smooth_per_run(y, design, K, [PEN], STARTS, torch.ones(2), lambda_mode="x")
     with pytest.raises(ValueError, match="two runs"):
         fit_smooth_per_run(y[:, :T], design[:T], K, [PEN], [0], torch.ones(2))
+
+
+def test_per_run_scores_held_out_runs_on_score_data_when_given():
+    y, design, run_design, _ = _problem()
+    pooled = _pooled(y, design)
+    rough = y + torch.randn_like(y)  # a different series to score against
+    out = fit_smooth_per_run(
+        y,
+        design,
+        K,
+        [PEN],
+        STARTS,
+        pooled.lam,
+        xval=True,
+        xval_lambda="all",
+        score_data=rough,
+        device=CPU,
+    )
+    b = out.betas.double().numpy()
+    ref = _brute_xval(rough, run_design, lambda r, j: b[:, r])
+    np.testing.assert_allclose(out.xval_r2.numpy(), ref, atol=2e-4)
