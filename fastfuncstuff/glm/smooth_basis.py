@@ -144,8 +144,21 @@ def _spectrum(design: np.ndarray, n_task: int, penalty: np.ndarray) -> _Spectrum
     else:
         q = np.zeros((design.shape[0], 0))
     x = x - q @ (q.T @ x)
-    gram = x.T @ x
-    # Relative lambda: the penalty's scale matches the data term's.
+    w, s = _gram_spectrum(x.T @ x, penalty)
+    return _Spectrum(
+        g=x @ w,
+        w=w,
+        s=s,
+        q_nuis=q,
+        n_eff=design.shape[0] - q.shape[1],
+        rank_penalty=_penalty_rank(penalty),
+    )
+
+
+def _gram_spectrum(gram: np.ndarray, penalty: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(W, s)`` of the simultaneous diagonalization of ``gram`` and the penalty,
+    the penalty scaled to ``trace(gram)`` (the relative-lambda convention)."""
+    n_task = gram.shape[0]
     pen = penalty * (np.trace(gram) / max(np.trace(penalty), 1e-300))
     b = gram + pen
     b += np.eye(n_task) * (1e-10 * np.trace(b) / n_task)  # null(A) & null(P) guard
@@ -153,18 +166,12 @@ def _spectrum(design: np.ndarray, n_task: int, penalty: np.ndarray) -> _Spectrum
     r_inv = np.linalg.inv(r)
     m = r_inv.T @ pen @ r_inv
     s, v = np.linalg.eigh((m + m.T) / 2)
-    s = np.clip(s, 0.0, 1.0)
-    w = r_inv @ v
-    p_evals = np.linalg.eigvalsh(pen)
-    rank_p = int((p_evals > p_evals.max() * 1e-9).sum()) if p_evals.size else 0
-    return _Spectrum(
-        g=x @ w,
-        w=w,
-        s=s,
-        q_nuis=q,
-        n_eff=design.shape[0] - q.shape[1],
-        rank_penalty=rank_p,
-    )
+    return r_inv @ v, np.clip(s, 0.0, 1.0)
+
+
+def _penalty_rank(penalty: np.ndarray) -> int:
+    p_evals = np.linalg.eigvalsh(penalty)
+    return int((p_evals > p_evals.max() * 1e-9).sum()) if p_evals.size else 0
 
 
 def _criterion(
@@ -665,3 +672,344 @@ def fit_smooth_arma(
     fit = SmoothBasisFit(betas=betas, lam=out_lam, edf=out_edf, r2=r2, method=rule)
     biased = rule == "loro" or len(penalties) > 1
     return SmoothSelection(fit, pen_idx, xval_r2, biased), arma
+
+
+#: How each run's lambda is set in :func:`fit_smooth_per_run`.
+PER_RUN_LAMBDA = ("shared", "global", "run")
+#: Where the held-out scoring's lambda comes from.
+PER_RUN_XVAL_LAMBDA = ("fold", "all")
+
+
+@dataclass
+class PerRunFit:
+    """Result of :func:`fit_smooth_per_run`."""
+
+    betas: torch.Tensor  # (V, R, K) one smoothed curve per run
+    log10_lambda: torch.Tensor  # (V, R) relative lambda used in each run's fit
+    se: torch.Tensor | None  # (V, R, K) standard error about the SMOOTHED truth
+    #: COD of "fit one run, predict every other run", pooled over all pairs.
+    xval_r2: torch.Tensor | None
+    #: The same score for the unpenalized per-run fit (OLS; GLS when whitened).
+    xval_r2_ols: torch.Tensor | None
+    #: The xval lambda actually came from all runs (asked for, or forced by a
+    #: pooled rule that cannot be re-run without the scored run).
+    xval_lambda_used: str
+
+
+@dataclass
+class _RunBlock:
+    rows: np.ndarray
+    chol: torch.Tensor | None  # whitening factor, None when white
+    q_fit: torch.Tensor  # (T_r, p) nuisance basis in the fitted (whitened) space
+    x_fit: torch.Tensor  # (T_r, K) task columns, whitened and nuisance-projected
+    q_raw: torch.Tensor  # the same in the raw (scoring) space
+    x_raw: torch.Tensor
+    w: torch.Tensor  # (K, K) spectrum of this run alone
+    s: torch.Tensor
+    gram_trace: float
+    gram_raw: torch.Tensor
+    n_eff: int
+
+
+def _nuisance_basis(nuis: np.ndarray) -> np.ndarray:
+    nuis = nuis[:, np.abs(nuis).sum(axis=0) > 0]
+    if not nuis.shape[1]:
+        return np.zeros((nuis.shape[0], 0))
+    u, sv, _ = np.linalg.svd(nuis, full_matrices=False)
+    return u[:, sv > sv.max() * 1e-10]
+
+
+def _run_blocks(design64, n_task, penalty, bounds, a, b, device) -> list[_RunBlock]:
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+
+    blocks = []
+    for r in range(len(bounds) - 1):
+        rows = np.arange(bounds[r], bounds[r + 1])
+        d_raw = design64[rows]
+        chol = None
+        d_fit = d_raw
+        if a != 0.0 or b != 0.0:
+            cov = build_arma11_covariance(a, b, rows.size, torch.device("cpu"), torch.float64)
+            if cov is not None:
+                chol = torch.linalg.cholesky(cov)
+                d_fit = torch.linalg.solve_triangular(
+                    chol, torch.as_tensor(d_raw), upper=False
+                ).numpy()
+        q_raw = _nuisance_basis(d_raw[:, n_task:])
+        x_raw = d_raw[:, :n_task] - q_raw @ (q_raw.T @ d_raw[:, :n_task])
+        q_fit = _nuisance_basis(d_fit[:, n_task:])
+        x_fit = d_fit[:, :n_task] - q_fit @ (q_fit.T @ d_fit[:, :n_task])
+        gram = x_fit.T @ x_fit
+        w, s = _gram_spectrum(gram, penalty)
+
+        def dev(v):
+            return torch.as_tensor(v, dtype=torch.float64, device=device)
+
+        blocks.append(
+            _RunBlock(
+                rows=rows,
+                chol=None if chol is None else chol.to(device),
+                q_fit=dev(q_fit),
+                x_fit=dev(x_fit),
+                q_raw=dev(q_raw),
+                x_raw=dev(x_raw),
+                w=dev(w),
+                s=dev(s),
+                gram_trace=float(np.trace(gram)),
+                gram_raw=dev(x_raw.T @ x_raw),
+                n_eff=rows.size - q_fit.shape[1],
+            )
+        )
+    return blocks
+
+
+def _shrink(lam_rel: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """``d = 1/((1-s) + lam s)`` per voxel: (V,) lambdas -> (V, K)."""
+    return 1.0 / ((1.0 - s)[None, :] + lam_rel[:, None] * s[None, :])
+
+
+def _target_ss(beta, yy, c, gram):
+    """``||y - X beta||^2`` from ``y'y``, ``X'y`` and ``X'X`` (summed over targets)."""
+    return yy - 2 * (beta * c).sum(dim=1) + ((beta @ gram) * beta).sum(dim=1)
+
+
+def _choose_lambda(rule, z, yy, s, n_eff, rank_p, log_grid, lam_fixed):
+    if rule == "fixed":
+        return torch.full_like(yy, float(lam_fixed))
+    crit = _criterion(rule, z * z, yy, s, torch.exp(log_grid), n_eff, rank_p)
+    return torch.exp(_refine_log_lambda(crit, log_grid))
+
+
+def fit_smooth_per_run(
+    data: torch.Tensor,
+    design: torch.Tensor,
+    n_task: int,
+    penalties: list[np.ndarray],
+    run_starts: list[int],
+    pooled_lam: torch.Tensor,
+    *,
+    pooled_edf: torch.Tensor | None = None,
+    penalty_index: torch.Tensor | None = None,
+    arma: torch.Tensor | None = None,
+    rule: str = "reml",
+    lam: float | None = None,
+    lambda_mode: str = "shared",
+    xval: bool = False,
+    xval_lambda: str = "fold",
+    se: bool = False,
+    log10_grid: np.ndarray | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> PerRunFit:
+    """One smoothed FIR/TENT curve per run, for statistics ACROSS runs.
+
+    ``lambda_mode="shared"`` (default) fits every run with the pooled fit's
+    lambda (``pooled_lam``, relative to the pooled design) at the same ABSOLUTE
+    strength: ``lam_run = lam_pool * tr(G_pool) / tr(G_run)``, so a noisier
+    run is not shrunk harder.  The voxel's pooled lambda was itself chosen from
+    its data, which leaves a small bias (a noisy run that looks peaky lowers
+    it).  ``"global"`` removes that: one lambda per penalty -- the median pooled
+    lambda over voxels the pooled fit did not flatten (``pooled_edf`` above the
+    penalty's null space) -- makes each run's fit exactly linear.  Runs with
+    different event timing still smooth the same curve slightly differently.
+    ``"run"`` picks each
+    run's own lambda by REML/GCV -- noisier runs are then shrunk harder, which
+    fakes run effects (a sham habituation) when noise differs across runs.
+
+    ``penalty_index``/``arma`` carry the pooled fit's per-voxel penalty choice
+    and ARMA(1,1) noise; each run is prewhitened with its voxel's ``(a, b)``.
+
+    ``xval`` scores "fit run r, predict run j" over every pair, on the raw
+    series, for the smoothed and the unpenalized per-run fit.  ``xval_lambda
+    ="fold"`` re-chooses the pooled lambda by ``rule`` without run j (one pooled
+    REML per run, from per-run sufficient statistics -- no extra data pass);
+    ``"all"`` keeps the all-run lambda (a small leak, R times cheaper).  A
+    ``loro`` pooled rule cannot be re-run inside the fold, so it scores with
+    ``"all"``, and so does ``"global"`` (its one lambda comes from every
+    voxel and run).  A penalty chosen per voxel by held-out runs stays chosen with
+    every run.  ``se`` gives the standard error of each knot about the smoothed
+    truth (smoothing bias not included).
+    """
+    if lambda_mode not in PER_RUN_LAMBDA:
+        raise ValueError(f"lambda_mode must be one of {PER_RUN_LAMBDA}, got {lambda_mode!r}")
+    if xval_lambda not in PER_RUN_XVAL_LAMBDA:
+        raise ValueError(f"xval_lambda must be one of {PER_RUN_XVAL_LAMBDA}, got {xval_lambda!r}")
+    if len(run_starts) < 2:
+        raise ValueError("per-run curves need at least two runs")
+    device = device if device is not None else torch.device("cpu")
+    n_vox, n_t = data.shape
+    n_runs = len(run_starts)
+    bounds = list(run_starts) + [n_t]
+    design64 = design.detach().cpu().double().numpy()
+    log_grid = torch.as_tensor(
+        DEFAULT_LOG10_GRID if log10_grid is None else log10_grid, dtype=torch.float64
+    ).to(device) * np.log(10.0)
+    run_rule = rule if rule in ("reml", "gcv") else "reml"
+    fold_rule = rule if rule in ("reml", "gcv", "fixed") else None
+    xval_used = xval_lambda if lambda_mode == "shared" and fold_rule is not None else "all"
+    if lambda_mode == "run":
+        xval_used = "fold"  # each run's lambda never sees another run
+
+    betas = torch.zeros((n_vox, n_runs, n_task), dtype=torch.float32)
+    log10_lam = torch.zeros((n_vox, n_runs), dtype=torch.float32)
+    se_out = torch.zeros((n_vox, n_runs, n_task), dtype=torch.float32) if se else None
+    xr2 = torch.zeros(n_vox, dtype=torch.float32) if xval else None
+    xr2_ols = torch.zeros(n_vox, dtype=torch.float32) if xval else None
+
+    pen_idx = torch.zeros(n_vox, dtype=torch.long) if penalty_index is None else penalty_index
+    if arma is None:
+        arma_np = np.zeros((n_vox, 2))
+    else:
+        # Back to the grid values the pooled fit whitened with (float32 on the way out).
+        arma_np = np.round(arma.detach().cpu().double().numpy(), 2)
+    keys = np.column_stack([pen_idx.numpy(), arma_np])
+    uniq, which = np.unique(keys, axis=0, return_inverse=True)
+    which = which.reshape(-1)
+    pooled_lam64 = pooled_lam.detach().cpu().double()
+    if lambda_mode == "global":
+        pooled_lam64 = pooled_lam64.clone()
+        for p_i, penalty in enumerate(penalties):
+            sel = pen_idx == p_i
+            bent = sel.clone()
+            if pooled_edf is not None:
+                bent &= pooled_edf.cpu() > (n_task - _penalty_rank(penalty)) + 0.5
+            src = pooled_lam64[bent] if bool(bent.any()) else pooled_lam64[sel]
+            if src.numel():
+                pooled_lam64[sel] = torch.exp(torch.log(src).median())
+
+    chunk = estimate_chunk_size(n_vox, n_t, n_task * (4 * n_runs + 2), device, operation="glm")
+    groups = tqdm(
+        range(len(uniq)),
+        desc="  Per-run fits",
+        unit="group",
+        leave=True,
+        disable=not verbose or len(uniq) < 2,
+    )
+    for gi in groups:
+        p_i, a, b = int(uniq[gi, 0]), float(uniq[gi, 1]), float(uniq[gi, 2])
+        penalty = penalties[p_i]
+        rank_p = _penalty_rank(penalty)
+        blocks = _run_blocks(design64, n_task, penalty, bounds, a, b, device)
+        traces = np.array([blk.gram_trace for blk in blocks])
+        tr_pool = float(traces.sum())
+        n_eff_all = sum(blk.n_eff for blk in blocks)
+        fold_spec = []
+        if xval and xval_used == "fold" and lambda_mode == "shared":
+            g_all = sum(blk.x_fit.T @ blk.x_fit for blk in blocks)
+            for blk in blocks:
+                g_minus = (g_all - blk.x_fit.T @ blk.x_fit).cpu().numpy()
+                w_m, s_m = _gram_spectrum(g_minus, penalty)
+                fold_spec.append(
+                    (
+                        torch.as_tensor(w_m, device=device),
+                        torch.as_tensor(s_m, device=device),
+                        float(np.trace(g_minus)),
+                        n_eff_all - blk.n_eff,
+                    )
+                )
+        idx_all = torch.as_tensor(np.nonzero(which == gi)[0])
+        for c0 in range(0, idx_all.numel(), chunk):
+            idx = idx_all[c0 : c0 + chunk]
+            y = data[idx].to(device=device, dtype=torch.float64)
+            nv = y.shape[0]
+            c_fit, yy_fit, c_raw, yy_raw, sum_raw = [], [], [], [], []
+            for blk in blocks:
+                y_r = y[:, blk.rows[0] : blk.rows[-1] + 1]
+                y_s = y_r - (y_r @ blk.q_raw) @ blk.q_raw.T if blk.q_raw.shape[1] else y_r
+                c_raw.append(y_s @ blk.x_raw)
+                yy_raw.append((y_s * y_s).sum(dim=1))
+                sum_raw.append(y_s.sum(dim=1))
+                if blk.chol is not None:
+                    y_r = torch.linalg.solve_triangular(blk.chol, y_r.T, upper=False).T
+                y_f = y_r - (y_r @ blk.q_fit) @ blk.q_fit.T if blk.q_fit.shape[1] else y_r
+                c_fit.append(y_f @ blk.x_fit)
+                yy_fit.append((y_f * y_f).sum(dim=1))
+            empty = torch.stack(yy_raw).sum(dim=0) <= 1e-12 * n_t
+
+            lam_pool = pooled_lam64[idx].to(device)
+            beta_runs = []
+            for r, blk in enumerate(blocks):
+                z = c_fit[r] @ blk.w
+                if lambda_mode != "run":
+                    lam_r = lam_pool * tr_pool / blk.gram_trace
+                else:
+                    lam_r = _choose_lambda(
+                        run_rule, z, yy_fit[r], blk.s, blk.n_eff, rank_p, log_grid, None
+                    )
+                d = _shrink(lam_r, blk.s)
+                beta_r = (d * z) @ blk.w.T
+                beta_runs.append(beta_r)
+                betas[idx, r] = beta_r.float().cpu()
+                log10_lam[idx, r] = torch.log10(lam_r).float().cpu()
+                if se_out is not None:
+                    one_s = (1.0 - blk.s)[None, :]
+                    rss = (yy_fit[r] - (z * z * (2 * d - d * d * one_s)).sum(dim=1)).clamp_min(0)
+                    edf = (one_s * d).sum(dim=1)
+                    sigma2 = rss / (blk.n_eff - edf).clamp_min(1.0)
+                    var = (d * d * one_s) @ (blk.w * blk.w).T
+                    se_out[idx, r] = torch.sqrt(var * sigma2[:, None]).float().cpu()
+
+            if xval:
+                c_sum = torch.stack(c_raw).sum(dim=0)
+                g_sum = sum(blk.gram_raw for blk in blocks)
+                yy_sum = torch.stack(yy_raw).sum(dim=0)
+                n_all = sum(blk.rows.size for blk in blocks)
+                ss_tot = (n_runs - 1) * (yy_sum - torch.stack(sum_raw).sum(dim=0) ** 2 / n_all)
+
+                ss_ols = torch.zeros(nv, dtype=torch.float64, device=device)
+                for r, blk in enumerate(blocks):
+                    g_fit = blk.x_fit.T @ blk.x_fit
+                    beta_ols = c_fit[r] @ torch.linalg.pinv(g_fit, hermitian=True)
+                    ss_ols += _target_ss(
+                        beta_ols,
+                        yy_sum - yy_raw[r],
+                        c_sum - c_raw[r],
+                        g_sum - blk.gram_raw,
+                    )
+                ss = torch.zeros(nv, dtype=torch.float64, device=device)
+                if xval_used == "all" or lambda_mode == "run":
+                    for r in range(n_runs):
+                        ss += _target_ss(
+                            beta_runs[r],
+                            yy_sum - yy_raw[r],
+                            c_sum - c_raw[r],
+                            g_sum - blocks[r].gram_raw,
+                        )
+                else:
+                    c_fit_sum = torch.stack(c_fit).sum(dim=0)
+                    yy_fit_sum = torch.stack(yy_fit).sum(dim=0)
+                    for j in range(n_runs):
+                        w_m, s_m, tr_m, n_eff_m = fold_spec[j]
+                        z_m = (c_fit_sum - c_fit[j]) @ w_m
+                        lam_m = _choose_lambda(
+                            fold_rule,
+                            z_m,
+                            yy_fit_sum - yy_fit[j],
+                            s_m,
+                            n_eff_m,
+                            rank_p,
+                            log_grid,
+                            lam,
+                        )
+                        for r, blk in enumerate(blocks):
+                            if r == j:
+                                continue
+                            d = _shrink(lam_m * tr_m / blk.gram_trace, blk.s)
+                            beta = (d * (c_fit[r] @ blk.w)) @ blk.w.T
+                            ss += _target_ss(beta, yy_raw[j], c_raw[j], blocks[j].gram_raw)
+                live = ~empty & (ss_tot > 0)
+                safe = torch.where(live, ss_tot, torch.ones_like(ss_tot))
+                zero = torch.zeros_like(ss)
+                assert xr2 is not None and xr2_ols is not None
+                xr2[idx] = torch.where(live, 1 - ss / safe, zero).float().cpu()
+                xr2_ols[idx] = torch.where(live, 1 - ss_ols / safe, zero).float().cpu()
+            betas[idx[empty.cpu()]] = 0.0
+            log10_lam[idx[empty.cpu()]] = 0.0
+    return PerRunFit(
+        betas=betas,
+        log10_lambda=log10_lam,
+        se=se_out,
+        xval_r2=xr2,
+        xval_r2_ols=xr2_ols,
+        xval_lambda_used=xval_used if xval else xval_lambda,
+    )
