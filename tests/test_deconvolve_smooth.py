@@ -281,3 +281,84 @@ def test_smooth_noise_arma_writes_the_ab_map(monkeypatch, tmp_path, capsys):
     ab = nib.load(f"{prefix}_smooth_arma.nii.gz").get_fdata()
     assert ab.shape[-1] == 2 and np.isfinite(ab).all()
     assert np.isfinite(nib.load(f"{prefix}_xval_r2.nii.gz").get_fdata()).all()
+
+
+def _per_run_argv(runs, timing, prefix, *extra):
+    return [
+        "ffs_deconvolve",
+        "-input",
+        *runs,
+        "-onsets",
+        timing,
+        "-model",
+        "TENTzero",
+        "-window",
+        "0",
+        "16",
+        "-prefix",
+        prefix,
+        "-device",
+        "cpu",
+        "-verb",
+        "1",
+        "-tent-smooth",
+        "-per-run",
+        *extra,
+    ]
+
+
+def test_per_run_writes_one_curve_per_run_with_se_and_xval(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+    from fastfuncstuff.io.headers import read_brick_labels
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "pr")
+    argv = _per_run_argv(
+        runs, timing, prefix, "-per-run-se", "-save-xval-r2", "-smooth-noise", "arma"
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    out = capsys.readouterr().out
+    assert "one run predicting the others (fold lambda)" in out
+    pooled = nib.load(f"{prefix}_iresp_stim.nii.gz").get_fdata()
+    curves = nib.load(f"{prefix}_perrun_iresp_stim.nii.gz").get_fdata()
+    se = nib.load(f"{prefix}_perrun_se_stim.nii.gz").get_fdata()
+    n_lags = pooled.shape[-1]
+    assert curves.shape[-1] == 3 * n_lags and se.shape == curves.shape
+    per_run = curves.reshape(*curves.shape[:3], 3, n_lags)
+    # zero edges padded back like the pooled iresp; the runs average near the pooled curve
+    assert np.all(per_run[..., 0] == 0) and np.all(per_run[..., -1] == 0)
+    assert np.corrcoef(per_run.mean(axis=3).ravel(), pooled.ravel())[0, 1] > 0.9
+    assert (se.reshape(per_run.shape)[..., 1:-1] > 0).all()
+    labels = read_brick_labels(nib.load(f"{prefix}_perrun_iresp_stim.nii.gz"))
+    assert labels[0] == "run01#0" and labels[-1] == f"run03#{n_lags - 1}"
+    smooth_r2 = nib.load(f"{prefix}_perrun_xval_r2.nii.gz").get_fdata()
+    ols_r2 = nib.load(f"{prefix}_perrun_xval_r2_ols.nii.gz").get_fdata()
+    assert np.median(smooth_r2) > np.median(ols_r2)
+
+
+def test_per_run_lambda_run_mode_writes_its_lambda_map(monkeypatch, tmp_path):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    prefix = str(tmp_path / "prr")
+    monkeypatch.setattr(sys, "argv", _per_run_argv(runs, timing, prefix, "-per-run-lambda", "run"))
+    assert deconvolve.main() == 0
+    lam = nib.load(f"{prefix}_perrun_log10lambda.nii.gz").get_fdata()
+    assert lam.shape[-1] == 3 and np.isfinite(lam).all()
+
+
+def test_per_run_flags_need_per_run_and_smoothing(monkeypatch, tmp_path, capsys):
+    from fastfuncstuff.cli import deconvolve
+
+    runs, timing = _dataset(tmp_path)
+    argv = _per_run_argv(runs, timing, str(tmp_path / "x"))
+    argv.remove("-tent-smooth")
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 1
+    assert "-per-run needs -tent-smooth" in capsys.readouterr().err
+    argv = _per_run_argv(runs, timing, str(tmp_path / "y"), "-per-run-se")
+    argv.remove("-per-run")
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 1
+    assert "need -per-run" in capsys.readouterr().err

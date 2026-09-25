@@ -537,6 +537,53 @@ def parse_args():
         "second fit per ARMA bin.",
     )
     model_opts.add_argument(
+        "-per-run",
+        dest="per_run",
+        action="store_true",
+        help="Also fit one smoothed curve PER RUN (needs -tent-smooth, >= 2 runs), for "
+        "statistics across runs; lambda, penalty and noise model come from the pooled "
+        "fit. Writes <prefix>_perrun_iresp_<label>: runs x knots, run-major, bricks "
+        "runNN#k. Test area or fixed-lag values: peak height and argmax latency are "
+        "biased by noise for ANY estimator, so a noise trend across runs fakes an "
+        "effect in them. Runs with different event timing smooth the same curve "
+        "slightly differently.",
+    )
+    model_opts.add_argument(
+        "-per-run-lambda",
+        dest="per_run_lambda",
+        choices=["shared", "global", "run"],
+        default="shared",
+        help="Smoothing strength of each -per-run fit. shared: each voxel's pooled "
+        "lambda at the same absolute strength in every run, so a noisier run is not "
+        "smoothed harder. global: one lambda (median over voxels the pooled fit did "
+        "not flatten); exactly linear, removing shared's small bias from choosing "
+        "lambda on the same noise, but not adapted per voxel. run: each run's own "
+        "REML lambda; noisier runs are smoothed harder, which FAKES run effects "
+        "(e.g. habituation) when noise differs across runs. Diagnostic only; writes "
+        "<prefix>_perrun_log10lambda.",
+    )
+    model_opts.add_argument(
+        "-per-run-xval-lambda",
+        dest="per_run_xval_lambda",
+        choices=["fold", "all"],
+        default="fold",
+        help="With -per-run -save-xval-r2: score fit-one-run, predict-each-other-run "
+        "for the smoothed and the unpenalized per-run fits (<prefix>_perrun_xval_r2, "
+        "<prefix>_perrun_xval_r2_ols). fold: the pooled lambda is re-chosen without "
+        "the scored run (honest; cost grows with runs squared, from summary "
+        "statistics, no extra data pass). all: reuse the all-run lambda; a one-run "
+        "leak, runs-times cheaper, fine with many runs. -tent-smooth loro and "
+        "-per-run-lambda global always score with all.",
+    )
+    model_opts.add_argument(
+        "-per-run-se",
+        dest="per_run_se",
+        action="store_true",
+        help="With -per-run, also write <prefix>_perrun_se_<label>: each knot's "
+        "standard error about the SMOOTHED curve (smoothing bias excluded). For error "
+        "bars; test across runs with the spread of the curves themselves.",
+    )
+    model_opts.add_argument(
         "-pool-conditions",
         nargs="?",
         const="all",
@@ -1266,6 +1313,16 @@ def main(argv: list[str] | None = None):
         if (smooth_method == "loro" or len(smooth_specs) > 1) and n_runs < 2:
             print("ERROR: choosing by held-out runs needs at least two runs", file=sys.stderr)
             return 1
+    if args.per_run and (smooth_method is None or n_runs < 2):
+        print("ERROR: -per-run needs -tent-smooth and at least two runs", file=sys.stderr)
+        return 1
+    if not args.per_run and (
+        args.per_run_se or args.per_run_lambda != "shared" or args.per_run_xval_lambda != "fold"
+    ):
+        print(
+            "ERROR: -per-run-lambda/-per-run-xval-lambda/-per-run-se need -per-run", file=sys.stderr
+        )
+        return 1
 
     # ── FLOBS branch ─────────────────────────────────────────────────────────
     # **DEPRECATED 2026-05-17**: -model FLOBS in ffs_deconvolve is
@@ -2213,6 +2270,7 @@ def main(argv: list[str] | None = None):
     smooth_fit = None
     smooth_sel = None
     smooth_arma = None
+    smooth_pens: list[np.ndarray] = []
     if smooth_method is not None:
         from fastfuncstuff.glm.smooth_basis import fit_smooth_selected, penalty_matrix
 
@@ -2277,6 +2335,32 @@ def main(argv: list[str] | None = None):
 
     if args.verb >= 1:
         print("  ✓ GLM fit complete")
+
+    per_run_fit = None
+    if args.per_run and smooth_fit is not None and smooth_sel is not None:
+        from fastfuncstuff.glm.smooth_basis import fit_smooth_per_run
+
+        if args.verb >= 1:
+            print(f"\nFitting one curve per run ({n_runs} runs, {args.per_run_lambda} lambda)...")
+        per_run_fit = fit_smooth_per_run(
+            packed.data_concat,
+            packed.design_concat,
+            packed.n_task_cols,
+            smooth_pens,
+            list(run_starts),
+            smooth_fit.lam,
+            pooled_edf=smooth_fit.edf,
+            penalty_index=smooth_sel.penalty_index,
+            arma=smooth_arma,
+            rule=smooth_method or "reml",
+            lam=smooth_lam,
+            lambda_mode=args.per_run_lambda,
+            xval=bool(args.save_xval_r2),
+            xval_lambda=args.per_run_xval_lambda,
+            se=args.per_run_se,
+            device=device,
+            verbose=args.verb >= 1,
+        )
 
     # ── R² maps ──────────────────────────────────────────────────────────────
     if args.save_r2:
@@ -2352,6 +2436,38 @@ def main(argv: list[str] | None = None):
                 )
             del xr2_vol
 
+    if per_run_fit is not None:
+        run_maps = []
+        if per_run_fit.xval_r2 is not None and per_run_fit.xval_r2_ols is not None:
+            run_maps += [
+                ("perrun_xval_r2", per_run_fit.xval_r2, None),
+                ("perrun_xval_r2_ols", per_run_fit.xval_r2_ols, None),
+            ]
+        if args.per_run_lambda == "run":
+            run_labels = [f"run{r + 1:02d}" for r in range(n_runs)]
+            run_maps.append(("perrun_log10lambda", per_run_fit.log10_lambda, run_labels))
+        for name, values, labels in run_maps:
+            path = f"{args.prefix}_{name}{_nii_ext}"
+            vol = _to_volume(values.numpy().reshape(values.shape[0], -1))
+            if vol.shape[-1] == 1:
+                vol = vol[..., 0]
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
+                save_nifti(vol, path, reference_img=input_files[0], brick_labels=labels)
+            _announce_written(path, time.perf_counter() - t_write, args.verb)
+        if (
+            per_run_fit.xval_r2 is not None
+            and per_run_fit.xval_r2_ols is not None
+            and args.verb >= 1
+        ):
+            smooth_r2, ols_r2 = per_run_fit.xval_r2, per_run_fit.xval_r2_ols
+            print(
+                f"      one run predicting the others ({per_run_fit.xval_lambda_used} lambda): "
+                f"median R² {float(smooth_r2.median()):.4f} smoothed vs "
+                f"{float(ols_r2.median()):.4f} unpenalized; smoothed better in "
+                f"{100 * float((smooth_r2 > ols_r2).float().mean()):.0f}% of voxels"
+            )
+
     # Extract HRF estimates (only stimulus betas, not polynomials)
     if args.verb >= 1:
         print("\nExtracting HRF estimates...")
@@ -2414,6 +2530,25 @@ def main(argv: list[str] | None = None):
             )
         _announce_written(files, time.perf_counter() - t_write, args.verb)
         output_files.extend(files)
+
+        if per_run_fit is not None:
+            start = beta_col_idx - n_basis
+            run_outputs = [("perrun_iresp", per_run_fit.betas)]
+            if per_run_fit.se is not None:
+                run_outputs.append(("perrun_se", per_run_fit.se))
+            for name, values in run_outputs:
+                curves = values[:, :, start:beta_col_idx].numpy()
+                if model in ("TENTzero", "CSPLINzero"):
+                    curves = np.pad(curves, ((0, 0), (0, 0), (1, 1)))
+                n_lags = curves.shape[2]
+                labels = [f"run{r + 1:02d}#{k}" for r in range(n_runs) for k in range(n_lags)]
+                path = f"{args.prefix}_{name}_{condition_labels[cond_idx]}{_nii_ext}"
+                vol = _to_volume(curves.reshape(curves.shape[0], -1))
+                t_write = time.perf_counter()
+                with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
+                    save_nifti(vol, path, reference_img=input_files[0], brick_labels=labels)
+                _announce_written(path, time.perf_counter() - t_write, args.verb)
+                output_files.append(path)
 
     if args.verb < 1:
         print("Created HRF estimate files:")
