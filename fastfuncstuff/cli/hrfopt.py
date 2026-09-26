@@ -47,6 +47,7 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
+        add_noise_comps_arguments,
         add_ortvec_arguments,
         add_single_trial_args,
         add_trim_args,
@@ -55,6 +56,7 @@ try:
         auto_polort,
         blur_masked_data,
         build_nuisance_per_run,
+        collect_noise_comp_blocks,
         collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
@@ -456,6 +458,7 @@ Notes:
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
     add_ortvec_arguments(proc_opts)
+    add_noise_comps_arguments(proc_opts)
     add_stim_vec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
@@ -986,6 +989,31 @@ def main():
         verbose=(args.verb >= 1),
         trim=trim,
     )
+    if args.noise_comps:
+        # Their PCA projects out the same polynomials the fit will use, plus the
+        # user blocks above; after that they are ordinary nuisance blocks, so both
+        # the condition-level and the single-trial selection see them.
+        _polort = args.polort
+        if _polort is None:
+            _polort = auto_polort(
+                get_average_run_duration(compute_run_lengths(run_starts, n_timepoints), args.tr),
+                formula="afni",
+            )
+        nuisance_blocks = nuisance_blocks + collect_noise_comp_blocks(
+            args,
+            input_files,
+            run_starts,
+            build_nuisance_per_run(
+                run_starts=run_starts,
+                n_timepoints=n_timepoints,
+                polort=_polort,
+                device=device,
+                blocks=nuisance_blocks,
+            ),
+            trim=trim,
+            device=device,
+            verbose=True,
+        )
     # Continuous stimulus vectors join the STIM design, re-convolved with each
     # candidate HRF inside the selection loop. Leaving a strong background in the
     # residual would let it steer which HRF wins.
