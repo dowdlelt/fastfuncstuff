@@ -1657,6 +1657,155 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
     )
 
 
+def add_noise_comps_arguments(parser_or_group) -> None:
+    """Register the repeatable ``-noise_comps MAP N_COMPS ERODE`` flag.
+
+    Pair with :func:`collect_noise_comp_blocks`, which turns each use into a per-run
+    NuisanceBlock that rides the same path as ``-ortvec``.
+    """
+    parser_or_group.add_argument(
+        "-noise_comps",
+        dest="noise_comps",
+        action="append",
+        nargs=3,
+        metavar=("MAP", "N_COMPS", "ERODE"),
+        help=(
+            "Per-run noise components from the voxels of a tissue map (aCompCor-style). "
+            "MAP is a probability map or mask (e.g. white matter, CSF); it is resampled onto "
+            "the data grid if the grids differ, thresholded at 0.5, then eroded by ERODE "
+            "voxels of the DATA grid (0 = no erosion). N_COMPS PCs are taken per run, after "
+            "that run's polynomials and -ortvec regressors (e.g. motion) are projected out of "
+            "the tissue voxels, so the components carry noise those do not already explain. "
+            "The components enter as per-run nuisance, exactly like -ortvec_run. Computed from "
+            "the unblurred, unscaled data. Repeatable: "
+            "-noise_comps wm_prob.nii.gz 5 1 -noise_comps csf_prob.nii.gz 5 0"
+        ),
+    )
+
+
+def collect_noise_comp_blocks(
+    args,
+    input_files: list,
+    run_starts: list[int],
+    nuisance_per_run: list[torch.Tensor],
+    trim: TrimSpec | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> list[NuisanceBlock]:
+    """One NuisanceBlock per ``-noise_comps`` use.
+
+    ``nuisance_per_run`` is what gets projected out of the tissue voxels before each run's
+    PCA: the run's polynomials and user nuisance blocks, NOT earlier -noise_comps blocks,
+    so each map's components are defined independently of the flag order.
+    """
+    specs = getattr(args, "noise_comps", None) or []
+    if not specs:
+        return []
+    from fastfuncstuff.denoise.tissue_comps import (
+        reference_grid,
+        tissue_mask_on_grid,
+        tissue_noise_components,
+    )
+
+    ref_shape, ref_affine = reference_grid(input_files[0])
+    blocks = []
+    used_labels: set[str] = set()
+    for map_path, n_str, erode_str in specs:
+        try:
+            n_comps, erode = int(n_str), int(erode_str)
+        except ValueError:
+            raise ValueError(
+                f"-noise_comps {map_path} {n_str} {erode_str}: N_COMPS and ERODE must be integers"
+            ) from None
+        if n_comps < 1 or erode < 0:
+            raise ValueError(f"-noise_comps {map_path}: need N_COMPS >= 1 and ERODE >= 0")
+        mask, counts = tissue_mask_on_grid(
+            map_path, ref_shape, ref_affine, erode=erode, device=device
+        )
+        stem = Path(map_path).name.split(".")[0]
+        label = f"ncomp_{stem}"
+        while label in used_labels:
+            label += "_"
+        used_labels.add(label)
+        if verbose:
+            how = "resampled to the data grid, " if counts["resampled"] else ""
+            print(
+                f"  -noise_comps {Path(map_path).name}: {how}{counts['above_threshold']:,} voxels > 0.5, "
+                f"{counts['after_erode']:,} after {erode}-voxel erosion -> {n_comps} PCs/run"
+            )
+        pcs = tissue_noise_components(
+            input_files,
+            mask,
+            n_comps,
+            run_starts,
+            nuisance_per_run,
+            drop_first=trim.drop_first if trim is not None else 0,
+            drop_last=trim.drop_last if trim is not None else 0,
+            device=device,
+        )
+        blocks.append(NuisanceBlock(label=label, per_run=list(pcs)))
+    return blocks
+
+
+def append_nuisance_blocks_to_design_info(design_info: dict, blocks: list[NuisanceBlock]) -> int:
+    """Append per-run (block-diagonal) nuisance columns to a loaded xmat ``design_info``.
+
+    For the ``-matrix`` / ``-spec`` path, whose design is read from disk rather than built
+    from blocks. Each block run gets its own columns, zero outside that run, the same layout
+    ``-ortvec_run`` produces. Returns the number of columns added.
+    """
+    X = np.asarray(design_info["matrix"])
+    T = X.shape[0]
+    bounds = list(design_info["run_starts"]) + [T]
+    new_cols, new_labels = [], []
+    for block in blocks:
+        for r in range(len(bounds) - 1):
+            s, e = bounds[r], bounds[r + 1]
+            m = block.get_run(r, e - s)
+            for c in range(m.shape[1]):
+                col = np.zeros(T, dtype=X.dtype)
+                col[s:e] = m[:, c]
+                new_cols.append(col)
+                new_labels.append(f"{block.label}_r{r + 1}[{c}]")
+    if not new_cols:
+        return 0
+    n0 = X.shape[1]
+    X = np.concatenate([X, np.stack(new_cols, 1)], axis=1)
+    design_info["matrix"] = X
+    if "design_matrix" in design_info:
+        design_info["design_matrix"] = X
+    design_info["n_regressors"] = X.shape[1]
+    if design_info.get("column_labels") is not None:
+        design_info["column_labels"] = list(design_info["column_labels"]) + new_labels
+    if design_info.get("column_groups") is not None:
+        design_info["column_groups"] = list(design_info["column_groups"]) + [0] * len(new_cols)
+    if design_info.get("nuisance_indices") is not None:
+        design_info["nuisance_indices"] = list(design_info["nuisance_indices"]) + list(
+            range(n0, X.shape[1])
+        )
+    return len(new_cols)
+
+
+def xmat_nuisance_per_run(
+    design_info: dict, device: torch.device | None = None
+) -> list[torch.Tensor]:
+    """Each run's own nuisance columns from a loaded xmat: the non-stimulus columns that are
+    nonzero inside the run (its polynomials and whatever -ortvec the spec compiled in)."""
+    X = np.asarray(design_info["matrix"])
+    T = X.shape[0]
+    stim = set()
+    for b, t in zip(
+        design_info.get("stim_bots") or [], design_info.get("stim_tops") or [], strict=True
+    ):
+        stim.update(range(int(b), int(t) + 1))
+    bounds = list(design_info["run_starts"]) + [T]
+    out = []
+    for s, e in zip(bounds[:-1], bounds[1:], strict=True):
+        cols = [c for c in range(X.shape[1]) if c not in stim and np.any(X[s:e, c] != 0)]
+        out.append(torch.as_tensor(X[s:e][:, cols], dtype=torch.float32, device=device))
+    return out
+
+
 def expand_ortvec_concat(
     pattern: str,
     label: str,

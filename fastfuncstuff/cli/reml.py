@@ -44,12 +44,16 @@ try:
         add_event_filter_arguments,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
+        add_noise_comps_arguments,
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
+        append_nuisance_blocks_to_design_info,
         apply_trim_to_timing,
         auto_polort,
         build_nuisance_block_diag,
+        build_nuisance_per_run,
+        collect_noise_comp_blocks,
         collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
@@ -62,6 +66,7 @@ try:
         resolve_microtime_dt,
         resolve_microtime_offset,
         trim_spec_from_args,
+        xmat_nuisance_per_run,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
@@ -1038,6 +1043,7 @@ Examples:
         help="Polynomial order (default: auto based on run length)",
     )
     add_ortvec_arguments(onset_group)
+    add_noise_comps_arguments(onset_group)
     add_stim_vec_arguments(onset_group)
     onset_group.add_argument(
         "-canonical",
@@ -1895,6 +1901,19 @@ def main():
             sys.exit(1)
         # Load design matrix from file
         design_info = read_afni_design_matrix(args.matrix)
+        if args.noise_comps:
+            print()
+            print("Adding -noise_comps to the loaded design...")
+            _nc_blocks = collect_noise_comp_blocks(
+                args,
+                input_files,
+                design_info["run_starts"],
+                xmat_nuisance_per_run(design_info, device=device),
+                trim=trim,
+                device=device,
+                verbose=True,
+            )
+            append_nuisance_blocks_to_design_info(design_info, _nc_blocks)
         # Echo a summary so -matrix / -spec runs confirm run structure, polort
         # and nuisance width just like the onset-building path does.
         _report_loaded_design(design_info, source=str(args.matrix))
@@ -2284,6 +2303,22 @@ def main():
             n_timepoints,
             verbose=True,
         )
+        if args.noise_comps:
+            nuisance_blocks = nuisance_blocks + collect_noise_comp_blocks(
+                args,
+                input_files,
+                run_starts,
+                build_nuisance_per_run(
+                    run_starts=run_starts,
+                    n_timepoints=n_timepoints,
+                    polort=polort,
+                    device=device,
+                    blocks=nuisance_blocks,
+                ),
+                trim=trim,
+                device=device,
+                verbose=True,
+            )
         nuisance_design = build_nuisance_block_diag(
             run_starts=run_starts,
             n_timepoints=n_timepoints,
@@ -3271,7 +3306,7 @@ def main():
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
-            design_info=design_info if (args.onsets or args.events) else None,
+            design_info=design_info if (args.onsets or args.events or args.noise_comps) else None,
             method=analysis_method,
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,

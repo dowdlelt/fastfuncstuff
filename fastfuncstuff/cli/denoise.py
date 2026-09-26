@@ -51,6 +51,7 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
+        add_noise_comps_arguments,
         add_ortvec_arguments,
         add_single_trial_args,
         add_trim_args,
@@ -58,6 +59,7 @@ try:
         apply_trim_to_timing,
         auto_polort,
         blur_masked_data,
+        collect_noise_comp_blocks,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         microtime_offset_bins,
@@ -628,6 +630,7 @@ Notes:
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
     add_ortvec_arguments(proc_opts)
+    add_noise_comps_arguments(proc_opts)
     add_stim_vec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
@@ -2447,6 +2450,29 @@ def main():
                     dim=1,
                 )
             max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
+
+    # Tissue-map components come last: their PCA projects out the polynomials and
+    # user blocks above, so they carry only what those leave unexplained. From here
+    # they are ordinary nuisance -- projected out of the initial fit, the training
+    # runs, the held-out runs and the noise pool alike.
+    if args.noise_comps:
+        for block in collect_noise_comp_blocks(
+            args,
+            input_files,
+            run_starts,
+            [n.clone() for n in nuisance_per_run],
+            trim=trim,
+            device=device,
+            verbose=(args.verb >= 1),
+        ):
+            for run_idx in range(n_runs):
+                start_tp = run_starts[run_idx]
+                end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                m_t = torch.from_numpy(block.get_run(run_idx, end_tp - start_tp)).to(
+                    device=device, dtype=nuisance_per_run[run_idx].dtype
+                )
+                nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], m_t], dim=1)
+                max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
 
     # Pad all runs to have same number of columns (for CV concatenation compatibility)
     # -------------------------------------------
