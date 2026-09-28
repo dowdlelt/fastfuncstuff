@@ -2,7 +2,7 @@
 
 Self-contained stage that:
 1. Uses existing MELODIC single-run debug outputs (``--debug --Oall``).
-2. Runs ``ffs_ica -trace`` per single run with matching MELODIC mask.
+2. Runs ``ffs_ica -trace`` per single run with matching MELODIC mask and model order.
 3. Compares intermediates: eigenvalues, varnorm, whitening, mixing, IC maps.
 
 Removes MIGP from the pipeline — isolates varnorm and ICA solver divergence.
@@ -42,6 +42,11 @@ def _ica_tasks(ctx: BenchmarkContext) -> list[str]:
 
 def _melodic_dir(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
     return ctx.melodic_ica_dir / f"{dataset}_run{run:02d}_melodic.ica"
+
+
+def _melodic_n_components(ctx: BenchmarkContext, dataset: str, run: int) -> int:
+    mixing = np.loadtxt(_melodic_dir(ctx, dataset, run) / "melodic_mix", ndmin=2)
+    return int(mixing.shape[1])
 
 
 def _trace_dir(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
@@ -449,6 +454,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             inp = _mni_input(ctx, dataset, run)
             pfx = _ffs_prefix(ctx, dataset, run)
             trace_base = str(ctx.ffs_ica_dir / f"{dataset}_single_trace" / f"run{run:02d}")
+            n_components = _melodic_n_components(ctx, dataset, run)
 
             mask_arg = f"-mask {mask}" if mask.exists() else ""
 
@@ -456,6 +462,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
                 f"ffs_ica -input {inp} "
                 f"{mask_arg} "
                 f"-ordering stdev "
+                f"-num_comps {n_components} "
                 f"-trace {trace_base} "
                 f"-prefix {pfx} -verbose"
                 f"{ctx.ffs_device_flag()}",

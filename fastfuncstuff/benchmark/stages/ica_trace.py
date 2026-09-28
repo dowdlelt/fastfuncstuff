@@ -2,7 +2,7 @@
 
 Self-contained stage that:
 1. Reads MELODIC's ``melodic.log`` to extract the randomized file order.
-2. Runs ``ffs_ica -temp_concat -migp -trace -migp_shuffle <order>`` to match.
+2. Runs ``ffs_ica -temp_concat -migp -trace -migp_shuffle <order>`` at MELODIC's model order.
 3. Compares intermediates: eigenvalue spectrum, IC stats, mixing, spatial maps.
 
 Requires MELODIC debug output (``--debug --Oall``) already present.
@@ -479,6 +479,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         mel_log = mel_dir / "melodic.log"
         order = _parse_melodic_file_order(mel_log)
         shuffle_arg = ",".join(str(i) for i in order)
+        n_components = int(np.loadtxt(mel_dir / "melodic_mix", ndmin=2).shape[1])
 
         inputs = " ".join(
             str(ctx.processing_dir / f"afni_mni_task-{dataset}_run-{r}.nii.gz")
@@ -491,6 +492,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"ffs_ica -input {inputs} "
             f"{mask_arg} "
             f"-temp_concat -ordering stdev "
+            f"-num_comps {n_components} "
             f"-migp -migp_shuffle {shuffle_arg} "
             f"-trace {td} "
             f"-prefix {pfx} -verbose"
