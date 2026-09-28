@@ -529,18 +529,19 @@ Notes:
         "            computed on a truncated spectrum, so it tracks its own search ceiling.",
     )
     comp_opts.add_argument(
-        "-count_smooth_fwhm",
+        "-noise_pool_blur",
         type=float,
-        default=6.0,
-        help="-component_count laplace: blur the noise pool by this FWHM (mm) before counting,"
-        " within the pool mask only -- no criteria voxel contributes. Structured noise is"
-        " spatially extended, so a blurred pool separates it from the fine-grained remainder"
-        " the white-noise null misreads as signal. Affects the COUNT only; components are"
-        " extracted from the unblurred pool. 0 = off.\n"
-        "Measured on two NORDIC'd subjects (1.6 mm voxels): 0 mm found no cutoff at all"
-        " (Marchenko-Pastur passed ~337 of 350 dimensions); 6 mm gave 18-30 per run, stable"
-        " across runs and subjects and inside a plateau that held to 12 mm; from 8 mm the"
-        " effective sample size hit its floor (the number of timepoints).",
+        default=0.0,
+        metavar="FWHM_MM",
+        help="Blur the noise pool by this FWHM (mm) before the automatic component COUNT,"
+        " within the pool mask only -- no criteria voxel contributes (unlike -cv_blur, which"
+        " blurs the whole selection stage). Extraction and the K-curve still use the unblurred"
+        " pool. Off by default.\n"
+        "Why it exists: on NORDIC'd data the pool is spatially near-white (ACF FWHM ~1.3"
+        " voxels), and against the white-noise null the model order then finds no cutoff"
+        " (Marchenko-Pastur passed ~337 of 350 dimensions on two subjects). Structured noise is"
+        " spatially extended; at 6 mm the count was 18-30 per run, stable across runs and"
+        " subjects, and from 8 mm the effective sample size reached its floor.",
     )
     comp_opts.add_argument(
         "-no_auto_component_caps",
@@ -3825,7 +3826,7 @@ def main():
             spatial_geometry=dict(
                 volume_shape=volume_shape, voxel_sizes=voxel_sizes, mask_flat=mask_flat
             ),
-            count_smooth_fwhm=args.count_smooth_fwhm,
+            count_smooth_fwhm=args.noise_pool_blur,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
@@ -3877,7 +3878,7 @@ def main():
             spatial_geometry=dict(
                 volume_shape=volume_shape, voxel_sizes=voxel_sizes, mask_flat=mask_flat
             ),
-            count_smooth_fwhm=args.count_smooth_fwhm,
+            count_smooth_fwhm=args.noise_pool_blur,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
