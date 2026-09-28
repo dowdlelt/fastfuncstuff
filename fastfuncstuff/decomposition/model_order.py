@@ -518,7 +518,10 @@ def parallel_analysis_order(
 
     EXPERIMENTAL. On ds005165 single runs (10 runs, rest + localizer) it lands near
     MELODIC (mean ~69 against 66.6, mean |difference| ~2.5, r ~0.92-0.95 across runs),
-    where the white-null Laplace/MP estimator gives 80.7 (|difference| 14.1, r = 0.66).
+    where ffs_ica's default count gives 80.7 (|difference| 14.1, r = 0.66). That comparison
+    is not like-for-like: PA ran on total-stdev-normalised data, ffs_ica's default on its
+    residual-noise varnorm, and the white null on total-stdev data already lands near
+    MELODIC on rest run 1.
     But it is biased on strongly coloured noise: past the true count, removing another
     leading direction also removes noise power at the low frequencies where coloured
     noise concentrates, notching every residual row's spectrum, so the rebuilt null is
