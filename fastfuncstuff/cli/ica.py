@@ -3585,10 +3585,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="auto",
         help=(
-            "Component selection: INT, FLOAT(0-1), or auto/laplace/hybrid/current/erank/mp. "
+            "Component selection: INT, FLOAT(0-1), or auto/laplace/hybrid/current/erank/mp/parallel. "
             "'auto' and 'laplace' take the Marchenko-Pastur count as a ceiling and pick "
             "within it by Minka's PPCA Laplace evidence.  ('melodic' is accepted as an "
-            "old name for 'laplace'.)"
+            "old name for 'laplace'.)  'parallel' (EXPERIMENTAL) is revised (sequential) "
+            "parallel analysis against phase-randomised surrogates of the residual after "
+            "removing the components already accepted: the null is coloured like the "
+            "noise.  Tracks MELODIC closely on ds005165, but over-counts on strongly "
+            "autocorrelated noise."
         ),
     )
     basic.add_argument(

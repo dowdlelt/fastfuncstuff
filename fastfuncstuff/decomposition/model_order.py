@@ -65,6 +65,8 @@ __all__ = [
     "mp_noise_level",
     "mp_signal_count",
     "select_model_order",
+    "ParallelAnalysisResult",
+    "parallel_analysis_order",
 ]
 
 
@@ -456,4 +458,148 @@ def select_model_order(
         k_min=lo,
         at_ceiling=at_ceiling,
         ceiling_source=ceiling_source,
+    )
+
+
+@dataclass
+class ParallelAnalysisResult:
+    k: int
+    observed: np.ndarray
+    null_top: dict  # k tested -> surrogate leading eigenvalue
+    n_samples: int
+    n_surrogates: int
+    rule: str
+    n_null_evaluations: int
+
+    def as_dict(self) -> dict:
+        return {
+            "k": int(self.k),
+            "rule": self.rule,
+            "n_samples": int(self.n_samples),
+            "n_surrogates": int(self.n_surrogates),
+            "n_null_evaluations": int(self.n_null_evaluations),
+        }
+
+
+def parallel_analysis_order(
+    data_vt,
+    n_samples: int,
+    *,
+    n_surrogates: int = 3,
+    rule: str = "edge",
+    remove_timepoint_mean: bool = False,
+    k_min: int = 1,
+    k_max: int | None = None,
+    seed: int = 0,
+    device=None,
+) -> ParallelAnalysisResult:
+    """Model order by revised parallel analysis against phase-randomised surrogates.
+
+    Revised (sequential) parallel analysis (Green et al. 2012, after Horn 1965): component
+    ``k+1`` is kept when its eigenvalue exceeds the leading eigenvalue of a null built
+    from the data with the ``k`` already-accepted components REMOVED. Each null row is a
+    phase-randomised copy of one voxel's residual (Theiler et al. 1992): its power
+    spectrum -- so its temporal autocorrelation -- is kept, every cross-voxel dependence
+    destroyed. The null is therefore coloured like the noise, needs no ARMA model, and
+    stops inheriting the removed components' shared signal (which is what makes a
+    one-shot, non-revised version collapse to a handful of components on BOLD).
+
+    Two details are load-bearing. The surrogate is projected back out of the removed
+    subspace (phase randomisation spreads power into it) and each row is rescaled to its
+    source residual row's power; without both, the null is diluted by ~(T-k)/T and the
+    count runs to ``k_max``.
+
+    ``data_vt`` is ``(voxels, time)``, prepared as the caller's spectrum is. ``n_samples``
+    is the effective sample size (e.g. voxels / resel size); that many rows are drawn for
+    the null. ``rule`` "edge" compares with the largest leading eigenvalue across the
+    surrogates, "mean" with their average. Rows and phases are drawn once and reused for
+    every ``k`` (common random numbers), and the residual's spectrum is updated in the
+    frequency domain, so each ``k`` costs one inverse FFT and one Gram of ``n`` rows.
+
+    EXPERIMENTAL. On ds005165 single runs (10 runs, rest + localizer) it lands near
+    MELODIC (mean ~69 against 66.6, mean |difference| ~2.5, r ~0.92-0.95 across runs),
+    where the white-null Laplace/MP estimator gives 80.7 (|difference| 14.1, r = 0.66).
+    But it is biased on strongly coloured noise: past the true count, removing another
+    leading direction also removes noise power at the low frequencies where coloured
+    noise concentrates, notching every residual row's spectrum, so the rebuilt null is
+    too low and the count runs away (pure AR(1) noise, phi = 0.6: observed clears the null
+    by 5-13% at every k). The surrogate itself is not the cause -- plain, 2T-padded and
+    circular-shift surrogates and fresh AR draws all give the same null edge. The
+    ds005165 agreement may partly be biases cancelling. On NORDIC'd data it finds no
+    cutoff: patch-wise low-rank denoising leaves locally shared structure in nearly
+    every dimension.
+    """
+    import torch
+
+    X = data_vt if torch.is_tensor(data_vt) else torch.as_tensor(np.asarray(data_vt))
+    device = device or X.device
+    X = X.to(device, torch.float32)
+    if remove_timepoint_mean:
+        X = X - X.mean(dim=0, keepdim=True)
+    V, T = X.shape
+    n = int(max(T + 1, min(int(n_samples), V)))
+    hi = (T - 2) if k_max is None else min(int(k_max), T - 2)
+
+    G = (X.T @ X).double().cpu() / V
+    w, U = torch.linalg.eigh(G)
+    observed = w.flip(0).clamp_min(0).numpy()
+    U = U.flip(1).to(device, torch.float32)  # (T, T) temporal eigenvectors
+    F_U = torch.fft.rfft(U.T, dim=1)  # (T, F): spectrum of each eigenvector
+
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    sims = []
+    for _ in range(int(n_surrogates)):
+        rows = torch.randperm(V, device=device, generator=gen)[:n]
+        Xr = X[rows]
+        phase = torch.exp(2j * np.pi * torch.rand((n, T // 2 + 1), device=device, generator=gen))
+        phase[:, 0] = 1.0
+        if T % 2 == 0:
+            phase[:, -1] = 1.0
+        sims.append((Xr, torch.fft.rfft(Xr, dim=1), phase, (Xr * Xr).sum(1)))
+
+    cache: dict[int, float] = {}
+
+    def null_top(k: int) -> float:
+        if k in cache:
+            return cache[k]
+        Uk = U[:, :k]
+        tops = []
+        for Xr, F_X, phase, sq in sims:
+            if k:
+                C = Xr @ Uk  # (n, k) scores on the removed components
+                F_R = F_X - C.to(F_X.dtype) @ F_U[:k]
+                row_sq = (sq - (C * C).sum(1)).clamp_min(0)
+            else:
+                F_R, row_sq = F_X, sq
+            S = torch.fft.irfft(F_R * phase, n=T, dim=1)
+            if k:
+                S = S - (S @ Uk) @ Uk.T
+            if remove_timepoint_mean:
+                S = S - S.mean(dim=0, keepdim=True)
+            S = S * (row_sq.sqrt() / S.norm(dim=1).clamp_min(1e-12))[:, None]
+            tops.append(float(torch.linalg.eigvalsh((S.T @ S).double().cpu() / n)[-1]))
+        cache[k] = max(tops) if rule == "edge" else float(np.mean(tops))
+        return cache[k]
+
+    def keeps(k: int) -> bool:  # is component k+1 (0-based index k) above its null?
+        return bool(observed[k] > null_top(k))
+
+    # Sequential by definition: stop at the FIRST component that fails. The test is not
+    # monotone past the true count -- each further removal deflates the residual, and its
+    # surrogate's edge drops with it, so later components can pass again. A bisection
+    # therefore lands anywhere in those later passing stretches (98 on a rank-6 test).
+    k = hi
+    for kk in range(hi + 1):
+        if not keeps(kk):
+            k = kk
+            break
+    k = int(max(k_min, min(k, hi)))
+    return ParallelAnalysisResult(
+        k=k,
+        observed=observed,
+        null_top=dict(cache),
+        n_samples=n,
+        n_surrogates=int(n_surrogates),
+        rule=rule,
+        n_null_evaluations=len(cache),
     )

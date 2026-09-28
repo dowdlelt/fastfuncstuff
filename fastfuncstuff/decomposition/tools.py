@@ -55,7 +55,7 @@ def parse_num_comps_spec(spec: str) -> int | float | str:
     if spec_norm == "melodic":
         # Back-compat: the mode used to be named after the tool it was matching.
         spec_norm = "laplace"
-    if spec_norm in {"auto", "laplace", "hybrid", "current", "erank", "mp"}:
+    if spec_norm in {"auto", "laplace", "hybrid", "current", "erank", "mp", "parallel"}:
         return spec_norm
     try:
         if any(ch in spec_norm for ch in [".", "e"]):
@@ -64,7 +64,7 @@ def parse_num_comps_spec(spec: str) -> int | float | str:
     except ValueError as exc:
         raise ValueError(
             "Invalid -num_comps. Use int, float (0-1), or one of: "
-            "auto|laplace|hybrid|current|erank|mp"
+            "auto|laplace|hybrid|current|erank|mp|parallel"
         ) from exc
 
 
@@ -440,6 +440,28 @@ def estimate_ica_component_count(
                 f"n_samples={res.n_samples:,})"
             )
         return res.k, diagnostics, {"mode": "laplace_mp", **res.as_dict()}
+
+    if mode == "parallel":
+        # Horn's parallel analysis against phase-randomised surrogates: a null coloured
+        # like the noise (each voxel keeps its own autocorrelation), measured on the same
+        # timepoint-centred matrix the spectrum above was built from.
+        from fastfuncstuff.decomposition.model_order import parallel_analysis_order
+
+        pa = parallel_analysis_order(
+            data_vox_t,
+            n_samples=n_samples_minka,
+            remove_timepoint_mean=True,
+            k_min=auto_min_components,
+            k_max=rank_cap,
+            device=device,
+        )
+        if verbose:
+            print(
+                f"    Model order (revised parallel analysis): k={pa.k} ({pa.n_surrogates} "
+                f"phase-randomised surrogates of {pa.n_samples:,} voxels, "
+                f"{pa.n_null_evaluations} null evaluations)"
+            )
+        return pa.k, diagnostics, {"mode": "parallel", **pa.as_dict()}
 
     if mode in {"hybrid", "current"}:
         all_mask = torch.ones(data_vox_t.shape[0], dtype=torch.bool, device=data_vox_t.device)
