@@ -73,9 +73,10 @@ __all__ = [
 DEFAULT_SIGNAL_RANK = 30
 """Rank of the signal subspace removed before measuring the noise.
 
-This remains the library default for callers that explicitly request residual-noise
-normalization without a rank. ``ffs_ica`` no longer invokes it implicitly: its default is
-total temporal SD, and ``-varnorm_rank`` opts into this estimator with an explicit rank.
+``ffs_ica`` uses it by default for -temp_concat and tensorial ICA. Single-run ICA divides
+by total temporal SD instead, because its automatic model order is read off the
+normalized spectrum and this rank pushes that count up. ``-varnorm_rank`` overrides
+either mode, and 0 selects total SD.
 
 **This is a real quality/count trade-off, not a nuisance parameter.** An earlier version of
 this docstring claimed it "does not need to be right, only generous, since the

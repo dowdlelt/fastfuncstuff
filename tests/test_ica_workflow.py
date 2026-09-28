@@ -269,3 +269,16 @@ class TestEstimateSmoothnessReselsACF:
         )
         assert resels >= 1.0
         assert fwhm_geom >= 1.0
+
+
+def test_varnorm_rank_defaults_per_mode():
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.ica import _resolve_varnorm_rank
+    from fastfuncstuff.decomposition.varnorm import DEFAULT_SIGNAL_RANK
+
+    unset = Namespace(varnorm_rank=None)
+    assert _resolve_varnorm_rank(unset, concatenated=False) is None
+    assert _resolve_varnorm_rank(unset, concatenated=True) == DEFAULT_SIGNAL_RANK
+    assert _resolve_varnorm_rank(Namespace(varnorm_rank=0), concatenated=True) is None
+    assert _resolve_varnorm_rank(Namespace(varnorm_rank=12), concatenated=False) == 12

@@ -126,6 +126,22 @@ def _prune_constant_runs(
     return new_mask, n_drop
 
 
+def _resolve_varnorm_rank(args: argparse.Namespace, *, concatenated: bool) -> int | None:
+    """Residual-noise rank for voxel variance normalization, or None for total SD.
+
+    Single-run defaults to total SD because its automatic model order is read off the
+    normalized spectrum; concatenated and tensorial runs default to the residual-noise
+    estimator, which reproduces more components across runs. ``-varnorm_rank 0``
+    forces total SD anywhere.
+    """
+    from fastfuncstuff.decomposition.varnorm import DEFAULT_SIGNAL_RANK
+
+    rank = args.varnorm_rank
+    if rank is None:
+        rank = DEFAULT_SIGNAL_RANK if concatenated else 0
+    return None if rank == 0 else int(rank)
+
+
 def _run_single_ica(
     run_file: str,
     run_idx: int,
@@ -425,6 +441,7 @@ def _run_single_ica(
     # rather than being dominated by high-amplitude voxels.
     # Also excludes constant/near-constant voxels (MELODIC step 3).
     varnorm_std_np: np.ndarray | None = None
+    vn_rank = _resolve_varnorm_rank(args, concatenated=False)
     if args.voxel_norm:
         _vsection(args.verb >= 1, "Voxel Variance Normalization")
         t_step = time.time()
@@ -436,7 +453,7 @@ def _run_single_ica(
             _trace_vn_dir = _Pvn(_trace_single_dir) / run_tag
             _trace_vn_dir.mkdir(parents=True, exist_ok=True)
         data_vox_t, norm_msg, varnorm_std = ica_workflow.apply_voxel_variance_normalization(
-            signal_rank=getattr(args, "varnorm_rank", None),
+            signal_rank=vn_rank,
             data_vox_t=data_vox_t,
             n_vox_masked=n_vox_masked,
             trace_dir=_trace_vn_dir,
@@ -1309,9 +1326,9 @@ def _run_single_ica(
         "voxel_norm_method": (
             "none"
             if not args.voxel_norm
-            else ("total_stdev" if args.varnorm_rank is None else "residual_noise")
+            else ("total_stdev" if vn_rank is None else "residual_noise")
         ),
-        "varnorm_rank": None if args.varnorm_rank is None else int(args.varnorm_rank),
+        "varnorm_rank": vn_rank,
         "tc_var_norm": bool(args.var_norm),
         "smoothness_fwhm_vox": round(float(fwhm_geo), 3),
         "smoothness_resels": round(float(resels), 3),
@@ -1507,9 +1524,9 @@ def _run_concat_ica(
     Then concatenate all runs and apply:
         joined voxel varnorm → ICA
 
-    Joined variance normalization puts a voxel on one scale across runs. Total temporal
-    SD is the parameter-free default; ``-varnorm_rank`` explicitly selects the former
-    residual-noise estimator.
+    Joined variance normalization puts a voxel on one scale across runs. It defaults to
+    the residual-noise estimator (rank ``DEFAULT_SIGNAL_RANK``); ``-varnorm_rank 0``
+    selects total temporal SD.
     """
     from fastfuncstuff.decomposition import postprocess as ica_postprocess
     from fastfuncstuff.decomposition.tools import (
@@ -1777,6 +1794,7 @@ def _run_concat_ica(
     # One voxel-wise varnorm over the fully-concatenated data, not per run, so run-to-run
     # scale differences cannot survive into the concatenation as spurious structure.
     vn_scope = "none"
+    vn_rank = _resolve_varnorm_rank(args, concatenated=True)
     varnorm_std_np: np.ndarray | None = None
     if args.voxel_norm:
         _vsection(args.verb >= 1, "Variance Normalization (joined on concat)")
@@ -1786,7 +1804,7 @@ def _run_concat_ica(
             data_vox_t=data_tv.T,
             n_vox_masked=n_vox_masked,
             trace_dir=None if _trace_dir_vn is None else Path(_trace_dir_vn),
-            signal_rank=args.varnorm_rank,
+            signal_rank=vn_rank,
         )
         data_tv = data_tv_vt.T.contiguous()
         varnorm_std_np = varnorm_std.cpu().numpy()
@@ -2430,9 +2448,9 @@ def _run_concat_ica(
         "voxel_norm_method": (
             "none"
             if not args.voxel_norm
-            else ("total_stdev" if args.varnorm_rank is None else "residual_noise")
+            else ("total_stdev" if vn_rank is None else "residual_noise")
         ),
-        "varnorm_rank": None if args.varnorm_rank is None else int(args.varnorm_rank),
+        "varnorm_rank": vn_rank,
         "whiten_mode": whiten_mode,
         "num_comps_request": args.num_comps,
         "n_components_selected": int(n_components),
@@ -3164,13 +3182,14 @@ def _run_tensorial_ica(
 
     # --- Variance normalization (joined on the full stack) ------------------
     vn_scope = "none"
+    vn_rank = _resolve_varnorm_rank(args, concatenated=True)
     if args.voxel_norm:
         _vsection(args.verb >= 1, "Variance Normalization (joined on spatial concat)")
         t_step = time.time()
         data_tv_vt, norm_msg, _varnorm_std = ica_workflow.apply_voxel_variance_normalization(
             data_vox_t=data_tv.T,
             n_vox_masked=V_total,
-            signal_rank=args.varnorm_rank,
+            signal_rank=vn_rank,
         )
         data_tv = data_tv_vt.T.contiguous()
         del data_tv_vt, _varnorm_std
@@ -3519,9 +3538,9 @@ def _run_tensorial_ica(
         "voxel_norm_method": (
             "none"
             if not args.voxel_norm
-            else ("total_stdev" if args.varnorm_rank is None else "residual_noise")
+            else ("total_stdev" if vn_rank is None else "residual_noise")
         ),
-        "varnorm_rank": None if args.varnorm_rank is None else int(args.varnorm_rank),
+        "varnorm_rank": vn_rank,
         "num_comps_request": args.num_comps,
         "n_components_selected": int(n_components),
         "num_comps_diagnostics": num_diag,
@@ -3729,12 +3748,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-varnorm_rank",
         type=int,
         default=None,
-        help="Opt into residual-noise variance normalization by removing this many "
-        "temporal components before estimating each voxel's noise SD. By default, "
-        "ffs_ica divides by total temporal SD: parameter-free and closest to MELODIC's "
-        "model order on ds005165. Residual-noise normalization can improve cross-run map "
-        "reproducibility at fixed k, but the chosen rank strongly changes automatic model "
-        "order; e.g. use -varnorm_rank 30 to reproduce the former default.",
+        help="Signal rank removed before estimating each voxel's noise SD for variance "
+        "normalization; 0 divides by total temporal SD instead.\n"
+        "Default: 0 (total SD) for single-run ICA, 30 (residual noise) for -temp_concat "
+        "and tensorial ICA.  Single-run automatic model order reads the eigenspectrum of "
+        "the normalized data, and total SD lands closest to MELODIC's count (ds005165: "
+        "|diff| 2.2 vs 14.1 at rank 30).  Across concatenated runs, residual-noise "
+        "normalization gave roughly twice the cross-run-reproducible components at fixed k "
+        "on unsmoothed data; with -do_blur 5 the rank matters far less.",
     )
     proc.add_argument(
         "-drop_constant",
@@ -4321,8 +4342,8 @@ def main() -> None:
         raise ValueError("-depth_lag_min_voxels must be >= 1")
     if args.depth_lag_max_lag_s <= 0:
         raise ValueError("-depth_lag_max_lag_s must be > 0")
-    if args.varnorm_rank is not None and args.varnorm_rank < 1:
-        raise ValueError("-varnorm_rank must be >= 1")
+    if args.varnorm_rank is not None and args.varnorm_rank < 0:
+        raise ValueError("-varnorm_rank must be >= 0 (0 = total temporal SD)")
 
     # --- Resolve high-pass cutoff: Hz vs seconds ---
     if args.high_pass is not None and args.high_pass_s is not None:

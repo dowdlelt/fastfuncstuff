@@ -521,8 +521,7 @@ def parallel_analysis_order(
     where ffs_ica's default count gives 80.7 (|difference| 14.1, r = 0.66). That comparison
     is not like-for-like: PA ran on total-stdev-normalised data, ffs_ica's default on its
     former residual-noise varnorm, and the white null on total-stdev data already lands
-    near MELODIC. Total-stdev is now ffs_ica's parameter-free default; residual-noise
-    normalization is available explicitly with ``-varnorm_rank``.
+    near MELODIC. Total-stdev is now ffs_ica's single-run default.
     But it is biased on strongly coloured noise: past the true count, removing another
     leading direction also removes noise power at the low frequencies where coloured
     noise concentrates, notching every residual row's spectrum, so the rebuilt null is
