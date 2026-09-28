@@ -388,9 +388,13 @@ Notes:
     comp_opts.add_argument(
         "-dl_alpha",
         type=float,
-        default=0.1,
+        default=0.3,
         help="-noise dictionary: sparsity, as a fraction of the penalty at which every "
-        "spatial code would be zero. Near 0 approaches PCA; larger means sparser maps.",
+        "spatial code would be zero. Up to ~0.03 the atoms ARE the PCs; from ~0.1 they rotate "
+        "within the same noise subspace toward localised maps (0.3: each voxel uses ~1-2 "
+        "of 20 atoms, close to a soft parcellation of the pool). On two subjects the R2 at "
+        "the selected count did not depend on it; larger values made the count curve decline "
+        "more gently, so a poorly chosen count costs less.",
     )
     comp_opts.add_argument(
         "-dl_iter",
@@ -416,9 +420,12 @@ Notes:
         "-max_pcs",
         dest="max_comps",
         type=int,
-        default=20,
+        default=None,
         help="How many components to extract and sweep. The selection curve is evaluated at"
-        " every count from 0 to this, so raising it costs time linearly. Alias: -max_pcs.",
+        " every count from 0 to this, so raising it costs time linearly. Alias: -max_pcs.\n"
+        "Default: 20 for -noise pca, whose leading components do not depend on how many are\n"
+        "extracted. For ica/dictionary they do, so under the automatic count (their default)\n"
+        "the ceiling is -auto_component_estimate_max and each run extracts its own estimate.",
     )
     npc_opts.add_argument(
         "-pcstop",
@@ -506,7 +513,25 @@ Notes:
         help=(
             "Cap each run's component count from its own noise-pool spectrum, before and"
             " independently of the denoising CV, rather than extracting -max_comps everywhere."
+            " ON by default for -noise ica and dictionary, whose components change with the"
+            " count extracted; this flag turns it on for pca too."
         ),
+    )
+    comp_opts.add_argument(
+        "-component_count",
+        choices=["laplace", "spectrum"],
+        default="laplace",
+        help="How the automatic count is estimated, per run, from the noise pool alone.\n"
+        "  laplace   ffs_ica's model order: the full eigenspectrum, adjusted for the noise-only\n"
+        "            slope, capped by Marchenko-Pastur and chosen by Minka's Laplace evidence,\n"
+        "            with the sample size corrected for spatial smoothness (ACF, as 3dFWHMx).\n"
+        "  spectrum  the older heuristic (variance target blended with effective rank). It is\n"
+        "            computed on a truncated spectrum, so it tracks its own search ceiling.",
+    )
+    comp_opts.add_argument(
+        "-no_auto_component_caps",
+        action="store_true",
+        help="Extract -max_comps components in every run even for ica/dictionary.",
     )
     comp_opts.add_argument(
         "-auto_component_min",
@@ -527,8 +552,9 @@ Notes:
         type=int,
         default=None,
         help=(
-            "Ceiling for the -auto_component_caps estimator only; defaults to 2x"
-            " -max_comps. The denoising sweep still stops at -max_comps."
+            "Ceiling for the -auto_component_caps estimator; defaults to 2x -max_comps, or 40"
+            " when -max_comps is left to default under the automatic count (then it is the"
+            " sweep's ceiling as well)."
         ),
     )
     comp_opts.add_argument(
@@ -849,6 +875,58 @@ Notes:
     )
 
     return parser
+
+
+def _resolve_component_count(args) -> None:
+    """Which components get stepped through.
+
+    PCA is nested -- its first k components are the same however many are extracted
+    -- so a fixed ceiling only bounds the sweep. ICA and dictionary components change
+    with the count extracted, so that count is a modelling choice and defaults to the
+    per-run estimate from the noise-pool spectrum (made without the denoising CV).
+    """
+    if args.auto_component_caps and args.no_auto_component_caps:
+        print("ERROR: -auto_component_caps and -no_auto_component_caps are contradictory")
+        sys.exit(1)
+    auto_by_default = args.noise in ("ica", "dictionary") and not args.no_auto_component_caps
+    args.auto_component_caps = bool(args.auto_component_caps or auto_by_default)
+    if args.max_comps is None:
+        if args.auto_component_caps and args.noise != "pca":
+            if args.auto_component_estimate_max is None:
+                args.auto_component_estimate_max = 40
+            args.max_comps = args.auto_component_estimate_max
+        else:
+            args.max_comps = 20
+    if args.noise != "pca":
+        how = (
+            f"per-run estimate from the noise-pool spectrum, up to {args.max_comps}"
+            if args.auto_component_caps
+            else f"fixed at {args.max_comps} per run"
+        )
+        print(f"Components extracted ({args.noise}): {how}")
+
+
+def _resels_per_run(
+    data, run_starts, mask, volume_shape, voxel_sizes, device, verbose
+) -> list[float]:
+    """Resel size per run from the ACF smoothness estimator ffs_ica uses."""
+    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+
+    mask3d = np.ones(volume_shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    out = []
+    n_t_total = data.shape[1]
+    for r, s0 in enumerate(run_starts):
+        e = run_starts[r + 1] if r + 1 < len(run_starts) else n_t_total
+        vol = np.zeros((*volume_shape, e - s0), dtype=np.float32)
+        vol[mask3d] = data[:, s0:e].detach().cpu().numpy()
+        resels, fwhm, _ = estimate_smoothness_resels_acf(
+            vol, tuple(voxel_sizes), mask=mask3d, device=device
+        )
+        del vol
+        out.append(float(resels))
+        if verbose:
+            print(f"  Run {r + 1}: ACF FWHM {fwhm:.2f} voxels, resel size {resels:.1f} voxels")
+    return out
 
 
 def print_header(args):
@@ -1920,6 +1998,7 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+    _resolve_component_count(args)
 
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem  # overwrite with clean stem
@@ -2545,6 +2624,13 @@ def main():
         print(
             f"  -nuisance_scope test: {max_nuisance_cols - max_poly_cols} user nuisance columns per run "
             "projected out of held-out runs only"
+        )
+
+    resels_per_run: list[float] | None = None
+    if args.auto_component_caps and args.component_count == "laplace" and not args.single_trials:
+        print("Estimating spatial smoothness per run for the model-order count (ACF)...")
+        resels_per_run = _resels_per_run(
+            data, run_starts, mask, volume_shape, voxel_sizes, device, verbose=args.verb >= 1
         )
 
     # Summary
@@ -3751,6 +3837,8 @@ def main():
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
             test_nuisance=test_nuisance_per_run,
+            component_count_method=args.component_count,
+            resels_per_run=resels_per_run,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
@@ -3798,6 +3886,8 @@ def main():
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
             test_nuisance=test_nuisance_per_run,
+            component_count_method=args.component_count,
+            resels_per_run=resels_per_run,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,

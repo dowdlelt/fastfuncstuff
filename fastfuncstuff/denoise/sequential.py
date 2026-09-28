@@ -571,6 +571,97 @@ def estimate_noise_component_caps_per_run(
     )
 
 
+def estimate_noise_model_order_per_run(
+    data: torch.Tensor,
+    run_starts: list[int],
+    noise_pool_mask: torch.Tensor,
+    resels_per_run: list[float],
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    min_components: int = 1,
+    max_components: int | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> ComponentCountEstimate:
+    """Per-run noise-pool model order, the ffs_ica way (decomposition/model_order.py).
+
+    Each run's pool is prepared exactly as the extractors prepare it (nuisance projected,
+    unit-norm voxels); its FULL temporal eigenspectrum goes to
+    :func:`~fastfuncstuff.decomposition.model_order.select_model_order`: the noise-null
+    adjustment, a Marchenko-Pastur ceiling and Minka's Laplace evidence, with the sample
+    size corrected for spatial smoothness (pool voxels / resel size). No denoising CV is
+    consulted, and nothing depends on a search ceiling other than ``max_components``.
+    """
+    from fastfuncstuff.decomposition.model_order import (
+        effective_sample_size_from_resels,
+        select_model_order,
+    )
+
+    device = device or get_device()
+    n_runs = len(run_starts)
+    if len(resels_per_run) != n_runs:
+        raise ValueError(f"resels_per_run has {len(resels_per_run)} entries but n_runs={n_runs}")
+    noise_pool_mask = noise_pool_mask.to(data.device)
+    n_pool = int(noise_pool_mask.sum())
+    caps: list[int] = []
+    mp_caps: list[int | None] = []
+    details: list[dict[str, float]] = []
+    reasons: list[str] = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+        run_data = data[:, start_tp:end_tp][noise_pool_mask, :].to(device)
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            q = _qr_projector(nuisance_per_run[run_idx].to(device))
+            run_data = run_data - (run_data @ q) @ q.T
+        run_data = run_data / torch.clamp(torch.norm(run_data, dim=1, keepdim=True), min=1e-10)
+        # (T, T) Gram of the wide (V, T) matrix: the full spectrum, never a truncation.
+        gram = (run_data.T @ run_data).double() / float(run_data.shape[0])
+        ev = torch.linalg.eigvalsh(gram.cpu()).flip(0).clamp_min(0).numpy()
+        n_t = int(ev.shape[0])
+        n_eff = effective_sample_size_from_resels(n_pool, float(resels_per_run[run_idx]), floor=n_t)
+        res = select_model_order(ev, n_samples=n_eff, k_min=min_components, k_max=max_components)
+        caps.append(int(res.k))
+        mp_caps.append(int(res.k_mp))
+        reasons.append(str(res.ceiling_source))
+        details.append(
+            {
+                "run_index": float(run_idx),
+                "n_timepoints": float(n_t),
+                "n_noise_voxels": float(n_pool),
+                "resels": float(resels_per_run[run_idx]),
+                "n_eff": float(n_eff),
+                "mp_cap": float(res.k_mp),
+                "selected_cap": float(res.k),
+            }
+        )
+        if verbose:
+            print(
+                f"    Run {run_idx + 1}/{n_runs}: k={res.k} (MP ceiling {res.k_mp}, bound by "
+                f"{res.ceiling_source}; n_eff={n_eff:,} from {n_pool:,} voxels / resel "
+                f"{resels_per_run[run_idx]:.1f})"
+            )
+        del run_data, gram
+    if max_components is not None and any(c >= max_components for c in caps):
+        print(
+            f"  WARNING: the model order reached the {max_components}-component ceiling in "
+            f"{sum(c >= max_components for c in caps)}/{n_runs} runs (MP ceilings "
+            f"{', '.join(str(m) for m in mp_caps)}): the pool shows no cutoff against a white-noise "
+            "null, so the ceiling, not the data, set the count. Typical after NORDIC or on "
+            "temporally autocorrelated noise; raise -auto_component_estimate_max to extract more."
+        )
+    return ComponentCountEstimate(
+        per_run_caps=caps,
+        variance_caps=[-1] * n_runs,
+        entropy_rank_caps=[-1] * n_runs,
+        mp_caps=mp_caps,
+        search_iterations=[1] * n_runs,
+        search_final_max_per_run=caps,
+        search_ceiling_per_run=[int(max_components or -1)] * n_runs,
+        mp_reasons=reasons,
+        details_by_run=details,
+    )
+
+
 def compute_noise_pool_pca_scree_per_run(
     data: torch.Tensor,
     run_starts: list[int],
@@ -1020,7 +1111,7 @@ def extract_noise_dl_per_run(
     return_loadings: bool = False,
     nuisance_per_run: list[torch.Tensor] | None = None,
     component_caps_per_run: list[int] | None = None,
-    alpha: float = 0.1,
+    alpha: float = 0.3,
     n_iter: int = 50,
     device: torch.device | None = None,
     verbose: bool = False,
@@ -2607,7 +2698,9 @@ def fit_denoising_model(
     hrf_indices: torch.Tensor | None = None,
     compute_noise_ceiling: bool = False,
     test_nuisance: list[torch.Tensor] | None = None,
-    dl_alpha: float = 0.1,
+    component_count_method: Literal["laplace", "spectrum"] = "spectrum",
+    resels_per_run: list[float] | None = None,
+    dl_alpha: float = 0.3,
     dl_iter: int = 50,
 ) -> DenoiseResults:
     """
@@ -3178,18 +3271,34 @@ def fit_denoising_model(
         )
         estimate_max_components = max(1, int(estimate_max_components))
 
-        component_cap_info = estimate_noise_component_caps_per_run(
-            data=data,
-            run_starts=run_starts,
-            noise_pool_mask=noise_pool_mask,
-            max_components=estimate_max_components,
-            nuisance_per_run=nuisance_per_run,
-            min_components=auto_component_min,
-            variance_threshold=auto_component_var_threshold,
-            use_mp_prior=auto_component_use_mp,
-            device=device,
-            verbose=verbose,
-        )
+        if component_count_method == "laplace":
+            if resels_per_run is None:
+                raise ValueError("component_count_method='laplace' needs resels_per_run")
+            print("  Model order per run (Laplace evidence + Marchenko-Pastur, ffs_ica estimator):")
+            component_cap_info = estimate_noise_model_order_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                resels_per_run=resels_per_run,
+                nuisance_per_run=nuisance_per_run,
+                min_components=auto_component_min,
+                max_components=estimate_max_components,
+                device=device,
+                verbose=True,
+            )
+        else:
+            component_cap_info = estimate_noise_component_caps_per_run(
+                data=data,
+                run_starts=run_starts,
+                noise_pool_mask=noise_pool_mask,
+                max_components=estimate_max_components,
+                nuisance_per_run=nuisance_per_run,
+                min_components=auto_component_min,
+                variance_threshold=auto_component_var_threshold,
+                use_mp_prior=auto_component_use_mp,
+                device=device,
+                verbose=verbose,
+            )
         component_caps_per_run = component_cap_info.per_run_caps
 
         if component_caps_per_run:
