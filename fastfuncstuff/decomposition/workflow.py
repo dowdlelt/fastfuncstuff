@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 from . import postprocess as ica_postprocess
 from .tools import apply_high_pass_fft, apply_polort_projection
-from .varnorm import variance_normalize
+from .varnorm import apply_noise_std_map, noise_std_map
 
 
 def verbose_section(verbose: bool, name: str) -> None:
@@ -68,25 +68,24 @@ def sanitize_finite_tensor(t: torch.Tensor, label: str, verbose: bool = False) -
 
 def apply_voxel_variance_normalization(
     data_vox_t: torch.Tensor,
-    num_spec: int | float | str,
-    n_t: int,
     n_vox_masked: int,
     trace_dir: Path | None = None,
     signal_rank: int | None = None,
-) -> tuple[torch.Tensor, str]:
-    """Apply voxel variance normalisation; residual-noise path for automatic model order.
+) -> tuple[torch.Tensor, str, torch.Tensor]:
+    """Apply voxel variance normalisation and return the divisor used.
 
-    Automatic model order reads the eigenspectrum, so the scale each voxel is put on
-    directly determines the answer -- hence the residual-noise estimate there rather than
-    the cheaper total-stdev divide. See :mod:`fastfuncstuff.decomposition.varnorm`.
+    Total temporal standard deviation is the parameter-free default. Supplying
+    ``signal_rank`` explicitly selects residual-noise normalisation: a rank-``signal_rank``
+    temporal fit is removed before measuring each voxel's noise standard deviation.
 
-    ``signal_rank`` overrides the noise-estimate rank; None uses
-    :data:`~fastfuncstuff.decomposition.varnorm.DEFAULT_SIGNAL_RANK`.
+    Model-order mode does not change preprocessing implicitly.
     """
-    if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
-        data_vox_t, n_const = variance_normalize(data_vox_t, signal_rank)
+    if signal_rank is not None:
+        norm_std, const_mask, n_const = noise_std_map(data_vox_t, signal_rank)
+        data_vox_t = apply_noise_std_map(data_vox_t, norm_std, const_mask)
         norm_msg = (
-            f"Voxel-norm: residual-noise varnorm over {n_vox_masked:,} voxels "
+            f"Voxel-norm: residual-noise varnorm (rank {signal_rank}) over "
+            f"{n_vox_masked:,} voxels "
             f"({n_const} constant voxels zeroed)"
         )
         if trace_dir is not None:
@@ -94,7 +93,9 @@ def apply_voxel_variance_normalization(
 
             trace_dir.mkdir(parents=True, exist_ok=True)
             _np.save(str(trace_dir / "migp_post_varnorm.npy"), data_vox_t.T.cpu().numpy())
-        return data_vox_t, norm_msg
+            _np.save(str(trace_dir / "ffs_noise_std.npy"), norm_std.cpu().numpy())
+            _np.save(str(trace_dir / "ffs_const_mask.npy"), const_mask.cpu().numpy())
+        return data_vox_t, norm_msg, norm_std
 
     voxel_std = torch.std(data_vox_t, dim=1, keepdim=True)
     const_mask = voxel_std.squeeze() < 1e-6
@@ -111,9 +112,9 @@ def apply_voxel_variance_normalization(
         _np.save(str(trace_dir / "ffs_const_mask.npy"), const_mask.cpu().numpy())
     norm_msg = (
         f"Voxel-norm: divided {n_vox_masked:,} voxels by temporal stdev "
-        f"({n_const} constant voxels zeroed, legacy path)"
+        f"({n_const} constant voxels zeroed)"
     )
-    return data_vox_t, norm_msg
+    return data_vox_t, norm_msg, safe_std.squeeze(1)
 
 
 @torch.inference_mode()

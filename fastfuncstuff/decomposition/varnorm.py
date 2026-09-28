@@ -73,6 +73,10 @@ __all__ = [
 DEFAULT_SIGNAL_RANK = 30
 """Rank of the signal subspace removed before measuring the noise.
 
+This remains the library default for callers that explicitly request residual-noise
+normalization without a rank. ``ffs_ica`` no longer invokes it implicitly: its default is
+total temporal SD, and ``-varnorm_rank`` opts into this estimator with an explicit rank.
+
 **This is a real quality/count trade-off, not a nuisance parameter.** An earlier version of
 this docstring claimed it "does not need to be right, only generous, since the
 degrees-of-freedom correction handles whatever it removes". Both halves of that are wrong,

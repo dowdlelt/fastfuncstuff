@@ -134,48 +134,30 @@ class TestSanitizeFiniteTensor:
 class TestApplyVoxelVarianceNormalization:
     """Test voxel variance normalization."""
 
-    def test_integer_num_spec_legacy_path(self):
-        """Test integer num_spec uses legacy path."""
+    def test_default_uses_total_stdev(self):
         data = torch.randn(10, 50)  # 10 voxels, 50 timepoints
-        result, msg = apply_voxel_variance_normalization(data, num_spec=20, n_t=50, n_vox_masked=10)
-        assert "legacy path" in msg
+        result, msg, divisor = apply_voxel_variance_normalization(data, n_vox_masked=10)
+        assert "temporal stdev" in msg
         assert result.shape == data.shape
+        torch.testing.assert_close(divisor, data.std(dim=1))
 
-    def test_float_num_spec_legacy_path(self):
-        """Test float num_spec uses legacy path."""
+    def test_explicit_rank_uses_residual_noise_path(self):
         data = torch.randn(10, 50)
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec=0.5, n_t=50, n_vox_masked=10
-        )
-        assert "legacy path" in msg
-        assert result.shape == data.shape
-
-    def test_auto_uses_residual_noise_path(self):
-        """'auto' takes the residual-noise path, not the cheap total-stdev divide."""
-        data = torch.randn(10, 50)
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec="auto", n_t=50, n_vox_masked=10
+        result, msg, divisor = apply_voxel_variance_normalization(
+            data, n_vox_masked=10, signal_rank=5
         )
         assert "residual-noise" in msg
+        assert "rank 5" in msg
         assert result.shape == data.shape
+        assert divisor.shape == (10,)
 
-    def test_laplace_uses_residual_noise_path(self):
-        """'laplace' takes the residual-noise path, since it drives model order."""
-        data = torch.randn(10, 50)
-        result, msg = apply_voxel_variance_normalization(
-            data, num_spec="laplace", n_t=50, n_vox_masked=10
-        )
-        assert "residual-noise" in msg
-        assert result.shape == data.shape
-
-    def test_legacy_path_normalizes_variance(self):
-        """Test that legacy path normalizes variance."""
+    def test_total_stdev_normalizes_variance(self):
         # Create data with different variances per voxel
         data = torch.randn(5, 100)
         scales = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).unsqueeze(1)
         data = data * scales
 
-        result, msg = apply_voxel_variance_normalization(data, num_spec=10, n_t=100, n_vox_masked=5)
+        result, msg, _ = apply_voxel_variance_normalization(data, n_vox_masked=5)
 
         # Check that variances are more similar after normalization
         input_vars = data.var(dim=1)
@@ -184,25 +166,35 @@ class TestApplyVoxelVarianceNormalization:
         # Output variances should be closer to 1
         assert (output_vars - 1.0).abs().max() < (input_vars - 1.0).abs().max()
 
-    def test_legacy_path_handles_constant_voxels(self):
+    def test_total_stdev_handles_constant_voxels(self):
         """Test that constant voxels are zeroed."""
         data = torch.randn(5, 100)
         data[2, :] = 5.0  # Make voxel 2 constant
 
-        result, msg = apply_voxel_variance_normalization(data, num_spec=10, n_t=100, n_vox_masked=5)
+        result, msg, divisor = apply_voxel_variance_normalization(data, n_vox_masked=5)
 
         # Voxel 2 should be zeroed
         assert torch.all(result[2, :] == 0)
+        assert divisor[2] == 1
         assert "1 constant voxels" in msg or "constant voxel" in msg.lower()
 
     def test_returns_tuple(self):
-        """Test that function returns (tensor, message) tuple."""
+        """Test that function returns normalized data, message, and divisor."""
         data = torch.randn(5, 50)
-        result = apply_voxel_variance_normalization(data, num_spec=10, n_t=50, n_vox_masked=5)
+        result = apply_voxel_variance_normalization(data, n_vox_masked=5)
         assert isinstance(result, tuple)
-        assert len(result) == 2
+        assert len(result) == 3
         assert isinstance(result[0], torch.Tensor)
         assert isinstance(result[1], str)
+        assert isinstance(result[2], torch.Tensor)
+
+
+def test_ica_parser_varnorm_rank_is_explicit_opt_in():
+    from fastfuncstuff.cli.ica import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["-input", "run.nii.gz"]).varnorm_rank is None
+    assert parser.parse_args(["-input", "run.nii.gz", "-varnorm_rank", "30"]).varnorm_rank == 30
 
 
 class TestEstimateSmoothnessReselsACF:
