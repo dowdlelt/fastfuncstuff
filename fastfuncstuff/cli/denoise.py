@@ -376,11 +376,40 @@ Notes:
     comp_opts.add_argument(
         "-noise",
         type=str,
-        choices=["pca", "ica"],
+        choices=["pca", "ica", "dictionary"],
         default="pca",
         help="How to summarise the noise pool's shared structure.\n"
-        "  pca  orthogonal components, ordered by variance explained.\n"
-        "  ica  spatially independent components; slower, and see -ica_restarts.",
+        "  pca         orthogonal components, ordered by variance explained.\n"
+        "  ica         spatially independent components; slower, and see -ica_restarts.\n"
+        "  dictionary  sparse dictionary learning: temporal atoms whose spatial maps are\n"
+        "              sparse and may overlap; ordered by reconstruction energy. See\n"
+        "              -dl_alpha. -auto_component_caps sets the atom count per run.",
+    )
+    comp_opts.add_argument(
+        "-dl_alpha",
+        type=float,
+        default=0.1,
+        help="-noise dictionary: sparsity, as a fraction of the penalty at which every "
+        "spatial code would be zero. Near 0 approaches PCA; larger means sparser maps.",
+    )
+    comp_opts.add_argument(
+        "-dl_iter",
+        type=int,
+        default=50,
+        help="-noise dictionary: maximum alternating (code/dictionary) iterations per run.",
+    )
+    comp_opts.add_argument(
+        "-nuisance_scope",
+        choices=["both", "test"],
+        default="both",
+        help="Where the -ortvec* and -noise_comps regressors are projected out. Polynomials "
+        "are always projected everywhere.\n"
+        "  both  the initial fit, the training runs, the held-out runs and the noise pool:\n"
+        "        the pool components are then whatever those regressors leave unexplained.\n"
+        "  test  the HELD-OUT runs only: they clean the referee that scores the initial fit\n"
+        "        and every component count, but the model, the noise pool and the\n"
+        "        components never see them -- which components help is still learned from\n"
+        "        the data.",
     )
     comp_opts.add_argument(
         "-max_comps",
@@ -2421,6 +2450,9 @@ def main():
         nuisance_per_run.append(poly)
         max_nuisance_cols = max(max_nuisance_cols, poly.shape[1])
 
+    poly_per_run = [p.clone() for p in nuisance_per_run]
+    max_poly_cols = max_nuisance_cols
+
     # Add user-supplied nuisance blocks (any of -ortvec / -ortvec_run / -ortvec_glob).
     nuisance_blocks_user = collect_nuisance_blocks(
         args,
@@ -2491,6 +2523,29 @@ def main():
                 (nuisance_per_run[run_idx].shape[0], max_nuisance_cols - n_cols), device=device
             )
             nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
+
+    # -nuisance_scope test: the user blocks clean only the held-out runs. The full
+    # list becomes the referee's nuisance; everything that trains, extracts or fits
+    # from here on sees the polynomials alone.
+    if args.single_trials and args.noise == "dictionary":
+        print("ERROR: -noise dictionary is not implemented for -single_trials yet")
+        sys.exit(1)
+    test_nuisance_per_run: list[torch.Tensor] | None = None
+    if args.nuisance_scope == "test" and max_nuisance_cols > max_poly_cols:
+        if args.single_trials:
+            print("ERROR: -nuisance_scope test is not implemented for -single_trials")
+            sys.exit(1)
+        test_nuisance_per_run = nuisance_per_run
+        nuisance_per_run = [
+            torch.cat(
+                [p, torch.zeros((p.shape[0], max_poly_cols - p.shape[1]), device=device)], dim=1
+            )
+            for p in poly_per_run
+        ]
+        print(
+            f"  -nuisance_scope test: {max_nuisance_cols - max_poly_cols} user nuisance columns per run "
+            "projected out of held-out runs only"
+        )
 
     # Summary
     if task_design is not None:
@@ -3695,6 +3750,9 @@ def main():
             compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
+            test_nuisance=test_nuisance_per_run,
+            dl_alpha=args.dl_alpha,
+            dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
@@ -3739,6 +3797,9 @@ def main():
             compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
+            test_nuisance=test_nuisance_per_run,
+            dl_alpha=args.dl_alpha,
+            dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,

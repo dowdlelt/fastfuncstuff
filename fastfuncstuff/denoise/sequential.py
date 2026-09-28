@@ -1012,6 +1012,64 @@ def extract_noise_ics_per_run(
     return noise_ics_per_run
 
 
+def extract_noise_dl_per_run(
+    data: torch.Tensor,
+    run_starts: list[int],
+    noise_pool_mask: torch.Tensor,
+    max_components: int = 20,
+    return_loadings: bool = False,
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    component_caps_per_run: list[int] | None = None,
+    alpha: float = 0.1,
+    n_iter: int = 50,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Per-run sparse dictionary learning on the noise pool.
+
+    Same preparation as :func:`extract_noise_pcs_per_run` (nuisance projected,
+    unit-norm voxels); the temporal atoms are the regressors, ordered by the
+    reconstruction energy of atom x code, and standardised. Loadings are the sparse
+    spatial codes. See :mod:`fastfuncstuff.decomposition.dictionary`.
+    """
+    from fastfuncstuff.decomposition.dictionary import dictionary_learning
+
+    device = device or get_device()
+    n_runs = len(run_starts)
+    if component_caps_per_run is not None and len(component_caps_per_run) != n_runs:
+        raise ValueError(
+            f"component_caps_per_run has {len(component_caps_per_run)} entries but n_runs={n_runs}"
+        )
+    noise_pool_mask = noise_pool_mask.to(data.device)
+    atoms_per_run: list[torch.Tensor] = []
+    loadings_per_run: list[torch.Tensor] = []
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else data.shape[1]
+        run_data = data[:, start_tp:end_tp][noise_pool_mask, :]
+        if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
+            q_nuisance = _qr_projector(nuisance_per_run[run_idx].to(run_data.device))
+            run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
+        run_data = run_data / torch.clamp(torch.norm(run_data, dim=1, keepdim=True), min=1e-10)
+        n_keep = min(max_components, run_data.shape[0], run_data.shape[1])
+        if component_caps_per_run is not None:
+            n_keep = int(max(1, min(component_caps_per_run[run_idx], n_keep)))
+        res = dictionary_learning(run_data.T, n_keep, alpha=alpha, n_iter=n_iter, device=device)
+        atoms = res.atoms / torch.clamp(res.atoms.std(dim=0, keepdim=True), min=1e-10)
+        atoms_per_run.append(atoms.to(data.device))
+        if return_loadings:
+            loadings_per_run.append(res.codes.T.to(data.device))
+        if verbose:
+            print(
+                f"  Run {run_idx + 1}: {n_keep} atoms, code density {res.density:.3f}, "
+                f"atom 1 energy {float(res.energy[0]) * 100:.1f}%, {res.n_iter} iterations"
+            )
+        del run_data, res
+    if return_loadings:
+        return atoms_per_run, loadings_per_run
+    return atoms_per_run
+
+
 def compute_full_brain_pc_loadings(
     data: torch.Tensor,
     noise_pcs_per_run: list[torch.Tensor],
@@ -1316,6 +1374,7 @@ def cross_validate_noise_pcs(
     zero_event_strategy: str = "zero",
     clean_reference: bool = False,
     diagnostics: dict | None = None,
+    test_nuisance: list[torch.Tensor] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -1407,6 +1466,13 @@ def cross_validate_noise_pcs(
         ``'ss_tot_fraction'``: (n_voxels, max_components + 1) float32, the
         fraction of the k=0 held-out sum of squares that survives the referee's
         own projection at each k. Identically 1.0 in column 0.
+    test_nuisance : list of torch.Tensor, optional
+        Per-run nuisance projected out of the HELD-OUT run only (data and the
+        prediction design), in place of ``nuisance`` there. Training runs keep
+        ``nuisance``. This is ``ffs_denoise -nuisance_scope test``: regressors such
+        as motion clean the referee without being part of the model the PCs are
+        chosen for. Must contain ``nuisance`` (e.g. polynomials + motion when
+        ``nuisance`` is the polynomials). Not combinable with ``clean_reference``.
 
     Returns
     -------
@@ -1427,6 +1493,8 @@ def cross_validate_noise_pcs(
         raise ValueError("Cannot provide both design_matrix and designs_by_hrf")
     if designs_by_hrf is not None and hrf_indices is None:
         raise ValueError("hrf_indices required when designs_by_hrf is provided")
+    if test_nuisance is not None and clean_reference:
+        raise ValueError("test_nuisance and clean_reference each redefine the referee; use one")
 
     if designs_by_hrf is not None:
         # Per-HRF mode: the only thing that varies across voxels is which design
@@ -1471,6 +1539,7 @@ def cross_validate_noise_pcs(
                 zero_event_strategy=zero_event_strategy,
                 clean_reference=clean_reference,
                 diagnostics=group_diag,
+                test_nuisance=test_nuisance,
             )
             r2_maps[voxel_mask.numpy(), :] = group_maps
             if ss_tot_fraction is not None and group_diag:
@@ -1546,6 +1615,15 @@ def cross_validate_noise_pcs(
         from fastfuncstuff.glm.xval import compute_qr_projectors
 
         q_factors_all = compute_qr_projectors(nuisance_per_run, run_starts, device=proj_device)
+    # Held-out-only projector (-nuisance_scope test). Breaks "a run's projector is
+    # the same whether it is train or test" (fact 1 below) for the TEST side only:
+    # training statistics keep q_factors_all, the held-out data and prediction
+    # design use these.
+    q_test_all: list[torch.Tensor | None] | None = None
+    if test_nuisance is not None:
+        from fastfuncstuff.glm.xval import compute_qr_projectors
+
+        q_test_all = compute_qr_projectors(test_nuisance, run_starts, device=proj_device)
 
     # Generate CV splits based on strategy
     cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
@@ -1722,6 +1800,17 @@ def cross_validate_noise_pcs(
 
     gram_total = torch.stack(gram_by_run, dim=0).sum(dim=0)
     design_proj_by_run = [xt[0] for xt in xtilde_by_run]  # k=0 is nuisance-only
+    if q_test_all is not None:
+        # The held-out prediction design gets the held-out projector.
+        design_proj_by_run = []
+        for r in range(n_runs):
+            start_tp, end_tp = run_slices[r]
+            design_run = design_matrix_cpu[start_tp:end_tp, :].to(proj_device)
+            q_t = q_test_all[r]
+            if q_t is not None:
+                q_t = q_t.to(proj_device)
+                design_run = design_run - q_t @ (q_t.T @ design_run)
+            design_proj_by_run.append(design_run)
 
     # =========================================================================
     # Per-fold plans: everything a fold needs that has no voxel axis
@@ -1815,7 +1904,7 @@ def cross_validate_noise_pcs(
     # over all runs. They cannot once the held-out run is modified -- either by
     # the unpredictable-condition projection or, per PC count, by the referee's
     # own PC projection -- because then they are a property of the fold.
-    defer_actual = any_projection or clean_reference
+    defer_actual = any_projection or clean_reference or q_test_all is not None
 
     if (verbose or announce_missing) and max(n_dropped_by_fold) > 0:
         print(
@@ -1840,6 +1929,18 @@ def cross_validate_noise_pcs(
         if q_nuis_run is not None:
             q_nuis = q_nuis_run.to(proj_device)
             y_run = y_run - (q_nuis @ (q_nuis.T @ y_run.T)).T
+        return y_run
+
+    def _load_run_test(chunk_cpu: torch.Tensor, run_idx: int) -> torch.Tensor:
+        """The held-out copy of a run: test-side projector when one is set."""
+        if q_test_all is None:
+            return _load_run(chunk_cpu, run_idx)
+        start_tp, end_tp = run_slices[run_idx]
+        y_run = chunk_cpu[:, start_tp:end_tp].to(proj_device)
+        q_t = q_test_all[run_idx]
+        if q_t is not None:
+            q_t = q_t.to(proj_device)
+            y_run = y_run - (q_t @ (q_t.T @ y_run.T)).T
         return y_run
 
     # Process voxels in chunks to manage memory
@@ -1935,7 +2036,7 @@ def cross_validate_noise_pcs(
             betas_fit = torch.matmul(plan["gram_inv"], xty_fit)
 
             for r in test_runs:
-                y_test = test_data[r]
+                y_test = test_data[r] if q_test_all is None else _load_run_test(chunk_data_cpu, r)
                 start_tp, end_tp = run_slices[r]
                 design_test = plan["design_test_fit"][r]  # (run_len, n_fit)
                 basis = plan["unpred_basis_by_run"].get(r)
@@ -2480,7 +2581,7 @@ def fit_denoising_model(
     pcstop: float = 1.05,
     pc_min_gain: float | None = None,
     pcR2cutoff: float | None = 0.05,
-    noise_method: Literal["pca", "ica"] = "pca",
+    noise_method: Literal["pca", "ica", "dictionary"] = "pca",
     auto_component_caps: bool = False,
     auto_component_estimate_max: int | None = None,
     auto_component_min: int = 5,
@@ -2505,6 +2606,9 @@ def fit_denoising_model(
     designs_by_hrf: dict | None = None,
     hrf_indices: torch.Tensor | None = None,
     compute_noise_ceiling: bool = False,
+    test_nuisance: list[torch.Tensor] | None = None,
+    dl_alpha: float = 0.1,
+    dl_iter: int = 50,
 ) -> DenoiseResults:
     """
     Fit cross-validated denoising model
@@ -2732,6 +2836,44 @@ def fit_denoising_model(
     # R2 with the same denominator, so the initial ceiling is only offered for an
     # R2 this function measured itself.
     initial_r2_is_ours = initial_r2 is None
+
+    if test_nuisance is not None:
+        if clean_reference_diagnostic:
+            raise ValueError("clean_reference_diagnostic is not available with test_nuisance")
+        if compute_noise_ceiling:
+            raise ValueError("the noise ceiling is not yet available with test_nuisance")
+        if initial_r2 is None:
+            # The same referee as the PC sweep: training runs keep `nuisance`, the
+            # held-out run loses `test_nuisance`. Zero components makes it the
+            # task-only initial fit.
+            if verbose:
+                print("\nStep 1: cross-validated task-only R² (held-out-only nuisance)...")
+            zero_pcs = [
+                torch.zeros((e - s0, 0), device=device)
+                for s0, e in zip(run_starts, [*run_starts[1:], n_timepoints], strict=True)
+            ]
+            init_maps, _ = cross_validate_noise_pcs(
+                data=data,
+                design_matrix=None if per_hrf_mode else design_matrix,
+                designs_by_hrf=designs_by_hrf if per_hrf_mode else None,
+                hrf_indices=hrf_indices if per_hrf_mode else None,
+                noise_pcs=zero_pcs,
+                run_starts=run_starts,
+                max_components=0,
+                tr=tr,
+                nuisance=nuisance_per_run,
+                cv_strategy=cv_strategy,
+                n_perms=n_perms,
+                chunk_size=chunk_size,
+                device=device,
+                verbose=False,
+                progress_desc="Initial R² (held-out nuisance)",
+                zero_event_strategy=zero_event_strategy,
+                test_nuisance=test_nuisance,
+            )
+            initial_r2 = torch.from_numpy(init_maps[:, 0]).to(device)
+            if verbose:
+                print(f"  Median xval R²: {initial_r2.median().item():.4f}")
 
     if per_hrf_mode and initial_r2 is None:
         # per_hrf_mode implies designs_by_hrf/hrf_indices were both required (see guard above).
@@ -3014,7 +3156,7 @@ def fit_denoising_model(
             else 0
         )
         nuisance_msg = f", projecting {n_nuisance} nuisance" if n_nuisance > 0 else ""
-        method_label = "ICs" if noise_method == "ica" else "PCs"
+        method_label = {"ica": "ICs", "dictionary": "atoms"}.get(noise_method, "PCs")
         print(
             f"\nStep 3: Extracting {method_label} from noise pool "
             f"(max={max_components}{nuisance_msg})..."
@@ -3065,10 +3207,28 @@ def fit_denoising_model(
 
     pc_loadings = None
     ic_variance_ratio_per_run: list[torch.Tensor] | None = None
-    if noise_method not in {"pca", "ica"}:
-        raise ValueError(f"noise_method must be 'pca' or 'ica', got {noise_method}")
+    if noise_method not in {"pca", "ica", "dictionary"}:
+        raise ValueError(f"noise_method must be 'pca', 'ica' or 'dictionary', got {noise_method}")
 
-    if noise_method == "pca":
+    if noise_method == "dictionary":
+        dl_out = extract_noise_dl_per_run(
+            data=data,
+            run_starts=run_starts,
+            noise_pool_mask=noise_pool_mask,
+            max_components=extraction_max_components,
+            return_loadings=return_loadings,
+            nuisance_per_run=nuisance_per_run,
+            component_caps_per_run=component_caps_per_run,
+            alpha=dl_alpha,
+            n_iter=dl_iter,
+            device=device,
+            verbose=verbose,
+        )
+        if return_loadings:
+            noise_pcs, pc_loadings = dl_out
+        else:
+            noise_pcs = dl_out
+    elif noise_method == "pca":
         if return_loadings:
             noise_pcs, pc_loadings = extract_noise_pcs_per_run(
                 data=data,
@@ -3246,6 +3406,7 @@ def fit_denoising_model(
                 # the HRF, so one group's report covers all of them.
                 announce_missing=bool(verbose and hrf_idx == unique_hrf_indices[0]),
                 zero_event_strategy=zero_event_strategy,
+                test_nuisance=test_nuisance,
             )
 
             # Scatter results back to full array
@@ -3272,6 +3433,7 @@ def fit_denoising_model(
             device=device,
             verbose=verbose,
             zero_event_strategy=zero_event_strategy,
+            test_nuisance=test_nuisance,
         )
 
     # -------------------------------------------------------------------
