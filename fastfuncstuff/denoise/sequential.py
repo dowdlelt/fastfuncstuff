@@ -571,6 +571,82 @@ def estimate_noise_component_caps_per_run(
     )
 
 
+def prepare_pool_for_model_order(
+    data: torch.Tensor,
+    run_starts: list[int],
+    noise_pool_mask: torch.Tensor,
+    spatial_geometry: dict,
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    smooth_fwhm: float = 0.0,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, list[float]]:
+    """Noise-pool data for the model-order count, and its resel size per run.
+
+    Nuisance is projected out per run first. With ``smooth_fwhm`` > 0 the pool is then
+    blurred **within the pool mask only** (normalised convolution), so no criteria voxel
+    ever contributes to a pool voxel. The resel size is measured on the result with the
+    ACF estimator ffs_ica uses, so a blurred pool gets its (larger) resels and a smaller
+    effective sample size. Used only to COUNT; the extracted components come from the
+    unblurred pool.
+
+    ``spatial_geometry``: ``volume_shape`` (x, y, z), ``voxel_sizes`` (mm) and
+    ``mask_flat``, the C-order volume mask selecting ``data``'s rows (None = every voxel).
+    """
+    from fastfuncstuff.cli_utils import blur_masked_data
+    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+
+    device = device or get_device()
+    volume_shape = tuple(int(v) for v in spatial_geometry["volume_shape"])
+    voxel_sizes = tuple(float(v) for v in spatial_geometry["voxel_sizes"])
+    n_vol = int(np.prod(volume_shape))
+    mask_flat = spatial_geometry.get("mask_flat")
+    data_idx = (
+        np.arange(n_vol)
+        if mask_flat is None
+        else np.flatnonzero(np.asarray(mask_flat, dtype=bool).reshape(-1))
+    )
+    pool_np = noise_pool_mask.detach().cpu().numpy().astype(bool)
+    pool_idx = data_idx[pool_np]
+    pool_vol = np.zeros(n_vol, dtype=bool)
+    pool_vol[pool_idx] = True
+
+    pool = data[noise_pool_mask.to(data.device)].float()
+    n_runs = len(run_starts)
+    bounds = [*run_starts, pool.shape[1]]
+    if nuisance_per_run is not None:
+        for r in range(n_runs):
+            if nuisance_per_run[r].shape[1] == 0:
+                continue
+            q = _qr_projector(nuisance_per_run[r].to(pool.device).float())
+            seg = pool[:, bounds[r] : bounds[r + 1]]
+            pool[:, bounds[r] : bounds[r + 1]] = seg - (seg @ q) @ q.T
+    if smooth_fwhm and smooth_fwhm > 0:
+        pool = blur_masked_data(
+            pool,
+            fwhm_mm=float(smooth_fwhm),
+            volume_shape=volume_shape,
+            voxel_sizes=voxel_sizes,
+            mask_flat=pool_vol,
+            run_starts=run_starts,
+            device=device,
+            verbose=verbose,
+        )
+    resels = []
+    pool3d = pool_vol.reshape(volume_shape)
+    for r in range(n_runs):
+        vol = np.zeros((n_vol, bounds[r + 1] - bounds[r]), dtype=np.float32)
+        vol[pool_idx] = pool[:, bounds[r] : bounds[r + 1]].detach().cpu().numpy()
+        res, fwhm, _ = estimate_smoothness_resels_acf(
+            vol.reshape(*volume_shape, -1), voxel_sizes, mask=pool3d, device=device
+        )
+        del vol
+        resels.append(float(res))
+        if verbose:
+            print(f"    Run {r + 1}: pool ACF FWHM {fwhm:.2f} voxels, resel size {res:.1f}")
+    return pool, resels
+
+
 def estimate_noise_model_order_per_run(
     data: torch.Tensor,
     run_starts: list[int],
@@ -2699,7 +2775,8 @@ def fit_denoising_model(
     compute_noise_ceiling: bool = False,
     test_nuisance: list[torch.Tensor] | None = None,
     component_count_method: Literal["laplace", "spectrum"] = "spectrum",
-    resels_per_run: list[float] | None = None,
+    spatial_geometry: dict | None = None,
+    count_smooth_fwhm: float = 0.0,
     dl_alpha: float = 0.3,
     dl_iter: int = 50,
 ) -> DenoiseResults:
@@ -3272,20 +3349,38 @@ def fit_denoising_model(
         estimate_max_components = max(1, int(estimate_max_components))
 
         if component_count_method == "laplace":
-            if resels_per_run is None:
-                raise ValueError("component_count_method='laplace' needs resels_per_run")
-            print("  Model order per run (Laplace evidence + Marchenko-Pastur, ffs_ica estimator):")
-            component_cap_info = estimate_noise_model_order_per_run(
+            if spatial_geometry is None:
+                raise ValueError("component_count_method='laplace' needs spatial_geometry")
+            smooth_txt = (
+                f", pool blurred {count_smooth_fwhm:g} mm within itself"
+                if count_smooth_fwhm
+                else ""
+            )
+            print(
+                f"  Model order per run (ffs_ica estimator: Laplace evidence + Marchenko-Pastur{smooth_txt}):"
+            )
+            pool_for_count, pool_resels = prepare_pool_for_model_order(
                 data=data,
                 run_starts=run_starts,
                 noise_pool_mask=noise_pool_mask,
-                resels_per_run=resels_per_run,
+                spatial_geometry=spatial_geometry,
                 nuisance_per_run=nuisance_per_run,
+                smooth_fwhm=count_smooth_fwhm,
+                device=device,
+                verbose=True,
+            )
+            component_cap_info = estimate_noise_model_order_per_run(
+                data=pool_for_count,
+                run_starts=run_starts,
+                noise_pool_mask=torch.ones(pool_for_count.shape[0], dtype=torch.bool),
+                resels_per_run=pool_resels,
+                nuisance_per_run=None,
                 min_components=auto_component_min,
                 max_components=estimate_max_components,
                 device=device,
                 verbose=True,
             )
+            del pool_for_count
         else:
             component_cap_info = estimate_noise_component_caps_per_run(
                 data=data,

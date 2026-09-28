@@ -529,6 +529,20 @@ Notes:
         "            computed on a truncated spectrum, so it tracks its own search ceiling.",
     )
     comp_opts.add_argument(
+        "-count_smooth_fwhm",
+        type=float,
+        default=6.0,
+        help="-component_count laplace: blur the noise pool by this FWHM (mm) before counting,"
+        " within the pool mask only -- no criteria voxel contributes. Structured noise is"
+        " spatially extended, so a blurred pool separates it from the fine-grained remainder"
+        " the white-noise null misreads as signal. Affects the COUNT only; components are"
+        " extracted from the unblurred pool. 0 = off.\n"
+        "Measured on two NORDIC'd subjects (1.6 mm voxels): 0 mm found no cutoff at all"
+        " (Marchenko-Pastur passed ~337 of 350 dimensions); 6 mm gave 18-30 per run, stable"
+        " across runs and subjects and inside a plateau that held to 12 mm; from 8 mm the"
+        " effective sample size hit its floor (the number of timepoints).",
+    )
+    comp_opts.add_argument(
         "-no_auto_component_caps",
         action="store_true",
         help="Extract -max_comps components in every run even for ica/dictionary.",
@@ -904,29 +918,6 @@ def _resolve_component_count(args) -> None:
             else f"fixed at {args.max_comps} per run"
         )
         print(f"Components extracted ({args.noise}): {how}")
-
-
-def _resels_per_run(
-    data, run_starts, mask, volume_shape, voxel_sizes, device, verbose
-) -> list[float]:
-    """Resel size per run from the ACF smoothness estimator ffs_ica uses."""
-    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
-
-    mask3d = np.ones(volume_shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
-    out = []
-    n_t_total = data.shape[1]
-    for r, s0 in enumerate(run_starts):
-        e = run_starts[r + 1] if r + 1 < len(run_starts) else n_t_total
-        vol = np.zeros((*volume_shape, e - s0), dtype=np.float32)
-        vol[mask3d] = data[:, s0:e].detach().cpu().numpy()
-        resels, fwhm, _ = estimate_smoothness_resels_acf(
-            vol, tuple(voxel_sizes), mask=mask3d, device=device
-        )
-        del vol
-        out.append(float(resels))
-        if verbose:
-            print(f"  Run {r + 1}: ACF FWHM {fwhm:.2f} voxels, resel size {resels:.1f} voxels")
-    return out
 
 
 def print_header(args):
@@ -2626,13 +2617,6 @@ def main():
             "projected out of held-out runs only"
         )
 
-    resels_per_run: list[float] | None = None
-    if args.auto_component_caps and args.component_count == "laplace" and not args.single_trials:
-        print("Estimating spatial smoothness per run for the model-order count (ACF)...")
-        resels_per_run = _resels_per_run(
-            data, run_starts, mask, volume_shape, voxel_sizes, device, verbose=args.verb >= 1
-        )
-
     # Summary
     if task_design is not None:
         if is_fir_model:
@@ -3838,7 +3822,10 @@ def main():
             nuisance=nuisance_per_run,
             test_nuisance=test_nuisance_per_run,
             component_count_method=args.component_count,
-            resels_per_run=resels_per_run,
+            spatial_geometry=dict(
+                volume_shape=volume_shape, voxel_sizes=voxel_sizes, mask_flat=mask_flat
+            ),
+            count_smooth_fwhm=args.count_smooth_fwhm,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
@@ -3887,7 +3874,10 @@ def main():
             nuisance=nuisance_per_run,
             test_nuisance=test_nuisance_per_run,
             component_count_method=args.component_count,
-            resels_per_run=resels_per_run,
+            spatial_geometry=dict(
+                volume_shape=volume_shape, voxel_sizes=voxel_sizes, mask_flat=mask_flat
+            ),
+            count_smooth_fwhm=args.count_smooth_fwhm,
             dl_alpha=args.dl_alpha,
             dl_iter=args.dl_iter,
             min_noise_voxels=args.min_noise_voxels,
