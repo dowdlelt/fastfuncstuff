@@ -66,6 +66,15 @@ def _mni_input(ctx: BenchmarkContext, dataset: str, run: int) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _row_subspace_principal_cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Principal-angle cosines between row spans, independent of basis scaling."""
+    k = min(a.shape[0], b.shape[0])
+    n = min(a.shape[1], b.shape[1])
+    qa, _ = np.linalg.qr(a[:k, :n].T, mode="reduced")
+    qb, _ = np.linalg.qr(b[:k, :n].T, mode="reduced")
+    return np.clip(np.linalg.svd(qa.T @ qb, compute_uv=False), 0.0, 1.0)
+
+
 def _compare_eigenvalues(mel_dir: Path, trace_dir: Path) -> dict:
     mel_eig = np.loadtxt(str(mel_dir / "pcaD"))
     ffs_p = trace_dir / "pca_eigenvalues.npy"
@@ -185,9 +194,7 @@ def _compare_whitening(mel_dir: Path, trace_dir: Path) -> dict:
     mel_w = mel_wm[:k, :T]
     ffs_w = ffs_wm[:k, :T]
 
-    cross = mel_w @ ffs_w.T
-    cos_angles = np.linalg.svd(cross, compute_uv=False)
-    cos_angles = np.clip(cos_angles, 0.0, 1.0)
+    cos_angles = _row_subspace_principal_cos(mel_w, ffs_w)
 
     result = {
         "melodic_shape": list(mel_wm.shape),
@@ -392,9 +399,7 @@ def _compare_pca_components(mel_dir: Path, trace_dir: Path) -> dict:
     ffs_pca = np.load(str(ffs_pca_p)).astype(np.float32)
 
     n_k = min(mel_pca.shape[0], ffs_pca.shape[0])
-    cross = mel_pca[:n_k] @ ffs_pca[:n_k].T
-    cos_angles = np.linalg.svd(cross, compute_uv=False)
-    cos_angles = np.clip(cos_angles, 0.0, 1.0)
+    cos_angles = _row_subspace_principal_cos(mel_pca[:n_k], ffs_pca[:n_k])
 
     return {
         "mean_principal_cos": float(cos_angles.mean()),
