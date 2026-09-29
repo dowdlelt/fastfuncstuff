@@ -478,170 +478,6 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------- plotting
-SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
-CATEGORICAL = [
-    "#2a78d6",
-    "#eb6834",
-    "#1baf7a",
-    "#eda100",
-    "#e87ba4",
-    "#008300",
-    "#4a3aa7",
-    "#e34948",
-]
-# Sequential blue, 200 -> 700: tSNR bins are ordered, so they are magnitude, not identity.
-BLUES = ["#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
-
-
-def _style(ax) -> None:
-    ax.set_facecolor(SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(INK2)
-    ax.tick_params(colors=INK2, labelsize=9)
-    ax.grid(True, color=GRID, linewidth=0.8)
-    ax.set_axisbelow(True)
-
-
-def _ramp(n: int) -> list[str]:
-    if n <= 1:
-        return [BLUES[3]]
-    if n > len(BLUES):
-        import matplotlib.colors as mcolors
-
-        cmap = mcolors.LinearSegmentedColormap.from_list("seq", [BLUES[0], BLUES[-1]])
-        return [mcolors.to_hex(cmap(x)) for x in np.linspace(0, 1, n)]
-    idx = np.linspace(0, len(BLUES) - 1, n).round().astype(int)
-    return [BLUES[i] for i in idx]
-
-
-def _plot_power(res, conds, contrasts, pattern, args, path: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    names = [c for c in contrasts if abs(contrasts[c] @ np.asarray(pattern)) > 0][:6]
-    if not names:
-        return
-    rows = res["table"]
-    colors = _ramp(len(conds))
-    fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names), 4.2), squeeze=False)
-    fig.patch.set_facecolor(SURFACE)
-    for ax, c in zip(axes[0], names, strict=True):
-        _style(ax)
-        ax.axhline(0.8, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
-        for cond, col in zip(conds, colors, strict=True):
-            sel = [r for r in rows if r["noise"] == cond["label"] and r["contrast"] == c]
-            amps = sorted({r["amplitude"] for r in sel})
-            by = {a: [r for r in sel if r["amplitude"] == a] for a in amps}
-            med = [np.median([r["power_predicted"] for r in by[a]]) for a in amps]
-            lo = [np.min([r["power_predicted"] for r in by[a]]) for a in amps]
-            hi = [np.max([r["power_predicted"] for r in by[a]]) for a in amps]
-            mc = [np.mean([r["power"] for r in by[a]]) for a in amps]
-            ax.fill_between(amps, lo, hi, color=col, alpha=0.18, linewidth=0)
-            ax.plot(amps, med, color=col, linewidth=2, label=cond["label"])
-            ax.plot(
-                amps, mc, "o", color=col, markersize=4.5, markeredgecolor=SURFACE, markeredgewidth=1
-            )
-            if len(conds) <= 4:
-                # Label each curve where it crosses 50% power: saturated curves all
-                # end at 1.0, so labels at the right edge land on top of each other.
-                k = int(np.argmin(np.abs(np.asarray(med) - 0.5)))
-                ax.annotate(
-                    cond["label"].split(" (")[0],
-                    (amps[k], med[k]),
-                    xytext=(6, -2),
-                    textcoords="offset points",
-                    fontsize=8,
-                    color=INK2,
-                    va="top",
-                )
-        if args.effect is not None:
-            ax.axvline(args.effect, color=INK2, linewidth=1, linestyle=":")
-        ax.set_ylim(-0.02, 1.02)
-        ax.set_title(c, color=INK, fontsize=11)
-        ax.set_xlabel("amplitude (% signal change x pattern)", color=INK2, fontsize=9)
-    axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        frameon=False,
-        fontsize=8,
-        labelcolor=INK2,
-        loc="lower center",
-        ncol=min(len(labels), 5),
-    )
-    fig.suptitle(
-        f"Power at two-tailed p < {args.alpha:g} -- line: analytic (band: range over "
-        f"realizations), dots: Monte Carlo; dashed: 80%",
-        color=INK,
-        fontsize=10,
-    )
-    fig.tight_layout(rect=(0, 0.07, 1, 1))
-    fig.savefig(path, dpi=130, facecolor=SURFACE)
-    plt.close(fig)
-
-
-def _plot_design(res, reals, args, path: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
-
-    real = reals[0]
-    X = res["designs"][0]["X"].numpy()
-    n0 = real.run_lengths[0]
-    t = np.arange(n0) * args.tr
-    fig = plt.figure(figsize=(13, 5.6))
-    fig.patch.set_facecolor(SURFACE)
-    gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1], height_ratios=[1, 1.4])
-    ax_ev, ax_x, ax_c = (
-        fig.add_subplot(gs[0, 0]),
-        fig.add_subplot(gs[1, 0]),
-        fig.add_subplot(gs[:, 1]),
-    )
-    for ax in (ax_ev, ax_x):
-        _style(ax)
-    for i, (cond, dur) in enumerate(zip(real.conditions, real.durations, strict=True)):
-        col = CATEGORICAL[i % len(CATEGORICAL)]
-        for on in real.onsets[i][0]:
-            ax_ev.broken_barh([(on, max(dur, args.tr / 4))], (i + 0.15, 0.7), color=col)
-        ax_x.plot(t, X[:n0, i], color=col, linewidth=2, label=cond)
-    ax_ev.set_yticks(np.arange(len(real.conditions)) + 0.5, real.conditions)
-    ax_ev.set_xlim(0, t[-1] + args.tr)
-    ax_ev.set_title("Events, first realization, run 1", color=INK, fontsize=10, loc="left")
-    ax_x.set_xlim(0, t[-1] + args.tr)
-    ax_x.set_xlabel("time (s)", color=INK2, fontsize=9)
-    ax_x.set_title("Regressors (unit peak)", color=INK, fontsize=10, loc="left")
-    ax_x.legend(frameon=False, fontsize=8, labelcolor=INK2, ncol=min(4, len(real.conditions)))
-
-    corr = np.corrcoef(X.T) if X.shape[1] > 1 else np.ones((1, 1))
-    cmap = LinearSegmentedColormap.from_list("div", ["#2a78d6", "#f0efec", "#eb6834"])
-    ax_c.imshow(corr, cmap=cmap, vmin=-1, vmax=1)
-    for (i, j), v in np.ndenumerate(corr):
-        ax_c.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=8, color=INK)
-    ax_c.set_xticks(range(len(real.conditions)), real.conditions)
-    ax_c.set_yticks(range(len(real.conditions)), real.conditions)
-    ax_c.tick_params(colors=INK2, labelsize=9)
-    ax_c.set_title("Regressor correlation", color=INK, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130, facecolor=SURFACE)
-    plt.close(fig)
-
-
-def _write_events(real, outdir: Path) -> None:
-    outdir.mkdir(parents=True, exist_ok=True)
-    for i, cond in enumerate(real.conditions):
-        with open(outdir / f"{cond}.txt", "w") as f:
-            for run in real.onsets[i]:
-                f.write((" ".join(f"{t:.3f}" for t in run) if len(run) else "*") + "\n")
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     from fastfuncstuff.cli_utils import setup_device
@@ -751,10 +587,27 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     if described:
-        _write_events(reals[0], Path(f"{prefix}_events"))
+        from fastfuncstuff.simulation.core import write_timing_files
+
+        write_timing_files(reals[0].onsets, reals[0].conditions, Path(f"{prefix}_events"))
     if not args.no_plots:
-        _plot_power(res, conds, contrasts, pattern, args, Path(f"{prefix}_power.png"))
-        _plot_design(res, reals, args, Path(f"{prefix}_design.png"))
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from fastfuncstuff.simulation.plots import plot_design, plot_power
+
+        labels = [c["label"] for c in conds]
+        if any(abs(w @ np.asarray(pattern)) > 0 for w in contrasts.values()):
+            plot_power(
+                res, labels, contrasts, pattern, args.alpha, args.effect, path=f"{prefix}_power.png"
+            )
+        plot_design(
+            res,
+            reals[0],
+            args.tr,
+            path=f"{prefix}_design.png",
+            title="Events, first realization, run 1",
+        )
     print(
         f"\nwrote {prefix}_summary.txt, _power.tsv, _spec.json"
         + ("" if args.no_plots else ", _power.png, _design.png")

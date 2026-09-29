@@ -42,10 +42,13 @@ def test_write_afni_onset_files_handles_multiple_runs_and_empty_condition(tmp_pa
     cond1_lines = cond1_path.read_text().strip().splitlines()
     cond2_lines = cond2_path.read_text().strip().splitlines()
 
-    assert cond1_lines[0] == "0.00 8.00"
-    assert cond1_lines[1] == "4.00"
+    def values(line):
+        return [float(v) for v in line.split()]
 
-    assert cond2_lines[0] == "2.00"
+    assert values(cond1_lines[0]) == [0.0, 8.0]
+    assert values(cond1_lines[1]) == [4.0]
+
+    assert values(cond2_lines[0]) == [2.0]
     assert cond2_lines[1] == "*"
 
 

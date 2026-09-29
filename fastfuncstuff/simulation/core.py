@@ -391,79 +391,49 @@ def simulate_batch_experiments(
     return experiments
 
 
+def write_timing_files(
+    onsets: list[list[np.ndarray | list[float]]],
+    conditions: list[str],
+    output_dir: str | Path,
+    prefix: str = "",
+) -> list[Path]:
+    """AFNI timing files: one per condition, one row per run, onsets in seconds.
+
+    ``onsets[condition][run]``. An empty run is written as ``*``. These read
+    back with io.afni.read_afni_onset_files, e.g. as ffs_simulate -events.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for cond, runs in zip(conditions, onsets, strict=True):
+        path = output_dir / f"{prefix}{cond}.txt"
+        with open(path, "w") as f:
+            for run in runs:
+                run = np.asarray(run, dtype=float)
+                f.write((" ".join(f"{t:.3f}" for t in run) if run.size else "*") + "\n")
+        paths.append(path)
+    return paths
+
+
 def write_afni_onset_files(
     onsets_list: list[torch.Tensor] | torch.Tensor,
     tr: float,
     output_dir: Path,
     prefix: str = "onsets",
 ) -> list[Path]:
+    """AFNI timing files from binary TR-grid onset matrices (one per run).
+
+    Converts each ``(n_timepoints, n_conditions)`` matrix to onset times and
+    writes ``{prefix}_condition{k}.txt`` through :func:`write_timing_files`.
     """
-    Write AFNI-compatible onset timing files
-
-    AFNI format: Space-separated onset times in seconds, one row per run
-    One file per condition: onsets_condition1.txt, onsets_condition2.txt, etc.
-
-    Parameters
-    ----------
-    onsets_list : list of torch.Tensor or torch.Tensor
-        Either:
-        - List of onset matrices (one per run): [(n_timepoints, n_conditions), ...]
-        - Single onset matrix: (n_timepoints, n_conditions)
-    tr : float
-        TR in seconds (to convert timepoints to seconds)
-    output_dir : Path
-        Directory to save onset files
-    prefix : str
-        Prefix for onset files (default: "onsets")
-
-    Returns
-    -------
-    onset_files : list of Path
-        Paths to created onset files
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Handle single onset matrix vs list
     if isinstance(onsets_list, torch.Tensor):
         onsets_list = [onsets_list]
-
-    # Convert to numpy
-    onsets_np_list = [o.cpu().numpy() if isinstance(o, torch.Tensor) else o for o in onsets_list]
-
-    n_runs = len(onsets_np_list)
-    n_conditions = onsets_np_list[0].shape[1] if onsets_np_list[0].ndim > 1 else 1
-
-    onset_files = []
-
-    # Write one file per condition
-    for cond_idx in range(n_conditions):
-        filename = output_dir / f"{prefix}_condition{cond_idx + 1}.txt"
-
-        with open(filename, "w") as f:
-            for run_idx, onsets in enumerate(onsets_np_list):
-                # Extract onsets for this condition (binary onset matrix)
-                if onsets.ndim > 1:
-                    onset_timepoints = np.where(onsets[:, cond_idx] > 0)[0]
-                else:
-                    onset_timepoints = np.where(onsets > 0)[0]
-
-                # Convert to seconds
-                onset_seconds = onset_timepoints * tr
-
-                # Write space-separated
-                if len(onset_seconds) > 0:
-                    onset_str = " ".join([f"{t:.2f}" for t in onset_seconds])
-                else:
-                    onset_str = "*"  # AFNI convention for no events
-
-                f.write(onset_str)
-                if run_idx < n_runs - 1:
-                    f.write("\n")
-
-        onset_files.append(filename)
-
-    return onset_files
+    mats = [np.asarray(o.cpu() if isinstance(o, torch.Tensor) else o) for o in onsets_list]
+    mats = [m[:, None] if m.ndim == 1 else m for m in mats]
+    n_cond = mats[0].shape[1]
+    per_cond = [[np.flatnonzero(m[:, k] > 0) * tr for m in mats] for k in range(n_cond)]
+    names = [f"condition{k + 1}" for k in range(n_cond)]
+    return write_timing_files(per_cond, names, output_dir, prefix=f"{prefix}_")
 
 
 def write_nifti_files(
