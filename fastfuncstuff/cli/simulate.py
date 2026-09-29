@@ -73,8 +73,9 @@ Examples
 
 Outputs: PREFIX_summary.txt, PREFIX_power.tsv, PREFIX_power.png,
 PREFIX_design.png, PREFIX_spec.json, PREFIX_events/ (timing files of the
-first realization, for a described experiment), and PREFIX_hrf.png when the
-true HRF differs from the fitted one.
+first realization, for a described experiment), PREFIX_voxels.png (an active
+and a silent voxel at each noise level, every condition at -effect or 1%),
+and PREFIX_hrf.png when the true HRF differs from the fitted one.
 
 COMPARE -- designs simulated separately, side by side:
     ffs_simulate -compare sim/cycle_power.tsv sim/jittered_power.tsv -prefix sim/cmp
@@ -771,6 +772,18 @@ def main(argv: list[str] | None = None) -> int:
             effective = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
             if effective:
                 plot_hrf_recovery(res, args.tr, effective[0], path=f"{prefix}_hrf.png")
+        from fastfuncstuff.simulation.plots import plot_example_voxels
+
+        truth = res["true_hrfs"][0] if res["true_hrfs"] != [res["hrf"]] else res["hrf"]
+        plot_example_voxels(
+            reals[0],
+            args.tr,
+            conds,
+            amplitude=args.effect if args.effect is not None else 1.0,
+            true_hrf=truth,
+            seed=args.seed,
+            path=f"{prefix}_voxels.png",
+        )
         plot_design(
             res,
             reals[0],

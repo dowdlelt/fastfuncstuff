@@ -428,3 +428,113 @@ def plot_hrf_recovery(
     fig.suptitle(title or "HRF mismatch: what the fitted HRF recovers", color=INK, fontsize=10)
     fig.tight_layout()
     return _finish(fig, path)
+
+
+def plot_example_voxels(
+    realization,
+    tr: float,
+    noise: list[dict[str, Any]],
+    amplitude: float = 1.0,
+    true_hrf: str = "spmg1",
+    run: int = 0,
+    seed: int = 0,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """What the data would look like: an active and a silent voxel at each noise level.
+
+    One row per noise level (``noise`` as for the power engine, with labels).
+    Each row shows, in percent signal change over one run: a voxel responding
+    to every condition equally at ``amplitude`` (the level's colour), a voxel
+    that does not respond at all (grey), and the noiseless response (ink).
+    Event onsets are marked along the top in condition colours. A picture of
+    what a tSNR level means before any statistics.
+    """
+    import matplotlib.pyplot as plt
+    import torch
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+    from .noise import generate_thermal_physio_noise
+
+    real = realization
+    cpu = torch.device("cpu")
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(true_hrf, dt, cpu)[0][1]
+    X = build_task_design(
+        real.onsets, real.durations, tr, real.run_lengths, bases, dt, device=cpu
+    ).numpy()
+    start = int(sum(real.run_lengths[:run]))
+    n_t = real.run_lengths[run]
+    t = np.arange(n_t) * tr
+    signal = amplitude * X[start : start + n_t].sum(axis=1)  # PSC, every condition equal
+
+    gen = torch.Generator().manual_seed(seed)
+    colors = ramp(len(noise))
+    fig, axes = plt.subplots(
+        len(noise), 1, figsize=(13, 1.9 * len(noise) + 0.9), sharex=True, squeeze=False
+    )
+    fig.patch.set_facecolor(SURFACE)
+    lo = hi = 0.0
+    for ax, cond, col in zip(axes[:, 0], noise, colors, strict=True):
+        _style(ax)
+        kw = {k: v for k, v in cond.items() if k != "label"}
+        # Two voxels, same noise statistics: column 0 responds, column 1 does not.
+        n = generate_thermal_physio_noise(
+            n_t, tr, baseline=100.0, n_voxels=2, device=cpu, generator=gen, **kw
+        ).numpy()  # already in PSC
+        ax.plot(t, n[:, 1], color="#a9a8a2", linewidth=1, label="silent voxel")
+        ax.plot(t, signal + n[:, 0], color=col, linewidth=1.3, label="active voxel")
+        ax.plot(t, signal, color=INK, linewidth=1.6, label="true response")
+        lo, hi = (
+            min(lo, n.min(), (signal + n[:, 0]).min()),
+            max(hi, n.max(), (signal + n[:, 0]).max()),
+        )
+        sd = 100.0 / float(kw["tsnr"])
+        ax.set_ylabel("% signal", color=INK2, fontsize=9)
+        ax.set_title(
+            f"{cond.get('label', '')}  (noise SD {sd:.2g}%)",
+            loc="left",
+            fontsize=9,
+            color=INK,
+            pad=3,
+        )
+    pad = 0.08 * (hi - lo)
+    for ax in axes[:, 0]:
+        ax.set_ylim(lo - pad, hi + 3 * pad)
+        for i, cond_name in enumerate(real.conditions):
+            for on in real.onsets[i][run]:
+                ax.plot(
+                    [on, on],
+                    [hi + 1.6 * pad, hi + 2.6 * pad],
+                    color=CATEGORICAL[i % len(CATEGORICAL)],
+                    linewidth=1.5,
+                    label=cond_name if on == real.onsets[i][run][0] else None,
+                )
+    axes[-1, 0].set_xlabel("time (s)", color=INK2, fontsize=9)
+    axes[-1, 0].set_xlim(0, t[-1])
+    from matplotlib.lines import Line2D
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    # The first row's active trace wears the lightest ramp step; the legend
+    # stands for every row, so it gets a mid step and says what colour means.
+    k = labels.index("active voxel")
+    handles[k] = Line2D([], [], color=BLUES[3], linewidth=1.3)
+    labels[k] = "active voxel (colour = noise level)"
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=8,
+        labelcolor=INK2,
+        loc="lower center",
+        ncol=min(len(labels), 8),
+    )
+    fig.suptitle(
+        title
+        or f"Example voxels, run {run + 1}: every condition at {amplitude:g}% "
+        f"({true_hrf} response); same y-scale in every row",
+        color=INK,
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    return _finish(fig, path)

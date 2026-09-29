@@ -9,7 +9,12 @@ matplotlib.use("Agg")
 import torch
 
 from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
-from fastfuncstuff.simulation.plots import plot_design, plot_design_comparison, plot_power
+from fastfuncstuff.simulation.plots import (
+    plot_design,
+    plot_design_comparison,
+    plot_example_voxels,
+    plot_power,
+)
 from fastfuncstuff.simulation.power import simulate_realizations_power
 
 
@@ -41,5 +46,8 @@ def test_figures_render(tmp_path):
     plot_power(res, labels, contrasts, [1, 0], effect=1.0, path=tmp_path / "p.png")
     plot_design(res, reals[0], 2, path=tmp_path / "d.png")
     plot_design_comparison({"x": res, "y": res}, "A", labels, path=tmp_path / "c.png")
-    for name in ("p.png", "d.png", "c.png"):
+    plot_example_voxels(reals[0], 2, noise, amplitude=1.0, path=tmp_path / "v.png")
+    arma = [{"label": "measured", "tsnr": 60.0, "arma": (0.0, 0.4)}]
+    plot_example_voxels(reals[0], 2, arma, path=tmp_path / "v2.png")
+    for name in ("p.png", "d.png", "c.png", "v.png", "v2.png"):
         assert (tmp_path / name).stat().st_size > 10_000
