@@ -65,8 +65,16 @@ Examples
         -contrast A-B -prefix sim/mb
 
 Outputs: PREFIX_summary.txt, PREFIX_power.tsv, PREFIX_power.png,
-PREFIX_design.png, PREFIX_spec.json, and PREFIX_events/ (timing files of the
-first realization, for a described experiment).
+PREFIX_design.png, PREFIX_spec.json, PREFIX_events/ (timing files of the
+first realization, for a described experiment), and PREFIX_hrf.png when the
+true HRF differs from the fitted one.
+
+COMPARE -- designs simulated separately, side by side:
+    ffs_simulate -compare sim/cycle_power.tsv sim/jittered_power.tsv -prefix sim/cmp
+Each file is one design, summarised over its realizations (median and range
+of the amplitude needed for -target power). Designs should share the noise
+levels and contrasts, and a scan time -- a longer scan wins by having more
+data, so differing scan times are flagged.
 """
 
 from __future__ import annotations
@@ -90,7 +98,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="ffs_simulate", description=__doc__, formatter_class=FfsHelpFormatter
     )
     t = p.add_argument_group("Timing")
-    t.add_argument("-tr", type=float, required=True, help="Repetition time (s).")
+    t.add_argument("-tr", type=float, help="Repetition time (s); required unless -compare.")
     t.add_argument(
         "-events", nargs="+", metavar="FILE", help="AFNI timing files, one per condition."
     )
@@ -229,6 +237,23 @@ def _build_parser() -> argparse.ArgumentParser:
     add_device_arg(a)
     p.add_argument("-prefix", required=True, help="Output prefix (a directory is created).")
     p.add_argument("-no_plots", action="store_true", help="Skip the PNG figures.")
+
+    c = p.add_argument_group("Compare")
+    c.add_argument(
+        "-compare",
+        nargs="+",
+        metavar="TSV",
+        help="Compare earlier runs instead of simulating: their PREFIX_power.tsv files, one "
+        "design each, summarised over that design's realizations. Writes "
+        "PREFIX_compare.txt and one PREFIX_compare_<contrast>.png per shared contrast.",
+    )
+    c.add_argument(
+        "-compare_names",
+        nargs="+",
+        metavar="NAME",
+        help="Names for the -compare designs (default: the file prefixes).",
+    )
+    c.add_argument("-target", type=float, default=0.8, help="Power to reach (default 0.8).")
     return p
 
 
@@ -478,8 +503,94 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
     return "\n".join(out)
 
 
+def _run_compare(args) -> int:
+    from fastfuncstuff.simulation.power import compare_designs, load_power_table
+
+    try:
+        loaded = [load_power_table(f) for f in args.compare]
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    names = args.compare_names or [r["name"] for r in loaded]
+    if len(names) != len(loaded) or len(set(names)) != len(names):
+        print("ERROR: -compare_names needs one distinct name per file", file=sys.stderr)
+        return 1
+    results = dict(zip(names, loaded, strict=True))
+    rows = compare_designs(results, args.target)
+    if not rows:
+        print("ERROR: the files share no noise level and contrast", file=sys.stderr)
+        return 1
+
+    out = ["ffs_simulate -compare", "=" * 72]
+    scans = {n: r["scan_s"] for n, r in ((r["design"], r) for r in rows)}
+    for n in names:
+        s = scans[n]
+        out.append(
+            f"  {n:<28} {'scan time unknown (no _spec.json)' if s is None else f'{s:.0f} s total'}"
+        )
+    known = [s for s in scans.values() if s is not None]
+    if known and (max(known) - min(known)) > 0.02 * max(known):
+        out.append(
+            "WARNING: scan times differ -- the longer design wins partly by having more data"
+        )
+    contrasts = list(dict.fromkeys(r["contrast"] for r in rows))
+    noises = list(dict.fromkeys(r["noise"] for r in rows))
+    for c in contrasts:
+        out += [
+            "",
+            f"{c}: amplitude (% signal change) for {args.target:.0%} power -- "
+            "median [range] over realizations",
+        ]
+        out.append(f"{'design':<28}" + "".join(f"{n:>22}" for n in noises))
+        for n in names:
+            cells = []
+            for noise in noises:
+                r = next(
+                    x
+                    for x in rows
+                    if x["design"] == n and x["contrast"] == c and x["noise"] == noise
+                )
+                if not r["has_effect"]:
+                    text = "no true effect"
+                elif np.isnan(r["median"]):
+                    text = "not reached"
+                else:
+                    text = f"{r['median']:.2f} [{r['min']:.2f}-{r['max']:.2f}]"
+                    if r["n_unreached"]:
+                        text += f" +{r['n_unreached']}"
+                cells.append(f"{text:>22}")
+            out.append(f"{n:<28}" + "".join(cells))
+    out.append("  +k: k realizations never reach the target within their sweep")
+    text = "\n".join(out)
+    print(text)
+    prefix = Path(args.prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    Path(f"{prefix}_compare.txt").write_text(text + "\n")
+    if not args.no_plots:
+        import re
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from fastfuncstuff.simulation.plots import plot_design_comparison
+
+        for c in contrasts:
+            if not any(r["has_effect"] for r in rows if r["contrast"] == c):
+                continue
+            safe = re.sub(r"[^\w.+-]", "_", c)
+            plot_design_comparison(
+                results, c, noises, args.target, path=f"{prefix}_compare_{safe}.png"
+            )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.compare:
+        return _run_compare(args)
+    if args.tr is None:
+        print("ERROR: -tr is required (unless -compare)", file=sys.stderr)
+        return 1
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.simulation.experiment import default_contrasts, parse_contrast, realize
     from fastfuncstuff.simulation.power import simulate_realizations_power
@@ -577,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
                 "noise": conds,
                 "seeds": [r.seed for r in reals],
                 "run_lengths": [r.run_lengths for r in reals],
+                "tr": args.tr,
+                "scan_time": args.scan_time,
                 "polort": res["designs"][0]["poly_degree"],
                 "hrf": res["hrf"],
                 "true_hrfs": res["true_hrfs"],
@@ -601,6 +714,12 @@ def main(argv: list[str] | None = None) -> int:
             plot_power(
                 res, labels, contrasts, pattern, args.alpha, args.effect, path=f"{prefix}_power.png"
             )
+        if res["true_hrfs"] != [res["hrf"]]:
+            from fastfuncstuff.simulation.plots import plot_hrf_recovery
+
+            effective = [c for c, w in contrasts.items() if abs(w @ np.asarray(pattern)) > 0]
+            if effective:
+                plot_hrf_recovery(res, args.tr, effective[0], path=f"{prefix}_hrf.png")
         plot_design(
             res,
             reals[0],

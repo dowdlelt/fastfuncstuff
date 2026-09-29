@@ -135,3 +135,44 @@ def test_analytic_power_accounts_for_hrf_mismatch():
         assert r["expected_est"] < 0.85 * r["true_effect"]
         assert r["mean_est"] == pytest.approx(r["expected_est"], abs=0.03)
         assert r["power"] == pytest.approx(r["power_predicted"], abs=0.04)
+
+
+def test_power_table_round_trips_through_tsv(tmp_path):
+    from fastfuncstuff.cli.simulate import main
+    from fastfuncstuff.simulation.power import compare_designs, load_power_table, scan_seconds
+
+    assert (
+        main(
+            [
+                "-tr",
+                "2",
+                "-trial",
+                "A",
+                "2",
+                "8",
+                "-isi",
+                "4",
+                "-tsnr",
+                "50",
+                "-amplitudes",
+                "1",
+                "3",
+                "-ndesigns",
+                "2",
+                "-nreps",
+                "20",
+                "-device",
+                "cpu",
+                "-no_plots",
+                "-prefix",
+                str(tmp_path / "x"),
+            ]
+        )
+        == 0
+    )
+    res = load_power_table(tmp_path / "x_power.tsv")
+    assert res["name"] == "x" and isinstance(res["table"][0]["power"], float)
+    assert {r["design"] for r in res["table"]} == {0, 1}
+    assert scan_seconds(res) is not None
+    rows = compare_designs({"x": res})
+    assert {r["contrast"] for r in rows} == {"A"} and rows[0]["n_realizations"] == 2

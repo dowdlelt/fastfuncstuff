@@ -258,3 +258,110 @@ def test_bad_hrf_spec_fails_early(tmp_path, capsys):
         == 1
     )
     assert "0-19" in capsys.readouterr().err
+
+
+def _sim(prefix, *extra):
+    base = [
+        "-tr",
+        "2",
+        "-trial",
+        "A",
+        "2",
+        "1",
+        "-trial",
+        "B",
+        "2",
+        "1",
+        "-isi",
+        "exp:4,2,10",
+        "-pattern",
+        "A=1",
+        "B=0",
+        "-tsnr",
+        "40",
+        "90",
+        "-amplitudes",
+        "0.5",
+        "1",
+        "2",
+        "4",
+        "-nreps",
+        "40",
+        "-device",
+        "cpu",
+        "-prefix",
+        str(prefix),
+    ]
+    assert main(base + list(extra)) == 0
+
+
+def test_compare_summarises_each_design_over_its_realizations(tmp_path, capsys):
+    _sim(tmp_path / "a", "-scan_time", "200", "-ndesigns", "3", "-no_plots")
+    _sim(tmp_path / "b", "-scan_time", "200", "-ndesigns", "2", "-no_plots")
+    _sim(tmp_path / "c", "-scan_time", "300", "-ndesigns", "1", "-no_plots")
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "-compare",
+                str(tmp_path / "a_power.tsv"),
+                str(tmp_path / "b_power.tsv"),
+                "-compare_names",
+                "first",
+                "second",
+                "-prefix",
+                str(tmp_path / "cmp"),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "first" in out and "second" in out and "WARNING" not in out
+    assert (tmp_path / "cmp_compare.txt").exists()
+    assert (tmp_path / "cmp_compare_A.png").exists()
+    assert not (tmp_path / "cmp_compare_B.png").exists()  # B has no true effect
+    # a longer scan is flagged
+    assert (
+        main(
+            [
+                "-compare",
+                str(tmp_path / "a_power.tsv"),
+                str(tmp_path / "c_power.tsv"),
+                "-no_plots",
+                "-prefix",
+                str(tmp_path / "cmp2"),
+            ]
+        )
+        == 0
+    )
+    assert "scan times differ" in capsys.readouterr().out
+
+
+def test_compare_needs_matching_names(tmp_path, capsys):
+    _sim(tmp_path / "a", "-ndesigns", "1", "-no_plots")
+    assert (
+        main(
+            [
+                "-compare",
+                str(tmp_path / "a_power.tsv"),
+                "-compare_names",
+                "x",
+                "y",
+                "-prefix",
+                str(tmp_path / "cmp"),
+            ]
+        )
+        == 1
+    )
+
+
+def test_hrf_figure_written_only_under_mismatch(tmp_path):
+    _sim(tmp_path / "same", "-ndesigns", "1")
+    assert not (tmp_path / "same_hrf.png").exists()
+    _sim(tmp_path / "lib", "-ndesigns", "1", "-true_hrf", "lib:3")
+    assert (tmp_path / "lib_hrf.png").stat().st_size > 10_000
+
+
+def test_tr_required_when_simulating(tmp_path, capsys):
+    assert main(["-trial", "A", "2", "5", "-prefix", str(tmp_path / "x")]) == 1
+    assert "-tr is required" in capsys.readouterr().err

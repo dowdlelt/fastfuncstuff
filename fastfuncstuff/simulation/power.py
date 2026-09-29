@@ -23,6 +23,7 @@ answer to "does autocorrelation matter for this design".
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -383,3 +384,103 @@ def simulate_realizations_power(
         "hrf": fit_label,
         "true_hrfs": [t for t, _ in truths],
     }
+
+
+_NUMERIC = {
+    "design",
+    "tsnr",
+    "amplitude",
+    "true_effect",
+    "mean_est",
+    "expected_est",
+    "sd_est",
+    "sd_predicted",
+    "mean_t",
+    "power",
+    "power_predicted",
+    "mean_t_naive",
+    "power_naive",
+}
+
+
+def load_power_table(path: str | Path) -> dict[str, Any]:
+    """Read an ffs_simulate ``_power.tsv`` back into the result form the figures take.
+
+    Also picks up the sibling ``_spec.json`` when present (for scan time and
+    the contrasts' weights), under ``"spec"``.
+    """
+    import csv
+    import json
+
+    path = Path(path)
+    with open(path, newline="") as f:
+        rows = []
+        for raw in csv.DictReader(f, delimiter="\t"):
+            row: dict[str, Any] = dict(raw)
+            for key in _NUMERIC & row.keys():
+                row[key] = int(row[key]) if key == "design" else float(row[key])
+            row.setdefault("true_hrf", "")
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"{path}: no rows")
+    stem = path.name.removesuffix(".tsv").removesuffix("_power")
+    spec_path = path.with_name(f"{stem}_spec.json")
+    spec = json.loads(spec_path.read_text()) if spec_path.exists() else None
+    return {"table": rows, "spec": spec, "name": stem}
+
+
+def scan_seconds(result: dict[str, Any]) -> float | None:
+    """Total scan time per realization, from the spec, or None if it was not recorded."""
+    spec = result.get("spec") or {}
+    if spec.get("tr") is None or not spec.get("run_lengths"):
+        return None
+    return float(np.mean([sum(r) for r in spec["run_lengths"]])) * float(spec["tr"])
+
+
+def compare_designs(
+    results: dict[str, dict[str, Any]], target: float = 0.8
+) -> list[dict[str, Any]]:
+    """Amplitude each design needs for ``target`` power, summarised over its realizations.
+
+    One row per design x noise level x contrast shared by every design:
+    median, min and max over realizations (and true HRFs), and how many of
+    them never reach ``target`` within the swept amplitudes.
+    """
+    names = list(results)
+    shared_noise = [
+        n
+        for n in dict.fromkeys(r["noise"] for r in results[names[0]]["table"])
+        if all(any(r["noise"] == n for r in res["table"]) for res in results.values())
+    ]
+    shared_con = [
+        c
+        for c in dict.fromkeys(r["contrast"] for r in results[names[0]]["table"])
+        if all(any(r["contrast"] == c for r in res["table"]) for res in results.values())
+    ]
+    out = []
+    for name in names:
+        rows = results[name]["table"]
+        keys = sorted({(r["design"], r.get("true_hrf", "")) for r in rows})
+        need = {}
+        for d, th in keys:
+            sub = {"table": [r for r in rows if r["design"] == d and r.get("true_hrf", "") == th]}
+            need[(d, th)] = amplitude_for_power(sub, target)
+        for noise in shared_noise:
+            for c in shared_con:
+                v = np.array([need[k].get((noise, c), np.nan) for k in keys], dtype=float)
+                eff = max(abs(r["true_effect"]) for r in rows if r["contrast"] == c)
+                out.append(
+                    {
+                        "design": name,
+                        "noise": noise,
+                        "contrast": c,
+                        "n_realizations": len(keys),
+                        "has_effect": eff > 0,
+                        "median": float(np.nanmedian(v)) if np.isfinite(v).any() else np.nan,
+                        "min": float(np.nanmin(v)) if np.isfinite(v).any() else np.nan,
+                        "max": float(np.nanmax(v)) if np.isfinite(v).any() else np.nan,
+                        "n_unreached": int(np.isnan(v).sum()),
+                        "scan_s": scan_seconds(results[name]),
+                    }
+                )
+    return out

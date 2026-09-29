@@ -303,3 +303,113 @@ def plot_design_comparison(
     )
     fig.tight_layout()
     return _finish(fig, path)
+
+
+def plot_hrf_recovery(
+    result: dict[str, Any],
+    tr: float,
+    contrast: str | None = None,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """What an HRF mismatch costs: the true shapes, and the amplitude the fit recovers.
+
+    Left: each true HRF (ordered by peak time, sequential ramp) against the
+    fitted one (ink, dashed). Right: recovered fraction of the true amplitude,
+    E[estimate] / truth, per true HRF, on the same colours -- 1.0 is unbiased.
+    It is a property of the design and the two shapes, not of the noise.
+    """
+    import matplotlib.pyplot as plt
+    import torch
+
+    from .core import default_microtime_dt, hrfs_from_spec
+
+    rows = [r for r in result["table"] if abs(r["true_effect"]) > 0]
+    if contrast is None:
+        contrast = rows[0]["contrast"]
+    rows = [r for r in rows if r["contrast"] == contrast]
+    top = max(r["amplitude"] for r in rows)
+    truths = list(dict.fromkeys(r["true_hrf"] for r in rows))
+    frac = {
+        th: float(
+            np.mean(
+                [
+                    r["expected_est"] / r["true_effect"]
+                    for r in rows
+                    if r["true_hrf"] == th and r["amplitude"] == top
+                ]
+            )
+        )
+        for th in truths
+    }
+    dt = default_microtime_dt(tr)
+    cpu = torch.device("cpu")
+    shapes = {th: hrfs_from_spec(th, dt, cpu)[0][1].ravel().numpy() for th in truths}
+    fit = hrfs_from_spec(result.get("hrf", "spmg1"), dt, cpu)[0][1].ravel().numpy()
+    peak = {th: float(np.argmax(h)) * dt for th, h in shapes.items()}
+    order = sorted(truths, key=lambda th: peak[th])
+    colors = dict(zip(order, ramp(len(order)), strict=True))
+
+    fig, (ax_h, ax_r) = plt.subplots(1, 2, figsize=(12, 4.3), width_ratios=[1.1, 1])
+    fig.patch.set_facecolor(SURFACE)
+    for ax in (ax_h, ax_r):
+        _style(ax)
+    for th in order:
+        h = shapes[th] / np.abs(shapes[th]).max()
+        t = np.arange(h.size) * dt
+        ax_h.plot(t, h, color=colors[th], linewidth=1)
+        # Mark each peak: twenty unit-peak curves peaking 2.7-5.7 s apart overlap
+        # at 1.0 into what reads as one flat-topped response.
+        ax_h.plot(
+            peak[th],
+            1.0,
+            "o",
+            color=colors[th],
+            markersize=4.5,
+            markeredgecolor=SURFACE,
+            markeredgewidth=0.8,
+            zorder=3,
+        )
+    t = np.arange(fit.size) * dt
+    ax_h.plot(
+        t,
+        fit / np.abs(fit).max(),
+        color=INK,
+        linewidth=2,
+        linestyle=(0, (5, 3)),
+        label=f"fitted ({result.get('hrf', 'spmg1')})",
+    )
+    ax_h.axhline(0, color=INK2, linewidth=0.8)
+    ax_h.set_xlim(0, 25)
+    ax_h.set_xlabel("time (s)", color=INK2, fontsize=9)
+    ax_h.set_ylabel("response (unit peak)", color=INK2, fontsize=9)
+    ax_h.set_title("True HRFs (dot = peak), light = earliest", color=INK, fontsize=10, loc="left")
+    ax_h.legend(frameon=False, fontsize=8, labelcolor=INK2)
+
+    x = np.arange(len(order))
+    ax_r.axhline(1.0, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
+    ax_r.vlines(x, 0, [frac[th] for th in order], colors=[colors[th] for th in order], linewidth=2)
+    ax_r.scatter(
+        x,
+        [frac[th] for th in order],
+        c=[colors[th] for th in order],
+        s=40,
+        edgecolors=SURFACE,
+        linewidths=1,
+        zorder=3,
+    )
+    ax_r.set_xticks(x, [f"{peak[th]:.1f}" for th in order], fontsize=8)
+    ax_r.set_xlabel("true HRF peak (s)", color=INK2, fontsize=9)
+    ax_r.set_ylabel("recovered fraction of the amplitude", color=INK2, fontsize=9)
+    ax_r.set_ylim(0, max(1.15, max(frac.values()) * 1.08))
+    worst = min(frac, key=frac.get)
+    ax_r.set_title(
+        f"{contrast}: median {np.median(list(frac.values())):.2f}, "
+        f"worst {frac[worst]:.2f} ({worst})",
+        color=INK,
+        fontsize=10,
+        loc="left",
+    )
+    fig.suptitle(title or "HRF mismatch: what the fitted HRF recovers", color=INK, fontsize=10)
+    fig.tight_layout()
+    return _finish(fig, path)
