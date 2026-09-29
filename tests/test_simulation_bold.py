@@ -220,3 +220,37 @@ class TestContrastVarianceMatchesMonteCarlo:
         d = torch.rand(100, 1).repeat(1, 2)
         v = design_contrast_variance(d, torch.tensor([[1.0, 0.0], [1.0, 1.0]]))
         assert np.isinf(v[0].item()) and np.isfinite(v[1].item())
+
+
+class TestDirectArma:
+    def test_acf_round_trip(self):
+        from fastfuncstuff.simulation.noise import arma11_from_acf
+
+        for a, b in [(0.7, -0.3), (0.5, 0.2), (0.0, 0.4), (0.9, -0.6)]:
+            lam = compute_arma_lambda(a, b)
+            fa, fb = arma11_from_acf(lam, lam * a)
+            assert float(fa) == pytest.approx(a, abs=1e-6)
+            assert float(fb) == pytest.approx(b, abs=1e-6)
+
+    def test_arma_noise_has_the_requested_level_and_correlation(self):
+        g = torch.Generator().manual_seed(9)
+        a, b = 0.0, 0.4
+        n = generate_thermal_physio_noise(
+            4000, 2.0, 50.0, n_voxels=200, device=CPU, generator=g, arma=(a, b)
+        )
+        assert n.std(0).mean().item() == pytest.approx(2.0, rel=0.03)
+        assert _acf(n, [1, 2]) == pytest.approx([compute_arma_lambda(a, b), 0.0], abs=0.02)
+
+    def test_simulate_bold_reports_the_arma_it_used(self):
+        sim = simulate_bold(
+            [[np.array([10.0])]],
+            [0.0],
+            2.0,
+            50,
+            [1.0],
+            tsnr=50.0,
+            n_voxels=3,
+            device=CPU,
+            arma=(0.3, 0.2),
+        )
+        assert torch.allclose(sim["arma_a"], torch.full((3,), 0.3, dtype=torch.float64))

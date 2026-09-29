@@ -649,6 +649,7 @@ def simulate_bold(
     drift_amplitude: float = 0.0,
     device: torch.device | None = None,
     generator: torch.Generator | None = None,
+    arma: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Simulate BOLD timeseries from events in seconds, at any TR, with a known noise model.
 
@@ -677,6 +678,9 @@ def simulate_bold(
         land within 25 ms of where they were asked for.
     drift_amplitude : float
         Drift std as a fraction of each voxel's noise std (0 = none).
+    arma : (a, b), optional
+        Generate AFNI-form ARMA(1,1) noise directly instead of white + OU; valid
+        only at the TR it was measured at (see generate_thermal_physio_noise).
 
     Returns
     -------
@@ -746,6 +750,7 @@ def simulate_bold(
             n_voxels=n_voxels,
             device=device,
             generator=generator,
+            arma=arma,
         )
         if drift_amplitude > 0:
             run_noise = add_drift(
@@ -755,7 +760,11 @@ def simulate_bold(
     noise = torch.cat(noise_runs, dim=0).T
 
     run_starts = np.concatenate([[0], np.cumsum(n_timepoints_per_run)[:-1]]).astype(int)
-    a, b = ou_to_arma11(tr, torch.as_tensor(tau).expand(n_voxels), phys_fraction)
+    if arma is not None:
+        a = torch.full((n_voxels,), float(arma[0]), dtype=torch.float64)
+        b = torch.full((n_voxels,), float(arma[1]), dtype=torch.float64)
+    else:
+        a, b = ou_to_arma11(tr, torch.as_tensor(tau).expand(n_voxels), phys_fraction)
     return {
         "data": baseline + signal + noise,
         "signal": signal,

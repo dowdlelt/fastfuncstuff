@@ -1113,6 +1113,41 @@ def _per_voxel(value: float | torch.Tensor | np.ndarray, n_voxels: int, device, 
     return t
 
 
+def _ma_from_lambda(a: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+    """The invertible MA term b giving lag-1 correlation ``lam`` at AR term ``a``.
+
+    lam = (a + b)(1 + a b) / (1 + 2 a b + b^2) is a quadratic in b,
+    (lam - a) b^2 + (2 a lam - 1 - a^2) b + (lam - a) = 0, whose roots are b and
+    1/b; the one with |b| <= 1 is returned.
+    """
+    qa = lam - a
+    qb = 2 * a * lam - 1 - a**2
+    disc = (qb**2 - 4 * qa**2).clamp_min(0.0)
+    tiny = qa.abs() < 1e-12
+    safe_qa = torch.where(tiny, torch.full_like(qa, -1e-12), qa)
+    b = torch.where(tiny, torch.zeros_like(qa), (-qb - torch.sqrt(disc)) / (2 * safe_qa))
+    return torch.where(b.abs() > 1, 1 / b, b)
+
+
+def arma11_from_acf(
+    r1: float | torch.Tensor, r2: float | torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AFNI ARMA(1,1) (a, b) matching lag-1 and lag-2 autocorrelations.
+
+    In AFNI's form r(k) = lambda * a**(k-1), so a = r2 / r1 and lambda = r1.
+    Used to summarise a group of voxels by its typical autocorrelation, which
+    stays meaningful when the group mixes fits that the (a, b) grid places far
+    apart -- AFNI folds near-white voxels onto a = b = 0, making a median of a
+    itself a poor summary.
+    """
+    r1_t = torch.as_tensor(r1, dtype=torch.float64)
+    r2_t = torch.as_tensor(r2, dtype=torch.float64)
+    a = torch.where(
+        r1_t > 1e-9, (r2_t / r1_t.clamp_min(1e-9)).clamp(0.0, 0.99), torch.zeros_like(r1_t)
+    )
+    return a, _ma_from_lambda(a, r1_t)
+
+
 def ou_to_arma11(
     tr: float,
     tau: float | torch.Tensor | np.ndarray,
@@ -1137,17 +1172,7 @@ def ou_to_arma11(
     tau_t = torch.as_tensor(tau, dtype=torch.float64)
     f = torch.as_tensor(phys_fraction, dtype=torch.float64)
     a = torch.exp(-tr / tau_t)
-    lam = f * a
-    # (lam - a) b^2 + (2 a lam - 1 - a^2) b + (lam - a) = 0
-    qa = lam - a
-    qb = 2 * a * lam - 1 - a**2
-    disc = (qb**2 - 4 * qa**2).clamp_min(0.0)
-    safe_qa = torch.where(qa.abs() < 1e-12, torch.full_like(qa, -1e-12), qa)
-    b = torch.where(
-        qa.abs() < 1e-12, torch.zeros_like(qa), (-qb - torch.sqrt(disc)) / (2 * safe_qa)
-    )
-    # Of the pair (b, 1/b) keep the invertible one.
-    b = torch.where(b.abs() > 1, 1 / b, b)
+    b = _ma_from_lambda(a, f * a)
     return a, b
 
 
@@ -1198,6 +1223,7 @@ def generate_thermal_physio_noise(
     n_voxels: int | None = None,
     device: torch.device | None = None,
     generator: torch.Generator | None = None,
+    arma: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Thermal (white) plus physiological (tau-second exponential) noise, at a given tSNR.
 
@@ -1207,6 +1233,11 @@ def generate_thermal_physio_noise(
     a = exp(-tr / tau) (see :func:`ou_to_arma11`), so the autocorrelation widens
     in samples as TR shortens while the white share -- most of the noise at low
     tSNR -- stays white. Each parameter may be a scalar or one value per voxel.
+
+    ``arma=(a, b)`` instead generates AFNI-form ARMA(1,1) directly, ignoring
+    phys_fraction and tau. That is for correlation measured at *this* TR which
+    white + OU cannot produce (b > 0, e.g. lag-1-only correlation); unlike tau
+    it does not transfer to another TR.
 
     Returns (n_timepoints, n_voxels), zero-mean, float32. Drift is not included;
     add it with :func:`add_drift`. Generate each run separately: runs are
@@ -1232,6 +1263,16 @@ def generate_thermal_physio_noise(
         raise ValueError("tau must be positive (seconds)")
 
     sigma = baseline / tsnr_v
+    if arma is not None:
+        a_, b_ = float(arma[0]), float(arma[1])
+        if abs(a_) >= 1 or abs(b_) >= 1:
+            raise ValueError(f"arma (a, b) must lie inside the unit square, got {arma}")
+        raw = generate_arma_noise(
+            [a_], [b_], n_timepoints, n_voxels, normalize=False, device=device, generator=generator
+        ).reshape(n_timepoints, n_voxels)
+        # Analytic unit variance, so each voxel keeps its own sampling variability.
+        gamma0 = (1 + 2 * a_ * b_ + b_**2) / (1 - a_**2)
+        return (raw.double() / np.sqrt(gamma0) * sigma).to(torch.float32)
     sigma_white = sigma * torch.sqrt(1.0 - f_v)
     sigma_phys = sigma * torch.sqrt(f_v)
     phi = torch.exp(-tr / tau_v)
