@@ -60,6 +60,7 @@ def generate_event_sequence(
     ordering: Literal["random", "alternating", "blocked", "permuted_block"] = "random",
     block_size: int | None = None,
     seed: int | None = None,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Generate event sequence specifying which condition occurs at each trial.
@@ -75,13 +76,17 @@ def generate_event_sequence(
             - 'blocked': Blocked design (AAAA-BBBB-AAAA...)
             - 'permuted_block': Randomized mini-blocks for balanced randomization
         block_size: Size of mini-blocks (for 'permuted_block' or 'blocked')
-        seed: Random seed
+        seed: Random seed (reseeds numpy's global RNG; prefer ``rng``)
+        rng: Generator to draw from without touching global state, so several
+            design realizations can be made independently and reproducibly
 
     Returns:
         event_sequence: Array of condition indices [0, 1, 0, 2, 1, ...]
     """
-    if seed is not None:
-        np.random.seed(seed)
+    if rng is None:
+        if seed is not None:
+            np.random.seed(seed)
+        rng = np.random.default_rng(np.random.randint(0, 2**31))
 
     # Handle n_trials specification
     if isinstance(n_trials_per_condition, int):
@@ -101,7 +106,7 @@ def generate_event_sequence(
         event_sequence = []
         for cond_idx in range(n_conditions):
             event_sequence.extend([cond_idx] * n_trials[cond_idx])
-        np.random.shuffle(event_sequence)
+        rng.shuffle(event_sequence)
         return np.array(event_sequence)
 
     elif ordering == "alternating":
@@ -155,7 +160,7 @@ def generate_event_sequence(
                     trials_remaining[cond_idx] -= n_in_block
 
             # Shuffle mini-block
-            np.random.shuffle(mini_block)
+            rng.shuffle(mini_block)
             event_sequence.extend(mini_block)
 
         return np.array(event_sequence)
@@ -171,6 +176,7 @@ def generate_isi_sequence(
         "poisson", "exponential", "uniform", "fixed", "truncated_exponential", "poisson_target_mean"
     ] = "exponential",
     seed: int | None = None,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Generate ISI sequence (inter-stimulus intervals between consecutive events).
@@ -187,7 +193,8 @@ def generate_isi_sequence(
             - 'poisson_target_mean': Poisson with a tighter (0.1%) mean-matching tolerance
             - 'uniform': Uniform random intervals
             - 'fixed': Fixed ISI (constant)
-        seed: Random seed for reproducibility
+        seed: Random seed for reproducibility (reseeds numpy's global RNG)
+        rng: Generator to draw from instead, leaving global state alone
 
     Returns:
         isis: Array of ISIs in seconds (length = n_events - 1)
@@ -203,8 +210,10 @@ def generate_isi_sequence(
         - 'uniform' and 'fixed' are not mean-adjusted; 'uniform' has mean
           (min_isi + max_isi) / 2 regardless of mean_isi.
     """
-    if seed is not None:
-        np.random.seed(seed)
+    if rng is None:
+        if seed is not None:
+            np.random.seed(seed)
+        rng = np.random.default_rng(np.random.randint(0, 2**31))
 
     min_isi = isi_constraints.min_isi
     max_isi = isi_constraints.max_isi
@@ -221,7 +230,7 @@ def generate_isi_sequence(
     if distribution == "exponential":
         # Exponential with rate λ = 1/mean
         scale = target_mean
-        isis = expon.rvs(scale=scale, size=n_isis * 2)  # Oversample for clipping
+        isis = expon.rvs(scale=scale, size=n_isis * 2, random_state=rng)  # Oversample for clipping
 
     elif distribution == "truncated_exponential":
         # Truncated exponential: properly bounded exponential distribution
@@ -240,7 +249,7 @@ def generate_isi_sequence(
         b_param = max(b_param, 2.0)  # Ensure reasonable truncation
 
         # Generate from truncated exponential
-        isis_standardized = truncexpon.rvs(b=b_param, scale=1.0, size=n_isis * 2)
+        isis_standardized = truncexpon.rvs(b=b_param, scale=1.0, size=n_isis * 2, random_state=rng)
         # Transform to [min_isi, max_isi]
         isis = min_isi + isis_standardized * scale_guess
         isis = np.clip(isis, min_isi, max_isi)  # Ensure bounds
@@ -248,7 +257,7 @@ def generate_isi_sequence(
     elif distribution == "poisson":
         # Poisson ISIs (discrete count → continuous time)
         lam = target_mean / isi_constraints.tr
-        counts = poisson.rvs(mu=lam, size=n_isis * 2)
+        counts = poisson.rvs(mu=lam, size=n_isis * 2, random_state=rng)
         isis = counts * isi_constraints.tr
         isis = isis[isis > 0]  # Remove zero ISIs
 
@@ -256,7 +265,7 @@ def generate_isi_sequence(
         # Poisson with aggressive mean matching
         # Strategy: Generate Poisson samples, then use tighter tolerance in adjustment
         lam = target_mean / isi_constraints.tr
-        counts = poisson.rvs(mu=lam, size=n_isis * 3)  # Extra oversampling
+        counts = poisson.rvs(mu=lam, size=n_isis * 3, random_state=rng)  # Extra oversampling
         isis = counts * isi_constraints.tr
         isis = isis[isis > 0]  # Remove zero ISIs
 
@@ -269,7 +278,7 @@ def generate_isi_sequence(
 
     elif distribution == "uniform":
         # Uniform distribution
-        isis = np.random.uniform(min_isi, max_isi, size=n_isis)
+        isis = rng.uniform(min_isi, max_isi, size=n_isis)
 
     elif distribution == "fixed":
         # Fixed ISI (constant spacing)
