@@ -121,3 +121,17 @@ def test_large_effects_do_not_produce_nan_power():
     assert _two_tailed_power(3.3, 150, 16.0) == pytest.approx(1.0)
     assert _two_tailed_power(3.3, 150, -40.0) == pytest.approx(1.0)
     assert _two_tailed_power(3.3, 150, 0.0) == pytest.approx(0.0012, abs=2e-4)
+
+
+def test_analytic_power_accounts_for_hrf_mismatch():
+    """With a late true response the analytic curve must follow the biased estimate."""
+    res = _run(
+        [{"label": "w", "tsnr": 40.0, "phys_fraction": 0.0}],
+        amplitudes=(1.0, 2.0),
+        true_design=_design(shift_s=3.0),
+    )
+    for amp in (1.0, 2.0):
+        r = _rows(res, "w", "A")[amp]
+        assert r["expected_est"] < 0.85 * r["true_effect"]
+        assert r["mean_est"] == pytest.approx(r["expected_est"], abs=0.03)
+        assert r["power"] == pytest.approx(r["power_predicted"], abs=0.04)

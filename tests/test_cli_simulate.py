@@ -194,3 +194,67 @@ def test_scan_time_sets_the_volumes(tmp_path):
     assert spec["run_lengths"] == [[120], [120]]
     events = (tmp_path / "st_events" / "blk.txt").read_text().split()
     assert len(events) == 3
+
+
+def test_true_hrf_sweep_reports_recovery(tmp_path, capsys):
+    prefix = tmp_path / "lib"
+    assert (
+        main(
+            [
+                "-tr",
+                "2",
+                "-trial",
+                "A",
+                "2",
+                "12",
+                "-isi",
+                "exp:5,3,10",
+                "-tsnr",
+                "80",
+                "-amplitudes",
+                "1",
+                "2",
+                "-true_hrf",
+                "lib:0",
+                "-ndesigns",
+                "1",
+                "-nreps",
+                "30",
+                "-device",
+                "cpu",
+                "-no_plots",
+                "-prefix",
+                str(prefix),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "data generated with lib:0" in out and "Recovered fraction" in out
+    rows = _rows(prefix)
+    assert {r["true_hrf"] for r in rows} == {"lib:0"}
+    top = [r for r in rows if r["amplitude"] == "2.0"]
+    assert float(top[0]["expected_est"]) < 0.6 * float(top[0]["true_effect"])
+
+
+def test_bad_hrf_spec_fails_early(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "-tr",
+                "2",
+                "-trial",
+                "A",
+                "2",
+                "5",
+                "-hrf",
+                "lib:99",
+                "-device",
+                "cpu",
+                "-prefix",
+                str(tmp_path / "x"),
+            ]
+        )
+        == 1
+    )
+    assert "0-19" in capsys.readouterr().err

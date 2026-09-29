@@ -202,6 +202,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "condition and every pairwise difference.",
     )
     e.add_argument(
+        "-hrf",
+        default="spmg1",
+        help="HRF the GLM fits: spmg1 (default) or lib:K, one of the 20-HRF library.",
+    )
+    e.add_argument(
+        "-true_hrf",
+        default="same",
+        help="HRF that generates the data: same (default), spmg1, lib:K, or lib:all to "
+        "sweep the library as the truth (reports how much amplitude is recovered).",
+    )
+    e.add_argument(
         "-true_delay",
         type=float,
         default=0.0,
@@ -336,7 +347,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
         out += [spec_text, f"{len(reals)} realization(s)"]
     durs = np.array([sum(r.run_durations) for r in reals])
     out.append(
-        f"scan time per realization: {durs.mean():.0f} s (range {durs.min():.0f}-{durs.max():.0f}), "
+        f"total scan time per realization: {durs.mean():.0f} s (range {durs.min():.0f}-{durs.max():.0f}), "
         f"runs {reals[0].run_lengths} TRs in the first"
     )
     n_ev = {
@@ -354,6 +365,13 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
         "response pattern: "
         + ", ".join(f"{c}={w:g}" for c, w in zip(reals[0].conditions, pattern, strict=True))
     )
+    truths = res.get("true_hrfs", [res.get("hrf", "spmg1")])
+    fit = res.get("hrf", "spmg1")
+    if truths != [fit]:
+        shown = truths if len(truths) <= 4 else [f"{len(truths)} library HRFs"]
+        out.append(f"fitted HRF {fit}; data generated with {', '.join(shown)}")
+    else:
+        out.append(f"HRF {fit} (generated and fitted)")
     if args.true_delay:
         out.append(f"true response delayed {args.true_delay:g} s relative to the fitted model")
     if profile_text:
@@ -361,11 +379,14 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
     out += ["", f"threshold: two-tailed p < {args.alpha:g}; {args.nreps} replicates per cell", ""]
 
     # Amplitude needed, from the analytic curve, across realizations.
-    out.append("Amplitude (% signal change) for 80% power -- median [range] over realizations")
+    over = "realizations" + (" x true HRFs" if len(truths) > 1 else "")
+    out.append(f"Amplitude (% signal change) for 80% power -- median [range] over {over}")
     per_design = {}
     for d in range(len(reals)):
-        sub = {"table": [r for r in rows if r["design"] == d]}
-        per_design[d] = amplitude_for_power(sub, 0.8)
+        for th in truths:
+            sub = {"table": [r for r in rows if r["design"] == d and r["true_hrf"] == th]}
+            per_design[(d, th)] = amplitude_for_power(sub, 0.8)
+    unreached = False
     header = f"{'noise':<24}" + "".join(f"{c:>18}" for c in contrasts)
     out.append(header)
     for cond in conds:
@@ -379,8 +400,46 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             else:
                 med = np.nanmedian(vals)
                 text = f"{med:.2f} [{np.nanmin(vals):.2f}-{np.nanmax(vals):.2f}]"
+                if np.isnan(vals).any():
+                    text += "*"
+                    unreached = True
                 cells.append(f"{text:>18}")
         out.append(f"{cond['label']:<24}" + "".join(cells))
+    if unreached:
+        out.append(
+            f"  * some realizations/HRFs never reach 80% within the sweep (max "
+            f"{max(r['amplitude'] for r in rows):g}%); the median and range leave them out"
+        )
+
+    if truths != [fit] or args.true_delay:
+        top = max(r["amplitude"] for r in rows)
+        out += [
+            "",
+            f"Recovered fraction of the true amplitude (mean estimate / truth, {fit} fitted):",
+        ]
+        for c in contrasts:
+            if abs(contrasts[c] @ np.asarray(pattern)) == 0:
+                continue
+            fr = {
+                th: np.mean(
+                    [
+                        r["expected_est"] / r["true_effect"]
+                        for r in rows
+                        if r["contrast"] == c and r["true_hrf"] == th and r["amplitude"] == top
+                    ]
+                )
+                for th in truths
+            }
+            vals = np.array(list(fr.values()))
+            detail = (
+                "  ".join(f"{k} {v:.2f}" for k, v in fr.items())
+                if len(fr) <= 6
+                else (
+                    f"median {np.median(vals):.2f}, range {vals.min():.2f}-{vals.max():.2f}; worst "
+                    + ", ".join(f"{k} {fr[k]:.2f}" for k in sorted(fr, key=fr.get)[:3])
+                )
+            )
+            out.append(f"  {c:<10} {detail}")
 
     # False positives at amplitude 0.
     out += ["", "False-positive rate at amplitude 0 (should be ~alpha):"]
@@ -613,6 +672,12 @@ def main(argv: list[str] | None = None) -> int:
         pattern = _pattern(args.pattern, conditions)
         amps = _amplitudes(args.amplitudes, args.effect)
         conds, profile_text = _noise_conditions(args)
+        import torch
+
+        from fastfuncstuff.simulation.core import hrfs_from_spec
+
+        for hrf_spec in {args.hrf, args.true_hrf} - {"same"}:
+            hrfs_from_spec(hrf_spec, 0.1, torch.device("cpu"))  # fail before simulating
     except (ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -628,6 +693,8 @@ def main(argv: list[str] | None = None) -> int:
         n_reps=args.nreps,
         alpha=args.alpha,
         true_delay=args.true_delay,
+        hrf=args.hrf,
+        true_hrf=args.true_hrf,
         poly_degree=args.polort,
         device=device,
         seed=args.seed,
@@ -641,12 +708,14 @@ def main(argv: list[str] | None = None) -> int:
 
     cols = [
         "design",
+        "true_hrf",
         "noise",
         "tsnr",
         "amplitude",
         "contrast",
         "true_effect",
         "mean_est",
+        "expected_est",
         "sd_est",
         "sd_predicted",
         "mean_t",
@@ -673,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
                 "seeds": [r.seed for r in reals],
                 "run_lengths": [r.run_lengths for r in reals],
                 "polort": res["designs"][0]["poly_degree"],
+                "hrf": res["hrf"],
+                "true_hrfs": res["true_hrfs"],
                 "alpha": args.alpha,
             },
             indent=2,

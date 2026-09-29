@@ -640,6 +640,29 @@ def default_microtime_dt(tr: float) -> float:
     return commensurate_microtime_dt(tr, 0.05)
 
 
+def hrfs_from_spec(
+    spec: str, microtime_dt: float, device: torch.device | None = None
+) -> list[tuple[str, torch.Tensor]]:
+    """``spmg1``, ``lib:K`` (one HRF of the 20-HRF library) or ``lib:all``.
+
+    Returns (label, (1, n_microtime) response) pairs. The library is the
+    GLMsingle-style set in design/getcanonicalhrflibrary.tsv (peaks ~2.7-5.7 s).
+    """
+    from fastfuncstuff.design.hrf import get_spmg1_hrf, load_canonical_hrf_library
+
+    text = spec.strip().lower()
+    if text == "spmg1":
+        return [("spmg1", get_spmg1_hrf(microtime_dt=microtime_dt, device=device).reshape(1, -1))]
+    if text.startswith("lib:"):
+        lib = load_canonical_hrf_library(microtime_dt=microtime_dt, device=device)
+        which = text[4:]
+        idx = range(lib.shape[0]) if which == "all" else [int(which)]
+        if any(not 0 <= i < lib.shape[0] for i in idx):
+            raise ValueError(f"{spec!r}: the library has HRFs 0-{lib.shape[0] - 1}")
+        return [(f"lib:{i}", lib[i].reshape(1, -1)) for i in idx]
+    raise ValueError(f"cannot parse HRF {spec!r}: use spmg1, lib:K or lib:all")
+
+
 def build_task_design(
     onsets: list[list[np.ndarray | list[float]]],
     durations: list[float],

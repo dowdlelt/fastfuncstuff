@@ -120,7 +120,7 @@ def simulate_design_power(
     dict with
         'table' : list of row dicts, one per noise x amplitude x contrast:
             noise, tsnr, amplitude, contrast, true_effect (PSC), mean_est,
-            sd_est, sd_predicted, mean_t, power, power_predicted, mean_t_naive,
+            expected_est (analytic mean, biased under mismatch), sd_est, sd_predicted, mean_t, power, power_predicted, mean_t_naive,
             power_naive
         'alpha', 'poly_degree', 'dof' ({noise label: (naive, corrected)}),
         'n_reps'
@@ -160,6 +160,7 @@ def simulate_design_power(
         C[i, :n_cond] = w
 
     amps = sorted({0.0, *(float(a) for a in amplitudes)})
+    expected_unit = C @ P @ (X_true @ pattern)  # expected contrast estimate per unit amplitude
     P_dev = P.to(device=device, dtype=torch.float32)
     X_dev = X.to(device=device, dtype=torch.float32)
     CP_dev = (C @ P).to(device=device, dtype=torch.float32)  # contrast estimates directly
@@ -218,8 +219,13 @@ def simulate_design_power(
 
             for i, name in enumerate(names):
                 true_eff = float(C[i, :n_cond] @ pattern) * amp  # PSC
+                # What the fit returns on average: c P X_true beta. It equals the
+                # true effect only when the fitted and generating regressors
+                # agree; with an HRF mismatch it is biased, and power must be
+                # computed from it, not from the truth.
+                exp_est = float(expected_unit[i]) * amp  # PSC
                 sd_pred = sigma * float(torch.sqrt(v_true[i])) / scale  # PSC
-                nc = true_eff / sd_pred if sd_pred > 0 else 0.0
+                nc = exp_est / sd_pred if sd_pred > 0 else 0.0
                 p_pred = _two_tailed_power(crit_corr, dof_corr, nc)
                 rows.append(
                     {
@@ -229,6 +235,7 @@ def simulate_design_power(
                         "contrast": name,
                         "true_effect": true_eff,
                         "mean_est": float(est[i].mean()) / scale,
+                        "expected_est": exp_est,
                         "sd_est": float(est[i].std()) / scale,
                         "sd_predicted": sd_pred,
                         "mean_t": float(t_corr[i].mean()),
@@ -291,32 +298,52 @@ def simulate_realizations_power(
     device: torch.device | None = None,
     seed: int = 0,
     progress: bool = True,
+    hrf: str = "spmg1",
+    true_hrf: str = "same",
 ) -> dict[str, Any]:
     """:func:`simulate_design_power` over several realizations of one experiment.
 
     A jittered, shuffled design is a distribution over event lists, so its
     power is too: each realization (from :func:`~.experiment.realize`, or any
     object with ``onsets``, ``durations`` and ``run_lengths``) is simulated in
-    turn and its rows carry a ``design`` index. ``true_delay`` generates the
-    response that many seconds late while fitting the nominal onsets.
+    turn and its rows carry a ``design`` index.
+
+    ``hrf`` is the response the GLM fits; ``true_hrf`` generates the data
+    (``same``, ``spmg1``, ``lib:K``, or ``lib:all`` to sweep the library as the
+    truth), and rows carry a ``true_hrf`` label. ``true_delay`` additionally
+    generates the response that many seconds late. Any mismatch shows up as
+    bias in ``mean_est`` and lost power.
     """
     from tqdm import tqdm
 
-    from .core import build_task_design
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    dt = default_microtime_dt(tr)
+    fit_label, fit_bases = hrfs_from_spec(hrf, dt, cpu)[0]
+    truths = [(fit_label, fit_bases)] if true_hrf == "same" else hrfs_from_spec(true_hrf, dt, cpu)
 
     rows: list[dict[str, Any]] = []
     per_design = []
-    cpu = torch.device("cpu")
-    for i, real in enumerate(
-        tqdm(
-            realizations, desc="designs", leave=True, disable=not progress or len(realizations) < 2
-        )
+    jobs = [(i, real, t) for i, real in enumerate(realizations) for t in range(len(truths))]
+    for i, real, ti in tqdm(
+        jobs, desc="designs", leave=True, disable=not progress or len(jobs) < 2
     ):
-        X = build_task_design(real.onsets, real.durations, tr, real.run_lengths, device=cpu)
+        X = build_task_design(
+            real.onsets, real.durations, tr, real.run_lengths, fit_bases, dt, device=cpu
+        )
+        t_label, t_bases = truths[ti]
         X_true = None
-        if true_delay:
+        if true_delay or t_label != fit_label:
             X_true = build_task_design(
-                real.onsets, real.durations, tr, real.run_lengths, delay=true_delay, device=cpu
+                real.onsets,
+                real.durations,
+                tr,
+                real.run_lengths,
+                t_bases,
+                dt,
+                delay=true_delay,
+                device=cpu,
             )
         res = simulate_design_power(
             X,
@@ -331,19 +358,28 @@ def simulate_realizations_power(
             alpha=alpha,
             true_design=X_true,
             device=device,
-            seed=seed + 7919 * i,
+            seed=seed + 7919 * i + 104729 * ti,
         )
         for r in res["table"]:
             r["design"] = i
+            r["true_hrf"] = t_label
         rows += res["table"]
-        per_design.append(
-            {
-                "design": i,
-                "seed": getattr(real, "seed", i),
-                "run_lengths": list(real.run_lengths),
-                "dof": res["dof"],
-                "poly_degree": res["poly_degree"],
-                "X": X,
-            }
-        )
-    return {"table": rows, "alpha": alpha, "n_reps": n_reps, "designs": per_design}
+        if ti == 0:
+            per_design.append(
+                {
+                    "design": i,
+                    "seed": getattr(real, "seed", i),
+                    "run_lengths": list(real.run_lengths),
+                    "dof": res["dof"],
+                    "poly_degree": res["poly_degree"],
+                    "X": X,
+                }
+            )
+    return {
+        "table": rows,
+        "alpha": alpha,
+        "n_reps": n_reps,
+        "designs": per_design,
+        "hrf": fit_label,
+        "true_hrfs": [t for t, _ in truths],
+    }
