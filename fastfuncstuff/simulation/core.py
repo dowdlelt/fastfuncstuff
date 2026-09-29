@@ -15,7 +15,7 @@ from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.io.afni import save_nifti
 from fastfuncstuff.utils import get_device, print_device_info, to_tensor
 
-from .noise import add_drift, generate_fmri_noise
+from .noise import add_drift, generate_thermal_physio_noise
 
 
 def simulate_fmri_run(
@@ -30,9 +30,17 @@ def simulate_fmri_run(
     add_scanner_drift: bool = True,
     drift_amplitude: float = 0.5,
     device: torch.device | None = None,
+    phys_fraction: float | torch.Tensor = 0.5,
+    tau: float | torch.Tensor = 6.0,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
-    Simulate a single fMRI run
+    Simulate a single fMRI run on a TR-grid onset matrix
+
+    For events in seconds (sub-TR onsets, durations) use :func:`simulate_bold`,
+    which shares this noise model. Both draw noise from
+    :func:`~.noise.generate_thermal_physio_noise` with tSNR = baseline /
+    noise_level.
 
     Parameters
     ----------
@@ -51,8 +59,8 @@ def simulate_fmri_run(
         Total number of timepoints
     matrix_size : tuple
         (nx, ny, nz) spatial dimensions
-    noise_level : float
-        Noise amplitude (default: 1.0)
+    noise_level : float or tensor
+        Noise std, scalar or one per voxel (default 1.0): tSNR = baseline / noise_level
     baseline : float
         Baseline signal level (default: 100)
     add_scanner_drift : bool
@@ -99,12 +107,9 @@ def simulate_fmri_run(
     # Add baseline
     data = baseline + signal
 
-    # Generate noise
-    noise = torch.zeros(n_voxels, n_timepoints, device=device)
-
     # noise_level may be a scalar or one value per voxel, so that the per-voxel
     # levels create_parametric_voxels returns are actually usable.
-    scale_per_voxel = to_tensor(noise_level, device=device).flatten().float()
+    scale_per_voxel = to_tensor(noise_level, device=device).flatten().double()
     if scale_per_voxel.numel() == 1:
         scale_per_voxel = scale_per_voxel.expand(n_voxels)
     elif scale_per_voxel.numel() != n_voxels:
@@ -112,30 +117,21 @@ def simulate_fmri_run(
             f"noise_level must be a scalar or have one value per voxel "
             f"({n_voxels}); got {scale_per_voxel.numel()}"
         )
-    scale_per_voxel = scale_per_voxel.unsqueeze(1)
-
-    # Generate noise per slice (more efficient than per voxel)
-    for slice_idx in range(nz):
-        slice_noise = generate_fmri_noise(
-            tr, n_timepoints * tr, matrix_size=(nx, ny), normalize=True, device=device
-        )
-        # generate_fmri_noise returns (n_trs, nx, ny) -- time FIRST. Flattening it
-        # as (-1, n_timepoints) does not transpose it, it interleaves the two:
-        # each row ends up striding across space at nearly fixed time, which
-        # destroys the temporal structure the generator exists to produce
-        # (measured lag-1 autocorrelation +0.44 correct vs -0.01 that way). Every
-        # simulation built on this function was effectively getting white noise.
-        slice_noise = slice_noise.reshape(n_timepoints, -1).T  # -> (nx*ny, n_trs)
-
-        # Voxel ordering must match the final reshape to (nx, ny, nz, n_timepoints),
-        # which indexes voxels as x*ny*nz + y*nz + z. Writing whole slices
-        # contiguously would instead lay them out as z-major.
-        voxel_index = (
-            torch.arange(nx * ny, device=device) // ny * (ny * nz)
-            + torch.arange(nx * ny, device=device) % ny * nz
-            + slice_idx
-        )
-        noise[voxel_index, :] = slice_noise * scale_per_voxel[voxel_index]
+    # One noise model for every simulation path. This used to call the 1/f
+    # spectral generator slice by slice, a second model with no white floor and
+    # no tSNR parameter. Voxels come out in the (nx, ny, nz) order of the final
+    # reshape, which the old per-slice loop had to reconstruct by hand.
+    noise = generate_thermal_physio_noise(
+        n_timepoints,
+        tr,
+        baseline / scale_per_voxel,
+        phys_fraction,
+        tau,
+        baseline=baseline,
+        n_voxels=n_voxels,
+        device=device,
+        generator=generator,
+    ).T  # (n_voxels, n_timepoints)
 
     # Drift is scaled to the noise, not to the data. add_drift sizes it from the
     # std of whatever it is handed, and handed the data that std includes the
@@ -143,7 +139,7 @@ def simulate_fmri_run(
     # (residual SD 1.23 vs 1.04 at beta=5 vs 0 under a cubic detrend), coupling a
     # nuisance to the very effect being simulated.
     if add_scanner_drift:
-        noise = add_drift(noise.T, amplitude=drift_amplitude, device=device).T
+        noise = add_drift(noise.T, amplitude=drift_amplitude, device=device, generator=generator).T
 
     data = data + noise
 
@@ -332,63 +328,6 @@ def create_parametric_voxels(
                 noise_levels[voxel_idx] = noise_steps[z]
 
     return betas, hrf_indices, noise_levels
-
-
-def simulate_batch_experiments(
-    n_experiments: int, sim_config: dict, device: torch.device | None = None, verbose: bool = True
-) -> list[dict]:
-    """
-    Simulate multiple experiments in batch (for statistical power analysis, etc.)
-
-    Parameters
-    ----------
-    n_experiments : int
-        Number of independent experiments to simulate
-    sim_config : dict
-        Configuration dictionary containing simulation parameters:
-        - n_runs, tr, n_timepoints, matrix_size, n_conditions, etc.
-    device : torch.device, optional
-        Device for computation
-    verbose : bool
-        Print progress
-
-    Returns
-    -------
-    experiments : list of dict
-        List of experiment dictionaries, each containing:
-        - 'data': List of data tensors (one per run)
-        - 'onsets': Onsets used
-        - 'betas': True betas
-        - 'hrf': HRF used
-    """
-    if device is None:
-        device = get_device()
-
-    if verbose:
-        print(f"Simulating {n_experiments} experiments in batch...")
-        print_device_info(device)
-
-    experiments = []
-
-    for exp_idx in range(n_experiments):
-        if verbose and exp_idx % max(1, n_experiments // 10) == 0:
-            print(f"  Experiment {exp_idx + 1}/{n_experiments}...")
-
-        # Generate this experiment
-        # (Implementation would extract from sim_config and call simulate_fmri_experiment)
-        # This is a template - full implementation depends on specific needs
-
-        exp_data = {
-            "id": exp_idx,
-            # Add simulated data here
-        }
-
-        experiments.append(exp_data)
-
-    if verbose:
-        print("Batch simulation complete!")
-
-    return experiments
 
 
 def write_timing_files(

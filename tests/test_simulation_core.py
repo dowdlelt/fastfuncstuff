@@ -505,48 +505,6 @@ class TestCreateParametricVoxels:
         assert noise_levels.std() > 0.1
 
 
-class TestSimulateBatchExperiments:
-    """Test simulate_batch_experiments for batch simulation."""
-
-    @pytest.fixture
-    def device(self):
-        return torch.device("cpu")
-
-    def test_basic_batch_experiments(self, device):
-        """Test basic batch experiment simulation."""
-        from fastfuncstuff.simulation.core import simulate_batch_experiments
-
-        n_experiments = 5
-        sim_config = {
-            "n_runs": 2,
-            "tr": 2.0,
-            "n_timepoints": 100,
-        }
-
-        experiments = simulate_batch_experiments(
-            n_experiments=n_experiments, sim_config=sim_config, device=device, verbose=False
-        )
-
-        assert len(experiments) == n_experiments
-        for exp in experiments:
-            assert "id" in exp
-
-    def test_batch_experiments_verbose(self, device, capsys):
-        """Test batch experiments with verbose output."""
-        from fastfuncstuff.simulation.core import simulate_batch_experiments
-
-        n_experiments = 10
-        sim_config = {"n_runs": 1}
-
-        _experiments = simulate_batch_experiments(
-            n_experiments=n_experiments, sim_config=sim_config, device=device, verbose=True
-        )
-
-        captured = capsys.readouterr()
-        assert "Simulating" in captured.out
-        assert "Batch simulation complete" in captured.out
-
-
 class TestSimulationFileWriting:
     """Test file writing functions in simulation module."""
 

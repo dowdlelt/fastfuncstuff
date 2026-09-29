@@ -3,7 +3,6 @@
 from fastfuncstuff.simulation.core import (
     create_parametric_voxels,
     save_simulation_outputs,
-    simulate_batch_experiments,
     simulate_fmri_experiment,
     simulate_fmri_run,
     write_afni_onset_files,
@@ -25,7 +24,6 @@ __all__ = [
     "simulate_fmri_run",
     "simulate_fmri_experiment",
     "create_parametric_voxels",
-    "simulate_batch_experiments",
     "save_simulation_outputs",
     "write_afni_onset_files",
     "write_nifti_files",

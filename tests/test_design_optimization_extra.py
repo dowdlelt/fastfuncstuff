@@ -13,11 +13,8 @@ from fastfuncstuff.design.matrices import (
     make_singletrialdesign,
 )
 from fastfuncstuff.design.optimization import (
-    DesignCandidate,
     ISIConstraints,
-    compare_designs_summary,
     create_onset_matrix,
-    find_optimal_designs,
     generate_event_sequence,
     generate_isi_sequence,
 )
@@ -83,53 +80,6 @@ class TestCreateOnsetMatrix:
         onsets = create_onset_matrix(event_seq, isis, duration=20.0, tr=1.0, n_conditions=2)
         assert onsets[:, 0].sum() == 3
         assert onsets[:, 1].sum() == 2
-
-
-class TestFindOptimalDesigns:
-    def test_find_optimal_designs(self):
-        candidates = []
-        for i in range(5):
-            onsets = torch.zeros(20, 2)
-            isis = np.array([2.0, 3.0])
-            dm = torch.randn(20, 2)
-            score_power = float(i) / 4.0
-            score_eff = float(4 - i) / 4.0
-            c = DesignCandidate(
-                onsets=onsets,
-                isis=isis,
-                design_matrix=dm,
-                metrics={"detection_power": score_power, "estimation_efficiency": score_eff},
-                metadata={"ordering": "random", "distribution": "exponential"},
-            )
-            candidates.append(c)
-        result = find_optimal_designs(candidates, objective="power", top_k=3)
-        assert len(result) <= 3
-        assert all(isinstance(t, tuple) and len(t) == 3 for t in result)
-        scores = [t[2] for t in result]
-        assert scores == sorted(scores, reverse=True)
-
-
-class TestCompareDesignsSummary:
-    def test_compare_designs_summary(self):
-        candidates = []
-        for i in range(3):
-            onsets = torch.zeros(20, 2)
-            isis = np.array([2.0, 3.0])
-            dm = torch.randn(20, 2)
-            c = DesignCandidate(
-                onsets=onsets,
-                isis=isis,
-                design_matrix=dm,
-                metrics={
-                    "detection_power": float(i) * 0.1,
-                    "estimation_efficiency": float(i) * 0.2,
-                },
-                metadata={"ordering": "random", "distribution": "exponential", "n_conditions": 2},
-            )
-            candidates.append(c)
-        summary = compare_designs_summary(candidates, top_k=3)
-        assert isinstance(summary, str)
-        assert len(summary) > 0
 
 
 class TestBasisTent:

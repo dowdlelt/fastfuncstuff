@@ -265,3 +265,15 @@ class TestEstimateSfnr:
         data = np.random.randn(20, 50).astype(np.float32) + 100.0
         result = estimate_sfnr(data, device=DEVICE)
         assert result["sfnr_mean"] > 0
+
+
+class TestArStationarityByRoots:
+    """|a| < 1 per coefficient is only the AR(1) rule."""
+
+    def test_stationary_ar2_with_a_large_coefficient_is_accepted(self):
+        noise = generate_arma_noise([1.2, -0.5], [], n_timepoints=500, n_voxels=4, device=DEVICE)
+        assert torch.isfinite(noise).all()
+
+    def test_explosive_ar2_with_small_coefficients_is_refused(self):
+        with pytest.raises(ValueError, match="stationarity"):
+            generate_arma_noise([0.6, 0.5], [], n_timepoints=100, device=DEVICE)

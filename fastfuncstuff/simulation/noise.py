@@ -465,6 +465,42 @@ def add_motion_artifacts(
     return data_with_motion, spike_times
 
 
+def _unit_ar1(innov: torch.Tensor, phi: float | torch.Tensor) -> torch.Tensor:
+    """Unit-variance stationary AR(1) driven by standard-normal ``innov`` (T, V).
+
+    The one AR(1) recursion: generate_ar1_noise and the physiological part of
+    generate_thermal_physio_noise are both this. Seeded from the stationary
+    distribution (the first sample *is* unit variance), so there is no ramp-up
+    -- at phi=0.9 a zero start left var(y[1]) at 0.19 and took ~50 samples to
+    settle. ``phi`` may be one value per column.
+    """
+    phi_t = torch.as_tensor(phi, dtype=innov.dtype, device=innov.device)
+    scale = torch.sqrt(1.0 - phi_t**2)
+    y = torch.empty_like(innov)
+    y[0] = innov[0]
+    for t in range(1, innov.shape[0]):
+        y[t] = phi_t * y[t - 1] + scale * innov[t]
+    return y
+
+
+def _check_ar_stationary(ar: torch.Tensor) -> None:
+    """All roots of 1 - a1 z - ... - ap z^p outside the unit circle.
+
+    A per-coefficient |a| < 1 test (what this module used) is only right for
+    AR(1): it rejects stationary AR(2) such as [1.2, -0.5] and accepts
+    explosive ones such as [0.6, 0.5].
+    """
+    coeffs = ar.detach().cpu().double().numpy()
+    if coeffs.size == 0:
+        return
+    roots = np.roots(np.concatenate([-coeffs[::-1], [1.0]]))
+    if np.any(np.abs(roots) <= 1.0 + 1e-9):
+        raise ValueError(
+            f"AR coefficients {coeffs.tolist()} fail stationarity: a root of the AR "
+            "polynomial lies on or inside the unit circle"
+        )
+
+
 def generate_ar1_noise(
     rho: float,
     n_timepoints: int,
@@ -522,29 +558,8 @@ def generate_ar1_noise(
     if not (-1 < rho < 1):
         raise ValueError(f"rho must be in (-1, 1) for stationarity, got {rho}")
 
-    # Initialize output
-    y = torch.zeros(n_timepoints, n_voxels, device=device)
-
-    # Innovation variance to achieve unit variance AR(1) process
-    # Var(y_t) = σ²_ε / (1 - ρ²) = 1  →  σ²_ε = (1 - ρ²)
-    innovation_std = np.sqrt(1 - rho**2)
-
-    # Generate innovations
-    epsilon = (
-        torch.randn(n_timepoints, n_voxels, device=device, generator=generator) * innovation_std
-    )
-
-    # Seed from the stationary distribution BEFORE the recursion. Assigning y[0]
-    # afterwards (as this once did) left the loop starting from zeros, so the
-    # series ramped up to its stationary variance instead of beginning at it --
-    # at rho=0.9, var(y[1]) measured 0.19 against a stationary 1.0 and took ~50
-    # samples to recover. Short runs are exactly where that bias bites.
-    y[0] = epsilon[0] / np.sqrt(1 - rho**2)
-
-    # Sequential generation (vectorized across voxels)
-    # This is fast enough for typical use cases
-    for t in range(1, n_timepoints):
-        y[t] = rho * y[t - 1] + epsilon[t]
+    innov = torch.randn(n_timepoints, n_voxels, device=device, generator=generator)
+    y = _unit_ar1(innov, rho)
 
     # Normalize if requested
     if normalize:
@@ -596,8 +611,8 @@ def generate_ar_noise(
 
     Notes
     -----
-    No explicit stationarity check is performed. User should ensure
-    the AR polynomial roots are outside the unit circle.
+    Implemented as ARMA(p, 0) by :func:`generate_arma_noise`, which checks
+    that the AR polynomial's roots lie outside the unit circle.
 
     Examples
     --------
@@ -609,50 +624,17 @@ def generate_ar_noise(
     - Box & Jenkins (1976): Time Series Analysis
     - Worsley & Friston (1995): AR models in fMRI
     """
-    if device is None:
-        device = get_device()
-
-    # Convert coefficients to tensor
-    if not torch.is_tensor(rho_coeffs):
-        rho_coeffs = torch.tensor(rho_coeffs, dtype=torch.float32, device=device)
-    else:
-        rho_coeffs = rho_coeffs.to(device)
-
-    p = len(rho_coeffs)
-
-    # Burn-in, then discard. There is no one-line stationary seed for AR(p) as
-    # there is for AR(1), and the alternative -- starting from zeros and writing
-    # the first p samples afterwards -- is worse than it looks: those samples get
-    # the innovation variance (1.0) while the stationary variance of e.g.
-    # [0.5, 0.2] is 1.71, so every run opened with a variance step.
-    n_burn = max(p, burn_in if burn_in is not None else 200)
-    n_total = n_timepoints + n_burn
-
-    # Initialize output
-    y = torch.zeros(n_total, n_voxels, device=device)
-
-    # Generate innovations (white noise)
-    epsilon = torch.randn(n_total, n_voxels, device=device, generator=generator)
-    y[:p] = epsilon[:p]
-
-    # Sequential generation
-    for t in range(p, n_total):
-        # Dot product with past p values
-        # y[t] = sum(rho_coeffs * y[t-p:t].flip())
-        past_values = y[t - p : t].flip(0)  # Reverse to align with coefficients
-        y[t] = (rho_coeffs.unsqueeze(1) * past_values).sum(dim=0) + epsilon[t]
-
-    y = y[n_burn:]
-
-    # Normalize if requested
-    if normalize:
-        y = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-10)
-
-    # Return shape
-    if n_voxels == 1:
-        return y.squeeze(1)
-    else:
-        return y
+    # AR(p) is ARMA(p, 0): one recursion, one burn-in, one stationarity check.
+    return generate_arma_noise(
+        rho_coeffs,
+        [],
+        n_timepoints,
+        n_voxels,
+        normalize=normalize,
+        device=device,
+        generator=generator,
+        burn_in=burn_in,
+    )
 
 
 def generate_arma_noise(
@@ -720,10 +702,7 @@ def generate_arma_noise(
     else:
         ma_coeffs = ma_coeffs.to(device)
 
-    # Validate AR coefficients for stationarity
-    if len(ar_coeffs) > 0:
-        if torch.any(torch.abs(ar_coeffs) >= 1):
-            raise ValueError("AR coefficients must be in (-1, 1) for stationarity.")
+    _check_ar_stationary(ar_coeffs)
 
     p = len(ar_coeffs)
     q = len(ma_coeffs)
@@ -1276,7 +1255,6 @@ def generate_thermal_physio_noise(
     sigma_white = sigma * torch.sqrt(1.0 - f_v)
     sigma_phys = sigma * torch.sqrt(f_v)
     phi = torch.exp(-tr / tau_v)
-    innov_scale = torch.sqrt(1.0 - phi**2)
 
     white = torch.randn(
         n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
@@ -1284,9 +1262,6 @@ def generate_thermal_physio_noise(
     innov = torch.randn(
         n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
     )
-    phys = torch.empty_like(innov)
-    phys[0] = innov[0]  # stationary start: unit variance from the first sample
-    for t in range(1, n_timepoints):
-        phys[t] = phi * phys[t - 1] + innov_scale * innov[t]
+    phys = _unit_ar1(innov, phi)
     noise = sigma_white * white + sigma_phys * phys
     return noise.to(torch.float32)
