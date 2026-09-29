@@ -387,7 +387,8 @@ CATEGORICAL = [
     "#4a3aa7",
     "#e34948",
 ]
-BLUES = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281", "#0d366b"]
+# Sequential blue, 200 -> 700: tSNR bins are ordered, so they are magnitude, not identity.
+BLUES = ["#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
 
 
 def _style(ax) -> None:
@@ -402,7 +403,14 @@ def _style(ax) -> None:
 
 
 def _ramp(n: int) -> list[str]:
-    idx = np.linspace(0, len(BLUES) - 1, n).round().astype(int) if n > 1 else [3]
+    if n <= 1:
+        return [BLUES[3]]
+    if n > len(BLUES):
+        import matplotlib.colors as mcolors
+
+        cmap = mcolors.LinearSegmentedColormap.from_list("seq", [BLUES[0], BLUES[-1]])
+        return [mcolors.to_hex(cmap(x)) for x in np.linspace(0, 1, n)]
+    idx = np.linspace(0, len(BLUES) - 1, n).round().astype(int)
     return [BLUES[i] for i in idx]
 
 
@@ -435,32 +443,42 @@ def _plot_power(res, conds, contrasts, pattern, args, path: Path) -> None:
             ax.plot(
                 amps, mc, "o", color=col, markersize=4.5, markeredgecolor=SURFACE, markeredgewidth=1
             )
-            # Label each curve where it crosses 50% power: saturated curves all
-            # end at 1.0, so labels at the right edge land on top of each other.
-            k = int(np.argmin(np.abs(np.asarray(med) - 0.5)))
-            ax.annotate(
-                cond["label"].split(" (")[0],
-                (amps[k], med[k]),
-                xytext=(6, -2),
-                textcoords="offset points",
-                fontsize=8,
-                color=INK2,
-                va="top",
-            )
+            if len(conds) <= 4:
+                # Label each curve where it crosses 50% power: saturated curves all
+                # end at 1.0, so labels at the right edge land on top of each other.
+                k = int(np.argmin(np.abs(np.asarray(med) - 0.5)))
+                ax.annotate(
+                    cond["label"].split(" (")[0],
+                    (amps[k], med[k]),
+                    xytext=(6, -2),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color=INK2,
+                    va="top",
+                )
         if args.effect is not None:
             ax.axvline(args.effect, color=INK2, linewidth=1, linestyle=":")
         ax.set_ylim(-0.02, 1.02)
         ax.set_title(c, color=INK, fontsize=11)
-        ax.set_xlabel("amplitude (% signal change)", color=INK2, fontsize=9)
+        ax.set_xlabel("amplitude (% signal change x pattern)", color=INK2, fontsize=9)
     axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
-    axes[0][-1].legend(frameon=False, fontsize=8, labelcolor=INK2, loc="lower right")
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=8,
+        labelcolor=INK2,
+        loc="lower center",
+        ncol=min(len(labels), 5),
+    )
     fig.suptitle(
         f"Power at two-tailed p < {args.alpha:g} -- line: analytic (band: range over "
         f"realizations), dots: Monte Carlo; dashed: 80%",
         color=INK,
         fontsize=10,
     )
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     fig.savefig(path, dpi=130, facecolor=SURFACE)
     plt.close(fig)
 
