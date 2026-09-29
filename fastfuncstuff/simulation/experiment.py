@@ -130,14 +130,27 @@ def _split_items(text: str) -> list[str]:
 
 @dataclass
 class Unit:
-    """A trial, block or miniblock: items shown in order, ``count`` times per run."""
+    """A trial, block or miniblock: items shown in order, ``count`` times per run.
+
+    ``family`` says which total governs it: ``"event"`` units (trials and null
+    trials) are scaled by ``num_events``, ``"block"`` units (blocks and
+    miniblocks) by ``num_blocks``. When a total or ``scan_time`` decides the
+    counts, ``count`` is only a relative weight.
+    """
 
     name: str
     items: list[Item]
     count: int
+    family: Literal["event", "block"] = "event"
+
+    @property
+    def is_null(self) -> bool:
+        return all(it.condition == NULL for it in self.items)
 
     @classmethod
-    def parse(cls, name: str, items: str, count: int) -> Unit:
+    def parse(
+        cls, name: str, items: str, count: int, family: Literal["event", "block"] = "event"
+    ) -> Unit:
         """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring)."""
         parsed: list[Item] = []
         for token in _split_items(items):
@@ -155,7 +168,7 @@ class Unit:
             raise ValueError(f"unit {name!r} has no items")
         if count < 1:
             raise ValueError(f"unit {name!r}: count must be >= 1")
-        return cls(name, parsed, int(count))
+        return cls(name, parsed, int(count), family)
 
 
 @dataclass
@@ -168,6 +181,9 @@ class ExperimentSpec:
     initial_fix: float = 0.0
     post_fix: float = 0.0
     order: Literal["random", "alternating", "blocked", "permuted_block"] = "random"
+    scan_time: float | None = None  # seconds per run; fixes the number of volumes
+    num_events: int | None = None  # per-run total of non-null event units
+    num_blocks: int | None = None  # per-run total of block units
 
     @property
     def conditions(self) -> list[str]:
@@ -192,18 +208,131 @@ class ExperimentSpec:
                     )
         return [found[c] for c in self.conditions]
 
+    def _mean_gap(self, unit: Unit, j: int) -> float:
+        item = unit.items[j]
+        if item.off is not None:
+            return item.off.mean
+        return self.isi.mean if j == len(unit.items) - 1 else self.within_isi.mean
+
+    def _expected_length(self, unit: Unit) -> tuple[float, float]:
+        """(seconds from the unit's onset to the next unit's, its trailing gap), on average."""
+        body = sum(it.duration + self._mean_gap(unit, j) for j, it in enumerate(unit.items))
+        return body, self._mean_gap(unit, len(unit.items) - 1)
+
+    def expected_duration(self, counts: list[float]) -> float:
+        """Expected run length for unit ``counts``: the last unit's gap is -post_fix instead."""
+        lengths = [self._expected_length(u) for u in self.units]
+        n = sum(counts)
+        if n == 0:
+            return self.initial_fix + self.post_fix
+        trailing = sum(c * t for c, (_, t) in zip(counts, lengths, strict=True)) / n
+        body = sum(c * b for c, (b, _) in zip(counts, lengths, strict=True))
+        return self.initial_fix + body - trailing + self.post_fix
+
+    def resolve_counts(self) -> list[int]:
+        """Units per run, after -num_events / -num_blocks / -scan_time.
+
+        Each family is fixed by exactly one thing. A total (num_events,
+        num_blocks) turns that family's counts into weights and scales them to
+        it -- null trials scale with the events. Without a total, a family's
+        counts stand as given, unless scan_time is set: then every family
+        without a total is scaled, by one common factor, to fill the scan on
+        average. If scan_time is set and nothing is left free, it only fixes the
+        run length, and content that cannot fit is an error.
+        """
+        weights = [float(u.count) for u in self.units]
+        counts = list(weights)
+
+        def scale(idx: list[int], factor: float) -> None:
+            for i in idx:
+                counts[i] = weights[i] * factor
+
+        events = [i for i, u in enumerate(self.units) if u.family == "event" and not u.is_null]
+        nulls = [i for i, u in enumerate(self.units) if u.family == "event" and u.is_null]
+        blocks = [i for i, u in enumerate(self.units) if u.family == "block"]
+        free: list[int] = []
+        if self.num_events is not None:
+            if not events:
+                raise ValueError("-num_events given but there are no -trial units")
+            scale(events + nulls, self.num_events / sum(weights[i] for i in events))
+        else:
+            free += events + nulls
+        if self.num_blocks is not None:
+            if not blocks:
+                raise ValueError("-num_blocks given but there are no -block/-miniblock units")
+            scale(blocks, self.num_blocks / sum(weights[i] for i in blocks))
+        else:
+            free += blocks
+
+        if self.scan_time is not None and free:
+            fixed = [c if i not in free else 0.0 for i, c in enumerate(counts)]
+            unit_free = [weights[i] if i in free else 0.0 for i in range(len(weights))]
+            # expected_duration is affine in a common scale of the free counts
+            # (up to the trailing-gap average, which is a small correction), so
+            # solve it by bisection rather than algebra.
+            lo, hi = 0.0, 1.0
+            while (
+                self.expected_duration([f + hi * w for f, w in zip(fixed, unit_free, strict=True)])
+                < self.scan_time
+            ):
+                hi *= 2
+                if hi > 1e6:
+                    raise ValueError("cannot fill -scan_time: the units take no time")
+            for _ in range(60):
+                mid = (lo + hi) / 2
+                d = self.expected_duration(
+                    [f + mid * w for f, w in zip(fixed, unit_free, strict=True)]
+                )
+                lo, hi = (mid, hi) if d < self.scan_time else (lo, mid)
+            scale(free, lo)
+
+        # Round each family to whole units, preserving its total (largest remainder).
+        out = [0] * len(counts)
+        for fam in (events, nulls, blocks):
+            if not fam:
+                continue
+            total = int(round(sum(counts[i] for i in fam)))
+            floors = {i: int(np.floor(counts[i])) for i in fam}
+            spare = total - sum(floors.values())
+            for i in sorted(fam, key=lambda i: counts[i] - floors[i], reverse=True)[
+                : max(spare, 0)
+            ]:
+                floors[i] += 1
+            out = [floors.get(i, c) for i, c in enumerate(out)]
+        for i, u in enumerate(self.units):
+            if out[i] < 1 and not u.is_null:
+                raise ValueError(
+                    f"unit {u.name!r} rounds to 0 per run -- -scan_time or the totals are "
+                    "too small for the design"
+                )
+        if self.scan_time is not None:
+            need = self.expected_duration([float(c) for c in out])
+            if need > self.scan_time * 1.02:
+                raise ValueError(
+                    f"the units need ~{need:.0f} s per run on average, more than "
+                    f"-scan_time {self.scan_time:g} s"
+                )
+        return out
+
     def describe(self) -> str:
+        counts = self.resolve_counts()
         lines = [
             f"TR {self.tr:g} s, {self.n_runs} run(s), fixation {self.initial_fix:g} s before / "
             f"{self.post_fix:g} s after, order {self.order}",
             f"between units: {self.isi}   within units: {self.within_isi}",
         ]
-        for u in self.units:
+        if self.scan_time is not None:
+            lines.append(
+                f"scan time {self.scan_time:g} s per run "
+                f"({int(round(self.scan_time / self.tr))} volumes); expected content "
+                f"{self.expected_duration([float(c) for c in counts]):.0f} s"
+            )
+        for u, c in zip(self.units, counts, strict=True):
             items = ", ".join(
                 f"{it.condition}:{it.duration:g}" + (f":{it.off}" if it.off else "")
                 for it in u.items
             )
-            lines.append(f"  unit {u.name:<10} x{u.count:<4} [{items}]")
+            lines.append(f"  {u.family:<5} {u.name:<10} x{c:<4} [{items}]")
         return "\n".join(lines)
 
 
@@ -217,6 +346,8 @@ class Realization:
     onsets: list[list[np.ndarray]]  # [condition][run] -> seconds
     run_lengths: list[int]  # timepoints
     run_durations: list[float]  # seconds, before rounding up to whole TRs
+    counts: list[int] = field(default_factory=list)  # units per run, as resolved
+    n_dropped: int = 0  # events past a fixed -scan_time, over all runs
 
 
 def realize(spec: ExperimentSpec, seed: int) -> Realization:
@@ -228,15 +359,15 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
     if not conds:
         raise ValueError("the experiment has no non-null conditions")
     durations = spec.durations()
+    counts = spec.resolve_counts()
     onsets: dict[str, list[list[float]]] = {c: [[] for _ in range(spec.n_runs)] for c in conds}
     run_lengths, run_durations = [], []
+    n_dropped = 0
 
     for run in range(spec.n_runs):
         order = [
             int(u)
-            for u in generate_event_sequence(
-                [u.count for u in spec.units], len(spec.units), ordering=spec.order, rng=rng
-            )
+            for u in generate_event_sequence(counts, len(spec.units), ordering=spec.order, rng=rng)
         ]
         # Every gap slot in the run: (unit position k, item j) -> the interval it
         # draws from. The last unit's trailing gap is replaced by -post_fix.
@@ -267,11 +398,20 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
         for k, ui in enumerate(order):
             for j, item in enumerate(spec.units[ui].items):
                 if item.condition != NULL:
-                    onsets[item.condition][run].append(t)
+                    # A fixed scan acquires a fixed number of volumes; an event
+                    # that jitter pushed past the end is simply not recorded.
+                    if spec.scan_time is not None and t >= spec.scan_time:
+                        n_dropped += 1
+                    else:
+                        onsets[item.condition][run].append(t)
                 t += item.duration + gap.get((k, j), 0.0)
         t += spec.post_fix
-        run_durations.append(t)
-        run_lengths.append(int(np.ceil(t / spec.tr - 1e-9)))
+        if spec.scan_time is not None:
+            run_durations.append(spec.scan_time)
+            run_lengths.append(int(round(spec.scan_time / spec.tr)))
+        else:
+            run_durations.append(t)
+            run_lengths.append(int(np.ceil(t / spec.tr - 1e-9)))
 
     return Realization(
         seed=seed,
@@ -280,6 +420,8 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
         onsets=[[np.asarray(r) for r in onsets[c]] for c in conds],
         run_lengths=run_lengths,
         run_durations=run_durations,
+        counts=counts,
+        n_dropped=n_dropped,
     )
 
 

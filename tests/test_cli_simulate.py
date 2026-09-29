@@ -150,3 +150,47 @@ def test_miniblocks_and_explicit_timing_roundtrip(tmp_path):
 def test_described_and_explicit_are_exclusive(tmp_path, capsys):
     assert main(["-tr", "2", "-prefix", str(tmp_path / "x"), "-device", "cpu"]) == 1
     assert "either -events or" in capsys.readouterr().err
+
+
+def test_scan_time_sets_the_volumes(tmp_path):
+    prefix = tmp_path / "st"
+    assert (
+        main(
+            [
+                "-tr",
+                "2",
+                "-trial",
+                "A",
+                "2",
+                "1",
+                "-block",
+                "blk",
+                "16",
+                "1",
+                "-num_blocks",
+                "3",
+                "-scan_time",
+                "240",
+                "-isi",
+                "exp:4,2,10",
+                "-tsnr",
+                "50",
+                "-amplitudes",
+                "1",
+                "-ndesigns",
+                "2",
+                "-nreps",
+                "20",
+                "-device",
+                "cpu",
+                "-no_plots",
+                "-prefix",
+                str(prefix),
+            ]
+        )
+        == 0
+    )
+    spec = json.loads((tmp_path / "st_spec.json").read_text())
+    assert spec["run_lengths"] == [[120], [120]]
+    events = (tmp_path / "st_events" / "blk.txt").read_text().split()
+    assert len(events) == 3

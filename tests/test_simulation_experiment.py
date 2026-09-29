@@ -151,3 +151,71 @@ class TestItemOffsets:
         gaps = np.asarray(r.onsets[1][0]) - np.asarray(r.onsets[0][0]) - 2.0
         assert gaps.std() > 0.5
         assert gaps.mean() == pytest.approx(3.0, rel=0.02)
+
+
+class TestCountsAndScanTime:
+    BASE = dict(tr=1.25, isi=Interval.parse("exp:4,2,12"), initial_fix=10, post_fix=16)
+
+    def test_num_events_turns_counts_into_weights(self):
+        spec = ExperimentSpec(
+            units=[
+                Unit.parse("A", "A:2", 3),
+                Unit.parse("B", "B:2", 1),
+                Unit.parse("n", "null:2", 1),
+            ],
+            num_events=40,
+            **self.BASE,
+        )
+        assert spec.resolve_counts() == [30, 10, 10]  # nulls scale with the events
+
+    def test_scan_time_fills_the_run(self):
+        spec = ExperimentSpec(
+            units=[Unit.parse("A", "A:2", 1), Unit.parse("B", "B:2", 1)], scan_time=300, **self.BASE
+        )
+        counts = spec.resolve_counts()
+        assert counts[0] == counts[1]
+        per_unit = 2 + 4  # duration + mean gap
+        assert abs(spec.expected_duration([float(c) for c in counts]) - 300) <= per_unit
+        r = realize(spec, 0)
+        assert r.run_lengths == [240] and r.run_durations == [300]
+
+    def test_a_block_total_is_held_while_events_fill(self):
+        spec = ExperimentSpec(
+            units=[Unit.parse("A", "A:2", 1), Unit.parse("blk", "B:20", 1, family="block")],
+            scan_time=400,
+            num_blocks=4,
+            **self.BASE,
+        )
+        counts = spec.resolve_counts()
+        assert counts[1] == 4 and counts[0] > 30
+
+    def test_fixed_content_that_cannot_fit_is_refused(self):
+        spec = ExperimentSpec(
+            units=[Unit.parse("A", "A:2", 1)], scan_time=100, num_events=100, **self.BASE
+        )
+        with pytest.raises(ValueError, match="more than -scan_time"):
+            spec.resolve_counts()
+
+    def test_fixed_counts_under_scan_time_keep_the_volumes(self):
+        spec = ExperimentSpec(
+            units=[Unit.parse("A", "A:2", 1)], scan_time=300, num_events=10, **self.BASE
+        )
+        r = realize(spec, 0)
+        assert r.counts == [10] and r.run_lengths == [240]
+        assert r.n_dropped == 0 and len(r.onsets[0][0]) == 10
+
+    def test_overrun_events_are_dropped_and_counted(self):
+        # uniform is not mean-matched: some realizations run long
+        spec = ExperimentSpec(
+            units=[Unit.parse("A", "A:2", 1)],
+            scan_time=200,
+            tr=1,
+            isi=Interval.parse("uniform:2,10"),
+            post_fix=0,
+        )
+        dropped = [realize(spec, s).n_dropped for s in range(20)]
+        assert any(dropped)
+        for s in range(20):
+            r = realize(spec, s)
+            assert len(r.onsets[0][0]) + r.n_dropped == r.counts[0]
+            assert max(r.onsets[0][0]) < 200

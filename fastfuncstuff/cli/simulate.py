@@ -11,6 +11,7 @@ AFNI timing files, one per condition, one row per run, onsets in seconds.
 or a described experiment, realized -ndesigns times with fresh jitter/order:
     -trial NAME DUR COUNT         a trial type: COUNT per run, DUR seconds
     -miniblock NAME ITEMS COUNT   items shown in order, each LABEL:DUR[:OFF][xN]
+    -block NAME DUR COUNT         a block (one long item, counted as a block)
     -null DUR COUNT               blank trials (time with no event)
     -isi SPEC                     default gap between trials/blocks (offset to onset)
     -within_isi SPEC              default gap between items inside a miniblock
@@ -26,6 +27,19 @@ miniblock: the LAST item's OFF is the gap to the next unit and overrides -isi.
 Items without an OFF use -within_isi (inside) and -isi (after the unit).
 "A:1:0.5x10" repeats an item. "null" is time without an event; uniform, exp
 and poisson cannot be condition names.
+
+HOW MANY -- each family (events: -trial/-null; blocks: -block/-miniblock) is
+fixed by exactly one thing:
+    COUNTs alone       as given; run length is whatever they take
+    -num_events N      total -trial units per run; COUNTs become weights
+                       (-trial A 2 3 -trial B 2 1 -num_events 40 -> 30 A, 10 B),
+                       and -null scales along with them
+    -num_blocks N      the same for -block/-miniblock units
+    -scan_time S       S seconds per run (fixed volumes). Families without a
+                       total are scaled to fill it on average; with every
+                       family fixed it only sets the run length (leftover time
+                       is trailing fixation). Events jitter pushes past the end
+                       are dropped and counted, as on a scanner.
 
 NOISE -- tSNR levels (-tsnr 20 50 100) with a physiological share and its
 correlation time in seconds (-phys_fraction, -tau), or calibrated from a real
@@ -104,6 +118,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "(repeatable). The last item's OFF is the gap to the next unit.",
     )
     t.add_argument(
+        "-block",
+        nargs=3,
+        action="append",
+        metavar=("NAME", "DUR", "COUNT"),
+        help="A block: one long item, counted with -num_blocks (repeatable).",
+    )
+    t.add_argument(
         "-null",
         nargs=2,
         action="append",
@@ -121,6 +142,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Order of units within a run.",
     )
     t.add_argument("-nruns", type=int, default=1, help="Runs (described experiment).")
+    t.add_argument("-scan_time", type=float, metavar="S", help="Seconds per run (fixed volumes).")
+    t.add_argument("-num_events", type=int, metavar="N", help="-trial units per run in total.")
+    t.add_argument("-num_blocks", type=int, metavar="N", help="-block/-miniblock units per run.")
     t.add_argument(
         "-ndesigns",
         type=int,
@@ -235,7 +259,8 @@ def _spec_from_args(args):
     from fastfuncstuff.simulation.experiment import NULL, ExperimentSpec, Interval, Unit
 
     units = [Unit.parse(nm, f"{nm}:{d}", int(c)) for nm, d, c in (args.trial or [])]
-    units += [Unit.parse(nm, items, int(c)) for nm, items, c in (args.miniblock or [])]
+    units += [Unit.parse(nm, f"{nm}:{d}", int(c), "block") for nm, d, c in (args.block or [])]
+    units += [Unit.parse(nm, items, int(c), "block") for nm, items, c in (args.miniblock or [])]
     units += [
         Unit.parse(f"null{i}", f"{NULL}:{d}", int(c)) for i, (d, c) in enumerate(args.null or [])
     ]
@@ -248,6 +273,9 @@ def _spec_from_args(args):
         initial_fix=args.initial_fix,
         post_fix=args.post_fix,
         order=args.order,
+        scan_time=args.scan_time,
+        num_events=args.num_events,
+        num_blocks=args.num_blocks,
     )
 
 
@@ -315,6 +343,12 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
         c: [sum(len(o) for o in r.onsets[i]) for r in reals]
         for i, c in enumerate(reals[0].conditions)
     }
+    dropped = sum(r.n_dropped for r in reals)
+    if dropped:
+        out.append(
+            f"note: {dropped} event(s) over {len(reals)} realization(s) fell past -scan_time "
+            "and were dropped"
+        )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
     out.append(
         "response pattern: "
@@ -555,10 +589,10 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.simulation.experiment import default_contrasts, parse_contrast, realize
     from fastfuncstuff.simulation.power import simulate_realizations_power
 
-    described = bool(args.trial or args.miniblock)
+    described = bool(args.trial or args.miniblock or args.block)
     if described == bool(args.events):
         print(
-            "ERROR: give either -events or a described experiment (-trial/-miniblock)",
+            "ERROR: give either -events or a described experiment (-trial/-block/-miniblock)",
             file=sys.stderr,
         )
         return 1
