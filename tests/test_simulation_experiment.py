@@ -107,3 +107,47 @@ def test_contrasts():
     assert list(default_contrasts(["A", "B", "C"])) == ["A", "B", "C", "A-B", "A-C", "B-C"]
     with pytest.raises(ValueError, match="unknown condition"):
         parse_contrast("A-D", ["A", "B"])
+
+
+class TestItemOffsets:
+    """LABEL:DUR[:OFF][xN]: a per-position gap after each item, jitterable."""
+
+    def test_parse_the_mixed_example(self):
+        u = Unit.parse("ABC", "A:0.5:0, B:2:2,C3:3:uniform:2,4", 10)
+        assert [(i.condition, i.duration, str(i.off)) for i in u.items] == [
+            ("A", 0.5, "0"),
+            ("B", 2.0, "2"),
+            ("C3", 3.0, "uniform:2,4"),
+        ]
+
+    def test_specs_with_commas_stay_with_their_item(self):
+        u = Unit.parse("x", "A:2:exp:4,2,12,B:1", 1)
+        assert [i.condition for i in u.items] == ["A", "B"]
+        assert str(u.items[0].off) == "exp:4,2,12" and u.items[1].off is None
+
+    def test_interval_kinds_cannot_name_conditions(self):
+        with pytest.raises(ValueError, match="interval spec"):
+            Unit.parse("x", "uniform:2", 1)
+
+    def test_timeline_follows_the_offsets(self):
+        u = Unit.parse("ABC", "A:0.5:0, B:2:2, C:3:uniform:2,4", 12)
+        r = realize(ExperimentSpec(tr=1, units=[u], isi=Interval.parse(99)), 0)
+        a, b, c = (np.asarray(x[0]) for x in r.onsets)
+        np.testing.assert_allclose(b - a, 0.5)  # no gap after A
+        np.testing.assert_allclose(c - b, 4.0)  # 2 s on + 2 s off
+        between = a[1:] - (c[:-1] + 3.0)  # C's OFF overrides -isi 99
+        assert between.min() >= 2.0 - 1e-9 and between.max() <= 4.0 + 1e-9
+        assert between.std() > 0.2
+
+    def test_jittered_within_gaps_are_actually_jittered(self):
+        """Drawn one unit at a time, a mean-matched 1-sample draw is the mean itself."""
+        spec = ExperimentSpec(
+            tr=2,
+            units=[Unit.parse("AB", "A:2,B:2", 20)],
+            within_isi=Interval.parse("exp:3,1,8"),
+            isi=Interval.parse(8),
+        )
+        r = realize(spec, 0)
+        gaps = np.asarray(r.onsets[1][0]) - np.asarray(r.onsets[0][0]) - 2.0
+        assert gaps.std() > 0.5
+        assert gaps.mean() == pytest.approx(3.0, rel=0.02)

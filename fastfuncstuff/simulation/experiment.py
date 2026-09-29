@@ -1,28 +1,37 @@
 """Describe an experiment instead of listing its events, then draw realizations of it.
 
 One abstraction covers event-related, block and miniblock designs: a run is a
-sequence of **units**. A unit is one or more **items** -- a condition shown for
-a duration -- separated by a *within-unit* interval, and units are separated by
-a *between-unit* interval.
+sequence of **units**, and a unit is one or more **items**. Each item is
 
-    event-related trial   one item          -trial A 2 20
-    block                 one long item     -trial A 20 5
-    block of events       one item x10      -miniblock A "A:1x10" 5
-    miniblock             several items     -miniblock AB "A:2,B:2" 10
+    LABEL:DUR[:OFF][xN]
 
-The reserved condition ``null`` occupies time without producing an event, which
-is how blank trials are described. Intervals are measured offset-to-onset (the
-gap between one stimulus ending and the next starting), and can be fixed or
-jittered -- see :class:`Interval`. Every realization is one seed: a design that
-is "20 trials with exponential jitter" is a distribution over event lists, and
-power is a property of that distribution, not of one draw from it.
+a condition shown for DUR seconds, then OFF seconds of nothing before whatever
+comes next, repeated N times. OFF is any :class:`Interval` spec, so it can be
+fixed or jittered per position:
+
+    -miniblock ABC "A:0.5:0, B:2:2, C:3:uniform:2,4" 10
+
+is A for 0.5 s, straight into B for 2 s, 2 s off, C for 3 s, then 2-4 s before
+the next unit. The last item's OFF is the gap to the next unit; items without
+an OFF fall back to ``-within_isi`` inside a unit and ``-isi`` after it, so
+
+    event-related trial   -trial A 2 20              (gap from -isi)
+    per-type ITI          -miniblock A "A:2:exp:4,2,12" 20
+    block                 -trial A 20 5
+    block of events       -miniblock A "A:1:0.5x10" 5
+
+The reserved condition ``null`` occupies time without producing an event, and
+``uniform``/``exp``/``poisson`` cannot be condition names (they start interval
+specs). Intervals are offset-to-onset. Every realization is one seed: a
+jittered design is a distribution over event lists, and power is a property
+of that distribution, not of one draw from it.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -95,6 +104,28 @@ class Interval:
 class Item:
     condition: str
     duration: float
+    off: Interval | None = None  # gap after this item; None -> -within_isi / -isi
+
+
+_INTERVAL_KINDS = ("uniform", "exp", "poisson")
+_ITEM = re.compile(r"([A-Za-z_][\w.]*):([\d.]+)(?::(.+?))?(?:[x*](\d+))?")
+
+
+def _split_items(text: str) -> list[str]:
+    """Split on commas, except those inside an OFF spec such as ``uniform:2,4``.
+
+    A new item starts only at ``NAME:`` where NAME is not an interval kind; any
+    other comma-separated piece belongs to the item before it.
+    """
+    items: list[str] = []
+    for piece in (p.strip() for p in text.replace(";", ",").split(",")):
+        head = re.match(r"([A-Za-z_][\w.]*):", piece)
+        starts_item = head is not None and head.group(1).lower() not in _INTERVAL_KINDS
+        if starts_item or not items:
+            items.append(piece)
+        else:
+            items[-1] += "," + piece
+    return [i for i in items if i]
 
 
 @dataclass
@@ -107,14 +138,21 @@ class Unit:
 
     @classmethod
     def parse(cls, name: str, items: str, count: int) -> Unit:
-        """``items`` is ``COND:DUR[xN]`` joined by commas, e.g. ``A:2,B:2`` or ``A:1x10``."""
+        """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring)."""
         parsed: list[Item] = []
-        for token in items.split(","):
-            m = re.fullmatch(r"\s*([A-Za-z_][\w.]*)\s*:\s*([\d.]+)\s*(?:[x*]\s*(\d+))?\s*", token)
+        for token in _split_items(items):
+            m = _ITEM.fullmatch(token.replace(" ", ""))
             if m is None:
-                raise ValueError(f"cannot parse item {token!r} in {items!r}: use COND:DUR[xN]")
-            reps = int(m.group(3) or 1)
-            parsed += [Item(m.group(1), float(m.group(2)))] * reps
+                raise ValueError(
+                    f"cannot parse item {token!r} in {items!r}: use LABEL:DUR[:OFF][xN]"
+                )
+            label = m.group(1)
+            if label.lower() in _INTERVAL_KINDS:
+                raise ValueError(f"{label!r} starts an interval spec and cannot name a condition")
+            off = Interval.parse(m.group(3)) if m.group(3) else None
+            parsed += [Item(label, float(m.group(2)), off)] * int(m.group(4) or 1)
+        if not parsed:
+            raise ValueError(f"unit {name!r} has no items")
         if count < 1:
             raise ValueError(f"unit {name!r}: count must be >= 1")
         return cls(name, parsed, int(count))
@@ -161,7 +199,10 @@ class ExperimentSpec:
             f"between units: {self.isi}   within units: {self.within_isi}",
         ]
         for u in self.units:
-            items = ", ".join(f"{it.condition}:{it.duration:g}" for it in u.items)
+            items = ", ".join(
+                f"{it.condition}:{it.duration:g}" + (f":{it.off}" if it.off else "")
+                for it in u.items
+            )
             lines.append(f"  unit {u.name:<10} x{u.count:<4} [{items}]")
         return "\n".join(lines)
 
@@ -191,22 +232,43 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
     run_lengths, run_durations = [], []
 
     for run in range(spec.n_runs):
-        order = generate_event_sequence(
-            [u.count for u in spec.units], len(spec.units), ordering=spec.order, rng=rng
-        )
-        gaps = spec.isi.sample(len(order) - 1, rng, spec.tr)
+        order = [
+            int(u)
+            for u in generate_event_sequence(
+                [u.count for u in spec.units], len(spec.units), ordering=spec.order, rng=rng
+            )
+        ]
+        # Every gap slot in the run: (unit position k, item j) -> the interval it
+        # draws from. The last unit's trailing gap is replaced by -post_fix.
+        slots: dict[Any, list[tuple[int, int]]] = {}
+        specs: dict[Any, Interval] = {}
+        for k, ui in enumerate(order):
+            items = spec.units[ui].items
+            for j, item in enumerate(items):
+                last = j == len(items) - 1
+                if last and k == len(order) - 1:
+                    continue
+                if item.off is not None:
+                    key: Any = ("item", ui, j)
+                    specs[key] = item.off
+                else:
+                    key = "isi" if last else "within"
+                    specs[key] = spec.isi if last else spec.within_isi
+                slots.setdefault(key, []).append((k, j))
+        # Draw each slot family in one call over the whole run. The mean-matched
+        # generators force a single draw to the mean, so drawing gap by gap (as
+        # the within-unit gaps once were) silently removed all jitter.
+        gap: dict[tuple[int, int], float] = {}
+        for key, where in slots.items():
+            for pos, value in zip(where, specs[key].sample(len(where), rng, spec.tr), strict=True):
+                gap[pos] = float(value)
+
         t = spec.initial_fix
-        for k, unit_idx in enumerate(order):
-            unit = spec.units[int(unit_idx)]
-            within = spec.within_isi.sample(len(unit.items) - 1, rng, spec.tr)
-            for j, item in enumerate(unit.items):
+        for k, ui in enumerate(order):
+            for j, item in enumerate(spec.units[ui].items):
                 if item.condition != NULL:
                     onsets[item.condition][run].append(t)
-                t += item.duration
-                if j < len(unit.items) - 1:
-                    t += within[j]
-            if k < len(order) - 1:
-                t += gaps[k]
+                t += item.duration + gap.get((k, j), 0.0)
         t += spec.post_fix
         run_durations.append(t)
         run_lengths.append(int(np.ceil(t / spec.tr - 1e-9)))

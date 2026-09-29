@@ -10,13 +10,22 @@ AFNI timing files, one per condition, one row per run, onsets in seconds.
 
 or a described experiment, realized -ndesigns times with fresh jitter/order:
     -trial NAME DUR COUNT         a trial type: COUNT per run, DUR seconds
-    -miniblock NAME ITEMS COUNT   items shown together, e.g. "A:2,B:2" or "A:1x10"
+    -miniblock NAME ITEMS COUNT   items shown in order, each LABEL:DUR[:OFF][xN]
     -null DUR COUNT               blank trials (time with no event)
-    -isi SPEC                     gap between trials/blocks (offset to onset)
-    -within_isi SPEC              gap between items inside a miniblock
+    -isi SPEC                     default gap between trials/blocks (offset to onset)
+    -within_isi SPEC              default gap between items inside a miniblock
     -initial_fix S / -post_fix S  fixation before the first / after the last
 SPEC is a fixed number of seconds, uniform:LO,HI, exp:MEAN,MIN,MAX or
 poisson:MEAN,MIN,MAX. A block is a -trial with a long duration.
+
+An item's OFF is the gap after it, and takes any SPEC, so every position can
+have its own (jittered) gap:
+    -miniblock ABC "A:0.5:0, B:2:2, C:3:uniform:2,4" 10
+is A 0.5 s, straight into B 2 s, 2 s off, C 3 s, then 2-4 s to the next
+miniblock: the LAST item's OFF is the gap to the next unit and overrides -isi.
+Items without an OFF use -within_isi (inside) and -isi (after the unit).
+"A:1:0.5x10" repeats an item. "null" is time without an event; uniform, exp
+and poisson cannot be condition names.
 
 NOISE -- tSNR levels (-tsnr 20 50 100) with a physiological share and its
 correlation time in seconds (-phys_fraction, -tau), or calibrated from a real
@@ -91,7 +100,8 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=3,
         action="append",
         metavar=("NAME", "ITEMS", "COUNT"),
-        help='Items shown together, e.g. "A:2,B:2" or "A:1x10" (repeatable).',
+        help='Items in order, each LABEL:DUR[:OFF][xN], e.g. "A:0.5:0, B:2:uniform:2,4" '
+        "(repeatable). The last item's OFF is the gap to the next unit.",
     )
     t.add_argument(
         "-null",
