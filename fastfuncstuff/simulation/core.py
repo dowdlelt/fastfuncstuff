@@ -631,3 +631,141 @@ def save_simulation_outputs(
         "nifti_files": nifti_files,
         "metadata_file": metadata_file,
     }
+
+
+def simulate_bold(
+    onsets: list[list[np.ndarray | list[float]]],
+    durations: list[float],
+    tr: float,
+    n_timepoints_per_run: list[int] | int,
+    amplitude_psc: float | list[float] | torch.Tensor | np.ndarray,
+    tsnr: float | torch.Tensor | np.ndarray,
+    phys_fraction: float | torch.Tensor | np.ndarray = 0.5,
+    tau: float | torch.Tensor | np.ndarray = 6.0,
+    n_voxels: int | None = None,
+    baseline: float = 100.0,
+    hrf_bases: torch.Tensor | None = None,
+    microtime_dt: float | None = None,
+    drift_amplitude: float = 0.0,
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> dict[str, Any]:
+    """Simulate BOLD timeseries from events in seconds, at any TR, with a known noise model.
+
+    Timing is not tied to the TR grid: events at whole seconds sampled at
+    TR = 1.25, say, go through the same microtime design builder the GLM tools
+    fit with (:func:`build_event_design_microtime`), so the simulated response
+    and the analysis model are built identically.
+
+    Signal: ``baseline * amplitude_psc / 100 * regressor``, with regressors at
+    AFNI's unit-peak convention, so ``amplitude_psc`` is the peak percent signal
+    change of an isolated event of that condition. Noise:
+    :func:`generate_thermal_physio_noise`, generated independently per run.
+
+    Parameters
+    ----------
+    onsets : list (per condition) of lists (per run) of onset times in seconds
+    durations : list of float, one per condition (0 = impulse)
+    tr : float
+    n_timepoints_per_run : list of int, or one int for a single run
+    amplitude_psc : (n_conditions,) or (n_voxels, n_conditions)
+    tsnr, phys_fraction, tau : scalar or (n_voxels,); tau in seconds
+    hrf_bases : (n_bases, n_microtime) response at ``microtime_dt``; default SPMG1.
+        With several bases, amplitude_psc must give one value per column.
+    microtime_dt : float, optional
+        Defaults to the largest step <= 0.05 s that divides the TR, so onsets
+        land within 25 ms of where they were asked for.
+    drift_amplitude : float
+        Drift std as a fraction of each voxel's noise std (0 = none).
+
+    Returns
+    -------
+    dict with 'data' (n_voxels, n_timepoints), 'signal', 'noise' (same shape),
+    'design' (n_timepoints, n_columns), 'run_starts', 'microtime_dt', and the
+    per-voxel 'tsnr', 'phys_fraction', 'tau', 'arma_a', 'arma_b'.
+    """
+    from fastfuncstuff.design.hrf import get_spmg1_hrf
+    from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
+        commensurate_microtime_dt,
+    )
+
+    from .noise import generate_thermal_physio_noise, ou_to_arma11
+
+    if device is None:
+        device = get_device()
+    if isinstance(n_timepoints_per_run, int):
+        n_timepoints_per_run = [n_timepoints_per_run]
+    if microtime_dt is None:
+        microtime_dt = commensurate_microtime_dt(tr, 0.05)
+    if hrf_bases is None:
+        hrf_bases = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
+
+    design = build_event_design_microtime(
+        all_onsets=[[np.asarray(r, dtype=np.float64) for r in cond] for cond in onsets],
+        durations=list(durations),
+        hrf_bases=hrf_bases,
+        n_timepoints_per_run=n_timepoints_per_run,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        device=device,
+    )
+    assert isinstance(design, torch.Tensor)
+    design = design.to(torch.float32)
+    n_columns = design.shape[1]
+
+    amps = torch.as_tensor(amplitude_psc, dtype=torch.float32, device=device)
+    if amps.ndim == 0:
+        amps = amps.expand(n_columns)
+    if n_voxels is None:
+        sizes = [
+            torch.as_tensor(v).numel()
+            for v in (tsnr, phys_fraction, tau)
+            if np.ndim(v) or torch.is_tensor(v)
+        ]
+        n_voxels = max(sizes + ([amps.shape[0]] if amps.ndim == 2 else []), default=1)
+    if amps.ndim == 1:
+        amps = amps.unsqueeze(0).expand(n_voxels, -1)
+    if amps.shape != (n_voxels, n_columns):
+        raise ValueError(
+            f"amplitude_psc must be ({n_columns},) or ({n_voxels}, {n_columns}); got "
+            f"{tuple(amps.shape)}"
+        )
+
+    signal = (baseline / 100.0) * (amps @ design.T)  # (n_voxels, n_timepoints)
+
+    noise_runs = []
+    for n_run in n_timepoints_per_run:
+        run_noise = generate_thermal_physio_noise(
+            n_run,
+            tr,
+            tsnr,
+            phys_fraction,
+            tau,
+            baseline=baseline,
+            n_voxels=n_voxels,
+            device=device,
+            generator=generator,
+        )
+        if drift_amplitude > 0:
+            run_noise = add_drift(
+                run_noise, amplitude=drift_amplitude, device=device, generator=generator
+            )
+        noise_runs.append(run_noise)
+    noise = torch.cat(noise_runs, dim=0).T
+
+    run_starts = np.concatenate([[0], np.cumsum(n_timepoints_per_run)[:-1]]).astype(int)
+    a, b = ou_to_arma11(tr, torch.as_tensor(tau).expand(n_voxels), phys_fraction)
+    return {
+        "data": baseline + signal + noise,
+        "signal": signal,
+        "noise": noise,
+        "design": design,
+        "run_starts": run_starts.tolist(),
+        "microtime_dt": microtime_dt,
+        "tsnr": torch.as_tensor(tsnr).expand(n_voxels),
+        "phys_fraction": torch.as_tensor(phys_fraction).expand(n_voxels),
+        "tau": torch.as_tensor(tau).expand(n_voxels),
+        "arma_a": a,
+        "arma_b": b,
+    }

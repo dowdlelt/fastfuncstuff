@@ -1101,3 +1101,151 @@ def estimate_sfnr(
         "sfnr_map": sfnr_map,
         "summary": f"SFNR = {sfnr_mean:.1f} ± {sfnr_std:.1f} (median={sfnr_median:.1f})",
     }
+
+
+def _per_voxel(value: float | torch.Tensor | np.ndarray, n_voxels: int, device, name: str):
+    """A scalar or one value per voxel, as a float64 (n_voxels,) tensor."""
+    t = torch.as_tensor(value, dtype=torch.float64, device=device).flatten()
+    if t.numel() == 1:
+        return t.expand(n_voxels).clone()
+    if t.numel() != n_voxels:
+        raise ValueError(f"{name} must be a scalar or have {n_voxels} values, got {t.numel()}")
+    return t
+
+
+def ou_to_arma11(
+    tr: float,
+    tau: float | torch.Tensor | np.ndarray,
+    phys_fraction: float | torch.Tensor | np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AFNI ARMA(1,1) (a, b) of white noise plus an Ornstein-Uhlenbeck process.
+
+    A continuous process with correlation exp(-|dt| / tau), sampled every TR and
+    added to white noise, has autocorrelation r(0) = 1, r(k) = f * phi**k with
+    phi = exp(-TR / tau) and f its share of the variance. That is exactly
+    ARMA(1,1) (Purdon & Weisskoff 1998) in AFNI's form r(k) = lambda * a**(k-1):
+
+        a = phi,   lambda = f * phi
+
+    and b is the invertible (|b| <= 1) root of
+    lambda = (a + b)(1 + a b) / (1 + 2 a b + b^2), a quadratic in b whose roots
+    are b and 1/b. f = 1 gives b = 0 (pure AR(1)), f = 0 gives b = -a (white).
+
+    Because a is set by TR / tau, the same tau gives a wider autocorrelation *in
+    samples* at a shorter TR -- which is how a physical process behaves.
+    """
+    tau_t = torch.as_tensor(tau, dtype=torch.float64)
+    f = torch.as_tensor(phys_fraction, dtype=torch.float64)
+    a = torch.exp(-tr / tau_t)
+    lam = f * a
+    # (lam - a) b^2 + (2 a lam - 1 - a^2) b + (lam - a) = 0
+    qa = lam - a
+    qb = 2 * a * lam - 1 - a**2
+    disc = (qb**2 - 4 * qa**2).clamp_min(0.0)
+    safe_qa = torch.where(qa.abs() < 1e-12, torch.full_like(qa, -1e-12), qa)
+    b = torch.where(
+        qa.abs() < 1e-12, torch.zeros_like(qa), (-qb - torch.sqrt(disc)) / (2 * safe_qa)
+    )
+    # Of the pair (b, 1/b) keep the invertible one.
+    b = torch.where(b.abs() > 1, 1 / b, b)
+    return a, b
+
+
+def arma11_to_ou(
+    tr: float, a: float | torch.Tensor | np.ndarray, b: float | torch.Tensor | np.ndarray
+) -> dict[str, torch.Tensor]:
+    """Inverse of :func:`ou_to_arma11`: read tau (s) and the physiological share off (a, b).
+
+    Lets per-voxel ARMA maps from ffs_reml -- fitted on real data at any TR --
+    calibrate a simulation in TR-independent units. ``representable`` is False
+    where lambda > a (b > 0): extra short-lag correlation, e.g. from slice-timing
+    interpolation or smoothing, that white noise plus one exponential cannot make.
+    """
+    from fastfuncstuff.glm.arma import _compute_arma11_lambda
+
+    a_t = torch.as_tensor(a, dtype=torch.float64)
+    b_t = torch.as_tensor(b, dtype=torch.float64)
+    lam = torch.as_tensor(_compute_arma11_lambda(a_t, b_t), dtype=torch.float64)
+    tau = torch.where(a_t > 0, -tr / torch.log(a_t.clamp(1e-12, 1 - 1e-12)), torch.zeros_like(a_t))
+    f = torch.where(a_t > 0, lam / a_t.clamp_min(1e-12), torch.zeros_like(a_t))
+    return {"tau": tau, "phys_fraction": f, "representable": (f >= 0) & (f <= 1 + 1e-9)}
+
+
+def kruger_glover_tsnr(
+    tsnr0: float | torch.Tensor, lam: float | torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """tSNR and physiological variance share from Krüger & Glover (2001).
+
+    Thermal noise is fixed (image SNR ``tsnr0`` = S / sigma_0); physiological
+    noise scales with the signal, sigma_p = lam * S. So
+    tSNR = 1 / sqrt(1 / tsnr0^2 + lam^2), saturating at 1 / lam however good the
+    images get, and the physiological share is lam^2 / (1 / tsnr0^2 + lam^2).
+    Useful for asking what changes when voxels shrink or the field goes up.
+    """
+    tsnr0 = torch.as_tensor(tsnr0, dtype=torch.float64)
+    lam = torch.as_tensor(lam, dtype=torch.float64)
+    total = 1.0 / tsnr0**2 + lam**2
+    return 1.0 / torch.sqrt(total), lam**2 / total
+
+
+def generate_thermal_physio_noise(
+    n_timepoints: int,
+    tr: float,
+    tsnr: float | torch.Tensor | np.ndarray,
+    phys_fraction: float | torch.Tensor | np.ndarray = 0.5,
+    tau: float | torch.Tensor | np.ndarray = 6.0,
+    baseline: float = 100.0,
+    n_voxels: int | None = None,
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Thermal (white) plus physiological (tau-second exponential) noise, at a given tSNR.
+
+    The noise std is ``baseline / tsnr``. A share ``phys_fraction`` of its
+    variance is an Ornstein-Uhlenbeck process with correlation time ``tau``
+    seconds, the rest is white. Sampled at ``tr`` that is ARMA(1,1) with
+    a = exp(-tr / tau) (see :func:`ou_to_arma11`), so the autocorrelation widens
+    in samples as TR shortens while the white share -- most of the noise at low
+    tSNR -- stays white. Each parameter may be a scalar or one value per voxel.
+
+    Returns (n_timepoints, n_voxels), zero-mean, float32. Drift is not included;
+    add it with :func:`add_drift`. Generate each run separately: runs are
+    independent realisations.
+    """
+    if device is None:
+        device = get_device()
+    sizes = [
+        torch.as_tensor(v).numel()
+        for v in (tsnr, phys_fraction, tau)
+        if np.ndim(v) or torch.is_tensor(v)
+    ]
+    if n_voxels is None:
+        n_voxels = max(sizes, default=1)
+    tsnr_v = _per_voxel(tsnr, n_voxels, device, "tsnr")
+    f_v = _per_voxel(phys_fraction, n_voxels, device, "phys_fraction")
+    tau_v = _per_voxel(tau, n_voxels, device, "tau")
+    if (tsnr_v <= 0).any():
+        raise ValueError("tsnr must be positive")
+    if ((f_v < 0) | (f_v > 1)).any():
+        raise ValueError("phys_fraction must be in [0, 1]")
+    if (tau_v <= 0).any():
+        raise ValueError("tau must be positive (seconds)")
+
+    sigma = baseline / tsnr_v
+    sigma_white = sigma * torch.sqrt(1.0 - f_v)
+    sigma_phys = sigma * torch.sqrt(f_v)
+    phi = torch.exp(-tr / tau_v)
+    innov_scale = torch.sqrt(1.0 - phi**2)
+
+    white = torch.randn(
+        n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
+    )
+    innov = torch.randn(
+        n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
+    )
+    phys = torch.empty_like(innov)
+    phys[0] = innov[0]  # stationary start: unit variance from the first sample
+    for t in range(1, n_timepoints):
+        phys[t] = phi * phys[t - 1] + innov_scale * innov[t]
+    noise = sigma_white * white + sigma_phys * phys
+    return noise.to(torch.float32)

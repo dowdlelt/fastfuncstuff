@@ -808,3 +808,78 @@ def compare_designs(
     results["summary_table"] = summary_table
 
     return results
+
+
+def design_contrast_variance(
+    design: torch.Tensor | np.ndarray,
+    contrasts: torch.Tensor | np.ndarray,
+    n_timepoints_per_run: list[int] | None = None,
+    poly_degree: int = 2,
+    arma_a: float = 0.0,
+    arma_b: float = 0.0,
+    extra_nuisance: torch.Tensor | np.ndarray | None = None,
+) -> torch.Tensor:
+    """Variance of each contrast's GLS estimate, per unit noise variance.
+
+    Works on any design matrix -- sub-TR onsets, durations, basis sets -- so it
+    covers what the TR-grid Liu & Frank metrics cannot. The model is the one
+    the GLM tools fit: task columns, per-run Legendre polynomials in
+    block-diagonal form (glm.core.construct_polynomial_matrix), and ARMA(1,1)
+    noise in AFNI's (a, b) form, block-diagonal across runs. Returns
+    c (X^T R^-1 X)^-1 c^T with R the noise *correlation* matrix, so multiplying
+    by the noise variance ((baseline / tSNR)^2) gives Var(c beta_hat), and
+
+        expected t = c beta / sqrt(variance * sigma^2)
+
+    Inestimable contrasts return inf.
+
+    Parameters
+    ----------
+    design : (n_timepoints, n_columns) task regressors
+    contrasts : (n_contrasts, n_columns) or (n_columns,)
+    n_timepoints_per_run : run lengths; default one run
+    poly_degree : per-run Legendre degree (-1 = none)
+    arma_a, arma_b : AFNI ARMA(1,1) parameters (0, 0 = white);
+        see simulation.noise.ou_to_arma11 for the physical parametrisation
+    extra_nuisance : (n_timepoints, l) further nuisance columns
+
+    Returns
+    -------
+    (n_contrasts,) float64 tensor
+    """
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    cpu = torch.device("cpu")
+    X = torch.as_tensor(design, dtype=torch.float64, device=cpu)
+    C = torch.as_tensor(contrasts, dtype=torch.float64, device=cpu)
+    if C.ndim == 1:
+        C = C.unsqueeze(0)
+    n_t, n_task = X.shape
+    if C.shape[1] != n_task:
+        raise ValueError(f"contrasts have {C.shape[1]} columns, design has {n_task}")
+    runs = list(n_timepoints_per_run) if n_timepoints_per_run is not None else [n_t]
+    if sum(runs) != n_t:
+        raise ValueError(f"run lengths sum to {sum(runs)}, design has {n_t} rows")
+
+    blocks = [construct_polynomial_matrix(n, poly_degree, cpu, torch.float64) for n in runs]
+    nuisance = torch.block_diag(*blocks) if poly_degree >= 0 else torch.empty(n_t, 0)
+    if extra_nuisance is not None:
+        nuisance = torch.cat(
+            [nuisance, torch.as_tensor(extra_nuisance, dtype=torch.float64)], dim=1
+        )
+    full = torch.cat([X, nuisance], dim=1)
+
+    if arma_a == 0.0 and arma_b == 0.0:
+        whitened = full
+    else:
+        run_starts = np.concatenate([[0], np.cumsum(runs)[:-1]]).astype(int).tolist()
+        R = build_arma11_covariance(arma_a, arma_b, n_t, cpu, torch.float64, run_starts=run_starts)
+        if R is None:
+            raise ValueError(f"ARMA(1,1) a={arma_a}, b={arma_b} is not a valid correlation")
+        L = torch.linalg.cholesky(R)
+        whitened = torch.linalg.solve_triangular(L, full, upper=False)
+
+    fisher = whitened.T @ whitened
+    L_full = torch.cat([C, torch.zeros(C.shape[0], nuisance.shape[1], dtype=torch.float64)], dim=1)
+    return torch.tensor(_contrast_variances(fisher, [row[None, :] for row in L_full]))
