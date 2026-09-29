@@ -633,6 +633,50 @@ def save_simulation_outputs(
     }
 
 
+def default_microtime_dt(tr: float) -> float:
+    """Largest step <= 0.05 s dividing the TR: onsets land within 25 ms of their request."""
+    from fastfuncstuff.design.matrices import commensurate_microtime_dt
+
+    return commensurate_microtime_dt(tr, 0.05)
+
+
+def build_task_design(
+    onsets: list[list[np.ndarray | list[float]]],
+    durations: list[float],
+    tr: float,
+    n_timepoints_per_run: list[int],
+    hrf_bases: torch.Tensor | None = None,
+    microtime_dt: float | None = None,
+    delay: float = 0.0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Unit-peak task regressors from events in seconds, via the GLM tools' builder.
+
+    ``delay`` shifts every onset (seconds) -- the truth for an HRF-latency
+    mismatch, fitted with the nominal onsets.
+    """
+    from fastfuncstuff.design.hrf import get_spmg1_hrf
+    from fastfuncstuff.design.matrices import build_event_design_microtime
+
+    if device is None:
+        device = get_device()
+    if microtime_dt is None:
+        microtime_dt = default_microtime_dt(tr)
+    if hrf_bases is None:
+        hrf_bases = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
+    design = build_event_design_microtime(
+        all_onsets=[[np.asarray(r, dtype=np.float64) + delay for r in cond] for cond in onsets],
+        durations=list(durations),
+        hrf_bases=hrf_bases,
+        n_timepoints_per_run=list(n_timepoints_per_run),
+        tr=tr,
+        microtime_dt=microtime_dt,
+        device=device,
+    )
+    assert isinstance(design, torch.Tensor)
+    return design.to(torch.float32)
+
+
 def simulate_bold(
     onsets: list[list[np.ndarray | list[float]]],
     durations: list[float],
@@ -688,12 +732,6 @@ def simulate_bold(
     'design' (n_timepoints, n_columns), 'run_starts', 'microtime_dt', and the
     per-voxel 'tsnr', 'phys_fraction', 'tau', 'arma_a', 'arma_b'.
     """
-    from fastfuncstuff.design.hrf import get_spmg1_hrf
-    from fastfuncstuff.design.matrices import (
-        build_event_design_microtime,
-        commensurate_microtime_dt,
-    )
-
     from .noise import generate_thermal_physio_noise, ou_to_arma11
 
     if device is None:
@@ -701,21 +739,10 @@ def simulate_bold(
     if isinstance(n_timepoints_per_run, int):
         n_timepoints_per_run = [n_timepoints_per_run]
     if microtime_dt is None:
-        microtime_dt = commensurate_microtime_dt(tr, 0.05)
-    if hrf_bases is None:
-        hrf_bases = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
-
-    design = build_event_design_microtime(
-        all_onsets=[[np.asarray(r, dtype=np.float64) for r in cond] for cond in onsets],
-        durations=list(durations),
-        hrf_bases=hrf_bases,
-        n_timepoints_per_run=n_timepoints_per_run,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        device=device,
+        microtime_dt = default_microtime_dt(tr)
+    design = build_task_design(
+        onsets, durations, tr, n_timepoints_per_run, hrf_bases, microtime_dt, device=device
     )
-    assert isinstance(design, torch.Tensor)
-    design = design.to(torch.float32)
     n_columns = design.shape[1]
 
     amps = torch.as_tensor(amplitude_psc, dtype=torch.float32, device=device)

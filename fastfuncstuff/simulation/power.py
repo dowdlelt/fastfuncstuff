@@ -32,6 +32,17 @@ from scipy import stats
 from .noise import generate_thermal_physio_noise, ou_to_arma11
 
 
+def _two_tailed_power(crit: float, dof: float, nc: float) -> float:
+    """P(|T| > crit) for noncentral t, by symmetry on |nc|.
+
+    scipy's nct.cdf returns nan far in the tail (nc = 16 at 150 dof), where the
+    wrong-sign tail it would contribute is < 1e-50 anyway.
+    """
+    nc = abs(nc)
+    far = float(stats.nct.cdf(-crit, dof, nc))
+    return float(stats.nct.sf(crit, dof, nc)) + (0.0 if np.isnan(far) else far)
+
+
 def _nuisance(run_lengths: list[int], poly_degree: int) -> torch.Tensor:
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
@@ -209,9 +220,7 @@ def simulate_design_power(
                 true_eff = float(C[i, :n_cond] @ pattern) * amp  # PSC
                 sd_pred = sigma * float(torch.sqrt(v_true[i])) / scale  # PSC
                 nc = true_eff / sd_pred if sd_pred > 0 else 0.0
-                p_pred = float(
-                    stats.nct.sf(crit_corr, dof_corr, nc) + stats.nct.cdf(-crit_corr, dof_corr, nc)
-                )
+                p_pred = _two_tailed_power(crit_corr, dof_corr, nc)
                 rows.append(
                     {
                         "noise": label,
@@ -266,3 +275,75 @@ def amplitude_for_power(
         else:
             out[key] = float(np.interp(target, [pw[j - 1], pw[j]], [amps[j - 1], amps[j]]))
     return out
+
+
+def simulate_realizations_power(
+    realizations: list[Any],
+    tr: float,
+    contrasts: dict[str, list[float] | np.ndarray],
+    amplitudes: list[float] | np.ndarray,
+    noise: list[dict[str, Any]],
+    beta_pattern: list[float] | np.ndarray | None = None,
+    n_reps: int = 500,
+    alpha: float = 0.001,
+    true_delay: float = 0.0,
+    poly_degree: int | None = None,
+    device: torch.device | None = None,
+    seed: int = 0,
+    progress: bool = True,
+) -> dict[str, Any]:
+    """:func:`simulate_design_power` over several realizations of one experiment.
+
+    A jittered, shuffled design is a distribution over event lists, so its
+    power is too: each realization (from :func:`~.experiment.realize`, or any
+    object with ``onsets``, ``durations`` and ``run_lengths``) is simulated in
+    turn and its rows carry a ``design`` index. ``true_delay`` generates the
+    response that many seconds late while fitting the nominal onsets.
+    """
+    from tqdm import tqdm
+
+    from .core import build_task_design
+
+    rows: list[dict[str, Any]] = []
+    per_design = []
+    cpu = torch.device("cpu")
+    for i, real in enumerate(
+        tqdm(
+            realizations, desc="designs", leave=True, disable=not progress or len(realizations) < 2
+        )
+    ):
+        X = build_task_design(real.onsets, real.durations, tr, real.run_lengths, device=cpu)
+        X_true = None
+        if true_delay:
+            X_true = build_task_design(
+                real.onsets, real.durations, tr, real.run_lengths, delay=true_delay, device=cpu
+            )
+        res = simulate_design_power(
+            X,
+            list(real.run_lengths),
+            tr,
+            contrasts,
+            amplitudes,
+            noise,
+            beta_pattern=beta_pattern,
+            n_reps=n_reps,
+            poly_degree=poly_degree,
+            alpha=alpha,
+            true_design=X_true,
+            device=device,
+            seed=seed + 7919 * i,
+        )
+        for r in res["table"]:
+            r["design"] = i
+        rows += res["table"]
+        per_design.append(
+            {
+                "design": i,
+                "seed": getattr(real, "seed", i),
+                "run_lengths": list(real.run_lengths),
+                "dof": res["dof"],
+                "poly_degree": res["poly_degree"],
+                "X": X,
+            }
+        )
+    return {"table": rows, "alpha": alpha, "n_reps": n_reps, "designs": per_design}

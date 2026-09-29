@@ -112,3 +112,12 @@ def test_collinear_conditions_are_refused():
             device=CPU,
             n_reps=10,
         )
+
+
+def test_large_effects_do_not_produce_nan_power():
+    """scipy's noncentral-t cdf is nan deep in the tail."""
+    from fastfuncstuff.simulation.power import _two_tailed_power
+
+    assert _two_tailed_power(3.3, 150, 16.0) == pytest.approx(1.0)
+    assert _two_tailed_power(3.3, 150, -40.0) == pytest.approx(1.0)
+    assert _two_tailed_power(3.3, 150, 0.0) == pytest.approx(0.0012, abs=2e-4)
