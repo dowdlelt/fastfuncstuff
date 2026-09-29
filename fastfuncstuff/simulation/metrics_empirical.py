@@ -34,6 +34,22 @@ from scipy.linalg import toeplitz
 from fastfuncstuff.utils import linalg_lstsq
 
 
+def _with_baseline(X: torch.Tensor) -> torch.Tensor:
+    """Append a constant column unless the design already spans one.
+
+    Every real GLM fits a baseline, and without one the regressors' DC is
+    counted as usable signal. Measured on matched designs, that inflated a
+    block design's detection power 2.2x and a random one's 6.3x, compressing the
+    block advantage from 4.5x to 1.6x -- the bug metrics.py fixed on 2026-08-11,
+    left alive in this path, which is the one the design optimizer uses.
+    """
+    ones = torch.ones(X.shape[0], 1, device=X.device, dtype=X.dtype)
+    fit = linalg_lstsq(X, ones).solution
+    if torch.allclose(X @ fit, ones, atol=1e-4):
+        return X
+    return torch.cat([X, ones], dim=1)
+
+
 def estimate_ar1_coefficient(
     residuals: torch.Tensor | np.ndarray, device: torch.device | None = None
 ) -> float:
@@ -246,8 +262,8 @@ def compute_detection_power_empirical(
 
     Parameters
     ----------
-    data : array-like, shape (n_timepoints,) or (n_voxels, n_timepoints)
-        fMRI timeseries (single voxel or ROI average)
+    data : array-like, shape (n_timepoints,) or (n_timepoints, n_voxels)
+        fMRI timeseries; several voxels are averaged into one ROI series
     design : array-like, shape (n_timepoints, n_regressors)
         Design matrix (convolved with HRF)
     contrast : array-like, shape (n_regressors,), optional
@@ -298,6 +314,10 @@ def compute_detection_power_empirical(
         contrast = torch.tensor(contrast, dtype=torch.float32, device=device)
     else:
         contrast = contrast.to(device)
+
+    design = _with_baseline(design)
+    if design.shape[1] > n_regressors:
+        contrast = torch.cat([contrast, torch.zeros(1, device=device, dtype=contrast.dtype)])
 
     # Step 1: Estimate AR(1) coefficient if requested
     if estimate_ar1:
@@ -366,8 +386,8 @@ def compute_estimation_efficiency_empirical(
 
     Parameters
     ----------
-    data : array-like, shape (n_timepoints,) or (n_voxels, n_timepoints)
-        fMRI timeseries
+    data : array-like, shape (n_timepoints,) or (n_timepoints, n_voxels)
+        fMRI timeseries; several voxels are averaged into one ROI series
     onsets : array-like, shape (n_timepoints, n_conditions)
         Binary onset matrix
     n_conditions : int
@@ -437,6 +457,9 @@ def compute_estimation_efficiency_empirical(
                     col_idx = cond * hrf_length + lag
                     X_FIR[t + lag, col_idx] = 1.0
 
+    # The baseline goes last so the FIR columns keep their indices below.
+    X_FIR = _with_baseline(X_FIR)
+
     # Step 2: Estimate AR(1)
     if estimate_ar1:
         ols_betas = linalg_lstsq(X_FIR, data).solution
@@ -460,6 +483,11 @@ def compute_estimation_efficiency_empirical(
     # Kronecker product: contrast_cond ⊗ I
     # Result shape: (hrf_length, n_conditions * hrf_length)
     contrast_fir = torch.kron(contrast_cond, I_hrf)
+    n_extra = X_FIR.shape[1] - contrast_fir.shape[1]
+    if n_extra:
+        contrast_fir = torch.cat(
+            [contrast_fir, torch.zeros(hrf_length, n_extra, device=device)], dim=1
+        )
 
     # Var(contrast_fir' * β_FIR) = contrast_fir' * Var(β_FIR) * contrast_fir
     var_betas_fir = gls_results["var_betas_design"]
@@ -471,7 +499,7 @@ def compute_estimation_efficiency_empirical(
     return {
         "estimation_efficiency": estimation_efficiency,
         "rho": rho,
-        "betas_fir": gls_results["betas"],
+        "betas_fir": gls_results["betas"][: n_conditions * hrf_length],
         "var_contrast_fir": torch.trace(var_contrast_fir).item(),
         "hrf_estimate": gls_results["betas"][:hrf_length] if n_conditions == 1 else None,
     }

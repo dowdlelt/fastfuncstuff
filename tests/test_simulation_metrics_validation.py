@@ -478,3 +478,39 @@ class TestMetricsAgreeWithMonteCarlo:
         y = rng.standard_normal((n_t, n_sim))
         beta = np.linalg.lstsq(X, y, rcond=None)[0][:k]
         assert beta.var(axis=1).sum() == pytest.approx(1.0 / xi, rel=0.1)
+
+
+class TestEmpiricalPathMatchesTheory:
+    """metrics_empirical drives the design optimizer; it must agree with metrics.py.
+
+    It fitted no baseline, so the regressors' DC counted as signal -- the bug
+    metrics.py lost on 2026-08-11, still alive in the path that ranks designs.
+    """
+
+    @pytest.mark.parametrize("which", ["block", "random"])
+    def test_detection_power_agrees(self, which):
+        from fastfuncstuff.simulation.metrics_empirical import compute_detection_power_empirical
+
+        h = _canonical_hrf().astype(np.float64)
+        block = _block_design()
+        onsets = block if which == "block" else _matched_random_design(block)
+        X = np.convolve(onsets[:, 0].astype(np.float64), h)[:N_TIMEPOINTS, None]
+        y = np.random.default_rng(0).standard_normal(N_TIMEPOINTS)
+        empirical = compute_detection_power_empirical(
+            y, X.astype(np.float32), estimate_ar1=False, rho=0.0, device=CPU
+        )["detection_power"]
+        theory = compute_detection_power(onsets, h, 1, device=CPU)["total"] * float(h @ h)
+        assert empirical == pytest.approx(theory, rel=1e-3)
+
+    def test_estimation_efficiency_agrees(self):
+        from fastfuncstuff.simulation.metrics_empirical import (
+            compute_estimation_efficiency_empirical,
+        )
+
+        onsets = _random_multi(N_TIMEPOINTS, 1, 0.3, seed=8)
+        y = np.random.default_rng(1).standard_normal(N_TIMEPOINTS)
+        empirical = compute_estimation_efficiency_empirical(
+            y, onsets.astype(np.float32), 1, hrf_length=10, estimate_ar1=False, rho=0.0, device=CPU
+        )["estimation_efficiency"]
+        theory = compute_estimation_efficiency(onsets, 1, 10, device=CPU)["total"]
+        assert empirical == pytest.approx(theory, rel=1e-3)
