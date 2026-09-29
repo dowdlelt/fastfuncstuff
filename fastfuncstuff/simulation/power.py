@@ -85,6 +85,7 @@ def simulate_design_power(
     beta_pattern: list[float] | np.ndarray | None = None,
     n_reps: int = 500,
     poly_degree: int | None = None,
+    beta_offset: list[float] | np.ndarray | float = 0.0,
     alpha: float = 0.001,
     true_design: torch.Tensor | np.ndarray | None = None,
     baseline: float = 100.0,
@@ -105,6 +106,8 @@ def simulate_design_power(
     noise : noise conditions, each a dict of generate_thermal_physio_noise
         keywords (``tsnr`` plus ``phys_fraction``/``tau`` or ``arma``), optionally
         with a ``label``. ``TsnrBin.simulation_kwargs()`` returns exactly this.
+    beta_offset : (n_conditions,) or scalar, a fixed response (PSC) under every
+        amplitude -- the shared level a difference is swept on top of
     beta_pattern : (n_conditions,) response of each condition per unit amplitude;
         default all ones. A contrast whose weights sum to zero (A - B) then has
         no true effect -- pass e.g. [1, 0] to make A respond and B not.
@@ -141,6 +144,7 @@ def simulate_design_power(
     pattern = torch.ones(n_cond, dtype=torch.float64)
     if beta_pattern is not None:
         pattern = torch.as_tensor(beta_pattern, dtype=torch.float64)
+    offset = torch.as_tensor(beta_offset, dtype=torch.float64).expand(n_cond).clone()
     if poly_degree is None:
         poly_degree = auto_polort(max(run_lengths) * tr)
 
@@ -161,7 +165,17 @@ def simulate_design_power(
         C[i, :n_cond] = w
 
     amps = sorted({0.0, *(float(a) for a in amplitudes)})
-    expected_unit = C @ P @ (X_true @ pattern)  # expected contrast estimate per unit amplitude
+    # Expected contrast estimate: c P X_true beta, affine in the amplitude.
+    expected_unit = C @ P @ (X_true @ pattern)
+    expected_base = C @ P @ (X_true @ offset)
+    # What the fitted model cannot absorb of the true response stays in the
+    # residuals: E[RSS] = sigma^2 tr(MR) + ||M X_true beta||^2. Under a correct
+    # HRF M X_true = 0 and this vanishes; under a mismatch it inflates the
+    # variance estimate and shrinks every t -- which an unbiased-noise power
+    # formula misses (it promised 80% where Monte Carlo gave ~0 for A-B on a
+    # 4% shared response).
+    misfit_unit = M @ (X_true @ pattern)
+    misfit_base = M @ (X_true @ offset)
     P_dev = P.to(device=device, dtype=torch.float32)
     X_dev = X.to(device=device, dtype=torch.float32)
     CP_dev = (C @ P).to(device=device, dtype=torch.float32)  # contrast estimates directly
@@ -190,7 +204,7 @@ def simulate_design_power(
         crit_corr = stats.t.ppf(1 - alpha / 2, dof_corr)
 
         for amp in amps:
-            signal = (scale * amp) * (X_true @ pattern)  # (n_t,)
+            signal = scale * (X_true @ (offset + amp * pattern))  # (n_t,)
             parts = []
             start = 0
             for n_run in run_lengths:
@@ -219,14 +233,17 @@ def simulate_design_power(
             t_corr = est / se_corr
 
             for i, name in enumerate(names):
-                true_eff = float(C[i, :n_cond] @ pattern) * amp  # PSC
+                true_eff = float(C[i, :n_cond] @ (offset + amp * pattern))  # PSC
                 # What the fit returns on average: c P X_true beta. It equals the
                 # true effect only when the fitted and generating regressors
                 # agree; with an HRF mismatch it is biased, and power must be
                 # computed from it, not from the truth.
-                exp_est = float(expected_unit[i]) * amp  # PSC
+                exp_est = float(expected_base[i] + expected_unit[i] * amp)  # PSC
                 sd_pred = sigma * float(torch.sqrt(v_true[i])) / scale  # PSC
-                nc = exp_est / sd_pred if sd_pred > 0 else 0.0
+                resid_misfit = float(((misfit_base + amp * misfit_unit) ** 2).sum()) * scale**2
+                sigma2_hat = sigma**2 + resid_misfit / tr_MR  # E[RSS] / tr(MR)
+                se_hat = float(torch.sqrt(v_true[i])) * np.sqrt(sigma2_hat) / scale  # PSC
+                nc = exp_est / se_hat if se_hat > 0 else 0.0
                 p_pred = _two_tailed_power(crit_corr, dof_corr, nc)
                 rows.append(
                     {
@@ -256,14 +273,37 @@ def simulate_design_power(
     }
 
 
+def has_mismatch(rows: list[dict[str, Any]], rtol: float = 1e-3) -> bool:
+    """Whether the fitted model differs from the generating one (the estimate is biased)."""
+    return any(
+        abs(r["expected_est"] - r["true_effect"]) > rtol * max(abs(r["true_effect"]), 1e-9)
+        for r in rows
+        if "expected_est" in r
+    )
+
+
+def power_column(rows: list[dict[str, Any]]) -> str:
+    """Which power to trust: analytic when the model is right, Monte Carlo otherwise.
+
+    Under an HRF mismatch the unfit response inflates the residual variance.
+    The analytic curve includes that in expectation, but with a large misfit
+    the noncentral-t approximation drifts (0.155 off for A-B on a 4% shared
+    response), and the Monte Carlo is the referee.
+    """
+    return "power" if has_mismatch(rows) else "power_predicted"
+
+
 def amplitude_for_power(
-    result: dict[str, Any], target: float = 0.8, column: str = "power_predicted"
+    result: dict[str, Any], target: float = 0.8, column: str | None = None
 ) -> dict[tuple[str, str], float]:
     """Smallest amplitude reaching ``target`` power, per (noise, contrast), by interpolation.
 
-    nan where the swept amplitudes never reach it. ``column='power'`` uses the
-    Monte-Carlo estimate instead of the analytic curve.
+    nan where the swept amplitudes never reach it. ``column`` defaults to
+    :func:`power_column` -- the analytic curve, or the Monte Carlo under a
+    model mismatch.
     """
+    if column is None:
+        column = power_column(result["table"])
     out: dict[tuple[str, str], float] = {}
     keys = {(r["noise"], r["contrast"]) for r in result["table"]}
     for key in keys:
@@ -301,6 +341,7 @@ def simulate_realizations_power(
     progress: bool = True,
     hrf: str = "spmg1",
     true_hrf: str = "same",
+    shared: float = 0.0,
 ) -> dict[str, Any]:
     """:func:`simulate_design_power` over several realizations of one experiment.
 
@@ -314,6 +355,16 @@ def simulate_realizations_power(
     truth), and rows carry a ``true_hrf`` label. ``true_delay`` additionally
     generates the response that many seconds late. Any mismatch shows up as
     bias in ``mean_est`` and lost power.
+
+    What is swept depends on the contrast. A **condition contrast** (weights
+    not summing to zero, e.g. ``A``) sweeps the response amplitude, every
+    condition responding ``amplitude x beta_pattern``. A **difference
+    contrast** (weights summing to zero, e.g. ``A-B``) sweeps the difference
+    itself: every condition sits at ``shared`` percent and the positive side
+    is raised so that the contrast equals the swept value (A = shared + d,
+    B = shared). Under a correct HRF the shared level cancels exactly; under a
+    mismatch it does not, which is the case ``shared`` exists to measure. Rows
+    carry ``swept`` ("amplitude" or "difference") and ``shared``.
     """
     from tqdm import tqdm
 
@@ -323,6 +374,21 @@ def simulate_realizations_power(
     dt = default_microtime_dt(tr)
     fit_label, fit_bases = hrfs_from_spec(hrf, dt, cpu)[0]
     truths = [(fit_label, fit_bases)] if true_hrf == "same" else hrfs_from_spec(true_hrf, dt, cpu)
+
+    n_cond = len(realizations[0].conditions)
+    pattern = np.ones(n_cond) if beta_pattern is None else np.asarray(beta_pattern, float)
+    # One simulation for all condition contrasts, one per difference contrast
+    # (each plants its own responses).
+    groups: list[tuple[str, dict[str, Any], np.ndarray, np.ndarray]] = []
+    condition = {k: w for k, w in contrasts.items() if abs(float(np.sum(w))) > 1e-9}
+    if condition:
+        groups.append(("amplitude", condition, pattern, np.zeros(n_cond)))
+    for k, w in contrasts.items():
+        if k in condition:
+            continue
+        w = np.asarray(w, dtype=float)
+        pos = np.clip(w, 0, None)
+        groups.append(("difference", {k: w}, pos / float(pos @ pos), np.full(n_cond, shared)))
 
     rows: list[dict[str, Any]] = []
     per_design = []
@@ -346,25 +412,29 @@ def simulate_realizations_power(
                 delay=true_delay,
                 device=cpu,
             )
-        res = simulate_design_power(
-            X,
-            list(real.run_lengths),
-            tr,
-            contrasts,
-            amplitudes,
-            noise,
-            beta_pattern=beta_pattern,
-            n_reps=n_reps,
-            poly_degree=poly_degree,
-            alpha=alpha,
-            true_design=X_true,
-            device=device,
-            seed=seed + 7919 * i + 104729 * ti,
-        )
-        for r in res["table"]:
-            r["design"] = i
-            r["true_hrf"] = t_label
-        rows += res["table"]
+        for g, (swept, group, g_pattern, g_offset) in enumerate(groups):
+            res = simulate_design_power(
+                X,
+                list(real.run_lengths),
+                tr,
+                group,
+                amplitudes,
+                noise,
+                beta_pattern=g_pattern,
+                beta_offset=g_offset,
+                n_reps=n_reps,
+                poly_degree=poly_degree,
+                alpha=alpha,
+                true_design=X_true,
+                device=device,
+                seed=seed + 7919 * i + 104729 * ti + 15485863 * g,
+            )
+            for r in res["table"]:
+                r["design"] = i
+                r["true_hrf"] = t_label
+                r["swept"] = swept
+                r["shared"] = float(g_offset[0]) if swept == "difference" else 0.0
+            rows += res["table"]
         if ti == 0:
             per_design.append(
                 {
@@ -376,6 +446,19 @@ def simulate_realizations_power(
                     "X": X,
                 }
             )
+    # Keep the caller's order of noise levels and contrasts (not alphabetical:
+    # "tSNR 100" would sort before "tSNR 40").
+    c_order = {k: j for j, k in enumerate(contrasts)}
+    n_order = {str(n.get("label", f"noise{j}")): j for j, n in enumerate(noise)}
+    rows.sort(
+        key=lambda r: (
+            r["design"],
+            r["true_hrf"],
+            n_order.get(r["noise"], 0),
+            r["amplitude"],
+            c_order[r["contrast"]],
+        )
+    )
     return {
         "table": rows,
         "alpha": alpha,
@@ -383,10 +466,12 @@ def simulate_realizations_power(
         "designs": per_design,
         "hrf": fit_label,
         "true_hrfs": [t for t, _ in truths],
+        "shared": shared,
     }
 
 
 _NUMERIC = {
+    "shared",
     "design",
     "tsnr",
     "amplitude",
@@ -484,3 +569,19 @@ def compare_designs(
                     }
                 )
     return out
+
+
+def is_difference(weights) -> bool:
+    """A zero-sum contrast (A-B, A+B-2C): its sweep is the difference itself."""
+    return abs(float(np.sum(np.asarray(weights, dtype=float)))) <= 1e-9
+
+
+def has_true_effect(weights, beta_pattern) -> bool:
+    """Whether the sweep gives this contrast a true effect.
+
+    A difference contrast always has one -- the swept value is the difference.
+    A condition contrast has one when the response pattern gives it one
+    (``-pattern B=0`` leaves ``B`` with nothing to detect).
+    """
+    w = np.asarray(weights, dtype=float)
+    return is_difference(w) or abs(float(w @ np.asarray(beta_pattern, dtype=float))) > 0

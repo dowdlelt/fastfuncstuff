@@ -48,9 +48,16 @@ mask, lowest bin the worst case, with each bin's typical ARMA(1,1).
 
 ANALYSIS -- OLS with per-run Legendre drift. t is corrected for the noise's
 known ARMA(1,1) (sandwich variance + Satterthwaite dof), so no per-voxel REML is
-needed; naive OLS false positives are reported alongside. Amplitudes are peak
-percent signal change of an isolated event; amplitude 0 is always simulated
-so the false-positive rate is measured.
+needed; naive OLS false positives are reported alongside. 0 is always
+simulated, so the false-positive rate is measured.
+
+WHAT IS SWEPT -- -amplitudes (peak % signal change of an isolated event) means
+the response amplitude for a condition contrast (A, or any contrast whose
+weights do not sum to zero; -pattern sets relative responses), and the
+difference itself for a difference contrast (A-B, A+B-2*C): at 1%, A is 1%
+above B. -shared X puts every condition at X% underneath the difference
+(A = X + d, B = X) -- it cancels under a correct HRF, and with -true_hrf or
+-true_delay shows what a large common response costs.
 
 Examples
 --------
@@ -210,6 +217,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "condition and every pairwise difference.",
     )
     e.add_argument(
+        "-shared",
+        type=float,
+        default=0.0,
+        metavar="PSC",
+        help="Difference contrasts (A-B) sweep the difference itself; -shared puts every "
+        "condition at this % underneath it (A = shared + d, B = shared). Cancels exactly "
+        "under a correct HRF; with -true_hrf/-true_delay it shows what a large common "
+        "response costs.",
+    )
+    e.add_argument(
         "-hrf",
         default="spmg1",
         help="HRF the GLM fits: spmg1 (default) or lib:K, one of the 20-HRF library.",
@@ -364,7 +381,7 @@ def _verdict(power: float) -> str:
 
 
 def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_text) -> str:
-    from fastfuncstuff.simulation.power import amplitude_for_power
+    from fastfuncstuff.simulation.power import amplitude_for_power, has_true_effect, is_difference
 
     rows = res["table"]
     out = ["ffs_simulate", "=" * 72]
@@ -386,10 +403,18 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             "and were dropped"
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
-    out.append(
-        "response pattern: "
-        + ", ".join(f"{c}={w:g}" for c, w in zip(reals[0].conditions, pattern, strict=True))
-    )
+    cond_c = [c for c in contrasts if not is_difference(contrasts[c])]
+    diff_c = [c for c in contrasts if is_difference(contrasts[c])]
+    if cond_c:
+        out.append(
+            f"condition contrasts ({', '.join(cond_c)}): sweep = response amplitude, pattern "
+            + ", ".join(f"{c}={w:g}" for c, w in zip(reals[0].conditions, pattern, strict=True))
+        )
+    if diff_c:
+        out.append(
+            f"difference contrasts ({', '.join(diff_c)}): sweep = the difference itself, every "
+            f"condition at {res.get('shared', 0.0):g}% shared underneath"
+        )
     truths = res.get("true_hrfs", [res.get("hrf", "spmg1")])
     fit = res.get("hrf", "spmg1")
     if truths != [fit]:
@@ -404,8 +429,15 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
     out += ["", f"threshold: two-tailed p < {args.alpha:g}; {args.nreps} replicates per cell", ""]
 
     # Amplitude needed, from the analytic curve, across realizations.
+    from fastfuncstuff.simulation.power import has_mismatch
+
     over = "realizations" + (" x true HRFs" if len(truths) > 1 else "")
-    out.append(f"Amplitude (% signal change) for 80% power -- median [range] over {over}")
+    if has_mismatch(rows):
+        over += "; Monte Carlo power, since the fitted HRF is wrong"
+    out.append(
+        "Effect (% signal change: amplitude, or the difference for A-B) for 80% power -- "
+        f"median [range] over {over}"
+    )
     per_design = {}
     for d in range(len(reals)):
         for th in truths:
@@ -418,7 +450,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
         cells = []
         for c in contrasts:
             vals = np.array([per_design[d][(cond["label"], c)] for d in per_design])
-            if abs(contrasts[c] @ np.asarray(pattern)) == 0:
+            if not has_true_effect(contrasts[c], pattern):
                 cells.append(f"{'no true effect':>18}")
             elif np.all(np.isnan(vals)):
                 cells.append(f"{'> ' + format(max(r['amplitude'] for r in rows), 'g'):>18}")
@@ -443,7 +475,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             f"Recovered fraction of the true amplitude (mean estimate / truth, {fit} fitted):",
         ]
         for c in contrasts:
-            if abs(contrasts[c] @ np.asarray(pattern)) == 0:
+            if not has_true_effect(contrasts[c], pattern):
                 continue
             fr = {
                 th: np.mean(
@@ -478,9 +510,20 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             else ""
         )
         out.append(f"  {cond['label']:<24} corrected {fp:.4f}   naive OLS {fpn:.4f}{flag}")
+        for c in diff_c:
+            fp_c = np.mean([r["power"] for r in nulls if r["contrast"] == c])
+            if fp_c > 3 * args.alpha and res.get("shared", 0.0):
+                out.append(
+                    f"    {c}: {fp_c:.4f} at zero difference -- the {res['shared']:g}% shared "
+                    "response, fitted with the wrong HRF, reads as a difference"
+                )
 
     if args.effect is not None:
-        out += ["", f"At {args.effect:g}% signal change (power, analytic / Monte Carlo):"]
+        out += [
+            "",
+            f"At {args.effect:g}% signal change -- amplitude, or difference for A-B "
+            "(power, analytic / Monte Carlo):",
+        ]
         out.append(f"{'noise':<24}" + "".join(f"{c:>22}" for c in contrasts))
         for cond in conds:
             cells = []
@@ -536,9 +579,13 @@ def _run_compare(args) -> int:
     contrasts = list(dict.fromkeys(r["contrast"] for r in rows))
     noises = list(dict.fromkeys(r["noise"] for r in rows))
     for c in contrasts:
+        swept = next(
+            (r.get("swept") for r in loaded[0]["table"] if r["contrast"] == c), "amplitude"
+        )
+        what = "difference" if swept == "difference" else "amplitude"
         out += [
             "",
-            f"{c}: amplitude (% signal change) for {args.target:.0%} power -- "
+            f"{c}: {what} (% signal change) for {args.target:.0%} power -- "
             "median [range] over realizations",
         ]
         out.append(f"{'design':<28}" + "".join(f"{n:>22}" for n in noises))
@@ -593,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.simulation.experiment import default_contrasts, parse_contrast, realize
-    from fastfuncstuff.simulation.power import simulate_realizations_power
+    from fastfuncstuff.simulation.power import has_true_effect, simulate_realizations_power
 
     described = bool(args.trial or args.miniblock or args.block)
     if described == bool(args.events):
@@ -642,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         true_delay=args.true_delay,
         hrf=args.hrf,
         true_hrf=args.true_hrf,
+        shared=args.shared,
         poly_degree=args.polort,
         device=device,
         seed=args.seed,
@@ -660,6 +708,8 @@ def main(argv: list[str] | None = None) -> int:
         "tsnr",
         "amplitude",
         "contrast",
+        "swept",
+        "shared",
         "true_effect",
         "mean_est",
         "expected_est",
@@ -684,6 +734,7 @@ def main(argv: list[str] | None = None) -> int:
                 "durations": reals[0].durations,
                 "contrasts": {k: v.tolist() for k, v in contrasts.items()},
                 "pattern": pattern,
+                "shared": args.shared,
                 "amplitudes": amps,
                 "noise": conds,
                 "seeds": [r.seed for r in reals],
@@ -710,14 +761,14 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.simulation.plots import plot_design, plot_power
 
         labels = [c["label"] for c in conds]
-        if any(abs(w @ np.asarray(pattern)) > 0 for w in contrasts.values()):
+        if any(has_true_effect(w, pattern) for w in contrasts.values()):
             plot_power(
                 res, labels, contrasts, pattern, args.alpha, args.effect, path=f"{prefix}_power.png"
             )
         if res["true_hrfs"] != [res["hrf"]]:
             from fastfuncstuff.simulation.plots import plot_hrf_recovery
 
-            effective = [c for c, w in contrasts.items() if abs(w @ np.asarray(pattern)) > 0]
+            effective = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
             if effective:
                 plot_hrf_recovery(res, args.tr, effective[0], path=f"{prefix}_hrf.png")
         plot_design(

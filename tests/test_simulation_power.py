@@ -176,3 +176,79 @@ def test_power_table_round_trips_through_tsv(tmp_path):
     assert scan_seconds(res) is not None
     rows = compare_designs({"x": res})
     assert {r["contrast"] for r in rows} == {"A"} and rows[0]["n_realizations"] == 2
+
+
+class TestDifferenceSweep:
+    """A zero-sum contrast sweeps the difference; -shared sets the level underneath."""
+
+    def _reals(self):
+        from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+
+        spec = ExperimentSpec(
+            tr=2,
+            units=[Unit.parse(c, f"{c}:2", 1) for c in "ABC"],
+            isi=Interval.parse("exp:4,2,12"),
+            scan_time=300,
+            n_runs=2,
+            post_fix=16,
+        )
+        return [realize(spec, s) for s in range(2)]
+
+    def _run(self, shared=0.0, true_hrf="same", contrasts=None):
+        from fastfuncstuff.simulation.power import simulate_realizations_power
+
+        return simulate_realizations_power(
+            self._reals(),
+            2,
+            contrasts or {"A": [1, 0, 0], "A-B": [1, -1, 0]},
+            [0.5, 1.0],
+            [{"label": "t", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}],
+            n_reps=100,
+            device=CPU,
+            progress=False,
+            shared=shared,
+            true_hrf=true_hrf,
+        )
+
+    def test_the_swept_value_is_the_difference(self):
+        res = self._run(shared=4.0)
+        for r in res["table"]:
+            if r["contrast"] == "A-B":
+                assert r["swept"] == "difference" and r["shared"] == 4.0
+                assert r["true_effect"] == pytest.approx(r["amplitude"])
+            else:
+                assert r["swept"] == "amplitude" and r["shared"] == 0.0
+
+    def test_a_general_zero_sum_contrast_gets_exactly_the_difference(self):
+        res = self._run(shared=2.0, contrasts={"A+B-2C": [1, 1, -2]})
+        for r in res["table"]:
+            assert r["true_effect"] == pytest.approx(r["amplitude"])
+
+    def test_shared_response_cancels_under_the_right_hrf(self):
+        flat, high = self._run(0.0), self._run(4.0)
+        for a, b in zip(flat["table"], high["table"], strict=True):
+            if a["contrast"] == "A-B":
+                assert a["power_predicted"] == pytest.approx(b["power_predicted"], abs=1e-9)
+                assert a["expected_est"] == pytest.approx(b["expected_est"], abs=1e-9)
+
+    def test_but_not_under_a_mismatch(self):
+        flat, high = self._run(0.0, "lib:3"), self._run(4.0, "lib:3")
+        diff = [
+            abs(a["expected_est"] - b["expected_est"])
+            for a, b in zip(flat["table"], high["table"], strict=True)
+            if a["contrast"] == "A-B"
+        ]
+        assert max(diff) > 0.01
+
+
+def test_analytic_power_includes_residual_misfit():
+    """A mismatched HRF leaves signal in the residuals: t shrinks as the effect grows.
+
+    Without the misfit term the analytic curve promised 80% power where Monte
+    Carlo measured ~0 (A-B on a large shared response, wrong HRF).
+    """
+    res = _run([{"label": "w", "tsnr": 150.0, "phys_fraction": 0.0}], amplitudes=(2.0, 4.0),
+               true_design=_design(shift_s=3.0), n_reps=1500)
+    for amp in (2.0, 4.0):
+        r = _rows(res, "w", "A")[amp]
+        assert r["power"] == pytest.approx(r["power_predicted"], abs=0.06)

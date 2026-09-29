@@ -64,8 +64,10 @@ def _finish(fig, path: str | Path | None):
 
 
 def _effective(contrasts: dict[str, Any], pattern) -> list[str]:
-    """Contrasts with a non-zero true effect under ``pattern`` -- the ones power applies to."""
-    return [c for c in contrasts if abs(np.asarray(contrasts[c]) @ np.asarray(pattern)) > 0]
+    """Contrasts with a true effect to detect -- the ones power applies to."""
+    from .power import has_true_effect
+
+    return [c for c in contrasts if has_true_effect(contrasts[c], pattern)]
 
 
 def plot_power(
@@ -137,7 +139,13 @@ def plot_power(
             ax.axvline(effect, color=INK2, linewidth=1, linestyle=":")
         ax.set_ylim(-0.02, 1.02)
         ax.set_title(c, color=INK, fontsize=11)
-        ax.set_xlabel("amplitude (% signal change x pattern)", color=INK2, fontsize=9)
+        swept = next((r.get("swept", "amplitude") for r in rows if r["contrast"] == c), "amplitude")
+        if swept == "difference":
+            shared = next(r.get("shared", 0.0) for r in rows if r["contrast"] == c)
+            on = f" on {shared:g}% shared" if shared else ""
+            ax.set_xlabel(f"{c} difference (% signal change{on})", color=INK2, fontsize=9)
+        else:
+            ax.set_xlabel(f"{c} amplitude (% signal change)", color=INK2, fontsize=9)
     axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(
@@ -149,10 +157,17 @@ def plot_power(
         loc="lower center",
         ncol=min(len(labels), 5),
     )
+    from .power import has_mismatch
+
+    note = (
+        " (HRF mismatch: the analytic line is approximate, the dots decide)"
+        if has_mismatch(rows)
+        else ""
+    )
     fig.suptitle(
         title
         or f"Power at two-tailed p < {alpha:g} -- line: analytic (band: range over "
-        "realizations), dots: Monte Carlo; dashed: 80%",
+        f"realizations), dots: Monte Carlo; dashed: 80%{note}",
         color=INK,
         fontsize=10,
     )

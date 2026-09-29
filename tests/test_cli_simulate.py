@@ -365,3 +365,13 @@ def test_hrf_figure_written_only_under_mismatch(tmp_path):
 def test_tr_required_when_simulating(tmp_path, capsys):
     assert main(["-trial", "A", "2", "5", "-prefix", str(tmp_path / "x")]) == 1
     assert "-tr is required" in capsys.readouterr().err
+
+
+def test_shared_is_reported_and_recorded(tmp_path, capsys):
+    _sim(tmp_path / "sh", "-contrast", "A-B", "-shared", "3", "-ndesigns", "1", "-no_plots")
+    out = capsys.readouterr().out
+    assert "sweep = the difference itself" in out and "3% shared" in out
+    spec = json.loads((tmp_path / "sh_spec.json").read_text())
+    assert spec["shared"] == 3.0
+    rows = _rows(tmp_path / "sh")
+    assert {r["swept"] for r in rows} == {"difference"}
