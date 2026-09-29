@@ -514,3 +514,21 @@ class TestEmpiricalPathMatchesTheory:
         )["estimation_efficiency"]
         theory = compute_estimation_efficiency(onsets, 1, 10, device=CPU)["total"]
         assert empirical == pytest.approx(theory, rel=1e-3)
+
+
+def test_drift_does_not_scale_with_the_task_signal():
+    """Drift was sized from the data's std, so active voxels drew more of it."""
+    n_t, tr = 200, 2.0
+    hrf = torch.tensor(_canonical_hrf(16))
+    onsets = torch.zeros(n_t, 1)
+    onsets[10::12, 0] = 1.0
+    betas = torch.zeros(200, 1)
+    betas[100:] = 8.0
+    torch.manual_seed(0)
+    data = simulate_fmri_run(
+        onsets, betas, hrf, tr, n_t, matrix_size=(10, 10, 2), noise_level=1.0, device=CPU
+    ).reshape(-1, n_t)
+    signal = torch.tensor(np.convolve(onsets[:, 0].numpy(), _canonical_hrf(16))[:n_t])
+    nuisance = data - 100.0 - betas * signal  # noise + drift, exactly
+    quiet, active = nuisance[:100].std(dim=1).mean(), nuisance[100:].std(dim=1).mean()
+    assert active.item() == pytest.approx(quiet.item(), rel=0.05)

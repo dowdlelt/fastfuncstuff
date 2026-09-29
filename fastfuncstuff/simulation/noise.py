@@ -931,8 +931,11 @@ def estimate_noise_parameters_from_data(
     # Estimate AR coefficients per voxel using Yule-Walker equations
     ar_coeffs_per_voxel = []
 
-    for v in range(min(n_voxels, 1000)):  # Sample up to 1000 voxels for speed
-        resid_v = residuals[:, v]
+    # Up to 1000 voxels, spread evenly across the mask. Taking the first 1000
+    # took one edge of the volume -- without a mask, the corner of the FOV.
+    sampled = np.unique(np.linspace(0, n_voxels - 1, min(n_voxels, 1000)).round().astype(int))
+    for v in sampled:
+        resid_v = residuals[:, int(v)]
 
         if ar_order == 1:
             # Simple AR(1): correlation between y[t] and y[t-1]

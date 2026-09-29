@@ -58,7 +58,7 @@ def simulate_fmri_run(
     add_scanner_drift : bool
         Add low-frequency scanner drift (default: True)
     drift_amplitude : float
-        Amplitude of drift (default: 0.5)
+        Drift std as a fraction of each voxel's noise std (default: 0.5)
     device : torch.device, optional
         Device for computation
 
@@ -137,11 +137,15 @@ def simulate_fmri_run(
         )
         noise[voxel_index, :] = slice_noise * scale_per_voxel[voxel_index]
 
-    data = data + noise
-
-    # Add scanner drift if requested
+    # Drift is scaled to the noise, not to the data. add_drift sizes it from the
+    # std of whatever it is handed, and handed the data that std includes the
+    # task signal -- so a strongly active voxel got proportionally more drift
+    # (residual SD 1.23 vs 1.04 at beta=5 vs 0 under a cubic detrend), coupling a
+    # nuisance to the very effect being simulated.
     if add_scanner_drift:
-        data = add_drift(data.T, amplitude=drift_amplitude, device=device).T
+        noise = add_drift(noise.T, amplitude=drift_amplitude, device=device).T
+
+    data = data + noise
 
     # Reshape to 4D
     data = data.reshape(nx, ny, nz, n_timepoints)
