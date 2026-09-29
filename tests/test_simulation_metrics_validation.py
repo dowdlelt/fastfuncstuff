@@ -362,3 +362,119 @@ class TestParametricVoxels:
         for z in range(shape[2]):
             assert len(set(noise_volume[:, :, z].flatten().tolist())) == 1, "noise varies along Z"
         assert len(set(hrf_indices.tolist())) > 1
+
+
+def _random_multi(n_t: int, n_conditions: int, p: float, seed: int) -> np.ndarray:
+    """Non-overlapping random design: each slot is one trial type with probability p, else null."""
+    rng = np.random.default_rng(seed)
+    probs = [p] * n_conditions + [1.0 - n_conditions * p]
+    slot = rng.choice(n_conditions + 1, size=n_t, p=probs)
+    onsets = np.zeros((n_t, n_conditions), dtype=np.float64)
+    for k in range(n_conditions):
+        onsets[slot == k, k] = 1.0
+    return onsets
+
+
+class TestJointFisherInformation:
+    """Liu & Frank (2004) define both metrics on the joint design, not per condition.
+
+    Scoring each condition alone (as this module did until 2026-09-29) drops the
+    cross-terms of X^T X -- which is precisely where collinearity between trial
+    types lives.
+    """
+
+    def test_identical_timing_is_not_estimable(self):
+        """Two conditions that always co-occur cannot be told apart by any GLM.
+
+        Scored in isolation they looked *better* than an independent pair.
+        """
+        rng = np.random.default_rng(0)
+        a = (rng.random(N_TIMEPOINTS) < 0.3).astype(np.float64)
+        same = np.stack([a, a], axis=1)
+        power = compute_detection_power(same, _canonical_hrf(), 2, device=CPU)
+        eff = compute_estimation_efficiency(same, 2, HRF_LAGS, device=CPU)
+        assert power["per_condition"].abs().max().item() == 0.0
+        assert eff["per_condition"].abs().max().item() == 0.0
+        # The sum is still perfectly estimable -- only the split is not.
+        assert power["per_contrast"][(0, 1)] == 0.0
+
+    def test_random_design_matches_the_closed_form(self):
+        """Q = 1 random design, white noise: A_k ~ I, so xi ~ N p(1-p) / k and R ~ N p(1-p)."""
+        n_t, k, p = 4000, 10, 0.5
+        onsets = _random_multi(n_t, 1, p, seed=1)
+        h = _canonical_hrf(k)
+        xi = compute_estimation_efficiency(onsets, 1, k, device=CPU)["total"]
+        R = compute_detection_power(onsets, h, 1, device=CPU)["total"]
+        assert xi == pytest.approx(n_t * p * (1 - p) / k, rel=0.08)
+        assert R == pytest.approx(n_t * p * (1 - p), rel=0.08)
+
+    def test_normalized_efficiency_does_not_depend_on_run_length(self):
+        """It used to divide an already per-sample figure by N again, falling as 1/N."""
+        norms = [
+            compute_estimation_efficiency(_random_multi(n_t, 2, 1 / 3, seed=2), 2, 12, device=CPU)[
+                "total_normalized"
+            ]
+            for n_t in (240, 960, 3840)
+        ]
+        assert max(norms) / min(norms) < 1.15
+        assert 0.5 < norms[-1] <= 1.0 + 1e-9  # random designs sit just under the Eq. 26 bound
+
+    def test_optimal_probability_for_two_trial_types_is_one_third(self):
+        """xi_tot, averaged over types and their difference, peaks at p = 1/(Q+1)."""
+        scores = {}
+        for p in (0.15, 0.25, 1 / 3, 0.42, 0.49):
+            runs = [
+                compute_estimation_efficiency(_random_multi(2000, 2, p, seed=s), 2, 10, device=CPU)[
+                    "total"
+                ]
+                for s in range(3)
+            ]
+            scores[p] = float(np.mean(runs))
+        assert max(scores, key=scores.get) == pytest.approx(1 / 3)
+
+
+class TestMetricsAgreeWithMonteCarlo:
+    """The theoretical variance must be the variance a GLM fit actually shows."""
+
+    @pytest.mark.parametrize("rho", [0.0, 0.5])
+    def test_detection_power_is_inverse_amplitude_variance(self, rho):
+        n_t, n_sim = 300, 3000
+        h = _canonical_hrf().astype(np.float64)
+        onsets = _random_multi(n_t, 2, 0.2, seed=3)
+        R = compute_detection_power(onsets, h, 2, device=CPU, poly_degree=1, rho=rho)
+
+        # Build and fit the same model independently, in numpy.
+        Z = np.stack([np.convolve(onsets[:, q], h)[:n_t] for q in range(2)], axis=1)
+        t = np.linspace(-1, 1, n_t)
+        X = np.column_stack([Z, np.ones(n_t), t])
+        rng = np.random.default_rng(4)
+        e = rng.standard_normal((n_t, n_sim))
+        noise = np.empty_like(e)
+        noise[0] = e[0] / np.sqrt(1 - rho**2)
+        for i in range(1, n_t):
+            noise[i] = rho * noise[i - 1] + e[i]
+        y = Z @ np.array([1.0, 0.5])[:, None] + noise
+        W = np.eye(n_t) - rho * np.eye(n_t, k=-1)
+        W[0, 0] = np.sqrt(1 - rho**2)
+        beta = np.linalg.lstsq(W @ X, W @ y, rcond=None)[0]
+
+        h_power = float(h @ h)
+        for q in range(2):
+            predicted_var = 1.0 / (R["per_condition"][q].item() * h_power)
+            assert beta[q].var() == pytest.approx(predicted_var, rel=0.1)
+        diff_var = 1.0 / (R["per_contrast"][(0, 1)] * h_power)
+        assert (beta[0] - beta[1]).var() == pytest.approx(diff_var, rel=0.1)
+
+    def test_estimation_efficiency_is_inverse_summed_fir_variance(self):
+        n_t, k, n_sim = 400, 8, 3000
+        onsets = _random_multi(n_t, 1, 0.4, seed=5)
+        xi = compute_estimation_efficiency(onsets, 1, k, device=CPU, poly_degree=0)["total"]
+
+        X = np.column_stack(
+            [np.concatenate([np.zeros(lag), onsets[: n_t - lag, 0]]) for lag in range(k)]
+            + [np.ones(n_t)]
+        )
+        rng = np.random.default_rng(6)
+        y = rng.standard_normal((n_t, n_sim))
+        beta = np.linalg.lstsq(X, y, rcond=None)[0][:k]
+        assert beta.var(axis=1).sum() == pytest.approx(1.0 / xi, rel=0.1)

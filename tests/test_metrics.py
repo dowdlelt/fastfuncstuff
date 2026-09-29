@@ -407,15 +407,19 @@ class TestEfficiencyPowerTradeoff:
         correlation = np.corrcoef(result["efficiency"], result["power"])[0, 1]
         assert correlation < 0, "Efficiency and power should be negatively correlated"
 
-    def test_efficiency_increases_with_alpha(self, device):
-        """Efficiency should generally increase with α."""
-        result = compute_efficiency_power_tradeoff(hrf_length=20, device=device)
-        assert result["efficiency"][-1] > result["efficiency"][0]
+    def test_alpha_runs_from_even_spread_to_one_eigenvalue(self, device):
+        """Liu's alpha: 1/k is maximum efficiency, 1 is maximum power."""
+        result = compute_efficiency_power_tradeoff(hrf_length=20, device=device, theta_deg=0.0)
+        assert result["alpha"][0] == pytest.approx(1 / 20)
+        assert result["efficiency"][0] == pytest.approx(1.0)
+        assert result["efficiency"][-1] == pytest.approx(0.0, abs=1e-12)
+        assert result["power"][-1] == pytest.approx(1.0)
+        assert result["power"][0] == pytest.approx(1 / 20)
 
-    def test_power_decreases_with_alpha(self, device):
-        """Power should generally decrease with α."""
-        result = compute_efficiency_power_tradeoff(hrf_length=20, device=device)
-        assert result["power"][0] > result["power"][-1]
+    def test_theta_caps_block_design_power(self, device):
+        """At alpha = 1 the power is cos^2(theta) of the bound (Liu et al. 2001)."""
+        result = compute_efficiency_power_tradeoff(hrf_length=15, device=device, theta_deg=45.0)
+        assert result["power"][-1] == pytest.approx(0.5)
 
 
 # =============================================================================

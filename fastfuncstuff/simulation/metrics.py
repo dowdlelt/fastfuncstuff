@@ -89,23 +89,11 @@ def compute_design_matrix_for_condition(
         raise ValueError(f"Unknown mode: {mode}")
 
 
-def _residualise(X: torch.Tensor, nuisance: torch.Tensor | None) -> torch.Tensor:
-    """Project ``nuisance`` out of ``X``.
-
-    Every real GLM carries at least a baseline, and design efficiency that
-    ignores it credits the design for DC power no contrast can ever use.
-    """
-    if nuisance is None or nuisance.shape[1] == 0:
-        return X
-    q, _ = torch.linalg.qr(nuisance)
-    return X - q @ (q.T @ X)
-
-
 def _baseline_nuisance(
     n_timepoints: int,
     poly_degree: int,
     device: torch.device,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor | None:
     """Legendre-style polynomial nuisance columns, degree 0 = the baseline."""
     if poly_degree < 0:
@@ -119,6 +107,96 @@ def _baseline_nuisance(
     return q
 
 
+def _ar1_whiten(M: torch.Tensor, rho: float) -> torch.Tensor:
+    """Apply the exact AR(1) whitener V^(-1/2) to the rows of ``M``.
+
+    Prais-Winsten form: the first row is scaled by sqrt(1 - rho^2) and every
+    later row has rho times its predecessor subtracted, so W V W^T = I for
+    V[i, j] = rho^|i-j|. This is the Sigma^(-1/2) of Liu & Frank (2004) Eq. 2.
+    """
+    if rho == 0.0:
+        return M
+    if not -1.0 < rho < 1.0:
+        raise ValueError(f"rho must be in (-1, 1), got {rho}")
+    out = torch.empty_like(M)
+    out[0] = M[0] * np.sqrt(1.0 - rho**2)
+    out[1:] = M[1:] - rho * M[:-1]
+    return out
+
+
+def _condition_onsets(design: torch.Tensor, n_conditions: int, hrf_length: int) -> torch.Tensor:
+    """The (N, Q) stimulus pattern, from an onset matrix or a stacked FIR matrix."""
+    if design.shape[1] == n_conditions:
+        return design
+    if design.shape[1] == n_conditions * hrf_length:
+        return design[:, ::hrf_length]
+    # An onset matrix with extra trailing columns; conditions beyond it are empty.
+    cols = [
+        design[:, k] if k < design.shape[1] else torch.zeros_like(design[:, 0])
+        for k in range(n_conditions)
+    ]
+    return torch.stack(cols, dim=1)
+
+
+def _whitened_detrended(
+    X: torch.Tensor, poly_degree: int, rho: float, nuisance: torch.Tensor | None = None
+) -> torch.Tensor:
+    """X_perp = P_S~ Sigma^(-1/2) X, Liu & Frank (2004) Eq. 2.
+
+    The nuisance model is whitened along with the design before it is projected
+    out; projecting first and whitening second is only approximately the same.
+    """
+    n = X.shape[0]
+    S = _baseline_nuisance(n, poly_degree, X.device, X.dtype)
+    if nuisance is not None:
+        nuisance = nuisance.to(device=X.device, dtype=X.dtype)
+        S = nuisance if S is None else torch.cat([S, nuisance], dim=1)
+    Xw = _ar1_whiten(X, rho)
+    if S is None or S.shape[1] == 0:
+        return Xw
+    q, _ = torch.linalg.qr(_ar1_whiten(S, rho))
+    return Xw - q @ (q.T @ Xw)
+
+
+def _contrast_variances(
+    fisher: torch.Tensor, contrasts: list[torch.Tensor], rtol: float = 1e-10
+) -> list[float]:
+    """Tr[L F^+ L^T] per contrast, with ``inf`` for a contrast the design cannot estimate.
+
+    A ridge on F (as this module once added) gives every contrast a finite
+    variance, so two conditions with identical timing -- which no GLM can tell
+    apart -- scored the same power as a well-separated pair. Estimability is
+    decided instead: L is estimable iff it lies in the row space of F.
+    """
+    evals, evecs = torch.linalg.eigh(fisher)
+    keep = evals > rtol * evals.abs().max().clamp_min(1e-300)
+    V = evecs[:, keep]
+    inv = (V / evals[keep]) @ V.T
+    out = []
+    for L in contrasts:
+        residual = L - (L @ V) @ V.T
+        if residual.norm() > 1e-6 * L.norm().clamp_min(1e-300):
+            out.append(float("inf"))
+        else:
+            out.append(float(torch.trace(L @ inv @ L.T)))
+    return out
+
+
+def _condition_and_pairwise_contrasts(
+    n_conditions: int,
+) -> list[tuple[tuple[int, int], torch.Tensor]]:
+    """D_ij of Liu & Frank Eq. 3: each trial type (i == j), then each pairwise difference."""
+    out = []
+    for i in range(n_conditions):
+        for j in range(i, n_conditions):
+            d = torch.zeros(1, n_conditions, dtype=torch.float64)
+            d[0, i] = 1.0
+            if j != i:
+                d[0, j] = -1.0
+            out.append(((i, j), d))
+    return out
+
+
 def compute_estimation_efficiency(
     design: torch.Tensor | np.ndarray,
     n_conditions: int,
@@ -127,143 +205,105 @@ def compute_estimation_efficiency(
     normalize: bool = True,
     device: torch.device | None = None,
     poly_degree: int = 0,
-) -> torch.Tensor | dict[str, torch.Tensor | float]:
+    rho: float = 0.0,
+    nuisance: torch.Tensor | np.ndarray | None = None,
+) -> dict[str, Any]:
     """
-    Compute estimation efficiency for HRF shape estimation
+    Estimation efficiency for HRF shape, Liu & Frank (2004) Eqs. 4-5.
 
-    Efficiency for condition k:
-        ε_k = Tr[A_k^(-1)]^(-1)
+    The Q trial types enter one joint FIR design X = [X_1 ... X_Q] (N x kQ), is
+    whitened and has the nuisance model projected out (Eq. 2), and the
+    covariance of every contrast is read off the *joint* Fisher information:
 
-    where A_k = (X_k^T X_k) / N
-    X_k = FIR design matrix for condition k (n_timepoints x hrf_length)
+        C_ij = L_ij (X_perp^T X_perp)^-1 L_ij^T,    L_ij = D_ij (x) I_k
 
-    Higher efficiency = better HRF shape estimation
+    for each trial type (i == j) and each pairwise difference (i < j). Then
 
-    Liu & Frank (2004), Equation 9:
-        ε_k ≈ N * f(p, Q) / Tr[A_k^(-1)]
+        xi_ij  = 1 / Tr[C_ij]
+        xi_tot = 1 / mean_{i<=j} Tr[C_ij]                       (Eq. 5)
 
-    where:
-        N = total number of timepoints
-        p = probability of event occurrence
-        Q = hrf_length (number of time lags)
-        f(p, Q) = p(1-p) / (1 + 2p(Q-1))
+    Everything is in units of 1 / sigma^2: multiply Tr[C] by the noise variance
+    to get the summed variance of the k HRF estimates. Efficiency grows with N,
+    as it should -- a longer scan estimates better.
+
+    Conditions are not scored in isolation. Doing so ignores the cross-terms of
+    the Fisher information, which is where the collinearity between trial types
+    lives; two conditions with identical timing are not separately estimable at
+    all and score 0 here.
 
     Parameters
     ----------
-    design : array-like, shape (n_timepoints, n_regressors)
-        Full design matrix or onset matrix
+    design : array-like, shape (n_timepoints, n_conditions)
+        Stimulus pattern per trial type on the TR grid (a stacked FIR matrix of
+        width n_conditions * hrf_length is also accepted; its first lag of each
+        block is used).
     n_conditions : int
-        Number of conditions
+        Number of trial types Q.
     hrf_length : int
-        Length of HRF in TRs (Q in Liu & Frank notation)
-    tr : float, default=1.0
-        Repetition time (for normalization)
-    normalize : bool, default=True
-        If True, normalize efficiency by N*f(p,Q) to get ε_norm
-    device : torch.device, optional
-        Device for computation
+        Number of FIR lags k.
+    tr : float
+        Unused; kept for call compatibility.
+    normalize : bool
+        Also report efficiency as a fraction of the Eq. 26 bound
+        N / (2 (Q + 1) k), which is exact for binary patterns in white noise
+        with a constant nuisance term and approximate otherwise.
+    poly_degree : int
+        Legendre nuisance degree (0 = baseline only, -1 = none).
+    rho : float
+        AR(1) noise autocorrelation; the design is whitened with it.
+    nuisance : array-like, optional
+        Extra (N, l) nuisance columns (motion, per-run baselines, ...).
 
     Returns
     -------
-    efficiency : dict with keys:
-        'per_condition': torch.Tensor, shape (n_conditions,)
-            Efficiency for each condition
-        'total': float
-            Total efficiency (sum across conditions)
-        'normalized': torch.Tensor, shape (n_conditions,) if normalize=True
-            Normalized efficiency (divided by theoretical max)
+    dict with
+        'per_condition' : tensor (Q,), 1 / Tr[C_ii]
+        'per_contrast'  : {(i, j): 1 / Tr[C_ij]} including i == j
+        'total'         : xi_tot (Eq. 5)
+        'mean'          : mean of 'per_condition'
+        'normalized', 'mean_normalized', 'total_normalized' when normalize=True
     """
     if device is None:
         device = torch.device("cpu")
-
-    # Convert to tensor
-    if not torch.is_tensor(design):
-        design = torch.tensor(design, dtype=torch.float32, device=device)
-    else:
-        design = design.to(device)
+    design = torch.as_tensor(design, device=device).to(torch.float64)
+    nuisance_t = None if nuisance is None else torch.as_tensor(nuisance, device=device)
 
     n_timepoints = design.shape[0]
-    nuisance = _baseline_nuisance(n_timepoints, poly_degree, device, design.dtype)
-
-    # For FIR efficiency, we need the onset matrix (binary indicators)
-    # If design is already convolved, we need to extract onsets
-    # Assume design has n_conditions * hrf_length regressors (FIR style)
-    # OR n_conditions regressors (onset style)
-
-    efficiencies = []
-    efficiencies_norm = []
-
-    for k in range(n_conditions):
-        # Extract onsets for condition k
-        if design.shape[1] == n_conditions:
-            # Design is onset matrix
-            onsets_k = design[:, k]
-        elif design.shape[1] == n_conditions * hrf_length:
-            # Design is FIR matrix - extract first lag for each condition
-            onsets_k = design[:, k * hrf_length]
-        else:
-            # Assume design is onset matrix with potential extra regressors
-            onsets_k = (
-                design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+    onsets = _condition_onsets(design, n_conditions, hrf_length)
+    X = torch.cat(
+        [
+            compute_design_matrix_for_condition(
+                onsets, k, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
             )
+            for k in range(n_conditions)
+        ],
+        dim=1,
+    )
+    X_perp = _whitened_detrended(X, poly_degree, rho, nuisance_t)
+    fisher = X_perp.T @ X_perp
 
-        # Build X_k: FIR design matrix for condition k
-        X_k = compute_design_matrix_for_condition(
-            onsets_k[:, None], 0, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
-        )
-        event_times = torch.where(onsets_k > 0.5)[0]
-
-        # Efficiency is measured on what is left after the nuisance model, for
-        # the same reason detection power is: a baseline the GLM will fit is not
-        # available to any contrast.
-        X_k = _residualise(X_k, nuisance)
-
-        # Compute A_k = (X_k^T X_k) / N
-        XtX = X_k.T @ X_k
-        A_k = XtX / n_timepoints
-
-        # Add small regularization for numerical stability
-        A_k = A_k + 1e-6 * torch.eye(hrf_length, device=device)
-
-        # Compute efficiency: ε_k = Tr[A_k^(-1)]^(-1)
-        try:
-            A_k_inv = torch.linalg.inv(A_k)
-            trace_inv = torch.trace(A_k_inv)
-            efficiency_k = 1.0 / trace_inv
-        except Exception:
-            # If inversion fails, efficiency is very low
-            efficiency_k = torch.tensor(0.0, device=device)
-
-        efficiencies.append(efficiency_k)
-
-        # Normalized efficiency
-        if normalize:
-            # Compute f(p, Q) = p(1-p) / (1 + 2p(Q-1))
-            n_events = len(event_times)
-            p_k = n_events / n_timepoints  # Probability of event
-
-            if p_k > 0:
-                f_pQ = p_k * (1 - p_k) / (1 + 2 * p_k * (hrf_length - 1))
-                theoretical_max = n_timepoints * f_pQ
-                efficiency_norm_k = efficiency_k / theoretical_max
-            else:
-                efficiency_norm_k = torch.tensor(0.0, device=device)
-
-            efficiencies_norm.append(efficiency_norm_k)
-
-    efficiencies = torch.stack(efficiencies)
-
-    result = {
-        "per_condition": efficiencies,
-        "total": efficiencies.sum().item(),
-        "mean": efficiencies.mean().item(),
+    eye = torch.eye(hrf_length, dtype=torch.float64, device=device)
+    pairs = _condition_and_pairwise_contrasts(n_conditions)
+    traces = _contrast_variances(fisher, [torch.kron(d.to(device), eye) for _, d in pairs])
+    per_contrast = {
+        ij: (0.0 if np.isinf(v) else 1.0 / v) for (ij, _), v in zip(pairs, traces, strict=True)
     }
 
-    if normalize:
-        efficiencies_norm = torch.stack(efficiencies_norm)
-        result["normalized"] = efficiencies_norm
-        result["mean_normalized"] = efficiencies_norm.mean().item()
+    per_condition = torch.tensor([per_contrast[(k, k)] for k in range(n_conditions)])
+    mean_trace = float(np.mean(traces))
+    total = 0.0 if np.isinf(mean_trace) else 1.0 / mean_trace
 
+    result: dict[str, Any] = {
+        "per_condition": per_condition,
+        "per_contrast": per_contrast,
+        "total": total,
+        "mean": per_condition.mean().item(),
+    }
+    if normalize:
+        bound = n_timepoints / (2.0 * (n_conditions + 1) * hrf_length)
+        result["normalized"] = per_condition / bound
+        result["mean_normalized"] = result["normalized"].mean().item()
+        result["total_normalized"] = total / bound
     return result
 
 
@@ -276,127 +316,96 @@ def compute_detection_power(
     tr: float = 1.0,
     device: torch.device | None = None,
     poly_degree: int = 0,
-) -> dict[str, torch.Tensor | float]:
+    rho: float = 0.0,
+    nuisance: torch.Tensor | np.ndarray | None = None,
+) -> dict[str, Any]:
     """
-    Compute detection power for activation detection
+    Detection power under an assumed HRF, Liu & Frank (2004) Eqs. 7-11.
 
-    Power for condition k (relative efficiency):
-        R_k = (h_0^T A_k h_0) / (h_0^T h_0)
+    Each trial type's regressor is z_i = X_i h0; the Q regressors are fitted
+    jointly, whitened and detrended as in Eq. 2, and for every trial type and
+    pairwise difference
 
-    where:
-        h_0 = assumed HRF (hrf_length vector)
-        A_k = (X_k^T X_k) / N
-        X_k = FIR design for condition k
+        R_ij  = [D_ij (Z_perp^T Z_perp)^-1 D_ij^T]^-1 / (h0^T h0)   (Eq. 10)
+        R_tot = harmonic mean of R_ij                              (Eq. 11)
 
-    Higher power = better detection of activation amplitude
-
-    Liu & Frank (2004), Equation 11:
-        R_k ≈ N * f(p, Q) * (h_0^T A_k h_0) / (h_0^T h_0)
-
-    Interpretation:
-        R_k = 1 / variance_of_beta_estimate
-        Higher R_k → lower variance → better detection
+    R_ij is the non-centrality of the contrast's F-test per unit squared
+    amplitude, normalised by the HRF's own power so that it does not depend on
+    how h0 is scaled.
 
     Parameters
     ----------
-    design : array-like, shape (n_timepoints, n_regressors)
-        Design matrix or onset matrix
-    hrf_assumed : array-like, shape (hrf_length,)
-        Assumed HRF for detection
+    design : array-like, shape (n_timepoints, n_conditions)
+        Stimulus pattern per trial type on the TR grid.
+    hrf_assumed : array-like, shape (k,)
+        Assumed HRF h0 on the TR grid.
     n_conditions : int
-        Number of conditions
-    effect_size : float, default=1.0
-        Expected effect size (beta)
-    noise_std : float, default=1.0
-        Noise standard deviation
-    tr : float, default=1.0
-        Repetition time
-    device : torch.device, optional
-        Device for computation
+        Number of trial types Q.
+    effect_size : float
+        Response amplitude in units of ``hrf_assumed`` (the regressor is the
+        stimulus convolved with h0 as given, not a normalised copy).
+    noise_std : float
+        Noise standard deviation (of the innovations, when rho != 0).
+    poly_degree, rho, nuisance
+        As in :func:`compute_estimation_efficiency`.
 
     Returns
     -------
-    power : dict with keys:
-        'per_condition': torch.Tensor, shape (n_conditions,)
-            Detection power for each condition
-        'total': float
-            Total power (sum across conditions)
-        'snr': torch.Tensor, shape (n_conditions,)
-            SNR for each condition (effect_size * sqrt(power) / noise_std)
+    dict with
+        'per_condition' : tensor (Q,), R_ii
+        'per_contrast'  : {(i, j): R_ij}
+        'total'         : R_tot (Eq. 11)
+        'mean'          : mean of 'per_condition'
+        'snr'           : tensor (Q,), the expected t-statistic of each trial
+                          type's amplitude, effect_size / SE(amplitude)
+        'mean_snr'      : its mean
+        'total_normalized' : R_tot / (N k / (2 (Q + 1))), the Eq. 27 bound
     """
     if device is None:
         device = torch.device("cpu")
-
-    # Convert to tensors
-    if not torch.is_tensor(design):
-        design = torch.tensor(design, dtype=torch.float32, device=device)
-    else:
-        design = design.to(device)
-
-    if not torch.is_tensor(hrf_assumed):
-        hrf_assumed = torch.tensor(hrf_assumed, dtype=torch.float32, device=device)
-    else:
-        hrf_assumed = hrf_assumed.to(device)
+    design = torch.as_tensor(design, device=device).to(torch.float64)
+    h0 = torch.as_tensor(hrf_assumed, device=device).to(torch.float64).flatten()
+    nuisance_t = None if nuisance is None else torch.as_tensor(nuisance, device=device)
 
     n_timepoints = design.shape[0]
-    hrf_length = len(hrf_assumed)
-    nuisance = _baseline_nuisance(n_timepoints, poly_degree, device, design.dtype)
-
-    # Normalize HRF
-    h0 = hrf_assumed / torch.sqrt(torch.sum(hrf_assumed**2))
-
-    powers = []
-
-    for k in range(n_conditions):
-        # Extract onsets for condition k
-        if design.shape[1] == n_conditions:
-            onsets_k = design[:, k]
-        elif design.shape[1] >= n_conditions * hrf_length:
-            onsets_k = design[:, k * hrf_length]
-        else:
-            onsets_k = (
-                design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
+    hrf_length = h0.numel()
+    onsets = _condition_onsets(design, n_conditions, hrf_length)
+    Z = torch.stack(
+        [
+            compute_design_matrix_for_condition(
+                onsets, k, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
             )
+            @ h0
+            for k in range(n_conditions)
+        ],
+        dim=1,
+    )
+    Z_perp = _whitened_detrended(Z, poly_degree, rho, nuisance_t)
+    fisher = Z_perp.T @ Z_perp
+    h_power = float(h0 @ h0)
 
-        # Build X_k (same helper the efficiency path uses)
-        X_k = compute_design_matrix_for_condition(
-            onsets_k[:, None], 0, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
-        )
+    pairs = _condition_and_pairwise_contrasts(n_conditions)
+    variances = _contrast_variances(fisher, [d.to(device) for _, d in pairs])
+    per_contrast = {
+        ij: (0.0 if np.isinf(v) else 1.0 / (v * h_power))
+        for (ij, _), v in zip(pairs, variances, strict=True)
+    }
+    per_condition = torch.tensor([per_contrast[(k, k)] for k in range(n_conditions)])
+    inv_mean = float(np.mean([1.0 / r if r > 0 else np.inf for r in per_contrast.values()]))
+    total = 0.0 if np.isinf(inv_mean) else 1.0 / inv_mean
 
-        # Detection power is 1/Var(beta_hat) for the regressor X_k h0, and a real
-        # GLM always fits a baseline alongside it. Leaving the baseline in counts
-        # the regressor's DC against detection: measured on matched designs it was
-        # 55% of a block design's score and 84% of a random one's, which
-        # compressed the block-vs-random ratio from 4.5x to 1.6x and understated
-        # exactly the advantage this metric exists to quantify.
-        X_k = _residualise(X_k, nuisance)
+    # Var(amplitude_i) = sigma^2 / (R_ii h0^T h0), so the expected t is this.
+    snr = effect_size * torch.sqrt(per_condition * h_power) / noise_std
 
-        # Compute A_k = (X_k^T X_k) / N
-        XtX = X_k.T @ X_k
-        A_k = XtX / n_timepoints
-        A_k = A_k + 1e-6 * torch.eye(hrf_length, device=device)
-
-        # Compute power: R_k = (h_0^T A_k h_0) / (h_0^T h_0)
-        # Since h0 is normalized, denominator is 1
-        numerator = h0 @ A_k @ h0
-        power_k = numerator  # Relative efficiency
-
-        powers.append(power_k)
-
-    powers = torch.stack(powers)
-
-    # Compute SNR = effect_size * sqrt(power) / noise_std
-    snr = effect_size * torch.sqrt(powers) / noise_std
-
-    result = {
-        "per_condition": powers,
-        "total": powers.sum().item(),
-        "mean": powers.mean().item(),
+    return {
+        "per_condition": per_condition,
+        "per_contrast": per_contrast,
+        "total": total,
+        "mean": per_condition.mean().item(),
         "snr": snr,
         "mean_snr": snr.mean().item(),
+        "total_normalized": total / (n_timepoints * hrf_length / (2.0 * (n_conditions + 1))),
     }
-
-    return result
 
 
 def compute_conditional_entropy(
@@ -425,10 +434,10 @@ def compute_conditional_entropy(
         - Higher entropy → fewer confounds with task timing
         - BUT: trades off with power/efficiency
 
-    Simplified computation (empirical):
-        H_r = -Σ p(ISI) * log₂(p(ISI))
-
-    where p(ISI) is the probability distribution of inter-stimulus intervals
+    'conditional_entropy' is H_r proper (Eq. 28), over the slot sequence of Q
+    trial types plus null. 'type_entropy' is the same over the event-type
+    sequence alone. 'total' / 'per_condition' are the entropy of the ISI
+    histogram, a different quantity kept for compatibility.
 
     Parameters
     ----------
@@ -590,85 +599,54 @@ def _conditional_entropy_rate(symbols: np.ndarray, n_symbols: int, order: int = 
 def compute_efficiency_power_tradeoff(
     hrf_length: int,
     n_conditions: int = 1,
-    alpha_range: tuple[float, float] = (0.0, 1.0),
+    alpha_range: tuple[float, float] | None = None,
     n_points: int = 100,
     device: torch.device | None = None,
-) -> dict[str, np.ndarray]:
+    theta_deg: float = 45.0,
+) -> dict[str, Any]:
     """
-    Compute theoretical efficiency-power trade-off curve
+    Theoretical efficiency-power trade-off, Liu et al. (2001) / Liu & Frank (2004) Eqs. 18-19.
 
-    Liu & Frank (2004), Section 2.4:
-    The trade-off is characterized by parameter α ∈ [0, 1]:
-        α = 0: Maximum power, minimum efficiency
-        α = 1: Maximum efficiency, minimum power
+    The eigenvalues of the stimulus autocorrelation A_k are modelled as one
+    dominant eigenvalue alpha*M and k-1 equal ones (1-alpha)*M/(k-1), for
+    alpha in [1/k, 1]:
 
-    Trade-off curves:
-        ξ(α) = efficiency as function of α
-        R(α) = power as function of α
+        R(alpha, theta) / M = alpha cos^2(theta) + (1 - alpha) sin^2(theta) / (k - 1)
+        xi(alpha) / M       = alpha (1 - alpha) / (1 + alpha (k^2 - 2k))
 
-    These curves define the Pareto frontier: cannot improve one without
-    sacrificing the other.
+    alpha = 1/k spreads the eigenvalues evenly (maximum efficiency, a random or
+    m-sequence design); alpha = 1 leaves one (maximum power, a block design).
+    theta is the angle between h0 and the dominant eigenvector: Liu et al.
+    (2001) put a 1-block design near 45 degrees and a fast 32-block design near
+    90, so theta is what caps a real block design at a fraction of the bound.
 
-    Parameters
-    ----------
-    hrf_length : int
-        Length of HRF in TRs (Q)
-    n_conditions : int, default=1
-        Number of conditions
-    alpha_range : tuple, default=(0.0, 1.0)
-        Range of α to explore
-    n_points : int, default=100
-        Number of points on curve
-    device : torch.device, optional
-        Device for computation
+    The common factor N f(p, Q) (Eqs. 20-21) scales both axes equally, so each
+    curve is returned relative to its own maximum -- efficiency to its value at
+    alpha = 1/k, power to its value at alpha = 1 and theta = 0. Q enters only
+    through that factor and does not change the normalised curve.
 
     Returns
     -------
-    tradeoff : dict with keys:
-        'alpha': np.ndarray
-            Alpha values
-        'efficiency': np.ndarray
-            Efficiency at each alpha
-        'power': np.ndarray
-            Power at each alpha
-        'optimal_balanced': float
-            Alpha that balances efficiency and power (α ≈ 0.5)
+    dict with 'alpha', 'efficiency', 'power' (np.ndarray) and 'theta_deg'.
     """
-    if device is None:
-        device = torch.device("cpu")
+    k = int(hrf_length)
+    if k < 2:
+        raise ValueError("hrf_length must be at least 2 for a trade-off to exist")
+    lo, hi = alpha_range if alpha_range is not None else (1.0 / k, 1.0)
+    alphas = np.linspace(max(lo, 1.0 / k), min(hi, 1.0), n_points)
 
-    alphas = np.linspace(alpha_range[0], alpha_range[1], n_points)
+    theta = np.deg2rad(theta_deg)
+    power = alphas * np.cos(theta) ** 2 + (1.0 - alphas) * np.sin(theta) ** 2 / (k - 1)
+    efficiency = alphas * (1.0 - alphas) / (1.0 + alphas * (k**2 - 2 * k))
+    efficiency = efficiency / (1.0 / k**2)  # its value at alpha = 1/k
 
-    # Theoretical relationship (simplified from Liu & Frank)
-    # Efficiency: increases with α
-    # Power: decreases with α
-
-    # Based on eigenvalue distribution of A_k
-    # For uniform ISI distribution:
-    #   ξ(α) ∝ 1 / (1 + (1-α)²)
-    #   R(α) ∝ 1 / (1 + α²)
-
-    efficiency = 1.0 / (1.0 + (1.0 - alphas) ** 2)
-    power = 1.0 / (1.0 + alphas**2)
-
-    # Normalize to [0, 1]
-    efficiency = efficiency / efficiency.max()
-    power = power / power.max()
-
-    # Find balanced point (maximize product or minimize distance from (1,1))
-    balance_score = np.sqrt(efficiency**2 + power**2)
-    optimal_idx = np.argmax(balance_score)
-
-    result = {
+    return {
         "alpha": alphas,
         "efficiency": efficiency,
         "power": power,
-        "optimal_balanced": alphas[optimal_idx],
-        "efficiency_at_optimal": efficiency[optimal_idx],
-        "power_at_optimal": power[optimal_idx],
+        "theta_deg": theta_deg,
+        "n_conditions": n_conditions,
     }
-
-    return result
 
 
 def evaluate_design(
@@ -679,6 +657,8 @@ def evaluate_design(
     effect_size: float = 1.0,
     noise_std: float = 1.0,
     device: torch.device | None = None,
+    poly_degree: int = 0,
+    rho: float = 0.0,
 ) -> dict[str, Any]:
     """
     Complete design evaluation: efficiency + power + entropy
@@ -723,20 +703,39 @@ def evaluate_design(
 
     # Compute all metrics
     efficiency = compute_estimation_efficiency(
-        design, n_conditions, hrf_length, tr, normalize=True, device=device
+        design,
+        n_conditions,
+        hrf_length,
+        tr,
+        normalize=True,
+        device=device,
+        poly_degree=poly_degree,
+        rho=rho,
     )
 
     power = compute_detection_power(
-        design, hrf_assumed, n_conditions, effect_size, noise_std, tr, device
+        design,
+        hrf_assumed,
+        n_conditions,
+        effect_size,
+        noise_std,
+        tr,
+        device,
+        poly_degree=poly_degree,
+        rho=rho,
     )
 
     entropy = compute_conditional_entropy(design, n_conditions, tr, device)
 
-    # Summary for quick comparison
+    # Summary for quick comparison. 'entropy_total' is Liu & Frank's H_r, not
+    # the summed ISI entropy it once reported -- that is a different, unbounded
+    # quantity (see compute_conditional_entropy) and still lives in 'entropy'.
     summary = {
         "efficiency_mean": efficiency["mean"],
+        "efficiency_total": efficiency["total"],
         "power_mean": power["mean"],
-        "entropy_total": entropy["total"],
+        "power_total": power["total"],
+        "entropy_total": entropy["conditional_entropy"],
         "snr_mean": power["mean_snr"],
     }
 
