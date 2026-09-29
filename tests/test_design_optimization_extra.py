@@ -237,3 +237,46 @@ class TestConvolveDesignHrf:
         hrf = torch.exp(-0.1 * torch.arange(20, dtype=torch.float32))
         result = convolve_design_hrf(design, hrf, device=DEVICE)
         assert result.shape == design.shape
+
+
+class TestIsiJitterSurvivesMeanMatching:
+    def test_poisson_target_mean_keeps_its_spread_and_order(self):
+        """It picked the draws nearest the mean and returned them sorted by that
+        distance: SD 0.74 s where the exponential gave 3.6 s, and |ISI - mean|
+        correlated 0.85 with position in the run."""
+        from fastfuncstuff.design.optimization import ISIConstraints, generate_isi_sequence
+
+        c = ISIConstraints(min_isi=2.0, max_isi=12.0, mean_isi=5.0, tr=1.0)
+        isis = generate_isi_sequence(200, c, "poisson_target_mean", seed=1)
+        assert isis.mean() == pytest.approx(5.0, rel=0.002)
+        assert isis.min() >= 2.0 and isis.max() <= 12.0
+        assert isis.std() > 1.5
+        position = np.arange(isis.size)
+        assert abs(np.corrcoef(position, np.abs(isis - 5.0))[0, 1]) < 0.2
+
+
+class TestOnsetMatrixReportsLostEvents:
+    def test_sub_tr_isis_that_collide_are_reported(self):
+        from fastfuncstuff.design.optimization import create_onset_matrix
+
+        with pytest.warns(UserWarning, match="share a TR"):
+            onsets = create_onset_matrix(np.array([0, 1, 0]), np.array([0.4, 3.0]), 20.0, 2.0)
+        assert onsets[0].tolist() == [1.0, 1.0]  # two trial types now share TR 0
+
+    def test_events_past_the_scan_are_reported(self):
+        from fastfuncstuff.design.optimization import create_onset_matrix
+
+        with pytest.warns(UserWarning, match="fall past"):
+            create_onset_matrix(np.array([0, 0, 0]), np.array([8.0, 8.0]), 10.0, 1.0)
+
+
+@pytest.mark.parametrize("dist", ["exponential", "poisson", "truncated_exponential"])
+@pytest.mark.parametrize("mean", [3.0, 5.0, 9.0])
+def test_isi_mean_is_matched_within_tolerance(dist, mean):
+    """The additive nudge stalled once clipping pinned draws at the floor."""
+    from fastfuncstuff.design.optimization import ISIConstraints, generate_isi_sequence
+
+    c = ISIConstraints(min_isi=2.0, max_isi=12.0, mean_isi=mean, tr=1.0)
+    isis = generate_isi_sequence(120, c, dist, seed=3)
+    assert isis.mean() == pytest.approx(mean, rel=0.011)
+    assert isis.min() >= 2.0 and isis.max() <= 12.0

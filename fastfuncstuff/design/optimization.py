@@ -27,6 +27,7 @@ from scipy.stats import expon, poisson, truncexpon
 
 # Import our metrics
 from fastfuncstuff.simulation.metrics_empirical import evaluate_design_empirical
+from fastfuncstuff.utils import get_device
 
 from .hrf import get_canonical_hrf
 from .matrices import convolve_hrf
@@ -183,7 +184,7 @@ def generate_isi_sequence(
             - 'exponential': Exponential distribution (most common for event-related)
             - 'truncated_exponential': Truncated exponential with hard min/max bounds
             - 'poisson': Poisson-distributed intervals
-            - 'poisson_target_mean': Poisson with aggressive mean matching (recommended!)
+            - 'poisson_target_mean': Poisson with a tighter (0.1%) mean-matching tolerance
             - 'uniform': Uniform random intervals
             - 'fixed': Fixed ISI (constant)
         seed: Random seed for reproducibility
@@ -198,7 +199,9 @@ def generate_isi_sequence(
 
     Notes:
         - 'truncated_exponential': Uses scipy.stats.truncexpon for proper truncation
-        - 'poisson_target_mean': Guarantees exact mean match within 0.1% tolerance
+        - 'poisson_target_mean': Mean matched to 0.1% (the others to 1%)
+        - 'uniform' and 'fixed' are not mean-adjusted; 'uniform' has mean
+          (min_isi + max_isi) / 2 regardless of mean_isi.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -257,15 +260,12 @@ def generate_isi_sequence(
         isis = counts * isi_constraints.tr
         isis = isis[isis > 0]  # Remove zero ISIs
 
-        # Pre-clip to constraints
+        # Mean matching is left to the adjustment loop below. Pre-selecting the
+        # draws closest to the target (as this once did) both collapsed the
+        # jitter -- SD 0.74 s where the plain exponential gave 3.6 s -- and
+        # returned them sorted by that distance, so the ISI sequence ran from
+        # near-constant to extreme across the run.
         isis = np.clip(isis, min_isi, max_isi)
-
-        # Initial selection with preference for values near target
-        if len(isis) >= n_isis:
-            # Sort by distance from target mean
-            distances = np.abs(isis - target_mean)
-            sorted_idx = np.argsort(distances)
-            isis = isis[sorted_idx[:n_isis]]  # Select closest to target
 
     elif distribution == "uniform":
         # Uniform distribution
@@ -302,22 +302,23 @@ def generate_isi_sequence(
             max_iters = 100
             tolerance = 0.01  # 1% of target mean
 
+        # Rescale the excess over min_isi. Exponential and Poisson ISIs are a
+        # shift-scale family above the floor, so this keeps their shape; only
+        # the draws clipped at max_isi stop moving, which the next pass absorbs.
+        # The additive nudge this replaced stalled once clipping pinned draws at
+        # min_isi -- a Poisson(5) request with min 2 settled 1.4% high.
         for _i in range(max_iters):
             current_mean = isis.mean()
-            error = target_mean - current_mean
-
-            if abs(error) < tolerance * target_mean:
+            if abs(target_mean - current_mean) < tolerance * target_mean:
                 break
-
-            # Adjust ISIs proportionally
-            if error > 0:  # Need to increase mean
-                # Increase larger ISIs more
-                adjustment = error * (isis - min_isi) / (isis.sum() - min_isi * n_isis + 1e-10)
-                isis = np.clip(isis + adjustment, min_isi, max_isi)
-            else:  # Need to decrease mean
-                # Decrease larger ISIs more
-                adjustment = abs(error) * (max_isi - isis) / (max_isi * n_isis - isis.sum() + 1e-10)
-                isis = np.clip(isis - adjustment, min_isi, max_isi)
+            excess = isis - min_isi
+            # Shrinking moves every draw; stretching cannot move one at the cap.
+            free = isis < max_isi if current_mean < target_mean else np.ones_like(isis, bool)
+            if not free.any() or excess[free].sum() <= 0:
+                break
+            needed = target_mean * n_isis - isis[~free].sum() - min_isi * free.sum()
+            isis = np.where(free, min_isi + excess * (needed / excess[free].sum()), isis)
+            isis = np.clip(isis, min_isi, max_isi)
 
     return isis
 
@@ -359,16 +360,28 @@ def create_onset_matrix(
     # First event at t=0, subsequent events at cumulative ISI
     onset_times = np.concatenate([[0], np.cumsum(isis)])
 
-    # Convert to TRs and mark onsets
+    # Convert to TRs and mark onsets. Events that do not fit, or that round
+    # onto a TR already holding an event, are lost from the design -- say so,
+    # since the trial counts the caller asked for are then not the ones scored.
+    n_dropped = 0
+    n_merged = 0
     for event_idx, onset_time in enumerate(onset_times):
-        if onset_time >= duration:
-            break  # Exceeded scan duration
-
         onset_tr = int(np.round(onset_time / tr))
-        if onset_tr < n_timepoints:
-            condition = event_sequence[event_idx]
-            onsets[onset_tr, condition] = 1.0
+        if onset_time >= duration or onset_tr >= n_timepoints:
+            n_dropped += 1
+            continue
+        if onsets[onset_tr].any():
+            n_merged += 1
+        condition = event_sequence[event_idx]
+        onsets[onset_tr, condition] = 1.0
 
+    if n_dropped or n_merged:
+        warnings.warn(
+            f"create_onset_matrix: {n_dropped} of {len(onset_times)} events fall past the "
+            f"{duration:g} s scan and {n_merged} share a TR with an earlier event "
+            f"(ISIs below TR={tr:g} s round together on this grid)",
+            stacklevel=2,
+        )
     return onsets
 
 
@@ -417,13 +430,7 @@ def sample_design_space(
         )
     """
     if device is None:
-        device = torch.device(
-            "mps"
-            if torch.backends.mps.is_available()
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
     if event_orderings is None:
         event_orderings = ["random"]
@@ -549,13 +556,7 @@ def evaluate_design_candidates(
         candidates: Same list with metrics filled in
     """
     if device is None:
-        device = torch.device(
-            "mps"
-            if torch.backends.mps.is_available()
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
     for i, candidate in enumerate(candidates):
         if verbose and (i + 1) % 10 == 0:
@@ -1064,13 +1065,7 @@ def plot_isi_range_optimization(
     import matplotlib.pyplot as plt
 
     if device is None:
-        device = torch.device(
-            "mps"
-            if torch.backends.mps.is_available()
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
     # Create grid of ISI parameters
     min_isis = np.linspace(min_isi_range[0], min_isi_range[1], n_grid_points)
@@ -1341,13 +1336,7 @@ def plot_isi_range_by_target_mean(
     import matplotlib.pyplot as plt
 
     if device is None:
-        device = torch.device(
-            "mps"
-            if torch.backends.mps.is_available()
-            else "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
     n_target_means = len(target_mean_isis)
 
