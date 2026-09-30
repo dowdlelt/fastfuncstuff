@@ -91,7 +91,30 @@ def _noise_correlation(
     ab = _noise_arma(noise, tr)
     if ab is None:
         return None
-    return torch.block_diag(*(_run_correlation(n, *ab)[int(factor)] for n in run_lengths))
+    return _block_correlation(tuple(int(n) for n in run_lengths), *ab, factor)
+
+
+@lru_cache(maxsize=16)
+def _block_correlation(
+    run_lengths: tuple[int, ...], a: float, b: float, factor: bool
+) -> torch.Tensor:
+    return torch.block_diag(*(_run_correlation(n, a, b)[int(factor)] for n in run_lengths))
+
+
+def _corrected_terms(
+    X: torch.Tensor, P: torch.Tensor, R: torch.Tensor
+) -> tuple[torch.Tensor, float, float]:
+    """P R P', tr(MR) and the Satterthwaite dof tr(MR)^2 / tr((MR)^2), M = I - X P.
+
+    Without forming M: expanding M = I - X P turns every trace into products
+    of R with the p design columns, n_t^2 p instead of the n_t^3 of M @ R --
+    at TR 0.5 over two 10-minute runs that dense product was most of the run.
+    """
+    RX, RPt = R @ X, R @ P.T  # (n_t, p)
+    PRX = P @ RX  # (p, p)
+    tr_MR = float(torch.diagonal(R).sum() - torch.trace(PRX))
+    tr_MRMR = float((R * R).sum() - 2.0 * (RPt * RX).sum() + torch.trace(PRX @ PRX))
+    return P @ RPt, tr_MR, tr_MR**2 / tr_MRMR
 
 
 def simulate_design_power(
@@ -173,7 +196,6 @@ def simulate_design_power(
         raise ValueError("design + drift polynomials are rank-deficient; check the conditions")
     XtX_inv = torch.linalg.inv(X.T @ X)
     P = XtX_inv @ X.T  # (n_p, n_t)
-    M = torch.eye(n_t, dtype=torch.float64) - X @ P
 
     names = list(contrasts)
     C = torch.zeros(len(names), n_p, dtype=torch.float64)
@@ -193,8 +215,9 @@ def simulate_design_power(
     # variance estimate and shrinks every t -- which an unbiased-noise power
     # formula misses (it promised 80% where Monte Carlo gave ~0 for A-B on a
     # 4% shared response).
-    misfit_unit = M @ (X_true @ pattern)
-    misfit_base = M @ (X_true @ offset)
+    s_unit, s_base = X_true @ pattern, X_true @ offset
+    misfit_unit = s_unit - X @ (P @ s_unit)
+    misfit_base = s_base - X @ (P @ s_base)
     P_dev = P.to(device=device, dtype=torch.float32)
     X_dev = X.to(device=device, dtype=torch.float32)
     CP_dev = (C @ P).to(device=device, dtype=torch.float32)  # contrast estimates directly
@@ -204,6 +227,9 @@ def simulate_design_power(
     est_base, est_unit = scale * expected_base, scale * expected_unit
     mis_dev = (scale * torch.stack([misfit_base, misfit_unit], dim=1)).to(device, torch.float32)
 
+    v_naive = torch.einsum("ip,pq,iq->i", C, XtX_inv, C)
+    dev_mats = (P_dev, X_dev, CP_dev, mis_dev)
+    shared: dict[tuple[float, float] | None, tuple] = {}
     rows: list[dict[str, Any]] = []
     dofs: dict[str, tuple[float, float]] = {}
     for k, cond in enumerate(noise):
@@ -211,33 +237,19 @@ def simulate_design_power(
         kw = {key: v for key, v in cond.items() if key != "label"}
         sigma = baseline / float(kw["tsnr"])
 
-        R = _noise_correlation(kw, tr, run_lengths)
-        v_naive = torch.einsum("ip,pq,iq->i", C, XtX_inv, C)
-        if R is None:
-            v_true, tr_MR, dof_corr = v_naive, float(n_t - n_p), float(n_t - n_p)
-        else:
-            v_true = torch.einsum("ip,pq,iq->i", C, P @ R @ P.T, C)
-            MR = M @ R
-            tr_MR = float(torch.trace(MR))
-            dof_corr = tr_MR**2 / float((MR * MR.T).sum())
+        # Everything below depends on the noise only through its ARMA (a, b)
+        # and scales with sigma, so noise levels that share (a, b) -- every
+        # -tsnr level does -- share one unit-variance draw and one set of
+        # corrected-t terms (common random numbers across levels too).
+        ab = _noise_arma(kw, tr)
+        if ab not in shared:
+            shared[ab] = _unit_noise_fit(ab, X, P, C, run_lengths, n_reps, gen, dev_mats)
+        v_true, tr_MR, dof_corr, est_u, rss_u, cross_u = shared[ab]
+        est_n, rss_n, cross = sigma * est_u, sigma**2 * rss_u, sigma * cross_u
         dof_naive = float(n_t - n_p)
         dofs[label] = (dof_naive, dof_corr)
         crit_naive = stats.t.ppf(1 - alpha / 2, dof_naive)
         crit_corr = stats.t.ppf(1 - alpha / 2, dof_corr)
-
-        # One noise draw per condition, shared by every amplitude (common
-        # random numbers). OLS is linear, so the fit of noise + a*s splits
-        # into the noise's fit plus a times a fixed signal part, and each
-        # amplitude costs a few dot products instead of a fresh draw and fit.
-        # Drawing per amplitude, through a per-timepoint AR(1) loop on the
-        # CPU, was 93% of the run time.
-        L = _noise_correlation(kw, tr, run_lengths, factor=True)
-        Z = torch.randn(n_t, n_reps, device=device, generator=gen, dtype=torch.float32)
-        noise_y = sigma * (Z if L is None else L.to(device, torch.float32) @ Z)
-        est_n = (CP_dev @ noise_y).double().cpu()  # (n_contrasts, n_reps)
-        resid_n = noise_y - X_dev @ (P_dev @ noise_y)
-        rss_n = (resid_n * resid_n).sum(dim=0).double().cpu()
-        cross = (mis_dev.T @ resid_n).double().cpu()  # (2, n_reps): base, unit
 
         for amp in amps:
             est = est_n + (est_base + amp * est_unit)[:, None]
@@ -288,6 +300,55 @@ def simulate_design_power(
         "dof": dofs,
         "n_reps": n_reps,
     }
+
+
+def _unit_noise_fit(
+    ab: tuple[float, float] | None,
+    X: torch.Tensor,
+    P: torch.Tensor,
+    C: torch.Tensor,
+    run_lengths: list[int],
+    n_reps: int,
+    gen: torch.Generator,
+    dev_mats: tuple[torch.Tensor, ...],
+) -> tuple:
+    """Corrected-t terms and the OLS fit of one unit-variance noise draw of ARMA ``ab``.
+
+    Returns (v_true, tr(MR), dof, est, rss, cross): contrast variances under
+    R, the Satterthwaite terms, and per replicate the contrast estimates, the
+    RSS and the residual's cross terms with the (base, unit) misfit. Scale
+    est and cross by sigma and rss by sigma^2 for a noise SD of sigma.
+
+    The draw is chol(R) @ z -- exactly white + OU, runs independent -- run by
+    run, since chol(R) is block-diagonal: one dense product over all runs
+    cost n_runs times more. One draw serves every amplitude (common random
+    numbers): OLS is linear, so each amplitude adds a fixed signal part. A
+    fresh per-amplitude draw through a per-timepoint AR(1) loop on the CPU was
+    93% of the run time.
+    """
+    P_dev, X_dev, CP_dev, mis_dev = dev_mats
+    device = X_dev.device
+    n_t, n_p = X.shape
+    v_naive = torch.einsum("ip,pq,iq->i", C, P @ P.T, C)
+    Z = torch.randn(n_t, n_reps, device=device, generator=gen, dtype=torch.float32)
+    if ab is None:
+        v_true, tr_MR, dof = v_naive, float(n_t - n_p), float(n_t - n_p)
+        y = Z
+    else:
+        R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
+        PRPt, tr_MR, dof = _corrected_terms(X, P, R)
+        v_true = torch.einsum("ip,pq,iq->i", C, PRPt, C)
+        y = torch.empty_like(Z)
+        start = 0
+        for n in run_lengths:
+            L = _run_correlation(int(n), *ab)[1].to(device, torch.float32)
+            y[start : start + n] = L @ Z[start : start + n]
+            start += n
+    est = (CP_dev @ y).double().cpu()  # (n_contrasts, n_reps)
+    resid = y - X_dev @ (P_dev @ y)
+    rss = (resid * resid).sum(dim=0).double().cpu()
+    cross = (mis_dev.T @ resid).double().cpu()  # (2, n_reps): base, unit
+    return v_true, tr_MR, dof, est, rss, cross
 
 
 def has_mismatch(rows: list[dict[str, Any]], rtol: float = 1e-3) -> bool:
@@ -426,7 +487,6 @@ def design_quality(
     out["vif"] = (torch.diag(torch.linalg.inv(G)) * torch.diag(G)).numpy()
     XtX_inv = torch.linalg.inv(X.T @ X)
     P = XtX_inv @ X.T
-    M = torch.eye(n_t, dtype=torch.float64) - X @ P
     pairs = [(i, j) for i in range(n_cond) for j in range(i + 1)]
     C = torch.zeros(len(pairs), n_p, dtype=torch.float64)
     for k, (i, j) in enumerate(pairs):
@@ -435,16 +495,19 @@ def design_quality(
             C[k, j] -= 1.0
     CP = C @ P
     needed: dict[str, np.ndarray] = {}
+    terms: dict[tuple[float, float] | None, tuple[torch.Tensor, float]] = {}
     for k, cond in enumerate(noise):
         label = str(cond.get("label", f"noise{k}"))
         kw = {key: v for key, v in cond.items() if key != "label"}
-        R = _noise_correlation(kw, tr, run_lengths)
-        if R is None:
-            var, dof = (CP * CP).sum(dim=1), float(n_t - n_p)
-        else:
-            var = ((CP @ R) * CP).sum(dim=1)
-            MR = M @ R
-            dof = float(torch.trace(MR)) ** 2 / float((MR * MR.T).sum())
+        ab = _noise_arma(kw, tr)
+        if ab not in terms:  # every -tsnr level shares (a, b)
+            if ab is None:
+                terms[ab] = ((CP * CP).sum(dim=1), float(n_t - n_p))
+            else:
+                R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
+                PRPt, _, dof = _corrected_terms(X, P, R)
+                terms[ab] = (((C @ PRPt) * C).sum(dim=1), dof)
+        var, dof = terms[ab]
         nc = _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
         sd = 100.0 / float(kw["tsnr"])  # noise SD in PSC
         m = np.full((n_cond, n_cond), np.nan)

@@ -343,3 +343,18 @@ def test_correlation_sign_decides_whether_a_difference_is_cheap():
     assert near["corr"][1, 0] > 0 > apart["corr"][1, 0]
     ratio = [q["needed"]["t50"][1, 0] / q["needed"]["t50"][0, 0] for q in (near, apart)]
     assert ratio[0] > 1.4 and ratio[1] < 1.1
+
+
+def test_corrected_terms_match_the_dense_formula():
+    # The trace expansion avoids forming M = I - X P (n_t^3); it must equal it.
+    from fastfuncstuff.simulation.power import _corrected_terms, _noise_correlation
+
+    X = torch.cat([_two_condition_design(4.0), torch.ones(200, 1, dtype=torch.float64)], 1)
+    X = X.double()
+    P = torch.linalg.inv(X.T @ X) @ X.T
+    R = _noise_correlation({"tsnr": 50.0, "phys_fraction": 0.6, "tau": 6.0}, 2.0, [120, 80])
+    PRPt, tr_MR, dof = _corrected_terms(X, P, R)
+    MR = (torch.eye(200, dtype=torch.float64) - X @ P) @ R
+    torch.testing.assert_close(PRPt, P @ R @ P.T)
+    assert tr_MR == pytest.approx(float(torch.trace(MR)), rel=1e-10)
+    assert dof == pytest.approx(float(torch.trace(MR)) ** 2 / float((MR * MR.T).sum()), rel=1e-10)
