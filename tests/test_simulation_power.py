@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from fastfuncstuff.simulation.core import simulate_bold
-from fastfuncstuff.simulation.power import amplitude_for_power, simulate_design_power
+from fastfuncstuff.simulation.power import (
+    amplitude_for_power,
+    effect_needed,
+    simulate_design_power,
+)
 
 CPU = torch.device("cpu")
 TR = 1.25
@@ -247,8 +251,35 @@ def test_analytic_power_includes_residual_misfit():
     Without the misfit term the analytic curve promised 80% power where Monte
     Carlo measured ~0 (A-B on a large shared response, wrong HRF).
     """
-    res = _run([{"label": "w", "tsnr": 150.0, "phys_fraction": 0.0}], amplitudes=(2.0, 4.0),
-               true_design=_design(shift_s=3.0), n_reps=1500)
+    res = _run(
+        [{"label": "w", "tsnr": 150.0, "phys_fraction": 0.0}],
+        amplitudes=(2.0, 4.0),
+        true_design=_design(shift_s=3.0),
+        n_reps=1500,
+    )
     for amp in (2.0, 4.0):
         r = _rows(res, "w", "A")[amp]
         assert r["power"] == pytest.approx(r["power_predicted"], abs=0.06)
+
+
+def _row(design, noise, amp, power, contrast="A"):
+    return {
+        "design": design,
+        "true_hrf": "",
+        "noise": noise,
+        "contrast": contrast,
+        "amplitude": amp,
+        "true_effect": amp,
+        "expected_est": amp,
+        "power": power,
+        "power_predicted": power,
+    }
+
+
+def test_effect_needed_keeps_one_value_per_realization():
+    # design 0 reaches 80% between 1 and 2; design 1 never does.
+    rows = [_row(0, "lo", a, p) for a, p in ((0, 0.0), (1, 0.6), (2, 1.0))]
+    rows += [_row(1, "lo", a, p) for a, p in ((0, 0.0), (1, 0.1), (2, 0.3))]
+    need = effect_needed({"table": rows})
+    assert list(need) == [("lo", "A")]
+    np.testing.assert_allclose(need[("lo", "A")], [1.5, np.nan])

@@ -242,7 +242,7 @@ def plot_design_comparison(
     """
     import matplotlib.pyplot as plt
 
-    from .power import amplitude_for_power
+    from .power import effect_needed
 
     names = list(results)
     colors = ramp(len(noise_labels))
@@ -252,16 +252,9 @@ def plot_design_comparison(
     top = max(r["amplitude"] for res in results.values() for r in res["table"])
     offsets = np.linspace(-0.22, 0.22, len(noise_labels)) if len(noise_labels) > 1 else [0.0]
     for row, name in enumerate(names):
-        rows = results[name]["table"]
-        keys = {(r["design"], r.get("true_hrf", "")) for r in rows}
+        need = effect_needed(results[name], target)
         for label, col, dy in zip(noise_labels, colors, offsets, strict=True):
-            vals = []
-            for d, th in keys:
-                sub = {
-                    "table": [r for r in rows if r["design"] == d and r.get("true_hrf", "") == th]
-                }
-                vals.append(amplitude_for_power(sub, target).get((label, contrast), np.nan))
-            v = np.asarray(vals, dtype=float)
+            v = need.get((label, contrast), np.full(1, np.nan))
             y = row + dy
             if np.all(np.isnan(v)):
                 ax.annotate(
@@ -434,9 +427,11 @@ def plot_example_voxels(
     realization,
     tr: float,
     noise: list[dict[str, Any]],
-    amplitude: float = 1.0,
+    amplitude: float | list[float] = 1.0,
     true_hrf: str = "spmg1",
     run: int = 0,
+    basis: str | None = None,
+    notes: list[str] | None = None,
     seed: int = 0,
     path: str | Path | None = None,
     title: str | None = None,
@@ -449,6 +444,13 @@ def plot_example_voxels(
     that does not respond at all (grey), and the noiseless response (ink).
     Event onsets are marked along the top in condition colours. A picture of
     what a tSNR level means before any statistics.
+
+    ``amplitude`` is one value, or one per row -- e.g. the effect each level
+    needs for 80% power, so every row shows a just-detectable response.
+    ``basis`` says in the title where the amplitudes came from; ``notes``
+    adds one remark per row (e.g. that it never reached 80%). Each row has
+    its own y-scale: a shared one is set by the noisiest level and flattens
+    every quieter row.
     """
     import matplotlib.pyplot as plt
     import torch
@@ -466,7 +468,12 @@ def plot_example_voxels(
     start = int(sum(real.run_lengths[:run]))
     n_t = real.run_lengths[run]
     t = np.arange(n_t) * tr
-    signal = amplitude * X[start : start + n_t].sum(axis=1)  # PSC, every condition equal
+    unit = X[start : start + n_t].sum(axis=1)  # every condition equal, unit peak
+    amps = np.atleast_1d(np.asarray(amplitude, dtype=float))
+    if amps.size == 1:
+        amps = np.full(len(noise), amps[0])
+    if len(amps) != len(noise):
+        raise ValueError(f"{len(amps)} amplitudes for {len(noise)} noise levels")
 
     gen = torch.Generator().manual_seed(seed)
     colors = ramp(len(noise))
@@ -474,8 +481,9 @@ def plot_example_voxels(
         len(noise), 1, figsize=(13, 1.9 * len(noise) + 0.9), sharex=True, squeeze=False
     )
     fig.patch.set_facecolor(SURFACE)
-    lo = hi = 0.0
-    for ax, cond, col in zip(axes[:, 0], noise, colors, strict=True):
+    notes = notes or [""] * len(noise)
+    for ax, cond, col, amp, note in zip(axes[:, 0], noise, colors, amps, notes, strict=True):
+        signal = amp * unit  # PSC
         _style(ax)
         kw = {k: v for k, v in cond.items() if k != "label"}
         # Two voxels, same noise statistics: column 0 responds, column 1 does not.
@@ -485,21 +493,18 @@ def plot_example_voxels(
         ax.plot(t, n[:, 1], color="#a9a8a2", linewidth=1, label="silent voxel")
         ax.plot(t, signal + n[:, 0], color=col, linewidth=1.3, label="active voxel")
         ax.plot(t, signal, color=INK, linewidth=1.6, label="true response")
-        lo, hi = (
-            min(lo, n.min(), (signal + n[:, 0]).min()),
-            max(hi, n.max(), (signal + n[:, 0]).max()),
-        )
+        lo = min(n.min(), (signal + n[:, 0]).min())
+        hi = max(n.max(), (signal + n[:, 0]).max())
         sd = 100.0 / float(kw["tsnr"])
         ax.set_ylabel("% signal", color=INK2, fontsize=9)
         ax.set_title(
-            f"{cond.get('label', '')}  (noise SD {sd:.2g}%)",
+            f"{cond.get('label', '')}  (noise SD {sd:.2g}%, response {amp:.2g}%{note})",
             loc="left",
             fontsize=9,
             color=INK,
             pad=3,
         )
-    pad = 0.08 * (hi - lo)
-    for ax in axes[:, 0]:
+        pad = 0.08 * (hi - lo)
         ax.set_ylim(lo - pad, hi + 3 * pad)
         for i, cond_name in enumerate(real.conditions):
             for on in real.onsets[i][run]:
@@ -531,8 +536,9 @@ def plot_example_voxels(
     )
     fig.suptitle(
         title
-        or f"Example voxels, run {run + 1}: every condition at {amplitude:g}% "
-        f"({true_hrf} response); same y-scale in every row",
+        or f"Example voxels, run {run + 1}: every condition at "
+        f"{basis or ', '.join(f'{a:.2g}%' for a in dict.fromkeys(amps))} "
+        f"({true_hrf} response); y-scale per row",
         color=INK,
         fontsize=10,
     )

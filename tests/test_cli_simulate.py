@@ -386,3 +386,33 @@ def test_effect_verdict_follows_monte_carlo_under_mismatch():
     assert _effect_cell(sel, "power").endswith("hopeless")
     assert _effect_cell(sel, "power_predicted").endswith("good")
     assert _effect_cell([{**sel[0], "true_effect": 0.0}], "power") == "no true effect"
+
+
+def test_example_voxels_show_the_effect_each_level_needs():
+    from fastfuncstuff.cli.simulate import _voxel_amplitudes
+
+    # A fixed 1% default was undetectable at tSNR 50 and invisible at 20: each
+    # row now plants what that level needs, and says when it never gets there.
+    rows = []
+    for noise, (p1, p2) in {"t20": (0.1, 0.3), "t100": (0.9, 1.0)}.items():
+        for amp, pw in ((0.0, 0.0), (1.0, p1), (2.0, p2)):
+            rows.append(
+                {
+                    "design": 0,
+                    "true_hrf": "",
+                    "noise": noise,
+                    "contrast": "A",
+                    "amplitude": amp,
+                    "true_effect": amp,
+                    "expected_est": amp,
+                    "power": pw,
+                    "power_predicted": pw,
+                }
+            )
+    conds = [{"label": "t20"}, {"label": "t100"}]
+    amps, basis, notes = _voxel_amplitudes({"table": rows}, conds, {"A": [1.0]}, [1.0], None)
+    assert amps[0] == 2.0 and "not reached" in notes[0]  # top of the sweep
+    assert 0 < amps[1] < 1.0 and notes[1] == ""
+    assert "80% power" in basis
+    amps, basis, notes = _voxel_amplitudes({"table": rows}, conds, {"A": [1.0]}, [1.0], 1.5)
+    assert amps == [1.5, 1.5] and "-effect" in basis and notes is None

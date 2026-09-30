@@ -6,6 +6,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import pytest
 import torch
 
 from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
@@ -46,7 +47,9 @@ def test_figures_render(tmp_path):
     plot_power(res, labels, contrasts, [1, 0], effect=1.0, path=tmp_path / "p.png")
     plot_design(res, reals[0], 2, path=tmp_path / "d.png")
     plot_design_comparison({"x": res, "y": res}, "A", labels, path=tmp_path / "c.png")
-    plot_example_voxels(reals[0], 2, noise, amplitude=1.0, path=tmp_path / "v.png")
+    plot_example_voxels(reals[0], 2, noise, amplitude=[2.5, 1.0], path=tmp_path / "v.png")
+    with pytest.raises(ValueError, match="2 noise levels"):
+        plot_example_voxels(reals[0], 2, noise, amplitude=[1.0, 2.0, 3.0])
     arma = [{"label": "measured", "tsnr": 60.0, "arma": (0.0, 0.4)}]
     plot_example_voxels(reals[0], 2, arma, path=tmp_path / "v2.png")
     for name in ("p.png", "d.png", "c.png", "v.png", "v2.png"):

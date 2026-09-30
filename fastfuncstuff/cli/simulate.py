@@ -74,7 +74,8 @@ Examples
 Outputs: PREFIX_summary.txt, PREFIX_power.tsv, PREFIX_power.png,
 PREFIX_design.png, PREFIX_spec.json, PREFIX_events/ (timing files of the
 first realization, for a described experiment), PREFIX_voxels.png (an active
-and a silent voxel at each noise level, every condition at -effect or 1%),
+and a silent voxel at each noise level, every condition at -effect, or else at
+the effect that level needs for 80% power),
 and PREFIX_hrf.png when the true HRF differs from the fitted one.
 
 COMPARE -- designs simulated separately, side by side:
@@ -396,7 +397,7 @@ def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
 
 
 def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_text) -> str:
-    from fastfuncstuff.simulation.power import amplitude_for_power, has_true_effect, is_difference
+    from fastfuncstuff.simulation.power import effect_needed, has_true_effect, is_difference
 
     rows = res["table"]
     out = ["ffs_simulate", "=" * 72]
@@ -453,18 +454,14 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
         "Effect (% signal change: amplitude, or the difference for A-B) for 80% power -- "
         f"median [range] over {over}"
     )
-    per_design = {}
-    for d in range(len(reals)):
-        for th in truths:
-            sub = {"table": [r for r in rows if r["design"] == d and r["true_hrf"] == th]}
-            per_design[(d, th)] = amplitude_for_power(sub, 0.8)
+    need = effect_needed(res, 0.8)
     unreached = False
     header = f"{'noise':<24}" + "".join(f"{c:>18}" for c in contrasts)
     out.append(header)
     for cond in conds:
         cells = []
         for c in contrasts:
-            vals = np.array([per_design[d][(cond["label"], c)] for d in per_design])
+            vals = need[(cond["label"], c)]
             if not has_true_effect(contrasts[c], pattern):
                 cells.append(f"{'no true effect':>18}")
             elif np.all(np.isnan(vals)):
@@ -556,6 +553,35 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             out.append(f"{cond['label']:<24}" + "".join(cells))
         out.append("  hopeless < 0.2 <= marginal < 0.8 <= good")
     return "\n".join(out)
+
+
+def _voxel_amplitudes(
+    res, conds, contrasts, pattern, effect
+) -> tuple[list[float], str, list[str] | None]:
+    """Amplitude for each noise row of the example-voxel figure, what it is, and row notes.
+
+    -effect when given. Otherwise the effect each noise level needs for 80%
+    power (median over realizations), on the first contrast with a true effect
+    -- a fixed default (1%) was below detectability at tSNR 50 and invisible
+    against tSNR 20's noise, so the picture showed nothing the design could
+    find. A level that never reaches 80% shows the top of the sweep.
+    """
+    from fastfuncstuff.simulation.power import effect_needed, has_true_effect
+
+    if effect is not None:
+        return [effect] * len(conds), f"{effect:g}% (-effect)", None
+    live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
+    if not live:
+        return [1.0] * len(conds), "1% (no contrast has a true effect)", None
+    need = effect_needed(res, 0.8)
+    top = max(r["amplitude"] for r in res["table"])
+    amps, notes = [], []
+    for cond in conds:
+        v = need.get((cond["label"], live[0]), np.full(1, np.nan))
+        reached = bool(np.isfinite(v).any())
+        amps.append(float(np.nanmedian(v)) if reached else top)
+        notes.append("" if reached else "; 80% not reached, top of the sweep")
+    return amps, f"the effect {live[0]} needs for 80% power at each level", notes
 
 
 def _run_compare(args) -> int:
@@ -786,11 +812,14 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.simulation.plots import plot_example_voxels
 
         truth = res["true_hrfs"][0] if res["true_hrfs"] != [res["hrf"]] else res["hrf"]
+        amp, basis, notes = _voxel_amplitudes(res, conds, contrasts, pattern, args.effect)
         plot_example_voxels(
             reals[0],
             args.tr,
             conds,
-            amplitude=args.effect if args.effect is not None else 1.0,
+            amplitude=amp,
+            basis=basis,
+            notes=notes,
             true_hrf=truth,
             seed=args.seed,
             path=f"{prefix}_voxels.png",

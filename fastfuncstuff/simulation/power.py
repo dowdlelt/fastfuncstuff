@@ -325,6 +325,21 @@ def amplitude_for_power(
     return out
 
 
+def effect_needed(result: dict[str, Any], target: float = 0.8) -> dict[tuple[str, str], np.ndarray]:
+    """:func:`amplitude_for_power` per realization (and true HRF), per (noise, contrast).
+
+    A jittered design's answer is a distribution: each array holds one value
+    per (design, true_hrf) cell, nan where that cell never reaches ``target``.
+    """
+    rows = result["table"]
+    cells: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for r in rows:
+        cells.setdefault((r["design"], r.get("true_hrf", "")), []).append(r)
+    need = [amplitude_for_power({"table": sub}, target) for _, sub in sorted(cells.items())]
+    keys = dict.fromkeys((r["noise"], r["contrast"]) for r in rows)
+    return {k: np.array([n.get(k, np.nan) for n in need], dtype=float) for k in keys}
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,
@@ -545,21 +560,17 @@ def compare_designs(
     out = []
     for name in names:
         rows = results[name]["table"]
-        keys = sorted({(r["design"], r.get("true_hrf", "")) for r in rows})
-        need = {}
-        for d, th in keys:
-            sub = {"table": [r for r in rows if r["design"] == d and r.get("true_hrf", "") == th]}
-            need[(d, th)] = amplitude_for_power(sub, target)
+        need = effect_needed(results[name], target)
         for noise in shared_noise:
             for c in shared_con:
-                v = np.array([need[k].get((noise, c), np.nan) for k in keys], dtype=float)
+                v = need[(noise, c)]
                 eff = max(abs(r["true_effect"]) for r in rows if r["contrast"] == c)
                 out.append(
                     {
                         "design": name,
                         "noise": noise,
                         "contrast": c,
-                        "n_realizations": len(keys),
+                        "n_realizations": len(v),
                         "has_effect": eff > 0,
                         "median": float(np.nanmedian(v)) if np.isfinite(v).any() else np.nan,
                         "min": float(np.nanmin(v)) if np.isfinite(v).any() else np.nan,
