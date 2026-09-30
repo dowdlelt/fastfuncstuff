@@ -878,7 +878,13 @@ def plot_exploration(
     )
     for col, a in enumerate(shown, start=1):
         vals = [a.numeric(c[a.label]) for c in configs]
-        y_short = "1 - reliability" if y_label and "reliab" in y_label else "shape SD %"
+        y_short = (
+            "1 - reliability"
+            if y_label and "reliab" in y_label
+            else "steps"
+            if y_label and "steps" in y_label
+            else "shape SD %"
+        )
         for row, (metric, name) in enumerate(((x, "detection %"), (y, y_short))):
             sub = fig.add_subplot(gs[row, col])
             _style(sub)
@@ -1189,6 +1195,62 @@ def plot_spectrum(
     fig.suptitle(
         title or "Where each contrast's information sits (first run): lost to the drift at "
         "low frequencies, expensive where the noise is loud",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
+def plot_shape_steps(
+    result: dict[str, Any],
+    conditions: list[str],
+    noise_labels: list[str],
+    amplitudes: list[float] | np.ndarray,
+    target: float = 0.8,
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_conditions: int = 4,
+):
+    """Power to tell two response shapes apart, against how far apart they are.
+
+    Per condition, one line per noise level: the power to detect that the true
+    shape is not the modelled one, when they are s steps apart in the ordered
+    20-HRF library (about 0.16 s of peak latency per step, the width growing
+    with it). Where a line crosses the target is the shape resolution of the
+    design -- also how different two conditions' shapes must be to be told
+    apart. ``result`` is :func:`~.power.shape_steps`.
+    """
+    import matplotlib.pyplot as plt
+
+    names = conditions[:max_conditions]
+    steps = np.arange(1, result["max_step"] + 1)
+    colors = ramp(len(noise_labels))
+    fig, axes = plt.subplots(1, len(names), figsize=(4.4 * len(names) + 0.6, 3.8),
+                             squeeze=False, layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    for q, (ax, cond) in enumerate(zip(axes[0], names, strict=True)):
+        _style(ax)
+        ax.axhline(target, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
+        for label, col in zip(noise_labels, colors, strict=True):
+            ax.plot(steps, result["power"][label][q], "o-", color=col, linewidth=2,
+                    markersize=4, label=label)  # fmt: skip
+        s80 = result["steps"][noise_labels[len(noise_labels) // 2]][q]
+        tail = (
+            f"; {s80:.1f} steps at {noise_labels[len(noise_labels) // 2]}"
+            if np.isfinite(s80)
+            else ""
+        )
+        ax.set_title(f"{cond} ({float(amplitudes[q]):g}%){tail}", color=INK, fontsize=10,
+                     loc="left")  # fmt: skip
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_xlabel("library steps apart (~0.16 s of peak latency each)", color=INK2,
+                      fontsize=9)  # fmt: skip
+    axes[0, 0].set_ylabel("power to tell the shapes apart", color=INK2, fontsize=9)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
+               loc="outside lower center", ncol=min(len(labels), 5))  # fmt: skip
+    fig.suptitle(
+        title or "Shape resolution: how far apart two response shapes must be to be told apart "
+        f"(dashed: {target:.0%} power)",
         color=INK, fontsize=10,
     )  # fmt: skip
     return _finish(fig, path)

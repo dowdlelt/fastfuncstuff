@@ -122,3 +122,15 @@ def test_axes_are_named_by_what_they_control_and_edges_are_flagged():
     configs = [{a.label: a.value(0.01) for a in axes}] * 3
     edges = {label for label, _, _ in at_edges(axes, configs, [0, 1, 2])}
     assert "initial_fix" in edges and "null_share" not in edges  # 0% has nothing below it
+
+
+def test_shape_diff_objective_runs(tmp_path, capsys):
+    from fastfuncstuff.cli.simulate import main
+
+    argv = ["-tr", "1", "-nruns", "1", "-scan_time", "150", "-initial_fix", "10", "-post_fix",
+            "15", "-trial", "E1", "0.25", "1", "-isi", "exp:[3.0-6.0],1,12", "-tsnr", "80",
+            "-objective", "shape_diff", "-explore", "3", "-explore_designs", "1",
+            "-explore_keep", "1", "-explore_pick", "1", "-device", "cpu", "-no_plots",
+            "-prefix", str(tmp_path / "s")]  # fmt: skip
+    assert main(argv) == 0
+    assert "library steps two shapes must be apart" in capsys.readouterr().out

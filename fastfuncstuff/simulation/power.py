@@ -479,14 +479,20 @@ class RealizationScorer:
         # -pattern B=0 has none). The effect reported is the contrast's own value
         # in % signal -- not the sweep, which -pattern scales.
         self.live = np.array([has_true_effect(w, pattern) for w in self.W])
+        self.pattern = pattern
 
-    def score(self, real: Any, shape: bool = True, single: bool = False) -> dict[str, Any] | None:
+    def score(
+        self, real: Any, shape: bool = True, single: bool = False, steps: bool = False
+    ) -> dict[str, Any] | None:
         """Scores of one realization, or None if its model is rank-deficient.
 
         ``single`` adds single-trial estimability (:func:`single_trial_quality`,
         means over conditions): 'lss_sd' and 'lsa_sd' per noise label, 'leakage',
         and per noise label 'unreliability' (1 - the better trial-pattern
-        reliability of LSS and ridge) and 'ridge_frac'.
+        reliability of LSS and ridge) and 'ridge_frac'. ``steps`` adds
+        'shape_steps' per noise label: the library steps two shapes must be
+        apart to be told apart (:func:`shape_steps`, mean over conditions;
+        one past the maximum where never), at mean_response x pattern.
         """
         from fastfuncstuff.cli_utils import auto_polort
 
@@ -539,6 +545,15 @@ class RealizationScorer:
                 k: 1.0 - max(v["lss"], v["ridge"]) for k, v in st["reliability"].items()
             }
             out["ridge_frac"] = {k: v["ridge_frac"] for k, v in st["reliability"].items()}
+        if steps:
+            ss = shape_steps(
+                real, self.tr, self.noise, self.mean_response * self.pattern, self.alpha,
+                self.target, pdeg,
+            )  # fmt: skip
+            cap = ss["max_step"] + 1.0
+            out["shape_steps"] = {
+                k: float(np.mean(np.where(np.isfinite(v), v, cap))) for k, v in ss["steps"].items()
+            }
         return out
 
 
@@ -1400,6 +1415,101 @@ def design_spectrum(
         "drift_share": share,
         "noise_label": str(noise.get("label", "noise")),
     }
+
+
+def shape_steps(
+    realization: Any,
+    tr: float,
+    noise: list[dict[str, Any]],
+    amplitudes: list[float] | np.ndarray,
+    alpha: float = 0.001,
+    target: float = 0.8,
+    poly_degree: int | None = None,
+    max_step: int = 12,
+) -> dict[str, Any]:
+    """How far apart two response shapes must be for this design to tell them apart.
+
+    The 20-HRF library (GLMsingle's) is ordered: peak 2.7 -> 5.7 s, about
+    0.16 s of latency per step, widening as it goes. Suppose a condition's
+    true shape is library HRF k+s while the model gives every condition HRF k
+    (amplitudes free). What that model cannot absorb -- the residual e of the
+    true regressor on [X_k, drift] -- is what a shape test detects, with
+    noncentrality A (e'e) / (sigma sqrt(e'Re)) under the noise ARMA. Power is
+    averaged over library positions k and both directions, per step distance s.
+
+    This is also the two-condition question: 'do A and B differ in shape?' is
+    'is B's shape not A's HRF k?' -- the same residual. Model selection among
+    library shapes (``ffs_hrfopt``, GLMsingle) needs exactly this separation.
+
+    Returns 'steps' {label: (n_cond,)} -- the step distance at which power
+    reaches ``target`` (fractional; nan beyond ``max_step``) -- and
+    'power' {label: (n_cond, max_step)} per step distance 1..max_step.
+    """
+    from scipy import stats as st
+
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    lengths = list(realization.run_lengths)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    dt = default_microtime_dt(tr)
+    lib = hrfs_from_spec("lib:all", dt, cpu)
+    Xs = torch.stack(
+        [
+            build_task_design(realization.onsets, realization.durations, tr, lengths, b, dt,
+                              device=cpu).double()
+            for _, b in lib
+        ]
+    )  # (n_lib, n_t, n_cond)  # fmt: skip
+    n_lib, n_t, n_cond = Xs.shape
+    D = _nuisance(lengths, poly_degree)
+    amps = np.abs(np.asarray(amplitudes, dtype=float))
+    dof = n_t - n_cond - D.shape[1] - 1
+    crit = float(st.t.ppf(1 - alpha / 2, dof))
+    # Per noise ARMA: sum over k and both directions of e'e and e'Re per (q, s).
+    by_ab: dict[Any, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    out: dict[str, Any] = {"steps": {}, "power": {}, "max_step": max_step}
+    for i, c in enumerate(noise):
+        label = str(c.get("label", f"noise{i}"))
+        kw = {key: v for key, v in c.items() if key != "label"}
+        ab = _noise_arma(kw, tr)
+        if ab not in by_ab:
+            R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
+            ee = [[[] for _ in range(max_step)] for _ in range(n_cond)]
+            eRe = [[[] for _ in range(max_step)] for _ in range(n_cond)]
+            for k in range(n_lib):
+                Q, _ = torch.linalg.qr(torch.cat([Xs[k], D], dim=1))
+                for q in range(n_cond):
+                    others = [k + s for s in range(-max_step, max_step + 1)
+                              if s and 0 <= k + s < n_lib]  # fmt: skip
+                    E = Xs[others, :, q].T  # (n_t, len(others))
+                    E = E - Q @ (Q.T @ E)
+                    RE = E if R is None else R @ E
+                    for col, j in enumerate(others):
+                        step = abs(j - k) - 1
+                        ee[q][step].append(float(E[:, col] @ E[:, col]))
+                        eRe[q][step].append(float(E[:, col] @ RE[:, col]))
+            by_ab[ab] = (ee, eRe)
+        ee, eRe = by_ab[ab]
+        sd = 100.0 / float(kw["tsnr"])
+        power = np.zeros((n_cond, max_step))
+        for q in range(n_cond):
+            for s in range(max_step):
+                nc = amps[q] * np.array(ee[q][s]) / (sd * np.sqrt(np.array(eRe[q][s])))
+                power[q, s] = float(np.mean([_two_tailed_power(crit, dof, v) for v in nc]))
+        steps = np.full(n_cond, np.nan)
+        for q in range(n_cond):
+            hit = np.nonzero(power[q] >= target)[0]
+            if hit.size:
+                j = hit[0]
+                steps[q] = (
+                    1.0 if j == 0 else float(np.interp(target, power[q, j - 1 : j + 1], [j, j + 1]))
+                )
+        out["steps"][label], out["power"][label] = steps, power
+    return out
 
 
 def simulate_realizations_power(

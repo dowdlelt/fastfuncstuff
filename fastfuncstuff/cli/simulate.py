@@ -394,7 +394,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "(default: the first with a true effect) or 'detection' (alias 'efficiency', meaning "
         "detection efficiency -- not Liu & Frank's estimation efficiency, which is 'shape': the mean "
         "over all contrasts). Estimation: 'shape' (response shape, FIR). Single trials: "
-        "'trials' (trial-pattern reliability, the better of LSS and ridge; see -trial_sd). "
+        "'trials' (trial-pattern reliability, the better of LSS and ridge; see -trial_sd); "
+        "'shape_diff' (how many library steps apart two response shapes must be to be told "
+        "apart -- also whether two conditions differ in shape). "
         "The explorer trades detection against shape, or against trials for 'trials'.",
     )
     x.add_argument(
@@ -695,7 +697,7 @@ def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
 
 
 def _summarise(
-    res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
+    res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality, steps=None
 ) -> str:
     from fastfuncstuff.simulation.power import effect_needed, has_true_effect, is_difference
 
@@ -721,6 +723,17 @@ def _summarise(
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
     out += ["", *_quality_lines(quality, reals[0].conditions, conds, args.target)]
+    if steps is not None:
+        ref = _reference_noise(conds)
+        st_txt = ", ".join(
+            f"{c} {'> ' + str(steps['max_step']) if not np.isfinite(v) else f'{v:.1f}'}"
+            for c, v in zip(reals[0].conditions, steps["steps"][ref], strict=True)
+        )
+        out.append(
+            f"  shape resolution at {ref}: library steps apart for {args.target:.0%} power to "
+            f"tell two shapes apart -- {st_txt} (about 0.16 s of peak latency per step; also "
+            "how different two conditions' shapes must be to be told apart)"
+        )
     if len(reals[0].run_lengths) < 2 and any("single" in q for q in quality):
         out.append(
             "  note: one run -- single-trial ridge chooses its fraction by cross-validation "
@@ -1103,9 +1116,11 @@ def _goal(value, contrasts, pattern, flag: str) -> str:
     goal = value or next((c for c, w in contrasts.items() if has_true_effect(w, pattern)), None)
     if goal == "efficiency":
         goal = "detection"
-    if goal is None or (goal not in ("detection", "shape", "trials") and goal not in contrasts):
+    goals = ("detection", "shape", "shape_diff", "trials")
+    if goal is None or (goal not in goals and goal not in contrasts):
         raise ValueError(
-            f"{flag} {goal!r}: use 'detection', 'shape', 'trials' or one of {list(contrasts)}"
+            f"{flag} {goal!r}: use 'detection', 'shape', 'shape_diff', 'trials' or one of "
+            f"{list(contrasts)}"
         )
     return goal
 
@@ -1117,6 +1132,8 @@ def _objective_label(objective: str, target: float = 0.8) -> str:
         return f"all contrasts: mean % signal for {target:.0%} power"
     if objective == "trials":
         return "single trials: 1 - reliability (best of LSS, ridge)"
+    if objective == "shape_diff":
+        return "library steps two shapes must be apart to be told apart"
     return f"{objective}: % signal for {target:.0%} power"
 
 
@@ -1318,17 +1335,25 @@ def _run_explore(raw: list[str], started: float) -> int:
         trial_sd=args.trial_sd,
     )
     scores = ex.score_configs(
-        specs, scorer, args.explore_designs, ref, args.seed, single_all=objective == "trials"
+        specs,
+        scorer,
+        args.explore_designs,
+        ref,
+        args.seed,
+        single_all=objective == "trials",
+        steps_all=objective == "shape_diff",
     )
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
     det_c = objective if objective in contrasts or objective == "detection" else live[0]
     # The trade-off: detection against response shape -- or, when single trials are
     # the target, against LSS leakage (neighbours mixed into each trial's estimate).
-    y_key = "unreliability" if objective == "trials" else "shape_sd"
+    y_key = {"trials": "unreliability", "shape_diff": "shape_steps"}.get(objective, "shape_sd")
     x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
     y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
     front = ex.pareto_front(x, y)
-    keep = ex.shortlist(y if objective in ("shape", "trials") else x, front, args.explore_keep)
+    keep = ex.shortlist(
+        y if objective in ("shape", "trials", "shape_diff") else x, front, args.explore_keep
+    )
     edges = ex.at_edges(axes, configs, keep)
 
     prefix = Path(args.prefix)
@@ -1405,6 +1430,8 @@ def _run_explore(raw: list[str], started: float) -> int:
                 if objective == "shape"
                 else psc["unreliability"][ref]
                 if objective == "trials"
+                else psc["shape_steps"][ref]
+                if objective == "shape_diff"
                 else psc["needed"][(ref, objective)]
             )
             cmd = ["ffs_simulate", "-tr", f"{args.tr:g}", "-events", *files,
@@ -1446,17 +1473,26 @@ def _run_explore(raw: list[str], started: float) -> int:
         + (
             "single-trial 1 - reliability (best of LSS, ridge)"
             if objective == "trials"
+            else "library steps two shapes must be apart to be told apart"
+            if objective == "shape_diff"
             else "response-shape SD per FIR bin"
         )
         + "; lower is better on both",
         "",
         "what matters (rank correlation with detection / "
-        + ("1 - reliability" if objective == "trials" else "shape")
+        + {"trials": "1 - reliability", "shape_diff": "shape steps"}.get(objective, "shape")
         + " over feasible designs):",
     ]
     for a in axes:
         text.append(
-            "  " + _axis_effect(a, configs, x, y, "1-reliab." if objective == "trials" else "shape")
+            "  "
+            + _axis_effect(
+                a,
+                configs,
+                x,
+                y,
+                {"trials": "1-reliab.", "shape_diff": "steps"}.get(objective, "shape"),
+            )  # fmt: skip
         )
     text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
     for label, side, span in edges:
@@ -1488,11 +1524,10 @@ def _run_explore(raw: list[str], started: float) -> int:
             det_c,
             ref,
             path=f"{prefix}_explore.png",
-            y_label=(
-                "single trials: 1 - reliability (best of LSS, ridge)"
-                if objective == "trials"
-                else None
-            ),
+            y_label={
+                "trials": "single trials: 1 - reliability (best of LSS, ridge)",
+                "shape_diff": "shape resolution: library steps apart",
+            }.get(objective),
         )
     written = sorted(
         str(q.name).removeprefix(prefix.name)
@@ -1519,8 +1554,10 @@ def _axis_effect(axis, configs, x, y, y_name: str = "shape") -> str:
     v = np.array(vals, dtype=float)
     if ok.sum() < 3:
         return f"{axis.label:<14} too few feasible designs"
-    rd = spearmanr(v[ok], x[ok]).statistic
-    rs = spearmanr(v[ok], y[ok]).statistic
+    def rho(a, b):  # a constant measure (none resolved, say) has no rank correlation
+        return float("nan") if np.ptp(a) == 0 or np.ptp(b) == 0 else spearmanr(a, b).statistic
+
+    rd, rs = rho(v[ok], x[ok]), rho(v[ok], y[ok])
     return (
         f"{axis.label:<14} detection rho {rd:+.2f}, {y_name} rho {rs:+.2f} "
         "(negative: larger values help)"
@@ -1793,8 +1830,12 @@ def main(argv: list[str] | None = None) -> int:
 
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
+    from fastfuncstuff.simulation.power import shape_steps
+
+    shape_amps = [(args.effect if args.effect is not None else 1.0) * w for w in pattern]
+    steps = shape_steps(reals[0], args.tr, conds, shape_amps, args.alpha, args.target, args.polort)
     summary = _summarise(
-        res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
+        res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality, steps
     )
     if sweep is not None:
         summary += "\n\n" + "\n".join(
@@ -1955,6 +1996,12 @@ def main(argv: list[str] | None = None) -> int:
             [c["label"] for c in conds],
             tent_amps,
             path=f"{prefix}_tent.png",
+        )  # fmt: skip
+        from fastfuncstuff.simulation.plots import plot_shape_steps
+
+        plot_shape_steps(
+            steps, reals[0].conditions, [c["label"] for c in conds], shape_amps, args.target,
+            path=f"{prefix}_shape.png",
         )  # fmt: skip
         from fastfuncstuff.simulation.plots import plot_single_trials
         from fastfuncstuff.simulation.power import single_trial_example

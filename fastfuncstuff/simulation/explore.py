@@ -212,6 +212,7 @@ def score_configs(
     seed: int = 0,
     progress: bool = True,
     single_all: bool = False,
+    steps_all: bool = False,
 ) -> list[dict[str, Any]]:
     """Median scores over ``n_realizations`` for each spec (None: the config was refused).
 
@@ -233,7 +234,9 @@ def score_configs(
         scores = []
         for r in range(n_realizations):
             try:
-                sc = scorer.score(realize(spec, seed + r), single=single_all or r == 0)
+                sc = scorer.score(
+                    realize(spec, seed + r), single=single_all or r == 0, steps=steps_all
+                )
             except ValueError:
                 sc = None
             if sc is not None:
@@ -259,7 +262,14 @@ def score_configs(
                             ]
                         )
                     )
-                    for key in ("lss_sd", "lsa_sd", "leakage", "unreliability", "ridge_frac")
+                    for key in (
+                        "lss_sd",
+                        "lsa_sd",
+                        "leakage",
+                        "unreliability",
+                        "ridge_frac",
+                        "shape_steps",
+                    )  # fmt: skip
                     if any(key in s for s in scores)
                 },
                 "minutes": float(np.median([s["minutes"] for s in scores])),
@@ -288,7 +298,7 @@ def best_realization(
     best = None
     for r in range(n):
         real = realize(spec, seed + r)
-        sc = scorer.score(real, single=objective == "trials")
+        sc = scorer.score(real, single=objective == "trials", steps=objective == "shape_diff")
         if sc is None:
             continue
         v = (
@@ -296,6 +306,8 @@ def best_realization(
             if objective == "shape"
             else sc["unreliability"][ref_noise]
             if objective == "trials"
+            else sc["shape_steps"][ref_noise]
+            if objective == "shape_diff"
             else sc["needed"][(ref_noise, objective)]
         )
         if np.isfinite(v) and (best is None or v < best[0]):

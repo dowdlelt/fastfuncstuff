@@ -206,13 +206,20 @@ def make_fitness(
     ]
 
     def one(sc: Any, real: Realization) -> float:
-        s = sc.score(real, shape=objective == "shape", single=objective == "trials")
+        s = sc.score(
+            real,
+            shape=objective == "shape",
+            single=objective == "trials",
+            steps=objective == "shape_diff",
+        )
         if s is None:
             return np.inf
         if objective == "shape":
             return s["shape_sd"][ref_noise]
         if objective == "trials":
             return s["unreliability"][ref_noise]
+        if objective == "shape_diff":
+            return s["shape_steps"][ref_noise]
         return s["needed"][(ref_noise, objective)]
 
     return lambda real: float(np.mean([one(sc, real) for sc in scorers]))

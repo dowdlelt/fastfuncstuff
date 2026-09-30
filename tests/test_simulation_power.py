@@ -551,3 +551,25 @@ def test_effect_needed_is_the_true_effect_at_the_last_crossing():
         2 + (0.8 - 0.6) / (0.9 - 0.6)
     )
     assert np.isnan(amplitude_for_power(_curve([0.0, 0.1, 0.2, 0.3, 0.4]))[("n", "E1")])
+
+
+def test_shape_steps_short_events_resolve_shapes_blocks_do_not():
+    # The ordered library (peak 2.7 -> 5.7 s): brief jittered events tell nearby
+    # shapes apart; a 30 s boxcar smooths every library shape into the same
+    # regressor. Shape resolution is what HRF selection (hrfopt, GLMsingle) needs.
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import shape_steps
+
+    noise = [{"label": "t100", "tsnr": 100.0, "phys_fraction": 0.5, "tau": 6.0}]
+
+    def steps(unit, isi):
+        spec = ExperimentSpec(tr=1.0, units=[unit], isi=Interval.parse(isi), n_runs=2,
+                              initial_fix=10, post_fix=15, scan_time=330)  # fmt: skip
+        out = shape_steps(realize(spec, 0), 1.0, noise, [1.0])
+        assert out["power"]["t100"].shape == (1, out["max_step"])
+        return out["steps"]["t100"][0], out["power"]["t100"][0]
+
+    ev_steps, ev_power = steps(Unit.parse("E", "E:0.25", 1), "exp:3,1,10")
+    bl_steps, _ = steps(Unit.parse("E", "E:30", 1, "block"), 30)
+    assert np.isfinite(ev_steps) and ev_steps < 5 and np.isnan(bl_steps)
+    assert np.all(np.diff(ev_power) >= -1e-9)  # further apart: easier
