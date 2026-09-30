@@ -475,6 +475,7 @@ def test_null_count_can_be_a_share_of_the_trials():
     assert _null_fraction("15") is None  # a count
     with pytest.raises(ValueError, match="between 0 and 1"):
         _null_fraction("100%")
+    assert _null_fraction("0%") == 0.0  # no blank trials (an explored share can draw it)
     # "identical ISIs, then drop trials": a 3 s train with a fifth of its slots blank
     argv = ["-tr", "1", "-trial", "A", "0.25", "60", "-isi", "3", "-null", "0.25", "20%",
             "-prefix", "x"]  # fmt: skip

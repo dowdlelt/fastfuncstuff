@@ -386,19 +386,11 @@ def scan_time_sweep(
 
     from tqdm import tqdm
 
-    from fastfuncstuff.cli_utils import auto_polort
-
-    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
     from .experiment import realize
 
-    cpu = torch.device("cpu")
-    dt = default_microtime_dt(spec.tr)
-    bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
-    names = list(contrasts)
-    W = np.array([np.asarray(contrasts[c], dtype=float) for c in names])
-    pattern = np.ones(W.shape[1]) if beta_pattern is None else np.asarray(beta_pattern, float)
-    # Contrast value per unit of the swept effect.
-    per_unit = np.array([1.0 if is_difference(w) else abs(float(w @ pattern)) for w in W])
+    scorer = RealizationScorer(
+        spec.tr, contrasts, noise, beta_pattern, hrf, alpha, target, poly_degree
+    )
     rows: list[dict[str, Any]] = []
     skipped: dict[float, str] = {}
     for st in tqdm(scan_times, desc="scan times", leave=True, disable=not progress):
@@ -409,34 +401,101 @@ def scan_time_sweep(
             skipped[float(st)] = str(exc)
             continue
         for d, real in enumerate(reals):
-            X_task = build_task_design(
-                real.onsets, real.durations, sp.tr, real.run_lengths, bases, dt, device=cpu
-            )
-            lengths = list(real.run_lengths)
-            pdeg = poly_degree if poly_degree is not None else auto_polort(max(lengths) * sp.tr)
-            X = torch.cat([X_task, _nuisance(lengths, pdeg)], dim=1)
-            if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+            sc = scorer.score(real, shape=False)
+            if sc is None:
                 skipped.setdefault(float(st), "rank-deficient in some realizations")
                 continue
-            minutes = sum(lengths) * sp.tr / 60.0
-            need = _contrast_needed(X, lengths, sp.tr, W, noise, alpha, target)
-            for label, v in need.items():
-                for name, val, pu in zip(names, v, per_unit, strict=True):
-                    eff = float(val / pu) if pu > 0 else float("nan")
-                    rows.append(
-                        {
-                            "scan_time": float(st),
-                            "run_s": float(np.mean(lengths)) * sp.tr,
-                            "minutes": minutes,
-                            "counts": "/".join(str(c) for c in real.counts),
-                            "design": d,
-                            "noise": label,
-                            "contrast": name,
-                            "needed": eff,
-                            "per_minute": eff * float(np.sqrt(minutes)),
-                        }
-                    )
+            for (label, name), eff in sc["needed"].items():
+                rows.append(
+                    {
+                        "scan_time": float(st),
+                        "run_s": sc["run_s"],
+                        "minutes": sc["minutes"],
+                        "counts": sc["counts"],
+                        "design": d,
+                        "noise": label,
+                        "contrast": name,
+                        "needed": eff,
+                        "per_minute": eff * float(np.sqrt(sc["minutes"])),
+                    }
+                )
     return {"rows": rows, "skipped": skipped}
+
+
+class RealizationScorer:
+    """Analytic scores of one realization: what a design search ranks on.
+
+    Detection -- the effect each contrast needs for ``target`` power, in the
+    simulation's units (response amplitude for a condition contrast,
+    ``beta_pattern`` applied; the difference itself for a difference
+    contrast) -- and, unless ``shape=False``, response-shape estimation
+    (:func:`estimation_quality`). No Monte Carlo: ~10-20 ms a realization,
+    so thousands of candidate designs are affordable. Assumes the fitted HRF.
+    """
+
+    def __init__(
+        self,
+        tr: float,
+        contrasts: dict[str, list[float] | np.ndarray],
+        noise: list[dict[str, Any]],
+        beta_pattern: list[float] | np.ndarray | None = None,
+        hrf: str = "spmg1",
+        alpha: float = 0.001,
+        target: float = 0.8,
+        poly_degree: int | None = None,
+    ):
+        from .core import default_microtime_dt, hrfs_from_spec
+
+        self.tr, self.noise, self.alpha, self.target = tr, noise, alpha, target
+        self.poly_degree = poly_degree
+        self.dt = default_microtime_dt(tr)
+        self.bases = hrfs_from_spec(hrf, self.dt, torch.device("cpu"))[0][1]
+        self.names = list(contrasts)
+        self.W = np.array([np.asarray(contrasts[c], dtype=float) for c in self.names])
+        pattern = (
+            np.ones(self.W.shape[1]) if beta_pattern is None else np.asarray(beta_pattern, float)
+        )
+        # Contrast value per unit of the swept effect.
+        self.per_unit = np.array(
+            [1.0 if is_difference(w) else abs(float(w @ pattern)) for w in self.W]
+        )
+
+    def score(self, real: Any, shape: bool = True) -> dict[str, Any] | None:
+        """Scores of one realization, or None if its model is rank-deficient."""
+        from fastfuncstuff.cli_utils import auto_polort
+
+        from .core import build_task_design
+
+        cpu = torch.device("cpu")
+        lengths = list(real.run_lengths)
+        X_task = build_task_design(
+            real.onsets, real.durations, self.tr, lengths, self.bases, self.dt, device=cpu
+        )
+        pdeg = (
+            self.poly_degree
+            if self.poly_degree is not None
+            else auto_polort(max(lengths) * self.tr)
+        )
+        X = torch.cat([X_task, _nuisance(lengths, pdeg)], dim=1)
+        if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+            return None
+        need = _contrast_needed(X, lengths, self.tr, self.W, self.noise, self.alpha, self.target)
+        out: dict[str, Any] = {
+            "minutes": sum(lengths) * self.tr / 60.0,
+            "run_s": float(np.mean(lengths)) * self.tr,
+            "counts": "/".join(str(c) for c in real.counts),
+            "n_dropped": getattr(real, "n_dropped", 0),
+            "needed": {
+                (label, name): (float(val / pu) if pu > 0 else float("nan"))
+                for label, v in need.items()
+                for name, val, pu in zip(self.names, v, self.per_unit, strict=True)
+            },
+        }
+        if shape:
+            est = estimation_quality(real, self.tr, self.noise, poly_degree=pdeg)
+            out["shape_sd"] = {k: float(np.mean(v)) for k, v in est["shape_sd"].items()}
+            out["xi"] = est["xi"]
+        return out
 
 
 def has_mismatch(rows: list[dict[str, Any]], rtol: float = 1e-3) -> bool:

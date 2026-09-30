@@ -307,6 +307,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Names for the -compare designs (default: the file prefixes).",
     )
     c.add_argument("-target", type=float, default=0.8, help="Power to reach (default 0.8).")
+
+    x = p.add_argument_group("Explore")
+    x.add_argument(
+        "-explore",
+        type=int,
+        metavar="N",
+        help="Score N designs drawn from the ranges [a-b] and choices {x,y} written inside "
+        "the other flags (quote them), e.g. -isi 'exp:[3-8],[1-3],12' -null 0.25 '[0-40%%]' "
+        "-order '{random,permuted_block}'. One budget must be fixed: -scan_time (time) or "
+        "the trial counts (-num_events/-num_blocks or plain COUNTs), not both. Analytic "
+        "(fitted HRF assumed right). Writes _explore.tsv/.png/_summary.txt and, for a "
+        "shortlist off the detection-vs-estimation Pareto front, the best realization's "
+        "timing files with the commands that reproduce everything.",
+    )
+    x.add_argument(
+        "-objective",
+        metavar="CONTRAST",
+        help="Contrast whose detection is traded against shape estimation, and which picks "
+        "the best realization (default: the first with a true effect; 'shape' ranks by "
+        "estimation).",
+    )
+    x.add_argument(
+        "-explore_designs", type=int, default=3, help="Realizations scored per design (3)."
+    )
+    x.add_argument("-explore_keep", type=int, default=5, help="Shortlisted designs (5).")
+    x.add_argument(
+        "-explore_pick",
+        type=int,
+        default=50,
+        help="Realizations searched for each shortlisted design's best one (50).",
+    )
     return p
 
 
@@ -350,7 +381,7 @@ def _null_fraction(token: str) -> float | None:
     if not text.endswith("%") and "." not in text:
         return None
     frac = float(text.rstrip("%")) / (100.0 if text.endswith("%") else 1.0)
-    if not 0 < frac < 1:
+    if not 0 <= frac < 1:
         raise ValueError(f"-null {token!r}: a fraction must be between 0 and 1 (or 0-100%)")
     return frac
 
@@ -367,6 +398,8 @@ def _spec_from_args(args):
     rest = sum(u.count for u in units)
     for i, (d, c) in enumerate(args.null or []):
         frac = _null_fraction(c)
+        if frac == 0:  # an explored share can draw 0%: no blank trials
+            continue
         weight = frac / (1 - frac) * rest if frac is not None else int(c)
         units.append(Unit.parse(f"null{i}", f"{NULL}:{d}", weight))
     return ExperimentSpec(
@@ -889,6 +922,232 @@ def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
     return out
 
 
+EXPLORE_ONLY = ("explore", "objective", "explore_designs", "explore_keep", "explore_pick")
+TIMING_FLAGS = (
+    "trial", "block", "miniblock", "null", "isi", "within_isi", "initial_fix", "post_fix",
+    "order", "nruns", "scan_time", "num_events", "num_blocks", "ndesigns", "scan_times",
+    "events", "labels", "durations", "nt",
+)  # fmt: skip
+
+
+def _strip_flags(argv: list[str], parser, drop: tuple[str, ...]) -> list[str]:
+    """argv without the flags named in ``drop`` (either spelling) and their values."""
+    known = parser._option_string_actions
+    names = {"-" + d for d in drop} | {"-" + d.replace("_", "-") for d in drop}
+    out, skipping = [], False
+    for tok in argv:
+        if tok in known:
+            skipping = tok in names
+        if not skipping:
+            out.append(tok)
+    return out
+
+
+def _run_explore(raw: list[str], started: float) -> int:
+    """-explore: score N designs drawn from the placeholders, shortlist the Pareto front."""
+    import shlex
+
+    from fastfuncstuff.simulation import explore as ex
+    from fastfuncstuff.simulation.experiment import default_contrasts, parse_contrast, realize
+    from fastfuncstuff.simulation.power import RealizationScorer, has_true_effect
+
+    parser = _build_parser()
+    try:
+        axes = ex.find_axes(raw)
+        if not axes:
+            raise ValueError(
+                "-explore needs at least one range [a-b] or choice {x,y} inside the flags"
+            )
+        mid = ex.render(raw, axes, {a.label: a.value(0.5) for a in axes})
+        args = parser.parse_args(mid)
+        if args.tr is None or not (args.trial or args.block or args.miniblock):
+            raise ValueError("-explore needs -tr and a described experiment")
+        budget_axes = [a.label for a in axes if a.label.split(".")[0] in
+                       ("scan_time", "num_events", "num_blocks")]  # fmt: skip
+        if budget_axes:
+            raise ValueError(f"the budget must be fixed, not explored ({budget_axes[0]})")
+        if args.scan_time is not None and (args.num_events or args.num_blocks):
+            raise ValueError(
+                "-explore takes one budget: -scan_time (time) or the trial counts "
+                "(-num_events/-num_blocks), not both -- otherwise the search space is unbounded"
+            )
+        conditions = realize(_spec_from_args(args), args.seed).conditions
+        contrasts = (
+            {e: parse_contrast(e, conditions) for e in args.contrast}
+            if args.contrast
+            else default_contrasts(conditions)
+        )
+        pattern = _pattern(args.pattern, conditions)
+        conds, _ = _noise_conditions(args)
+        objective = args.objective or next(
+            (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
+        )
+        if objective is None or (objective != "shape" and objective not in contrasts):
+            raise ValueError(f"-objective {objective!r}: use 'shape' or one of {list(contrasts)}")
+    except (ValueError, FileNotFoundError, SystemExit) as exc:
+        if isinstance(exc, SystemExit):
+            return int(exc.code or 1)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    ref = _reference_noise(conds)
+    configs = ex.sample(axes, args.explore, args.seed)
+    rendered, specs, refused = [], [], {}
+    for values in configs:
+        argv_k = ex.render(raw, axes, values)
+        rendered.append(argv_k)
+        try:
+            spec = _spec_from_args(parser.parse_args(argv_k))
+            spec.resolve_counts()
+            specs.append(spec)
+        except (ValueError, SystemExit) as exc:
+            specs.append(None)
+            why = str(exc).split(" -- ")[0]
+            refused[why] = refused.get(why, 0) + 1
+    scorer = RealizationScorer(
+        args.tr, contrasts, conds, pattern, args.hrf, args.alpha, poly_degree=args.polort
+    )
+    scores = ex.score_configs(specs, scorer, args.explore_designs, ref, args.seed)
+    live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
+    det_c = objective if objective != "shape" else live[0]
+    x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
+    y = np.array([sc["shape_sd"] if sc else np.nan for sc in scores])
+    front = ex.pareto_front(x, y)
+    keep = ex.shortlist(y if objective == "shape" else x, front, args.explore_keep)
+
+    prefix = Path(args.prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    cols = ["design", *[a.label for a in axes], "feasible", "on_front", "counts", "minutes",
+            *[f"needed_{c}" for c in live], *[f"worst_{c}" for c in live],
+            "shape_sd", "efficiency", "dropped"]  # fmt: skip
+    with open(f"{prefix}_explore.tsv", "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(cols)
+        for k, (values, sc) in enumerate(zip(configs, scores, strict=True)):
+            w.writerow(
+                [k, *[values[a.label] for a in axes], int(bool(sc)), int(front[k])]
+                + (
+                    [sc["counts"], f"{sc['minutes']:.2f}"]
+                    + [f"{sc['needed'][c]:.4f}" for c in live]
+                    + [f"{sc['worst'][c]:.4f}" for c in live]
+                    + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}", f"{sc['dropped']:.2f}"]
+                    if sc
+                    else [""] * (len(cols) - len(axes) - 3)
+                )
+            )
+
+    # The shortlist: the recipe to reproduce, and its best realization's timing files.
+    best_dir = Path(f"{prefix}_explore_best")
+    lines = []
+    for rank, k in enumerate(keep, start=1):
+        sc = scores[k]
+        # Render on the original argv (placeholder positions index it), then strip.
+        filled = _strip_flags(rendered[k], parser, (*EXPLORE_ONLY, "prefix"))
+        recipe = filled
+        noise_etc = _strip_flags(filled, parser, (*TIMING_FLAGS, "tr"))
+        picked = ex.best_realization(
+            specs[k], scorer, args.explore_pick, ref, objective, args.seed + 7919 * k
+        )
+        desc = "  ".join(f"{a.label}={configs[k][a.label]}" for a in axes)
+        lines += [
+            f"#{rank}  {desc}",
+            "    "
+            + "  ".join(f"{c} {sc['needed'][c]:.2f}%" for c in live)
+            + f"  shape {sc['shape_sd']:.2f}%  efficiency {sc['xi']:.2f}  "
+            f"{sc['minutes']:.1f} min  counts {sc['counts']}",
+            "    recipe:  " + shlex.join(["ffs_simulate", *recipe, "-prefix", f"{prefix}_d{rank}"]),
+        ]
+        if picked is not None:
+            real, psc = picked
+            out_dir = best_dir / str(rank)
+            from fastfuncstuff.simulation.core import write_timing_files
+
+            write_timing_files(real.onsets, real.conditions, out_dir)
+            files = [str(out_dir / f"{c}.txt") for c in real.conditions]
+            val = psc["shape_sd"][ref] if objective == "shape" else psc["needed"][(ref, objective)]
+            cmd = ["ffs_simulate", "-tr", f"{args.tr:g}", "-events", *files,
+                   "-durations", *[f"{d:g}" for d in real.durations],
+                   "-nt", *[str(n) for n in real.run_lengths], *noise_etc,
+                   "-prefix", f"{prefix}_d{rank}_best"]  # fmt: skip
+            lines.append(
+                f"    best of {args.explore_pick} realizations ({objective} {val:.2f}%): "
+                + shlex.join(cmd)
+            )
+    n_ok = sum(1 for sc in scores if sc)
+    text = [
+        "ffs_simulate -explore",
+        "=" * 72,
+        f"{len(configs)} designs drawn, {n_ok} feasible"
+        + (
+            " -- refused: " + "; ".join(f"{n} x {why}" for why, n in refused.items())
+            if refused
+            else ""
+        ),
+        "budget: "
+        + (
+            f"-scan_time {args.scan_time:g} s per run (time)"
+            if args.scan_time is not None
+            else "trial counts (time follows)"
+        ),
+        "axes: " + ", ".join(f"{a.label} {raw[a.token][a.span[0] : a.span[1]]}" for a in axes),
+        f"scored analytically at {ref} (fitted HRF assumed right), median of "
+        f"{args.explore_designs} realization(s) each",
+        f"trade-off: {det_c} detection (% signal for 80% power) against response-shape SD per "
+        "FIR bin; lower is better on both",
+        "",
+        "what matters (rank correlation with detection / shape over feasible designs):",
+    ]
+    for a in axes:
+        text.append("  " + _axis_effect(a, configs, x, y))
+    text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
+    if best_dir.exists():
+        text.append(
+            f"\nbest realizations: {best_dir}/<rank>/ -- run a command above for the full "
+            "Monte Carlo and figures of that design"
+        )
+    summary = "\n".join(text)
+    print(summary)
+    Path(f"{prefix}_explore_summary.txt").write_text(summary + "\n")
+    if not args.no_plots and n_ok:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from fastfuncstuff.simulation.plots import plot_exploration
+
+        plot_exploration(axes, configs, x, y, front, keep, det_c, ref, path=f"{prefix}_explore.png")
+    written = sorted(
+        str(q.name).removeprefix(prefix.name)
+        for q in prefix.parent.glob(f"{prefix.name}_*")
+        if q.stat().st_mtime >= started
+    )
+    print(f"\nwrote {prefix}: " + ", ".join(written))
+    return 0
+
+
+def _axis_effect(axis, configs, x, y) -> str:
+    """One line on how an axis moves detection and shape (Spearman, or medians per choice)."""
+    from scipy.stats import spearmanr
+
+    vals = [axis.numeric(c[axis.label]) for c in configs]
+    ok = np.isfinite(x) & np.isfinite(y)
+    if axis.is_choice:
+        parts = []
+        for choice in axis.choices:
+            sel = ok & np.array([v == choice for v in vals])
+            if sel.any():
+                parts.append(f"{choice} {np.median(x[sel]):.2f}% / {np.median(y[sel]):.2f}%")
+        return f"{axis.label:<14} median detection / shape: " + "; ".join(parts)
+    v = np.array(vals, dtype=float)
+    if ok.sum() < 3:
+        return f"{axis.label:<14} too few feasible designs"
+    rd = spearmanr(v[ok], x[ok]).statistic
+    rs = spearmanr(v[ok], y[ok]).statistic
+    return (
+        f"{axis.label:<14} detection rho {rd:+.2f}, shape rho {rs:+.2f} "
+        "(negative: larger values help)"
+    )
+
+
 def _run_compare(args) -> int:
     from fastfuncstuff.simulation.power import compare_designs, load_power_table
 
@@ -1030,6 +1289,11 @@ def main(argv: list[str] | None = None) -> int:
     import time
 
     started = time.time() - 1.0  # files written from here on (mtime resolution)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if any(t in ("-explore",) for t in raw):
+        # Before argparse: placeholders inside typed flags ("-initial_fix [5-15]") would
+        # fail its type check; each design is parsed once its values are in.
+        return _run_explore(raw, started)
     args = _build_parser().parse_args(argv)
     if args.compare:
         return _run_compare(args)

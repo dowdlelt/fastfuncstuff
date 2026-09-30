@@ -811,6 +811,94 @@ def plot_detection_estimation(
     return _finish(fig, path)
 
 
+def plot_exploration(
+    axes_spec: list[Any],
+    configs: list[dict[str, str]],
+    x: np.ndarray,
+    y: np.ndarray,
+    front: np.ndarray,
+    keep: list[int],
+    contrast: str,
+    noise_label: str,
+    path: str | Path | None = None,
+    max_axes: int = 6,
+):
+    """What a design space looks like: every design, its Pareto front, and what each axis does.
+
+    Left: detection (``x``: % signal ``contrast`` needs for 80% power) against
+    response-shape estimation (``y``: SD per FIR bin), one dot per design;
+    the front is the line, the shortlist numbered. Right: each explored axis
+    against detection (top) and shape (bottom) -- a range as a scatter, a
+    choice as one box per option. Lower is better throughout.
+    """
+    import matplotlib.pyplot as plt
+
+    shown = axes_spec[:max_axes]
+    ok = np.isfinite(x) & np.isfinite(y)
+    fig = plt.figure(figsize=(6.5 + 2.6 * len(shown), 6.2), layout="constrained")
+    fig.patch.set_facecolor(SURFACE)
+    gs = fig.add_gridspec(2, 1 + len(shown), width_ratios=[2.6] + [1] * len(shown))
+    ax = fig.add_subplot(gs[:, 0])
+    _style(ax)
+    ax.scatter(x[ok & ~front], y[ok & ~front], s=10, color=BLUES[0], alpha=0.6, linewidths=0)
+    order = np.flatnonzero(front)[np.argsort(x[front])]
+    ax.plot(
+        x[order], y[order], "o-", color=BLUES[4], markersize=4, linewidth=1.5, label="Pareto front"
+    )
+    for rank, k in enumerate(keep, start=1):
+        ax.scatter([x[k]], [y[k]], s=150, color=CATEGORICAL[1], edgecolors=SURFACE, zorder=3)
+        ax.annotate(
+            str(rank),
+            (x[k], y[k]),
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=SURFACE,
+            fontweight="bold",
+            zorder=4,
+        )
+    ax.set_xlabel(f"{contrast}: % signal for 80% power (detection)", color=INK2, fontsize=9)
+    ax.set_ylabel("response shape: SD per FIR bin, % (estimation)", color=INK2, fontsize=9)
+    ax.set_title(
+        f"{int(ok.sum())} designs at {noise_label}; front and shortlist (numbered)",
+        color=INK,
+        fontsize=10,
+        loc="left",
+    )
+    for col, a in enumerate(shown, start=1):
+        vals = [a.numeric(c[a.label]) for c in configs]
+        for row, (metric, name) in enumerate(((x, "detection %"), (y, "shape SD %"))):
+            sub = fig.add_subplot(gs[row, col])
+            _style(sub)
+            if a.is_choice:
+                groups = [metric[ok & np.array([v == ch for v in vals])] for ch in a.choices]
+                sub.boxplot(
+                    groups,
+                    tick_labels=a.choices,
+                    widths=0.6,
+                    showfliers=False,
+                    medianprops={"color": BLUES[4]},
+                    boxprops={"color": INK2},
+                    whiskerprops={"color": INK2},
+                    capprops={"color": INK2},
+                )
+                sub.tick_params(axis="x", labelrotation=20, labelsize=7)
+            else:
+                v = np.array(vals, dtype=float)
+                sub.scatter(v[ok], metric[ok], s=6, color=BLUES[2], alpha=0.5, linewidths=0)
+                sub.scatter(v[front], metric[front], s=12, color=BLUES[4], linewidths=0)
+            if row == 0:
+                sub.set_title(a.label, color=INK, fontsize=9)
+            if col == 1:
+                sub.set_ylabel(name, color=INK2, fontsize=8)
+    fig.suptitle(
+        "Design space -- lower is better on every axis; analytic, fitted HRF assumed right",
+        color=INK,
+        fontsize=10,
+    )
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,
