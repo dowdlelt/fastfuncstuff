@@ -56,11 +56,16 @@ def validate_reml_power(
     names = list(dict.fromkeys(r["contrast"] for r in result["table"]))
     a_grid, b_grid = get_default_arma_grids(device)
     if maxa != 0.8:
-        a_grid = torch.tensor(sorted({*np.arange(0, maxa, 0.1), maxa}), device=device)
+        a_grid = torch.tensor(
+            sorted({*np.arange(0, maxa, 0.1), maxa}), device=device, dtype=a_grid.dtype
+        )
     if maxb != 0.8:
-        b_grid = torch.tensor(sorted({*np.arange(-maxb, maxb, 0.1), 0.0, maxb}), device=device)
+        b_grid = torch.tensor(
+            sorted({*np.arange(-maxb, maxb, 0.1), 0.0, maxb}), device=device, dtype=b_grid.dtype
+        )
     shared_cache = {} if shared_cache is None else shared_cache
-    if "autocorr" not in shared_cache:
+    signature = (tuple(run_lengths), maxa, maxb, device.type, device.index)
+    if shared_cache.get("signature") != signature:
         grid_bytes = calculate_grid_memory_footprint(
             estimate_valid_grid_pairs(a_grid, b_grid), n_t, n_p
         )
@@ -78,6 +83,7 @@ def validate_reml_power(
             if 4 * grid_bytes < budget
             else None
         )
+        shared_cache["signature"] = signature
     cache = shared_cache["autocorr"]
     fit_kw = {
         "device": device,

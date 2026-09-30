@@ -7,6 +7,41 @@ import torch
 from fastfuncstuff.simulation.power import amplitude_for_power, simulate_design_power
 
 
+def test_reml_covariance_cache_reuses_only_identical_noise_grids(monkeypatch):
+    import fastfuncstuff.glm.arma as arma
+
+    calls = []
+    original = arma.precompute_autocorr_grid
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs["run_starts"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(arma, "precompute_autocorr_grid", counted)
+    shared = {}
+    for phase, lengths, maxa in [
+        (0.0, [60], 0.8),
+        (0.3, [60], 0.8),
+        (0.3, [30, 30], 0.8),
+        (0.3, [30, 30], 0.9),
+    ]:
+        simulate_design_power(
+            torch.sin(torch.arange(60, dtype=torch.float64) * 0.2 + phase)[:, None],
+            lengths,
+            1.0,
+            {"A": [1]},
+            [1.0],
+            [{"tsnr": 50.0, "phys_fraction": 0.0}],
+            n_reps=10,
+            null_reps=20,
+            estimator="reml",
+            reml_maxa=maxa,
+            reml_cache=shared,
+            device=torch.device("cpu"),
+        )
+    assert calls == [[0], [0, 30], [0, 30]]
+
+
 def test_reml_reuses_noise_fits_across_effects_and_tsnr(monkeypatch):
     import fastfuncstuff.glm.arma as arma
 

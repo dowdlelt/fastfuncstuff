@@ -1507,7 +1507,9 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
     return 0
 
 
-def _validate_candidate(args, real, contrasts, pattern, conds, out_dir) -> list[str]:
+def _validate_candidate(
+    args, real, contrasts, pattern, conds, out_dir, reml_cache=None
+) -> list[str]:
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.simulation.power import effect_needed, simulate_realizations_power
 
@@ -1534,6 +1536,7 @@ def _validate_candidate(args, real, contrasts, pattern, conds, out_dir) -> list[
         null_reps=args.null_reps,
         reml_maxa=args.reml_maxa,
         reml_maxb=args.reml_maxb,
+        reml_cache=reml_cache,
     )
     Path(out_dir, "validation.json").write_text(
         json.dumps({"alpha": args.alpha, "estimator": "reml", "table": result["table"]}, indent=2)
@@ -1713,6 +1716,7 @@ def _run_explore(raw: list[str], started: float) -> int:
 
     # The shortlist: the recipe to reproduce, and its best realization's timing files.
     best_dir = Path(f"{prefix}_explore_best")
+    reml_cache = {}
     lines = []
     for rank, k in enumerate(keep, start=1):
         sc = scores[k]
@@ -1774,7 +1778,9 @@ def _run_explore(raw: list[str], started: float) -> int:
             write_timing_files(real.onsets, real.conditions, out_dir)
             lines.extend(
                 "    " + ln
-                for ln in _validate_candidate(args, real, contrasts, pattern, conds, out_dir)
+                for ln in _validate_candidate(
+                    args, real, contrasts, pattern, conds, out_dir, reml_cache
+                )
             )
             files = [str(out_dir / f"{c}.txt") for c in real.conditions]
             val = (

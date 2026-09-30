@@ -1793,6 +1793,7 @@ def simulate_realizations_power(
     null_reps: int | None = None,
     reml_maxa: float = 0.8,
     reml_maxb: float = 0.8,
+    reml_cache: dict | None = None,
 ) -> dict[str, Any]:
     """:func:`simulate_design_power` over several realizations of one experiment.
 
@@ -1844,10 +1845,10 @@ def simulate_realizations_power(
     rows: list[dict[str, Any]] = []
     per_design = []
     jobs = [(i, real, t) for i, real in enumerate(realizations) for t in range(len(truths))]
+    reml_cache = {} if reml_cache is None else reml_cache
     for i, real, ti in tqdm(
         jobs, desc="designs", leave=True, disable=not progress or len(jobs) < 2
     ):
-        reml_cache: dict = {}
         X = build_task_design(
             real.onsets, real.durations, tr, real.run_lengths, fit_bases, dt, device=cpu
         )
