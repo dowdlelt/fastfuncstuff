@@ -67,7 +67,10 @@ WHAT IT REPORTS -- for each design, at each noise level:
     detection    the effect each contrast needs for -target power, 80% (the classic design
                  efficiency, in % signal), by Monte Carlo and analytically
     estimation   how precisely the response *shape* is recovered (FIR SD per bin;
-                 Liu & Frank's estimation efficiency beside it)
+                 Liu & Frank's estimation efficiency beside it), and the shape
+                 resolution: how many steps apart in the ordered 20-HRF library
+                 two shapes must be to be told apart (also whether two
+                 conditions differ in shape)
     single trials  how well each trial is estimated on its own: LSS, LSA and
                  single-trial ridge, as trial-pattern reliability (-trial_sd)
 They trade off: rapid jittered designs estimate well and detect poorly, blocks
@@ -83,14 +86,23 @@ SEARCHING DESIGNS -- beyond scoring one design:
     -optimize G       the best realization (order and gaps) of one design, by an
                       evolutionary search averaged over HRF shapes
 -objective picks the goal: a contrast or 'detection' (all contrasts), 'shape',
-or 'trials'. Searches are analytic and assume the fitted HRF; each prints the
-command that runs the full Monte Carlo on its result.
+'shape_diff' or 'trials' -- or several, weighted: detection=1,shape=0.5 (each
+relative to a typical design). -rank_by takes the same, for _designs.png.
+Searches are analytic and assume the fitted HRF; each prints the command that
+runs the full Monte Carlo on its result.
 
-Outputs (one design): PREFIX_summary.txt, _power.tsv, _power.png (with the
-summary as text), _design.png (events, regressors, correlation, the effect each
-condition and pair needs), _designs.png (typical, best and worst realization),
-_voxels.png (what the data look like), _spec.json, _events/ (timing files), and
-_hrf.png when the true HRF differs from the fitted one.
+Outputs (one design): PREFIX_summary.txt, _power.tsv, _spec.json, _events/, and
+figures (-no_plots skips them):
+    _power.png     power against effect, with the summary as text
+    _tstats.png    t under the null and at the effect, corrected against naive
+    _design.png    events, regressors, correlation, the effect each pair needs
+    _designs.png   the typical, best and worst realization (-rank_by)
+    _spectrum.png  where each contrast's information sits against noise and drift
+    _voxels.png    what the data look like, at each noise level
+    _tent.png      the response shape one voxel gives (TENT deconvolution)
+    _shape.png     shape resolution: power against library steps apart
+    _trials.png    single trials by LSS, LSA and ridge, against the truth
+    _hrf.png       with -true_hrf: the true shapes and what was recovered
 """
 
 from __future__ import annotations
@@ -144,6 +156,9 @@ Optimize the realization you will actually run
         -trial E1 0.25 1 -trial E2 0.25 1 -isi exp:4,1,12 -contrast E1-E2 \\
         -tsnr 30 60 100 -objective E1-E2 -optimize 30 -max_repeat 4 -prefix sim/opt
     # ... or -explore 300 ... -optimize 20 to optimize every shortlisted design
+
+    # several goals at once, each relative to a typical design
+    ffs_simulate ... -objective "E1-E2=1,shape_diff=1,trials=0.5" -optimize 30 -prefix sim/multi
 """
 
 VERDICTS = ((0.2, "hopeless"), (0.8, "marginal"), (1.01, "good"))
