@@ -489,7 +489,14 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
             for pos, value in zip(where, specs[key].sample(len(where), rng, spec.tr), strict=True):
                 gap[pos] = float(value)
         if spare is not None:
-            gap[spare[1]] = float(specs[spare[0]].sample(1, spare_rng, spec.tr)[0])
+            # One value from a mean-matched generator can fail its own constraints
+            # and be padded with the mean, with a warning; for a gap that is only
+            # used if a search moves this unit, the mean is fine.
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                gap[spare[1]] = float(specs[spare[0]].sample(1, spare_rng, spec.tr)[0])
         plans.append(
             RunPlan(
                 [

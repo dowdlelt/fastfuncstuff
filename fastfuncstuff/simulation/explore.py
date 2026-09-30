@@ -8,7 +8,8 @@ Ranges and choices are written inside the ordinary ffs_simulate flags:
 
 ``[a-b]`` draws whole numbers when both ends are whole ("[3-8]") and any
 value otherwise ("[3.0-8.0]"); a trailing % keeps the percent sign. Every
-placeholder is one axis. Configurations are drawn by Latin hypercube over the
+placeholder is one axis, named by what it controls (isi_mean, isi_min,
+null_share, E1_duration, order). Configurations are drawn by Latin hypercube over the
 ranges (uniform over the choices), each is realized a few times and scored
 analytically (:class:`~.power.RealizationScorer`: detection per contrast and
 response-shape estimation), and the result is the cloud of designs, its
@@ -30,7 +31,7 @@ _PLACEHOLDER = re.compile(r"\[\s*([0-9.]+)\s*-\s*([0-9.]+)\s*(%?)\s*\]|\{([^{}]+
 class Axis:
     """One placeholder: where it sits in argv, and what it draws."""
 
-    label: str  # e.g. "isi.1" -- the flag, then which placeholder of that flag
+    label: str  # what it controls: "isi_mean", "null_share", "E1_duration", "order"
     token: int  # index in argv
     span: tuple[int, int]  # character span inside that token
     low: float = 0.0
@@ -60,16 +61,15 @@ class Axis:
 
 
 def find_axes(argv: list[str]) -> list[Axis]:
-    """Every [a-b] / {x,y} placeholder in argv, labelled by its flag."""
+    """Every [a-b] / {x,y} placeholder in argv, named by what it controls."""
     axes: list[Axis] = []
-    flag, seen = "arg", {}
+    flag, flag_at = "arg", -1
     for i, tok in enumerate(argv):
         if tok.startswith("-") and not _is_number(tok):
-            flag = tok.lstrip("-")
+            flag, flag_at = tok.lstrip("-").replace("-", "_"), i
             continue
         for m in _PLACEHOLDER.finditer(tok):
-            seen[flag] = seen.get(flag, 0) + 1
-            label = f"{flag}.{seen[flag]}"
+            label = _axis_name(argv, flag, flag_at, i - flag_at - 1, tok, m.start())
             if m.group(4) is not None:
                 choices = [c.strip() for c in m.group(4).split(",") if c.strip()]
                 if len(choices) < 2:
@@ -81,7 +81,53 @@ def find_axes(argv: list[str]) -> list[Axis]:
                 raise ValueError(f"{tok!r}: a range needs low < high")
             whole = "." not in m.group(1) and "." not in m.group(2)
             axes.append(Axis(label, i, m.span(), lo, hi, whole, bool(m.group(3))))
+    # Unique names: a second placeholder that would share one gets a number.
+    seen: dict[str, int] = {}
+    for a in axes:
+        seen[a.label] = seen.get(a.label, 0) + 1
+        if seen[a.label] > 1:
+            a.label = f"{a.label}_{seen[a.label]}"
     return axes
+
+
+_INTERVAL_FIELDS = {
+    "exp": ("mean", "min", "max"),
+    "poisson": ("mean", "min", "max"),
+    "uniform": ("low", "high"),
+}
+
+
+def _interval_field(spec: str, at: int) -> str | None:
+    """Which field of an interval spec ('poisson:3,1,9') character ``at`` falls in."""
+    kind, sep, rest = spec.partition(":")
+    fields = _INTERVAL_FIELDS.get(kind.lower())
+    if not sep or fields is None or at < len(kind) + 1:
+        return None
+    k = spec[len(kind) + 1 : at].count(",")
+    return fields[k] if k < len(fields) else None
+
+
+def _axis_name(argv: list[str], flag: str, flag_at: int, arg: int, tok: str, at: int) -> str:
+    """A readable name for a placeholder: 'isi_mean', 'null_share', 'E1_duration', ...
+
+    Falls back to the flag itself for anything not recognized.
+    """
+    if flag in ("isi", "within_isi"):
+        field = _interval_field(tok, at)
+        return f"{flag}_{field}" if field else flag
+    if flag == "null":
+        if arg == 1:
+            return "null_share" if ("%" in tok or "." in tok) else "null_count"
+        dur, _, off = tok.partition(":")
+        if at <= len(dur):
+            return "null_duration"
+        field = _interval_field(off, at - len(dur) - 1)
+        return f"null_gap_{field}" if field else "null_gap"
+    if flag in ("trial", "block", "miniblock") and arg in (1, 2):
+        name = argv[flag_at + 1]  # NAME, the flag's first argument
+        what = "count" if arg == 2 else ("items" if flag == "miniblock" else "duration")
+        return f"{name}_{what}"
+    return flag
 
 
 def _is_number(tok: str) -> bool:
@@ -110,6 +156,29 @@ def render(argv: list[str], axes: list[Axis], values: dict[str, str]) -> list[st
         for a in sorted(group, key=lambda a: a.span[0], reverse=True):
             tok = tok[: a.span[0]] + values[a.label] + tok[a.span[1] :]
         out[i] = tok
+    return out
+
+
+def at_edges(
+    axes: list[Axis], configs: list[dict[str, str]], keep: list[int], tol: float = 0.05
+) -> list[tuple[str, str, str]]:
+    """Range axes whose shortlisted values all sit at one end: the optimum may lie beyond.
+
+    Returns (label, 'low'/'high', '[a-b]') per such axis. A shortlist at an
+    edge is a range too narrow, not an answer -- a best Poisson mean of 2.006
+    against a floor of 2.0 hid designs that were better on every measure.
+    """
+    out = []
+    for a in axes:
+        if a.is_choice or not keep:
+            continue
+        v = np.array([float(a.numeric(configs[k][a.label])) for k in keep])
+        width = a.high - a.low
+        span = f"[{a.low:g}-{a.high:g}{'%' if a.percent else ''}]"
+        if np.all(v <= a.low + tol * width) and a.low > 0:
+            out.append((a.label, "low", span))
+        elif np.all(v >= a.high - tol * width):
+            out.append((a.label, "high", span))
     return out
 
 

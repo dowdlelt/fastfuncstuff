@@ -334,7 +334,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "-objective",
         metavar="GOAL",
         help="What to optimize, with -explore/-optimize. Detection: a contrast's name "
-        "(default: the first with a true effect) or 'detection' (alias 'efficiency': the mean "
+        "(default: the first with a true effect) or 'detection' (alias 'efficiency', meaning "
+        "detection efficiency -- not Liu & Frank's estimation efficiency, which is 'shape': the mean "
         "over all contrasts). Estimation: 'shape' (response shape, FIR). Single trials: "
         "'trials' (trial-pattern reliability, the better of LSS and ridge; see -trial_sd). "
         "The explorer trades detection against shape, or against trials for 'trials'.",
@@ -566,7 +567,8 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
             (
                 "shape",
                 f"{shape} SD per {args.tr:g} s bin at {ref} (FIR, "
-                f"{quality[0]['fir_lags']} bins); Liu & Frank efficiency {xi:.2f} of its bound",
+                f"{quality[0]['fir_lags']} bins); Liu & Frank estimation efficiency {xi:.2f} "
+                "of its bound",
             )
         )
     single = _single_text(quality, names, ref)
@@ -1247,13 +1249,14 @@ def _run_explore(raw: list[str], started: float) -> int:
     y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
     front = ex.pareto_front(x, y)
     keep = ex.shortlist(y if objective in ("shape", "trials") else x, front, args.explore_keep)
+    edges = ex.at_edges(axes, configs, keep)
 
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     cols = ["design", *[a.label for a in axes], "feasible", "on_front", "counts", "minutes",
             *[f"needed_{c}" for c in [*live, "detection"]],
             *[f"worst_{c}" for c in [*live, "detection"]],
-            "shape_sd", "efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
+            "shape_sd", "estimation_efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
             "ridge_frac", "dropped"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
@@ -1300,7 +1303,7 @@ def _run_explore(raw: list[str], started: float) -> int:
             f"#{rank}  {desc}",
             "    "
             + "  ".join(f"{c} {sc['needed'][c]:.2f}%" for c in live)
-            + f"  shape {sc['shape_sd']:.2f}%  efficiency {sc['xi']:.2f}"
+            + f"  shape {sc['shape_sd']:.2f}% (estimation efficiency {sc['xi']:.2f} of bound)"
             + (
                 f"  trials: reliability {1 - sc['unreliability']:.2f} "
                 f"(LSS leakage {sc['leakage']:.2f}, ridge fraction {sc['ridge_frac']:.2f})"
@@ -1357,7 +1360,9 @@ def _run_explore(raw: list[str], started: float) -> int:
         "axes: " + ", ".join(f"{a.label} {raw[a.token][a.span[0] : a.span[1]]}" for a in axes),
         f"scored analytically at {ref} (fitted HRF assumed right), median of "
         f"{args.explore_designs} realization(s) each",
-        f"trade-off: {det_c} detection (% signal for 80% power) against "
+        "trade-off: "
+        + ("detection, mean over contrasts" if det_c == "detection" else f"{det_c} detection")
+        + " (% signal for 80% power) against "
         + (
             "single-trial 1 - reliability (best of LSS, ridge)"
             if objective == "trials"
@@ -1374,6 +1379,11 @@ def _run_explore(raw: list[str], started: float) -> int:
             "  " + _axis_effect(a, configs, x, y, "1-reliab." if objective == "trials" else "shape")
         )
     text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
+    for label, side, span in edges:
+        text.append(
+            f"note: the shortlist sits at the {side} end of {label} {span} -- the best designs "
+            "may lie beyond it; widen that range"
+        )
     if best_dir.exists():
         text.append(
             f"\nbest realizations: {best_dir}/<rank>/ -- run a command above for the full "
@@ -1482,8 +1492,9 @@ def _run_compare(args) -> int:
         out += [
             "",
             "Response-shape estimation: SD of one FIR bin's estimate, % signal (mean over "
-            "conditions, median over realizations), and Liu & Frank efficiency (of its bound)",
-            f"{'design':<28}" + "".join(f"{n:>22}" for n in noises) + f"{'efficiency':>12}",
+            "conditions, median over realizations), and Liu & Frank estimation efficiency (of its "
+            "bound)",
+            f"{'design':<28}" + "".join(f"{n:>22}" for n in noises) + f"{'est. effic.':>12}",
         ]
         for n in names:
             q = quals[n]

@@ -12,7 +12,7 @@ def test_placeholders_become_axes_and_render_back():
     argv = ["-tr", "1", "-isi", "exp:[3.0-8.0],[1-3],12", "-null", "0.25", "[0-40%]",
             "-order", "{random,permuted_block}"]  # fmt: skip
     axes = find_axes(argv)
-    assert [a.label for a in axes] == ["isi.1", "isi.2", "null.1", "order.1"]
+    assert [a.label for a in axes] == ["isi_mean", "isi_min", "null_share", "order"]
     isi_mean, isi_min, null, order = axes
     assert not isi_mean.integer and isi_min.integer and null.percent and order.is_choice
     configs = sample(axes, 40, seed=1)
@@ -20,11 +20,11 @@ def test_placeholders_become_axes_and_render_back():
         out = render(argv, axes, c)
         assert "[" not in " ".join(out) and "{" not in " ".join(out)
         assert out[3].startswith("exp:") and out[3].endswith(",12")
-        assert 3.0 <= float(c["isi.1"]) <= 8.0 and c["isi.2"] in {"1", "2", "3"}
-        assert c["null.1"].endswith("%") and c["order.1"] in {"random", "permuted_block"}
+        assert 3.0 <= float(c["isi_mean"]) <= 8.0 and c["isi_min"] in {"1", "2", "3"}
+        assert c["null_share"].endswith("%") and c["order"] in {"random", "permuted_block"}
     # Latin hypercube: every tenth of a range is drawn once in 10 samples
     lh = sample(axes[:1], 10, seed=2)
-    assert sorted(int((float(c["isi.1"]) - 3) / 0.5) for c in lh) == list(range(10))
+    assert sorted(int((float(c["isi_mean"]) - 3) / 0.5) for c in lh) == list(range(10))
 
 
 def test_bad_placeholders_are_refused():
@@ -107,4 +107,18 @@ def test_detection_objective_is_the_mean_over_contrasts(tmp_path, capsys):
             "-objective", "efficiency", "-explore", "5", "-explore_keep", "1", "-explore_pick", "2",
             "-device", "cpu", "-prefix", str(tmp_path / "d")]  # fmt: skip
     assert main(argv) == 0
-    assert "detection (" in capsys.readouterr().out
+    assert "detection, mean over contrasts" in capsys.readouterr().out
+
+
+def test_axes_are_named_by_what_they_control_and_edges_are_flagged():
+    from fastfuncstuff.simulation.explore import at_edges
+
+    argv = ["-trial", "E1", "0.25", "[1-3]", "-trial", "E2", "0.25", "[1-3]",
+            "-null", "0.25:uniform:[2-4],6", "[0-50%]", "-initial_fix", "[5-15]"]  # fmt: skip
+    axes = find_axes(argv)
+    assert [a.label for a in axes] == [
+        "E1_count", "E2_count", "null_gap_low", "null_share", "initial_fix",
+    ]  # fmt: skip
+    configs = [{a.label: a.value(0.01) for a in axes}] * 3
+    edges = {label for label, _, _ in at_edges(axes, configs, [0, 1, 2])}
+    assert "initial_fix" in edges and "null_share" not in edges  # 0% has nothing below it
