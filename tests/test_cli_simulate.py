@@ -481,3 +481,12 @@ def test_null_count_can_be_a_share_of_the_trials():
             "-prefix", "x"]  # fmt: skip
     counts = _spec_from_args(_build_parser().parse_args(argv)).resolve_counts()
     assert counts == [60, 15]
+
+
+def test_target_reaches_the_summary_and_mismatch_false_positives_are_split(tmp_path, capsys):
+    _sim(tmp_path / "t", "-ndesigns", "1", "-no_plots", "-target", "0.9")
+    assert "for 90% power" in capsys.readouterr().out
+    _sim(tmp_path / "m", "-ndesigns", "1", "-no_plots", "-contrast", "A", "-contrast", "A-B",
+         "-shared", "3", "-true_hrf", "lib:3")  # fmt: skip
+    out = capsys.readouterr().out
+    assert "condition contrasts; differences below" in out

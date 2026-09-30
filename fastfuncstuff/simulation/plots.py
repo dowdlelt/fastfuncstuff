@@ -107,9 +107,12 @@ def plot_power(
         ax.axhline(0.8, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
         for label, col in zip(noise_labels, colors, strict=True):
             sel = [r for r in rows if r["noise"] == label and r["contrast"] == c]
-            amps = sorted({r["amplitude"] for r in sel})
-            by = {a: [r for r in sel if r["amplitude"] == a] for a in amps}
-            pred = [[r["power_predicted"] for r in by[a]] for a in amps]
+            sweep = sorted({r["amplitude"] for r in sel})
+            by = {a: [r for r in sel if r["amplitude"] == a] for a in sweep}
+            # Plotted against the contrast's true effect, as every table reports
+            # it -- the sweep differs from it under -pattern.
+            amps = [abs(by[a][0]["true_effect"]) for a in sweep]
+            pred = [[r["power_predicted"] for r in by[a]] for a in sweep]
             med = [float(np.median(p)) for p in pred]
             ax.fill_between(
                 amps,
@@ -122,7 +125,7 @@ def plot_power(
             ax.plot(amps, med, color=col, linewidth=2, label=label)
             ax.plot(
                 amps,
-                [np.mean([r["power"] for r in by[a]]) for a in amps],
+                [np.mean([r["power"] for r in by[a]]) for a in sweep],
                 "o",
                 color=col,
                 markersize=4.5,
@@ -142,8 +145,9 @@ def plot_power(
                     color=INK2,
                     va="top",
                 )
-        if effect is not None:
-            ax.axvline(effect, color=INK2, linewidth=1, linestyle=":")
+        at = [r for r in rows if r["contrast"] == c and abs(r["amplitude"] - (effect or -1)) < 1e-6]
+        if effect is not None and at:
+            ax.axvline(abs(at[0]["true_effect"]), color=INK2, linewidth=1, linestyle=":")
         ax.set_ylim(-0.02, 1.02)
         ax.set_title(c, color=INK, fontsize=11)
         swept = next((r.get("swept", "amplitude") for r in rows if r["contrast"] == c), "amplitude")
@@ -152,7 +156,7 @@ def plot_power(
             on = f" on {shared:g}% shared" if shared else ""
             ax.set_xlabel(f"{c} difference (% signal change{on})", color=INK2, fontsize=9)
         else:
-            ax.set_xlabel(f"{c} amplitude (% signal change)", color=INK2, fontsize=9)
+            ax.set_xlabel(f"{c} effect (% signal change)", color=INK2, fontsize=9)
     axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
     handles, labels = axes[0][0].get_legend_handles_labels()
     total_h = 4.2 + text_h

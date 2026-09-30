@@ -178,6 +178,7 @@ def make_fitness(
     poly_degree: int | None = None,
     mean_response: float = 1.0,
     trial_sd: float = 0.5,
+    target: float = 0.8,
 ) -> Callable[[Realization], float]:
     """Mean over ``hrfs`` of the objective: a contrast's detection, 'shape' or 'trials'.
 
@@ -196,6 +197,7 @@ def make_fitness(
             pattern,
             h,
             alpha,
+            target,
             poly_degree=poly_degree,
             mean_response=mean_response,
             trial_sd=trial_sd,

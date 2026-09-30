@@ -528,3 +528,26 @@ def test_trial_pattern_reliability_matches_a_monte_carlo_and_ridge_rescues_lsa()
         de, dt_ = (est - est.mean()).numpy(), (beta - beta.mean()).numpy()
         num, den_e, den_t = num + de @ dt_, den_e + de @ de, den_t + dt_ @ dt_
     assert rel["ridge"] == pytest.approx(num / np.sqrt(den_e * den_t), abs=0.03)
+
+
+def _curve(powers, scale=1.0):
+    return {
+        "table": [
+            {"noise": "n", "contrast": "E1", "amplitude": a, "true_effect": scale * a,
+             "power": p, "power_predicted": p, "expected_est": scale * a}
+            for a, p in zip([0.0, 1.0, 2.0, 3.0, 4.0], powers, strict=True)
+        ]
+    }  # fmt: skip
+
+
+def test_effect_needed_is_the_true_effect_at_the_last_crossing():
+    # -pattern E1=3: the sweep is a third of E1's response; report E1's response.
+    assert amplitude_for_power(_curve([0.0, 0.4, 0.8, 1.0, 1.0], scale=3.0))[("n", "E1")] == (
+        pytest.approx(6.0)
+    )
+    # Non-monotone (a misfit shared response): high at zero, a dip, then a rise.
+    # The first crossing read 0; the answer is where power stays above target.
+    assert amplitude_for_power(_curve([0.9, 0.3, 0.6, 0.9, 1.0]))[("n", "E1")] == pytest.approx(
+        2 + (0.8 - 0.6) / (0.9 - 0.6)
+    )
+    assert np.isnan(amplitude_for_power(_curve([0.0, 0.1, 0.2, 0.3, 0.4]))[("n", "E1")])

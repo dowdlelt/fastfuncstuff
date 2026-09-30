@@ -266,3 +266,12 @@ class TestCountsAndScanTime:
             r = realize(spec, s)
             assert len(r.onsets[0][0]) + r.n_dropped == r.counts[0]
             assert max(r.onsets[0][0]) < 200
+
+
+def test_scan_time_rounds_up_to_whole_volumes():
+    spec = ExperimentSpec(
+        tr=2.0, units=[Unit.parse("A", "A:2", 10)], isi=Interval.parse(10), post_fix=16,
+        scan_time=331,
+    )  # fmt: skip
+    r = realize(spec, 0)
+    assert r.run_lengths == [166] and r.run_durations == [332.0]

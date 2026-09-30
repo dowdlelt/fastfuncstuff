@@ -64,7 +64,7 @@ above B. -shared X puts every condition at X% underneath the difference
 -true_delay shows what a large common response costs.
 
 WHAT IT REPORTS -- for each design, at each noise level:
-    detection    the effect each contrast needs for 80% power (the classic design
+    detection    the effect each contrast needs for -target power, 80% (the classic design
                  efficiency, in % signal), by Monte Carlo and analytically
     estimation   how precisely the response *shape* is recovered (FIR SD per bin;
                  Liu & Frank's estimation efficiency beside it)
@@ -337,6 +337,13 @@ def _build_parser() -> argparse.ArgumentParser:
     a.add_argument("-alpha", type=float, default=0.001, help="Two-tailed p threshold (0.001).")
     a.add_argument("-polort", type=int, help="Per-run drift degree (default AFNI 1+floor(s/150)).")
     a.add_argument("-seed", type=int, default=0)
+    a.add_argument(
+        "-target",
+        type=float,
+        default=0.8,
+        help="Power every 'effect needed' is for: the summary, design quality, the searches "
+        "and -compare (default 0.8).",
+    )
     from fastfuncstuff.cli_utils import add_device_arg
 
     add_device_arg(a)
@@ -358,7 +365,6 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="Names for the -compare designs (default: the file prefixes).",
     )
-    c.add_argument("-target", type=float, default=0.8, help="Power to reach (default 0.8).")
 
     x = p.add_argument_group("Explore")
     x.add_argument(
@@ -634,7 +640,7 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
         for ln in (spec.describe() if spec else "").splitlines()
         if ln.strip().startswith("note:")
     ]
-    need = effect_needed(res, 0.8)
+    need = effect_needed(res, args.target)
     header = ["noise", *contrasts, "false pos. corr / naive"]
     table, partial = [], False
     for cond in conds:
@@ -652,12 +658,14 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
         )
         table.append(cells)
     foot = [
-        "effect for 80% power, % signal change: the amplitude for a condition contrast, the "
-        "difference for A-B; median [range] over realizations"
+        f"effect for {args.target:.0%} power, % signal change -- the contrast's true value "
+        "(a condition's response, or the difference for A-B); median [range] over realizations"
         + ("; Monte Carlo, the fitted HRF is wrong" if has_mismatch(rows) else "")
     ]
     if partial:
-        foot.append(f"* some realizations never reach 80% within the sweep (max {top:g}%)")
+        foot.append(
+            f"* some realizations never reach {args.target:.0%} within the sweep (max {top:g}%)"
+        )
     return {"facts": facts, "notes": notes, "header": header, "rows": table, "footer": foot}
 
 
@@ -705,7 +713,7 @@ def _summarise(
             "that is not mean-matched (uniform) makes some runs longer than the average"
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
-    out += ["", *_quality_lines(quality, reals[0].conditions, conds)]
+    out += ["", *_quality_lines(quality, reals[0].conditions, conds, args.target)]
     if len(reals[0].run_lengths) < 2 and any("single" in q for q in quality):
         out.append(
             "  note: one run -- single-trial ridge chooses its fraction by cross-validation "
@@ -743,10 +751,11 @@ def _summarise(
     if has_mismatch(rows):
         over += "; Monte Carlo power, since the fitted HRF is wrong"
     out.append(
-        "Effect (% signal change: amplitude, or the difference for A-B) for 80% power -- "
+        "Effect (% signal change: the contrast's true value -- a condition's response, or "
+        f"the difference for A-B) for {args.target:.0%} power -- "
         f"median [range] over {over}"
     )
-    need = effect_needed(res, 0.8)
+    need = effect_needed(res, args.target)
     unreached = False
     header = f"{'noise':<24}" + "".join(f"{c:>18}" for c in contrasts)
     out.append(header)
@@ -763,7 +772,7 @@ def _summarise(
         out.append(f"{cond['label']:<24}" + "".join(cells))
     if unreached:
         out.append(
-            f"  * some realizations/HRFs never reach 80% within the sweep (max "
+            f"  * some realizations/HRFs never reach {args.target:.0%} within the sweep (max "
             f"{max(r['amplitude'] for r in rows):g}%); the median and range leave them out"
         )
 
@@ -798,11 +807,21 @@ def _summarise(
             out.append(f"  {c:<10} {detail}")
 
     # False positives at amplitude 0.
-    out += ["", "False-positive rate at amplitude 0 (should be ~alpha):"]
+    # The rate checks the ARMA correction. Under a mismatch with a shared response
+    # a difference contrast's zero-difference estimate is biased by the misfit --
+    # real false positives, but of another kind; averaged in, they made the
+    # correction look broken. They get their own line below.
+    split = bool(res.get("shared", 0.0)) and has_mismatch(rows) and bool(cond_c)
+    out += [
+        "",
+        "False-positive rate at amplitude 0 (should be ~alpha)"
+        + (": condition contrasts; differences below" if split else ":"),
+    ]
     for cond in conds:
         nulls = [r for r in rows if r["noise"] == cond["label"] and r["amplitude"] == 0.0]
-        fp = np.mean([r["power"] for r in nulls])
-        fpn = np.mean([r["power_naive"] for r in nulls])
+        calib = [r for r in nulls if r["contrast"] not in diff_c] if split else nulls
+        fp = np.mean([r["power"] for r in calib])
+        fpn = np.mean([r["power_naive"] for r in calib])
         flag = (
             "  <- naive OLS is anticonservative here"
             if fpn > 3 * args.alpha and fpn > fp * 2
@@ -843,15 +862,15 @@ def _summarise(
 
 
 def _voxel_amplitudes(
-    res, conds, contrasts, pattern, effect
+    res, conds, contrasts, pattern, effect, target: float = 0.8
 ) -> tuple[list[float], str, list[str] | None]:
     """Amplitude for each noise row of the example-voxel figure, what it is, and row notes.
 
-    -effect when given. Otherwise the effect each noise level needs for 80%
+    -effect when given. Otherwise the effect each noise level needs for ``target``
     power (median over realizations), on the first contrast with a true effect
     -- a fixed default (1%) was below detectability at tSNR 50 and invisible
     against tSNR 20's noise, so the picture showed nothing the design could
-    find. A level that never reaches 80% shows the top of the sweep.
+    find. A level that never reaches ``target`` shows the top of the sweep.
     """
     from fastfuncstuff.simulation.power import effect_needed, has_true_effect
 
@@ -860,15 +879,15 @@ def _voxel_amplitudes(
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
     if not live:
         return [1.0] * len(conds), "1% (no contrast has a true effect)", None
-    need = effect_needed(res, 0.8)
+    need = effect_needed(res, target)
     top = max(r["amplitude"] for r in res["table"])
     amps, notes = [], []
     for cond in conds:
         v = need.get((cond["label"], live[0]), np.full(1, np.nan))
         reached = bool(np.isfinite(v).any())
         amps.append(float(np.nanmedian(v)) if reached else top)
-        notes.append("" if reached else "; 80% not reached, top of the sweep")
-    return amps, f"the effect {live[0]} needs for 80% power at each level", notes
+        notes.append("" if reached else f"; {target:.0%} not reached, top of the sweep")
+    return amps, f"the effect {live[0]} needs for {target:.0%} power at each level", notes
 
 
 def _rank_message(q, conditions, bad, n_reals) -> str:
@@ -892,7 +911,7 @@ def _reference_noise(conds) -> str:
     return str(conds[len(conds) // 2]["label"])
 
 
-def _quality_lines(quality, conditions, conds) -> list[str]:
+def _quality_lines(quality, conditions, conds, target: float = 0.8) -> list[str]:
     """Rank, VIF, drift-removed correlation and the effect-needed matrix, as text."""
     q0 = quality[0]
     n = len(conditions)
@@ -921,7 +940,8 @@ def _quality_lines(quality, conditions, conds) -> list[str]:
     ref = _reference_noise(conds)
     m = np.median([q["needed"][ref] for q in quality], axis=0)
     out.append(
-        f"  effect for 80% power at {ref} (analytic, % signal change): diagonal = condition "
+        f"  effect for {target:.0%} power at {ref} (analytic, % signal change): diagonal = "
+        "condition "
         "vs baseline, below it = the difference"
     )
     w = max(8, max(len(c) for c in conditions) + 2)
@@ -1002,7 +1022,7 @@ def _shape_lines(quality, conditions, conds) -> list[str]:
     )
 
 
-def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
+def _sweep_lines(sweep, conds, contrasts, reals, tr, target: float = 0.8) -> list[str]:
     """The -scan_times table at the reference noise level: effect, and effect x sqrt(min)."""
     rows = sweep["rows"]
     ref = _reference_noise(conds)
@@ -1013,7 +1033,8 @@ def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
     out = [
         f"How long to scan (analytic, fitted HRF assumed right; median over {n_real} "
         f"realization(s); {ref}):",
-        "  effect for 80% power (% signal), and in brackets effect x sqrt(total minutes): "
+        f"  effect for {target:.0%} power (% signal), and in brackets effect x sqrt(total "
+        "minutes): "
         "flat = the design scales ideally, lower = more per minute of scanning",
         f"  {'-scan_time':>10} {'run s':>6} {'counts':>8} {'total min':>9}"
         + "".join(f"{c:>18}" for c in names),
@@ -1079,14 +1100,14 @@ def _objective(args, contrasts, pattern) -> str:
     return objective
 
 
-def _objective_label(objective: str) -> str:
+def _objective_label(objective: str, target: float = 0.8) -> str:
     if objective == "shape":
         return "response-shape SD per FIR bin (%)"
     if objective == "detection":
-        return "all contrasts: mean % signal for 80% power"
+        return f"all contrasts: mean % signal for {target:.0%} power"
     if objective == "trials":
         return "single trials: 1 - reliability (best of LSS, ridge)"
-    return f"{objective}: % signal for 80% power"
+    return f"{objective}: % signal for {target:.0%} power"
 
 
 def _optimize_realization(args, spec, contrasts, pattern, conds, objective, progress=True):
@@ -1095,7 +1116,11 @@ def _optimize_realization(args, spec, contrasts, pattern, conds, objective, prog
 
     ref = _reference_noise(conds)
     hrfs = list(dict.fromkeys(args.optimize_hrfs or [args.hrf, *ROBUST_HRFS]))
-    trial_kw = {"mean_response": _mean_response(args), "trial_sd": args.trial_sd}
+    trial_kw = {
+        "mean_response": _mean_response(args),
+        "trial_sd": args.trial_sd,
+        "target": args.target,
+    }
     fit = make_fitness(
         args.tr,
         contrasts,
@@ -1123,7 +1148,7 @@ def _optimize_realization(args, spec, contrasts, pattern, conds, objective, prog
         f"search: {args.optimize} generations x {args.optimize_pop}: {n} realizations scored, "
         f"averaged over HRFs {', '.join(hrfs)}"
         + (f"; {res['n_rejected']} children broke -max_repeat" if res["n_rejected"] else ""),
-        f"  {_objective_label(objective)}, mean over those HRFs: median random draw "
+        f"  {_objective_label(objective, args.target)}, mean over those HRFs: median random draw "
         f"{res['random_median']:.3f}, best of {n} random {res['random_best'][-1]:.3f}, "
         f"evolved {res['best_fitness']:.3f} ({gain:+.1f}% vs best-of-N)",
     ]
@@ -1176,7 +1201,7 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
     text = [
         "ffs_simulate -optimize",
         "=" * 72,
-        f"objective: {_objective_label(objective)} at {_reference_noise(conds)} (analytic)",
+        f"objective: {_objective_label(objective, args.target)} at {_reference_noise(conds)} (analytic)",
         *lines,
         f"optimized realization: {out_dir}/ -- full Monte Carlo and figures:",
         "  " + shlex.join(cmd),
@@ -1190,7 +1215,7 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
         matplotlib.use("Agg")
         from fastfuncstuff.simulation.plots import plot_optimize
 
-        plot_optimize(res, _objective_label(objective), path=f"{prefix}_optimize.png")
+        plot_optimize(res, _objective_label(objective, args.target), path=f"{prefix}_optimize.png")
     written = sorted(
         str(q.name).removeprefix(prefix.name)
         for q in prefix.parent.glob(f"{prefix.name}_*")
@@ -1277,6 +1302,7 @@ def _run_explore(raw: list[str], started: float) -> int:
         pattern,
         args.hrf,
         args.alpha,
+        args.target,
         poly_degree=args.polort,
         mean_response=_mean_response(args),
         trial_sd=args.trial_sd,
@@ -1406,7 +1432,7 @@ def _run_explore(raw: list[str], started: float) -> int:
         f"{args.explore_designs} realization(s) each",
         "trade-off: "
         + ("detection, mean over contrasts" if det_c == "detection" else f"{det_c} detection")
-        + " (% signal for 80% power) against "
+        + f" (% signal for {args.target:.0%} power) against "
         + (
             "single-trial 1 - reliability (best of LSS, ridge)"
             if objective == "trials"
@@ -1693,6 +1719,7 @@ def main(argv: list[str] | None = None) -> int:
         poly_degree=args.polort,
         mean_response=_mean_response(args),
         trial_sd=args.trial_sd,
+        target=args.target,
     )
     bad = [i for i, q in enumerate(quality) if q["deficient"]]
     if bad:
@@ -1732,6 +1759,7 @@ def main(argv: list[str] | None = None) -> int:
             alpha=args.alpha,
             poly_degree=args.polort,
             seed=args.seed,
+            target=args.target,
         )
 
     device = setup_device(args.device)
@@ -1759,7 +1787,9 @@ def main(argv: list[str] | None = None) -> int:
         res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
     )
     if sweep is not None:
-        summary += "\n\n" + "\n".join(_sweep_lines(sweep, conds, contrasts, reals, args.tr))
+        summary += "\n\n" + "\n".join(
+            _sweep_lines(sweep, conds, contrasts, reals, args.tr, args.target)
+        )
     print(summary)
     Path(f"{prefix}_summary.txt").write_text(summary + "\n")
     if sweep is not None:
@@ -1890,7 +1920,9 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.simulation.plots import plot_example_voxels
 
         truth = res["true_hrfs"][0] if res["true_hrfs"] != [res["hrf"]] else res["hrf"]
-        amp, basis, notes = _voxel_amplitudes(res, conds, contrasts, pattern, args.effect)
+        amp, basis, notes = _voxel_amplitudes(
+            res, conds, contrasts, pattern, args.effect, args.target
+        )
         plot_example_voxels(
             reals[0],
             args.tr,

@@ -459,10 +459,10 @@ class RealizationScorer:
         pattern = (
             np.ones(self.W.shape[1]) if beta_pattern is None else np.asarray(beta_pattern, float)
         )
-        # Contrast value per unit of the swept effect.
-        self.per_unit = np.array(
-            [1.0 if is_difference(w) else abs(float(w @ pattern)) for w in self.W]
-        )
+        # Which contrasts the sweep gives a true effect (a condition contrast with
+        # -pattern B=0 has none). The effect reported is the contrast's own value
+        # in % signal -- not the sweep, which -pattern scales.
+        self.live = np.array([has_true_effect(w, pattern) for w in self.W])
 
     def score(self, real: Any, shape: bool = True, single: bool = False) -> dict[str, Any] | None:
         """Scores of one realization, or None if its model is rank-deficient.
@@ -496,9 +496,9 @@ class RealizationScorer:
             "counts": "/".join(str(c) for c in real.counts),
             "n_dropped": getattr(real, "n_dropped", 0),
             "needed": {
-                (label, name): (float(val / pu) if pu > 0 else float("nan"))
+                (label, name): (float(val) if live else float("nan"))
                 for label, v in need.items()
-                for name, val, pu in zip(self.names, v, self.per_unit, strict=True)
+                for name, val, live in zip(self.names, v, self.live, strict=True)
             },
         }
         # 'detection': the mean over every contrast with a true effect -- the
@@ -549,11 +549,18 @@ def power_column(rows: list[dict[str, Any]]) -> str:
 def amplitude_for_power(
     result: dict[str, Any], target: float = 0.8, column: str | None = None
 ) -> dict[tuple[str, str], float]:
-    """Smallest amplitude reaching ``target`` power, per (noise, contrast), by interpolation.
+    """The effect reaching ``target`` power, per (noise, contrast), by interpolation.
 
-    nan where the swept amplitudes never reach it. ``column`` defaults to
-    :func:`power_column` -- the analytic curve, or the Monte Carlo under a
-    model mismatch.
+    The effect is the contrast's *true* value in % signal (``true_effect``),
+    not the swept amplitude: with ``-pattern E1=3`` the sweep is a third of
+    E1's response, and reporting the sweep read E1 as three times easier than
+    it is. It is where power last crosses ``target`` -- beyond it power stays
+    there. The first crossing was wrong for a non-monotone curve (a wrong-HRF
+    shared response gives high power at zero difference, a dip, then a rise).
+
+    nan where the sweep never reaches it, or the contrast has no true effect.
+    ``column`` defaults to :func:`power_column` -- the analytic curve, or the
+    Monte Carlo under a model mismatch.
     """
     if column is None:
         column = power_column(result["table"])
@@ -564,17 +571,14 @@ def amplitude_for_power(
             (r for r in result["table"] if (r["noise"], r["contrast"]) == key),
             key=lambda r: r["amplitude"],
         )
-        amps = np.array([r["amplitude"] for r in rows])
+        eff = np.array([abs(r["true_effect"]) for r in rows])
         pw = np.array([r[column] for r in rows])
-        hit = np.nonzero(pw >= target)[0]
-        if hit.size == 0 or rows[hit[0]]["true_effect"] == 0 and hit[0] == 0:
+        below = np.nonzero(pw < target)[0]
+        if not np.any(eff > 0) or below.size == 0 or below[-1] == len(rows) - 1:
             out[key] = float("nan")
             continue
-        j = hit[0]
-        if j == 0:
-            out[key] = float(amps[0])
-        else:
-            out[key] = float(np.interp(target, [pw[j - 1], pw[j]], [amps[j - 1], amps[j]]))
+        j = below[-1]
+        out[key] = float(np.interp(target, [pw[j], pw[j + 1]], [eff[j], eff[j + 1]]))
     return out
 
 

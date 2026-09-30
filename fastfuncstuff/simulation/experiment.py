@@ -355,14 +355,19 @@ class ExperimentSpec:
         of the scan -- a TR or two is not worth it, and a jittered realization
         that runs long would lose events to it. Counts the user fixed keep
         -scan_time's padding: that is chosen.
+
+        A scan is whole volumes, so -scan_time is rounded *up* to a whole TR: 331 s
+        at TR 2 is 166 volumes, 332 s -- it had rounded the volumes but kept the
+        seconds, so a run's length and its duration disagreed.
         """
         if self.scan_time is None:
             return None
+        full = float(np.ceil(self.scan_time / self.tr - 1e-9) * self.tr)
         if not self.scan_sized():
-            return self.scan_time
+            return full
         need = self.expected_duration([float(c) for c in counts])
         trimmed = float(np.ceil(need / self.tr - 1e-9) * self.tr)
-        return trimmed if self.scan_time - trimmed >= 0.05 * self.scan_time else self.scan_time
+        return trimmed if full - trimmed >= 0.05 * full else full
 
     def describe(self) -> str:
         counts = self.resolve_counts()
