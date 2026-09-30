@@ -103,6 +103,11 @@ figures (-no_plots skips them):
     _shape.png     shape resolution: power against library steps apart
     _trials.png    single trials by LSS, LSA and ridge, against the truth
     _hrf.png       with -true_hrf: the true shapes and what was recovered
+    _robust.png    every library HRF as the truth: effect needed, fraction recovered
+    _soa.png       efficiency against SOA: fixed, jittered, with blanks; this design
+    _liu.png       Liu's estimation-vs-detection plane, with the theoretical bound
+    _tsnr.png      the effect needed against tSNR: what tSNR an effect needs
+    _matrix.png    the design matrix, SPM-style
 """
 
 from __future__ import annotations
@@ -2247,6 +2252,13 @@ def main(argv: list[str] | None = None) -> int:
                 for c in live
             }
             plot_tsnr(curves, grid, points, target=args.target, path=f"{prefix}_tsnr.png")
+        from fastfuncstuff.simulation.plots import plot_design_matrix
+
+        d0 = res["designs"][0]
+        plot_design_matrix(
+            d0["X"].numpy(), reals[0].conditions, d0["run_lengths"], d0["poly_degree"], args.tr,
+            path=f"{prefix}_matrix.png",
+        )  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

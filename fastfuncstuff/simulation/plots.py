@@ -1516,6 +1516,54 @@ def plot_tsnr(
     return _finish(fig, path)
 
 
+def plot_design_matrix(
+    task: np.ndarray,
+    conditions: list[str],
+    run_lengths: list[int],
+    poly_degree: int,
+    tr: float,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """The model as SPM draws it: every column of the fit, scans down, one image.
+
+    The task regressors (the fitted HRF), then each run's Legendre drift
+    polynomials -- the full X the fit uses. Each column scaled to its own
+    range (dark low, light high); run boundaries in the task columns as lines.
+    """
+    import matplotlib.pyplot as plt
+
+    from .power import _nuisance
+
+    D = _nuisance(list(run_lengths), poly_degree).numpy()
+    X = np.concatenate([np.asarray(task, dtype=float), D], axis=1)
+    lo, hi = X.min(axis=0), X.max(axis=0)
+    Xs = (X - lo) / np.where(hi > lo, hi - lo, 1.0)
+    labels = list(conditions) + [
+        f"run {r + 1} P{k}" for r in range(len(run_lengths)) for k in range(poly_degree + 1)
+    ]
+    n_cols = X.shape[1]
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.32 * n_cols + 2.0), 7.5))
+    fig.patch.set_facecolor(SURFACE)
+    ax.imshow(Xs, aspect="auto", cmap="gray", interpolation="nearest")
+    starts = np.cumsum([0, *run_lengths])[1:-1]
+    for b in starts:
+        ax.axhline(b - 0.5, color=CATEGORICAL[1], linewidth=1)
+    ax.axvline(len(conditions) - 0.5, color=CATEGORICAL[0], linewidth=1.5)
+    ax.set_xticks(range(n_cols), labels, rotation=90, fontsize=7 if n_cols > 12 else 8)
+    yt = np.linspace(0, X.shape[0] - 1, 6).astype(int)
+    ax.set_yticks(yt, [f"{int(v)}\n{v * tr:.0f} s" for v in yt], fontsize=7.5)
+    ax.tick_params(colors=INK2)
+    ax.set_ylabel("scan", color=INK2, fontsize=9)
+    ax.set_title(
+        title or f"Design matrix: {len(conditions)} task column(s), then drift\n(polort "
+        f"{poly_degree} per run); each column scaled to its range",
+        color=INK, fontsize=9.5, loc="left",
+    )  # fmt: skip
+    fig.tight_layout()
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

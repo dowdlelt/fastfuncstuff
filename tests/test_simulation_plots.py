@@ -186,3 +186,12 @@ def test_tsnr_figure_reads_off_the_tsnr_an_effect_needs(tmp_path):
     assert "1% at tSNR 55" in text and "0.5% at tSNR 110" in text
     plot_tsnr({"A": 55.0 / grid}, grid, path=tmp_path / "t.png")
     assert (tmp_path / "t.png").stat().st_size > 10_000
+
+
+def test_design_matrix_figure(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_design_matrix
+
+    task = np.random.default_rng(0).random((60, 2))
+    fig = plot_design_matrix(task, ["A", "B"], [30, 30], 2, 1.0, path=tmp_path / "m.png")
+    assert (tmp_path / "m.png").stat().st_size > 10_000
+    del fig
