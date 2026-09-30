@@ -1969,6 +1969,32 @@ def main(argv: list[str] | None = None) -> int:
             args.trial_sd,
             path=f"{prefix}_trials.png",
         )  # fmt: skip
+        live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
+        if live:
+            from fastfuncstuff.simulation.plots import plot_tstats
+            from fastfuncstuff.simulation.power import effect_needed, t_example
+
+            c0 = live[0]
+            need = effect_needed(res, args.target)
+            top = max(abs(r["true_effect"]) for r in res["table"] if r["contrast"] == c0)
+            effects = {}
+            for cnd in conds:
+                v = need.get((cnd["label"], c0), np.full(1, np.nan))
+                effects[cnd["label"]] = (
+                    args.effect
+                    if args.effect is not None
+                    else (float(np.nanmedian(v)) if np.isfinite(v).any() else top)
+                )
+            plot_tstats(
+                t_example(
+                    reals[0], args.tr, c0, contrasts[c0], conds, effects, pattern, args.hrf,
+                    args.alpha, args.polort, seed=args.seed,
+                ),
+                c0,
+                [c["label"] for c in conds],
+                args.alpha,
+                path=f"{prefix}_tstats.png",
+            )  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

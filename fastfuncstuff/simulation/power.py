@@ -134,8 +134,14 @@ def simulate_design_power(
     baseline: float = 100.0,
     device: torch.device | None = None,
     seed: int = 0,
+    keep_t: bool = False,
 ) -> dict[str, Any]:
     """Monte-Carlo detection power of each contrast, per noise condition and amplitude.
+
+    ``keep_t`` also returns the replicates' t values under 't': {(noise label,
+    amplitude, contrast): (corrected t, naive t)}, and the critical values
+    under 'crit': {noise label: (corrected, naive)} -- for the t-distribution
+    figure.
 
     Parameters
     ----------
@@ -231,6 +237,8 @@ def simulate_design_power(
     v_naive = torch.einsum("ip,pq,iq->i", C, XtX_inv, C)
     dev_mats = (P_dev, X_dev, CP_dev, mis_dev)
     shared: dict[tuple[float, float] | None, tuple] = {}
+    t_kept: dict[tuple[str, float, str], tuple[np.ndarray, np.ndarray]] = {}
+    crits: dict[str, tuple[float, float]] = {}
     rows: list[dict[str, Any]] = []
     dofs: dict[str, tuple[float, float]] = {}
     for k, cond in enumerate(noise):
@@ -291,14 +299,22 @@ def simulate_design_power(
                 row["contrast"] = name
                 row.update({key: v[j][i] for key, v in vals.items()})
                 rows.append(row)
+        if keep_t:
+            for j, amp in enumerate(amps):
+                for i, name in enumerate(names):
+                    t_kept[(label, amp, name)] = (t_corr[j, i].numpy(), t_naive[j, i].numpy())
+            crits[label] = (float(crit_corr), float(crit_naive))
 
-    return {
+    out = {
         "table": rows,
         "alpha": alpha,
         "poly_degree": poly_degree,
         "dof": dofs,
         "n_reps": n_reps,
     }
+    if keep_t:
+        out["t"], out["crit"] = t_kept, crits
+    return out
 
 
 def _unit_noise_fit(
@@ -1260,6 +1276,63 @@ def single_trial_example(
         "curve": curve,
         "noise": label,
     }
+
+
+def t_example(
+    realization: Any,
+    tr: float,
+    contrast: str,
+    weights: list[float] | np.ndarray,
+    noise: list[dict[str, Any]],
+    effects: dict[str, float],
+    beta_pattern: list[float] | np.ndarray | None = None,
+    hrf: str = "spmg1",
+    alpha: float = 0.001,
+    poly_degree: int | None = None,
+    n_reps: int = 2000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """t values of one contrast under the null and at an effect, per noise level.
+
+    ``effects`` is the contrast's true effect (PSC) per noise label, e.g. the
+    one each level needs for the target power. Returns 't' {label: {'null':
+    (corrected, naive), 'effect': (corrected, naive)}}, 'crit' and 'dof'
+    {label: (corrected, naive)} and 'effects' -- what the t-distribution
+    figure draws.
+    """
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
+    X = build_task_design(
+        realization.onsets, realization.durations, tr, realization.run_lengths, bases, dt,
+        device=cpu,
+    )  # fmt: skip
+    w = np.asarray(weights, dtype=float)
+    n_cond = len(w)
+    pattern = np.ones(n_cond) if beta_pattern is None else np.asarray(beta_pattern, float)
+    if is_difference(w):  # the sweep is the difference itself, as in the engine
+        pos = np.clip(w, 0, None)
+        pattern = pos / float(pos @ pos)
+    per_unit = float(w @ pattern)  # contrast value per unit of the sweep
+    out: dict[str, Any] = {"t": {}, "crit": {}, "dof": {}, "effects": effects}
+    for k, cond in enumerate(noise):
+        label = str(cond.get("label", f"noise{k}"))
+        amp = abs(effects[label] / per_unit) if per_unit else 0.0
+        res = simulate_design_power(
+            X, list(realization.run_lengths), tr, {contrast: w}, [amp], [cond],
+            beta_pattern=pattern, n_reps=n_reps, poly_degree=poly_degree, alpha=alpha,
+            device=cpu, seed=seed + k, keep_t=True,
+        )  # fmt: skip
+        out["t"][label] = {
+            "null": res["t"][(label, 0.0, contrast)],
+            "effect": res["t"][(label, float(amp), contrast)],
+        }
+        out["crit"][label] = res["crit"][label]
+        naive, corr = res["dof"][label]
+        out["dof"][label] = (corr, naive)
+    return out
 
 
 def simulate_realizations_power(

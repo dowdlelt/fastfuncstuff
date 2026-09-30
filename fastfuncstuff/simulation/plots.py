@@ -1076,6 +1076,77 @@ def plot_single_trials(
     return _finish(fig, path)
 
 
+def plot_tstats(
+    result: dict[str, Any],
+    contrast: str,
+    noise_labels: list[str],
+    alpha: float,
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_panels: int = 5,
+):
+    """The t values behind the power: the null and an effect, corrected and naive.
+
+    One panel per noise level. Grey: t under the null (amplitude 0), filled
+    for the ARMA-corrected t, outlined for naive OLS; the ink curve is the t
+    density the corrected t should follow. Colour: the corrected t at the
+    effect. Dashed: the corrected +-critical t, dotted: the naive one. A naive
+    null wider than the curve is why naive OLS is anticonservative -- its
+    false positives are the grey mass past the dotted lines.
+    ``result`` is :func:`~.power.t_example`.
+    """
+    import matplotlib.pyplot as plt
+    from scipy import stats as st
+
+    labels = noise_labels[:max_panels]
+    colors = ramp(len(noise_labels))
+    fig, axes = plt.subplots(1, len(labels), figsize=(4.0 * len(labels) + 0.6, 3.9),
+                             squeeze=False, layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    for ax, label, col in zip(axes[0], labels, colors, strict=False):
+        _style(ax)
+        t = result["t"][label]
+        (c_crit, n_crit), (c_dof, _) = result["crit"][label], result["dof"][label]
+        null_c, null_n = t["null"]
+        eff_c = t["effect"][0]
+        lo = min(np.percentile(null_n, 0.5), -c_crit * 1.4)
+        hi = max(np.percentile(eff_c, 99.5), c_crit * 1.4)
+        bins = np.linspace(lo, hi, 70)
+        ax.hist(
+            null_c, bins=bins, density=True, color="#bdbcb6", alpha=0.7, label="null, corrected"
+        )
+        ax.hist(null_n, bins=bins, density=True, histtype="step", color=INK2, linewidth=1.2,
+                label="null, naive OLS")  # fmt: skip
+        ax.hist(eff_c, bins=bins, density=True, color=col, alpha=0.55,
+                label="at the effect, corrected")  # fmt: skip
+        xs = np.linspace(lo, hi, 400)
+        ax.plot(xs, st.t.pdf(xs, c_dof), color=INK, linewidth=1.3, label=f"t({c_dof:.0f})")
+        for x in (-c_crit, c_crit):
+            ax.axvline(x, color=INK, linewidth=1, linestyle=(0, (4, 3)))
+        for x in (-n_crit, n_crit):
+            ax.axvline(x, color=INK2, linewidth=1, linestyle=":")
+        fp_c = float(np.mean(np.abs(null_c) > c_crit))
+        fp_n = float(np.mean(np.abs(null_n) > n_crit))
+        pw = float(np.mean(np.abs(eff_c) > c_crit))
+        ax.set_title(
+            f"{label}: effect {result['effects'][label]:.2f}%\n"
+            f"false pos. {fp_c:.4f} corrected, {fp_n:.4f} naive; power {pw:.2f}",
+            color=INK, fontsize=9, loc="left",
+        )  # fmt: skip
+        ax.set_xlabel(f"t ({contrast})", color=INK2, fontsize=9)
+        ax.set_yticks([])
+    handles, lbls = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, lbls, frameon=False, fontsize=8, labelcolor=INK2,
+               loc="outside lower center", ncol=4)  # fmt: skip
+    fig.suptitle(
+        title
+        or f"t under the null and at the effect, two-tailed p < {alpha:g} (dashed: corrected "
+        "critical t; dotted: naive)",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

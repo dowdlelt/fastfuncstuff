@@ -103,3 +103,23 @@ def test_tent_and_single_trial_figures_render(tmp_path):
     plot_single_trials(ex, r.conditions, 0.5, path=tmp_path / "s.png")
     for name in ("t.png", "s.png"):
         assert (tmp_path / name).stat().st_size > 10_000
+
+
+def test_tstats_figure_shows_a_calibrated_null(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_tstats
+    from fastfuncstuff.simulation.power import t_example
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:0.5", 30), Unit.parse("B", "B:0.5", 30)],
+        isi=Interval.parse("exp:4,2,10"),
+        post_fix=15,
+    )
+    r = realize(spec, 0)
+    noise = [{"label": "tSNR 60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}]
+    out = t_example(r, 1.0, "A", [1, 0], noise, {"tSNR 60": 1.0}, n_reps=800)
+    null_c, null_n = out["t"]["tSNR 60"]["null"]
+    assert abs(null_c.std() - 1.0) < 0.1  # the corrected null is a unit t
+    assert null_n.std() > 1.15 * null_c.std()  # the naive one is too wide
+    plot_tstats(out, "A", ["tSNR 60"], 0.001, path=tmp_path / "t.png")
+    assert (tmp_path / "t.png").stat().st_size > 10_000
