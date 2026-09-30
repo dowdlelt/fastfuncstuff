@@ -947,6 +947,135 @@ def plot_optimize(result: dict[str, Any], label: str, path: str | Path | None = 
     return _finish(fig, path)
 
 
+def plot_tent(
+    result: dict[str, Any],
+    conditions: list[str],
+    noise_labels: list[str],
+    amplitudes: list[float] | np.ndarray,
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_conditions: int = 4,
+):
+    """The response shape one voxel would give: TENT deconvolution against the truth.
+
+    One row per noise level, one column per condition. The ink line is the
+    true response to one event (the true HRF, duration included); the dots are
+    the TENT estimate from one simulated voxel, the band its 95% confidence
+    interval (+-1.96 SE under the noise ARMA). A band as wide as the response
+    means the shape cannot be read off one voxel, however well the amplitude is
+    detected. ``result`` is :func:`~.power.tent_estimate`.
+    """
+    import matplotlib.pyplot as plt
+
+    names = conditions[:max_conditions]
+    rows = len(noise_labels)
+    fig, axes = plt.subplots(
+        rows, len(names), figsize=(3.4 * len(names) + 0.8, 2.3 * rows + 1.0),
+        squeeze=False, sharex=True, sharey="row", layout="constrained",
+    )  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    kn, ft = result["knots"], result["fine_t"]
+    for i, label in enumerate(noise_labels):
+        for q, cond in enumerate(names):
+            ax = axes[i, q]
+            _style(ax)
+            col = CATEGORICAL[q % len(CATEGORICAL)]
+            est, se = result["est"][label][q], result["se"][label][q]
+            ax.axhline(0, color=GRID, linewidth=1)
+            ax.fill_between(kn, est - 1.96 * se, est + 1.96 * se, color=col, alpha=0.18,
+                            linewidth=0)  # fmt: skip
+            ax.plot(ft, result["truth"][q], color=INK, linewidth=1.8, label="true response")
+            ax.plot(kn, est, "o-", color=col, linewidth=1.2, markersize=4,
+                    markeredgecolor=SURFACE, label="TENT estimate, one voxel")  # fmt: skip
+            if i == 0:
+                ax.set_title(f"{cond} ({float(amplitudes[q]):g}%)", color=INK, fontsize=10)
+            if q == 0:
+                ax.set_ylabel(f"{label}\n% signal", color=INK2, fontsize=8)
+            if i == rows - 1:
+                ax.set_xlabel("time after onset (s)", color=INK2, fontsize=8)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
+               loc="outside lower center", ncol=2)  # fmt: skip
+    fig.suptitle(
+        title
+        or "Response shape from one voxel: TENT deconvolution (knots every "
+        f"{kn[1] - kn[0]:g} s, not TR-locked); band: 95% confidence interval",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
+def plot_single_trials(
+    result: dict[str, Any],
+    conditions: list[str],
+    trial_sd: float,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """Single trials, estimated three ways, against the truth -- and how variable they must be.
+
+    Panels 1-3: each trial's true deviation from its condition mean (x)
+    against its estimate's (y), for LSS, LSA and single-trial ridge, coloured
+    by condition; r is this voxel's, 'expected' the analytic reliability.
+    Ridge shrinks its estimates, so its slope is below one; a correlation does
+    not mind. Panel 4: expected reliability against trial-to-trial SD -- where
+    the curve crosses 0.5, trials start to be told apart. ``result`` is
+    :func:`~.power.single_trial_example`.
+    """
+    import matplotlib.pyplot as plt
+
+    cond = result["cond"]
+
+    def centred(v):
+        v = np.asarray(v, dtype=float).copy()
+        for q in np.unique(cond):
+            if np.isfinite(v[cond == q]).any():  # LSA can be all-nan: not estimable
+                v[cond == q] -= np.nanmean(v[cond == q])
+        return v
+
+    true = centred(result["true"])
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4.2), layout="constrained")
+    fig.patch.set_facecolor(SURFACE)
+    names = {"lss": "LSS", "lsa": "LSA", "ridge": "ridge"}
+    for ax, m in zip(axes[:3], ("lss", "lsa", "ridge"), strict=True):
+        _style(ax)
+        est = centred(result[m])
+        ok = np.isfinite(est)
+        for q, cname in enumerate(conditions):
+            sel = ok & (cond == q)
+            ax.scatter(true[sel], est[sel], s=10, color=CATEGORICAL[q % len(CATEGORICAL)],
+                       alpha=0.6, linewidths=0, label=cname)  # fmt: skip
+        r = float(np.corrcoef(true[ok], est[ok])[0, 1]) if ok.sum() > 2 else float("nan")
+        extra = f", fraction {result['ridge_frac']:.2f}" if m == "ridge" else ""
+        ax.set_title(f"{names[m]}: r {r:.2f} (expected {result['expected'][m]:.2f}{extra})",
+                     color=INK, fontsize=10, loc="left")  # fmt: skip
+        ax.set_xlabel("true trial deviation (%)", color=INK2, fontsize=9)
+        if m == "lss":
+            ax.set_ylabel("estimated trial deviation (%)", color=INK2, fontsize=9)
+    ax = axes[3]
+    _style(ax)
+    for m, col in zip(("lss", "lsa", "ridge"), (CATEGORICAL[0], CATEGORICAL[1], CATEGORICAL[2]),
+                      strict=True):  # fmt: skip
+        ax.plot(result["sd_grid"], result["curve"][m], "o-", color=col, linewidth=2,
+                markersize=4, label=names[m])  # fmt: skip
+    ax.axvline(trial_sd, color=INK2, linewidth=1, linestyle=":")
+    ax.axhline(0.5, color=GRID, linewidth=1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("trial-to-trial SD (% signal)", color=INK2, fontsize=9)
+    ax.set_ylabel("expected reliability", color=INK2, fontsize=9)
+    ax.set_title("how variable trials must be", color=INK, fontsize=10, loc="left")
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="lower right")
+    if len(conditions) > 1:
+        axes[0].legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper left")
+    fig.suptitle(
+        title
+        or f"Single trials at {result['noise']}: estimated vs true trial-to-trial deviations "
+        f"(trial SD {trial_sd:g}%; dotted: this SD)",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

@@ -874,6 +874,39 @@ def trial_regressors(realization: Any, tr: float, bases: torch.Tensor, dt: float
     return X.double(), np.asarray(cond, dtype=int)
 
 
+def lss_rows(Xt: torch.Tensor, cond: np.ndarray, D: torch.Tensor) -> torch.Tensor:
+    """LSS estimator rows (n_trials, n_t): trial i's estimate is ``A[i] @ y``.
+
+    Each trial's own model -- its regressor, the rest of its condition, the
+    other conditions, drift ``D`` -- solved at once by FWL: project out the
+    other conditions and drift, then a 2-column solve per trial.
+    """
+    n_t, n_tr = Xt.shape
+    n_cond = int(cond.max()) + 1
+    S = torch.stack([Xt[:, cond == q].sum(dim=1) for q in range(n_cond)], dim=1)
+    # LSS by FWL: for trial i in condition c, project out O = [other conditions, drift];
+    # then [u, v] = M_O [x_i, s_c - x_i] and b_i = row 1 of (G^-1 [u v]').
+    A = torch.empty(n_tr, n_t, dtype=torch.float64)
+    for q in range(n_cond):
+        O = torch.cat([S[:, [k for k in range(n_cond) if k != q]], D], dim=1)
+        Q, _ = torch.linalg.qr(O)
+        idx = np.flatnonzero(cond == q)
+        U = Xt[:, idx] - Q @ (Q.T @ Xt[:, idx])  # (n_t, m)
+        sc = S[:, q] - Q @ (Q.T @ S[:, q])
+        V = sc[:, None] - U
+        uu, uv, vv = (U * U).sum(0), (U * V).sum(0), (V * V).sum(0)
+        det = uu * vv - uv**2
+        ok = det > 1e-10 * uu * vv
+        rows = (vv[:, None] * U.T - uv[:, None] * V.T) / torch.where(ok, det, 1.0)[:, None]
+        # A condition's only trial has no "rest of the condition" (v = 0): LSS is then
+        # just its own regressor. Anything else singular is not estimable.
+        alone = vv <= 1e-12 * uu
+        rows[alone] = (U.T / uu[:, None])[alone]
+        rows[~ok & ~alone] = float("nan")
+        A[idx] = rows
+    return A
+
+
 def single_trial_quality(
     realization: Any,
     tr: float,
@@ -924,28 +957,8 @@ def single_trial_quality(
     n_t, n_tr = Xt.shape
     n_cond = len(realization.conditions)
     D = _nuisance(lengths, poly_degree)
-    S = torch.stack([Xt[:, cond == q].sum(dim=1) for q in range(n_cond)], dim=1)  # conditions
 
-    # LSS by FWL: for trial i in condition c, project out O = [other conditions, drift];
-    # then [u, v] = M_O [x_i, s_c - x_i] and b_i = row 1 of (G^-1 [u v]').
-    A = torch.empty(n_tr, n_t, dtype=torch.float64)  # estimator rows: b_i = A[i] @ y
-    for q in range(n_cond):
-        O = torch.cat([S[:, [k for k in range(n_cond) if k != q]], D], dim=1)
-        Q, _ = torch.linalg.qr(O)
-        idx = np.flatnonzero(cond == q)
-        U = Xt[:, idx] - Q @ (Q.T @ Xt[:, idx])  # (n_t, m)
-        sc = S[:, q] - Q @ (Q.T @ S[:, q])
-        V = sc[:, None] - U
-        uu, uv, vv = (U * U).sum(0), (U * V).sum(0), (V * V).sum(0)
-        det = uu * vv - uv**2
-        ok = det > 1e-10 * uu * vv
-        rows = (vv[:, None] * U.T - uv[:, None] * V.T) / torch.where(ok, det, 1.0)[:, None]
-        # A condition's only trial has no "rest of the condition" (v = 0): LSS is then
-        # just its own regressor. Anything else singular is not estimable.
-        alone = vv <= 1e-12 * uu
-        rows[alone] = (U.T / uu[:, None])[alone]
-        rows[~ok & ~alone] = float("nan")
-        A[idx] = rows
+    A = lss_rows(Xt, cond, D)  # estimator rows: b_i = A[i] @ y
     W = A @ Xt  # (n_tr, n_tr): w_ij, response of trial j in trial i's estimate
     off = W - torch.diag(torch.diagonal(W))
     leak = torch.sqrt((off * off).sum(dim=1)).numpy()
@@ -1079,6 +1092,174 @@ def _trial_reliability(Z, N, C, ones, mu: float, tau2: float) -> float:
         + float(torch.trace(C @ N @ C))
     )
     return e_hd / float(np.sqrt(e_hh * e_dd)) if e_hh > 0 and e_dd > 0 else 0.0
+
+
+def tent_estimate(
+    realization: Any,
+    tr: float,
+    noise: list[dict[str, Any]],
+    amplitudes: list[float] | np.ndarray,
+    true_hrf: str = "spmg1",
+    window: float = 20.0,
+    spacing: float = 2.0,
+    poly_degree: int | None = None,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Deconvolve one simulated voxel with TENTs: the response shape a design lets you see.
+
+    AFNI-style TENT (piecewise-linear) knots every ``spacing`` seconds over
+    ``window`` after onset, evaluated at the exact time since each onset --
+    not TR-locked, so jittered sub-TR onsets are fine (a TR-grid FIR would
+    round them). One voxel per noise condition responds with ``amplitudes``
+    (PSC, per condition) through ``true_hrf``; the fit is TENTs for every
+    condition plus the per-run drift.
+
+    Returns 'knots' (s), 'fine_t' and 'truth' (n_cond, len(fine_t)) -- the
+    true response to one event, duration included -- and per noise label
+    'est' and 'se' (n_cond, n_knots): the estimate from that voxel and its
+    SE under the noise ARMA (what a fresh voxel would scatter by).
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.matrices import make_tent_design
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    lengths = list(realization.run_lengths)
+    n_cond = len(realization.conditions)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    k = int(round(window / spacing)) + 1
+    knots = np.linspace(0.0, window, k)
+    blocks = []
+    start = 0
+    for r, n_run in enumerate(lengths):
+        cols = [
+            make_tent_design(
+                [np.asarray(realization.onsets[q][r], dtype=float)], 0.0, window, tr, n_run,
+                n_basis=k, device=cpu,
+            ).double()
+            for q in range(n_cond)
+        ]  # fmt: skip
+        blocks.append(torch.cat(cols, dim=1))
+        start += n_run
+    T = torch.cat(blocks, dim=0)  # (n_t, n_cond * k), condition-major
+    X = torch.cat([T, _nuisance(lengths, poly_degree)], dim=1)
+    P = torch.linalg.pinv(X)
+
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(true_hrf, dt, cpu)[0][1]
+    X_true = build_task_design(
+        realization.onsets, realization.durations, tr, lengths, bases, dt, device=cpu
+    ).double()
+    amps = torch.as_tensor(np.asarray(amplitudes, dtype=float), dtype=torch.float64)
+    # The truth on a fine grid: one event at 0, same HRF and duration convention.
+    fine_dt = 0.1
+    fdt = default_microtime_dt(fine_dt)
+    fbases = hrfs_from_spec(true_hrf, fdt, cpu)[0][1]
+    n_fine = int(round(window / fine_dt)) + 1
+    truth = np.stack(
+        [
+            float(amps[q])
+            * build_task_design([[np.array([0.0])]], [realization.durations[q]], fine_dt,
+                                [n_fine], fbases, fdt, device=cpu)[:, 0].numpy()
+            for q in range(n_cond)
+        ]
+    )  # fmt: skip
+
+    gen = torch.Generator().manual_seed(seed)
+    out: dict[str, Any] = {
+        "knots": knots, "fine_t": np.arange(n_fine) * fine_dt, "truth": truth,
+        "est": {}, "se": {},
+    }  # fmt: skip
+    for i, c in enumerate(noise):
+        label = str(c.get("label", f"noise{i}"))
+        kw = {key: v for key, v in c.items() if key != "label"}
+        sd = 100.0 / float(kw["tsnr"])
+        L = _noise_correlation(kw, tr, lengths, factor=True)
+        z = torch.randn(X.shape[0], generator=gen, dtype=torch.float64)
+        y = X_true @ amps + sd * (z if L is None else L @ z)
+        beta = (P @ y)[: n_cond * k]
+        R = _noise_correlation(kw, tr, lengths)
+        var = (P * P).sum(1) if R is None else ((P @ R) * P).sum(1)
+        out["est"][label] = beta.reshape(n_cond, k).numpy()
+        out["se"][label] = (sd * var[: n_cond * k].sqrt()).reshape(n_cond, k).numpy()
+    return out
+
+
+def single_trial_example(
+    realization: Any,
+    tr: float,
+    noise: dict[str, Any],
+    mean_response: float = 1.0,
+    trial_sd: float = 0.5,
+    hrf: str = "spmg1",
+    poly_degree: int | None = None,
+    seed: int = 0,
+    sd_grid: tuple[float, ...] = (0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0),
+) -> dict[str, Any]:
+    """One voxel's single trials, estimated three ways, beside the truth.
+
+    Trial amplitudes ``mean_response`` + N(0, ``trial_sd``^2) at one noise
+    condition; estimates by LSS, LSA and single-trial ridge (at the fraction
+    :func:`single_trial_quality` finds best). Also the expected reliability of
+    each over ``sd_grid`` -- how variable trials must be for the design to
+    resolve them. Returns 'true', 'cond', 'lss', 'lsa', 'ridge' (per trial),
+    'expected' {method: r at trial_sd}, 'ridge_frac', 'sd_grid', 'curve'
+    {method: r per sd}.
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import default_microtime_dt, hrfs_from_spec
+
+    lengths = list(realization.run_lengths)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    label = str(noise.get("label", "noise"))
+    kw = {k: v for k, v in noise.items() if k != "label"}
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(hrf, dt, torch.device("cpu"))[0][1]
+    Xt, cond = trial_regressors(realization, tr, bases, dt)
+    D = _nuisance(lengths, poly_degree)
+    Qd, _ = torch.linalg.qr(D)
+    Xp = Xt - Qd @ (Qd.T @ Xt)
+    q = single_trial_quality(realization, tr, [noise], hrf, poly_degree, mean_response, trial_sd)
+    rel = q["reliability"][label]
+
+    gen = torch.Generator().manual_seed(seed)
+    n_tr = Xt.shape[1]
+    beta = mean_response + trial_sd * torch.randn(n_tr, generator=gen, dtype=torch.float64)
+    sd = 100.0 / float(kw["tsnr"])
+    L = _noise_correlation(kw, tr, lengths, factor=True)
+    z = torch.randn(Xt.shape[0], generator=gen, dtype=torch.float64)
+    y = Xt @ beta + sd * (z if L is None else L @ z)
+    yp = y - Qd @ (Qd.T @ y)
+    eye = torch.eye(n_tr, dtype=torch.float64)
+    lsa = (
+        torch.linalg.lstsq(Xp, yp[:, None]).solution[:, 0]
+        if rel["lsa"] > 0
+        else torch.full((n_tr,), float("nan"), dtype=torch.float64)
+    )
+    ridge = torch.linalg.solve(Xp.T @ Xp + rel["ridge_lambda"] * eye, Xp.T @ yp)
+    curve: dict[str, list[float]] = {"lss": [], "lsa": [], "ridge": []}
+    for t_sd in sd_grid:
+        r_t = single_trial_quality(realization, tr, [noise], hrf, poly_degree, mean_response, t_sd)[
+            "reliability"
+        ][label]
+        for m in curve:
+            curve[m].append(r_t[m])
+    return {
+        "true": beta.numpy(),
+        "cond": cond,
+        "lss": (lss_rows(Xt, cond, D) @ y).numpy(),
+        "lsa": lsa.numpy(),
+        "ridge": ridge.numpy(),
+        "expected": {m: rel[m] for m in ("lss", "lsa", "ridge")},
+        "ridge_frac": rel["ridge_frac"],
+        "sd_grid": list(sd_grid),
+        "curve": curve,
+        "noise": label,
+    }
 
 
 def simulate_realizations_power(

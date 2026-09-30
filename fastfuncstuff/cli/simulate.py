@@ -1944,7 +1944,31 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             path=f"{prefix}_voxels.png",
         )
+        from fastfuncstuff.simulation.plots import plot_tent
+        from fastfuncstuff.simulation.power import tent_estimate
+
+        tent_amps = [(args.effect if args.effect is not None else 1.0) * w for w in pattern]
+        plot_tent(
+            tent_estimate(reals[0], args.tr, conds, tent_amps, truth, seed=args.seed,
+                          poly_degree=args.polort),
+            reals[0].conditions,
+            [c["label"] for c in conds],
+            tent_amps,
+            path=f"{prefix}_tent.png",
+        )  # fmt: skip
+        from fastfuncstuff.simulation.plots import plot_single_trials
+        from fastfuncstuff.simulation.power import single_trial_example
+
         ref = _reference_noise(conds)
+        plot_single_trials(
+            single_trial_example(
+                reals[0], args.tr, next(c for c in conds if c["label"] == ref),
+                _mean_response(args), args.trial_sd, args.hrf, args.polort, args.seed,
+            ),
+            reals[0].conditions,
+            args.trial_sd,
+            path=f"{prefix}_trials.png",
+        )  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

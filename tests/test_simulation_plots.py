@@ -80,3 +80,26 @@ def test_design_spread_renders_for_one_and_several_conditions(tmp_path):
         out = tmp_path / f"s{len(names)}.png"
         plot_design_spread(q, reals, "tSNR 50", path=out)
         assert out.stat().st_size > 10_000
+
+
+def test_tent_and_single_trial_figures_render(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_single_trials, plot_tent
+    from fastfuncstuff.simulation.power import single_trial_example, tent_estimate
+
+    spec = ExperimentSpec(
+        tr=1.25,
+        units=[Unit.parse("A", "A:0.5", 12), Unit.parse("B", "B:0.5", 12)],
+        isi=Interval.parse("exp:4,2,10"),
+        post_fix=15,
+    )
+    r = realize(spec, 0)
+    noise = [{"label": "tSNR 80", "tsnr": 80.0, "phys_fraction": 0.5, "tau": 6.0}]
+    t = tent_estimate(r, 1.25, noise, [1.0, 1.0])
+    # the truth peaks at the planted amplitude; the knots start at onset
+    assert t["truth"].max() == pytest.approx(1.0, abs=0.02) and t["knots"][0] == 0.0
+    plot_tent(t, r.conditions, ["tSNR 80"], [1.0, 1.0], path=tmp_path / "t.png")
+    ex = single_trial_example(r, 1.25, noise[0], sd_grid=(0.25, 1.0))
+    assert ex["curve"]["lsa"][1] > ex["curve"]["lsa"][0]  # more variable trials: more reliable
+    plot_single_trials(ex, r.conditions, 0.5, path=tmp_path / "s.png")
+    for name in ("t.png", "s.png"):
+        assert (tmp_path / name).stat().st_size > 10_000
