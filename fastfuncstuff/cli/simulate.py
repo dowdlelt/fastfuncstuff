@@ -396,7 +396,9 @@ def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
     return f"{pa:>6.2f} / {pm:.2f} {_verdict(pm if column == 'power' else pa):>9}"
 
 
-def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_text) -> str:
+def _summarise(
+    res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
+) -> str:
     from fastfuncstuff.simulation.power import effect_needed, has_true_effect, is_difference
 
     rows = res["table"]
@@ -419,6 +421,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
             "and were dropped"
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
+    out += ["", *_quality_lines(quality, reals[0].conditions, conds)]
     cond_c = [c for c in contrasts if not is_difference(contrasts[c])]
     diff_c = [c for c in contrasts if is_difference(contrasts[c])]
     if cond_c:
@@ -584,6 +587,76 @@ def _voxel_amplitudes(
     return amps, f"the effect {live[0]} needs for 80% power at each level", notes
 
 
+def _rank_message(q, conditions, bad, n_reals) -> str:
+    w = q["null_weights"]
+    combo = " ".join(
+        f"{'+' if v > 0 else '-'}{abs(v):.2g}*{c}"
+        for c, v in zip(conditions, w, strict=True)
+        if abs(v) > 0.05
+    )
+    return (
+        f"the design is rank-deficient in {len(bad)} of {n_reals} realization(s) (first: "
+        f"#{bad[0]}): {q['rank']} of {q['n_columns']} columns are independent. The "
+        f"combination {combo or '(drift only)'} is reproduced by the other columns and the "
+        "drift -- conditions with identical timing, a condition with no events in some run, "
+        "or conditions that tile a run with no baseline."
+    )
+
+
+def _reference_noise(conds) -> str:
+    """The middle noise level: where the design-quality matrix is reported."""
+    return str(conds[len(conds) // 2]["label"])
+
+
+def _quality_lines(quality, conditions, conds) -> list[str]:
+    """Rank, VIF, drift-removed correlation and the effect-needed matrix, as text."""
+    q0 = quality[0]
+    n = len(conditions)
+    out = [
+        f"Design quality (fitted model; median over {len(quality)} realization(s)):",
+        f"  rank {q0['rank']} of {q0['n_columns']} columns ({n} task + drift, polort "
+        f"{q0['poly_degree']} per run): full rank",
+    ]
+    vif = np.array([q["vif"] for q in quality])
+    worst = float(vif.max())
+    out.append(
+        "  VIF (1 = orthogonal, > 5 hard, > 10 severe): "
+        + ", ".join(f"{c} {v:.2f}" for c, v in zip(conditions, np.median(vif, axis=0), strict=True))
+        + (f"   [worst realization {worst:.2f}]" if len(quality) > 1 else "")
+        + ("  <- collinear" if worst > 5 else "")
+    )
+    if n < 2:
+        return out
+    corr = np.median([q["corr"] for q in quality], axis=0)
+    pairs = sorted(((i, j) for i in range(n) for j in range(i)), key=lambda ij: -abs(corr[ij]))
+    out.append(
+        "  regressor correlation after drift removal (largest): "
+        + ", ".join(f"{conditions[i]}~{conditions[j]} {corr[i, j]:+.2f}" for i, j in pairs[:3])
+    )
+    ref = _reference_noise(conds)
+    m = np.median([q["needed"][ref] for q in quality], axis=0)
+    out.append(
+        f"  effect for 80% power at {ref} (analytic, % signal change): diagonal = condition "
+        "vs baseline, below it = the difference"
+    )
+    w = max(8, max(len(c) for c in conditions) + 2)
+    out.append("    " + " " * w + "".join(f"{c:>{w}}" for c in conditions))
+    for i, c in enumerate(conditions):
+        out.append("    " + f"{c:<{w}}" + "".join(f"{m[i, j]:>{w}.2f}" for j in range(i + 1)))
+    diffs = sorted(((m[i, j], i, j) for i, j in pairs))
+    hard, easy = diffs[-1], diffs[0]
+    out.append(
+        "  (conditions that co-occur correlate positively and are costly to tell apart; "
+        "one following the other correlates negatively and is cheap)"
+    )
+    out.append(
+        f"  hardest to tell apart: {conditions[hard[1]]}-{conditions[hard[2]]} "
+        f"({hard[0]:.2f}%); easiest: {conditions[easy[1]]}-{conditions[easy[2]]} "
+        f"({easy[0]:.2f}%)."
+    )
+    return out
+
+
 def _run_compare(args) -> int:
     from fastfuncstuff.simulation.power import compare_designs, load_power_table
 
@@ -714,6 +787,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    from fastfuncstuff.simulation.power import realizations_design_quality
+
+    quality = realizations_design_quality(
+        reals, args.tr, conds, hrf=args.hrf, alpha=args.alpha, poly_degree=args.polort
+    )
+    bad = [i for i, q in enumerate(quality) if q["deficient"]]
+    if bad:
+        print(
+            f"ERROR: {_rank_message(quality[bad[0]], conditions, bad, len(reals))}", file=sys.stderr
+        )
+        return 1
+
     device = setup_device(args.device)
     res = simulate_realizations_power(
         reals,
@@ -735,7 +820,9 @@ def main(argv: list[str] | None = None) -> int:
 
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    summary = _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_text)
+    summary = _summarise(
+        res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
+    )
     print(summary)
     Path(f"{prefix}_summary.txt").write_text(summary + "\n")
 
@@ -824,10 +911,14 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             path=f"{prefix}_voxels.png",
         )
+        ref = _reference_noise(conds)
         plot_design(
             res,
             reals[0],
             args.tr,
+            corr=quality[0]["corr"],
+            needed=np.median([q["needed"][ref] for q in quality], axis=0),
+            needed_label=ref,
             path=f"{prefix}_design.png",
             title="Events, first realization, run 1",
         )

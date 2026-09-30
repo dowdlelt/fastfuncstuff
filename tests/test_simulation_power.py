@@ -9,6 +9,7 @@ import torch
 from fastfuncstuff.simulation.core import simulate_bold
 from fastfuncstuff.simulation.power import (
     amplitude_for_power,
+    design_quality,
     effect_needed,
     simulate_design_power,
 )
@@ -283,3 +284,62 @@ def test_effect_needed_keeps_one_value_per_realization():
     need = effect_needed({"table": rows})
     assert list(need) == [("lo", "A")]
     np.testing.assert_allclose(need[("lo", "A")], [1.5, np.nan])
+
+
+def _two_condition_design(offset_b: float, n=200, tr=2.0):
+    from fastfuncstuff.simulation.core import (
+        build_task_design,
+        default_microtime_dt,
+        hrfs_from_spec,
+    )
+
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec("spmg1", dt, torch.device("cpu"))[0][1]
+    a = np.arange(10.0, n * tr - 30, 23.0)
+    onsets = [[a], [a + offset_b]]
+    return build_task_design(onsets, [2.0, 2.0], tr, [n], bases, dt, device=torch.device("cpu"))
+
+
+NOISE = [{"label": "t50", "tsnr": 50.0, "phys_fraction": 0.5, "tau": 6.0}]
+
+
+def test_design_quality_names_the_combination_that_is_not_estimable():
+    q = design_quality(_two_condition_design(0.0), [200], 2.0, NOISE)
+    assert q["deficient"] and q["rank"] == q["n_columns"] - 1
+    w = q["null_weights"]
+    np.testing.assert_allclose(np.abs(w), [1.0, 1.0], atol=1e-6)
+    assert np.sign(w[0]) != np.sign(w[1])  # A - B, the identical-timing pair
+
+
+def test_design_quality_matches_the_simulated_effect_needed():
+    # The separability matrix is the engine's analytic power solved for 80%:
+    # it must agree with what the simulation reports for the same contrasts.
+    X = _two_condition_design(4.0)
+    q = design_quality(X, [200], 2.0, NOISE)
+    assert not q["deficient"] and q["vif"].min() >= 1.0
+    res = simulate_design_power(
+        X,
+        [200],
+        2.0,
+        {"A": [1, 0], "A-B": [1, -1]},
+        np.linspace(0.2, 12, 120),
+        NOISE,
+        beta_pattern=[1, 0],
+        n_reps=10,
+        device=torch.device("cpu"),
+    )
+    need = amplitude_for_power(res, 0.8, column="power_predicted")
+    m = q["needed"]["t50"]
+    assert m[0, 0] == pytest.approx(need[("t50", "A")], rel=0.01)
+    assert m[1, 0] == pytest.approx(need[("t50", "A-B")], rel=0.01)
+
+
+def test_correlation_sign_decides_whether_a_difference_is_cheap():
+    # 4 s apart, A and B co-occur (r > 0): the fit sees that something happened
+    # but not which, so A-B costs far more than A. Alternating evenly (r < 0)
+    # the difference is nearly as cheap as each condition.
+    near = design_quality(_two_condition_design(4.0), [200], 2.0, NOISE)
+    apart = design_quality(_two_condition_design(11.5), [200], 2.0, NOISE)
+    assert near["corr"][1, 0] > 0 > apart["corr"][1, 0]
+    ratio = [q["needed"]["t50"][1, 0] / q["needed"]["t50"][0, 0] for q in (near, apart)]
+    assert ratio[0] > 1.4 and ratio[1] < 1.1

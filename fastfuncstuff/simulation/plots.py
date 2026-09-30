@@ -181,8 +181,18 @@ def plot_design(
     tr: float,
     path: str | Path | None = None,
     title: str | None = None,
+    corr: np.ndarray | None = None,
+    needed: np.ndarray | None = None,
+    needed_label: str = "",
 ):
-    """Events and regressors of the first run of a realization, and regressor correlation."""
+    """Events and regressors of a realization's first run, plus how separable they are.
+
+    ``corr``: regressor correlation after drift removal (from
+    :func:`~.power.design_quality`); the raw correlation of ``result`` is shown
+    when it is not given. ``needed``: the effect-for-80%-power matrix -- the
+    diagonal is each condition against baseline, off-diagonal cells the
+    difference, so a dark cell is a hard contrast.
+    """
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
 
@@ -190,14 +200,11 @@ def plot_design(
     X = result["designs"][0]["X"].numpy()
     n0 = real.run_lengths[0]
     t = np.arange(n0) * tr
-    fig = plt.figure(figsize=(13, 5.6))
+    n_mat = 1 + (needed is not None)
+    fig = plt.figure(figsize=(9.5 + 3.6 * n_mat, 5.8))
     fig.patch.set_facecolor(SURFACE)
-    gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1], height_ratios=[1, 1.4])
-    ax_ev, ax_x, ax_c = (
-        fig.add_subplot(gs[0, 0]),
-        fig.add_subplot(gs[1, 0]),
-        fig.add_subplot(gs[:, 1]),
-    )
+    gs = fig.add_gridspec(2, 1 + n_mat, width_ratios=[3.2] + [1.25] * n_mat, height_ratios=[1, 1.4])
+    ax_ev, ax_x = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0])
     for ax in (ax_ev, ax_x):
         _style(ax)
     for i, (cond, dur) in enumerate(zip(real.conditions, real.durations, strict=True)):
@@ -211,19 +218,78 @@ def plot_design(
     ax_x.set_xlim(0, t[-1] + tr)
     ax_x.set_xlabel("time (s)", color=INK2, fontsize=9)
     ax_x.set_title("Regressors (unit peak)", color=INK, fontsize=10, loc="left")
-    ax_x.legend(frameon=False, fontsize=8, labelcolor=INK2, ncol=min(4, len(real.conditions)))
+    # Above the axes, beside the title: inside, it sat on top of the curves.
+    ax_x.legend(
+        frameon=False,
+        fontsize=8,
+        labelcolor=INK2,
+        ncol=min(8, len(real.conditions)),
+        loc="lower right",
+        bbox_to_anchor=(1.0, 1.0),
+        borderaxespad=0.2,
+    )
 
-    corr = np.corrcoef(X.T) if X.shape[1] > 1 else np.ones((1, 1))
-    cmap = LinearSegmentedColormap.from_list("div", [CATEGORICAL[0], "#f0efec", CATEGORICAL[1]])
-    ax_c.imshow(corr, cmap=cmap, vmin=-1, vmax=1)
-    for (i, j), v in np.ndenumerate(corr):
-        ax_c.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=8, color=INK)
-    ax_c.set_xticks(range(len(real.conditions)), real.conditions)
-    ax_c.set_yticks(range(len(real.conditions)), real.conditions)
-    ax_c.tick_params(colors=INK2, labelsize=9)
-    ax_c.set_title("Regressor correlation", color=INK, fontsize=10)
+    names = real.conditions
+    if corr is None:
+        corr = np.corrcoef(X.T) if X.shape[1] > 1 else np.ones((1, 1))
+        corr_title = "Regressor correlation"
+    else:
+        corr_title = "Regressor correlation\n(after drift removal)"
+    div = LinearSegmentedColormap.from_list("div", [CATEGORICAL[0], "#f0efec", CATEGORICAL[1]])
+    ax_c = fig.add_subplot(gs[:, 1])
+    # Lower triangle only: the diagonal is 1 by definition and the upper half a mirror.
+    corr = np.where(np.tril(np.ones_like(corr, dtype=bool), k=-1), corr, np.nan)
+    _matrix(ax_c, corr, names, div, -1, 1, "{:.2f}", corr_title)
+    if needed is not None:
+        ax_n = fig.add_subplot(gs[:, 2])
+        seq = LinearSegmentedColormap.from_list("seq", ["#f0efec", BLUES[-1]])
+        lower = np.where(np.tril(np.ones_like(needed, dtype=bool)), needed, np.nan)
+        finite = lower[np.isfinite(lower)]
+        # Scaled to its own range: from 0, a 2.46-2.82 spread was one flat dark block.
+        lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+        im = _matrix(
+            ax_n,
+            lower,
+            names,
+            seq,
+            lo - 0.15 * (hi - lo + 1e-9),
+            hi,
+            "{:.2f}",
+            f"% signal for 80% power, {needed_label}\ndiagonal: vs baseline; below: difference",
+        )
+        # The colour range is the matrix's own, so a small spread looks large:
+        # the bar keeps the scale honest.
+        cb = fig.colorbar(im, ax=ax_n, shrink=0.6, pad=0.03)
+        for spine in cb.ax.spines.values():
+            spine.set_visible(False)
+        cb.ax.tick_params(colors=INK2, labelsize=8)
     fig.tight_layout()
     return _finish(fig, path)
+
+
+def _matrix(ax, m, names, cmap, vmin, vmax, fmt, title):
+    """A labelled heat-map matrix with values printed in the cells (nan cells blank)."""
+    im = ax.imshow(np.ma.masked_invalid(m), cmap=cmap, vmin=vmin, vmax=vmax)
+    mid = (vmin + vmax) / 2
+    for (i, j), v in np.ndenumerate(m):
+        if np.isfinite(v):
+            dark = v > mid if vmin >= 0 else abs(v) > 0.6
+            ax.text(
+                j,
+                i,
+                fmt.format(v),
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=SURFACE if dark else INK,
+            )
+    ax.set_xticks(range(len(names)), names)
+    ax.set_yticks(range(len(names)), names)
+    ax.tick_params(colors=INK2, labelsize=9)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    ax.set_title(title, color=INK, fontsize=10)
+    return im
 
 
 def plot_design_comparison(

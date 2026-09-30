@@ -416,3 +416,22 @@ def test_example_voxels_show_the_effect_each_level_needs():
     assert "80% power" in basis
     amps, basis, notes = _voxel_amplitudes({"table": rows}, conds, {"A": [1.0]}, [1.0], 1.5)
     assert amps == [1.5, 1.5] and "-effect" in basis and notes is None
+
+
+def test_rank_deficient_design_is_an_error_not_a_traceback(tmp_path, capsys):
+    for c in ("A", "B"):
+        (tmp_path / f"{c}.txt").write_text("10 40 70 100 130\n")
+    argv = [
+        "-tr", "2", "-events", str(tmp_path / "A.txt"), str(tmp_path / "B.txt"),
+        "-durations", "2", "-nt", "90", "-nreps", "10", "-device", "cpu", "-no_plots",
+        "-prefix", str(tmp_path / "rd"),
+    ]  # fmt: skip
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "rank-deficient" in err and "*A" in err and "*B" in err
+
+
+def test_summary_reports_design_quality(tmp_path, capsys):
+    _sim(tmp_path / "q", "-ndesigns", "2", "-no_plots")
+    out = capsys.readouterr().out
+    assert "Design quality" in out and "VIF" in out and "hardest to tell apart" in out

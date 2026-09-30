@@ -340,6 +340,128 @@ def effect_needed(result: dict[str, Any], target: float = 0.8) -> dict[tuple[str
     return {k: np.array([n.get(k, np.nan) for n in need], dtype=float) for k in keys}
 
 
+def _nc_for_power(target: float, crit: float, dof: float) -> float:
+    """Noncentrality at which two-tailed power reaches ``target``."""
+    from scipy.optimize import brentq
+
+    return float(brentq(lambda nc: _two_tailed_power(crit, dof, nc) - target, 0.0, 200.0))
+
+
+def design_quality(
+    design: torch.Tensor | np.ndarray,
+    run_lengths: list[int],
+    tr: float,
+    noise: list[dict[str, Any]],
+    alpha: float = 0.001,
+    target: float = 0.8,
+    poly_degree: int | None = None,
+) -> dict[str, Any]:
+    """How estimable each condition and each pairwise difference is, before any simulation.
+
+    The same GLM :func:`simulate_design_power` fits (task + per-run Legendre
+    drift), judged three ways:
+
+    - ``rank`` of the full model; if deficient, ``null_weights`` is the
+      combination of task regressors the drift and the other conditions
+      reproduce exactly (e.g. two conditions with the same timing: +1, -1).
+    - ``vif`` per condition, after drift removal: how much the other
+      conditions inflate its variance (1 = orthogonal; > 5 hard, > 10 severe).
+    - ``corr``: regressor correlation after drift removal -- what the fit sees.
+      The raw correlation carries each run's mean and trend.
+    - ``needed[label]``: (n_cond, n_cond) effect (PSC) for ``target`` power at
+      each noise condition. Diagonal: a condition against baseline; (i, j): the
+      difference i - j. Analytic, with the same ARMA-corrected t as the
+      engine, so under a correct HRF it is what the simulation will find.
+      Positively correlated regressors make their *difference* costly: the
+      fit can tell that something happened, not which.
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    X_task = torch.as_tensor(design, dtype=torch.float64)
+    n_t, n_cond = X_task.shape
+    if poly_degree is None:
+        poly_degree = auto_polort(max(run_lengths) * tr)
+    D = _nuisance(run_lengths, poly_degree)
+    X = torch.cat([X_task, D], dim=1)
+    n_p = X.shape[1]
+    rank = int(torch.linalg.matrix_rank(X))
+    Q, _ = torch.linalg.qr(D)
+    Xt = X_task - Q @ (Q.T @ X_task)  # drift removed
+    norms = Xt.norm(dim=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = ((Xt.T @ Xt) / torch.outer(norms, norms)).numpy()
+    out: dict[str, Any] = {
+        "rank": rank,
+        "n_columns": n_p,
+        "n_task": n_cond,
+        "poly_degree": poly_degree,
+        "deficient": rank < n_p,
+        "corr": corr,
+    }
+    if rank < n_p:
+        v = torch.linalg.svd(X)[2][-1, :n_cond]
+        out["null_weights"] = (v / v.abs().max()).numpy() if v.abs().max() > 0 else v.numpy()
+        out["vif"] = np.full(n_cond, np.inf)
+        out["needed"] = {}
+        return out
+
+    G = Xt.T @ Xt
+    out["vif"] = (torch.diag(torch.linalg.inv(G)) * torch.diag(G)).numpy()
+    XtX_inv = torch.linalg.inv(X.T @ X)
+    P = XtX_inv @ X.T
+    M = torch.eye(n_t, dtype=torch.float64) - X @ P
+    pairs = [(i, j) for i in range(n_cond) for j in range(i + 1)]
+    C = torch.zeros(len(pairs), n_p, dtype=torch.float64)
+    for k, (i, j) in enumerate(pairs):
+        C[k, i] += 1.0
+        if j != i:
+            C[k, j] -= 1.0
+    CP = C @ P
+    needed: dict[str, np.ndarray] = {}
+    for k, cond in enumerate(noise):
+        label = str(cond.get("label", f"noise{k}"))
+        kw = {key: v for key, v in cond.items() if key != "label"}
+        R = _noise_correlation(kw, tr, run_lengths)
+        if R is None:
+            var, dof = (CP * CP).sum(dim=1), float(n_t - n_p)
+        else:
+            var = ((CP @ R) * CP).sum(dim=1)
+            MR = M @ R
+            dof = float(torch.trace(MR)) ** 2 / float((MR * MR.T).sum())
+        nc = _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
+        sd = 100.0 / float(kw["tsnr"])  # noise SD in PSC
+        m = np.full((n_cond, n_cond), np.nan)
+        for (i, j), v in zip(pairs, var.numpy(), strict=True):
+            m[i, j] = m[j, i] = nc * sd * float(np.sqrt(v))
+        needed[label] = m
+    out["needed"] = needed
+    return out
+
+
+def realizations_design_quality(
+    realizations: list[Any],
+    tr: float,
+    noise: list[dict[str, Any]],
+    hrf: str = "spmg1",
+    alpha: float = 0.001,
+    target: float = 0.8,
+    poly_degree: int | None = None,
+) -> list[dict[str, Any]]:
+    """:func:`design_quality` of the fitted model, one dict per realization."""
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
+    out = []
+    for real in realizations:
+        X = build_task_design(
+            real.onsets, real.durations, tr, real.run_lengths, bases, dt, device=cpu
+        )
+        out.append(design_quality(X, list(real.run_lengths), tr, noise, alpha, target, poly_degree))
+    return out
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,
