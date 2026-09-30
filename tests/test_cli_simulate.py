@@ -434,4 +434,6 @@ def test_rank_deficient_design_is_an_error_not_a_traceback(tmp_path, capsys):
 def test_summary_reports_design_quality(tmp_path, capsys):
     _sim(tmp_path / "q", "-ndesigns", "2", "-no_plots")
     out = capsys.readouterr().out
-    assert "Design quality" in out and "VIF" in out and "hardest to tell apart" in out
+    assert "Design quality" in out and "VIF" in out
+    # one pair: "hardest" and "easiest" would name the same pair
+    assert "hardest to tell apart" not in out

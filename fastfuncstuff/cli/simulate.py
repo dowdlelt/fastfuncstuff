@@ -645,17 +645,18 @@ def _quality_lines(quality, conditions, conds) -> list[str]:
     out.append("    " + " " * w + "".join(f"{c:>{w}}" for c in conditions))
     for i, c in enumerate(conditions):
         out.append("    " + f"{c:<{w}}" + "".join(f"{m[i, j]:>{w}.2f}" for j in range(i + 1)))
-    diffs = sorted(((m[i, j], i, j) for i, j in pairs))
-    hard, easy = diffs[-1], diffs[0]
-    out.append(
-        "  (conditions that co-occur correlate positively and are costly to tell apart; "
-        "one following the other correlates negatively and is cheap)"
-    )
-    out.append(
-        f"  hardest to tell apart: {conditions[hard[1]]}-{conditions[hard[2]]} "
-        f"({hard[0]:.2f}%); easiest: {conditions[easy[1]]}-{conditions[easy[2]]} "
-        f"({easy[0]:.2f}%)."
-    )
+    if len(pairs) > 1:  # with one pair, "hardest" and "easiest" are the same pair
+        diffs = sorted(((m[i, j], i, j) for i, j in pairs))
+        hard, easy = diffs[-1], diffs[0]
+        out.append(
+            "  (conditions that co-occur correlate positively and are costly to tell apart; "
+            "one following the other correlates negatively and is cheap)"
+        )
+        out.append(
+            f"  hardest to tell apart: {conditions[hard[1]]}-{conditions[hard[2]]} "
+            f"({hard[0]:.2f}%); easiest: {conditions[easy[1]]}-{conditions[easy[2]]} "
+            f"({easy[0]:.2f}%)."
+        )
     return out
 
 

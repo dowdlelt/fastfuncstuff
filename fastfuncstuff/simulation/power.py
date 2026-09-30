@@ -34,15 +34,16 @@ from scipy import stats
 from .noise import ou_to_arma11
 
 
-def _two_tailed_power(crit: float, dof: float, nc: float) -> float:
-    """P(|T| > crit) for noncentral t, by symmetry on |nc|.
+def _two_tailed_power(crit: float, dof: float, nc: float | np.ndarray) -> Any:
+    """P(|T| > crit) for noncentral t, by symmetry on |nc| (scalar or array ``nc``).
 
     scipy's nct.cdf returns nan far in the tail (nc = 16 at 150 dof), where the
     wrong-sign tail it would contribute is < 1e-50 anyway.
     """
-    nc = abs(nc)
-    far = float(stats.nct.cdf(-crit, dof, nc))
-    return float(stats.nct.sf(crit, dof, nc)) + (0.0 if np.isnan(far) else far)
+    nc = np.abs(np.asarray(nc, dtype=float))
+    far = stats.nct.cdf(-crit, dof, nc)
+    out = stats.nct.sf(crit, dof, nc) + np.where(np.isnan(far), 0.0, far)
+    return float(out) if np.ndim(out) == 0 else out
 
 
 def _nuisance(run_lengths: list[int], poly_degree: int) -> torch.Tensor:
@@ -251,47 +252,45 @@ def simulate_design_power(
         crit_naive = stats.t.ppf(1 - alpha / 2, dof_naive)
         crit_corr = stats.t.ppf(1 - alpha / 2, dof_corr)
 
-        for amp in amps:
-            est = est_n + (est_base + amp * est_unit)[:, None]
-            mis = scale * (misfit_base + amp * misfit_unit)
-            rss = rss_n + 2.0 * (cross[0] + amp * cross[1]) + float(mis @ mis)
-
-            se_naive = torch.sqrt(rss / dof_naive * v_naive[:, None])
-            se_corr = torch.sqrt(rss / tr_MR * v_true[:, None])
-            t_naive = est / se_naive
-            t_corr = est / se_corr
-
+        # Every amplitude and contrast at once: (A, K, reps). A per-row loop
+        # of scalar torch reductions and scalar scipy calls was ~80% of the
+        # run once the draw itself was cheap.
+        a = torch.tensor(amps, dtype=torch.float64)[:, None]  # (A, 1)
+        est = est_n[None] + (est_base + a * est_unit)[:, :, None]  # (A, K, reps)
+        mis2 = scale**2 * ((misfit_base[None] + a * misfit_unit[None]) ** 2).sum(dim=1)  # (A,)
+        rss = rss_n[None] + 2.0 * (cross[0][None] + a * cross[1][None]) + mis2[:, None]
+        t_naive = est / torch.sqrt(rss[:, None] / dof_naive * v_naive[None, :, None])
+        t_corr = est / torch.sqrt(rss[:, None] / tr_MR * v_true[None, :, None])
+        true_eff = (offset[None] + a * pattern[None]) @ C[:, :n_cond].T  # (A, K), PSC
+        # What the fit returns on average: c P X_true beta. It equals the true
+        # effect only when the fitted and generating regressors agree; with an
+        # HRF mismatch it is biased, and power must be computed from it.
+        exp_est = expected_base[None] + a * expected_unit[None]  # (A, K), PSC
+        sd_pred = sigma * torch.sqrt(v_true) / scale  # (K,), PSC
+        sigma2_hat = sigma**2 + mis2 / tr_MR  # E[RSS] / tr(MR), (A,)
+        se_hat = torch.sqrt(v_true)[None] * torch.sqrt(sigma2_hat)[:, None] / scale
+        nc = torch.where(se_hat > 0, exp_est / se_hat, torch.zeros_like(se_hat))
+        cols = {
+            "true_effect": true_eff,
+            "mean_est": est.mean(dim=-1) / scale,
+            "expected_est": exp_est,
+            "sd_est": est.std(dim=-1) / scale,
+            "sd_predicted": sd_pred.expand_as(exp_est),
+            "mean_t": t_corr.mean(dim=-1),
+            "power": (t_corr.abs() > crit_corr).double().mean(dim=-1),
+            "power_predicted": torch.as_tensor(
+                _two_tailed_power(crit_corr, dof_corr, nc.numpy()), dtype=torch.float64
+            ),
+            "mean_t_naive": t_naive.mean(dim=-1),
+            "power_naive": (t_naive.abs() > crit_naive).double().mean(dim=-1),
+        }
+        vals = {key: v.tolist() for key, v in cols.items()}
+        for j, amp in enumerate(amps):
             for i, name in enumerate(names):
-                true_eff = float(C[i, :n_cond] @ (offset + amp * pattern))  # PSC
-                # What the fit returns on average: c P X_true beta. It equals the
-                # true effect only when the fitted and generating regressors
-                # agree; with an HRF mismatch it is biased, and power must be
-                # computed from it, not from the truth.
-                exp_est = float(expected_base[i] + expected_unit[i] * amp)  # PSC
-                sd_pred = sigma * float(torch.sqrt(v_true[i])) / scale  # PSC
-                resid_misfit = float(((misfit_base + amp * misfit_unit) ** 2).sum()) * scale**2
-                sigma2_hat = sigma**2 + resid_misfit / tr_MR  # E[RSS] / tr(MR)
-                se_hat = float(torch.sqrt(v_true[i])) * np.sqrt(sigma2_hat) / scale  # PSC
-                nc = exp_est / se_hat if se_hat > 0 else 0.0
-                p_pred = _two_tailed_power(crit_corr, dof_corr, nc)
-                rows.append(
-                    {
-                        "noise": label,
-                        "tsnr": float(kw["tsnr"]),
-                        "amplitude": amp,
-                        "contrast": name,
-                        "true_effect": true_eff,
-                        "mean_est": float(est[i].mean()) / scale,
-                        "expected_est": exp_est,
-                        "sd_est": float(est[i].std()) / scale,
-                        "sd_predicted": sd_pred,
-                        "mean_t": float(t_corr[i].mean()),
-                        "power": float((t_corr[i].abs() > crit_corr).double().mean()),
-                        "power_predicted": p_pred,
-                        "mean_t_naive": float(t_naive[i].mean()),
-                        "power_naive": float((t_naive[i].abs() > crit_naive).double().mean()),
-                    }
-                )
+                row = {"noise": label, "tsnr": float(kw["tsnr"]), "amplitude": amp}
+                row["contrast"] = name
+                row.update({key: v[j][i] for key, v in vals.items()})
+                rows.append(row)
 
     return {
         "table": rows,
@@ -495,20 +494,20 @@ def design_quality(
             C[k, j] -= 1.0
     CP = C @ P
     needed: dict[str, np.ndarray] = {}
-    terms: dict[tuple[float, float] | None, tuple[torch.Tensor, float]] = {}
+    terms: dict[tuple[float, float] | None, tuple[torch.Tensor, float]] = {}  # var, nc
     for k, cond in enumerate(noise):
         label = str(cond.get("label", f"noise{k}"))
         kw = {key: v for key, v in cond.items() if key != "label"}
         ab = _noise_arma(kw, tr)
         if ab not in terms:  # every -tsnr level shares (a, b)
             if ab is None:
-                terms[ab] = ((CP * CP).sum(dim=1), float(n_t - n_p))
+                var, dof = (CP * CP).sum(dim=1), float(n_t - n_p)
             else:
                 R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
                 PRPt, _, dof = _corrected_terms(X, P, R)
-                terms[ab] = (((C @ PRPt) * C).sum(dim=1), dof)
-        var, dof = terms[ab]
-        nc = _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
+                var = ((C @ PRPt) * C).sum(dim=1)
+            terms[ab] = (var, _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof))
+        var, nc = terms[ab]
         sd = 100.0 / float(kw["tsnr"])  # noise SD in PSC
         m = np.full((n_cond, n_cond), np.nan)
         for (i, j), v in zip(pairs, var.numpy(), strict=True):
