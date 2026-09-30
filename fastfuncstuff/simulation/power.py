@@ -501,6 +501,12 @@ class RealizationScorer:
                 for name, val, pu in zip(self.names, v, self.per_unit, strict=True)
             },
         }
+        # 'detection': the mean over every contrast with a true effect -- the
+        # objective when all contrasts matter, as Liu & Frank average efficiency.
+        for label in need:
+            vals = [out["needed"][(label, n)] for n in self.names]
+            finite = [v for v in vals if np.isfinite(v)]
+            out["needed"][(label, "detection")] = float(np.mean(finite)) if finite else np.nan
         if shape:
             est = estimation_quality(real, self.tr, self.noise, poly_degree=pdeg)
             out["shape_sd"] = {k: float(np.mean(v)) for k, v in est["shape_sd"].items()}

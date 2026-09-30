@@ -81,3 +81,30 @@ def test_trials_objective_runs_in_explore_and_optimize(tmp_path, capsys):
                 "-optimize_hrfs", "spmg1", "-prefix", str(tmp_path / "o")]  # fmt: skip
     assert main(optimize) == 0
     assert "reliability" in capsys.readouterr().out
+
+
+def test_detection_objective_is_the_mean_over_contrasts(tmp_path, capsys):
+    from fastfuncstuff.cli.simulate import main
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import RealizationScorer
+
+    noise = [{"label": "t50", "tsnr": 50.0, "phys_fraction": 0.5, "tau": 6.0}]
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:1", 10), Unit.parse("B", "B:1", 10)],
+        isi=Interval.parse("exp:4,2,10"),
+        post_fix=15,
+    )
+    sc = RealizationScorer(1.0, {"A": [1, 0], "A-B": [1, -1]}, noise).score(realize(spec, 0))
+    need = sc["needed"]
+    assert need[("t50", "detection")] == pytest.approx(
+        (need[("t50", "A")] + need[("t50", "A-B")]) / 2
+    )
+
+    argv = ["-tr", "1", "-nruns", "1", "-scan_time", "150", "-initial_fix", "10", "-post_fix",
+            "15", "-trial", "A", "0.25", "1", "-trial", "B", "0.25", "1",
+            "-isi", "exp:[3.0-6.0],1,12", "-contrast", "A", "-contrast", "A-B", "-tsnr", "50",
+            "-objective", "efficiency", "-explore", "5", "-explore_keep", "1", "-explore_pick", "2",
+            "-device", "cpu", "-prefix", str(tmp_path / "d")]  # fmt: skip
+    assert main(argv) == 0
+    assert "detection (" in capsys.readouterr().out

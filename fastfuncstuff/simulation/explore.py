@@ -172,7 +172,7 @@ def score_configs(
         if not scores:
             out.append({})
             continue
-        names = scorer.names
+        names = [*scorer.names, "detection"]  # 'detection': the mean over contrasts
         per = {c: [s["needed"][(ref_noise, c)] for s in scores] for c in names}
         out.append(
             {

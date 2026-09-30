@@ -332,12 +332,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     x.add_argument(
         "-objective",
-        metavar="CONTRAST",
-        help="Contrast whose detection is traded against shape estimation, and which picks "
-        "the best realization (default: the first with a true effect). 'shape' ranks by "
-        "response-shape estimation; 'trials' by single-trial reliability (the better of LSS "
-        "and ridge, see -trial_sd; and trades "
-        "detection against it).",
+        metavar="GOAL",
+        help="What to optimize, with -explore/-optimize. Detection: a contrast's name "
+        "(default: the first with a true effect) or 'detection' (alias 'efficiency': the mean "
+        "over all contrasts). Estimation: 'shape' (response shape, FIR). Single trials: "
+        "'trials' (trial-pattern reliability, the better of LSS and ridge; see -trial_sd). "
+        "The explorer trades detection against shape, or against trials for 'trials'.",
     )
     x.add_argument(
         "-explore_designs", type=int, default=3, help="Realizations scored per design (3)."
@@ -1021,9 +1021,14 @@ def _objective(args, contrasts, pattern) -> str:
     objective = args.objective or next(
         (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
     )
-    if objective is None or (objective not in ("shape", "trials") and objective not in contrasts):
+    if objective == "efficiency":
+        objective = "detection"
+    if objective is None or (
+        objective not in ("detection", "shape", "trials") and objective not in contrasts
+    ):
         raise ValueError(
-            f"-objective {objective!r}: use 'shape', 'trials' or one of {list(contrasts)}"
+            f"-objective {objective!r}: use 'detection', 'shape', 'trials' or one of "
+            f"{list(contrasts)}"
         )
     return objective
 
@@ -1031,6 +1036,8 @@ def _objective(args, contrasts, pattern) -> str:
 def _objective_label(objective: str) -> str:
     if objective == "shape":
         return "response-shape SD per FIR bin (%)"
+    if objective == "detection":
+        return "all contrasts: mean % signal for 80% power"
     if objective == "trials":
         return "single trials: 1 - reliability (best of LSS, ridge)"
     return f"{objective}: % signal for 80% power"
@@ -1232,7 +1239,7 @@ def _run_explore(raw: list[str], started: float) -> int:
         specs, scorer, args.explore_designs, ref, args.seed, single_all=objective == "trials"
     )
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
-    det_c = objective if objective in contrasts else live[0]
+    det_c = objective if objective in contrasts or objective == "detection" else live[0]
     # The trade-off: detection against response shape -- or, when single trials are
     # the target, against LSS leakage (neighbours mixed into each trial's estimate).
     y_key = "unreliability" if objective == "trials" else "shape_sd"
@@ -1244,7 +1251,8 @@ def _run_explore(raw: list[str], started: float) -> int:
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     cols = ["design", *[a.label for a in axes], "feasible", "on_front", "counts", "minutes",
-            *[f"needed_{c}" for c in live], *[f"worst_{c}" for c in live],
+            *[f"needed_{c}" for c in [*live, "detection"]],
+            *[f"worst_{c}" for c in [*live, "detection"]],
             "shape_sd", "efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
             "ridge_frac", "dropped"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
@@ -1255,8 +1263,8 @@ def _run_explore(raw: list[str], started: float) -> int:
                 [k, *[values[a.label] for a in axes], int(bool(sc)), int(front[k])]
                 + (
                     [sc["counts"], f"{sc['minutes']:.2f}"]
-                    + [f"{sc['needed'][c]:.4f}" for c in live]
-                    + [f"{sc['worst'][c]:.4f}" for c in live]
+                    + [f"{sc['needed'][c]:.4f}" for c in [*live, "detection"]]
+                    + [f"{sc['worst'][c]:.4f}" for c in [*live, "detection"]]
                     + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}"]
                     + [
                         f"{sc[k]:.4f}" if k in sc else ""
