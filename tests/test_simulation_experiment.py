@@ -221,6 +221,28 @@ class TestCountsAndScanTime:
         r = realize(spec, 0)
         assert r.run_lengths == [290] and r.run_durations == [290.0] and r.n_dropped == 0
 
+    def test_a_fixed_scan_keeps_its_final_fixation_and_whole_units(self):
+        # uniform jitter is not mean-matched, so some runs run long. Dropping only
+        # events that *started* past the scan let them eat the final fixation
+        # (3.5 s of a 15 s one); a cycle unit must also never lose half of itself.
+        spec = ExperimentSpec(
+            units=[Unit.parse("cycle", "E1:0.25:0, E2:0.25:uniform:2,5", 1, "block")],
+            tr=1.0,
+            n_runs=2,
+            initial_fix=10,
+            post_fix=15,
+            scan_time=330,
+        )
+        dropped = 0
+        for seed in range(30):
+            r = realize(spec, seed)
+            dropped += r.n_dropped
+            for run in range(2):
+                end = max(o[run].max() + d for o, d in zip(r.onsets, r.durations, strict=True))
+                assert r.run_durations[run] - end >= 15 - 1e-9
+                assert len(r.onsets[0][run]) == len(r.onsets[1][run])
+        assert dropped > 0 and dropped % 2 == 0  # whole two-event units
+
     def test_fixed_counts_under_scan_time_keep_the_volumes(self):
         spec = ExperimentSpec(
             units=[Unit.parse("A", "A:2", 1)], scan_time=300, num_events=10, **self.BASE

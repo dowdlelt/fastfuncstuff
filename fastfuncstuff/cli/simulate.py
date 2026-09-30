@@ -553,8 +553,9 @@ def _summarise(
     dropped = sum(r.n_dropped for r in reals)
     if dropped:
         out.append(
-            f"note: {dropped} event(s) over {len(reals)} realization(s) fell past -scan_time "
-            "and were dropped"
+            f"note: {dropped} event(s) over {len(reals)} realization(s) did not end -post_fix "
+            "before the end of the scan and were dropped, whole units at a time -- jitter "
+            "that is not mean-matched (uniform) makes some runs longer than the average"
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
     out += ["", *_quality_lines(quality, reals[0].conditions, conds)]

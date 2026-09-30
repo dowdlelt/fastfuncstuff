@@ -311,11 +311,13 @@ class ExperimentSpec:
         if (
             self.scan_time is not None
             and free
-            and self.expected_duration([float(c) for c in out]) > self.scan_time * 1.02
+            and self.expected_duration([float(c) for c in out]) > self.scan_time + 1e-6
         ):
             # The families scan_time sized were rounded up past the scan (5.73
             # blocks -> 6, needing 345 s of a 330 s run). Refusing a count the
-            # tool chose itself is wrong: take the largest that fits.
+            # tool chose itself is wrong: take the largest that fits. The fit is
+            # strict -- the content *and* the full -post_fix: a 2% allowance let 8
+            # 30 s blocks into 330 s by cutting the final fixation from 15 s to 10.
             out = whole(set(free))
         for i, u in enumerate(self.units):
             if out[i] < 1 and not u.is_null:
@@ -325,7 +327,7 @@ class ExperimentSpec:
                 )
         if self.scan_time is not None:
             need = self.expected_duration([float(c) for c in out])
-            if need > self.scan_time * 1.02:
+            if need > self.scan_time + 1e-6:
                 raise ValueError(
                     f"the units need ~{need:.0f} s per run on average, more than "
                     f"-scan_time {self.scan_time:g} s"
@@ -427,7 +429,7 @@ class Realization:
     run_lengths: list[int]  # timepoints
     run_durations: list[float]  # seconds, before rounding up to whole TRs
     counts: list[int] = field(default_factory=list)  # units per run, as resolved
-    n_dropped: int = 0  # events past a fixed -scan_time, over all runs
+    n_dropped: int = 0  # events of units that did not end -post_fix before a fixed scan's end
 
 
 def realize(spec: ExperimentSpec, seed: int) -> Realization:
@@ -475,17 +477,25 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
             for pos, value in zip(where, specs[key].sample(len(where), rng, spec.tr), strict=True):
                 gap[pos] = float(value)
 
+        # A fixed scan has a fixed number of volumes, and its last -post_fix
+        # seconds are fixation: a unit whose events do not all end by then is
+        # dropped whole (a cycle never loses its E2 and keeps its E1). Only
+        # dropping events that *started* past the scan let jitter that is not
+        # mean-matched (uniform) eat the final fixation -- 3.5 s of a 15 s one.
+        limit = None if run_s is None else run_s - spec.post_fix
         t = spec.initial_fix
         for k, ui in enumerate(order):
+            unit_events = []
             for j, item in enumerate(spec.units[ui].items):
                 if item.condition != NULL:
-                    # A fixed scan acquires a fixed number of volumes; an event
-                    # that jitter pushed past the end is simply not recorded.
-                    if run_s is not None and t >= run_s:
-                        n_dropped += 1
-                    else:
-                        onsets[item.condition][run].append(t)
+                    unit_events.append((item.condition, t, item.duration))
                 t += item.duration + gap.get((k, j), 0.0)
+            if limit is not None and unit_events:
+                if max(on + d for _, on, d in unit_events) > limit + 1e-9:
+                    n_dropped += len(unit_events)
+                    continue
+            for cond, on, _ in unit_events:
+                onsets[cond][run].append(on)
         t += spec.post_fix
         if run_s is not None:
             run_durations.append(run_s)

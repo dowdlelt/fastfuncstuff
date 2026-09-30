@@ -373,8 +373,9 @@ def test_scan_time_sweep_scales_as_one_over_sqrt_time_and_reports_trimmed_runs()
         order="permuted_block",
         n_runs=2,
     )
+    # 15 + 40 n s holds n blocks exactly: 8 and 32, balanced, 4x the blocks
     out = scan_time_sweep(
-        spec, [330, 1330], 3, {"E1": [1, 0], "E1-E2": [1, -1]}, NOISE, progress=False
+        spec, [335, 1295], 3, {"E1": [1, 0], "E1-E2": [1, -1]}, NOISE, progress=False
     )
     rows = out["rows"]
     assert not out["skipped"]
@@ -386,7 +387,7 @@ def test_scan_time_sweep_scales_as_one_over_sqrt_time_and_reports_trimmed_runs()
 
     # 4x the scan: the effect needed halves, so effect x sqrt(minutes) is ~flat
     for c in ("E1", "E1-E2"):
-        assert med(1330, c, "needed") / med(330, c, "needed") == pytest.approx(0.5, abs=0.06)
-        assert med(1330, c, "per_minute") / med(330, c, "per_minute") == pytest.approx(1, abs=0.1)
+        assert med(1295, c, "needed") / med(335, c, "needed") == pytest.approx(0.5, abs=0.06)
+        assert med(1295, c, "per_minute") / med(335, c, "per_minute") == pytest.approx(1, abs=0.1)
     # minutes are the runs actually scanned (after any trim), not the request
     assert all(r["minutes"] == pytest.approx(2 * r["run_s"] / 60) for r in rows)
