@@ -23,6 +23,7 @@ answer to "does autocorrelation matter for this design".
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ import numpy as np
 import torch
 from scipy import stats
 
-from .noise import generate_thermal_physio_noise, ou_to_arma11
+from .noise import ou_to_arma11
 
 
 def _two_tailed_power(crit: float, dof: float, nc: float) -> float:
@@ -52,12 +53,8 @@ def _nuisance(run_lengths: list[int], poly_degree: int) -> torch.Tensor:
     return torch.block_diag(*blocks)
 
 
-def _noise_correlation(
-    noise: dict[str, Any], tr: float, run_lengths: list[int]
-) -> torch.Tensor | None:
-    """Block-diagonal ARMA(1,1) correlation of a noise condition, or None if white."""
-    from fastfuncstuff.glm.arma import build_arma11_covariance
-
+def _noise_arma(noise: dict[str, Any], tr: float) -> tuple[float, float] | None:
+    """AFNI-form ARMA(1,1) (a, b) of a noise condition, or None if white."""
     if noise.get("arma") is not None:
         a, b = (float(v) for v in noise["arma"])
     else:
@@ -65,14 +62,36 @@ def _noise_correlation(
         if f == 0.0:
             return None
         a, b = (float(v) for v in ou_to_arma11(tr, float(noise.get("tau", 6.0)), f))
-    if a == 0.0 and b == 0.0:
-        return None
-    n = sum(run_lengths)
-    starts = np.concatenate([[0], np.cumsum(run_lengths)[:-1]]).astype(int).tolist()
-    R = build_arma11_covariance(a, b, n, torch.device("cpu"), torch.float64, run_starts=starts)
+    return None if a == 0.0 and b == 0.0 else (a, b)
+
+
+@lru_cache(maxsize=64)
+def _run_correlation(n: int, a: float, b: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """One run's ARMA(1,1) correlation and its Cholesky factor (CPU float64).
+
+    Cached: every realization of a fixed-scan design has the same run lengths,
+    and every -tsnr level the same (a, b).
+    """
+    from fastfuncstuff.glm.arma import build_arma11_covariance
+
+    R = build_arma11_covariance(a, b, n, torch.device("cpu"), torch.float64)
     if R is None:
         raise ValueError(f"noise ARMA a={a:.3f}, b={b:.3f} is not a valid correlation")
-    return R
+    return R, torch.linalg.cholesky(R)
+
+
+def _noise_correlation(
+    noise: dict[str, Any], tr: float, run_lengths: list[int], factor: bool = False
+) -> torch.Tensor | None:
+    """Block-diagonal ARMA(1,1) correlation of a noise condition, or None if white.
+
+    ``factor=True`` returns its lower Cholesky factor instead: ``L @ z`` with
+    z standard normal is noise of exactly that correlation, runs independent.
+    """
+    ab = _noise_arma(noise, tr)
+    if ab is None:
+        return None
+    return torch.block_diag(*(_run_correlation(n, *ab)[int(factor)] for n in run_lengths))
 
 
 def simulate_design_power(
@@ -180,7 +199,10 @@ def simulate_design_power(
     X_dev = X.to(device=device, dtype=torch.float32)
     CP_dev = (C @ P).to(device=device, dtype=torch.float32)  # contrast estimates directly
     scale = baseline / 100.0
-    gen = torch.Generator(device="cpu").manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # Signal parts, in data units: estimate and residual are affine in the amplitude.
+    est_base, est_unit = scale * expected_base, scale * expected_unit
+    mis_dev = (scale * torch.stack([misfit_base, misfit_unit], dim=1)).to(device, torch.float32)
 
     rows: list[dict[str, Any]] = []
     dofs: dict[str, tuple[float, float]] = {}
@@ -203,29 +225,24 @@ def simulate_design_power(
         crit_naive = stats.t.ppf(1 - alpha / 2, dof_naive)
         crit_corr = stats.t.ppf(1 - alpha / 2, dof_corr)
 
-        for amp in amps:
-            signal = scale * (X_true @ (offset + amp * pattern))  # (n_t,)
-            parts = []
-            start = 0
-            for n_run in run_lengths:
-                parts.append(
-                    generate_thermal_physio_noise(
-                        n_run,
-                        tr,
-                        baseline=baseline,
-                        n_voxels=n_reps,
-                        device=torch.device("cpu"),
-                        generator=gen,
-                        **kw,
-                    )
-                )
-                start += n_run
-            Y = torch.cat(parts, dim=0).to(device) + signal.to(device, torch.float32)[:, None]
+        # One noise draw per condition, shared by every amplitude (common
+        # random numbers). OLS is linear, so the fit of noise + a*s splits
+        # into the noise's fit plus a times a fixed signal part, and each
+        # amplitude costs a few dot products instead of a fresh draw and fit.
+        # Drawing per amplitude, through a per-timepoint AR(1) loop on the
+        # CPU, was 93% of the run time.
+        L = _noise_correlation(kw, tr, run_lengths, factor=True)
+        Z = torch.randn(n_t, n_reps, device=device, generator=gen, dtype=torch.float32)
+        noise_y = sigma * (Z if L is None else L.to(device, torch.float32) @ Z)
+        est_n = (CP_dev @ noise_y).double().cpu()  # (n_contrasts, n_reps)
+        resid_n = noise_y - X_dev @ (P_dev @ noise_y)
+        rss_n = (resid_n * resid_n).sum(dim=0).double().cpu()
+        cross = (mis_dev.T @ resid_n).double().cpu()  # (2, n_reps): base, unit
 
-            est = CP_dev @ Y  # (n_contrasts, n_reps), data units
-            resid = Y - X_dev @ (P_dev @ Y)
-            rss = (resid * resid).sum(dim=0).double().cpu()
-            est = est.double().cpu()
+        for amp in amps:
+            est = est_n + (est_base + amp * est_unit)[:, None]
+            mis = scale * (misfit_base + amp * misfit_unit)
+            rss = rss_n + 2.0 * (cross[0] + amp * cross[1]) + float(mis @ mis)
 
             se_naive = torch.sqrt(rss / dof_naive * v_naive[:, None])
             se_corr = torch.sqrt(rss / tr_MR * v_true[:, None])
