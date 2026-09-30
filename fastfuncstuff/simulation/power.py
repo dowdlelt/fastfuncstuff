@@ -1140,13 +1140,12 @@ def single_trial_quality(
     MM = Mv * Mv
     a = V.T @ ones
     e_dd = tau2 * float(torch.trace(Cc))
-    sig = []  # per lambda: (lam, g, d, tau2 tr(CZC), signal part of E|d_hat|^2)
-    for lam in lams:
-        g, d = s2 / (s2 + lam), sx / (s2 + lam)
-        ag = a * g
-        e_hd = tau2 * float((g * torch.diagonal(Mv)).sum())
-        e_sig = tau2 * float(g @ MM @ g) + mu**2 * float(ag @ Mv @ ag)
-        sig.append((lam, g, d, e_hd, e_sig))
+    denominator = s2 + torch.as_tensor(lams, dtype=s2.dtype)[:, None]
+    g, d = s2 / denominator, sx / denominator
+    ag = a * g
+    e_hd = (tau2 * (g * torch.diagonal(Mv)).sum(1)).numpy()
+    e_sig = (tau2 * ((g @ MM) * g).sum(1) + mu**2 * ((ag @ Mv) * ag).sum(1)).numpy()
+    e_norm = (mu**2 * (ag * ag).sum(1) + tau2 * (g * g).sum(1)).numpy()
     out["reliability"] = {}
     urc: dict[tuple[float, float] | None, tuple] = {}
     for i, c in enumerate(noise):
@@ -1157,10 +1156,9 @@ def single_trial_quality(
             R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
             B = noise_basis(ab)
             BM = B * Mv
-            per_lam = [
-                (float(d @ BM @ d), float((d * d * torch.diagonal(B)).sum()))
-                for _, _, d, _, _ in sig
-            ]
+            per_lam = torch.stack(
+                (((d @ BM) * d).sum(1), (d * d * torch.diagonal(B)).sum(1)), dim=1
+            ).numpy()
             AR = A if R is None else A @ R
             urc[ab] = (per_lam, AR @ A.T)
         per_lam, ARA = urc[ab]
@@ -1173,22 +1171,20 @@ def single_trial_quality(
         # The least shrinkage within a hair of the best: a correlation is blind to
         # scaling, so with barely-overlapping trials it is flat in lambda and the
         # plain argmax reported a meaningless fraction of 0.01.
-        scan = []
-        e0 = None
-        for (lam, g, _, e_hd, e_sig), (n_cm, n_tr_) in zip(sig, per_lam, strict=True):
-            e_hh = e_sig + var * n_cm
-            r = e_hd / float(np.sqrt(e_hh * e_dd)) if e_hh > 0 and e_dd > 0 else 0.0
-            ag = a * g
-            e_b = mu**2 * float(ag @ ag) + tau2 * float(g @ g) + var * n_tr_
-            if lam == 0.0:
-                rel["lsa"], e0 = r, e_b
-            scan.append((lam, r, e_b))
-        top = max(r for _, r, _ in scan)
-        best_lam, best, best_e = next((lam, r, e) for lam, r, e in scan if r >= top - 1e-3)
-        rel["ridge"] = best
-        rel["ridge_frac"] = float(np.sqrt(best_e / e0)) if e0 else float("nan")
-        rel.setdefault("lsa", 0.0)
-        rel["ridge_lambda"] = best_lam
+        e_hh = e_sig + var * per_lam[:, 0]
+        scan = np.divide(
+            e_hd,
+            np.sqrt(np.maximum(e_hh * e_dd, 0.0)),
+            out=np.zeros_like(e_hd),
+            where=(e_hh > 0) & (e_dd > 0),
+        )
+        e_b = e_norm + var * per_lam[:, 1]
+        best_i = int(np.flatnonzero(scan >= scan.max() - 1e-3)[0])
+        e0 = float(e_b[0]) if lsa_ok else 0.0
+        rel["ridge"] = float(scan[best_i])
+        rel["ridge_frac"] = float(np.sqrt(e_b[best_i] / e0)) if e0 else float("nan")
+        rel["lsa"] = float(scan[0]) if lsa_ok else 0.0
+        rel["ridge_lambda"] = lams[best_i]
         out["reliability"][label] = rel
     return out
 

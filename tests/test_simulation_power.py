@@ -164,6 +164,53 @@ def test_cached_ou_parameters_follow_changed_noise_settings():
     assert _ou_arma_parameters.cache_info().hits == 1
 
 
+def test_batched_ridge_reliability_matches_full_matrix_grid():
+    from fastfuncstuff.simulation.core import default_microtime_dt, hrfs_from_spec
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import (
+        _noise_correlation,
+        _nuisance,
+        _trial_reliability,
+        single_trial_quality,
+        trial_regressors,
+    )
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:0.25", 12)],
+        isi=Interval.parse("uniform:2,8"),
+        post_fix=16,
+    )
+    real = realize(spec, 4)
+    noise = [{"label": "n", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}]
+    dt = default_microtime_dt(1.0)
+    bases = hrfs_from_spec("spmg1", dt, CPU)[0][1]
+    X, _ = trial_regressors(real, 1.0, bases, dt)
+    Q, _ = torch.linalg.qr(_nuisance(real.run_lengths, 1))
+    X = X - Q @ (Q.T @ X)
+    U, s, Vh = torch.linalg.svd(X, full_matrices=False)
+    n = X.shape[1]
+    C = torch.eye(n, dtype=torch.float64) - torch.ones(n, n, dtype=torch.float64) / n
+    ones = torch.ones(n, dtype=torch.float64)
+    R = _noise_correlation(noise[0], 1.0, real.run_lengths)
+    assert R is not None
+    sigma2 = (100 / 60) ** 2
+    lams = [0.0, *(float(torch.median(s**2)) * np.logspace(-3, 2, 26))]
+    grid = []
+    for lam in lams:
+        P = (Vh.T * (s / (s**2 + lam))) @ U.T
+        Z, N = P @ X, sigma2 * P @ R @ P.T
+        r = _trial_reliability(Z, N, C, ones, 1.0, 0.25)
+        norm = float((Z @ ones).square().sum() + 0.25 * Z.square().sum() + torch.trace(N))
+        grid.append((lam, r, norm))
+    top = max(r for _, r, _ in grid)
+    lam, expected, norm = next(row for row in grid if row[1] >= top - 1e-3)
+    actual = single_trial_quality(real, 1.0, noise, poly_degree=1)["reliability"]["n"]
+    assert actual["ridge_lambda"] == pytest.approx(lam)
+    assert actual["ridge"] == pytest.approx(expected, abs=1e-12)
+    assert actual["ridge_frac"] == pytest.approx(np.sqrt(norm / grid[0][2]), abs=1e-12)
+
+
 def test_analytic_power_accounts_for_hrf_mismatch():
     """With a late true response the analytic curve must follow the biased estimate."""
     res = _run(
