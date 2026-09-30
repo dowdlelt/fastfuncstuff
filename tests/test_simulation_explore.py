@@ -65,3 +65,19 @@ def test_explore_writes_a_small_set_of_outputs(tmp_path, capsys):
     both = [*argv, "-num_events", "40"]
     assert main(both) == 1
     assert "one budget" in capsys.readouterr().err
+
+
+def test_trials_objective_runs_in_explore_and_optimize(tmp_path, capsys):
+    from fastfuncstuff.cli.simulate import main
+
+    base = ["-tr", "1", "-nruns", "2", "-scan_time", "120", "-initial_fix", "10",
+            "-post_fix", "15", "-trial", "A", "0.25", "1", "-tsnr", "50",
+            "-objective", "trials", "-device", "cpu"]  # fmt: skip
+    explore = [*base, "-isi", "exp:[3.0-9.0],1,14", "-explore", "6", "-explore_keep", "1",
+               "-explore_pick", "2", "-prefix", str(tmp_path / "e")]  # fmt: skip
+    assert main(explore) == 0
+    assert "1 - reliability" in capsys.readouterr().out
+    optimize = [*base, "-isi", "exp:4,1,14", "-optimize", "1", "-optimize_pop", "4",
+                "-optimize_hrfs", "spmg1", "-prefix", str(tmp_path / "o")]  # fmt: skip
+    assert main(optimize) == 0
+    assert "reliability" in capsys.readouterr().out

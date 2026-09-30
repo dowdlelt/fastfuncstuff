@@ -174,6 +174,8 @@ def make_fitness(
     hrfs: list[str],
     alpha: float = 0.001,
     poly_degree: int | None = None,
+    mean_response: float = 1.0,
+    trial_sd: float = 0.5,
 ) -> Callable[[Realization], float]:
     """Mean over ``hrfs`` of the objective: a contrast's detection, 'shape' or 'trials'.
 
@@ -185,7 +187,17 @@ def make_fitness(
     from .power import RealizationScorer
 
     scorers = [
-        RealizationScorer(tr, contrasts, noise, pattern, h, alpha, poly_degree=poly_degree)
+        RealizationScorer(
+            tr,
+            contrasts,
+            noise,
+            pattern,
+            h,
+            alpha,
+            poly_degree=poly_degree,
+            mean_response=mean_response,
+            trial_sd=trial_sd,
+        )
         for h in hrfs
     ]
 
@@ -196,7 +208,7 @@ def make_fitness(
         if objective == "shape":
             return s["shape_sd"][ref_noise]
         if objective == "trials":
-            return s["leakage"]
+            return s["unreliability"][ref_noise]
         return s["needed"][(ref_noise, objective)]
 
     return lambda real: float(np.mean([one(sc, real) for sc in scorers]))

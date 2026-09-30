@@ -190,7 +190,7 @@ def score_configs(
                             ]
                         )
                     )
-                    for key in ("lss_sd", "lsa_sd", "leakage")
+                    for key in ("lss_sd", "lsa_sd", "leakage", "unreliability", "ridge_frac")
                     if any(key in s for s in scores)
                 },
                 "minutes": float(np.median([s["minutes"] for s in scores])),
@@ -212,7 +212,7 @@ def best_realization(
     """Of ``n`` realizations of ``spec``, the one best on ``objective``.
 
     ``objective`` is a contrast (its detection), 'shape' (estimation) or
-    'trials' (single-trial LSS leakage).
+    'trials' (single-trial unreliability: 1 - the better of LSS and ridge).
     """
     from .experiment import realize
 
@@ -225,7 +225,7 @@ def best_realization(
         v = (
             sc["shape_sd"][ref_noise]
             if objective == "shape"
-            else sc["leakage"]
+            else sc["unreliability"][ref_noise]
             if objective == "trials"
             else sc["needed"][(ref_noise, objective)]
         )

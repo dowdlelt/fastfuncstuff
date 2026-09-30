@@ -443,10 +443,13 @@ class RealizationScorer:
         alpha: float = 0.001,
         target: float = 0.8,
         poly_degree: int | None = None,
+        mean_response: float = 1.0,
+        trial_sd: float = 0.5,
     ):
         from .core import default_microtime_dt, hrfs_from_spec
 
         self.tr, self.noise, self.alpha, self.target = tr, noise, alpha, target
+        self.mean_response, self.trial_sd = mean_response, trial_sd
         self.hrf = hrf
         self.poly_degree = poly_degree
         self.dt = default_microtime_dt(tr)
@@ -465,7 +468,9 @@ class RealizationScorer:
         """Scores of one realization, or None if its model is rank-deficient.
 
         ``single`` adds single-trial estimability (:func:`single_trial_quality`,
-        means over conditions): 'lss_sd' and 'lsa_sd' per noise label, 'leakage'.
+        means over conditions): 'lss_sd' and 'lsa_sd' per noise label, 'leakage',
+        and per noise label 'unreliability' (1 - the better trial-pattern
+        reliability of LSS and ridge) and 'ridge_frac'.
         """
         from fastfuncstuff.cli_utils import auto_polort
 
@@ -501,10 +506,17 @@ class RealizationScorer:
             out["shape_sd"] = {k: float(np.mean(v)) for k, v in est["shape_sd"].items()}
             out["xi"] = est["xi"]
         if single:
-            st = single_trial_quality(real, self.tr, self.noise, self.hrf, pdeg)
+            st = single_trial_quality(
+                real, self.tr, self.noise, self.hrf, pdeg, self.mean_response, self.trial_sd
+            )
             out["lss_sd"] = {k: float(np.mean(v)) for k, v in st["lss_sd"].items()}
             out["lsa_sd"] = {k: float(np.mean(v)) for k, v in st["lsa_sd"].items()}
             out["leakage"] = float(np.mean(st["leakage"]))
+            # What a trial-wise search minimizes: the best of LSS and ridge, as 1 - r.
+            out["unreliability"] = {
+                k: 1.0 - max(v["lss"], v["ridge"]) for k, v in st["reliability"].items()
+            }
+            out["ridge_frac"] = {k: v["ridge_frac"] for k, v in st["reliability"].items()}
         return out
 
 
@@ -707,6 +719,8 @@ def realizations_design_quality(
     target: float = 0.8,
     poly_degree: int | None = None,
     single_trial_designs: int = 20,
+    mean_response: float = 1.0,
+    trial_sd: float = 0.5,
 ) -> list[dict[str, Any]]:
     """:func:`design_quality` of the fitted model, one dict per realization.
 
@@ -728,7 +742,9 @@ def realizations_design_quality(
         if not q["deficient"]:
             q.update(estimation_quality(real, tr, noise, poly_degree=q["poly_degree"]))
             if k < single_trial_designs:  # per-trial numbers barely vary across realizations
-                q["single"] = single_trial_quality(real, tr, noise, hrf, q["poly_degree"])
+                q["single"] = single_trial_quality(
+                    real, tr, noise, hrf, q["poly_degree"], mean_response, trial_sd
+                )
         out.append(q)
     return out
 
@@ -859,6 +875,8 @@ def single_trial_quality(
     noise: list[dict[str, Any]],
     hrf: str = "spmg1",
     poly_degree: int | None = None,
+    mean_response: float = 1.0,
+    trial_sd: float = 0.5,
 ) -> dict[str, Any]:
     """How well each *trial* can be estimated on its own -- what MVPA/RSA and trial-wise
     analyses need, and a design can be good for conditions and poor for trials.
@@ -874,8 +892,19 @@ def single_trial_quality(
     construction but its variance explodes as trials overlap; its precision
     is reported too (inf if the trial regressors are not all estimable).
 
+    Ridge (single-trial LSA with fractional ridge, as GLMsingle): biased on
+    purpose, so SD and leakage cannot score it. All three are therefore also
+    put on one measure, 'reliability': the expected correlation between the
+    estimated and the true trial-to-trial deviations (within condition), for
+    true amplitudes ``mean_response`` + N(0, ``trial_sd``^2) (PSC). Ridge's
+    shrinkage is taken at its best on a grid -- the oracle that choosing it by
+    cross-validation across runs estimates (so it needs two or more runs) --
+    and reported as GLMsingle's fraction (norm of the ridge solution over the
+    unregularized one, in expectation).
+
     Returns per noise label the median over trials of 'lss_sd', 'lsa_sd'
-    (per condition), and 'leakage' (per condition; noise-free).
+    (per condition), 'leakage' (per condition; noise-free), and
+    'reliability' {label: {'lss', 'lsa', 'ridge', 'ridge_frac'}}.
     """
     from fastfuncstuff.cli_utils import auto_polort
 
@@ -946,7 +975,80 @@ def single_trial_quality(
         out["lsa_sd"][label] = np.array(
             [sd * float(np.nanmedian(lsa_sd[cond == q])) for q in range(n_cond)]
         )
+
+    # Trial-pattern reliability for LSS, LSA and ridge, on the drift-projected
+    # trial regressors (ridge must not shrink the drift).
+    Qd, _ = torch.linalg.qr(D)
+    Xp = Xt - Qd @ (Qd.T @ Xt)
+    Ux, sx, Vh = torch.linalg.svd(Xp, full_matrices=False)
+    V = Vh.T
+    same = torch.as_tensor(cond[:, None] == cond[None, :], dtype=torch.float64)
+    Cc = torch.eye(n_tr, dtype=torch.float64) - same / same.sum(dim=1, keepdim=True)
+    ones = torch.ones(n_tr, dtype=torch.float64)
+    mu, tau2 = float(mean_response), float(trial_sd) ** 2
+    s2 = sx**2
+    lams = [0.0] if float(sx.min()) > 1e-8 * float(sx.max()) else []
+    lams += (float(torch.median(s2)) * np.logspace(-3, 2, 26)).tolist()
+    out["reliability"] = {}
+    urc: dict[tuple[float, float] | None, torch.Tensor] = {}
+    for i, c in enumerate(noise):
+        label = str(c.get("label", f"noise{i}"))
+        kw = {key: v for key, v in c.items() if key != "label"}
+        ab = _noise_arma(kw, tr)
+        R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
+        if ab not in urc:
+            urc[ab] = Ux.T @ Ux if R is None else Ux.T @ R @ Ux
+        var = (100.0 / float(kw["tsnr"])) ** 2
+        rel = {}
+        # LSS: estimator rows A (all trials), including noise through R.
+        N_lss = var * ((A @ A.T) if R is None else A @ R @ A.T)
+        rel["lss"] = _trial_reliability(
+            torch.nan_to_num(W), torch.nan_to_num(N_lss), Cc, ones, mu, tau2
+        )
+        # The least shrinkage within a hair of the best: a correlation is blind to
+        # scaling, so with barely-overlapping trials it is flat in lambda and the
+        # plain argmax reported a meaningless fraction of 0.01.
+        scan = []
+        e0 = None
+        for lam in lams:
+            d = sx / (s2 + lam)
+            Z = (V * (s2 / (s2 + lam))) @ V.T
+            N = var * (V * d) @ urc[ab] @ (V * d).T
+            r = _trial_reliability(Z, N, Cc, ones, mu, tau2)
+            e_b = (
+                mu**2 * float((Z @ ones) @ (Z @ ones))
+                + tau2 * float((Z * Z).sum())
+                + float(torch.trace(N))
+            )
+            if lam == 0.0:
+                rel["lsa"], e0 = r, e_b
+            scan.append((lam, r, e_b))
+        top = max(r for _, r, _ in scan)
+        best_lam, best, best_e = next((lam, r, e) for lam, r, e in scan if r >= top - 1e-3)
+        rel["ridge"] = best
+        rel["ridge_frac"] = float(np.sqrt(best_e / e0)) if e0 else float("nan")
+        rel.setdefault("lsa", 0.0)
+        rel["ridge_lambda"] = best_lam
+        out["reliability"][label] = rel
     return out
+
+
+def _trial_reliability(Z, N, C, ones, mu: float, tau2: float) -> float:
+    """Expected correlation of estimated with true within-condition trial deviations.
+
+    Estimates b = Z beta + e with beta = mu + delta, delta ~ N(0, tau2 I), and
+    Cov(e) = N; deviations are centred within condition by C. A ratio of
+    expectations: E[d_hat . d] / sqrt(E[|d_hat|^2] E[|d|^2]).
+    """
+    CZ = C @ Z
+    e_dd = tau2 * float(torch.trace(C))
+    e_hd = tau2 * float(torch.trace(CZ @ C))
+    e_hh = (
+        tau2 * float(torch.trace(CZ @ C @ CZ.T))
+        + mu**2 * float((CZ @ ones) @ (CZ @ ones))
+        + float(torch.trace(C @ N @ C))
+    )
+    return e_hd / float(np.sqrt(e_hh * e_dd)) if e_hh > 0 and e_dd > 0 else 0.0
 
 
 def simulate_realizations_power(

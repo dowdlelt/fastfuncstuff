@@ -263,6 +263,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "response costs.",
     )
     e.add_argument(
+        "-trial_sd",
+        type=float,
+        default=0.5,
+        metavar="PSC",
+        help="Trial-to-trial SD of the response (%% signal) for single-trial reliability; the "
+        "mean is -effect, else 1%% (default 0.5).",
+    )
+    e.add_argument(
         "-hrf",
         default="spmg1",
         help="HRF the GLM fits: spmg1 (default) or lib:K, one of the 20-HRF library.",
@@ -327,7 +335,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="CONTRAST",
         help="Contrast whose detection is traded against shape estimation, and which picks "
         "the best realization (default: the first with a true effect). 'shape' ranks by "
-        "response-shape estimation; 'trials' by single-trial LSS leakage (and trades "
+        "response-shape estimation; 'trials' by single-trial reliability (the better of LSS "
+        "and ridge, see -trial_sd; and trades "
         "detection against it).",
     )
     x.add_argument(
@@ -651,6 +660,11 @@ def _summarise(
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
     out += ["", *_quality_lines(quality, reals[0].conditions, conds)]
+    if len(reals[0].run_lengths) < 2 and any("single" in q for q in quality):
+        out.append(
+            "  note: one run -- single-trial ridge chooses its fraction by cross-validation "
+            "across runs, so with one run the ridge figure is an optimistic oracle"
+        )
     cond_c = [c for c in contrasts if not is_difference(contrasts[c])]
     diff_c = [c for c in contrasts if is_difference(contrasts[c])]
     if cond_c:
@@ -902,7 +916,14 @@ def _single_text(quality, conditions, ref) -> str | None:
     lss = np.median([q["lss_sd"][ref] for q in qs], axis=0)
     lsa = np.median([q["lsa_sd"][ref] for q in qs], axis=0)
     leak = np.median([q["leakage"] for q in qs], axis=0)
-    return "; ".join(
+    rel = {
+        k: float(np.median([q["reliability"][ref][k] for q in qs]))
+        for k in ("lss", "lsa", "ridge", "ridge_frac")
+    }
+    return (
+        f"reliability of the trial pattern: LSS {rel['lss']:.2f}, LSA {rel['lsa']:.2f}, "
+        f"ridge {rel['ridge']:.2f} (fraction {rel['ridge_frac']:.2f}); "
+    ) + "; ".join(
         f"{c} LSS {a:.2f}% (leakage {k:.2f}), LSA "
         + ("not estimable" if not np.isfinite(b) else f"{b:.2f}%")
         for c, a, k, b in zip(conditions, lss, leak, lsa, strict=True)
@@ -923,9 +944,12 @@ def _shape_lines(quality, conditions, conds) -> list[str]:
         "detects poorly, blocks the reverse; blank trials help both)",
     ] + (
         [
-            f"  single trials, SD of one trial's estimate at {ref}: {single}",
-            "  (leakage: how much of the neighbours' trial-to-trial variation each LSS "
-            "estimate picks up, 0 when trials do not overlap; LSA has none but pays in SD)",
+            f"  single trials at {ref}: {single}",
+            "  (reliability: expected correlation of the estimated with the true trial-to-"
+            "trial pattern, for -trial_sd variation around -effect (else 1%); ridge's "
+            "fraction is the best one, which cross-validation across runs estimates -- it "
+            "needs two or more runs. Per condition: SD of one trial's estimate, and LSS "
+            "leakage, the neighbours' variation mixed into each estimate)",
         ]
         if (single := _single_text(quality, conditions, ref))
         else []
@@ -985,6 +1009,11 @@ TIMING_FLAGS = (
 )  # fmt: skip
 
 
+def _mean_response(args) -> float:
+    """The condition-mean response single-trial reliability assumes: -effect, else 1%."""
+    return args.effect if args.effect is not None else 1.0
+
+
 def _objective(args, contrasts, pattern) -> str:
     """-objective: a contrast (its detection), 'shape' or 'trials'; default the first live one."""
     from fastfuncstuff.simulation.power import has_true_effect
@@ -1003,7 +1032,7 @@ def _objective_label(objective: str) -> str:
     if objective == "shape":
         return "response-shape SD per FIR bin (%)"
     if objective == "trials":
-        return "single-trial LSS leakage"
+        return "single trials: 1 - reliability (best of LSS, ridge)"
     return f"{objective}: % signal for 80% power"
 
 
@@ -1013,8 +1042,18 @@ def _optimize_realization(args, spec, contrasts, pattern, conds, objective, prog
 
     ref = _reference_noise(conds)
     hrfs = list(dict.fromkeys(args.optimize_hrfs or [args.hrf, *ROBUST_HRFS]))
+    trial_kw = {"mean_response": _mean_response(args), "trial_sd": args.trial_sd}
     fit = make_fitness(
-        args.tr, contrasts, conds, pattern, objective, ref, hrfs, args.alpha, args.polort
+        args.tr,
+        contrasts,
+        conds,
+        pattern,
+        objective,
+        ref,
+        hrfs,
+        args.alpha,
+        args.polort,
+        **trial_kw,
     )
     res = evolve(
         spec,
@@ -1038,7 +1077,16 @@ def _optimize_realization(args, spec, contrasts, pattern, conds, objective, prog
     held = [h for h in HELD_OUT_HRFS if h not in hrfs]
     if held:
         check = make_fitness(
-            args.tr, contrasts, conds, pattern, objective, ref, held, args.alpha, args.polort
+            args.tr,
+            contrasts,
+            conds,
+            pattern,
+            objective,
+            ref,
+            held,
+            args.alpha,
+            args.polort,
+            **trial_kw,
         )
         rb, ev = check(res["random_best_realization"]), check(res["best"])
         lines.append(
@@ -1170,7 +1218,15 @@ def _run_explore(raw: list[str], started: float) -> int:
             why = str(exc).split(" -- ")[0]
             refused[why] = refused.get(why, 0) + 1
     scorer = RealizationScorer(
-        args.tr, contrasts, conds, pattern, args.hrf, args.alpha, poly_degree=args.polort
+        args.tr,
+        contrasts,
+        conds,
+        pattern,
+        args.hrf,
+        args.alpha,
+        poly_degree=args.polort,
+        mean_response=_mean_response(args),
+        trial_sd=args.trial_sd,
     )
     scores = ex.score_configs(
         specs, scorer, args.explore_designs, ref, args.seed, single_all=objective == "trials"
@@ -1179,7 +1235,7 @@ def _run_explore(raw: list[str], started: float) -> int:
     det_c = objective if objective in contrasts else live[0]
     # The trade-off: detection against response shape -- or, when single trials are
     # the target, against LSS leakage (neighbours mixed into each trial's estimate).
-    y_key = "leakage" if objective == "trials" else "shape_sd"
+    y_key = "unreliability" if objective == "trials" else "shape_sd"
     x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
     y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
     front = ex.pareto_front(x, y)
@@ -1189,7 +1245,8 @@ def _run_explore(raw: list[str], started: float) -> int:
     prefix.parent.mkdir(parents=True, exist_ok=True)
     cols = ["design", *[a.label for a in axes], "feasible", "on_front", "counts", "minutes",
             *[f"needed_{c}" for c in live], *[f"worst_{c}" for c in live],
-            "shape_sd", "efficiency", "lss_sd", "leakage", "lsa_sd", "dropped"]  # fmt: skip
+            "shape_sd", "efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
+            "ridge_frac", "dropped"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(cols)
@@ -1201,7 +1258,10 @@ def _run_explore(raw: list[str], started: float) -> int:
                     + [f"{sc['needed'][c]:.4f}" for c in live]
                     + [f"{sc['worst'][c]:.4f}" for c in live]
                     + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}"]
-                    + [f"{sc[k]:.4f}" if k in sc else "" for k in ("lss_sd", "leakage", "lsa_sd")]
+                    + [
+                        f"{sc[k]:.4f}" if k in sc else ""
+                        for k in ("lss_sd", "leakage", "lsa_sd", "unreliability", "ridge_frac")
+                    ]
                     + [f"{sc['dropped']:.2f}"]
                     if sc
                     else [""] * (len(cols) - len(axes) - 3)
@@ -1234,8 +1294,9 @@ def _run_explore(raw: list[str], started: float) -> int:
             + "  ".join(f"{c} {sc['needed'][c]:.2f}%" for c in live)
             + f"  shape {sc['shape_sd']:.2f}%  efficiency {sc['xi']:.2f}"
             + (
-                f"  trials LSS {sc['lss_sd']:.2f}% leakage {sc['leakage']:.2f}"
-                if "leakage" in sc
+                f"  trials: reliability {1 - sc['unreliability']:.2f} "
+                f"(LSS leakage {sc['leakage']:.2f}, ridge fraction {sc['ridge_frac']:.2f})"
+                if "unreliability" in sc
                 else ""
             )
             + f"  {sc['minutes']:.1f} min  counts {sc['counts']}",
@@ -1251,7 +1312,7 @@ def _run_explore(raw: list[str], started: float) -> int:
             val = (
                 psc["shape_sd"][ref]
                 if objective == "shape"
-                else psc["leakage"]
+                else psc["unreliability"][ref]
                 if objective == "trials"
                 else psc["needed"][(ref, objective)]
             )
@@ -1289,16 +1350,20 @@ def _run_explore(raw: list[str], started: float) -> int:
         f"scored analytically at {ref} (fitted HRF assumed right), median of "
         f"{args.explore_designs} realization(s) each",
         f"trade-off: {det_c} detection (% signal for 80% power) against "
-        + ("single-trial LSS leakage" if objective == "trials" else "response-shape SD per FIR bin")
+        + (
+            "single-trial 1 - reliability (best of LSS, ridge)"
+            if objective == "trials"
+            else "response-shape SD per FIR bin"
+        )
         + "; lower is better on both",
         "",
         "what matters (rank correlation with detection / "
-        + ("leakage" if objective == "trials" else "shape")
+        + ("1 - reliability" if objective == "trials" else "shape")
         + " over feasible designs):",
     ]
     for a in axes:
         text.append(
-            "  " + _axis_effect(a, configs, x, y, "leakage" if objective == "trials" else "shape")
+            "  " + _axis_effect(a, configs, x, y, "1-reliab." if objective == "trials" else "shape")
         )
     text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
     if best_dir.exists():
@@ -1326,7 +1391,7 @@ def _run_explore(raw: list[str], started: float) -> int:
             ref,
             path=f"{prefix}_explore.png",
             y_label=(
-                "single trials: LSS leakage (neighbours in each estimate)"
+                "single trials: 1 - reliability (best of LSS, ridge)"
                 if objective == "trials"
                 else None
             ),
@@ -1557,7 +1622,14 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.simulation.power import realizations_design_quality
 
     quality = realizations_design_quality(
-        reals, args.tr, conds, hrf=args.hrf, alpha=args.alpha, poly_degree=args.polort
+        reals,
+        args.tr,
+        conds,
+        hrf=args.hrf,
+        alpha=args.alpha,
+        poly_degree=args.polort,
+        mean_response=_mean_response(args),
+        trial_sd=args.trial_sd,
     )
     bad = [i for i, q in enumerate(quality) if q["deficient"]]
     if bad:
@@ -1704,6 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
                         },
                         "leakage": [
                             q["single"]["leakage"].tolist() for q in quality if "single" in q
+                        ],
+                        "reliability": [
+                            q["single"]["reliability"] for q in quality if "single" in q
                         ],
                     },
                 },

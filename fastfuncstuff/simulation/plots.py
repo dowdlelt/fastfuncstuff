@@ -870,7 +870,7 @@ def plot_exploration(
     )
     for col, a in enumerate(shown, start=1):
         vals = [a.numeric(c[a.label]) for c in configs]
-        y_short = "leakage" if y_label and "leakage" in y_label else "shape SD %"
+        y_short = "1 - reliability" if y_label and "reliab" in y_label else "shape SD %"
         for row, (metric, name) in enumerate(((x, "detection %"), (y, y_short))):
             sub = fig.add_subplot(gs[row, col])
             _style(sub)

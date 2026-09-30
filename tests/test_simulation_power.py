@@ -484,3 +484,47 @@ def test_a_conditions_only_trial_is_estimable():
     )
     q = single_trial_quality(realize(spec, 0), 1.0, NOISE)
     assert np.isfinite(q["lss_sd"]["t50"]).all() and np.isfinite(q["leakage"]).all()
+
+
+def test_trial_pattern_reliability_matches_a_monte_carlo_and_ridge_rescues_lsa():
+    # The analytic expected correlation of estimated with true trial deviations,
+    # against fitting simulated trials (amplitudes 1 +- 0.5 %, ARMA noise).
+    from fastfuncstuff.simulation.core import default_microtime_dt, hrfs_from_spec
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import (
+        _noise_correlation,
+        _nuisance,
+        single_trial_quality,
+        trial_regressors,
+    )
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:0.25", 40)],
+        isi=Interval.parse("exp:2,1,6"),
+        post_fix=15,
+    )
+    r = realize(spec, 0)
+    rel = single_trial_quality(r, 1.0, NOISE, poly_degree=2)["reliability"]["t50"]
+    assert rel["ridge"] >= rel["lsa"] and 0 < rel["ridge_frac"] <= 1
+    assert rel["ridge"] > 1.5 * rel["lsa"]  # packed trials: LSA's variance explodes
+
+    dt = default_microtime_dt(1.0)
+    bases = hrfs_from_spec("spmg1", dt, torch.device("cpu"))[0][1]
+    Xt, _ = trial_regressors(r, 1.0, bases, dt)
+    Q, _ = torch.linalg.qr(_nuisance(r.run_lengths, 2))
+    Xp = Xt - Q @ (Q.T @ Xt)
+    L = torch.linalg.cholesky(_noise_correlation(NOISE[0], 1.0, r.run_lengths))
+    n = Xt.shape[1]
+    H = torch.linalg.solve(
+        Xp.T @ Xp + rel["ridge_lambda"] * torch.eye(n, dtype=torch.float64), Xp.T
+    )
+    gen = torch.Generator().manual_seed(0)
+    num = den_e = den_t = 0.0
+    for _ in range(300):
+        beta = 1.0 + 0.5 * torch.randn(n, generator=gen, dtype=torch.float64)
+        y = Xt @ beta + 2.0 * (L @ torch.randn(Xt.shape[0], generator=gen, dtype=torch.float64))
+        est = H @ (y - Q @ (Q.T @ y))
+        de, dt_ = (est - est.mean()).numpy(), (beta - beta.mean()).numpy()
+        num, den_e, den_t = num + de @ dt_, den_e + de @ de, den_t + dt_ @ dt_
+    assert rel["ridge"] == pytest.approx(num / np.sqrt(den_e * den_t), abs=0.03)
