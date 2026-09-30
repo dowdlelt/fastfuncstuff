@@ -573,3 +573,25 @@ def test_shape_steps_short_events_resolve_shapes_blocks_do_not():
     bl_steps, _ = steps(Unit.parse("E", "E:30", 1, "block"), 30)
     assert np.isfinite(ev_steps) and ev_steps < 5 and np.isnan(bl_steps)
     assert np.all(np.diff(ev_power) >= -1e-9)  # further apart: easier
+
+
+def test_hrf_robustness_ceiling_for_events_and_blocks_hold_up():
+    # Fitting SPMG1 while the truth is the fastest library HRF: brief events keep
+    # ~20% of the response and the rest inflates the residuals, so power levels
+    # off below 80% at any amplitude. A 20 s boxcar smooths shapes alike.
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import hrf_robustness
+
+    noise = {"label": "t60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}
+
+    def run(units, isi):
+        spec = ExperimentSpec(tr=1.0, units=units, isi=Interval.parse(isi), n_runs=2,
+                              initial_fix=10, post_fix=15, scan_time=330)  # fmt: skip
+        return hrf_robustness(realize(spec, 0), 1.0, {"A": [1.0]}, noise)["contrasts"]["A"]
+
+    ev = run([Unit.parse("A", "A:0.25", 1)], "exp:4,1,12")
+    bl = run([Unit.parse("A", "A:20", 1, "block")], 20)
+    assert np.isinf(ev["needed"][0]) and ev["ceiling"][0] < 0.8 and ev["recovered"][0] < 0.3
+    assert np.all(np.isfinite(bl["needed"])) and min(bl["recovered"]) > 0.4
+    # at the library shape nearest the fitted one, the cost is close to a right HRF
+    assert min(ev["needed"]) == pytest.approx(ev["fitted"], rel=0.15)

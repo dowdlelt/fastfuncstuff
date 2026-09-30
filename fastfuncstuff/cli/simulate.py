@@ -2207,6 +2207,18 @@ def main(argv: list[str] | None = None) -> int:
             pts["this design"] = [(sc["xi"], sc["liu_power"]) for sc in this]
             plot_liu(pts, int(round(16.0 / args.tr)), len(reals[0].conditions),
                      path=f"{prefix}_liu.png")  # fmt: skip
+        if live:
+            from fastfuncstuff.simulation.plots import plot_robustness
+            from fastfuncstuff.simulation.power import hrf_robustness
+
+            plot_robustness(
+                hrf_robustness(
+                    reals[0], args.tr, {c: contrasts[c] for c in live},
+                    next(c for c in conds if c["label"] == ref), pattern, args.hrf,
+                    args.shared, args.alpha, args.target, args.polort,
+                ),
+                live, args.hrf, ref, args.target, path=f"{prefix}_robust.png",
+            )  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

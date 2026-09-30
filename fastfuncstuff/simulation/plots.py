@@ -1390,6 +1390,75 @@ def plot_liu(
     return _finish(fig, path)
 
 
+def plot_robustness(
+    result: dict[str, Any],
+    contrasts: list[str],
+    fit_hrf: str,
+    noise_label: str,
+    target: float = 0.8,
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_panels: int = 4,
+):
+    """What a wrong HRF costs: every library HRF as the truth, the model fitting ``fit_hrf``.
+
+    Top: the effect each contrast needs for ``target`` power, against the true
+    HRF's peak latency; the dashed line is the cost when the fitted HRF is
+    right; a cross at the top is a truth under which no amplitude gets there
+    (power levels off, the annotation says where). Bottom: the fraction of the
+    true amplitude the estimate recovers. Blocks are robust (a boxcar smooths
+    shapes alike); brief events detect well only near the fitted shape.
+    ``result`` is :func:`~.power.hrf_robustness`.
+    """
+    import matplotlib.pyplot as plt
+
+    names = [c for c in contrasts if c in result["contrasts"]][:max_panels]
+    # The library index on x (two shapes can share a peak latency; the index keeps
+    # them apart), the peaks in the tick labels.
+    peaks = np.arange(len(result["peaks"]))
+    ticks = peaks[::3]
+    tick_labels = [f"{k}\n{result['peaks'][k]:.1f} s" for k in ticks]
+    fig, axes = plt.subplots(2, len(names), figsize=(4.6 * len(names) + 0.6, 6.4),
+                             squeeze=False, sharex=True, height_ratios=[1.3, 1],
+                             layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    for q, c in enumerate(names):
+        r = result["contrasts"][c]
+        col = CATEGORICAL[q % len(CATEGORICAL)]
+        top, bot = axes[0, q], axes[1, q]
+        for ax in (top, bot):
+            _style(ax)
+        need = np.asarray(r["needed"], dtype=float)
+        ok = np.isfinite(need)
+        ymax = float(np.nanmax(np.concatenate([need[ok], [r["fitted"]]]))) * 1.25
+        top.plot(peaks[ok], need[ok], "o-", color=col, linewidth=2, markersize=4)
+        top.axhline(r["fitted"], color=INK2, linewidth=1, linestyle=(0, (4, 3)))
+        for i in np.flatnonzero(~ok):
+            top.plot([peaks[i]], [ymax * 0.97], "x", color=CATEGORICAL[7], markersize=8,
+                     markeredgewidth=2)  # fmt: skip
+            top.annotate(f"{r['ceiling'][i]:.2f}", (peaks[i], ymax * 0.97), xytext=(0, -12),
+                         textcoords="offset points", ha="center", fontsize=6.5, color=INK2)  # fmt: skip
+        top.set_ylim(0, ymax)
+        top.set_title(f"{c}: % signal for {target:.0%} power", color=INK, fontsize=10,
+                      loc="left")  # fmt: skip
+        rec = np.asarray(r["recovered"], dtype=float)
+        bot.plot(peaks, rec, "o-", color=col, linewidth=2, markersize=4)
+        bot.axhline(1.0, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
+        bot.set_ylim(min(0.0, float(np.nanmin(rec)) - 0.05), max(1.1, float(np.nanmax(rec)) + 0.05))
+        bot.set_xticks(ticks, tick_labels)
+        bot.set_xlabel("true HRF: GLMsingle library index (peak latency)", color=INK2, fontsize=9)
+        if q == 0:
+            top.set_ylabel("effect needed (% signal)", color=INK2, fontsize=9)
+            bot.set_ylabel("fraction recovered", color=INK2, fontsize=9)
+    fig.suptitle(
+        title or f"What a wrong HRF costs at {noise_label}: every library HRF as the truth, the "
+        f"model fitting {fit_hrf}\ndashed: the fitted HRF right; x: never detected (the number: "
+        "the most power any amplitude gives)",
+        color=INK, fontsize=9.5,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

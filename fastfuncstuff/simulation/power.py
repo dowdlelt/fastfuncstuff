@@ -1626,6 +1626,104 @@ def soa_sweep(
             "ref": ref_noise}  # fmt: skip
 
 
+def hrf_robustness(
+    realization: Any,
+    tr: float,
+    contrasts: dict[str, list[float] | np.ndarray],
+    noise: dict[str, Any],
+    beta_pattern: list[float] | np.ndarray | None = None,
+    fit_hrf: str = "spmg1",
+    shared: float = 0.0,
+    alpha: float = 0.001,
+    target: float = 0.8,
+    poly_degree: int | None = None,
+) -> dict[str, Any]:
+    """What each contrast costs when the true HRF is each of the 20 library shapes.
+
+    The model fits ``fit_hrf``; the data come from library HRF k. Analytic, as
+    the engine's power: the expected estimate c P X_true beta (biased), and the
+    residual variance inflated by what the model cannot absorb,
+    sigma^2 + |M X_true beta|^2 / tr(MR). Both grow with the amplitude, so under
+    a mismatch power has a *ceiling* -- some contrasts are never detected, at
+    any amplitude. Differences sweep the difference on ``shared`` underneath,
+    as the engine does.
+
+    Returns 'labels', 'peaks' (s), and per contrast: 'needed' (true effect,
+    PSC, for ``target`` power; inf past the ceiling), 'recovered' (estimate /
+    truth), 'ceiling' (the highest power any amplitude gives), and 'fitted'
+    (the effect needed when the truth *is* ``fit_hrf``).
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    lengths = list(realization.run_lengths)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    dt = default_microtime_dt(tr)
+
+    def design(spec: str) -> torch.Tensor:
+        b = hrfs_from_spec(spec, dt, cpu)[0][1]
+        return build_task_design(
+            realization.onsets, realization.durations, tr, lengths, b, dt, device=cpu
+        ).double()
+
+    Xf = design(fit_hrf)
+    n_t, n_cond = Xf.shape
+    X = torch.cat([Xf, _nuisance(lengths, poly_degree)], dim=1)
+    P = torch.linalg.inv(X.T @ X) @ X.T
+    kw = {key: v for key, v in noise.items() if key != "label"}
+    R = _noise_correlation(kw, tr, lengths)
+    if R is None:
+        PRPt, tr_MR, dof = P @ P.T, float(n_t - X.shape[1]), float(n_t - X.shape[1])
+    else:
+        PRPt, tr_MR, dof = _corrected_terms(X, P, R)
+    crit = float(stats.t.ppf(1 - alpha / 2, dof))
+    sd2 = (100.0 / float(kw["tsnr"])) ** 2
+    pattern = np.ones(n_cond) if beta_pattern is None else np.asarray(beta_pattern, float)
+    amps = np.geomspace(1e-3, 1e3, 400)
+
+    def cost(X_true: torch.Tensor, w: np.ndarray) -> tuple[float, float, float]:
+        if is_difference(w):
+            pos = np.clip(w, 0, None)
+            p_, off = pos / float(pos @ pos), np.full(n_cond, shared)
+        else:
+            p_, off = pattern, np.zeros(n_cond)
+        c = torch.zeros(X.shape[1], dtype=torch.float64)
+        c[:n_cond] = torch.as_tensor(w)
+        v = float(c @ PRPt @ c)
+        su, s0 = X_true @ torch.as_tensor(p_), X_true @ torch.as_tensor(off)
+        mu, m0 = su - X @ (P @ su), s0 - X @ (P @ s0)
+        eu, e0 = float(c @ (P @ su)), float(c @ (P @ s0))
+        per = float(w @ p_)  # the contrast's true value per unit amplitude
+        if per == 0:
+            return float("nan"), float("nan"), float("nan")
+        ests = e0 + amps * eu
+        mis = float(m0 @ m0) + 2 * amps * float(m0 @ mu) + amps**2 * float(mu @ mu)
+        se = np.sqrt(v * (sd2 + mis / tr_MR))
+        pw = np.asarray(_two_tailed_power(crit, dof, ests / se), dtype=float)
+        hit = np.nonzero(pw >= target)[0]
+        needed = float(amps[hit[0]] * abs(per)) if hit.size else float("inf")
+        return needed, eu / per, float(pw.max())
+
+    lib = hrfs_from_spec("lib:all", 0.1, cpu)
+    labels = [lab for lab, _ in lib]
+    peaks = [float(np.argmax(b[0].numpy())) * 0.1 for _, b in lib]
+    out: dict[str, Any] = {"labels": labels, "peaks": peaks, "contrasts": {}}
+    X_libs = [design(lab) for lab in labels]
+    for name, w in contrasts.items():
+        w = np.asarray(w, dtype=float)
+        rows = [cost(Xt, w) for Xt in X_libs]
+        out["contrasts"][name] = {
+            "needed": [r[0] for r in rows],
+            "recovered": [r[1] for r in rows],
+            "ceiling": [r[2] for r in rows],
+            "fitted": cost(Xf, w)[0],
+        }
+    return out
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,
