@@ -199,7 +199,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-amplitudes",
         nargs="+",
         default=["0.1:3:15"],
-        help="Peak % signal change to sweep: values, or START:STOP:NUM.",
+        help="Peak %% signal change to sweep: values, or START:STOP:NUM.",
     )
     e.add_argument(
         "-effect", type=float, help="Report a verdict at this amplitude (added to the sweep)."
@@ -223,7 +223,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         metavar="PSC",
         help="Difference contrasts (A-B) sweep the difference itself; -shared puts every "
-        "condition at this % underneath it (A = shared + d, B = shared). Cancels exactly "
+        "condition at this %% underneath it (A = shared + d, B = shared). Cancels exactly "
         "under a correct HRF; with -true_hrf/-true_delay it shows what a large common "
         "response costs.",
     )
