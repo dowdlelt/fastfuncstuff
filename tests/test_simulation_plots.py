@@ -20,6 +20,37 @@ from fastfuncstuff.simulation.plots import (
 from fastfuncstuff.simulation.power import simulate_realizations_power
 
 
+@pytest.mark.parametrize("constrained", [False, True])
+def test_finish_reserves_space_for_wrapped_explanations(tmp_path, constrained):
+    import matplotlib.pyplot as plt
+
+    from fastfuncstuff.simulation.plots import _finish
+
+    fig, ax = plt.subplots(figsize=(5, 4), layout="constrained" if constrained else None)
+    ax.plot([0, 1], [0, 1])
+    ax.set_xlabel("Time since onset (seconds)")
+    title = fig.suptitle("Response estimates: " + "a long instructive explanation " * 4)
+    footer = fig.text(
+        0.02,
+        0.01,
+        "Model assumptions: " + "autocorrelation and drift matter " * 5,
+        fontsize=9,
+        va="bottom",
+    )
+    _finish(fig, None)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for text in (title, footer):
+        bounds = text.get_window_extent(renderer)
+        assert bounds.x0 >= 0 and bounds.x1 <= fig.bbox.width
+        assert bounds.y0 >= 0 and bounds.y1 <= fig.bbox.height
+        assert "\n" in text.get_text()
+    assert footer.get_window_extent(renderer).y1 < ax.get_tightbbox(renderer).y0
+    assert title.get_window_extent(renderer).y0 > ax.get_tightbbox(renderer).y1
+    _finish(fig, tmp_path / "explanation.png")
+    assert (tmp_path / "explanation.png").stat().st_size > 10_000
+
+
 def test_figures_render(tmp_path):
     spec = ExperimentSpec(
         tr=2,

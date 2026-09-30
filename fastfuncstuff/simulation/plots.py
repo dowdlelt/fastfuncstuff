@@ -55,10 +55,45 @@ def ramp(n: int) -> list[str]:
 
 
 def _finish(fig, path: str | Path | None):
+    import textwrap
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    footer_top = 0.0
+    for text in fig.texts:
+        if not text.get_text():
+            continue
+        x, y = text.get_position()
+        width_fraction = 2 * min(x, 1 - x) if text.get_ha() == "center" else 1 - x
+        width_pixels = max(0.5, width_fraction) * fig.bbox.width - 24
+        char_pixels = (
+            renderer.get_text_width_height_descent(
+                "abcdefghijklmnopqrstuvwxyz", text.get_fontproperties(), False
+            )[0]
+            / 26
+        )
+        wrapper = textwrap.TextWrapper(
+            width=max(20, int(width_pixels / char_pixels)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        text.set_text("\n".join(wrapper.fill(line) for line in text.get_text().splitlines()))
+        text.set_wrap(False)
+        if y < 0.1:
+            footer_top = max(footer_top, text.get_window_extent(renderer).y1 / fig.bbox.height)
+    # Power's manually positioned scorecard has its own height calculation.
+    # Other figures can reserve caption space through their subplot layout.
+    if all(ax.get_subplotspec() is not None for ax in fig.axes):
+        bottom = max(0.02, footer_top + 0.02)
+        engine = fig.get_layout_engine()
+        if engine is not None and type(engine).__name__ == "ConstrainedLayoutEngine":
+            engine.set(rect=(0.015, bottom, 0.97, 0.985 - bottom))
+        else:
+            fig.tight_layout(rect=(0.015, bottom, 0.985, 0.985), pad=1.2)
     if path is not None:
         import matplotlib.pyplot as plt
 
-        fig.savefig(path, dpi=200, facecolor=SURFACE)
+        fig.savefig(path, dpi=200, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.18)
         plt.close(fig)
     return fig
 
@@ -97,6 +132,7 @@ def plot_power(
     if not names:
         raise ValueError("no contrast has a true effect under this pattern")
     rows = result["table"]
+    reml = any(r.get("estimator") == "reml" for r in rows)
     colors = ramp(len(noise_labels))
     width = max(4.6 * len(names), 13.0 if summary else 0.0)
     text_h = _summary_height(summary, width) if summary else 0.0
@@ -112,7 +148,9 @@ def plot_power(
             # Plotted against the contrast's true effect, as every table reports
             # it -- the sweep differs from it under -pattern.
             amps = [abs(by[a][0]["true_effect"]) for a in sweep]
-            pred = [[r["power_predicted"] for r in by[a]] for a in sweep]
+            pred = [
+                [r["power_validated" if reml else "power_predicted"] for r in by[a]] for a in sweep
+            ]
             med = [float(np.median(p)) for p in pred]
             ax.fill_between(
                 amps,
@@ -132,10 +170,10 @@ def plot_power(
                 markeredgecolor=SURFACE,
                 markeredgewidth=1,
             )
-            if len(noise_labels) <= 4:
+            if len(noise_labels) <= 4 and np.isfinite(med).any():
                 # At the 50% crossing: saturated curves all end at 1.0, where
                 # right-edge labels land on top of each other.
-                k = int(np.argmin(np.abs(np.asarray(med) - 0.5)))
+                k = int(np.nanargmin(np.abs(np.asarray(med) - 0.5)))
                 ax.annotate(
                     label.split(" (")[0],
                     (amps[k], med[k]),
@@ -175,12 +213,12 @@ def plot_power(
 
     note = (
         " (HRF mismatch: the analytic line is approximate, the dots decide)"
-        if has_mismatch(rows)
+        if has_mismatch(rows) and not reml
         else ""
     )
     fig.suptitle(
         title
-        or f"Power at two-tailed p < {alpha:g} -- line: analytic (band: range over "
+        or f"Power at two-tailed p < {alpha:g} -- line: {'null-checked REML' if reml else 'analytic'} (band: range over "
         f"realizations), dots: Monte Carlo; dashed: 80%{note}",
         color=INK,
         fontsize=10,
@@ -787,6 +825,8 @@ def plot_detection_estimation(
         col = CATEGORICAL[i % len(CATEGORICAL)]
         y = np.array([np.mean(v) for v in q["shape_sd"][noise_label]], dtype=float)
         x = effect_needed(res, target).get((noise_label, contrast), np.full(1, np.nan))
+        if not np.isfinite(x).any() or not np.isfinite(y).any():
+            continue
         if len(x) == len(y):  # one per realization, in order
             ax.scatter(x, y, s=14, color=col, alpha=0.35, linewidths=0)
         mx, my = float(np.nanmedian(x)), float(np.nanmedian(y[np.isfinite(y)]))
@@ -1111,6 +1151,7 @@ def plot_tstats(
     fig, axes = plt.subplots(1, len(labels), figsize=(4.0 * len(labels) + 0.6, 3.9),
                              squeeze=False, layout="constrained")  # fmt: skip
     fig.patch.set_facecolor(SURFACE)
+    method = "REML" if result.get("estimator") == "reml" else "corrected"
     for ax, label, col in zip(axes[0], labels, colors, strict=False):
         _style(ax)
         t = result["t"][label]
@@ -1121,12 +1162,12 @@ def plot_tstats(
         hi = max(np.percentile(eff_c, 99.5), c_crit * 1.4)
         bins = np.linspace(lo, hi, 70)
         ax.hist(
-            null_c, bins=bins, density=True, color="#bdbcb6", alpha=0.7, label="null, corrected"
+            null_c, bins=bins, density=True, color="#bdbcb6", alpha=0.7, label=f"null, {method}"
         )
         ax.hist(null_n, bins=bins, density=True, histtype="step", color=INK2, linewidth=1.2,
                 label="null, naive OLS")  # fmt: skip
         ax.hist(eff_c, bins=bins, density=True, color=col, alpha=0.55,
-                label="at the effect, corrected")  # fmt: skip
+                label=f"at the effect, {method}")  # fmt: skip
         xs = np.linspace(lo, hi, 400)
         ax.plot(xs, st.t.pdf(xs, c_dof), color=INK, linewidth=1.3, label=f"t({c_dof:.0f})")
         for x in (-c_crit, c_crit):
@@ -1138,7 +1179,7 @@ def plot_tstats(
         pw = float(np.mean(np.abs(eff_c) > c_crit))
         ax.set_title(
             f"{label}: effect {result['effects'][label]:.2f}%\n"
-            f"false pos. {fp_c:.4f} corrected, {fp_n:.4f} naive; power {pw:.2f}",
+            f"false pos. {fp_c:.4f} {method}, {fp_n:.4f} naive; power {pw:.2f}",
             color=INK, fontsize=9, loc="left",
         )  # fmt: skip
         ax.set_xlabel(f"t ({contrast})", color=INK2, fontsize=9)
@@ -1430,7 +1471,9 @@ def plot_robustness(
             _style(ax)
         need = np.asarray(r["needed"], dtype=float)
         ok = np.isfinite(need)
-        ymax = float(np.nanmax(np.concatenate([need[ok], [r["fitted"]]]))) * 1.25
+        finite = np.concatenate([need[ok], [r["fitted"]]])
+        finite = finite[np.isfinite(finite)]
+        ymax = max(float(finite.max()) * 1.25, 0.01) if finite.size else 1.0
         top.plot(peaks[ok], need[ok], "o-", color=col, linewidth=2, markersize=4)
         top.axhline(r["fitted"], color=INK2, linewidth=1, linestyle=(0, (4, 3)))
         for i in np.flatnonzero(~ok):
@@ -1446,14 +1489,22 @@ def plot_robustness(
         bot.axhline(1.0, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
         bot.set_ylim(min(0.0, float(np.nanmin(rec)) - 0.05), max(1.1, float(np.nanmax(rec)) + 0.05))
         bot.set_xticks(ticks, tick_labels)
-        bot.set_xlabel("true HRF: GLMsingle library index (peak latency)", color=INK2, fontsize=9)
+        bot.set_xlabel("true HRF: library index / peak latency", color=INK2, fontsize=9)
         if q == 0:
             top.set_ylabel("effect needed (% signal)", color=INK2, fontsize=9)
             bot.set_ylabel("fraction recovered", color=INK2, fontsize=9)
+    import textwrap
+
+    heading = title or (
+        f"HRF mismatch at {noise_label} (fitting {fit_hrf})\n"
+        "Dashed: matched HRF; ×: target not reached\n"
+        "Numbers beside × show maximum power (analytic)"
+    )
+    heading = "\n".join(
+        textwrap.fill(line, width=int(fig.get_figwidth() * 11)) for line in heading.splitlines()
+    )
     fig.suptitle(
-        title or f"What a wrong HRF costs at {noise_label}: every library HRF as the truth, the "
-        f"model fitting {fit_hrf}\ndashed: the fitted HRF right; x: never detected (the number: "
-        "the most power any amplitude gives)",
+        heading,
         color=INK, fontsize=9.5,
     )  # fmt: skip
     return _finish(fig, path)

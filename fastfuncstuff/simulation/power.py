@@ -135,6 +135,11 @@ def simulate_design_power(
     device: torch.device | None = None,
     seed: int = 0,
     keep_t: bool = False,
+    estimator: str = "ols",
+    null_reps: int | None = None,
+    reml_maxa: float = 0.8,
+    reml_maxb: float = 0.8,
+    reml_cache: dict | None = None,
 ) -> dict[str, Any]:
     """Monte-Carlo detection power of each contrast, per noise condition and amplitude.
 
@@ -181,6 +186,8 @@ def simulate_design_power(
     from fastfuncstuff.cli_utils import auto_polort
     from fastfuncstuff.utils import get_device
 
+    if estimator not in {"ols", "reml"}:
+        raise ValueError("estimator must be 'ols' or 'reml'")
     if device is None:
         device = get_device()
     X_task = torch.as_tensor(design, dtype=torch.float64)
@@ -314,6 +321,26 @@ def simulate_design_power(
     }
     if keep_t:
         out["t"], out["crit"] = t_kept, crits
+    if estimator == "reml":
+        from .reml_power import validate_reml_power
+
+        validate_reml_power(
+            out,
+            X,
+            X_true,
+            C,
+            pattern,
+            offset,
+            run_lengths,
+            tr,
+            noise,
+            device,
+            seed,
+            null_reps,
+            reml_maxa,
+            reml_maxb,
+            reml_cache,
+        )
     return out
 
 
@@ -575,6 +602,8 @@ def power_column(rows: list[dict[str, Any]]) -> str:
     the noncentral-t approximation drifts (0.155 off for A-B on a 4% shared
     response), and the Monte Carlo is the referee.
     """
+    if any(r.get("estimator") == "reml" for r in rows):
+        return "power_validated"
     return "power" if has_mismatch(rows) else "power_predicted"
 
 
@@ -605,6 +634,9 @@ def amplitude_for_power(
         )
         eff = np.array([abs(r["true_effect"]) for r in rows])
         pw = np.array([r[column] for r in rows])
+        if not np.isfinite(pw).all():
+            out[key] = float("nan")
+            continue
         below = np.nonzero(pw < target)[0]
         if not np.any(eff > 0) or below.size == 0 or below[-1] == len(rows) - 1:
             out[key] = float("nan")
@@ -1341,6 +1373,11 @@ def t_example(
     poly_degree: int | None = None,
     n_reps: int = 2000,
     seed: int = 0,
+    estimator: str = "ols",
+    null_reps: int | None = None,
+    reml_maxa: float = 0.8,
+    reml_maxb: float = 0.8,
+    device: torch.device | None = None,
 ) -> dict[str, Any]:
     """t values of one contrast under the null and at an effect, per noise level.
 
@@ -1366,14 +1403,21 @@ def t_example(
         pos = np.clip(w, 0, None)
         pattern = pos / float(pos @ pos)
     per_unit = float(w @ pattern)  # contrast value per unit of the sweep
-    out: dict[str, Any] = {"t": {}, "crit": {}, "dof": {}, "effects": effects}
+    out: dict[str, Any] = {
+        "t": {},
+        "crit": {},
+        "dof": {},
+        "effects": effects,
+        "estimator": estimator,
+    }
     for k, cond in enumerate(noise):
         label = str(cond.get("label", f"noise{k}"))
         amp = abs(effects[label] / per_unit) if per_unit else 0.0
         res = simulate_design_power(
             X, list(realization.run_lengths), tr, {contrast: w}, [amp], [cond],
             beta_pattern=pattern, n_reps=n_reps, poly_degree=poly_degree, alpha=alpha,
-            device=cpu, seed=seed + k, keep_t=True,
+            device=cpu if device is None else device, seed=seed + k, keep_t=True,
+            estimator=estimator, null_reps=null_reps, reml_maxa=reml_maxa, reml_maxb=reml_maxb,
         )  # fmt: skip
         out["t"][label] = {
             "null": res["t"][(label, 0.0, contrast)],
@@ -1703,8 +1747,12 @@ def hrf_robustness(
         mis = float(m0 @ m0) + 2 * amps * float(m0 @ mu) + amps**2 * float(mu @ mu)
         se = np.sqrt(v * (sd2 + mis / tr_MR))
         pw = np.asarray(_two_tailed_power(crit, dof, ests / se), dtype=float)
-        hit = np.nonzero(pw >= target)[0]
-        needed = float(amps[hit[0]] * abs(per)) if hit.size else float("inf")
+        below = np.nonzero(pw < target)[0]
+        if below.size and below[-1] < len(amps) - 1:
+            j = below[-1]
+            needed = float(np.interp(target, pw[j : j + 2], amps[j : j + 2]) * abs(per))
+        else:
+            needed = float("inf")
         return needed, eu / per, float(pw.max())
 
     lib = hrfs_from_spec("lib:all", 0.1, cpu)
@@ -1741,6 +1789,10 @@ def simulate_realizations_power(
     hrf: str = "spmg1",
     true_hrf: str = "same",
     shared: float = 0.0,
+    estimator: str = "ols",
+    null_reps: int | None = None,
+    reml_maxa: float = 0.8,
+    reml_maxb: float = 0.8,
 ) -> dict[str, Any]:
     """:func:`simulate_design_power` over several realizations of one experiment.
 
@@ -1795,6 +1847,7 @@ def simulate_realizations_power(
     for i, real, ti in tqdm(
         jobs, desc="designs", leave=True, disable=not progress or len(jobs) < 2
     ):
+        reml_cache: dict = {}
         X = build_task_design(
             real.onsets, real.durations, tr, real.run_lengths, fit_bases, dt, device=cpu
         )
@@ -1827,6 +1880,11 @@ def simulate_realizations_power(
                 true_design=X_true,
                 device=device,
                 seed=seed + 7919 * i + 104729 * ti + 15485863 * g,
+                estimator=estimator,
+                null_reps=null_reps,
+                reml_maxa=reml_maxa,
+                reml_maxb=reml_maxb,
+                reml_cache=reml_cache,
             )
             for r in res["table"]:
                 r["design"] = i
@@ -1866,10 +1924,21 @@ def simulate_realizations_power(
         "hrf": fit_label,
         "true_hrfs": [t for t, _ in truths],
         "shared": shared,
+        "estimator": estimator,
     }
 
 
 _NUMERIC = {
+    "power_ols",
+    "mean_t_ols",
+    "power_validated",
+    "null_rate",
+    "null_reps",
+    "null_p",
+    "null_ci_low",
+    "null_ci_high",
+    "generating_a",
+    "reml_maxa",
     "shared",
     "design",
     "tsnr",
@@ -1902,7 +1971,10 @@ def load_power_table(path: str | Path) -> dict[str, Any]:
         for raw in csv.DictReader(f, delimiter="\t"):
             row: dict[str, Any] = dict(raw)
             for key in _NUMERIC & row.keys():
-                row[key] = int(row[key]) if key == "design" else float(row[key])
+                if row[key] == "":
+                    del row[key]
+                else:
+                    row[key] = int(row[key]) if key == "design" else float(row[key])
             row.setdefault("true_hrf", "")
             rows.append(row)
     if not rows:

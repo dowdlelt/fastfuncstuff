@@ -208,8 +208,8 @@ TIME_AXIS_ATTRS = frozenset({"residuals", "residuals_whitened", "predicted"})
 # AFNI 3dREMLfit defaults: -MAXa 0.8, -MAXb 0.8, -Grid 3 (step=0.1).
 # a is non-negative (POScor); b is symmetric.
 # 9 a-values × 17 b-values = 153 candidates (gamma0>0 filter trims to ~117).
-# Users can widen with the CLI -MAXa/-MAXb flags; the absolute upper bound
-# is 0.9 (any closer to 1 and the ARMA(1,1) model is degenerate).
+# Custom -a_grid/-b_grid can approach 1; the stationary/invertible model
+# requires absolute parameter values strictly below 1.
 DEFAULT_ARMA_A_GRID = (
     0.0,
     0.8,
@@ -555,8 +555,8 @@ def get_default_arma_grids(device: torch.device) -> tuple[torch.Tensor, torch.Te
         a_grid = torch.arange(0.0, 0.91, 0.1, device=device)   # MAXa=0.9
         b_grid = torch.arange(-0.9, 0.91, 0.1, device=device)  # MAXb=0.9
 
-    The absolute upper bound for either parameter is 0.9 — beyond that
-    the ARMA(1,1) covariance becomes ill-conditioned.
+    Stable/invertible parameters above 0.9 are supported, strictly below 1.
+    Near-unit parameters need finer grids and numerically stable factorization.
     """
     a_grid = torch.linspace(*DEFAULT_ARMA_A_GRID, device=device)
     b_grid = torch.linspace(*DEFAULT_ARMA_B_GRID, device=device)

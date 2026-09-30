@@ -373,6 +373,31 @@ def _build_parser() -> argparse.ArgumentParser:
 
     a = p.add_argument_group("Analysis")
     a.add_argument("-nreps", type=int, default=500, help="Replicates per cell (default 500).")
+    a.add_argument(
+        "-estimator",
+        choices=("reml", "ols"),
+        default="reml",
+        help="Power estimator: fitted ARMA(1,1) REML (default), or OLS with known-noise correction.",
+    )
+    a.add_argument(
+        "-null_reps",
+        type=int,
+        help="Independent REML null replicates (default max(nreps, ceil(10/alpha))). "
+        "Inflated null rejection or fewer than five expected exceedances withholds timing verdicts.",
+    )
+    a.add_argument(
+        "-reml_maxa",
+        type=float,
+        default=0.8,
+        help="Maximum fitted AR coefficient (same default as ffs_reml: 0.8). "
+        "Stable values strictly below 1 are supported, e.g. 0.99 for fast sampling.",
+    )
+    a.add_argument(
+        "-reml_maxb",
+        type=float,
+        default=0.8,
+        help="Maximum absolute fitted MA coefficient (default 0.8; strictly below 1).",
+    )
     a.add_argument("-alpha", type=float, default=0.001, help="Two-tailed p threshold (0.001).")
     a.add_argument("-polort", type=int, help="Per-run drift degree (default AFNI 1+floor(s/150)).")
     a.add_argument("-seed", type=int, default=0)
@@ -610,7 +635,8 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
     out = []
     need = effect_needed(res, args.target)
     det = {
-        c: float(np.nanmedian(need[(ref, c)])) for c in live if np.isfinite(need[(ref, c)]).any()
+        c: float(np.median(need[(ref, c)])) if np.isfinite(need[(ref, c)]).all() else float("inf")
+        for c in live
     }
     if live and not det:  # say so, rather than leave the measure out
         top = max(abs(x["true_effect"]) for x in res["table"])
@@ -621,7 +647,10 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
         out.append(
             (
                 "detection",
-                ", ".join(f"{c} {v:.2f}%" for c, v in det.items())
+                ", ".join(
+                    f"{c} {v:.2f}%" if np.isfinite(v) else f"{c} unavailable"
+                    for c, v in det.items()
+                )
                 + f"  (% signal for {args.target:.0%} power)",
                 float(np.mean(list(det.values()))),
             )
@@ -649,11 +678,11 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
                     "(fractions of their bounds)", xi))  # fmt: skip
     if steps is not None:
         st = steps["steps"][ref]
-        fin = st[np.isfinite(st)]
-        if fin.size:
-            m = float(np.mean(fin))
+        if np.isfinite(st).all():
+            m = float(np.mean(st))
             out.append(("shape resolution", f"{m:.1f} library steps (~{0.16 * m:.1f} s of peak "
-                        "latency) to tell two shapes apart", m))  # fmt: skip
+                        "latency) to separate a response from a library template "
+                        "(first realization)", m))  # fmt: skip
         else:
             out.append(("shape resolution", f"> {steps['max_step']} library steps: shapes "
                         "cannot be told apart", float("inf")))  # fmt: skip
@@ -680,15 +709,17 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
             (
                 "HRF robustness",
                 f"{c0} detectable under {n_ok}/{len(r['needed'])} library HRFs (fitting "
-                f"{args.hrf}); median cost x{ratio:.2f} of the right HRF's",
+                f"{args.hrf}); median cost x{ratio:.2f} relative to matched {args.hrf} "
+                "(first realization)",
                 n_ok / len(r["needed"]),
             )
         )
     nulls = [x for x in res["table"] if x["noise"] == ref and x["amplitude"] == 0.0]
     if nulls:
-        fp = float(np.mean([x["power"] for x in nulls]))
+        fp = float(np.mean([x.get("null_rate", x["power"]) for x in nulls]))
         fpn = float(np.mean([x["power_naive"] for x in nulls]))
-        out.append(("false positives", f"{fp:.4f} corrected, {fpn:.4f} naive OLS (nominal "
+        estimator = "REML" if res.get("estimator") == "reml" else "corrected"
+        out.append(("false positives", f"{fp:.4f} {estimator}, {fpn:.4f} naive OLS (nominal "
                     f"{args.alpha:g})", fp))  # fmt: skip
     vif = float(np.median([np.max(q["vif"]) for q in quality]))
     out.append(("collinearity", f"largest VIF {vif:.2f} (1 = orthogonal, > 5 hard)", vif))
@@ -754,7 +785,17 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, 
     if truths and truths != [fit]:
         shown = truths if len(truths) <= 3 else [f"{len(truths)} library HRFs"]
         model += f"; data from {', '.join(shown)}"
-    facts.append(("model", model + "; t corrected for the noise ARMA"))
+    facts.append(
+        (
+            "model",
+            model
+            + (
+                "; fitted ARMA(1,1) REML"
+                if res.get("estimator") == "reml"
+                else "; OLS t corrected for known ARMA"
+            ),
+        )
+    )
     vif = np.median([q["vif"] for q in quality], axis=0)
     facts.append(("VIF", ", ".join(f"{c} {v:.2f}" for c, v in zip(names, vif, strict=True))))
     ref = _reference_noise(conds)
@@ -788,6 +829,7 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, 
         for ln in (spec.describe() if spec else "").splitlines()
         if ln.strip().startswith("note:")
     ]
+    notes.extend(_reml_calibration_notes(res))
     need = effect_needed(res, args.target)
     header = ["noise", *contrasts, "false pos. corr / naive"]
     table, partial = [], False
@@ -824,6 +866,32 @@ def _verdict(power: float) -> str:
     return next(label for cut, label in VERDICTS if power < cut)
 
 
+def _reml_calibration_notes(res) -> list[str]:
+    rows = [r for r in res["table"] if r.get("estimator") == "reml" and r["amplitude"] == 0]
+    if not rows:
+        return []
+    rates = [r["null_rate"] for r in rows]
+    inflated = sorted({r["contrast"] for r in rows if r["calibration"] == "inflated"})
+    limited = any(r["calibration"] == "limited" for r in rows)
+    status = "no detected inflation"
+    if inflated:
+        status = "inflation in " + ", ".join(inflated) + "; timing verdict withheld"
+    elif limited:
+        status = "too few null replicates; timing verdict withheld (increase -null_reps)"
+    notes = [
+        f"REML calibration: {status}. Null rejection "
+        f"{min(rates):.4f}–{max(rates):.4f} (nominal {res['alpha']:g})."
+    ]
+    outside = [r for r in rows if r["generating_a"] > r["reml_maxa"]]
+    if outside:
+        r = max(outside, key=lambda r: r["generating_a"])
+        notes.append(
+            f"Noise AR {r['generating_a']:.3f} exceeds fitted maximum "
+            f"{r['reml_maxa']:g}: widen -reml_maxa and the analysis -a_grid."
+        )
+    return notes
+
+
 def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
     """'analytic / Monte Carlo  verdict' for one noise x contrast at -effect.
 
@@ -835,7 +903,9 @@ def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
         return "no true effect"
     pa = float(np.median([r["power_predicted"] for r in sel]))
     pm = float(np.mean([r["power"] for r in sel]))
-    return f"{pa:>6.2f} / {pm:.2f} {_verdict(pm if column == 'power' else pa):>9}"
+    judged = float(np.mean([r[column] for r in sel]))
+    verdict = _verdict(judged) if np.isfinite(judged) else "unchecked"
+    return f"{pa:>6.2f} / {pm:.2f} {verdict:>9}"
 
 
 def _summarise(
@@ -919,6 +989,7 @@ def _summarise(
     if profile_text:
         out += ["", profile_text]
     out += ["", f"threshold: two-tailed p < {args.alpha:g}; {args.nreps} replicates per cell", ""]
+    out += _reml_calibration_notes(res)
 
     # Amplitude needed, from the analytic curve, across realizations.
     from fastfuncstuff.simulation.power import has_mismatch, power_column
@@ -996,14 +1067,15 @@ def _summarise(
     for cond in conds:
         nulls = [r for r in rows if r["noise"] == cond["label"] and r["amplitude"] == 0.0]
         calib = [r for r in nulls if r["contrast"] not in diff_c] if split else nulls
-        fp = np.mean([r["power"] for r in calib])
+        fp = np.mean([r.get("null_rate", r["power"]) for r in calib])
         fpn = np.mean([r["power_naive"] for r in calib])
         flag = (
             "  <- naive OLS is anticonservative here"
             if fpn > 3 * args.alpha and fpn > fp * 2
             else ""
         )
-        out.append(f"  {cond['label']:<24} corrected {fp:.4f}   naive OLS {fpn:.4f}{flag}")
+        method = "REML" if res.get("estimator") == "reml" else "corrected"
+        out.append(f"  {cond['label']:<24} {method} {fp:.4f}   naive OLS {fpn:.4f}{flag}")
         for c in diff_c:
             fp_c = np.mean([r["power"] for r in nulls if r["contrast"] == c])
             if fp_c > 3 * args.alpha and res.get("shared", 0.0):
@@ -1014,7 +1086,11 @@ def _summarise(
 
     if args.effect is not None:
         column = power_column(rows)
-        judged = "Monte Carlo" if column == "power" else "analytic"
+        judged = (
+            "null-checked REML"
+            if column == "power_validated"
+            else ("Monte Carlo" if column == "power" else "analytic")
+        )
         out += [
             "",
             f"At {args.effect:g}% signal change -- amplitude, or difference for A-B "
@@ -1396,6 +1472,7 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
     best = res["best"]
     out_dir = Path(f"{prefix}_optimized")
     write_timing_files(best.onsets, best.conditions, out_dir)
+    validation = _validate_candidate(args, best, contrasts, pattern, conds, out_dir)
     raw = list(sys.argv[1:] if argv is None else argv)
     rest = _strip_flags(raw, _build_parser(), (*TIMING_FLAGS, *EXPLORE_ONLY, "tr", "prefix"))
     cmd = ["ffs_simulate", "-tr", f"{args.tr:g}", "-events",
@@ -1407,6 +1484,7 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
         "=" * 72,
         f"objective: {_objective_label(objective, args.target)} at {_reference_noise(conds)} (analytic)",
         *lines,
+        *validation,
         f"optimized realization: {out_dir}/ -- full Monte Carlo and figures:",
         "  " + shlex.join(cmd),
     ]
@@ -1427,6 +1505,54 @@ def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
     )
     print(f"\nwrote {prefix}: " + ", ".join(written))
     return 0
+
+
+def _validate_candidate(args, real, contrasts, pattern, conds, out_dir) -> list[str]:
+    from fastfuncstuff.cli_utils import setup_device
+    from fastfuncstuff.simulation.power import effect_needed, simulate_realizations_power
+
+    if args.estimator != "reml":
+        return ["Candidate scored with known-noise OLS; fitted REML power has not been validated."]
+    result = simulate_realizations_power(
+        [real],
+        args.tr,
+        contrasts,
+        _amplitudes(args.amplitudes, args.effect),
+        conds,
+        beta_pattern=pattern,
+        n_reps=args.nreps,
+        alpha=args.alpha,
+        poly_degree=args.polort,
+        device=setup_device(args.device),
+        seed=args.seed + 1000003,
+        progress=False,
+        hrf=args.hrf,
+        true_hrf=args.true_hrf,
+        true_delay=args.true_delay,
+        shared=args.shared,
+        estimator="reml",
+        null_reps=args.null_reps,
+        reml_maxa=args.reml_maxa,
+        reml_maxb=args.reml_maxb,
+    )
+    Path(out_dir, "validation.json").write_text(
+        json.dumps({"alpha": args.alpha, "estimator": "reml", "table": result["table"]}, indent=2)
+    )
+    ref = _reference_noise(conds)
+    needed = effect_needed(result, args.target)
+    lines = ["Candidate validation through fitted REML (independent of search):"]
+    lines.extend(_reml_calibration_notes(result))
+    for c in contrasts:
+        v = needed[(ref, c)][0]
+        lines.append(
+            f"  {c} at {ref}: "
+            + (
+                f"{v:.2f}% for {args.target:.0%} power"
+                if np.isfinite(v)
+                else "no validated target-power estimate"
+            )
+        )
+    return lines
 
 
 def _strip_flags(argv: list[str], parser, drop: tuple[str, ...]) -> list[str]:
@@ -1646,6 +1772,10 @@ def _run_explore(raw: list[str], started: float) -> int:
             from fastfuncstuff.simulation.core import write_timing_files
 
             write_timing_files(real.onsets, real.conditions, out_dir)
+            lines.extend(
+                "    " + ln
+                for ln in _validate_candidate(args, real, contrasts, pattern, conds, out_dir)
+            )
             files = [str(out_dir / f"{c}.txt") for c in real.conditions]
             val = (
                 fit_val
@@ -2099,6 +2229,10 @@ def main(argv: list[str] | None = None) -> int:
         poly_degree=args.polort,
         device=device,
         seed=args.seed,
+        estimator=args.estimator,
+        null_reps=args.null_reps,
+        reml_maxa=args.reml_maxa,
+        reml_maxb=args.reml_maxb,
     )
 
     prefix = Path(args.prefix)
@@ -2154,6 +2288,18 @@ def main(argv: list[str] | None = None) -> int:
         "power_predicted",
         "mean_t_naive",
         "power_naive",
+        "estimator",
+        "power_ols",
+        "mean_t_ols",
+        "power_validated",
+        "null_rate",
+        "null_reps",
+        "null_p",
+        "null_ci_low",
+        "null_ci_high",
+        "calibration",
+        "generating_a",
+        "reml_maxa",
     ]
     with open(f"{prefix}_power.tsv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter="\t", extrasaction="ignore")
@@ -2179,6 +2325,9 @@ def main(argv: list[str] | None = None) -> int:
                 "hrf": res["hrf"],
                 "true_hrfs": res["true_hrfs"],
                 "alpha": args.alpha,
+                "estimator": args.estimator,
+                "reml_maxa": args.reml_maxa,
+                "reml_maxb": args.reml_maxb,
                 "scorecard": {SCORE_KEYS.get(k.strip(), k.strip()): v for k, _, v in card},
                 "tr_lock": args.tr_lock,
                 # per realization, for -compare's detection-vs-estimation view
@@ -2326,6 +2475,8 @@ def main(argv: list[str] | None = None) -> int:
                 t_example(
                     reals[0], args.tr, c0, contrasts[c0], conds, effects, pattern, args.hrf,
                     args.alpha, args.polort, seed=args.seed,
+                    estimator=args.estimator, null_reps=args.null_reps,
+                    reml_maxa=args.reml_maxa, reml_maxb=args.reml_maxb, device=device,
                 ),
                 c0,
                 [c["label"] for c in conds],

@@ -633,7 +633,8 @@ Examples:
             "  start:stop:num  — linspace, e.g.  0:0.9:10  (widen MAXa to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  0.1,0.3,0.5,0.7,0.9\n"
             "  start,stop,num  — legacy linspace, e.g.  0,0.9,10\n"
-            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
+            "Stationary AR values must be strictly below 1; e.g. 0:0.99:100 "
+            "covers slow noise at fast TRs. Check residual whiteness."
         ),
     )
     arma_opts.add_argument(
@@ -645,7 +646,7 @@ Examples:
             "  start:stop:num  — linspace, e.g.  -0.9:0.9:19  (widen MAXb to 0.9)\n"
             "  v1,v2,...       — explicit list, e.g.  -0.5,-0.2,0.0,0.2,0.5\n"
             "  start,stop,num  — legacy linspace, e.g.  -0.9,0.9,19\n"
-            "Absolute upper bound is 0.9 (ARMA(1,1) is degenerate above)."
+            "Invertible MA values must have absolute value strictly below 1."
         ),
     )
     arma_opts.add_argument(
