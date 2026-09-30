@@ -44,7 +44,14 @@ def test_figures_render(tmp_path):
         progress=False,
     )
     labels = [n["label"] for n in noise]
-    plot_power(res, labels, contrasts, [1, 0], effect=1.0, path=tmp_path / "p.png")
+    summary = {
+        "facts": [("scan", "TR 2 s, 1 run"), ("model", "spmg1 " * 40)],  # wraps
+        "notes": ["trimmed"],
+        "header": ["noise", "A", "a long false-positive header"],
+        "rows": [["tSNR 40", "1.00 [0.90-1.10]", "0.0010 / 0.0100"]],
+        "footer": ["effect for 80% power"],
+    }
+    plot_power(res, labels, contrasts, [1, 0], effect=1.0, path=tmp_path / "p.png", summary=summary)
     plot_design(res, reals[0], 2, path=tmp_path / "d.png")
     plot_design_comparison({"x": res, "y": res}, "A", labels, path=tmp_path / "c.png")
     plot_example_voxels(reals[0], 2, noise, amplitude=[2.5, 1.0], path=tmp_path / "v.png")

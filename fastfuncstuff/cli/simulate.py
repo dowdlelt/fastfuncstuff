@@ -408,6 +408,112 @@ def _pattern(tokens: list[str] | None, conditions: list[str]) -> list[float]:
     return w
 
 
+def _needed_cell(vals: np.ndarray, has_effect: bool, top: float) -> tuple[str, bool]:
+    """'median [min-max]' of the effect needed over realizations, and whether some never got there.
+
+    One formatter for the text summary and the summary panel of _power.png.
+    """
+    if not has_effect:
+        return "no true effect", False
+    if np.all(np.isnan(vals)):
+        return f"> {top:g}", False
+    text = f"{np.nanmedian(vals):.2f} [{np.nanmin(vals):.2f}-{np.nanmax(vals):.2f}]"
+    partial = bool(np.isnan(vals).any())
+    return text + ("*" if partial else ""), partial
+
+
+def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) -> dict:
+    """The headline facts and the answer table, for the text panel of _power.png."""
+    from fastfuncstuff.simulation.power import effect_needed, has_mismatch, has_true_effect
+
+    rows = res["table"]
+    top = max(r["amplitude"] for r in rows)
+    names = reals[0].conditions
+    n_ev = [
+        float(np.mean([sum(len(o) for o in r.onsets[i]) for r in reals])) for i in range(len(names))
+    ]
+    total_s = float(np.mean([sum(r.run_lengths) for r in reals])) * args.tr
+    run_s = float(np.mean(reals[0].run_lengths)) * args.tr
+    facts = [
+        (
+            "events",
+            ", ".join(f"{c} {n:g}" for c, n in zip(names, n_ev, strict=True))
+            + " (all runs, per realization)",
+        ),
+        (
+            "scan",
+            f"TR {args.tr:g} s, {len(reals[0].run_lengths)} run(s) x {run_s:g} s = "
+            f"{total_s / 60:.1f} min; {len(reals)} realization(s)"
+            + (f", order {args.order}" if spec is not None else ""),
+        ),
+    ]
+    if args.noise_profile:
+        facts.append(
+            (
+                "noise",
+                f"calibrated from {Path(args.noise_profile[0]).name} ({args.noise_bins} tSNR bins)",
+            )
+        )
+    else:
+        facts.append(
+            (
+                "noise",
+                f"physiological {args.phys_fraction:.0%} of the variance, "
+                f"tau {args.tau:g} s; the rest white",
+            )
+        )
+    fit, truths = res.get("hrf", "spmg1"), res.get("true_hrfs", [])
+    model = f"{fit} fitted, polort {quality[0]['poly_degree']}, two-tailed p < {args.alpha:g}"
+    if truths and truths != [fit]:
+        shown = truths if len(truths) <= 3 else [f"{len(truths)} library HRFs"]
+        model += f"; data from {', '.join(shown)}"
+    facts.append(("model", model + "; t corrected for the noise ARMA"))
+    vif = np.median([q["vif"] for q in quality], axis=0)
+    facts.append(("VIF", ", ".join(f"{c} {v:.2f}" for c, v in zip(names, vif, strict=True))))
+    if len(names) > 2:
+        ref = _reference_noise(conds)
+        m = np.median([q["needed"][ref] for q in quality], axis=0)
+        pairs = sorted((m[i, j], i, j) for i in range(len(names)) for j in range(i))
+        facts.append(
+            (
+                "pairs",
+                f"hardest {names[pairs[-1][1]]}-{names[pairs[-1][2]]} "
+                f"({pairs[-1][0]:.2f}%), easiest {names[pairs[0][1]]}-"
+                f"{names[pairs[0][2]]} ({pairs[0][0]:.2f}%) at {ref}",
+            )
+        )
+    notes = [
+        ln.strip().removeprefix("note: ")
+        for ln in (spec.describe() if spec else "").splitlines()
+        if ln.strip().startswith("note:")
+    ]
+    need = effect_needed(res, 0.8)
+    header = ["noise", *contrasts, "false pos. corr / naive"]
+    table, partial = [], False
+    for cond in conds:
+        cells = [cond["label"]]
+        for c in contrasts:
+            text, part = _needed_cell(
+                need[(cond["label"], c)], has_true_effect(contrasts[c], pattern), top
+            )
+            partial |= part
+            cells.append(text)
+        nulls = [r for r in rows if r["noise"] == cond["label"] and r["amplitude"] == 0.0]
+        cells.append(
+            f"{np.mean([r['power'] for r in nulls]):.4f} / "
+            f"{np.mean([r['power_naive'] for r in nulls]):.4f}"
+        )
+        table.append(cells)
+    foot = [
+        "effect for 80% power, % signal change: the amplitude for a condition contrast, the "
+        "difference for A-B; median [range] over realizations"
+        + ("; Monte Carlo, the fitted HRF is wrong" if has_mismatch(rows) else "")
+    ]
+    if partial:
+        foot.append(f"* some realizations never reach 80% within the sweep (max {top:g}%)")
+    return {"facts": facts, "notes": notes, "header": header, "rows": table, "footer": foot}
+
+
 def _verdict(power: float) -> str:
     return next(label for cut, label in VERDICTS if power < cut)
 
@@ -494,18 +600,13 @@ def _summarise(
     for cond in conds:
         cells = []
         for c in contrasts:
-            vals = need[(cond["label"], c)]
-            if not has_true_effect(contrasts[c], pattern):
-                cells.append(f"{'no true effect':>18}")
-            elif np.all(np.isnan(vals)):
-                cells.append(f"{'> ' + format(max(r['amplitude'] for r in rows), 'g'):>18}")
-            else:
-                med = np.nanmedian(vals)
-                text = f"{med:.2f} [{np.nanmin(vals):.2f}-{np.nanmax(vals):.2f}]"
-                if np.isnan(vals).any():
-                    text += "*"
-                    unreached = True
-                cells.append(f"{text:>18}")
+            text, partial = _needed_cell(
+                need[(cond["label"], c)],
+                has_true_effect(contrasts[c], pattern),
+                max(r["amplitude"] for r in rows),
+            )
+            unreached |= partial
+            cells.append(f"{text:>18}")
         out.append(f"{cond['label']:<24}" + "".join(cells))
     if unreached:
         out.append(
@@ -1022,7 +1123,23 @@ def main(argv: list[str] | None = None) -> int:
         labels = [c["label"] for c in conds]
         if any(has_true_effect(w, pattern) for w in contrasts.values()):
             plot_power(
-                res, labels, contrasts, pattern, args.alpha, args.effect, path=f"{prefix}_power.png"
+                res,
+                labels,
+                contrasts,
+                pattern,
+                args.alpha,
+                args.effect,
+                path=f"{prefix}_power.png",
+                summary=_figure_summary(
+                    res,
+                    reals,
+                    conds,
+                    contrasts,
+                    pattern,
+                    args,
+                    quality,
+                    spec if described else None,
+                ),
             )
         if res["true_hrfs"] != [res["hrf"]]:
             from fastfuncstuff.simulation.plots import plot_hrf_recovery

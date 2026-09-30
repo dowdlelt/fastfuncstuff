@@ -80,11 +80,16 @@ def plot_power(
     path: str | Path | None = None,
     title: str | None = None,
     max_panels: int = 6,
+    summary: dict[str, Any] | None = None,
 ):
     """Power vs amplitude, one panel per contrast, one line per noise level.
 
     Line: analytic power (median over realizations/true HRFs), band: its range,
     dots: Monte Carlo. Dashed: 80%; dotted: ``effect``.
+
+    ``summary`` adds a text panel underneath, so the figure stands alone: a
+    block of ``facts`` ((key, value) pairs) and ``notes`` on the left, the
+    answer table (``header``, ``rows``) and its ``footer`` on the right.
     """
     import matplotlib.pyplot as plt
 
@@ -93,7 +98,9 @@ def plot_power(
         raise ValueError("no contrast has a true effect under this pattern")
     rows = result["table"]
     colors = ramp(len(noise_labels))
-    fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names), 4.2), squeeze=False)
+    width = max(4.6 * len(names), 13.0 if summary else 0.0)
+    text_h = _summary_height(summary, width) if summary else 0.0
+    fig, axes = plt.subplots(1, len(names), figsize=(width, 4.2 + text_h), squeeze=False)
     fig.patch.set_facecolor(SURFACE)
     for ax, c in zip(axes[0], names, strict=True):
         _style(ax)
@@ -148,6 +155,8 @@ def plot_power(
             ax.set_xlabel(f"{c} amplitude (% signal change)", color=INK2, fontsize=9)
     axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
     handles, labels = axes[0][0].get_legend_handles_labels()
+    total_h = 4.2 + text_h
+    legend_y = (text_h + 0.05) / total_h  # the strip between the curves and the text
     fig.legend(
         handles,
         labels,
@@ -155,6 +164,7 @@ def plot_power(
         fontsize=8,
         labelcolor=INK2,
         loc="lower center",
+        bbox_to_anchor=(0.5, legend_y),
         ncol=min(len(labels), 5),
     )
     from .power import has_mismatch
@@ -171,8 +181,73 @@ def plot_power(
         color=INK,
         fontsize=10,
     )
-    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    fig.tight_layout(rect=(0, (text_h + 0.32) / total_h, 1, 1))
+    if summary:
+        ax_t = fig.add_axes((0.02, 0.01, 0.96, (text_h - 0.05) / total_h))
+        _draw_summary(ax_t, summary, width)
     return _finish(fig, path)
+
+
+_LINE_IN = 0.19  # inches per summary text line at fontsize 8.5
+
+
+def _wrap_facts(summary: dict[str, Any], width: float) -> list[tuple[str, str]]:
+    """Facts and notes as (key, line) pairs, wrapped to the left block's width."""
+    import textwrap
+
+    chars = max(40, int(width * 0.46 * 13))  # ~13 chars per inch at 8.5 pt
+    out: list[tuple[str, str]] = []
+    items = list(summary.get("facts", [])) + [("note", n) for n in summary.get("notes", [])]
+    for key, value in items:
+        for k, line in enumerate(textwrap.wrap(str(value), chars - 12) or [""]):
+            out.append((key if k == 0 else "", line))
+    return out
+
+
+def _summary_height(summary: dict[str, Any], width: float) -> float:
+    left = len(_wrap_facts(summary, width))
+    right = 2 + len(summary.get("rows", [])) + 2 * len(summary.get("footer", []))
+    return (max(left, right) + 1.5) * _LINE_IN
+
+
+def _draw_summary(ax, summary: dict[str, Any], width: float) -> None:
+    """The text panel: facts on the left, the answer table on the right."""
+    import textwrap
+
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axhline(1.0, color=GRID, linewidth=1)
+    n_lines = _summary_height(summary, width) / _LINE_IN
+    dy = 1.0 / n_lines
+    y0 = 1.0 - 0.9 * dy
+    for k, (key, line) in enumerate(_wrap_facts(summary, width)):
+        y = y0 - k * dy
+        ax.text(0.0, y, key, fontsize=8.5, color=INK2, va="top", fontweight="bold")
+        ax.text(0.075, y, line, fontsize=8.5, color=INK, va="top")
+    header, rows = summary.get("header", []), summary.get("rows", [])
+    if not header:
+        return
+    # Right block: first column left-aligned, the rest right-aligned, each column
+    # as wide as its longest entry (even slots let a long header run into the next).
+    x_left, x_right = 0.5, 1.0
+    chars = [max(len(str(c)) for c in [h, *(r[k] for r in rows)]) + 3 for k, h in enumerate(header)]
+    edges = x_left + (x_right - x_left) * np.cumsum(chars) / sum(chars)
+    slots = edges[1:]
+    ax.text(x_left, y0, header[0], fontsize=8.5, color=INK2, va="top", fontweight="bold")
+    for x, h in zip(slots, header[1:], strict=True):
+        ax.text(x, y0, h, fontsize=8.5, color=INK2, va="top", ha="right", fontweight="bold")
+    ax.plot([x_left, x_right], [y0 - 1.05 * dy] * 2, color=GRID, linewidth=0.8)
+    for r, cells in enumerate(rows):
+        y = y0 - (r + 1.3) * dy
+        ax.text(x_left, y, cells[0], fontsize=8.5, color=INK, va="top")
+        for x, cell in zip(slots, cells[1:], strict=True):
+            ax.text(x, y, cell, fontsize=8.5, color=INK, va="top", ha="right")
+    y = y0 - (len(rows) + 1.6) * dy
+    for foot in summary.get("footer", []):
+        for line in textwrap.wrap(foot, int(width * 0.5 * 13)):
+            ax.text(x_left, y, line, fontsize=7.5, color=INK2, va="top")
+            y -= dy
 
 
 def plot_design(
