@@ -6,6 +6,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import numpy as np
 import pytest
 import torch
 
@@ -123,3 +124,26 @@ def test_tstats_figure_shows_a_calibrated_null(tmp_path):
     assert null_n.std() > 1.15 * null_c.std()  # the naive one is too wide
     plot_tstats(out, "A", ["tSNR 60"], 0.001, path=tmp_path / "t.png")
     assert (tmp_path / "t.png").stat().st_size > 10_000
+
+
+def test_spectrum_puts_block_power_at_the_block_frequency(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_spectrum
+    from fastfuncstuff.simulation.power import design_spectrum
+
+    # A-B alternating 20 s blocks with no gap: the difference is a 40 s square wave
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("AB", "A:20:0, B:20:0", 8, "block")],
+        isi=Interval.parse(0),
+        initial_fix=10,
+        post_fix=16,
+    )
+    r = realize(spec, 0)
+    noise = {"label": "tSNR 60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}
+    sp = design_spectrum(r, 1.0, {"A-B": [1, -1]}, noise)
+    peak = sp["freq"][np.argmax(sp["power"]["A-B"])]
+    assert peak == pytest.approx(1 / 40, abs=0.003)
+    assert sp["removed"][0] == pytest.approx(1.0) and sp["removed"][-1] < 0.01
+    assert sp["noise_psd"][0] == pytest.approx(1.0) and sp["noise_psd"][-1] < 0.5
+    plot_spectrum(sp, ["A-B"], path=tmp_path / "s.png")
+    assert (tmp_path / "s.png").stat().st_size > 10_000

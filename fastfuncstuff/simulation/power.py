@@ -1335,6 +1335,73 @@ def t_example(
     return out
 
 
+def design_spectrum(
+    realization: Any,
+    tr: float,
+    contrasts: dict[str, list[float] | np.ndarray],
+    noise: dict[str, Any],
+    hrf: str = "spmg1",
+    poly_degree: int | None = None,
+) -> dict[str, Any]:
+    """Where each contrast's information sits in frequency, against the noise and the drift.
+
+    For the first run: each contrast's regressor (weighted sum of the
+    condition regressors, mean removed) and its power spectrum; the noise
+    power spectrum from the ARMA autocorrelation (relative, peak 1); and the
+    fraction of a sinusoid at each frequency the drift polynomials remove --
+    by projection, exactly, rather than as a nominal cutoff. Efficiency is
+    contrast power where the drift keeps it and the noise is quiet (Josephs &
+    Henson 1999; Smith et al. 2007). Returns 'freq' (Hz), 'power' {contrast:
+    relative}, 'noise_psd', 'removed', 'drift_share' {contrast: fraction of
+    its power the drift removes}.
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+
+    cpu = torch.device("cpu")
+    n = int(realization.run_lengths[0])
+    if poly_degree is None:
+        poly_degree = auto_polort(max(realization.run_lengths) * tr)
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
+    X = build_task_design(
+        realization.onsets, realization.durations, tr, realization.run_lengths, bases, dt,
+        device=cpu,
+    ).double()[:n].numpy()  # fmt: skip
+    freq = np.fft.rfftfreq(n, d=tr)
+    t = np.arange(n) * tr
+    Q, _ = np.linalg.qr(_nuisance([n], poly_degree).numpy())
+    removed = np.empty(len(freq))
+    for k, f in enumerate(freq):
+        wave = np.stack([np.cos(2 * np.pi * f * t), np.sin(2 * np.pi * f * t)], axis=1)
+        e = float((wave * wave).sum())
+        proj = Q @ (Q.T @ wave)
+        removed[k] = float((proj * proj).sum()) / e if e > 1e-12 else 1.0
+    power, share = {}, {}
+    for name, w in contrasts.items():
+        x = X @ np.asarray(w, dtype=float)
+        x = x - x.mean()
+        pw = np.abs(np.fft.rfft(x)) ** 2
+        power[name] = pw / pw.max() if pw.max() > 0 else pw
+        share[name] = float((pw * removed).sum() / pw.sum()) if pw.sum() > 0 else float("nan")
+    kw = {key: v for key, v in noise.items() if key != "label"}
+    R = _noise_correlation(kw, tr, [n])
+    acf = np.zeros(n) if R is None else R[0].numpy()
+    if R is None:
+        acf[0] = 1.0
+    sym = np.concatenate([acf, acf[-2:0:-1]])  # a symmetric autocorrelation's spectrum
+    psd = np.interp(freq, np.fft.rfftfreq(len(sym), d=tr), np.abs(np.fft.rfft(sym)))
+    return {
+        "freq": freq,
+        "power": power,
+        "noise_psd": psd / psd.max(),
+        "removed": removed,
+        "drift_share": share,
+        "noise_label": str(noise.get("label", "noise")),
+    }
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,

@@ -1995,6 +1995,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.alpha,
                 path=f"{prefix}_tstats.png",
             )  # fmt: skip
+        if live:
+            from fastfuncstuff.simulation.plots import plot_spectrum
+            from fastfuncstuff.simulation.power import design_spectrum
+
+            plot_spectrum(
+                design_spectrum(
+                    reals[0], args.tr, {c: contrasts[c] for c in live},
+                    next(c for c in conds if c["label"] == ref), args.hrf, args.polort,
+                ),
+                live,
+                path=f"{prefix}_spectrum.png",
+            )  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

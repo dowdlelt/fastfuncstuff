@@ -1147,6 +1147,53 @@ def plot_tstats(
     return _finish(fig, path)
 
 
+def plot_spectrum(
+    result: dict[str, Any],
+    contrasts: list[str],
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_panels: int = 4,
+):
+    """Why a contrast is efficient or not: its power spectrum against noise and drift.
+
+    Per contrast: the contrast regressor's power spectrum (filled, relative),
+    the noise's (grey, relative) and the fraction of each frequency the drift
+    polynomials remove (dashed). Power the drift removes is lost; power where
+    the noise is loud is expensive. ``result`` is :func:`~.power.design_spectrum`.
+    """
+    import matplotlib.pyplot as plt
+
+    names = [c for c in contrasts if c in result["power"]][:max_panels]
+    f = result["freq"]
+    keep = f <= min(f.max(), 0.3)  # the HRF passes little above ~0.25 Hz
+    fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names) + 0.6, 3.8),
+                             squeeze=False, layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    for q, (ax, c) in enumerate(zip(axes[0], names, strict=True)):
+        _style(ax)
+        col = CATEGORICAL[q % len(CATEGORICAL)]
+        ax.fill_between(f[keep], result["power"][c][keep], color=col, alpha=0.45, linewidth=0,
+                        label="contrast power")  # fmt: skip
+        ax.plot(f[keep], result["noise_psd"][keep], color=INK2, linewidth=1.4,
+                label=f"noise ({result['noise_label']})")  # fmt: skip
+        ax.plot(f[keep], result["removed"][keep], color=INK, linewidth=1.2,
+                linestyle=(0, (4, 3)), label="removed by the drift")  # fmt: skip
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("frequency (Hz)", color=INK2, fontsize=9)
+        ax.set_title(f"{c}: {100 * result['drift_share'][c]:.0f}% of its power in the drift",
+                     color=INK, fontsize=10, loc="left")  # fmt: skip
+    axes[0, 0].set_ylabel("relative power / fraction", color=INK2, fontsize=9)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
+               loc="outside lower center", ncol=3)  # fmt: skip
+    fig.suptitle(
+        title or "Where each contrast's information sits (first run): lost to the drift at "
+        "low frequencies, expensive where the noise is loud",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,
