@@ -490,8 +490,18 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
     facts.append(("model", model + "; t corrected for the noise ARMA"))
     vif = np.median([q["vif"] for q in quality], axis=0)
     facts.append(("VIF", ", ".join(f"{c} {v:.2f}" for c, v in zip(names, vif, strict=True))))
+    ref = _reference_noise(conds)
+    shape = _shape_text(quality, names, ref)
+    if shape is not None:
+        xi = float(np.median([q["xi"] for q in quality]))
+        facts.append(
+            (
+                "shape",
+                f"{shape} SD per {args.tr:g} s bin at {ref} (FIR, "
+                f"{quality[0]['fir_lags']} bins); Liu & Frank efficiency {xi:.2f} of its bound",
+            )
+        )
     if len(names) > 2:
-        ref = _reference_noise(conds)
         m = np.median([q["needed"][ref] for q in quality], axis=0)
         pairs = sorted((m[i, j], i, j) for i in range(len(names)) for j in range(i))
         facts.append(
@@ -777,6 +787,7 @@ def _quality_lines(quality, conditions, conds) -> list[str]:
         + (f"   [worst realization {worst:.2f}]" if len(quality) > 1 else "")
         + ("  <- collinear" if worst > 5 else "")
     )
+    out += _shape_lines(quality, conditions, conds)
     if n < 2:
         return out
     corr = np.median([q["corr"] for q in quality], axis=0)
@@ -808,6 +819,32 @@ def _quality_lines(quality, conditions, conds) -> list[str]:
             f"({easy[0]:.2f}%)."
         )
     return out
+
+
+def _shape_text(quality, conditions, ref) -> str | None:
+    """'E1 0.27%, ... per 1 s bin' of the FIR shape precision at ``ref``, median over realizations."""
+    if not all("shape_sd" in q for q in quality):
+        return None
+    sd = np.median([q["shape_sd"][ref] for q in quality], axis=0)
+    return ", ".join(
+        f"{c} {'not estimable' if not np.isfinite(v) else f'{v:.2f}%'}"
+        for c, v in zip(conditions, sd, strict=True)
+    )
+
+
+def _shape_lines(quality, conditions, conds) -> list[str]:
+    ref = _reference_noise(conds)
+    text = _shape_text(quality, conditions, ref)
+    if text is None:
+        return []
+    k = quality[0]["fir_lags"]
+    xi = float(np.median([q["xi"] for q in quality]))
+    return [
+        f"  response shape (FIR, {k} bins after onset), SD of one bin's estimate at {ref}: "
+        f"{text}; Liu & Frank estimation efficiency {xi:.2f} of its bound",
+        "  (detection and shape estimation trade off: rapid jitter recovers the shape and "
+        "detects poorly, blocks the reverse; blank trials help both)",
+    ]
 
 
 def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
@@ -892,6 +929,24 @@ def _run_compare(args) -> int:
         )
     contrasts = list(dict.fromkeys(r["contrast"] for r in rows))
     noises = list(dict.fromkeys(r["noise"] for r in rows))
+    quals = {n: (res.get("spec") or {}).get("quality") for n, res in results.items()}
+    if any(quals.values()):
+        out += [
+            "",
+            "Response-shape estimation: SD of one FIR bin's estimate, % signal (mean over "
+            "conditions, median over realizations), and Liu & Frank efficiency (of its bound)",
+            f"{'design':<28}" + "".join(f"{n:>22}" for n in noises) + f"{'efficiency':>12}",
+        ]
+        for n in names:
+            q = quals[n]
+            if not q:
+                out.append(f"{n:<28}  (no estimation in its _spec.json -- rerun ffs_simulate)")
+                continue
+            cells = []
+            for noise in noises:
+                v = [np.mean(x) for x in q["shape_sd"].get(noise, [])]
+                cells.append(f"{(f'{np.median(v):.2f}' if v else '-'):>22}")
+            out.append(f"{n:<28}" + "".join(cells) + f"{np.median(q['xi']):>12.2f}")
     for c in contrasts:
         swept = next(
             (r.get("swept") for r in loaded[0]["table"] if r["contrast"] == c), "amplitude"
@@ -958,6 +1013,16 @@ def _run_compare(args) -> int:
             plot_design_comparison(
                 results, c, noises, args.target, path=f"{prefix}_compare_{safe}.png"
             )
+            if any(quals.values()):
+                from fastfuncstuff.simulation.plots import plot_detection_estimation
+
+                plot_detection_estimation(
+                    results,
+                    c,
+                    noises[len(noises) // 2],
+                    args.target,
+                    path=f"{prefix}_compare_tradeoff_{safe}.png",
+                )
     return 0
 
 
@@ -1126,6 +1191,15 @@ def main(argv: list[str] | None = None) -> int:
                 "hrf": res["hrf"],
                 "true_hrfs": res["true_hrfs"],
                 "alpha": args.alpha,
+                # per realization, for -compare's detection-vs-estimation view
+                "quality": {
+                    "shape_sd": {
+                        c["label"]: [q["shape_sd"][c["label"]].tolist() for q in quality]
+                        for c in conds
+                    },
+                    "xi": [q["xi"] for q in quality],
+                    "fir_lags": quality[0]["fir_lags"],
+                },
             },
             indent=2,
             default=str,

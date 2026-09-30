@@ -391,3 +391,40 @@ def test_scan_time_sweep_scales_as_one_over_sqrt_time_and_reports_trimmed_runs()
         assert med(1295, c, "per_minute") / med(335, c, "per_minute") == pytest.approx(1, abs=0.1)
     # minutes are the runs actually scanned (after any trim), not the request
     assert all(r["minutes"] == pytest.approx(2 * r["run_s"] / 60) for r in rows)
+
+
+def test_estimation_trades_off_against_detection():
+    # Liu et al. 2001: rapid jitter recovers the response shape and detects
+    # poorly; sparse events the reverse. The design-quality pass must show both.
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Unit, realize
+    from fastfuncstuff.simulation.power import realizations_design_quality
+
+    def spec(gap):
+        return ExperimentSpec(
+            tr=1.0,
+            units=[Unit.parse("c", f"E1:0.25:uniform:{gap}", 1, "block")],
+            n_runs=2,
+            initial_fix=10,
+            post_fix=15,
+            scan_time=330,
+        )
+
+    def score(gap):
+        q = realizations_design_quality([realize(spec(gap), s) for s in range(4)], 1.0, NOISE)
+        det = np.median([x["needed"]["t50"][0, 0] for x in q])
+        return det, np.median([x["shape_sd"]["t50"][0] for x in q]), np.median([x["xi"] for x in q])
+
+    packed, sparse = score("2,5"), score("10,14")
+    assert packed[0] > 1.3 * sparse[0]  # detects worse
+    assert packed[1] < 0.7 * sparse[1] and packed[2] > 2 * sparse[2]  # estimates better
+
+
+def test_a_fixed_soa_leaves_the_response_shape_barely_estimable():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import estimation_quality
+
+    fixed = ExperimentSpec(
+        tr=1.0, units=[Unit.parse("A", "A:0.25", 60)], isi=Interval.parse(2.75), post_fix=16
+    )
+    q = estimation_quality(realize(fixed, 0), 1.0, NOISE)
+    assert q["xi"] < 0.05

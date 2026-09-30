@@ -649,7 +649,102 @@ def realizations_design_quality(
         X = build_task_design(
             real.onsets, real.durations, tr, real.run_lengths, bases, dt, device=cpu
         )
-        out.append(design_quality(X, list(real.run_lengths), tr, noise, alpha, target, poly_degree))
+        q = design_quality(X, list(real.run_lengths), tr, noise, alpha, target, poly_degree)
+        if not q["deficient"]:
+            q.update(estimation_quality(real, tr, noise, poly_degree=q["poly_degree"]))
+        out.append(q)
+    return out
+
+
+def fir_onsets(realization: Any, tr: float) -> np.ndarray:
+    """(n_timepoints, n_conditions) onset counts on the TR grid, runs concatenated."""
+    n = sum(realization.run_lengths)
+    on = np.zeros((n, len(realization.conditions)))
+    start = 0
+    for run, n_run in enumerate(realization.run_lengths):
+        for q, per_run in enumerate(realization.onsets):
+            for t in per_run[run]:
+                k = int(np.floor(t / tr + 1e-9))
+                if 0 <= k < n_run:
+                    on[start + k, q] += 1
+        start += n_run
+    return on
+
+
+def estimation_quality(
+    realization: Any,
+    tr: float,
+    noise: list[dict[str, Any]],
+    window: float = 16.0,
+    poly_degree: int | None = None,
+) -> dict[str, Any]:
+    """How well the design estimates each condition's response *shape* (FIR), not its size.
+
+    Detection (effect needed for 80% power) and estimation trade off (Liu et
+    al. 2001): rapid jittered designs pack events into a plateau that the drift
+    absorbs, and detect poorly, but sample the response at many lags and
+    recover its shape well; blocks are the reverse. So both are reported.
+
+    The model is a joint FIR -- one column per TR bin over ``window`` seconds
+    after onset, every condition together -- plus the same per-run drift.
+    Returns
+        'shape_sd'  : {noise label: (n_cond,)} SD of one bin's estimate (PSC),
+                      root-mean over the bins, under that noise's ARMA -- how
+                      precisely the response time course is seen; inf when the
+                      FIR is not estimable (e.g. a fixed SOA aliasing the lags)
+        'xi'        : Liu & Frank's estimation efficiency as a fraction of its
+                      bound (white noise, design only; comparable to the papers)
+        'fir_lags'  : bins per condition
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .metrics import compute_estimation_efficiency
+
+    lengths = list(realization.run_lengths)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    k = max(1, int(round(window / tr)))
+    on = fir_onsets(realization, tr)
+    n_t, n_cond = on.shape
+    cols = []
+    for q in range(n_cond):
+        for lag in range(k):
+            c = np.zeros(n_t)
+            start = 0
+            for n_run in lengths:  # lags never cross a run boundary
+                seg = on[start : start + n_run, q]
+                c[start + lag : start + n_run] = seg[: n_run - lag] if lag < n_run else 0
+                start += n_run
+            cols.append(c)
+    D = _nuisance(lengths, poly_degree)
+    X = torch.cat([torch.as_tensor(np.stack(cols, 1)), D], dim=1)
+    out: dict[str, Any] = {"fir_lags": k}
+    if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+        out["shape_sd"] = {
+            str(c.get("label", f"noise{i}")): np.full(n_cond, np.inf) for i, c in enumerate(noise)
+        }
+        out["xi"] = 0.0
+        return out
+    P = torch.linalg.inv(X.T @ X) @ X.T
+    shape: dict[str, np.ndarray] = {}
+    cache: dict[tuple[float, float] | None, np.ndarray] = {}
+    for i, cond in enumerate(noise):
+        label = str(cond.get("label", f"noise{i}"))
+        kw = {key: v for key, v in cond.items() if key != "label"}
+        ab = _noise_arma(kw, tr)
+        if ab not in cache:  # every -tsnr level shares (a, b)
+            if ab is None:
+                var = torch.diagonal(P @ P.T)
+            else:
+                R = _block_correlation(tuple(lengths), *ab, False)
+                var = torch.diagonal(_corrected_terms(X, P, R)[0])
+            cache[ab] = var[: n_cond * k].reshape(n_cond, k).mean(dim=1).sqrt().numpy()
+        shape[label] = 100.0 / float(kw["tsnr"]) * cache[ab]
+    out["shape_sd"] = shape
+    eff = compute_estimation_efficiency(
+        on, n_cond, k, poly_degree=-1, nuisance=D.numpy(), normalize=True
+    )
+    out["xi"] = float(eff["total_normalized"])
     return out
 
 

@@ -749,6 +749,68 @@ def _comparison_panel(ax, names, need, scale, contrast, noise_labels, colors, ed
     ax.set_xlim(0, right * (1.08 if unreached else 1.15))
 
 
+def plot_detection_estimation(
+    results: dict[str, dict[str, Any]],
+    contrast: str,
+    noise_label: str,
+    target: float = 0.8,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """Detection against shape estimation, one colour per design: the Liu (2001) trade-off.
+
+    x: effect ``contrast`` needs for ``target`` power; y: SD of the response
+    shape's FIR estimate per bin (mean over conditions). Both in % signal at
+    ``noise_label``, both lower-is-better, so the best designs sit bottom-left.
+    Small dots are realizations, the large one their median. Needs the
+    ``quality`` block ffs_simulate writes to each _spec.json.
+    """
+    import matplotlib.pyplot as plt
+
+    from .power import effect_needed
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.2))
+    fig.patch.set_facecolor(SURFACE)
+    _style(ax)
+    for i, (name, res) in enumerate(results.items()):
+        q = (res.get("spec") or {}).get("quality")
+        if not q or noise_label not in q.get("shape_sd", {}):
+            continue
+        col = CATEGORICAL[i % len(CATEGORICAL)]
+        y = np.array([np.mean(v) for v in q["shape_sd"][noise_label]], dtype=float)
+        x = effect_needed(res, target).get((noise_label, contrast), np.full(1, np.nan))
+        if len(x) == len(y):  # one per realization, in order
+            ax.scatter(x, y, s=14, color=col, alpha=0.35, linewidths=0)
+        mx, my = float(np.nanmedian(x)), float(np.nanmedian(y[np.isfinite(y)]))
+        ax.scatter(
+            [mx], [my], s=90, color=col, edgecolors=SURFACE, linewidths=1.5, label=name, zorder=3
+        )
+        ax.annotate(
+            name, (mx, my), xytext=(7, 5), textcoords="offset points", fontsize=8, color=INK2
+        )
+    ax.set_xlabel(
+        f"{contrast}: % signal for {target:.0%} power (detection; lower is better)",
+        color=INK2,
+        fontsize=9,
+    )
+    ax.set_ylabel(
+        "response shape: SD per FIR bin, % (estimation; lower is better)", color=INK2, fontsize=9
+    )
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    # Every design is labelled at its median; a legend only covered points.
+    ax.set_title(
+        title
+        or f"Detection vs estimation at {noise_label} -- best designs sit bottom-left; "
+        "dots: realizations",
+        color=INK,
+        fontsize=10,
+        loc="left",
+    )
+    fig.tight_layout()
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,
