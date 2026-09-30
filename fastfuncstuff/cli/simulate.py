@@ -317,7 +317,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "the other flags (quote them), e.g. -isi 'exp:[3-8],[1-3],12' -null 0.25 '[0-40%%]' "
         "-order '{random,permuted_block}'. One budget must be fixed: -scan_time (time) or "
         "the trial counts (-num_events/-num_blocks or plain COUNTs), not both. Analytic "
-        "(fitted HRF assumed right). Writes _explore.tsv/.png/_summary.txt and, for a "
+        "(fitted HRF assumed right). -objective trials targets single-trial estimability. "
+        "Writes _explore.tsv/.png/_summary.txt and, for a "
         "shortlist off the detection-vs-estimation Pareto front, the best realization's "
         "timing files with the commands that reproduce everything.",
     )
@@ -325,8 +326,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "-objective",
         metavar="CONTRAST",
         help="Contrast whose detection is traded against shape estimation, and which picks "
-        "the best realization (default: the first with a true effect; 'shape' ranks by "
-        "estimation).",
+        "the best realization (default: the first with a true effect). 'shape' ranks by "
+        "response-shape estimation; 'trials' by single-trial LSS leakage (and trades "
+        "detection against it).",
     )
     x.add_argument(
         "-explore_designs", type=int, default=3, help="Realizations scored per design (3)."
@@ -534,6 +536,9 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
                 f"{quality[0]['fir_lags']} bins); Liu & Frank efficiency {xi:.2f} of its bound",
             )
         )
+    single = _single_text(quality, names, ref)
+    if single is not None:
+        facts.append(("trials", f"{single}; SD per trial at {ref}"))
     if len(names) > 2:
         m = np.median([q["needed"][ref] for q in quality], axis=0)
         pairs = sorted((m[i, j], i, j) for i in range(len(names)) for j in range(i))
@@ -865,6 +870,21 @@ def _shape_text(quality, conditions, ref) -> str | None:
     )
 
 
+def _single_text(quality, conditions, ref) -> str | None:
+    """LSS precision and leakage per condition, and LSA precision, medians over realizations."""
+    qs = [q["single"] for q in quality if "single" in q]
+    if not qs:
+        return None
+    lss = np.median([q["lss_sd"][ref] for q in qs], axis=0)
+    lsa = np.median([q["lsa_sd"][ref] for q in qs], axis=0)
+    leak = np.median([q["leakage"] for q in qs], axis=0)
+    return "; ".join(
+        f"{c} LSS {a:.2f}% (leakage {k:.2f}), LSA "
+        + ("not estimable" if not np.isfinite(b) else f"{b:.2f}%")
+        for c, a, k, b in zip(conditions, lss, leak, lsa, strict=True)
+    )
+
+
 def _shape_lines(quality, conditions, conds) -> list[str]:
     ref = _reference_noise(conds)
     text = _shape_text(quality, conditions, ref)
@@ -877,7 +897,15 @@ def _shape_lines(quality, conditions, conds) -> list[str]:
         f"{text}; Liu & Frank estimation efficiency {xi:.2f} of its bound",
         "  (detection and shape estimation trade off: rapid jitter recovers the shape and "
         "detects poorly, blocks the reverse; blank trials help both)",
-    ]
+    ] + (
+        [
+            f"  single trials, SD of one trial's estimate at {ref}: {single}",
+            "  (leakage: how much of the neighbours' trial-to-trial variation each LSS "
+            "estimate picks up, 0 when trials do not overlap; LSA has none but pays in SD)",
+        ]
+        if (single := _single_text(quality, conditions, ref))
+        else []
+    )
 
 
 def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
@@ -982,8 +1010,12 @@ def _run_explore(raw: list[str], started: float) -> int:
         objective = args.objective or next(
             (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
         )
-        if objective is None or (objective != "shape" and objective not in contrasts):
-            raise ValueError(f"-objective {objective!r}: use 'shape' or one of {list(contrasts)}")
+        if objective is None or (
+            objective not in ("shape", "trials") and objective not in contrasts
+        ):
+            raise ValueError(
+                f"-objective {objective!r}: use 'shape', 'trials' or one of {list(contrasts)}"
+            )
     except (ValueError, FileNotFoundError, SystemExit) as exc:
         if isinstance(exc, SystemExit):
             return int(exc.code or 1)
@@ -1007,19 +1039,24 @@ def _run_explore(raw: list[str], started: float) -> int:
     scorer = RealizationScorer(
         args.tr, contrasts, conds, pattern, args.hrf, args.alpha, poly_degree=args.polort
     )
-    scores = ex.score_configs(specs, scorer, args.explore_designs, ref, args.seed)
+    scores = ex.score_configs(
+        specs, scorer, args.explore_designs, ref, args.seed, single_all=objective == "trials"
+    )
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
-    det_c = objective if objective != "shape" else live[0]
+    det_c = objective if objective in contrasts else live[0]
+    # The trade-off: detection against response shape -- or, when single trials are
+    # the target, against LSS leakage (neighbours mixed into each trial's estimate).
+    y_key = "leakage" if objective == "trials" else "shape_sd"
     x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
-    y = np.array([sc["shape_sd"] if sc else np.nan for sc in scores])
+    y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
     front = ex.pareto_front(x, y)
-    keep = ex.shortlist(y if objective == "shape" else x, front, args.explore_keep)
+    keep = ex.shortlist(y if objective in ("shape", "trials") else x, front, args.explore_keep)
 
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     cols = ["design", *[a.label for a in axes], "feasible", "on_front", "counts", "minutes",
             *[f"needed_{c}" for c in live], *[f"worst_{c}" for c in live],
-            "shape_sd", "efficiency", "dropped"]  # fmt: skip
+            "shape_sd", "efficiency", "lss_sd", "leakage", "lsa_sd", "dropped"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(cols)
@@ -1030,7 +1067,9 @@ def _run_explore(raw: list[str], started: float) -> int:
                     [sc["counts"], f"{sc['minutes']:.2f}"]
                     + [f"{sc['needed'][c]:.4f}" for c in live]
                     + [f"{sc['worst'][c]:.4f}" for c in live]
-                    + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}", f"{sc['dropped']:.2f}"]
+                    + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}"]
+                    + [f"{sc[k]:.4f}" if k in sc else "" for k in ("lss_sd", "leakage", "lsa_sd")]
+                    + [f"{sc['dropped']:.2f}"]
                     if sc
                     else [""] * (len(cols) - len(axes) - 3)
                 )
@@ -1053,8 +1092,13 @@ def _run_explore(raw: list[str], started: float) -> int:
             f"#{rank}  {desc}",
             "    "
             + "  ".join(f"{c} {sc['needed'][c]:.2f}%" for c in live)
-            + f"  shape {sc['shape_sd']:.2f}%  efficiency {sc['xi']:.2f}  "
-            f"{sc['minutes']:.1f} min  counts {sc['counts']}",
+            + f"  shape {sc['shape_sd']:.2f}%  efficiency {sc['xi']:.2f}"
+            + (
+                f"  trials LSS {sc['lss_sd']:.2f}% leakage {sc['leakage']:.2f}"
+                if "leakage" in sc
+                else ""
+            )
+            + f"  {sc['minutes']:.1f} min  counts {sc['counts']}",
             "    recipe:  " + shlex.join(["ffs_simulate", *recipe, "-prefix", f"{prefix}_d{rank}"]),
         ]
         if picked is not None:
@@ -1064,14 +1108,20 @@ def _run_explore(raw: list[str], started: float) -> int:
 
             write_timing_files(real.onsets, real.conditions, out_dir)
             files = [str(out_dir / f"{c}.txt") for c in real.conditions]
-            val = psc["shape_sd"][ref] if objective == "shape" else psc["needed"][(ref, objective)]
+            val = (
+                psc["shape_sd"][ref]
+                if objective == "shape"
+                else psc["leakage"]
+                if objective == "trials"
+                else psc["needed"][(ref, objective)]
+            )
             cmd = ["ffs_simulate", "-tr", f"{args.tr:g}", "-events", *files,
                    "-durations", *[f"{d:g}" for d in real.durations],
                    "-nt", *[str(n) for n in real.run_lengths], *noise_etc,
                    "-prefix", f"{prefix}_d{rank}_best"]  # fmt: skip
             lines.append(
-                f"    best of {args.explore_pick} realizations ({objective} {val:.2f}%): "
-                + shlex.join(cmd)
+                f"    best of {args.explore_pick} realizations ({objective} "
+                f"{val:.2f}{'' if objective == 'trials' else '%'}): " + shlex.join(cmd)
             )
     n_ok = sum(1 for sc in scores if sc)
     text = [
@@ -1092,13 +1142,18 @@ def _run_explore(raw: list[str], started: float) -> int:
         "axes: " + ", ".join(f"{a.label} {raw[a.token][a.span[0] : a.span[1]]}" for a in axes),
         f"scored analytically at {ref} (fitted HRF assumed right), median of "
         f"{args.explore_designs} realization(s) each",
-        f"trade-off: {det_c} detection (% signal for 80% power) against response-shape SD per "
-        "FIR bin; lower is better on both",
+        f"trade-off: {det_c} detection (% signal for 80% power) against "
+        + ("single-trial LSS leakage" if objective == "trials" else "response-shape SD per FIR bin")
+        + "; lower is better on both",
         "",
-        "what matters (rank correlation with detection / shape over feasible designs):",
+        "what matters (rank correlation with detection / "
+        + ("leakage" if objective == "trials" else "shape")
+        + " over feasible designs):",
     ]
     for a in axes:
-        text.append("  " + _axis_effect(a, configs, x, y))
+        text.append(
+            "  " + _axis_effect(a, configs, x, y, "leakage" if objective == "trials" else "shape")
+        )
     text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
     if best_dir.exists():
         text.append(
@@ -1114,7 +1169,22 @@ def _run_explore(raw: list[str], started: float) -> int:
         matplotlib.use("Agg")
         from fastfuncstuff.simulation.plots import plot_exploration
 
-        plot_exploration(axes, configs, x, y, front, keep, det_c, ref, path=f"{prefix}_explore.png")
+        plot_exploration(
+            axes,
+            configs,
+            x,
+            y,
+            front,
+            keep,
+            det_c,
+            ref,
+            path=f"{prefix}_explore.png",
+            y_label=(
+                "single trials: LSS leakage (neighbours in each estimate)"
+                if objective == "trials"
+                else None
+            ),
+        )
     written = sorted(
         str(q.name).removeprefix(prefix.name)
         for q in prefix.parent.glob(f"{prefix.name}_*")
@@ -1124,7 +1194,7 @@ def _run_explore(raw: list[str], started: float) -> int:
     return 0
 
 
-def _axis_effect(axis, configs, x, y) -> str:
+def _axis_effect(axis, configs, x, y, y_name: str = "shape") -> str:
     """One line on how an axis moves detection and shape (Spearman, or medians per choice)."""
     from scipy.stats import spearmanr
 
@@ -1136,14 +1206,14 @@ def _axis_effect(axis, configs, x, y) -> str:
             sel = ok & np.array([v == choice for v in vals])
             if sel.any():
                 parts.append(f"{choice} {np.median(x[sel]):.2f}% / {np.median(y[sel]):.2f}%")
-        return f"{axis.label:<14} median detection / shape: " + "; ".join(parts)
+        return f"{axis.label:<14} median detection / {y_name}: " + "; ".join(parts)
     v = np.array(vals, dtype=float)
     if ok.sum() < 3:
         return f"{axis.label:<14} too few feasible designs"
     rd = spearmanr(v[ok], x[ok]).statistic
     rs = spearmanr(v[ok], y[ok]).statistic
     return (
-        f"{axis.label:<14} detection rho {rd:+.2f}, shape rho {rs:+.2f} "
+        f"{axis.label:<14} detection rho {rd:+.2f}, {y_name} rho {rs:+.2f} "
         "(negative: larger values help)"
     )
 
@@ -1463,6 +1533,27 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     "xi": [q["xi"] for q in quality],
                     "fir_lags": quality[0]["fir_lags"],
+                    "single": {
+                        "lss_sd": {
+                            c["label"]: [
+                                q["single"]["lss_sd"][c["label"]].tolist()
+                                for q in quality
+                                if "single" in q
+                            ]
+                            for c in conds
+                        },
+                        "lsa_sd": {
+                            c["label"]: [
+                                q["single"]["lsa_sd"][c["label"]].tolist()
+                                for q in quality
+                                if "single" in q
+                            ]
+                            for c in conds
+                        },
+                        "leakage": [
+                            q["single"]["leakage"].tolist() for q in quality if "single" in q
+                        ],
+                    },
                 },
             },
             indent=2,

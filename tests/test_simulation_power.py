@@ -428,3 +428,59 @@ def test_a_fixed_soa_leaves_the_response_shape_barely_estimable():
     )
     q = estimation_quality(realize(fixed, 0), 1.0, NOISE)
     assert q["xi"] < 0.05
+
+
+def test_single_trial_lss_matches_a_brute_force_fit_and_sees_leakage():
+    # Vectorized LSS (FWL onto a 2-column solve per trial) against fitting each
+    # trial's own model directly; then the design effect it exists to show.
+    from fastfuncstuff.simulation.core import default_microtime_dt, hrfs_from_spec
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import (
+        _noise_correlation,
+        _nuisance,
+        single_trial_quality,
+        trial_regressors,
+    )
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:1", 12), Unit.parse("B", "B:1", 12)],
+        isi=Interval.parse("exp:4,2,10"),
+        post_fix=15,
+    )
+    r = realize(spec, 0)
+    dt = default_microtime_dt(1.0)
+    bases = hrfs_from_spec("spmg1", dt, torch.device("cpu"))[0][1]
+    Xt, cond = trial_regressors(r, 1.0, bases, dt)
+    D = _nuisance(r.run_lengths, 1)
+    R = _noise_correlation(NOISE[0], 1.0, r.run_lengths)
+    S = torch.stack([Xt[:, cond == q].sum(1) for q in range(2)], 1)
+    brute = []
+    for i, q in enumerate(cond):
+        Z = torch.cat([Xt[:, [i]], (S[:, q] - Xt[:, i])[:, None], S[:, [1 - q]], D], 1)
+        a = torch.linalg.pinv(Z)[0]
+        brute.append(float(torch.sqrt(a @ R @ a)) * 100 / 50)
+    q = single_trial_quality(r, 1.0, NOISE, poly_degree=1)
+    for k in range(2):
+        assert q["lss_sd"]["t50"][k] == pytest.approx(np.median(np.array(brute)[cond == k]))
+
+    def leak(isi):
+        s = ExperimentSpec(tr=1.0, units=[Unit.parse("A", "A:0.25", 40)],
+                           isi=Interval.parse(isi), post_fix=15)  # fmt: skip
+        return single_trial_quality(realize(s, 0), 1.0, NOISE)["leakage"][0]
+
+    assert leak("uniform:2,5") > 3 * leak("uniform:10,14")  # overlap mixes neighbours in
+
+
+def test_a_conditions_only_trial_is_estimable():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import single_trial_quality
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:1", 10), Unit.parse("B", "B:1", 1)],
+        isi=Interval.parse(8),
+        post_fix=15,
+    )
+    q = single_trial_quality(realize(spec, 0), 1.0, NOISE)
+    assert np.isfinite(q["lss_sd"]["t50"]).all() and np.isfinite(q["leakage"]).all()

@@ -822,6 +822,7 @@ def plot_exploration(
     noise_label: str,
     path: str | Path | None = None,
     max_axes: int = 6,
+    y_label: str | None = None,
 ):
     """What a design space looks like: every design, its Pareto front, and what each axis does.
 
@@ -858,7 +859,9 @@ def plot_exploration(
             zorder=4,
         )
     ax.set_xlabel(f"{contrast}: % signal for 80% power (detection)", color=INK2, fontsize=9)
-    ax.set_ylabel("response shape: SD per FIR bin, % (estimation)", color=INK2, fontsize=9)
+    ax.set_ylabel(
+        y_label or "response shape: SD per FIR bin, % (estimation)", color=INK2, fontsize=9
+    )
     ax.set_title(
         f"{int(ok.sum())} designs at {noise_label}; front and shortlist (numbered)",
         color=INK,
@@ -867,7 +870,8 @@ def plot_exploration(
     )
     for col, a in enumerate(shown, start=1):
         vals = [a.numeric(c[a.label]) for c in configs]
-        for row, (metric, name) in enumerate(((x, "detection %"), (y, "shape SD %"))):
+        y_short = "leakage" if y_label and "leakage" in y_label else "shape SD %"
+        for row, (metric, name) in enumerate(((x, "detection %"), (y, y_short))):
             sub = fig.add_subplot(gs[row, col])
             _style(sub)
             if a.is_choice:

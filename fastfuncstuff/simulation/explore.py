@@ -142,11 +142,15 @@ def score_configs(
     ref_noise: str,
     seed: int = 0,
     progress: bool = True,
+    single_all: bool = False,
 ) -> list[dict[str, Any]]:
     """Median scores over ``n_realizations`` for each spec (None: the config was refused).
 
     Keys: 'needed' {contrast: effect at ``ref_noise``}, 'worst' {contrast: max
-    over realizations}, 'shape_sd', 'xi', 'minutes', 'counts', 'dropped'.
+    over realizations}, 'shape_sd', 'xi', 'lss_sd', 'lsa_sd', 'leakage',
+    'minutes', 'counts', 'dropped'. Single-trial scores cost 20-65 ms a
+    realization, so they come from the first realization only unless
+    ``single_all`` (when they are what is being optimized).
     """
     from tqdm import tqdm
 
@@ -160,7 +164,7 @@ def score_configs(
         scores = []
         for r in range(n_realizations):
             try:
-                sc = scorer.score(realize(spec, seed + r))
+                sc = scorer.score(realize(spec, seed + r), single=single_all or r == 0)
             except ValueError:
                 sc = None
             if sc is not None:
@@ -176,6 +180,19 @@ def score_configs(
                 "worst": {c: float(np.max(v)) for c, v in per.items()},
                 "shape_sd": float(np.median([s["shape_sd"][ref_noise] for s in scores])),
                 "xi": float(np.median([s["xi"] for s in scores])),
+                **{
+                    key: float(
+                        np.median(
+                            [
+                                s[key][ref_noise] if isinstance(s[key], dict) else s[key]
+                                for s in scores
+                                if key in s
+                            ]
+                        )
+                    )
+                    for key in ("lss_sd", "lsa_sd", "leakage")
+                    if any(key in s for s in scores)
+                },
                 "minutes": float(np.median([s["minutes"] for s in scores])),
                 "counts": scores[0]["counts"],
                 "dropped": float(np.mean([s["n_dropped"] for s in scores])),
@@ -192,18 +209,24 @@ def best_realization(
     objective: str,
     seed: int = 0,
 ) -> tuple[Any, dict[str, Any]] | None:
-    """Of ``n`` realizations of ``spec``, the one best on ``objective`` (a contrast or 'shape')."""
+    """Of ``n`` realizations of ``spec``, the one best on ``objective``.
+
+    ``objective`` is a contrast (its detection), 'shape' (estimation) or
+    'trials' (single-trial LSS leakage).
+    """
     from .experiment import realize
 
     best = None
     for r in range(n):
         real = realize(spec, seed + r)
-        sc = scorer.score(real)
+        sc = scorer.score(real, single=objective == "trials")
         if sc is None:
             continue
         v = (
             sc["shape_sd"][ref_noise]
             if objective == "shape"
+            else sc["leakage"]
+            if objective == "trials"
             else sc["needed"][(ref_noise, objective)]
         )
         if np.isfinite(v) and (best is None or v < best[0]):

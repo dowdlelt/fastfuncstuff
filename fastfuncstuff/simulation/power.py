@@ -447,6 +447,7 @@ class RealizationScorer:
         from .core import default_microtime_dt, hrfs_from_spec
 
         self.tr, self.noise, self.alpha, self.target = tr, noise, alpha, target
+        self.hrf = hrf
         self.poly_degree = poly_degree
         self.dt = default_microtime_dt(tr)
         self.bases = hrfs_from_spec(hrf, self.dt, torch.device("cpu"))[0][1]
@@ -460,8 +461,12 @@ class RealizationScorer:
             [1.0 if is_difference(w) else abs(float(w @ pattern)) for w in self.W]
         )
 
-    def score(self, real: Any, shape: bool = True) -> dict[str, Any] | None:
-        """Scores of one realization, or None if its model is rank-deficient."""
+    def score(self, real: Any, shape: bool = True, single: bool = False) -> dict[str, Any] | None:
+        """Scores of one realization, or None if its model is rank-deficient.
+
+        ``single`` adds single-trial estimability (:func:`single_trial_quality`,
+        means over conditions): 'lss_sd' and 'lsa_sd' per noise label, 'leakage'.
+        """
         from fastfuncstuff.cli_utils import auto_polort
 
         from .core import build_task_design
@@ -495,6 +500,11 @@ class RealizationScorer:
             est = estimation_quality(real, self.tr, self.noise, poly_degree=pdeg)
             out["shape_sd"] = {k: float(np.mean(v)) for k, v in est["shape_sd"].items()}
             out["xi"] = est["xi"]
+        if single:
+            st = single_trial_quality(real, self.tr, self.noise, self.hrf, pdeg)
+            out["lss_sd"] = {k: float(np.mean(v)) for k, v in st["lss_sd"].items()}
+            out["lsa_sd"] = {k: float(np.mean(v)) for k, v in st["lsa_sd"].items()}
+            out["leakage"] = float(np.mean(st["leakage"]))
         return out
 
 
@@ -696,21 +706,29 @@ def realizations_design_quality(
     alpha: float = 0.001,
     target: float = 0.8,
     poly_degree: int | None = None,
+    single_trial_designs: int = 20,
 ) -> list[dict[str, Any]]:
-    """:func:`design_quality` of the fitted model, one dict per realization."""
+    """:func:`design_quality` of the fitted model, one dict per realization.
+
+    Also response-shape estimation for each, and single-trial estimability
+    (:func:`single_trial_quality`, under 'single') for the first
+    ``single_trial_designs`` -- it costs 20-65 ms a realization.
+    """
     from .core import build_task_design, default_microtime_dt, hrfs_from_spec
 
     cpu = torch.device("cpu")
     dt = default_microtime_dt(tr)
     bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
     out = []
-    for real in realizations:
+    for k, real in enumerate(realizations):
         X = build_task_design(
             real.onsets, real.durations, tr, real.run_lengths, bases, dt, device=cpu
         )
         q = design_quality(X, list(real.run_lengths), tr, noise, alpha, target, poly_degree)
         if not q["deficient"]:
             q.update(estimation_quality(real, tr, noise, poly_degree=q["poly_degree"]))
+            if k < single_trial_designs:  # per-trial numbers barely vary across realizations
+                q["single"] = single_trial_quality(real, tr, noise, hrf, q["poly_degree"])
         out.append(q)
     return out
 
@@ -804,6 +822,130 @@ def estimation_quality(
         on, n_cond, k, poly_degree=-1, nuisance=D.numpy(), normalize=True
     )
     out["xi"] = float(eff["total_normalized"])
+    return out
+
+
+def trial_regressors(realization: Any, tr: float, bases: torch.Tensor, dt: float) -> tuple:
+    """One regressor per trial (unit peak, like the condition regressors they sum to).
+
+    Returns (X (n_t, n_trials), condition index of each trial).
+    """
+    from .core import build_task_design
+
+    n_runs = len(realization.run_lengths)
+    trials = [
+        (q, run, t)
+        for q, per in enumerate(realization.onsets)
+        for run, arr in enumerate(per)
+        for t in arr
+    ]
+    onsets = [[np.array([t]) if r == run else np.array([]) for r in range(n_runs)]
+              for _, run, t in trials]  # fmt: skip
+    X = build_task_design(
+        onsets,
+        [realization.durations[q] for q, _, _ in trials],
+        tr,
+        realization.run_lengths,
+        bases,
+        dt,
+        device=torch.device("cpu"),
+    ).double()
+    return X, np.array([q for q, _, _ in trials], dtype=int)
+
+
+def single_trial_quality(
+    realization: Any,
+    tr: float,
+    noise: list[dict[str, Any]],
+    hrf: str = "spmg1",
+    poly_degree: int | None = None,
+) -> dict[str, Any]:
+    """How well each *trial* can be estimated on its own -- what MVPA/RSA and trial-wise
+    analyses need, and a design can be good for conditions and poor for trials.
+
+    LSS (least squares separate; Mumford et al. 2012): each trial gets its own
+    regressor, the rest of its condition one more, the other conditions and
+    per-run drift the usual. Two numbers per trial:
+      - precision: SD of the trial's estimate from noise (PSC) under the noise ARMA;
+      - leakage: sqrt(sum_j w_ij^2) over the other trials j, where w_ij is how
+        much of trial j's response the estimate of trial i picks up -- the error
+        per unit of trial-to-trial amplitude SD. Zero only if trials don't overlap.
+    LSA (least squares all: one regressor per trial) has no leakage by
+    construction but its variance explodes as trials overlap; its precision
+    is reported too (inf if the trial regressors are not all estimable).
+
+    Returns per noise label the median over trials of 'lss_sd', 'lsa_sd'
+    (per condition), and 'leakage' (per condition; noise-free).
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import default_microtime_dt, hrfs_from_spec
+
+    lengths = list(realization.run_lengths)
+    if poly_degree is None:
+        poly_degree = auto_polort(max(lengths) * tr)
+    dt = default_microtime_dt(tr)
+    bases = hrfs_from_spec(hrf, dt, torch.device("cpu"))[0][1]
+    Xt, cond = trial_regressors(realization, tr, bases, dt)
+    n_t, n_tr = Xt.shape
+    n_cond = len(realization.conditions)
+    D = _nuisance(lengths, poly_degree)
+    S = torch.stack([Xt[:, cond == q].sum(dim=1) for q in range(n_cond)], dim=1)  # conditions
+
+    # LSS by FWL: for trial i in condition c, project out O = [other conditions, drift];
+    # then [u, v] = M_O [x_i, s_c - x_i] and b_i = row 1 of (G^-1 [u v]').
+    A = torch.empty(n_tr, n_t, dtype=torch.float64)  # estimator rows: b_i = A[i] @ y
+    for q in range(n_cond):
+        O = torch.cat([S[:, [k for k in range(n_cond) if k != q]], D], dim=1)
+        Q, _ = torch.linalg.qr(O)
+        idx = np.flatnonzero(cond == q)
+        U = Xt[:, idx] - Q @ (Q.T @ Xt[:, idx])  # (n_t, m)
+        sc = S[:, q] - Q @ (Q.T @ S[:, q])
+        V = sc[:, None] - U
+        uu, uv, vv = (U * U).sum(0), (U * V).sum(0), (V * V).sum(0)
+        det = uu * vv - uv**2
+        ok = det > 1e-10 * uu * vv
+        rows = (vv[:, None] * U.T - uv[:, None] * V.T) / torch.where(ok, det, 1.0)[:, None]
+        # A condition's only trial has no "rest of the condition" (v = 0): LSS is then
+        # just its own regressor. Anything else singular is not estimable.
+        alone = vv <= 1e-12 * uu
+        rows[alone] = (U.T / uu[:, None])[alone]
+        rows[~ok & ~alone] = float("nan")
+        A[idx] = rows
+    W = A @ Xt  # (n_tr, n_tr): w_ij, response of trial j in trial i's estimate
+    off = W - torch.diag(torch.diagonal(W))
+    leak = torch.sqrt((off * off).sum(dim=1)).numpy()
+
+    # LSA: all trials at once.
+    X = torch.cat([Xt, D], dim=1)
+    lsa_ok = int(torch.linalg.matrix_rank(X)) == X.shape[1]
+    P = torch.linalg.inv(X.T @ X) @ X.T if lsa_ok else None
+
+    out: dict[str, Any] = {"n_trials": n_tr, "lss_sd": {}, "lsa_sd": {}}
+    out["leakage"] = np.array([float(np.nanmedian(leak[cond == q])) for q in range(n_cond)])
+    cache: dict[tuple[float, float] | None, tuple[np.ndarray, np.ndarray]] = {}
+    for i, c in enumerate(noise):
+        label = str(c.get("label", f"noise{i}"))
+        kw = {key: v for key, v in c.items() if key != "label"}
+        ab = _noise_arma(kw, tr)
+        if ab not in cache:  # every -tsnr level shares (a, b)
+            R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
+            lss = (A * A).sum(1) if R is None else ((A @ R) * A).sum(1)
+            if P is None:
+                lsa = torch.full((n_tr,), float("inf"), dtype=torch.float64)
+            elif R is None:
+                lsa = torch.diagonal(P @ P.T)[:n_tr]
+            else:
+                lsa = torch.diagonal(_corrected_terms(X, P, R)[0])[:n_tr]
+            cache[ab] = (lss.sqrt().numpy(), lsa.sqrt().numpy())
+        sd = 100.0 / float(kw["tsnr"])
+        lss_sd, lsa_sd = cache[ab]
+        out["lss_sd"][label] = np.array(
+            [sd * float(np.nanmedian(lss_sd[cond == q])) for q in range(n_cond)]
+        )
+        out["lsa_sd"][label] = np.array(
+            [sd * float(np.nanmedian(lsa_sd[cond == q])) for q in range(n_cond)]
+        )
     return out
 
 
