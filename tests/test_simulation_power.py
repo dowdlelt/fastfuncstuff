@@ -358,3 +358,35 @@ def test_corrected_terms_match_the_dense_formula():
     torch.testing.assert_close(PRPt, P @ R @ P.T)
     assert tr_MR == pytest.approx(float(torch.trace(MR)), rel=1e-10)
     assert dof == pytest.approx(float(torch.trace(MR)) ** 2 / float((MR * MR.T).sum()), rel=1e-10)
+
+
+def test_scan_time_sweep_scales_as_one_over_sqrt_time_and_reports_trimmed_runs():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit
+    from fastfuncstuff.simulation.power import scan_time_sweep
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse(c, f"{c}:30", 1, "block") for c in ("E1", "E2")],
+        isi=Interval.parse(10),
+        initial_fix=10,
+        post_fix=15,
+        order="permuted_block",
+        n_runs=2,
+    )
+    out = scan_time_sweep(
+        spec, [330, 1330], 3, {"E1": [1, 0], "E1-E2": [1, -1]}, NOISE, progress=False
+    )
+    rows = out["rows"]
+    assert not out["skipped"]
+
+    def med(st, c, key):
+        return float(
+            np.median([r[key] for r in rows if r["scan_time"] == st and r["contrast"] == c])
+        )
+
+    # 4x the scan: the effect needed halves, so effect x sqrt(minutes) is ~flat
+    for c in ("E1", "E1-E2"):
+        assert med(1330, c, "needed") / med(330, c, "needed") == pytest.approx(0.5, abs=0.06)
+        assert med(1330, c, "per_minute") / med(330, c, "per_minute") == pytest.approx(1, abs=0.1)
+    # minutes are the runs actually scanned (after any trim), not the request
+    assert all(r["minutes"] == pytest.approx(2 * r["run_s"] / 60) for r in rows)

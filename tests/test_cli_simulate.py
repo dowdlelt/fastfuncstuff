@@ -437,3 +437,18 @@ def test_summary_reports_design_quality(tmp_path, capsys):
     assert "Design quality" in out and "VIF" in out
     # one pair: "hardest" and "easiest" would name the same pair
     assert "hardest to tell apart" not in out
+
+
+def test_scan_times_sweep_writes_its_table_and_figure(tmp_path, capsys):
+    blocks = ["-block", "E1", "30", "1", "-block", "E2", "30", "1", "-isi", "10"]
+    base = ["-tr", "1", "-nruns", "2", "-scan_time", "330", *blocks, "-tsnr", "60",
+            "-ndesigns", "2", "-nreps", "20", "-device", "cpu"]  # fmt: skip
+    assert main([*base, "-scan_times", "240", "480", "-prefix", str(tmp_path / "s")]) == 0
+    out = capsys.readouterr().out
+    assert "How long to scan" in out and "most per minute" in out
+    assert (tmp_path / "s_scantime.png").stat().st_size > 10_000
+    assert len((tmp_path / "s_scantime.tsv").read_text().splitlines()) > 1
+    # fixed counts: longer runs would only add fixation
+    argv = [*base, "-num_blocks", "4", "-scan_times", "240", "-prefix", str(tmp_path / "f")]
+    assert main(argv) == 1
+    assert "only add fixation" in capsys.readouterr().err

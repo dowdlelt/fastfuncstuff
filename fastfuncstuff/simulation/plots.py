@@ -431,6 +431,122 @@ def plot_design_spread(
     return _finish(fig, path)
 
 
+def _plain_log_ticks(ax, axis: str) -> None:
+    """Plain-number labels on a log axis (1, 2, 5 steps) instead of 6x10^0."""
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+    target = ax.yaxis if axis == "y" else ax.xaxis
+    target.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+    target.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    target.set_minor_formatter(NullFormatter())
+
+
+def plot_scan_time(
+    sweep: dict[str, Any],
+    noise_labels: list[str],
+    contrasts: list[str],
+    current_minutes: float | None = None,
+    path: str | Path | None = None,
+    title: str | None = None,
+    max_panels: int = 6,
+):
+    """How long to scan: the effect needed as total scan time grows, per contrast.
+
+    Top: effect for 80% power against total minutes (log-log), median over
+    realizations with their range as a band, one line per noise level; the
+    dashed guide is 1/sqrt(T) through the longest scan of each level.
+    Bottom: effect x sqrt(minutes) -- flat where the design scales ideally,
+    so it compares scan lengths (and designs) per unit of scan time, and a
+    short scan's fixed overhead (fixation, drift terms) shows as a rise at
+    the left. ``sweep`` is :func:`~.power.scan_time_sweep` output.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import NullFormatter
+
+    rows = sweep["rows"]
+    names = [
+        c for c in contrasts if any(np.isfinite(r["needed"]) for r in rows if r["contrast"] == c)
+    ][:max_panels]
+    if not names:
+        raise ValueError("no contrast has a true effect to sweep")
+    colors = ramp(len(noise_labels))
+    fig, axes = plt.subplots(
+        2,
+        len(names),
+        figsize=(4.4 * len(names) + 0.6, 7.0),
+        squeeze=False,
+        sharex=True,
+        layout="constrained",
+    )
+    fig.patch.set_facecolor(SURFACE)
+    for col, c in enumerate(names):
+        top, bot = axes[0, col], axes[1, col]
+        for ax in (top, bot):
+            _style(ax)
+            ax.set_xscale("log")
+            if current_minutes is not None:
+                ax.axvline(current_minutes, color=INK2, linewidth=1, linestyle=":")
+        top.set_yscale("log")
+        for label, color in zip(noise_labels, colors, strict=True):
+            sel = [r for r in rows if r["contrast"] == c and r["noise"] == label]
+            mins = sorted({r["minutes"] for r in sel})
+            by = {m: [r for r in sel if r["minutes"] == m] for m in mins}
+            for key, ax in (("needed", top), ("per_minute", bot)):
+                vals = [np.array([r[key] for r in by[m]]) for m in mins]
+                med = [float(np.nanmedian(v)) for v in vals]
+                ax.fill_between(
+                    mins,
+                    [float(np.nanmin(v)) for v in vals],
+                    [float(np.nanmax(v)) for v in vals],
+                    color=color,
+                    alpha=0.18,
+                    linewidth=0,
+                )
+                ax.plot(mins, med, "o-", color=color, linewidth=2, markersize=4, label=label)
+                if key == "needed":
+                    m0, v0 = mins[-1], med[-1]
+                    grid = np.geomspace(mins[0], mins[-1], 20)
+                    ax.plot(
+                        grid,
+                        v0 * np.sqrt(m0 / grid),
+                        color=color,
+                        linewidth=1,
+                        linestyle=(0, (4, 3)),
+                    )
+        top.set_title(c, color=INK, fontsize=11)
+        bot.set_xlabel("total scan time (minutes, all runs)", color=INK2, fontsize=9)
+        _plain_log_ticks(top, "y")
+    lo = min(r["minutes"] for r in rows)
+    hi = max(r["minutes"] for r in rows)
+    ticks = [
+        t for t in (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180) if lo * 0.9 <= t <= hi * 1.1
+    ]
+    for ax in axes.ravel():
+        ax.set_xticks(ticks, [f"{t:g}" for t in ticks])
+        ax.xaxis.set_minor_formatter(NullFormatter())
+    axes[0, 0].set_ylabel("% signal for 80% power", color=INK2, fontsize=9)
+    axes[1, 0].set_ylabel("% x sqrt(minutes)  (lower = more per minute)", color=INK2, fontsize=9)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        fontsize=8,
+        labelcolor=INK2,
+        loc="outside lower center",
+        ncol=min(len(labels), 6),
+    )
+    fig.suptitle(
+        title
+        or "How long to scan -- analytic, fitted HRF assumed right. Dashed: 1/sqrt(T); "
+        "band: range over realizations"
+        + ("; dotted: this design" if current_minutes else ""),
+        color=INK,
+        fontsize=10,
+    )
+    return _finish(fig, path)
+
+
 def plot_design_comparison(
     results: dict[str, dict[str, Any]],
     contrast: str,

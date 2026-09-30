@@ -350,6 +350,95 @@ def _unit_noise_fit(
     return v_true, tr_MR, dof, est, rss, cross
 
 
+def scan_time_sweep(
+    spec: Any,
+    scan_times: list[float],
+    n_designs: int,
+    contrasts: dict[str, list[float] | np.ndarray],
+    noise: list[dict[str, Any]],
+    beta_pattern: list[float] | np.ndarray | None = None,
+    hrf: str = "spmg1",
+    alpha: float = 0.001,
+    target: float = 0.8,
+    poly_degree: int | None = None,
+    seed: int = 0,
+    progress: bool = True,
+) -> dict[str, Any]:
+    """Effect needed for ``target`` power as the per-run scan time varies. Analytic.
+
+    Each scan time re-resolves the experiment (counts sized to the whole
+    units that fit, runs trimmed to them -- see ExperimentSpec.run_seconds),
+    draws ``n_designs`` realizations and solves for the effect every contrast
+    needs, at every noise level. The effect is in the simulation's units: the
+    response amplitude for a condition contrast (``beta_pattern`` applied),
+    the difference itself for a difference contrast. Assumes the fitted HRF
+    is right; under a mismatch the Monte Carlo at one scan time is the
+    referee.
+
+    For a fixed design the effect falls as 1/sqrt(T), so ``per_minute``
+    (effect x sqrt(total minutes)) is flat where the design scales ideally
+    and compares designs of different lengths per unit of scan time.
+
+    Returns {'rows': one per scan time x realization x noise x contrast,
+    'skipped': {scan_time: reason}}.
+    """
+    from dataclasses import replace
+
+    from tqdm import tqdm
+
+    from fastfuncstuff.cli_utils import auto_polort
+
+    from .core import build_task_design, default_microtime_dt, hrfs_from_spec
+    from .experiment import realize
+
+    cpu = torch.device("cpu")
+    dt = default_microtime_dt(spec.tr)
+    bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
+    names = list(contrasts)
+    W = np.array([np.asarray(contrasts[c], dtype=float) for c in names])
+    pattern = np.ones(W.shape[1]) if beta_pattern is None else np.asarray(beta_pattern, float)
+    # Contrast value per unit of the swept effect.
+    per_unit = np.array([1.0 if is_difference(w) else abs(float(w @ pattern)) for w in W])
+    rows: list[dict[str, Any]] = []
+    skipped: dict[float, str] = {}
+    for st in tqdm(scan_times, desc="scan times", leave=True, disable=not progress):
+        sp = replace(spec, scan_time=float(st))
+        try:
+            reals = [realize(sp, seed + d) for d in range(n_designs)]
+        except ValueError as exc:
+            skipped[float(st)] = str(exc)
+            continue
+        for d, real in enumerate(reals):
+            X_task = build_task_design(
+                real.onsets, real.durations, sp.tr, real.run_lengths, bases, dt, device=cpu
+            )
+            lengths = list(real.run_lengths)
+            pdeg = poly_degree if poly_degree is not None else auto_polort(max(lengths) * sp.tr)
+            X = torch.cat([X_task, _nuisance(lengths, pdeg)], dim=1)
+            if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+                skipped.setdefault(float(st), "rank-deficient in some realizations")
+                continue
+            minutes = sum(lengths) * sp.tr / 60.0
+            need = _contrast_needed(X, lengths, sp.tr, W, noise, alpha, target)
+            for label, v in need.items():
+                for name, val, pu in zip(names, v, per_unit, strict=True):
+                    eff = float(val / pu) if pu > 0 else float("nan")
+                    rows.append(
+                        {
+                            "scan_time": float(st),
+                            "run_s": float(np.mean(lengths)) * sp.tr,
+                            "minutes": minutes,
+                            "counts": "/".join(str(c) for c in real.counts),
+                            "design": d,
+                            "noise": label,
+                            "contrast": name,
+                            "needed": eff,
+                            "per_minute": eff * float(np.sqrt(minutes)),
+                        }
+                    )
+    return {"rows": rows, "skipped": skipped}
+
+
 def has_mismatch(rows: list[dict[str, Any]], rtol: float = 1e-3) -> bool:
     """Whether the fitted model differs from the generating one (the estimate is biased)."""
     return any(
@@ -484,16 +573,43 @@ def design_quality(
 
     G = Xt.T @ Xt
     out["vif"] = (torch.diag(torch.linalg.inv(G)) * torch.diag(G)).numpy()
-    XtX_inv = torch.linalg.inv(X.T @ X)
-    P = XtX_inv @ X.T
     pairs = [(i, j) for i in range(n_cond) for j in range(i + 1)]
-    C = torch.zeros(len(pairs), n_p, dtype=torch.float64)
+    W = np.zeros((len(pairs), n_cond))
     for k, (i, j) in enumerate(pairs):
-        C[k, i] += 1.0
+        W[k, i] += 1.0
         if j != i:
-            C[k, j] -= 1.0
-    CP = C @ P
+            W[k, j] -= 1.0
     needed: dict[str, np.ndarray] = {}
+    for label, v in _contrast_needed(X, run_lengths, tr, W, noise, alpha, target).items():
+        m = np.full((n_cond, n_cond), np.nan)
+        for (i, j), val in zip(pairs, v, strict=True):
+            m[i, j] = m[j, i] = val
+        needed[label] = m
+    out["needed"] = needed
+    return out
+
+
+def _contrast_needed(
+    X: torch.Tensor,
+    run_lengths: list[int],
+    tr: float,
+    W: np.ndarray,
+    noise: list[dict[str, Any]],
+    alpha: float,
+    target: float,
+) -> dict[str, np.ndarray]:
+    """Contrast value (PSC) each row of weights ``W`` needs for ``target`` power.
+
+    ``X`` is the full model (task columns first, then drift). Analytic, with
+    the engine's ARMA-corrected t, so under a correct HRF it is what the
+    simulation finds. One value per row of W, per noise label.
+    """
+    n_t, n_p = X.shape
+    P = torch.linalg.inv(X.T @ X) @ X.T
+    C = torch.zeros(W.shape[0], n_p, dtype=torch.float64)
+    C[:, : W.shape[1]] = torch.as_tensor(W, dtype=torch.float64)
+    CP = C @ P
+    out: dict[str, np.ndarray] = {}
     terms: dict[tuple[float, float] | None, tuple[torch.Tensor, float]] = {}  # var, nc
     for k, cond in enumerate(noise):
         label = str(cond.get("label", f"noise{k}"))
@@ -509,11 +625,7 @@ def design_quality(
             terms[ab] = (var, _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof))
         var, nc = terms[ab]
         sd = 100.0 / float(kw["tsnr"])  # noise SD in PSC
-        m = np.full((n_cond, n_cond), np.nan)
-        for (i, j), v in zip(pairs, var.numpy(), strict=True):
-            m[i, j] = m[j, i] = nc * sd * float(np.sqrt(v))
-        needed[label] = m
-    out["needed"] = needed
+        out[label] = nc * sd * np.sqrt(var.numpy())
     return out
 
 

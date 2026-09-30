@@ -104,6 +104,18 @@ import numpy as np
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 VERDICTS = ((0.2, "hopeless"), (0.8, "marginal"), (1.01, "good"))
+SWEEP_COLS = (
+    "scan_time",
+    "run_s",
+    "minutes",
+    "counts",
+    "design",
+    "noise",
+    "contrast",
+    "needed",
+    "per_minute",
+)
+SWEEP_DESIGNS = 50  # realizations per -scan_times value: the medians settle well before
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -171,6 +183,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("-num_events", type=int, metavar="N", help="-trial units per run in total.")
     t.add_argument("-num_blocks", type=int, metavar="N", help="-block/-miniblock units per run.")
+    t.add_argument(
+        "-scan_times",
+        nargs="+",
+        type=float,
+        metavar="S",
+        help="Also sweep the per-run scan time over these values (analytic, fitted HRF "
+        "assumed right): _scantime.png/.tsv and a summary table of the effect needed and "
+        "effect x sqrt(minutes) -- how long to scan.",
+    )
     t.add_argument(
         "-ndesigns",
         type=int,
@@ -667,6 +688,48 @@ def _quality_lines(quality, conditions, conds) -> list[str]:
     return out
 
 
+def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
+    """The -scan_times table at the reference noise level: effect, and effect x sqrt(min)."""
+    rows = sweep["rows"]
+    ref = _reference_noise(conds)
+    names = [
+        c for c in contrasts if any(np.isfinite(r["needed"]) for r in rows if r["contrast"] == c)
+    ]
+    n_real = len({r["design"] for r in rows})
+    out = [
+        f"How long to scan (analytic, fitted HRF assumed right; median over {n_real} "
+        f"realization(s); {ref}):",
+        "  effect for 80% power (% signal), and in brackets effect x sqrt(total minutes): "
+        "flat = the design scales ideally, lower = more per minute of scanning",
+        f"  {'-scan_time':>10} {'run s':>6} {'counts':>8} {'total min':>9}"
+        + "".join(f"{c:>18}" for c in names),
+    ]
+    best: dict[str, tuple[float, float, float]] = {}
+    for st in sorted({r["scan_time"] for r in rows}):
+        sel = [r for r in rows if r["scan_time"] == st and r["noise"] == ref]
+        cells = []
+        for c in names:
+            v = [r for r in sel if r["contrast"] == c]
+            need = float(np.nanmedian([r["needed"] for r in v]))
+            pm = float(np.nanmedian([r["per_minute"] for r in v]))
+            cells.append(f"{f'{need:.2f} ({pm:.2f})':>18}")
+            if c not in best or pm < best[c][0]:
+                best[c] = (pm, st, sel[0]["run_s"])
+        out.append(
+            f"  {st:>10g} {sel[0]['run_s']:>6.0f} {sel[0]['counts']:>8} "
+            f"{sel[0]['minutes']:>9.1f}" + "".join(cells)
+        )
+    for st, why in sweep["skipped"].items():
+        out.append(f"  {st:>10g}  skipped: {why}")
+    now = float(np.mean([sum(r.run_lengths) for r in reals])) * tr
+    out.append(
+        "  most per minute: "
+        + "; ".join(f"{c} at {b[1]:g} ({b[2]:.0f} s runs, {b[0]:.2f})" for c, b in best.items())
+        + f". This design: {now / 60:.1f} min."
+    )
+    return out
+
+
 def _run_compare(args) -> int:
     from fastfuncstuff.simulation.power import compare_designs, load_power_table
 
@@ -753,6 +816,9 @@ def _run_compare(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import time
+
+    started = time.time() - 1.0  # files written from here on (mtime resolution)
     args = _build_parser().parse_args(argv)
     if args.compare:
         return _run_compare(args)
@@ -809,6 +875,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    sweep = None
+    if args.scan_times:
+        from dataclasses import replace
+
+        from fastfuncstuff.simulation.power import scan_time_sweep
+
+        if not described or not replace(spec, scan_time=1.0).scan_sized():
+            print(
+                "ERROR: -scan_times needs a described experiment whose counts -scan_time "
+                "sets (a family without -num_events/-num_blocks); otherwise longer runs "
+                "only add fixation",
+                file=sys.stderr,
+            )
+            return 1
+        sweep = scan_time_sweep(
+            spec,
+            sorted(args.scan_times),
+            min(args.ndesigns, SWEEP_DESIGNS),
+            contrasts,
+            conds,
+            beta_pattern=pattern,
+            hrf=args.hrf,
+            alpha=args.alpha,
+            poly_degree=args.polort,
+            seed=args.seed,
+        )
+
     device = setup_device(args.device)
     res = simulate_realizations_power(
         reals,
@@ -833,8 +926,15 @@ def main(argv: list[str] | None = None) -> int:
     summary = _summarise(
         res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality
     )
+    if sweep is not None:
+        summary += "\n\n" + "\n".join(_sweep_lines(sweep, conds, contrasts, reals, args.tr))
     print(summary)
     Path(f"{prefix}_summary.txt").write_text(summary + "\n")
+    if sweep is not None:
+        with open(f"{prefix}_scantime.tsv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(SWEEP_COLS), delimiter="\t")
+            w.writeheader()
+            w.writerows(sweep["rows"])
 
     cols = [
         "design",
@@ -922,6 +1022,16 @@ def main(argv: list[str] | None = None) -> int:
             path=f"{prefix}_voxels.png",
         )
         ref = _reference_noise(conds)
+        if sweep is not None and sweep["rows"]:
+            from fastfuncstuff.simulation.plots import plot_scan_time
+
+            plot_scan_time(
+                sweep,
+                [c["label"] for c in conds],
+                list(contrasts),
+                current_minutes=float(np.mean([sum(r.run_lengths) for r in reals])) * args.tr / 60,
+                path=f"{prefix}_scantime.png",
+            )
         if len(reals) > 1:
             from fastfuncstuff.simulation.plots import plot_design_spread
 
@@ -936,10 +1046,12 @@ def main(argv: list[str] | None = None) -> int:
             path=f"{prefix}_design.png",
             title="Events, first realization, run 1",
         )
-    print(
-        f"\nwrote {prefix}_summary.txt, _power.tsv, _spec.json"
-        + ("" if args.no_plots else ", _power.png, _design.png")
+    written = sorted(
+        str(q.name).removeprefix(prefix.name)
+        for q in prefix.parent.glob(f"{prefix.name}_*")
+        if q.stat().st_mtime >= started
     )
+    print(f"\nwrote {prefix}: " + ", ".join(written))
     return 0
 
 
