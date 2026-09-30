@@ -58,7 +58,7 @@ def _finish(fig, path: str | Path | None):
     if path is not None:
         import matplotlib.pyplot as plt
 
-        fig.savefig(path, dpi=130, facecolor=SURFACE)
+        fig.savefig(path, dpi=200, facecolor=SURFACE)
         plt.close(fig)
     return fig
 
