@@ -188,11 +188,15 @@ def pareto_front(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     ok = np.isfinite(x) & np.isfinite(y)
     front = np.zeros(len(x), dtype=bool)
     best_y = np.inf
-    for k in np.argsort(np.where(ok, x, np.inf), kind="stable"):
+    best_x = np.inf
+    for k in np.lexsort((y, np.where(ok, x, np.inf))):
         if not ok[k]:
             break
         if y[k] < best_y:
             front[k], best_y = True, y[k]
+            best_x = x[k]
+        elif x[k] == best_x and y[k] == best_y:
+            front[k] = True
     return front
 
 

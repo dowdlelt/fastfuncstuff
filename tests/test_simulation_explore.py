@@ -42,6 +42,15 @@ def test_pareto_front_and_shortlist():
     assert shortlist(x, front, 2) == [0, 2]  # the two ends, best detection first
 
 
+def test_pareto_ties_do_not_keep_dominated_points():
+    assert pareto_front(np.array([1, 1, 1, 2]), np.array([2, 1, 1, 1])).tolist() == [
+        False,
+        True,
+        True,
+        False,
+    ]
+
+
 def test_explore_writes_a_small_set_of_outputs(tmp_path, capsys):
     from fastfuncstuff.cli.simulate import main
 

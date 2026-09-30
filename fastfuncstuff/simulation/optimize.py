@@ -201,10 +201,13 @@ def score_flags(goals: dict[str, float] | str) -> dict[str, bool]:
 def combine(values: dict[str, float], goals: dict[str, float], typical: dict[str, float]) -> float:
     """Weighted mean of goals, each relative to its typical value (1.0: typical on all)."""
     total = sum(goals.values())
-    return float(
-        sum(w * values[g] / typical[g] for g, w in goals.items() if w > 0 and typical[g] > 0)
-        / total
-    )
+    if any(
+        not np.isfinite(typical[g]) or typical[g] <= 0 or not np.isfinite(values[g])
+        for g, w in goals.items()
+        if w > 0
+    ):
+        return float("inf")
+    return float(sum(w * values[g] / typical[g] for g, w in goals.items() if w > 0) / total)
 
 
 def make_fitness(
@@ -269,4 +272,11 @@ def make_fitness(
         g: float(np.median([v[g] for v in ref_vals if np.isfinite(v[g])] or [np.nan]))
         for g in goals
     }
+    invalid = [
+        g for g, w in goals.items() if w > 0 and (not np.isfinite(typical[g]) or typical[g] <= 0)
+    ]
+    if invalid:
+        raise ValueError(
+            "combined objective has no positive finite reference for: " + ", ".join(invalid)
+        )
     return lambda real: combine(values(real), goals, typical)

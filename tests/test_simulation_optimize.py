@@ -93,6 +93,13 @@ def test_combined_goals_are_scaled_to_a_typical_design():
 
     assert parse_goals("detection=1, shape=0.5") == {"detection": 1.0, "shape": 0.5}
     assert parse_goals("trials") == {"trials": 1.0}
+    assert np.isinf(
+        combine(
+            {"detection": 1.0, "shape": np.inf},
+            {"detection": 1.0, "shape": 1.0},
+            {"detection": 1.0, "shape": np.nan},
+        )
+    )
     with pytest.raises(ValueError):
         parse_goals("shape=0")
     # 1.0 is typical on every goal; each goal counts by its weight
