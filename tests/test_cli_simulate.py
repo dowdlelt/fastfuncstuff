@@ -375,3 +375,14 @@ def test_shared_is_reported_and_recorded(tmp_path, capsys):
     assert spec["shared"] == 3.0
     rows = _rows(tmp_path / "sh")
     assert {r["swept"] for r in rows} == {"difference"}
+
+
+def test_effect_verdict_follows_monte_carlo_under_mismatch():
+    from fastfuncstuff.cli.simulate import _effect_cell
+
+    # The analytic curve overstated Monte Carlo 13x under a wrong HRF; a verdict
+    # read off it called a hopeless design good.
+    sel = [{"true_effect": 1.0, "power_predicted": 0.9, "power": 0.05}]
+    assert _effect_cell(sel, "power").endswith("hopeless")
+    assert _effect_cell(sel, "power_predicted").endswith("good")
+    assert _effect_cell([{**sel[0], "true_effect": 0.0}], "power") == "no true effect"

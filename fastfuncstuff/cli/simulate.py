@@ -381,6 +381,20 @@ def _verdict(power: float) -> str:
     return next(label for cut, label in VERDICTS if power < cut)
 
 
+def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
+    """'analytic / Monte Carlo  verdict' for one noise x contrast at -effect.
+
+    The verdict follows ``column`` (see :func:`power_column`): under an HRF
+    mismatch the analytic power overstated Monte Carlo 13x (0.137 vs 0.010),
+    enough to call a hopeless design marginal.
+    """
+    if abs(sel[0]["true_effect"]) < 1e-12:
+        return "no true effect"
+    pa = float(np.median([r["power_predicted"] for r in sel]))
+    pm = float(np.mean([r["power"] for r in sel]))
+    return f"{pa:>6.2f} / {pm:.2f} {_verdict(pm if column == 'power' else pa):>9}"
+
+
 def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_text) -> str:
     from fastfuncstuff.simulation.power import amplitude_for_power, has_true_effect, is_difference
 
@@ -430,7 +444,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
     out += ["", f"threshold: two-tailed p < {args.alpha:g}; {args.nreps} replicates per cell", ""]
 
     # Amplitude needed, from the analytic curve, across realizations.
-    from fastfuncstuff.simulation.power import has_mismatch
+    from fastfuncstuff.simulation.power import has_mismatch, power_column
 
     over = "realizations" + (" x true HRFs" if len(truths) > 1 else "")
     if has_mismatch(rows):
@@ -520,10 +534,12 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
                 )
 
     if args.effect is not None:
+        column = power_column(rows)
+        judged = "Monte Carlo" if column == "power" else "analytic"
         out += [
             "",
             f"At {args.effect:g}% signal change -- amplitude, or difference for A-B "
-            "(power, analytic / Monte Carlo):",
+            f"(power, analytic / Monte Carlo; verdict from {judged}):",
         ]
         out.append(f"{'noise':<24}" + "".join(f"{c:>22}" for c in contrasts))
         for cond in conds:
@@ -536,12 +552,7 @@ def _summarise(res, reals, conds, contrasts, pattern, args, spec_text, profile_t
                     and r["contrast"] == c
                     and abs(r["amplitude"] - args.effect) < 1e-6
                 ]
-                pa = float(np.median([r["power_predicted"] for r in sel]))
-                pm = float(np.mean([r["power"] for r in sel]))
-                if abs(sel[0]["true_effect"]) < 1e-12:
-                    cells.append(f"{'no true effect':>22}")
-                else:
-                    cells.append(f"{pa:>6.2f} / {pm:.2f} {_verdict(pa):>9}")
+                cells.append(f"{_effect_cell(sel, column):>22}")
             out.append(f"{cond['label']:<24}" + "".join(cells))
         out.append("  hopeless < 0.2 <= marginal < 0.8 <= good")
     return "\n".join(out)
