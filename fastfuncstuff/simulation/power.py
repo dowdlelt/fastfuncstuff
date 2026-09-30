@@ -41,8 +41,10 @@ def _two_tailed_power(crit: float, dof: float, nc: float | np.ndarray) -> Any:
     wrong-sign tail it would contribute is < 1e-50 anyway.
     """
     nc = np.abs(np.asarray(nc, dtype=float))
-    far = stats.nct.cdf(-crit, dof, nc)
-    out = stats.nct.sf(crit, dof, nc) + np.where(np.isnan(far), 0.0, far)
+    # Reflection evaluates both tails in one distribution call, without 1-CDF
+    # cancellation in the detection tail.
+    near, far = stats.nct.sf(crit, dof, np.stack((nc, -nc)))
+    out = near + np.where(np.isnan(far), 0.0, far)
     return float(out) if np.ndim(out) == 0 else out
 
 
@@ -62,8 +64,14 @@ def _noise_arma(noise: dict[str, Any], tr: float) -> tuple[float, float] | None:
         f = float(noise.get("phys_fraction", 0.5))
         if f == 0.0:
             return None
-        a, b = (float(v) for v in ou_to_arma11(tr, float(noise.get("tau", 6.0)), f))
+        a, b = _ou_arma_parameters(tr, float(noise.get("tau", 6.0)), f)
     return None if a == 0.0 and b == 0.0 else (a, b)
+
+
+@lru_cache(maxsize=128)
+def _ou_arma_parameters(tr: float, tau: float, fraction: float) -> tuple[float, float]:
+    a, b = ou_to_arma11(tr, tau, fraction)
+    return float(a), float(b)
 
 
 @lru_cache(maxsize=64)
@@ -665,7 +673,18 @@ def _nc_for_power(target: float, crit: float, dof: float) -> float:
     """Noncentrality at which two-tailed power reaches ``target``."""
     from scipy.optimize import brentq
 
-    return float(brentq(lambda nc: _two_tailed_power(crit, dof, nc) - target, 0.0, 200.0))
+    upper = min(200.0, max(8.0, crit))
+    value = _two_tailed_power(crit, dof, upper) - target
+    while value < 0 and upper < 200.0:
+        upper = min(200.0, 2 * upper)
+        value = _two_tailed_power(crit, dof, upper) - target
+    return float(
+        brentq(
+            lambda nc: value if nc == upper else _two_tailed_power(crit, dof, nc) - target,
+            0.0,
+            upper,
+        )
+    )
 
 
 def design_quality(

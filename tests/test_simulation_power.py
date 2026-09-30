@@ -128,6 +128,42 @@ def test_large_effects_do_not_produce_nan_power():
     assert _two_tailed_power(3.3, 150, 0.0) == pytest.approx(0.0012, abs=2e-4)
 
 
+@pytest.mark.parametrize("dof", [2, 10, 150])
+@pytest.mark.parametrize("alpha", [0.05, 0.001])
+@pytest.mark.parametrize("target", [0.5, 0.8, 0.99])
+def test_fast_power_root_matches_separate_tail_reference(dof, alpha, target):
+    from scipy import stats
+    from scipy.optimize import brentq
+
+    from fastfuncstuff.simulation.power import _nc_for_power, _two_tailed_power
+
+    crit = stats.t.ppf(1 - alpha / 2, dof)
+
+    def reference(nc):
+        far = stats.nct.cdf(-crit, dof, nc)
+        return stats.nct.sf(crit, dof, nc) + (0.0 if np.isnan(far) else far)
+
+    expected = brentq(lambda nc: reference(nc) - target, 0.0, 200.0)
+    actual = _nc_for_power(target, crit, dof)
+    assert actual == pytest.approx(expected, abs=1e-9)
+    values = np.array([-actual, 0.0, actual, 40.0])
+    np.testing.assert_allclose(
+        _two_tailed_power(crit, dof, values), [reference(abs(n)) for n in values], atol=1e-14
+    )
+
+
+def test_cached_ou_parameters_follow_changed_noise_settings():
+    from fastfuncstuff.simulation.noise import ou_to_arma11
+    from fastfuncstuff.simulation.power import _noise_arma, _ou_arma_parameters
+
+    _ou_arma_parameters.cache_clear()
+    noise = {"tau": 6.0, "phys_fraction": 0.5}
+    for tr, tau, fraction in [(1.0, 6.0, 0.5), (1.0, 6.0, 0.5), (0.5, 6.0, 0.5), (0.5, 8.0, 0.8)]:
+        noise.update(tau=tau, phys_fraction=fraction)
+        assert _noise_arma(noise, tr) == tuple(float(v) for v in ou_to_arma11(tr, tau, fraction))
+    assert _ou_arma_parameters.cache_info().hits == 1
+
+
 def test_analytic_power_accounts_for_hrf_mismatch():
     """With a late true response the analytic curve must follow the biased estimate."""
     res = _run(
