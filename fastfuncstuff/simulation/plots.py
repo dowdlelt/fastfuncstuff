@@ -1459,6 +1459,63 @@ def plot_robustness(
     return _finish(fig, path)
 
 
+def plot_tsnr(
+    curves: dict[str, np.ndarray],
+    tsnr: np.ndarray,
+    points: dict[str, list[tuple[float, float]]] | None = None,
+    effects: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0),
+    target: float = 0.8,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """What tSNR a design needs: the effect needed against tSNR, per contrast.
+
+    Lines: analytic, median over realizations (for a fixed noise ARMA the effect
+    needed scales exactly with the noise SD, 100/tSNR). Dots: the Monte Carlo
+    at the simulated tSNR levels. The grey lines are effects of 0.25-2%%: where a
+    contrast's line crosses one is the tSNR that effect needs -- read off below.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.2))
+    fig.patch.set_facecolor(SURFACE)
+    _style(ax)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    notes = []
+    for q, (c, need) in enumerate(curves.items()):
+        col = CATEGORICAL[q % len(CATEGORICAL)]
+        ax.plot(tsnr, need, color=col, linewidth=2.2, label=c)
+        if points and points.get(c):
+            px, py = np.array(points[c], dtype=float).T
+            ax.plot(px, py, "o", color=col, markersize=6, markeredgecolor=SURFACE)
+        cross = []
+        for e in effects:
+            # need falls with tSNR; the tSNR where it reaches e (log-linear interpolation)
+            if need.min() <= e <= need.max():
+                cross.append(
+                    f"{e:g}% at tSNR {np.exp(np.interp(np.log(e), np.log(need[::-1]), np.log(tsnr[::-1]))):.0f}"
+                )
+        if cross:
+            notes.append(f"{c}: " + ", ".join(cross))
+    for e in effects:
+        ax.axhline(e, color=GRID, linewidth=1.2, zorder=0)
+        ax.annotate(f"{e:g}%", (tsnr[-1], e), xytext=(3, 0), textcoords="offset points",
+                    fontsize=7.5, color=INK2, va="center")  # fmt: skip
+    _plain_log_ticks(ax, "x")
+    _plain_log_ticks(ax, "y")
+    ax.set_xlabel("tSNR", color=INK2, fontsize=9)
+    ax.set_ylabel(f"% signal for {target:.0%} power", color=INK2, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper right")
+    ax.set_title(title or "What tSNR this design needs -- lines analytic, dots Monte Carlo",
+                 color=INK, fontsize=10, loc="left")  # fmt: skip
+    if notes:
+        fig.text(0.01, 0.01, "tSNR needed:  " + ";   ".join(notes), fontsize=7.5, color=INK2,
+                 ha="left", va="bottom", wrap=True)  # fmt: skip
+    fig.tight_layout(rect=(0, 0.06 if notes else 0, 1, 1))
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

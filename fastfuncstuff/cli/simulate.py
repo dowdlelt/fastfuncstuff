@@ -2219,6 +2219,34 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 live, args.hrf, ref, args.target, path=f"{prefix}_robust.png",
             )  # fmt: skip
+        if live:
+            from fastfuncstuff.simulation.plots import plot_tsnr
+            from fastfuncstuff.simulation.power import RealizationScorer, effect_needed
+
+            # One noise level at tSNR 100 with this run's physiology; the effect
+            # needed scales with the noise SD, so it gives every tSNR.
+            unit_noise = [{"label": "t100", "tsnr": 100.0, "phys_fraction": args.phys_fraction,
+                           "tau": args.tau}]  # fmt: skip
+            t_scorer = RealizationScorer(
+                args.tr, {c: contrasts[c] for c in live}, unit_noise, pattern, args.hrf,
+                args.alpha, args.target, poly_degree=args.polort,
+            )  # fmt: skip
+            t_scores = [sc for sc in (t_scorer.score(r, shape=False) for r in reals[:10]) if sc]
+            grid = np.geomspace(10, 300, 60)
+            curves = {
+                c: np.median([sc["needed"][("t100", c)] for sc in t_scores]) * 100.0 / grid
+                for c in live
+            }
+            need_mc = effect_needed(res, args.target)
+            points = {
+                c: [
+                    (float(n["tsnr"]), float(np.nanmedian(need_mc[(n["label"], c)])))
+                    for n in conds
+                    if "arma" not in n and np.isfinite(need_mc[(n["label"], c)]).any()
+                ]
+                for c in live
+            }
+            plot_tsnr(curves, grid, points, target=args.target, path=f"{prefix}_tsnr.png")
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

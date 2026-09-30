@@ -175,3 +175,14 @@ def test_soa_sweep_and_liu_plane(tmp_path):
              path=tmp_path / "l.png")  # fmt: skip
     for name in ("s.png", "l.png"):
         assert (tmp_path / name).stat().st_size > 10_000
+
+
+def test_tsnr_figure_reads_off_the_tsnr_an_effect_needs(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_tsnr
+
+    grid = np.geomspace(10, 300, 40)
+    fig = plot_tsnr({"A": 55.0 / grid}, grid, {"A": [(55.0, 1.0)]})
+    text = " ".join(t.get_text() for t in fig.texts)
+    assert "1% at tSNR 55" in text and "0.5% at tSNR 110" in text
+    plot_tsnr({"A": 55.0 / grid}, grid, path=tmp_path / "t.png")
+    assert (tmp_path / "t.png").stat().st_size > 10_000
