@@ -196,6 +196,25 @@ class TestCountsAndScanTime:
         with pytest.raises(ValueError, match="more than -scan_time"):
             spec.resolve_counts()
 
+    def test_scan_time_never_rounds_past_the_scan(self):
+        # 45 s blocks + 10 s gaps fill 330 s with 5.73 blocks: rounding to 6
+        # needed 345 s, and the tool refused the count it had chosen itself.
+        spec = ExperimentSpec(
+            units=[
+                Unit.parse("E1", "E1:45", 1, family="block"),
+                Unit.parse("E2", "E2:45", 1, family="block"),
+            ],
+            tr=1.0,
+            isi=Interval.parse(10),
+            initial_fix=10,
+            post_fix=15,
+            scan_time=330,
+        )
+        counts = spec.resolve_counts()
+        assert sum(counts) == 5
+        assert spec.expected_duration([float(c) for c in counts]) <= 330
+        assert "uneven counts (3/2 per run)" in spec.describe()
+
     def test_fixed_counts_under_scan_time_keep_the_volumes(self):
         spec = ExperimentSpec(
             units=[Unit.parse("A", "A:2", 1)], scan_time=300, num_events=10, **self.BASE

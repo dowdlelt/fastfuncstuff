@@ -286,19 +286,37 @@ class ExperimentSpec:
                 lo, hi = (mid, hi) if d < self.scan_time else (lo, mid)
             scale(free, lo)
 
-        # Round each family to whole units, preserving its total (largest remainder).
-        out = [0] * len(counts)
-        for fam in (events, nulls, blocks):
-            if not fam:
-                continue
-            total = int(round(sum(counts[i] for i in fam)))
-            floors = {i: int(np.floor(counts[i])) for i in fam}
-            spare = total - sum(floors.values())
-            for i in sorted(fam, key=lambda i: counts[i] - floors[i], reverse=True)[
-                : max(spare, 0)
-            ]:
-                floors[i] += 1
-            out = [floors.get(i, c) for i, c in enumerate(out)]
+        def whole(down: set[int]) -> list[int]:
+            """Each family to whole units, preserving its total (largest remainder).
+
+            Families in ``down`` take the floor of their total instead of the
+            nearest whole number.
+            """
+            out = [0] * len(counts)
+            for fam in (events, nulls, blocks):
+                if not fam:
+                    continue
+                exact = sum(counts[i] for i in fam)
+                total = int(np.floor(exact + 1e-9)) if set(fam) & down else int(round(exact))
+                floors = {i: int(np.floor(counts[i])) for i in fam}
+                spare = total - sum(floors.values())
+                for i in sorted(fam, key=lambda i: counts[i] - floors[i], reverse=True)[
+                    : max(spare, 0)
+                ]:
+                    floors[i] += 1
+                out = [floors.get(i, c) for i, c in enumerate(out)]
+            return out
+
+        out = whole(set())
+        if (
+            self.scan_time is not None
+            and free
+            and self.expected_duration([float(c) for c in out]) > self.scan_time * 1.02
+        ):
+            # The families scan_time sized were rounded up past the scan (5.73
+            # blocks -> 6, needing 345 s of a 330 s run). Refusing a count the
+            # tool chose itself is wrong: take the largest that fits.
+            out = whole(set(free))
         for i, u in enumerate(self.units):
             if out[i] < 1 and not u.is_null:
                 raise ValueError(
@@ -333,6 +351,17 @@ class ExperimentSpec:
                 for it in u.items
             )
             lines.append(f"  {u.family:<5} {u.name:<10} x{c:<4} [{items}]")
+        for fam, flag in (("event", "-num_events"), ("block", "-num_blocks")):
+            idx = [i for i, u in enumerate(self.units) if u.family == fam and not u.is_null]
+            got = {counts[i] for i in idx}
+            if len({self.units[i].count for i in idx}) == 1 and len(got) > 1:
+                k = len(idx)
+                lines.append(
+                    f"  note: equally weighted {fam} units got uneven counts "
+                    f"({'/'.join(str(counts[i]) for i in idx)} per run): {sum(counts[i] for i in idx)} "
+                    f"is not a multiple of {k}. For a balanced design set {flag} to a "
+                    f"multiple of {k}, or change -scan_time."
+                )
         return "\n".join(lines)
 
 
