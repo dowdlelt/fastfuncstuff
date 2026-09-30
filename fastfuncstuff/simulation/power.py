@@ -850,29 +850,24 @@ def estimation_quality(
 def trial_regressors(realization: Any, tr: float, bases: torch.Tensor, dt: float) -> tuple:
     """One regressor per trial (unit peak, like the condition regressors they sum to).
 
+    The GLM tools' builder in its single-trial mode: one convolution per
+    condition, trials in chronological order -- building each trial as its own
+    condition took one convolution per trial (72 of 232 ms at 218 trials).
     Returns (X (n_t, n_trials), condition index of each trial).
     """
-    from .core import build_task_design
+    from fastfuncstuff.design.matrices import build_event_design_microtime
 
-    n_runs = len(realization.run_lengths)
-    trials = [
-        (q, run, t)
-        for q, per in enumerate(realization.onsets)
-        for run, arr in enumerate(per)
-        for t in arr
-    ]
-    onsets = [[np.array([t]) if r == run else np.array([]) for r in range(n_runs)]
-              for _, run, t in trials]  # fmt: skip
-    X = build_task_design(
-        onsets,
-        [realization.durations[q] for q, _, _ in trials],
-        tr,
-        realization.run_lengths,
-        bases,
-        dt,
+    _, X, cond, _ = build_event_design_microtime(
+        all_onsets=[[np.asarray(r, dtype=np.float64) for r in c] for c in realization.onsets],
+        durations=list(realization.durations),
+        hrf_bases=bases,
+        n_timepoints_per_run=list(realization.run_lengths),
+        tr=tr,
+        microtime_dt=dt,
         device=torch.device("cpu"),
-    ).double()
-    return X, np.array([q for q, _, _ in trials], dtype=int)
+        return_single_trials=True,
+    )
+    return X.double(), np.asarray(cond, dtype=int)
 
 
 def single_trial_quality(
@@ -951,10 +946,24 @@ def single_trial_quality(
     off = W - torch.diag(torch.diagonal(W))
     leak = torch.sqrt((off * off).sum(dim=1)).numpy()
 
-    # LSA: all trials at once.
-    X = torch.cat([Xt, D], dim=1)
-    lsa_ok = int(torch.linalg.matrix_rank(X)) == X.shape[1]
-    P = torch.linalg.inv(X.T @ X) @ X.T if lsa_ok else None
+    # LSA and ridge work on the drift-projected trial regressors (ridge must not
+    # shrink the drift), through one SVD Xp = U S V'. LSA is estimable iff Xp has
+    # full column rank, and its per-trial variance is diag(V S^-1 B S^-1 V') with
+    # B = U'RU -- no second SVD for the rank, no separate solve.
+    Qd, _ = torch.linalg.qr(D)
+    Xp = Xt - Qd @ (Qd.T @ Xt)
+    Ux, sx, Vh = torch.linalg.svd(Xp, full_matrices=False)
+    V = Vh.T
+    lsa_ok = float(sx.min()) > 1e-8 * float(sx.max())
+    Vs = V / sx
+    b_cache: dict[tuple[float, float] | None, torch.Tensor] = {}
+
+    def noise_basis(ab):
+        """B = U'RU for a noise ARMA (shared by LSA and ridge)."""
+        if ab not in b_cache:
+            R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
+            b_cache[ab] = Ux.T @ Ux if R is None else Ux.T @ R @ Ux
+        return b_cache[ab]
 
     out: dict[str, Any] = {"n_trials": n_tr, "lss_sd": {}, "lsa_sd": {}}
     out["leakage"] = np.array([float(np.nanmedian(leak[cond == q])) for q in range(n_cond)])
@@ -966,12 +975,10 @@ def single_trial_quality(
         if ab not in cache:  # every -tsnr level shares (a, b)
             R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
             lss = (A * A).sum(1) if R is None else ((A @ R) * A).sum(1)
-            if P is None:
+            if not lsa_ok:
                 lsa = torch.full((n_tr,), float("inf"), dtype=torch.float64)
-            elif R is None:
-                lsa = torch.diagonal(P @ P.T)[:n_tr]
             else:
-                lsa = torch.diagonal(_corrected_terms(X, P, R)[0])[:n_tr]
+                lsa = ((Vs @ noise_basis(ab)) * Vs).sum(1)
             cache[ab] = (lss.sqrt().numpy(), lsa.sqrt().numpy())
         sd = 100.0 / float(kw["tsnr"])
         lss_sd, lsa_sd = cache[ab]
@@ -982,50 +989,63 @@ def single_trial_quality(
             [sd * float(np.nanmedian(lsa_sd[cond == q])) for q in range(n_cond)]
         )
 
-    # Trial-pattern reliability for LSS, LSA and ridge, on the drift-projected
-    # trial regressors (ridge must not shrink the drift).
-    Qd, _ = torch.linalg.qr(D)
-    Xp = Xt - Qd @ (Qd.T @ Xt)
-    Ux, sx, Vh = torch.linalg.svd(Xp, full_matrices=False)
-    V = Vh.T
+    # Trial-pattern reliability for LSS, LSA and ridge.
     same = torch.as_tensor(cond[:, None] == cond[None, :], dtype=torch.float64)
     Cc = torch.eye(n_tr, dtype=torch.float64) - same / same.sum(dim=1, keepdim=True)
     ones = torch.ones(n_tr, dtype=torch.float64)
     mu, tau2 = float(mean_response), float(trial_sd) ** 2
     s2 = sx**2
-    lams = [0.0] if float(sx.min()) > 1e-8 * float(sx.max()) else []
+    lams = [0.0] if lsa_ok else []
     lams += (float(torch.median(s2)) * np.logspace(-3, 2, 26)).tolist()
+    # Ridge in the SVD basis Xp = U S V': Z = V g V', N = var V d B d V' with
+    # g = s^2/(s^2+lam), d = s/(s^2+lam), B = U'RU. With M = V'CV (C centres
+    # within condition) every trace below is a quadratic form in g or d, so the
+    # whole lambda grid costs O(n^2) per lambda instead of several n^3 products
+    # -- and the noise enters as one scalar per level. 70 of 232 ms before.
+    Mv = V.T @ Cc @ V
+    MM = Mv * Mv
+    a = V.T @ ones
+    e_dd = tau2 * float(torch.trace(Cc))
+    sig = []  # per lambda: (lam, g, d, tau2 tr(CZC), signal part of E|d_hat|^2)
+    for lam in lams:
+        g, d = s2 / (s2 + lam), sx / (s2 + lam)
+        ag = a * g
+        e_hd = tau2 * float((g * torch.diagonal(Mv)).sum())
+        e_sig = tau2 * float(g @ MM @ g) + mu**2 * float(ag @ Mv @ ag)
+        sig.append((lam, g, d, e_hd, e_sig))
     out["reliability"] = {}
-    urc: dict[tuple[float, float] | None, torch.Tensor] = {}
+    urc: dict[tuple[float, float] | None, tuple] = {}
     for i, c in enumerate(noise):
         label = str(c.get("label", f"noise{i}"))
         kw = {key: v for key, v in c.items() if key != "label"}
         ab = _noise_arma(kw, tr)
-        R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
-        if ab not in urc:
-            urc[ab] = Ux.T @ Ux if R is None else Ux.T @ R @ Ux
+        if ab not in urc:  # everything noise-shaped depends on (a, b) only
+            R = None if ab is None else _block_correlation(tuple(lengths), *ab, False)
+            B = noise_basis(ab)
+            BM = B * Mv
+            per_lam = [
+                (float(d @ BM @ d), float((d * d * torch.diagonal(B)).sum()))
+                for _, _, d, _, _ in sig
+            ]
+            AR = A if R is None else A @ R
+            urc[ab] = (per_lam, AR @ A.T)
+        per_lam, ARA = urc[ab]
         var = (100.0 / float(kw["tsnr"])) ** 2
-        rel = {}
-        # LSS: estimator rows A (all trials), including noise through R.
-        N_lss = var * ((A @ A.T) if R is None else A @ R @ A.T)
-        rel["lss"] = _trial_reliability(
-            torch.nan_to_num(W), torch.nan_to_num(N_lss), Cc, ones, mu, tau2
-        )
+        rel = {
+            "lss": _trial_reliability(
+                torch.nan_to_num(W), torch.nan_to_num(var * ARA), Cc, ones, mu, tau2
+            )
+        }
         # The least shrinkage within a hair of the best: a correlation is blind to
         # scaling, so with barely-overlapping trials it is flat in lambda and the
         # plain argmax reported a meaningless fraction of 0.01.
         scan = []
         e0 = None
-        for lam in lams:
-            d = sx / (s2 + lam)
-            Z = (V * (s2 / (s2 + lam))) @ V.T
-            N = var * (V * d) @ urc[ab] @ (V * d).T
-            r = _trial_reliability(Z, N, Cc, ones, mu, tau2)
-            e_b = (
-                mu**2 * float((Z @ ones) @ (Z @ ones))
-                + tau2 * float((Z * Z).sum())
-                + float(torch.trace(N))
-            )
+        for (lam, g, _, e_hd, e_sig), (n_cm, n_tr_) in zip(sig, per_lam, strict=True):
+            e_hh = e_sig + var * n_cm
+            r = e_hd / float(np.sqrt(e_hh * e_dd)) if e_hh > 0 and e_dd > 0 else 0.0
+            ag = a * g
+            e_b = mu**2 * float(ag @ ag) + tau2 * float(g @ g) + var * n_tr_
             if lam == 0.0:
                 rel["lsa"], e0 = r, e_b
             scan.append((lam, r, e_b))
