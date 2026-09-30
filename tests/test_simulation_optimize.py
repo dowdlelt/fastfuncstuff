@@ -6,6 +6,7 @@ import copy
 from collections import Counter
 
 import numpy as np
+import pytest
 
 from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, draw_plans
 from fastfuncstuff.simulation.optimize import evolve, longest_repeat, mutate
@@ -84,3 +85,27 @@ def test_a_population_of_one_still_evolves():
     res = evolve(_spec(), lambda r: float(len(r.onsets[0][0])), population=1, generations=2,
                  progress=False)  # fmt: skip
     assert len(res["history"]) == 2
+
+
+def test_combined_goals_are_scaled_to_a_typical_design():
+    from fastfuncstuff.simulation.experiment import realize
+    from fastfuncstuff.simulation.optimize import combine, make_fitness, parse_goals
+
+    assert parse_goals("detection=1, shape=0.5") == {"detection": 1.0, "shape": 0.5}
+    assert parse_goals("trials") == {"trials": 1.0}
+    with pytest.raises(ValueError):
+        parse_goals("shape=0")
+    # 1.0 is typical on every goal; each goal counts by its weight
+    goals = {"detection": 2.0, "shape": 1.0}
+    assert combine({"detection": 1.0, "shape": 3.0}, goals, {"detection": 1.0, "shape": 3.0}) == 1.0
+    assert combine({"detection": 0.5, "shape": 3.0}, goals, {"detection": 1.0, "shape": 3.0}) == (
+        pytest.approx((2 * 0.5 + 1) / 3)
+    )
+    spec = _spec()
+    noise = [{"label": "t60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}]
+    args = (1.0, {"A-B": [1, -1]}, noise, None, "detection=1,shape=1", "t60", ["spmg1"])
+    with pytest.raises(ValueError, match="reference"):
+        make_fitness(*args)
+    draws = [realize(spec, s) for s in range(9)]
+    fit = make_fitness(*args, reference=draws)
+    assert np.median([fit(r) for r in draws]) == pytest.approx(1.0, abs=0.15)

@@ -166,6 +166,47 @@ ROBUST_HRFS = ("lib:0", "lib:6", "lib:13", "lib:19")  # fast to slow, beside the
 HELD_OUT_HRFS = ("lib:2", "lib:9", "lib:16")  # never trained on: the generalization check
 
 
+def parse_goals(objective: str) -> dict[str, float]:
+    """'detection=1,shape=0.5' -> {'detection': 1.0, 'shape': 0.5}; 'shape' -> {'shape': 1.0}."""
+    goals: dict[str, float] = {}
+    for part in (p.strip() for p in objective.split(",")):
+        if not part:
+            continue
+        name, _, w = part.partition("=")
+        goals[name.strip()] = float(w) if w.strip() else 1.0
+    if not goals or any(w < 0 for w in goals.values()) or sum(goals.values()) <= 0:
+        raise ValueError(f"objective {objective!r}: goals need non-negative weights, not all 0")
+    return goals
+
+
+def goal_value(score: dict[str, Any] | None, goal: str, ref_noise: str) -> float:
+    """One goal's value (lower better) from a RealizationScorer score."""
+    if score is None:
+        return np.inf
+    if goal == "shape":
+        return score["shape_sd"][ref_noise]
+    if goal == "trials":
+        return score["unreliability"][ref_noise]
+    if goal == "shape_diff":
+        return score["shape_steps"][ref_noise]
+    return score["needed"][(ref_noise, goal)]
+
+
+def score_flags(goals: dict[str, float] | str) -> dict[str, bool]:
+    """Which optional analyses a set of goals needs from RealizationScorer.score."""
+    g = parse_goals(goals) if isinstance(goals, str) else goals
+    return {"shape": "shape" in g, "single": "trials" in g, "steps": "shape_diff" in g}
+
+
+def combine(values: dict[str, float], goals: dict[str, float], typical: dict[str, float]) -> float:
+    """Weighted mean of goals, each relative to its typical value (1.0: typical on all)."""
+    total = sum(goals.values())
+    return float(
+        sum(w * values[g] / typical[g] for g, w in goals.items() if w > 0 and typical[g] > 0)
+        / total
+    )
+
+
 def make_fitness(
     tr: float,
     contrasts: dict[str, Any],
@@ -179,8 +220,15 @@ def make_fitness(
     mean_response: float = 1.0,
     trial_sd: float = 0.5,
     target: float = 0.8,
+    reference: list[Realization] | None = None,
 ) -> Callable[[Realization], float]:
-    """Mean over ``hrfs`` of the objective: a contrast's detection, 'shape' or 'trials'.
+    """Mean over ``hrfs`` of the objective -- one goal, or several combined.
+
+    A goal is a contrast's detection, 'detection' (all contrasts), 'shape',
+    'shape_diff' or 'trials'. ``objective`` may combine them with weights,
+    'detection=1,shape=0.5,trials=1': the goals come in different units, so
+    each is divided by its median over ``reference`` realizations (random draws
+    of the same recipe) first -- 1.0 means typical on every goal.
 
     Averaging over HRF shapes is what keeps the search honest: optimized for
     SPMG1 alone, the best design of a rapid event experiment was 9% better than
@@ -189,6 +237,8 @@ def make_fitness(
     """
     from .power import RealizationScorer
 
+    goals = parse_goals(objective)
+    flags = score_flags(goals)
     scorers = [
         RealizationScorer(
             tr,
@@ -205,21 +255,18 @@ def make_fitness(
         for h in hrfs
     ]
 
-    def one(sc: Any, real: Realization) -> float:
-        s = sc.score(
-            real,
-            shape=objective == "shape",
-            single=objective == "trials",
-            steps=objective == "shape_diff",
-        )
-        if s is None:
-            return np.inf
-        if objective == "shape":
-            return s["shape_sd"][ref_noise]
-        if objective == "trials":
-            return s["unreliability"][ref_noise]
-        if objective == "shape_diff":
-            return s["shape_steps"][ref_noise]
-        return s["needed"][(ref_noise, objective)]
+    def values(real: Realization) -> dict[str, float]:
+        per = [sc.score(real, **flags) for sc in scorers]
+        return {g: float(np.mean([goal_value(s, g, ref_noise) for s in per])) for g in goals}
 
-    return lambda real: float(np.mean([one(sc, real) for sc in scorers]))
+    if len(goals) == 1:
+        (only,) = goals
+        return lambda real: values(real)[only]
+    if not reference:
+        raise ValueError("a combined objective needs reference realizations to scale its goals")
+    ref_vals = [values(r) for r in reference]
+    typical = {
+        g: float(np.median([v[g] for v in ref_vals if np.isfinite(v[g])] or [np.nan]))
+        for g in goals
+    }
+    return lambda real: combine(values(real), goals, typical)

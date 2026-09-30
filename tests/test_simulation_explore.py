@@ -134,3 +134,18 @@ def test_shape_diff_objective_runs(tmp_path, capsys):
             "-prefix", str(tmp_path / "s")]  # fmt: skip
     assert main(argv) == 0
     assert "library steps two shapes must be apart" in capsys.readouterr().out
+
+
+def test_combined_objective_in_explore(tmp_path, capsys):
+    from fastfuncstuff.cli.simulate import main
+
+    argv = ["-tr", "1", "-nruns", "1", "-scan_time", "150", "-initial_fix", "10", "-post_fix",
+            "15", "-trial", "E1", "0.25", "1", "-isi", "exp:[3.0-9.0],1,14", "-tsnr", "60",
+            "-objective", "detection=1,shape=0.5", "-explore", "5", "-explore_designs", "1",
+            "-explore_keep", "2", "-explore_pick", "3", "-device", "cpu", "-no_plots",
+            "-prefix", str(tmp_path / "c")]  # fmt: skip
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "combined: detection x1 + shape x0.5" in out and "combined 0." in out
+    header = (tmp_path / "c_explore.tsv").read_text().splitlines()[0].split("\t")
+    assert "combined" in header

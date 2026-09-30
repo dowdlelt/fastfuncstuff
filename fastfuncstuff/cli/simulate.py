@@ -1101,6 +1101,12 @@ def _mean_response(args) -> float:
     return args.effect if args.effect is not None else 1.0
 
 
+def _goal_of(sc: dict, goal: str) -> float:
+    """One goal's value from an explorer design's aggregated scores."""
+    key = {"shape": "shape_sd", "trials": "unreliability", "shape_diff": "shape_steps"}.get(goal)
+    return float(sc.get(key, np.nan)) if key else float(sc["needed"].get(goal, np.nan))
+
+
 def _objective(args, contrasts, pattern) -> str:
     """-objective: a contrast (its detection), 'shape' or 'trials'; default the first live one."""
     return _goal(args.objective, contrasts, pattern, "-objective")
@@ -1113,6 +1119,12 @@ def _goal(value, contrasts, pattern, flag: str) -> str:
     """
     from fastfuncstuff.simulation.power import has_true_effect
 
+    if value and ("," in value or "=" in value):
+        # Combined goals, each validated: 'detection=1,shape=0.5,trials=1'.
+        from fastfuncstuff.simulation.optimize import parse_goals
+
+        parts = {_goal(g, contrasts, pattern, flag): w for g, w in parse_goals(value).items()}
+        return ",".join(f"{g}={w:g}" for g, w in parts.items())
     goal = value or next((c for c, w in contrasts.items() if has_true_effect(w, pattern)), None)
     if goal == "efficiency":
         goal = "detection"
@@ -1126,6 +1138,11 @@ def _goal(value, contrasts, pattern, flag: str) -> str:
 
 
 def _objective_label(objective: str, target: float = 0.8) -> str:
+    if "=" in objective:
+        from fastfuncstuff.simulation.optimize import parse_goals
+
+        parts = " + ".join(f"{g} x{w:g}" for g, w in parse_goals(objective).items())
+        return f"combined: {parts} (each relative to a typical design; 1 = typical)"
     if objective == "shape":
         return "response-shape SD per FIR bin (%)"
     if objective == "detection":
@@ -1148,6 +1165,10 @@ def _optimize_realization(args, spec, contrasts, pattern, conds, objective, prog
         "trial_sd": args.trial_sd,
         "target": args.target,
     }
+    # A combined objective scales each goal by its value in typical random draws.
+    from fastfuncstuff.simulation.experiment import realize
+
+    trial_kw["reference"] = [realize(spec, args.seed + 1_000_000 + i) for i in range(20)]
     fit = make_fitness(
         args.tr,
         contrasts,
@@ -1334,26 +1355,42 @@ def _run_explore(raw: list[str], started: float) -> int:
         mean_response=_mean_response(args),
         trial_sd=args.trial_sd,
     )
+    from fastfuncstuff.simulation.optimize import combine, parse_goals
+
+    goals = parse_goals(objective)
+    flags = {"single": "trials" in goals, "steps": "shape_diff" in goals}
     scores = ex.score_configs(
         specs,
         scorer,
         args.explore_designs,
         ref,
         args.seed,
-        single_all=objective == "trials",
-        steps_all=objective == "shape_diff",
+        single_all="trials" in goals,
+        steps_all="shape_diff" in goals,
     )
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
-    det_c = objective if objective in contrasts or objective == "detection" else live[0]
+    det_c = next((g for g in goals if g in contrasts or g == "detection"), live[0])
     # The trade-off: detection against response shape -- or, when single trials are
     # the target, against LSS leakage (neighbours mixed into each trial's estimate).
     y_key = {"trials": "unreliability", "shape_diff": "shape_steps"}.get(objective, "shape_sd")
     x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
     y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
+    combined = None
+    if len(goals) > 1:
+        # Each goal relative to its median over the explored designs (1 = typical);
+        # the shortlist is the best on the weighted mean, not only the 2-D front.
+        vals = [{g: _goal_of(sc, g) for g in goals} if sc else None for sc in scores]
+        typical = {g: float(np.nanmedian([v[g] for v in vals if v])) for g in goals}
+        combined = np.array([combine(v, goals, typical) if v else np.nan for v in vals])
+        y = combined
     front = ex.pareto_front(x, y)
-    keep = ex.shortlist(
-        y if objective in ("shape", "trials", "shape_diff") else x, front, args.explore_keep
-    )
+    if combined is not None:
+        order = [int(i) for i in np.argsort(np.where(np.isfinite(combined), combined, np.inf))]
+        keep = [i for i in order if np.isfinite(combined[i])][: args.explore_keep]
+    else:
+        keep = ex.shortlist(
+            y if objective in ("shape", "trials", "shape_diff") else x, front, args.explore_keep
+        )
     edges = ex.at_edges(axes, configs, keep)
 
     prefix = Path(args.prefix)
@@ -1362,7 +1399,7 @@ def _run_explore(raw: list[str], started: float) -> int:
             *[f"needed_{c}" for c in [*live, "detection"]],
             *[f"worst_{c}" for c in [*live, "detection"]],
             "shape_sd", "estimation_efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
-            "ridge_frac", "dropped"]  # fmt: skip
+            "ridge_frac", "shape_steps", "combined", "dropped"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(cols)
@@ -1376,8 +1413,16 @@ def _run_explore(raw: list[str], started: float) -> int:
                     + [f"{sc['shape_sd']:.4f}", f"{sc['xi']:.4f}"]
                     + [
                         f"{sc[k]:.4f}" if k in sc else ""
-                        for k in ("lss_sd", "leakage", "lsa_sd", "unreliability", "ridge_frac")
-                    ]
+                        for k in (
+                            "lss_sd",
+                            "leakage",
+                            "lsa_sd",
+                            "unreliability",
+                            "ridge_frac",
+                            "shape_steps",
+                        )
+                    ]  # fmt: skip
+                    + [f"{combined[k]:.4f}" if combined is not None else ""]
                     + [f"{sc['dropped']:.2f}"]
                     if sc
                     else [""] * (len(cols) - len(axes) - 3)
@@ -1397,18 +1442,39 @@ def _run_explore(raw: list[str], started: float) -> int:
             opt, opt_lines = _optimize_realization(
                 args, specs[k], contrasts, pattern, conds, objective, progress=False
             )
-            picked = (opt["best"], scorer.score(opt["best"], single=objective == "trials"))
+            picked = (opt["best"], scorer.score(opt["best"], **flags))
+            fit_val = opt["best_fitness"]
+        elif combined is not None:
+            # best_realization ranks one goal; a combined one needs its typical
+            # values, so draw and score directly.
+            from fastfuncstuff.simulation.experiment import realize
+            from fastfuncstuff.simulation.optimize import make_fitness
+
+            opt_lines = []
+            draws = [realize(specs[k], args.seed + 7919 * k + i) for i in range(args.explore_pick)]
+            fit = make_fitness(
+                args.tr, contrasts, conds, pattern, objective, ref, [args.hrf], args.alpha,
+                args.polort, _mean_response(args), args.trial_sd, args.target,
+                reference=draws[:10],
+            )  # fmt: skip
+            fits = [fit(r) for r in draws]
+            best_i = int(np.nanargmin(fits))
+            picked = (draws[best_i], scorer.score(draws[best_i], **flags))
+            fit_val = fits[best_i]
         else:
             opt_lines = []
             picked = ex.best_realization(
                 specs[k], scorer, args.explore_pick, ref, objective, args.seed + 7919 * k
             )
+            fit_val = None
         desc = "  ".join(f"{a.label}={configs[k][a.label]}" for a in axes)
         lines += [
             f"#{rank}  {desc}",
             "    "
             + "  ".join(f"{c} {sc['needed'][c]:.2f}%" for c in live)
             + f"  shape {sc['shape_sd']:.2f}% (estimation efficiency {sc['xi']:.2f} of bound)"
+            + (f"  shape resolution {sc['shape_steps']:.1f} steps" if "shape_steps" in sc else "")
+            + (f"  combined {combined[k]:.2f}" if combined is not None else "")
             + (
                 f"  trials: reliability {1 - sc['unreliability']:.2f} "
                 f"(LSS leakage {sc['leakage']:.2f}, ridge fraction {sc['ridge_frac']:.2f})"
@@ -1426,7 +1492,9 @@ def _run_explore(raw: list[str], started: float) -> int:
             write_timing_files(real.onsets, real.conditions, out_dir)
             files = [str(out_dir / f"{c}.txt") for c in real.conditions]
             val = (
-                psc["shape_sd"][ref]
+                fit_val
+                if fit_val is not None
+                else psc["shape_sd"][ref]
                 if objective == "shape"
                 else psc["unreliability"][ref]
                 if objective == "trials"
@@ -1445,7 +1513,14 @@ def _run_explore(raw: list[str], started: float) -> int:
             )
             lines += ["    " + ln for ln in opt_lines]
             lines.append(
-                f"    {how} ({objective} {val:.2f}{'' if objective == 'trials' else '%'}): "
+                f"    {how} ("
+                + (
+                    f"combined {val:.2f}"
+                    if combined is not None
+                    else f"{objective} {val:.2f}"
+                    + ("" if objective in ("trials", "shape_diff") else "%")
+                )
+                + "): "
                 + shlex.join(cmd)
             )
     n_ok = sum(1 for sc in scores if sc)
@@ -1475,12 +1550,18 @@ def _run_explore(raw: list[str], started: float) -> int:
             if objective == "trials"
             else "library steps two shapes must be apart to be told apart"
             if objective == "shape_diff"
+            else _objective_label(objective, args.target)
+            if combined is not None
             else "response-shape SD per FIR bin"
         )
         + "; lower is better on both",
         "",
         "what matters (rank correlation with detection / "
-        + {"trials": "1 - reliability", "shape_diff": "shape steps"}.get(objective, "shape")
+        + (
+            "combined"
+            if combined is not None
+            else {"trials": "1 - reliability", "shape_diff": "shape steps"}.get(objective, "shape")
+        )
         + " over feasible designs):",
     ]
     for a in axes:
@@ -1491,7 +1572,9 @@ def _run_explore(raw: list[str], started: float) -> int:
                 configs,
                 x,
                 y,
-                {"trials": "1-reliab.", "shape_diff": "steps"}.get(objective, "shape"),
+                "combined"
+                if combined is not None
+                else {"trials": "1-reliab.", "shape_diff": "steps"}.get(objective, "shape"),
             )  # fmt: skip
         )
     text += ["", f"Pareto front: {int(front.sum())} design(s); shortlist:", *lines]
@@ -1524,10 +1607,14 @@ def _run_explore(raw: list[str], started: float) -> int:
             det_c,
             ref,
             path=f"{prefix}_explore.png",
-            y_label={
-                "trials": "single trials: 1 - reliability (best of LSS, ridge)",
-                "shape_diff": "shape resolution: library steps apart",
-            }.get(objective),
+            y_label=(
+                "combined score (1 = a typical design; lower is better)"
+                if combined is not None
+                else {
+                    "trials": "single trials: 1 - reliability (best of LSS, ridge)",
+                    "shape_diff": "shape resolution: library steps apart",
+                }.get(objective)
+            ),
         )
     written = sorted(
         str(q.name).removeprefix(prefix.name)
@@ -1554,6 +1641,7 @@ def _axis_effect(axis, configs, x, y, y_name: str = "shape") -> str:
     v = np.array(vals, dtype=float)
     if ok.sum() < 3:
         return f"{axis.label:<14} too few feasible designs"
+
     def rho(a, b):  # a constant measure (none resolved, say) has no rank correlation
         return float("nan") if np.ptp(a) == 0 or np.ptp(b) == 0 else spearmanr(a, b).statistic
 
@@ -2075,6 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
                 fit = make_fitness(
                     args.tr, contrasts, conds, pattern, goal, ref, [args.hrf], args.alpha,
                     args.polort, _mean_response(args), args.trial_sd, args.target,
+                    reference=reals,
                 )  # fmt: skip
                 score = np.array([fit(r) for r in reals])
                 score_label = _objective_label(goal, args.target)

@@ -883,6 +883,8 @@ def plot_exploration(
             if y_label and "reliab" in y_label
             else "steps"
             if y_label and "steps" in y_label
+            else "combined"
+            if y_label and "combined" in y_label
             else "shape SD %"
         )
         for row, (metric, name) in enumerate(((x, "detection %"), (y, y_short))):
