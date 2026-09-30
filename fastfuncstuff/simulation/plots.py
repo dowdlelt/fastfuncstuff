@@ -903,6 +903,42 @@ def plot_exploration(
     return _finish(fig, path)
 
 
+def plot_optimize(result: dict[str, Any], label: str, path: str | Path | None = None):
+    """Search progress: the evolved best against best-of-N random at equal evaluations.
+
+    ``result`` is :func:`~.optimize.evolve` output. The dashed line is a median
+    random draw -- what an unoptimized realization gives.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    fig.patch.set_facecolor(SURFACE)
+    _style(ax)
+    ev = result["evaluations"]
+    ax.plot(ev, result["history"], color=CATEGORICAL[1], linewidth=2.2, label="evolved (best)")
+    ax.plot(
+        ev, result["random_best"], color=BLUES[3], linewidth=2.2, label="best of N random draws"
+    )
+    ax.axhline(
+        result["random_median"],
+        color=INK2,
+        linewidth=1,
+        linestyle=(0, (4, 3)),
+        label="median random draw",
+    )
+    ax.set_xlabel("realizations scored", color=INK2, fontsize=9)
+    ax.set_ylabel(label + " (lower is better)", color=INK2, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
+    ax.set_title(
+        "Design search: evolution against random sampling at the same budget",
+        color=INK,
+        fontsize=10,
+        loc="left",
+    )
+    fig.tight_layout()
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

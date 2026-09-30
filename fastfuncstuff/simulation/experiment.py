@@ -433,42 +433,53 @@ class Realization:
     n_dropped: int = 0  # events of units that did not end -post_fix before a fixed scan's end
 
 
-def realize(spec: ExperimentSpec, seed: int) -> Realization:
-    """Draw one realization: unit order and every jittered interval, per run."""
+@dataclass
+class RunPlan:
+    """One run before it becomes a timeline: its units in order, each with the gap
+    after each of its items.
+
+    Every entry carries its full gap list, the last unit's trailing gap
+    included (it is replaced by -post_fix when assembled), so reordering keeps
+    each unit's gaps with it -- which is what a design search mutates.
+    """
+
+    entries: list[tuple[int, list[float]]]  # (unit index, gap after each item)
+
+
+def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan]]:
+    """Resolved counts and one drawn :class:`RunPlan` per run (order and every gap)."""
     from fastfuncstuff.design.optimization import generate_event_sequence
 
     rng = np.random.default_rng(seed)
-    conds = spec.conditions
-    if not conds:
-        raise ValueError("the experiment has no non-null conditions")
-    durations = spec.durations()
+    # The last unit's trailing gap is not part of the run (-post_fix replaces it);
+    # a design search still needs one per entry, drawn from its own stream so the
+    # main one -- and every realization drawn before RunPlan existed -- is unchanged.
+    spare_rng = np.random.default_rng([seed, 1])
     counts = spec.resolve_counts()
-    onsets: dict[str, list[list[float]]] = {c: [[] for _ in range(spec.n_runs)] for c in conds}
-    run_lengths, run_durations = [], []
-    n_dropped = 0
-
-    run_s = spec.run_seconds(counts)
-    for run in range(spec.n_runs):
+    plans = []
+    for _ in range(spec.n_runs):
         order = [
             int(u)
             for u in generate_event_sequence(counts, len(spec.units), ordering=spec.order, rng=rng)
         ]
         # Every gap slot in the run: (unit position k, item j) -> the interval it
-        # draws from. The last unit's trailing gap is replaced by -post_fix.
+        # draws from.
         slots: dict[Any, list[tuple[int, int]]] = {}
         specs: dict[Any, Interval] = {}
+        spare: tuple[Any, tuple[int, int]] | None = None
         for k, ui in enumerate(order):
             items = spec.units[ui].items
             for j, item in enumerate(items):
                 last = j == len(items) - 1
-                if last and k == len(order) - 1:
-                    continue
                 if item.off is not None:
                     key: Any = ("item", ui, j)
                     specs[key] = item.off
                 else:
                     key = "isi" if last else "within"
                     specs[key] = spec.isi if last else spec.within_isi
+                if last and k == len(order) - 1:
+                    spare = (key, (k, j))
+                    continue
                 slots.setdefault(key, []).append((k, j))
         # Draw each slot family in one call over the whole run. The mean-matched
         # generators force a single draw to the mean, so drawing gap by gap (as
@@ -477,7 +488,29 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
         for key, where in slots.items():
             for pos, value in zip(where, specs[key].sample(len(where), rng, spec.tr), strict=True):
                 gap[pos] = float(value)
+        if spare is not None:
+            gap[spare[1]] = float(specs[spare[0]].sample(1, spare_rng, spec.tr)[0])
+        plans.append(
+            RunPlan(
+                [
+                    (ui, [gap.get((k, j), 0.0) for j in range(len(spec.units[ui].items))])
+                    for k, ui in enumerate(order)
+                ]
+            )
+        )
+    return counts, plans
 
+
+def assemble(
+    spec: ExperimentSpec, counts: list[int], plans: list[RunPlan], seed: int = 0
+) -> Realization:
+    """The timeline of drawn (or searched) run plans: onsets, run lengths, drops."""
+    conds = spec.conditions
+    onsets: dict[str, list[list[float]]] = {c: [[] for _ in plans] for c in conds}
+    run_lengths, run_durations = [], []
+    n_dropped = 0
+    run_s = spec.run_seconds(counts)
+    for run, plan in enumerate(plans):
         # A fixed scan has a fixed number of volumes, and its last -post_fix
         # seconds are fixation: a unit whose events do not all end by then is
         # dropped whole (a cycle never loses its E2 and keeps its E1). Only
@@ -485,12 +518,14 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
         # mean-matched (uniform) eat the final fixation -- 3.5 s of a 15 s one.
         limit = None if run_s is None else run_s - spec.post_fix
         t = spec.initial_fix
-        for k, ui in enumerate(order):
+        for k, (ui, gaps) in enumerate(plan.entries):
             unit_events = []
-            for j, item in enumerate(spec.units[ui].items):
+            items = spec.units[ui].items
+            for j, item in enumerate(items):
                 if item.condition != NULL:
                     unit_events.append((item.condition, t, item.duration))
-                t += item.duration + gap.get((k, j), 0.0)
+                final = k == len(plan.entries) - 1 and j == len(items) - 1
+                t += item.duration + (0.0 if final else gaps[j])
             if limit is not None and unit_events:
                 if max(on + d for _, on, d in unit_events) > limit + 1e-9:
                     n_dropped += len(unit_events)
@@ -504,17 +539,24 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
         else:
             run_durations.append(t)
             run_lengths.append(int(np.ceil(t / spec.tr - 1e-9)))
-
     return Realization(
         seed=seed,
         conditions=conds,
-        durations=durations,
+        durations=spec.durations(),
         onsets=[[np.asarray(r) for r in onsets[c]] for c in conds],
         run_lengths=run_lengths,
         run_durations=run_durations,
         counts=counts,
         n_dropped=n_dropped,
     )
+
+
+def realize(spec: ExperimentSpec, seed: int) -> Realization:
+    """Draw one realization: unit order and every jittered interval, per run."""
+    if not spec.conditions:
+        raise ValueError("the experiment has no non-null conditions")
+    counts, plans = draw_plans(spec, seed)
+    return assemble(spec, counts, plans, seed)
 
 
 def parse_contrast(expr: str, conditions: list[str]) -> np.ndarray:

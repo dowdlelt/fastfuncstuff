@@ -340,6 +340,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default=50,
         help="Realizations searched for each shortlisted design's best one (50).",
     )
+    x.add_argument(
+        "-optimize",
+        type=int,
+        metavar="G",
+        help="Search G generations for the best realization of this design (an evolutionary "
+        "search over orders and gaps, the recipe kept exact) on -objective, instead of "
+        "simulating it; with -explore, for each shortlisted design instead of best-of-N. "
+        "Scored over several HRFs (-optimize_hrfs) and checked on held-out ones: optimized "
+        "for one HRF, a design lost to a median random draw under another.",
+    )
+    x.add_argument("-optimize_pop", type=int, default=30, help="Population per generation (30).")
+    x.add_argument(
+        "-optimize_hrfs",
+        nargs="+",
+        metavar="HRF",
+        help="HRFs the search averages over (default: the fitted one and lib:0 lib:6 lib:13 "
+        "lib:19, fast to slow).",
+    )
+    x.add_argument(
+        "-max_repeat",
+        type=int,
+        metavar="K",
+        help="With -optimize: at most K consecutive units of one kind.",
+    )
     return p
 
 
@@ -950,12 +974,129 @@ def _sweep_lines(sweep, conds, contrasts, reals, tr) -> list[str]:
     return out
 
 
-EXPLORE_ONLY = ("explore", "objective", "explore_designs", "explore_keep", "explore_pick")
+EXPLORE_ONLY = (
+    "explore", "objective", "explore_designs", "explore_keep", "explore_pick",
+    "optimize", "optimize_pop", "optimize_hrfs", "max_repeat",
+)  # fmt: skip
 TIMING_FLAGS = (
     "trial", "block", "miniblock", "null", "isi", "within_isi", "initial_fix", "post_fix",
     "order", "nruns", "scan_time", "num_events", "num_blocks", "ndesigns", "scan_times",
     "events", "labels", "durations", "nt",
 )  # fmt: skip
+
+
+def _objective(args, contrasts, pattern) -> str:
+    """-objective: a contrast (its detection), 'shape' or 'trials'; default the first live one."""
+    from fastfuncstuff.simulation.power import has_true_effect
+
+    objective = args.objective or next(
+        (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
+    )
+    if objective is None or (objective not in ("shape", "trials") and objective not in contrasts):
+        raise ValueError(
+            f"-objective {objective!r}: use 'shape', 'trials' or one of {list(contrasts)}"
+        )
+    return objective
+
+
+def _objective_label(objective: str) -> str:
+    if objective == "shape":
+        return "response-shape SD per FIR bin (%)"
+    if objective == "trials":
+        return "single-trial LSS leakage"
+    return f"{objective}: % signal for 80% power"
+
+
+def _optimize_realization(args, spec, contrasts, pattern, conds, objective, progress=True):
+    """evolve() on the HRF-averaged fitness, plus the held-out-HRF check. -> (result, lines)."""
+    from fastfuncstuff.simulation.optimize import HELD_OUT_HRFS, ROBUST_HRFS, evolve, make_fitness
+
+    ref = _reference_noise(conds)
+    hrfs = list(dict.fromkeys(args.optimize_hrfs or [args.hrf, *ROBUST_HRFS]))
+    fit = make_fitness(
+        args.tr, contrasts, conds, pattern, objective, ref, hrfs, args.alpha, args.polort
+    )
+    res = evolve(
+        spec,
+        fit,
+        population=args.optimize_pop,
+        generations=args.optimize,
+        seed=args.seed,
+        max_repeat=args.max_repeat,
+        progress=progress,
+    )
+    n = res["evaluations"][-1]
+    gain = 100 * (1 - res["best_fitness"] / res["random_best"][-1])
+    lines = [
+        f"search: {args.optimize} generations x {args.optimize_pop}: {n} realizations scored, "
+        f"averaged over HRFs {', '.join(hrfs)}"
+        + (f"; {res['n_rejected']} children broke -max_repeat" if res["n_rejected"] else ""),
+        f"  {_objective_label(objective)}, mean over those HRFs: median random draw "
+        f"{res['random_median']:.3f}, best of {n} random {res['random_best'][-1]:.3f}, "
+        f"evolved {res['best_fitness']:.3f} ({gain:+.1f}% vs best-of-N)",
+    ]
+    held = [h for h in HELD_OUT_HRFS if h not in hrfs]
+    if held:
+        check = make_fitness(
+            args.tr, contrasts, conds, pattern, objective, ref, held, args.alpha, args.polort
+        )
+        rb, ev = check(res["random_best_realization"]), check(res["best"])
+        lines.append(
+            f"  held-out HRFs ({', '.join(held)}), never searched on: best-of-N {rb:.3f}, "
+            f"evolved {ev:.3f}"
+            + ("" if ev <= rb else "  <- the search overfit its HRFs; prefer best-of-N")
+        )
+    return res, lines
+
+
+def _run_optimize(args, argv, spec, contrasts, pattern, conds, started) -> int:
+    """-optimize: the best realization of one design, its timing files and the evidence."""
+    import shlex
+
+    from fastfuncstuff.simulation.core import write_timing_files
+
+    try:
+        objective = _objective(args, contrasts, pattern)
+        res, lines = _optimize_realization(args, spec, contrasts, pattern, conds, objective)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    prefix = Path(args.prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    best = res["best"]
+    out_dir = Path(f"{prefix}_optimized")
+    write_timing_files(best.onsets, best.conditions, out_dir)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    rest = _strip_flags(raw, _build_parser(), (*TIMING_FLAGS, *EXPLORE_ONLY, "tr", "prefix"))
+    cmd = ["ffs_simulate", "-tr", f"{args.tr:g}", "-events",
+           *[str(out_dir / f"{c}.txt") for c in best.conditions],
+           "-durations", *[f"{d:g}" for d in best.durations],
+           "-nt", *[str(n) for n in best.run_lengths], *rest, "-prefix", f"{prefix}_opt"]  # fmt: skip
+    text = [
+        "ffs_simulate -optimize",
+        "=" * 72,
+        f"objective: {_objective_label(objective)} at {_reference_noise(conds)} (analytic)",
+        *lines,
+        f"optimized realization: {out_dir}/ -- full Monte Carlo and figures:",
+        "  " + shlex.join(cmd),
+    ]
+    summary = "\n".join(text)
+    print(summary)
+    Path(f"{prefix}_optimize_summary.txt").write_text(summary + "\n")
+    if not args.no_plots:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from fastfuncstuff.simulation.plots import plot_optimize
+
+        plot_optimize(res, _objective_label(objective), path=f"{prefix}_optimize.png")
+    written = sorted(
+        str(q.name).removeprefix(prefix.name)
+        for q in prefix.parent.glob(f"{prefix.name}_*")
+        if q.stat().st_mtime >= started
+    )
+    print(f"\nwrote {prefix}: " + ", ".join(written))
+    return 0
 
 
 def _strip_flags(argv: list[str], parser, drop: tuple[str, ...]) -> list[str]:
@@ -1007,15 +1148,7 @@ def _run_explore(raw: list[str], started: float) -> int:
         )
         pattern = _pattern(args.pattern, conditions)
         conds, _ = _noise_conditions(args)
-        objective = args.objective or next(
-            (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
-        )
-        if objective is None or (
-            objective not in ("shape", "trials") and objective not in contrasts
-        ):
-            raise ValueError(
-                f"-objective {objective!r}: use 'shape', 'trials' or one of {list(contrasts)}"
-            )
+        objective = _objective(args, contrasts, pattern)
     except (ValueError, FileNotFoundError, SystemExit) as exc:
         if isinstance(exc, SystemExit):
             return int(exc.code or 1)
@@ -1084,9 +1217,16 @@ def _run_explore(raw: list[str], started: float) -> int:
         filled = _strip_flags(rendered[k], parser, (*EXPLORE_ONLY, "prefix"))
         recipe = filled
         noise_etc = _strip_flags(filled, parser, (*TIMING_FLAGS, "tr"))
-        picked = ex.best_realization(
-            specs[k], scorer, args.explore_pick, ref, objective, args.seed + 7919 * k
-        )
+        if args.optimize:
+            opt, opt_lines = _optimize_realization(
+                args, specs[k], contrasts, pattern, conds, objective, progress=False
+            )
+            picked = (opt["best"], scorer.score(opt["best"], single=objective == "trials"))
+        else:
+            opt_lines = []
+            picked = ex.best_realization(
+                specs[k], scorer, args.explore_pick, ref, objective, args.seed + 7919 * k
+            )
         desc = "  ".join(f"{a.label}={configs[k][a.label]}" for a in axes)
         lines += [
             f"#{rank}  {desc}",
@@ -1119,9 +1259,15 @@ def _run_explore(raw: list[str], started: float) -> int:
                    "-durations", *[f"{d:g}" for d in real.durations],
                    "-nt", *[str(n) for n in real.run_lengths], *noise_etc,
                    "-prefix", f"{prefix}_d{rank}_best"]  # fmt: skip
+            how = (
+                f"optimized, {args.optimize} generations"
+                if args.optimize
+                else f"best of {args.explore_pick} realizations"
+            )
+            lines += ["    " + ln for ln in opt_lines]
             lines.append(
-                f"    best of {args.explore_pick} realizations ({objective} "
-                f"{val:.2f}{'' if objective == 'trials' else '%'}): " + shlex.join(cmd)
+                f"    {how} ({objective} {val:.2f}{'' if objective == 'trials' else '%'}): "
+                + shlex.join(cmd)
             )
     n_ok = sum(1 for sc in scores if sc)
     text = [
@@ -1419,6 +1565,12 @@ def main(argv: list[str] | None = None) -> int:
             f"ERROR: {_rank_message(quality[bad[0]], conditions, bad, len(reals))}", file=sys.stderr
         )
         return 1
+
+    if args.optimize:
+        if not described:
+            print("ERROR: -optimize needs a described experiment", file=sys.stderr)
+            return 1
+        return _run_optimize(args, argv, spec, contrasts, pattern, conds, started)
 
     sweep = None
     if args.scan_times:
