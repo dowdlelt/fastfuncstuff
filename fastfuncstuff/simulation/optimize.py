@@ -123,7 +123,9 @@ def evolve(
     for _ in tqdm(range(generations), desc="generations", leave=True, disable=not progress):
         children = []
         for _ in range(population):
-            a, b = rng.choice(len(pop), 2, replace=False)
+            # Tournament of two, with replacement: -max_repeat can leave a tiny
+            # population, and drawing two distinct members then failed.
+            a, b = rng.integers(len(pop), size=2)
             parent = pop[a] if pop[a][0] <= pop[b][0] else pop[b]
             child = copy.deepcopy(parent[1])
             other = pop[int(rng.integers(len(pop)))][1]

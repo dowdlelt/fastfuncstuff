@@ -77,3 +77,10 @@ def test_optimize_cli_writes_the_realization_and_the_evidence(tmp_path, capsys):
     rerun = cmd.split()[1:]
     rerun[rerun.index("-prefix") + 1] = str(tmp_path / "rerun")
     assert main([*rerun, "-nreps", "20", "-no_plots"]) == 0
+
+
+def test_a_population_of_one_still_evolves():
+    # -max_repeat can leave one member; a two-distinct tournament then crashed.
+    res = evolve(_spec(), lambda r: float(len(r.onsets[0][0])), population=1, generations=2,
+                 progress=False)  # fmt: skip
+    assert len(res["history"]) == 2

@@ -63,33 +63,34 @@ above B. -shared X puts every condition at X% underneath the difference
 (A = X + d, B = X) -- it cancels under a correct HRF, and with -true_hrf or
 -true_delay shows what a large common response costs.
 
-Examples
---------
-    # 2 conditions, 20 trials each per run, exponential jitter, 2 runs, TR 1.25
-    ffs_simulate -tr 1.25 -nruns 2 -trial A 2 20 -trial B 2 20 -null 2 10 \\
-        -isi exp:4,2,12 -initial_fix 10 -post_fix 16 -pattern A=1 B=0 \\
-        -effect 1 -prefix sim/er
+WHAT IT REPORTS -- for each design, at each noise level:
+    detection    the effect each contrast needs for 80% power (the classic design
+                 efficiency, in % signal), by Monte Carlo and analytically
+    estimation   how precisely the response *shape* is recovered (FIR SD per bin;
+                 Liu & Frank's estimation efficiency beside it)
+    single trials  how well each trial is estimated on its own: LSS, LSA and
+                 single-trial ridge, as trial-pattern reliability (-trial_sd)
+They trade off: rapid jittered designs estimate well and detect poorly, blocks
+the reverse, and single trials want trials spread apart. Design quality (rank,
+VIF, how separable each pair of conditions is) is checked first.
 
-    # miniblocks of A then B, 1 s apart, noise calibrated from a real dataset
-    ffs_simulate -tr 2 -miniblock AB "A:2,B:2" 12 -within_isi 1 -isi uniform:8,12 \\
-        -noise_profile stats_REMLvar+tlrc.HEAD TSNR+tlrc.HEAD -noise_mask mask+tlrc.HEAD \\
-        -contrast A-B -prefix sim/mb
+SEARCHING DESIGNS -- beyond scoring one design:
+    -scan_times S...  how long to scan: effect needed against total minutes
+    -compare TSV...   earlier runs side by side, per unit of scan time too
+    -explore N        N designs drawn from ranges [a-b] and choices {x,y} written
+                      inside the flags; their trade-off, what each range does,
+                      and a shortlist. One budget fixed: -scan_time or the counts
+    -optimize G       the best realization (order and gaps) of one design, by an
+                      evolutionary search averaged over HRF shapes
+-objective picks the goal: a contrast or 'detection' (all contrasts), 'shape',
+or 'trials'. Searches are analytic and assume the fitted HRF; each prints the
+command that runs the full Monte Carlo on its result.
 
-Outputs: PREFIX_summary.txt, PREFIX_power.tsv, PREFIX_power.png,
-PREFIX_design.png, PREFIX_designs.png (with several realizations: the typical,
-best and worst of them -- event order, correlation, effect needed),
-PREFIX_spec.json, PREFIX_events/ (timing files of the
-first realization, for a described experiment), PREFIX_voxels.png (an active
-and a silent voxel at each noise level, every condition at -effect, or else at
-the effect that level needs for 80% power),
-and PREFIX_hrf.png when the true HRF differs from the fitted one.
-
-COMPARE -- designs simulated separately, side by side:
-    ffs_simulate -compare sim/cycle_power.tsv sim/jittered_power.tsv -prefix sim/cmp
-Each file is one design, summarised over its realizations (median and range
-of the amplitude needed for -target power). Designs should share the noise
-levels and contrasts, and a scan time -- a longer scan wins by having more
-data, so differing scan times are flagged.
+Outputs (one design): PREFIX_summary.txt, _power.tsv, _power.png (with the
+summary as text), _design.png (events, regressors, correlation, the effect each
+condition and pair needs), _designs.png (typical, best and worst realization),
+_voxels.png (what the data look like), _spec.json, _events/ (timing files), and
+_hrf.png when the true HRF differs from the fitted one.
 """
 
 from __future__ import annotations
@@ -104,6 +105,46 @@ from typing import Any
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+
+EXAMPLES = """\
+Examples
+--------
+Evaluate one design
+    # rapid events: two conditions, jittered, a fifth of the slots blank
+    ffs_simulate -tr 1 -nruns 2 -scan_time 330 -initial_fix 10 -post_fix 15 \\
+        -trial A 0.25 1 -trial B 0.25 1 -null 0.25 20% -isi exp:4,2,12 \\
+        -contrast A -contrast A-B -tsnr 30 60 100 -prefix sim/er
+
+    # blocks, shuffled but evenly represented (one of each per group)
+    ffs_simulate -tr 1 -nruns 2 -scan_time 330 -initial_fix 10 -post_fix 15 \\
+        -block E1 30 1 -block E2 30 1 -isi 10 -order permuted_block \\
+        -contrast E1 -contrast E1-E2 -tsnr 30 60 100 -prefix sim/blocks
+
+    # your own timing files, noise calibrated from a real dataset
+    ffs_simulate -tr 2 -events A.txt B.txt -durations 2 -nt 240 240 \\
+        -noise_profile stats_REMLvar+tlrc.HEAD TSNR+tlrc.HEAD -noise_mask mask+tlrc.HEAD \\
+        -contrast A-B -prefix sim/mine
+
+How long to scan, and designs side by side
+    ffs_simulate ... -scan_times 150 240 330 480 660 900 -prefix sim/length
+    # two runs of the same conditions and contrasts, e.g. two ISI choices
+    ffs_simulate -compare sim/er_power.tsv sim/er_slow_power.tsv -prefix sim/cmp
+
+Check a family of designs (quote the ranges; one budget: -scan_time here)
+    ffs_simulate -explore 400 -tr 1 -nruns 2 -scan_time 330 -initial_fix 10 -post_fix 15 \\
+        -trial E1 0.25 1 -isi "poisson:[1.0-6.0],1,[6-12]" -null 0.25 "[0-50%]" \\
+        -order "{random,permuted_block}" -contrast E1 -tsnr 30 60 100 \\
+        -objective detection -prefix sim/family
+    #   -objective shape     for the response shape (estimation efficiency)
+    #   -objective trials    for single trials (LSS / ridge reliability)
+    #   a shortlist at the edge of a range is flagged: widen it and run again
+
+Optimize the realization you will actually run
+    ffs_simulate -tr 1 -nruns 2 -scan_time 330 -initial_fix 10 -post_fix 15 \\
+        -trial E1 0.25 1 -trial E2 0.25 1 -isi exp:4,1,12 -contrast E1-E2 \\
+        -tsnr 30 60 100 -objective E1-E2 -optimize 30 -max_repeat 4 -prefix sim/opt
+    # ... or -explore 300 ... -optimize 20 to optimize every shortlisted design
+"""
 
 VERDICTS = ((0.2, "hopeless"), (0.8, "marginal"), (1.01, "good"))
 SWEEP_COLS = (
@@ -122,7 +163,10 @@ SWEEP_DESIGNS = 50  # realizations per -scan_times value: the medians settle wel
 
 def _build_parser() -> argparse.ArgumentParser:
     p = FfsArgumentParser(
-        prog="ffs_simulate", description=__doc__, formatter_class=FfsHelpFormatter
+        prog="ffs_simulate",
+        description=__doc__,
+        epilog=EXAMPLES,
+        formatter_class=FfsHelpFormatter,
     )
     t = p.add_argument_group("Timing")
     t.add_argument("-tr", type=float, help="Repetition time (s); required unless -compare.")
