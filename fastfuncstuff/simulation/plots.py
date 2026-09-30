@@ -237,9 +237,8 @@ def plot_design(
         corr_title = "Regressor correlation\n(after drift removal)"
     div = LinearSegmentedColormap.from_list("div", [CATEGORICAL[0], "#f0efec", CATEGORICAL[1]])
     ax_c = fig.add_subplot(gs[:, 1])
-    # Lower triangle only: the diagonal is 1 by definition and the upper half a mirror.
-    corr = np.where(np.tril(np.ones_like(corr, dtype=bool), k=-1), corr, np.nan)
-    _matrix(ax_c, corr, names, div, -1, 1, "{:.2f}", corr_title)
+    if len(names) > 1:
+        _matrix(ax_c, *_below_diagonal(corr, names), div, -1, 1, "{:.2f}", corr_title)
     if needed is not None:
         ax_n = fig.add_subplot(gs[:, 2])
         seq = LinearSegmentedColormap.from_list("seq", ["#f0efec", BLUES[-1]])
@@ -267,8 +266,22 @@ def plot_design(
     return _finish(fig, path)
 
 
+def _below_diagonal(m: np.ndarray, names: list[str]) -> tuple[np.ndarray, tuple[list, list]]:
+    """The strictly-lower triangle as its own block: rows 1.., columns ..-1.
+
+    A correlation's diagonal is 1 and its upper half a mirror; dropping them
+    also drops the always-empty first row and last column.
+    """
+    block = np.where(np.tril(np.ones_like(m, dtype=bool), k=-1), m, np.nan)[1:, :-1]
+    return block, (list(names[1:]), list(names[:-1]))
+
+
 def _matrix(ax, m, names, cmap, vmin, vmax, fmt, title):
-    """A labelled heat-map matrix with values printed in the cells (nan cells blank)."""
+    """A labelled heat-map matrix with values printed in the cells (nan cells blank).
+
+    ``names`` labels both axes, or is a (row names, column names) pair.
+    """
+    rows, cols = names if isinstance(names, tuple) else (names, names)
     im = ax.imshow(np.ma.masked_invalid(m), cmap=cmap, vmin=vmin, vmax=vmax)
     mid = (vmin + vmax) / 2
     for (i, j), v in np.ndenumerate(m):
@@ -283,13 +296,139 @@ def _matrix(ax, m, names, cmap, vmin, vmax, fmt, title):
                 fontsize=8,
                 color=SURFACE if dark else INK,
             )
-    ax.set_xticks(range(len(names)), names)
-    ax.set_yticks(range(len(names)), names)
+    ax.set_xticks(range(len(cols)), cols)
+    ax.set_yticks(range(len(rows)), rows)
     ax.tick_params(colors=INK2, labelsize=9)
     for side in ax.spines.values():
         side.set_visible(False)
     ax.set_title(title, color=INK, fontsize=10)
     return im
+
+
+def plot_design_spread(
+    quality: list[dict[str, Any]],
+    realizations: list[Any],
+    noise_label: str,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """How much the sampled realizations of one design differ, and what a bad one looks like.
+
+    Columns: typical (mean correlation, median effect needed), the best and
+    the worst realization. Rows: the order of events in every run, regressor
+    correlation after drift removal, and the effect for 80% power at
+    ``noise_label`` (one colour scale across the row). A realization's score
+    is the mean of its effect-needed matrix -- every condition against
+    baseline and every pairwise difference -- so lower is better.
+    ``quality`` is :func:`~.power.realizations_design_quality` output.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    names = realizations[0].conditions
+    n = len(names)
+    tri = np.tril(np.ones((n, n), dtype=bool))
+    needed = np.array([q["needed"][noise_label] for q in quality])
+    score = np.array([m[tri].mean() for m in needed])
+    best, worst = int(np.argmin(score)), int(np.argmax(score))
+    corr = np.array([q["corr"] for q in quality])
+
+    div = LinearSegmentedColormap.from_list("div", [CATEGORICAL[0], "#f0efec", CATEGORICAL[1]])
+    seq = LinearSegmentedColormap.from_list("seq", ["#f0efec", BLUES[-1]])
+    lower = np.where(tri, 1.0, np.nan)
+    mats = [np.median(needed, axis=0), needed[best], needed[worst]]
+    lo, hi = (
+        min(float(np.nanmin(m * lower)) for m in mats),
+        max(float(np.nanmax(m * lower)) for m in mats),
+    )
+
+    cell = max(2.6, 0.55 * n + 1.2)
+    fig, axes = plt.subplots(
+        3,
+        3,
+        figsize=(3 * cell + 1.2, cell * 2 + 2.4),
+        height_ratios=[0.8, 1, 1],
+        layout="constrained",
+    )
+    fig.patch.set_facecolor(SURFACE)
+
+    # Row 0: score spread, then the event order of best and worst.
+    ax = axes[0, 0]
+    _style(ax)
+    order = np.argsort(score)
+    ax.plot(range(len(score)), score[order], "o", color=BLUES[2], markersize=4)
+    for k, col, lab in ((best, CATEGORICAL[2], "best"), (worst, CATEGORICAL[7], "worst")):
+        x = int(np.nonzero(order == k)[0][0])
+        ax.plot(x, score[k], "o", color=col, markersize=7)
+        ax.annotate(
+            lab, (x, score[k]), xytext=(4, 4), textcoords="offset points", fontsize=8, color=INK2
+        )
+    ax.set_xlabel("realizations, sorted", color=INK2, fontsize=8)
+    ax.set_ylabel("mean effect needed (%)", color=INK2, fontsize=8)
+    ax.set_title(f"{len(score)} realizations", color=INK, fontsize=10, loc="left")
+    for ax, k, lab in ((axes[0, 1], best, "best"), (axes[0, 2], worst, "worst")):
+        _style(ax)
+        real = realizations[k]
+        for run in range(len(real.run_lengths)):
+            for i, _cond in enumerate(real.conditions):
+                for on in real.onsets[i][run]:
+                    ax.broken_barh(
+                        [(on, max(real.durations[i], 1.0))],
+                        (run + 0.15, 0.7),
+                        color=CATEGORICAL[i % len(CATEGORICAL)],
+                    )
+        ax.set_yticks(
+            np.arange(len(real.run_lengths)) + 0.5,
+            [f"run {r + 1}" for r in range(len(real.run_lengths))],
+        )
+        ax.invert_yaxis()
+        ax.set_xlabel("time (s)", color=INK2, fontsize=8)
+        ax.set_title(
+            f"{lab}: realization {k} (mean {score[k]:.2f}%)", color=INK, fontsize=10, loc="left"
+        )
+
+    # Row 1: correlation after drift removal.
+    for ax, m, lab in (
+        (axes[1, 0], corr.mean(axis=0), "mean"),
+        (axes[1, 1], corr[best], "best"),
+        (axes[1, 2], corr[worst], "worst"),
+    ):
+        if n > 1:
+            _matrix(ax, *_below_diagonal(m, names), div, -1, 1, "{:.2f}", f"correlation, {lab}")
+        else:
+            ax.set_axis_off()
+
+    # Row 2: effect for 80% power, one scale across the row.
+    pad = 0.15 * (hi - lo + 1e-9)
+    for ax, m, lab in zip(axes[2], mats, ("median", "best", "worst"), strict=True):
+        im = _matrix(ax, m * lower, names, seq, lo - pad, hi, "{:.2f}", f"% for 80% power, {lab}")
+    cb = fig.colorbar(im, ax=axes[2].tolist(), shrink=0.8, pad=0.02)
+    for spine in cb.ax.spines.values():
+        spine.set_visible(False)
+    cb.ax.tick_params(colors=INK2, labelsize=8)
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=CATEGORICAL[i % len(CATEGORICAL)]) for i in range(n)
+    ]
+    fig.legend(
+        handles,
+        names,
+        frameon=False,
+        fontsize=8,
+        labelcolor=INK2,
+        loc="upper right",
+        ncol=min(n, 8),
+    )
+    fig.suptitle(
+        title
+        or f"Across realizations, {noise_label}: effect matrices -- diagonal vs baseline, "
+        "below it the difference",
+        color=INK,
+        fontsize=10,
+        x=0.02,
+        ha="left",
+    )
+    return _finish(fig, path)
 
 
 def plot_design_comparison(

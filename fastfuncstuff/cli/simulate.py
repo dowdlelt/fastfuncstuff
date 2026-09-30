@@ -72,7 +72,9 @@ Examples
         -contrast A-B -prefix sim/mb
 
 Outputs: PREFIX_summary.txt, PREFIX_power.tsv, PREFIX_power.png,
-PREFIX_design.png, PREFIX_spec.json, PREFIX_events/ (timing files of the
+PREFIX_design.png, PREFIX_designs.png (with several realizations: the typical,
+best and worst of them -- event order, correlation, effect needed),
+PREFIX_spec.json, PREFIX_events/ (timing files of the
 first realization, for a described experiment), PREFIX_voxels.png (an active
 and a silent voxel at each noise level, every condition at -effect, or else at
 the effect that level needs for 80% power),
@@ -912,6 +914,10 @@ def main(argv: list[str] | None = None) -> int:
             path=f"{prefix}_voxels.png",
         )
         ref = _reference_noise(conds)
+        if len(reals) > 1:
+            from fastfuncstuff.simulation.plots import plot_design_spread
+
+            plot_design_spread(quality, reals, ref, path=f"{prefix}_designs.png")
         plot_design(
             res,
             reals[0],

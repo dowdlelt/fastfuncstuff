@@ -54,3 +54,22 @@ def test_figures_render(tmp_path):
     plot_example_voxels(reals[0], 2, arma, path=tmp_path / "v2.png")
     for name in ("p.png", "d.png", "c.png", "v.png", "v2.png"):
         assert (tmp_path / name).stat().st_size > 10_000
+
+
+def test_design_spread_renders_for_one_and_several_conditions(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_design_spread
+    from fastfuncstuff.simulation.power import realizations_design_quality
+
+    noise = [{"label": "tSNR 50", "tsnr": 50.0, "phys_fraction": 0.5, "tau": 6.0}]
+    for names in (["A"], ["A", "B", "C"]):
+        spec = ExperimentSpec(
+            tr=2,
+            units=[Unit.parse(c, f"{c}:20", 2, "block") for c in names],
+            isi=Interval.parse(10),
+            post_fix=12,
+        )
+        reals = [realize(spec, s) for s in range(4)]
+        q = realizations_design_quality(reals, 2, noise)
+        out = tmp_path / f"s{len(names)}.png"
+        plot_design_spread(q, reals, "tSNR 50", path=out)
+        assert out.stat().st_size > 10_000
