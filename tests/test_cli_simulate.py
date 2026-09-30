@@ -466,3 +466,17 @@ def test_scan_times_sweep_writes_its_table_and_figure(tmp_path, capsys):
     argv = [*base, "-num_blocks", "4", "-scan_times", "240", "-prefix", str(tmp_path / "f")]
     assert main(argv) == 1
     assert "only add fixation" in capsys.readouterr().err
+
+
+def test_null_count_can_be_a_share_of_the_trials():
+    from fastfuncstuff.cli.simulate import _build_parser, _null_fraction, _spec_from_args
+
+    assert _null_fraction("20%") == 0.2 and _null_fraction("0.25") == 0.25
+    assert _null_fraction("15") is None  # a count
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        _null_fraction("100%")
+    # "identical ISIs, then drop trials": a 3 s train with a fifth of its slots blank
+    argv = ["-tr", "1", "-trial", "A", "0.25", "60", "-isi", "3", "-null", "0.25", "20%",
+            "-prefix", "x"]  # fmt: skip
+    counts = _spec_from_args(_build_parser().parse_args(argv)).resolve_counts()
+    assert counts == [60, 15]

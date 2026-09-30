@@ -12,7 +12,9 @@ or a described experiment, realized -ndesigns times with fresh jitter/order:
     -trial NAME DUR COUNT         a trial type: COUNT per run, DUR seconds
     -miniblock NAME ITEMS COUNT   items shown in order, each LABEL:DUR[:OFF][xN]
     -block NAME DUR COUNT         a block (one long item, counted as a block)
-    -null DUR COUNT               blank trials (time with no event)
+    -null DUR COUNT               blank trials: time with no event. COUNT per run, or a
+                                  share of all units (20% or 0.2); DUR:OFF gives it its
+                                  own gap, like a -miniblock item
     -isi SPEC                     default gap between trials/blocks (offset to onset)
     -within_isi SPEC              default gap between items inside a miniblock
     -initial_fix S / -post_fix S  fixation before the first / after the last
@@ -162,7 +164,9 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=2,
         action="append",
         metavar=("DUR", "COUNT"),
-        help="Blank trials: DUR seconds, COUNT per run (repeatable).",
+        help="Blank trials: DUR seconds (DUR:OFF for its own gap, as in a -miniblock item), "
+        "COUNT per run, or a share of all units -- 20%% or 0.2 -- as a weight (repeatable). "
+        "With a fixed -isi this is 'identical ISIs, then drop trials'.",
     )
     t.add_argument("-isi", default="0", metavar="SPEC", help="Gap between units (default 0).")
     t.add_argument("-within_isi", default="0", metavar="SPEC", help="Gap inside a miniblock.")
@@ -340,15 +344,31 @@ def _explicit_realization(args) -> Any:
     return Realization(0, labels, list(durs), onsets, list(nt), [n * args.tr for n in nt])
 
 
+def _null_fraction(token: str) -> float | None:
+    """'20%' or '0.2' -> 0.2; a whole number (a count) -> None."""
+    text = str(token).strip()
+    if not text.endswith("%") and "." not in text:
+        return None
+    frac = float(text.rstrip("%")) / (100.0 if text.endswith("%") else 1.0)
+    if not 0 < frac < 1:
+        raise ValueError(f"-null {token!r}: a fraction must be between 0 and 1 (or 0-100%)")
+    return frac
+
+
 def _spec_from_args(args):
     from fastfuncstuff.simulation.experiment import NULL, ExperimentSpec, Interval, Unit
 
     units = [Unit.parse(nm, f"{nm}:{d}", int(c)) for nm, d, c in (args.trial or [])]
     units += [Unit.parse(nm, f"{nm}:{d}", int(c), "block") for nm, d, c in (args.block or [])]
     units += [Unit.parse(nm, items, int(c), "block") for nm, items, c in (args.miniblock or [])]
-    units += [
-        Unit.parse(f"null{i}", f"{NULL}:{d}", int(c)) for i, (d, c) in enumerate(args.null or [])
-    ]
+    # A -null COUNT that is a fraction ("20%", "0.2") is that share of all units:
+    # weight p / (1 - p) against the rest, so it survives -num_events/-scan_time
+    # scaling. A whole number is a count.
+    rest = sum(u.count for u in units)
+    for i, (d, c) in enumerate(args.null or []):
+        frac = _null_fraction(c)
+        weight = frac / (1 - frac) * rest if frac is not None else int(c)
+        units.append(Unit.parse(f"null{i}", f"{NULL}:{d}", weight))
     return ExperimentSpec(
         tr=args.tr,
         units=units,

@@ -140,7 +140,7 @@ class Unit:
 
     name: str
     items: list[Item]
-    count: int
+    count: float  # whole for trials and blocks; a null unit's may be a fractional weight
     family: Literal["event", "block"] = "event"
 
     @property
@@ -149,7 +149,7 @@ class Unit:
 
     @classmethod
     def parse(
-        cls, name: str, items: str, count: int, family: Literal["event", "block"] = "event"
+        cls, name: str, items: str, count: float, family: Literal["event", "block"] = "event"
     ) -> Unit:
         """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring)."""
         parsed: list[Item] = []
@@ -166,9 +166,10 @@ class Unit:
             parsed += [Item(label, float(m.group(2)), off)] * int(m.group(4) or 1)
         if not parsed:
             raise ValueError(f"unit {name!r} has no items")
-        if count < 1:
+        null = all(it.condition == NULL for it in parsed)
+        if count <= 0 or (not null and count < 1):
             raise ValueError(f"unit {name!r}: count must be >= 1")
-        return cls(name, parsed, int(count), family)
+        return cls(name, parsed, float(count) if null else int(count), family)
 
 
 @dataclass
