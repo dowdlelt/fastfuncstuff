@@ -349,6 +349,13 @@ def _build_parser() -> argparse.ArgumentParser:
     add_device_arg(a)
     p.add_argument("-prefix", required=True, help="Output prefix (a directory is created).")
     p.add_argument("-no_plots", action="store_true", help="Skip the PNG figures.")
+    p.add_argument(
+        "-rank_by",
+        metavar="GOAL",
+        help="What makes a realization best or worst in _designs.png: a contrast, "
+        "'detection' (all contrasts), 'shape' or 'trials' -- as -objective (default: the "
+        "mean effect every condition and pair needs).",
+    )
 
     c = p.add_argument_group("Compare")
     c.add_argument(
@@ -1083,21 +1090,24 @@ def _mean_response(args) -> float:
 
 def _objective(args, contrasts, pattern) -> str:
     """-objective: a contrast (its detection), 'shape' or 'trials'; default the first live one."""
+    return _goal(args.objective, contrasts, pattern, "-objective")
+
+
+def _goal(value, contrasts, pattern, flag: str) -> str:
+    """A goal (-objective, -rank_by): a contrast, 'detection', 'shape' or 'trials'.
+
+    Default: the first contrast with a true effect. 'efficiency' is 'detection'.
+    """
     from fastfuncstuff.simulation.power import has_true_effect
 
-    objective = args.objective or next(
-        (c for c, w in contrasts.items() if has_true_effect(w, pattern)), None
-    )
-    if objective == "efficiency":
-        objective = "detection"
-    if objective is None or (
-        objective not in ("detection", "shape", "trials") and objective not in contrasts
-    ):
+    goal = value or next((c for c, w in contrasts.items() if has_true_effect(w, pattern)), None)
+    if goal == "efficiency":
+        goal = "detection"
+    if goal is None or (goal not in ("detection", "shape", "trials") and goal not in contrasts):
         raise ValueError(
-            f"-objective {objective!r}: use 'detection', 'shape', 'trials' or one of "
-            f"{list(contrasts)}"
+            f"{flag} {goal!r}: use 'detection', 'shape', 'trials' or one of {list(contrasts)}"
         )
-    return objective
+    return goal
 
 
 def _objective_label(objective: str, target: float = 0.8) -> str:
@@ -1948,7 +1958,21 @@ def main(argv: list[str] | None = None) -> int:
         if len(reals) > 1:
             from fastfuncstuff.simulation.plots import plot_design_spread
 
-            plot_design_spread(quality, reals, ref, path=f"{prefix}_designs.png")
+            score, score_label = None, None
+            if args.rank_by:
+                from fastfuncstuff.simulation.optimize import make_fitness
+
+                goal = _goal(args.rank_by, contrasts, pattern, "-rank_by")
+                fit = make_fitness(
+                    args.tr, contrasts, conds, pattern, goal, ref, [args.hrf], args.alpha,
+                    args.polort, _mean_response(args), args.trial_sd, args.target,
+                )  # fmt: skip
+                score = np.array([fit(r) for r in reals])
+                score_label = _objective_label(goal, args.target)
+            plot_design_spread(
+                quality, reals, ref, path=f"{prefix}_designs.png", score=score,
+                score_label=score_label,
+            )  # fmt: skip
         plot_design(
             res,
             reals[0],

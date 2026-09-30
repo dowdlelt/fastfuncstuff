@@ -390,6 +390,8 @@ def plot_design_spread(
     noise_label: str,
     path: str | Path | None = None,
     title: str | None = None,
+    score: np.ndarray | None = None,
+    score_label: str | None = None,
 ):
     """How much the sampled realizations of one design differ, and what a bad one looks like.
 
@@ -398,7 +400,8 @@ def plot_design_spread(
     correlation after drift removal, and the effect for 80% power at
     ``noise_label`` (one colour scale across the row). A realization's score
     is the mean of its effect-needed matrix -- every condition against
-    baseline and every pairwise difference -- so lower is better.
+    baseline and every pairwise difference -- or ``score`` (one per
+    realization, lower better; ``score_label`` names it), e.g. from -rank_by.
     ``quality`` is :func:`~.power.realizations_design_quality` output.
     """
     import matplotlib.pyplot as plt
@@ -408,7 +411,10 @@ def plot_design_spread(
     n = len(names)
     tri = np.tril(np.ones((n, n), dtype=bool))
     needed = np.array([q["needed"][noise_label] for q in quality])
-    score = np.array([m[tri].mean() for m in needed])
+    if score is None:
+        score = np.array([m[tri].mean() for m in needed])
+        score_label = "mean effect needed (%)"
+    score = np.asarray(score, dtype=float)
     best, worst = int(np.argmin(score)), int(np.argmax(score))
     corr = np.array([q["corr"] for q in quality])
 
@@ -443,7 +449,7 @@ def plot_design_spread(
             lab, (x, score[k]), xytext=(4, 4), textcoords="offset points", fontsize=8, color=INK2
         )
     ax.set_xlabel("realizations, sorted", color=INK2, fontsize=8)
-    ax.set_ylabel("mean effect needed (%)", color=INK2, fontsize=8)
+    ax.set_ylabel(score_label, color=INK2, fontsize=8)
     ax.set_title(f"{len(score)} realizations", color=INK, fontsize=10, loc="left")
     for ax, k, lab in ((axes[0, 1], best, "best"), (axes[0, 2], worst, "worst")):
         _style(ax)
@@ -462,9 +468,7 @@ def plot_design_spread(
         )
         ax.invert_yaxis()
         ax.set_xlabel("time (s)", color=INK2, fontsize=8)
-        ax.set_title(
-            f"{lab}: realization {k} (mean {score[k]:.2f}%)", color=INK, fontsize=10, loc="left"
-        )
+        ax.set_title(f"{lab}: realization {k} ({score[k]:.3g})", color=INK, fontsize=10, loc="left")
 
     # Row 1: correlation after drift removal.
     for ax, m, lab in (

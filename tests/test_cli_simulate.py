@@ -490,3 +490,13 @@ def test_target_reaches_the_summary_and_mismatch_false_positives_are_split(tmp_p
          "-shared", "3", "-true_hrf", "lib:3")  # fmt: skip
     out = capsys.readouterr().out
     assert "condition contrasts; differences below" in out
+
+
+def test_rank_by_picks_best_and_worst_by_a_goal(tmp_path):
+    _sim(tmp_path / "r", "-ndesigns", "3", "-rank_by", "shape")
+    assert (tmp_path / "r_designs.png").stat().st_size > 10_000
+    from fastfuncstuff.cli.simulate import _goal
+
+    assert _goal("efficiency", {"A": [1.0]}, [1.0], "-rank_by") == "detection"
+    with pytest.raises(ValueError, match="-rank_by 'nope'"):
+        _goal("nope", {"A": [1.0]}, [1.0], "-rank_by")
