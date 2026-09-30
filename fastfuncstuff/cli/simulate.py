@@ -167,6 +167,18 @@ Optimize the realization you will actually run
 """
 
 VERDICTS = ((0.2, "hopeless"), (0.8, "marginal"), (1.01, "good"))
+# The scorecard's number per measure, named with its unit for _spec.json / -compare.
+SCORE_KEYS = {
+    "detection": "detection, % (mean)",
+    "per minute": "detection x sqrt(min)",
+    "shape precision": "shape SD per bin, %",
+    "Liu & Frank": "estimation efficiency",
+    "shape resolution": "shape steps apart",
+    "single trials": "trial reliability",
+    "HRF robustness": "HRFs detectable, frac",
+    "false positives": "false positives",
+    "collinearity": "largest VIF",
+}
 SWEEP_COLS = (
     "scan_time",
     "run_s",
@@ -584,6 +596,105 @@ def _pattern(tokens: list[str] | None, conditions: list[str]) -> list[float]:
     return w
 
 
+def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robust):
+    """One value per measure at the reference noise level: [(name, text, number)].
+
+    Median over realizations throughout. The number (for _spec.json and
+    -compare) is the headline one; the text says what it is.
+    """
+    from fastfuncstuff.simulation.power import effect_needed, has_true_effect
+
+    ref = _reference_noise(conds)
+    live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
+    minutes = float(np.mean([sum(r.run_lengths) for r in reals])) * args.tr / 60
+    out = []
+    need = effect_needed(res, args.target)
+    det = {
+        c: float(np.nanmedian(need[(ref, c)])) for c in live if np.isfinite(need[(ref, c)]).any()
+    }
+    if live and not det:  # say so, rather than leave the measure out
+        top = max(abs(x["true_effect"]) for x in res["table"])
+        out.append(("detection", f"> {top:g}% for every contrast: {args.target:.0%} power not "
+                    "reached within the sweep (raise -amplitudes)", float("inf")))  # fmt: skip
+        out.append(("  per minute", "-", float("inf")))
+    if det:
+        out.append(
+            (
+                "detection",
+                ", ".join(f"{c} {v:.2f}%" for c, v in det.items())
+                + f"  (% signal for {args.target:.0%} power)",
+                float(np.mean(list(det.values()))),
+            )
+        )
+        out.append(
+            (
+                "  per minute",
+                ", ".join(f"{c} {v * np.sqrt(minutes):.2f}" for c, v in det.items())
+                + f"  (effect x sqrt({minutes:.1f} min); lower = more per minute)",
+                float(np.mean(list(det.values()))) * float(np.sqrt(minutes)),
+            )
+        )
+    qs = [q for q in quality if "shape_sd" in q]
+    if qs:
+        sd = float(np.median([np.mean(q["shape_sd"][ref]) for q in qs]))
+        xi = float(np.median([q["xi"] for q in qs]))
+        lp = float(np.median([q.get("liu_power", np.nan) for q in qs]))
+        out.append((
+            "shape precision",
+            f"{sd:.2f}% SD per FIR bin" if np.isfinite(sd) else "not estimable (the FIR "
+            "lags alias: too few events, or a fixed SOA)",
+            sd,
+        ))  # fmt: skip
+        out.append(("Liu & Frank", f"estimation efficiency {xi:.2f}, detection power {lp:.2f} "
+                    "(fractions of their bounds)", xi))  # fmt: skip
+    if steps is not None:
+        st = steps["steps"][ref]
+        fin = st[np.isfinite(st)]
+        if fin.size:
+            m = float(np.mean(fin))
+            out.append(("shape resolution", f"{m:.1f} library steps (~{0.16 * m:.1f} s of peak "
+                        "latency) to tell two shapes apart", m))  # fmt: skip
+        else:
+            out.append(("shape resolution", f"> {steps['max_step']} library steps: shapes "
+                        "cannot be told apart", float("inf")))  # fmt: skip
+    ss = [q["single"]["reliability"][ref] for q in quality if "single" in q]
+    if ss:
+        best = {k: float(np.median([r[k] for r in ss])) for k in ("lss", "lsa", "ridge")}
+        top = max(("lss", "ridge"), key=lambda k: best[k])
+        out.append(
+            (
+                "single trials",
+                f"reliability {best[top]:.2f} by {top.upper() if top == 'lss' else 'ridge'} "
+                f"(LSS {best['lss']:.2f}, LSA {best['lsa']:.2f}, ridge {best['ridge']:.2f}; trial "
+                f"SD {args.trial_sd:g}%)",
+                best[top],
+            )
+        )
+    if robust:
+        c0 = live[0]
+        r = robust["contrasts"][c0]
+        n_ok = int(np.sum(np.isfinite(r["needed"])))
+        ok = [v for v in r["needed"] if np.isfinite(v)]
+        ratio = float(np.median(ok) / r["fitted"]) if ok and r["fitted"] > 0 else float("nan")
+        out.append(
+            (
+                "HRF robustness",
+                f"{c0} detectable under {n_ok}/{len(r['needed'])} library HRFs (fitting "
+                f"{args.hrf}); median cost x{ratio:.2f} of the right HRF's",
+                n_ok / len(r["needed"]),
+            )
+        )
+    nulls = [x for x in res["table"] if x["noise"] == ref and x["amplitude"] == 0.0]
+    if nulls:
+        fp = float(np.mean([x["power"] for x in nulls]))
+        fpn = float(np.mean([x["power_naive"] for x in nulls]))
+        out.append(("false positives", f"{fp:.4f} corrected, {fpn:.4f} naive OLS (nominal "
+                    f"{args.alpha:g})", fp))  # fmt: skip
+    vif = float(np.median([np.max(q["vif"]) for q in quality]))
+    out.append(("collinearity", f"largest VIF {vif:.2f} (1 = orthogonal, > 5 hard)", vif))
+    return out
+
+
 def _needed_cell(vals: np.ndarray, has_effect: bool, top: float) -> tuple[str, bool]:
     """'median [min-max]' of the effect needed over realizations, and whether some never got there.
 
@@ -598,7 +709,7 @@ def _needed_cell(vals: np.ndarray, has_effect: bool, top: float) -> tuple[str, b
     return text + ("*" if partial else ""), partial
 
 
-def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) -> dict:
+def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, card=None) -> dict:
     """The headline facts and the answer table, for the text panel of _power.png."""
     from fastfuncstuff.simulation.power import effect_needed, has_mismatch, has_true_effect
 
@@ -703,6 +814,9 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec) 
         foot.append(
             f"* some realizations never reach {args.target:.0%} within the sweep (max {top:g}%)"
         )
+    if card:  # the scorecard first: one value per measure (it covers shape and trials)
+        facts = [f for f in facts if f[0] not in ("shape", "trials")]
+        facts = [(k.strip(), v) for k, v, _ in card] + [("", "")] + facts
     return {"facts": facts, "notes": notes, "header": header, "rows": table, "footer": foot}
 
 
@@ -725,12 +839,26 @@ def _effect_cell(sel: list[dict[str, Any]], column: str) -> str:
 
 
 def _summarise(
-    res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality, steps=None
+    res,
+    reals,
+    conds,
+    contrasts,
+    pattern,
+    args,
+    spec_text,
+    profile_text,
+    quality,
+    steps=None,
+    card=None,
 ) -> str:
     from fastfuncstuff.simulation.power import effect_needed, has_true_effect, is_difference
 
     rows = res["table"]
     out = ["ffs_simulate", "=" * 72]
+    if card:
+        out += [f"Scorecard at {_reference_noise(conds)} (one value per measure; details below):"]
+        out += [f"  {k:<18} {v}" for k, v, _ in card]
+        out += [""]
     if spec_text:
         out += [spec_text, f"{len(reals)} realization(s)"]
     durs = np.array([sum(r.run_durations) for r in reals])
@@ -1749,6 +1877,14 @@ def _run_compare(args) -> int:
                 v = [np.mean(x) for x in q["shape_sd"].get(noise, [])]
                 cells.append(f"{(f'{np.median(v):.2f}' if v else '-'):>22}")
             out.append(f"{n:<28}" + "".join(cells) + f"{np.median(q['xi']):>12.2f}")
+    cards = {n: (res.get("spec") or {}).get("scorecard") for n, res in results.items()}
+    if any(cards.values()):
+        keys = list(dict.fromkeys(k for card in cards.values() if card for k in card))
+        out += ["", "Scorecards (one value per measure, at each design's middle noise level):"]
+        out.append(f"{'measure':<24}" + "".join(f"{n[:20]:>22}" for n in names))
+        for k in keys:
+            cells = [f"{cards[n][k]:.3g}" if cards[n] and k in cards[n] else "-" for n in names]
+            out.append(f"{k:<24}" + "".join(f"{c:>22}" for c in cells))
     for c in contrasts:
         swept = next(
             (r.get("swept") for r in loaded[0]["table"] if r["contrast"] == c), "amplitude"
@@ -1971,9 +2107,22 @@ def main(argv: list[str] | None = None) -> int:
 
     shape_amps = [(args.effect if args.effect is not None else 1.0) * w for w in pattern]
     steps = shape_steps(reals[0], args.tr, conds, shape_amps, args.alpha, args.target, args.polort)
+    live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
+    ref = _reference_noise(conds)
+    robust = None
+    if live:
+        from fastfuncstuff.simulation.power import hrf_robustness
+
+        robust = hrf_robustness(
+            reals[0], args.tr, {c: contrasts[c] for c in live},
+            next(c for c in conds if c["label"] == ref), pattern, args.hrf, args.shared,
+            args.alpha, args.target, args.polort,
+        )  # fmt: skip
+    card = _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robust)
     summary = _summarise(
-        res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality, steps
-    )
+        res, reals, conds, contrasts, pattern, args, spec_text, profile_text, quality, steps,
+        card,
+    )  # fmt: skip
     if sweep is not None:
         summary += "\n\n" + "\n".join(
             _sweep_lines(sweep, conds, contrasts, reals, args.tr, args.target)
@@ -2030,6 +2179,8 @@ def main(argv: list[str] | None = None) -> int:
                 "hrf": res["hrf"],
                 "true_hrfs": res["true_hrfs"],
                 "alpha": args.alpha,
+                "scorecard": {SCORE_KEYS.get(k.strip(), k.strip()): v for k, _, v in card},
+                "tr_lock": args.tr_lock,
                 # per realization, for -compare's detection-vs-estimation view
                 "quality": {
                     "shape_sd": {
@@ -2098,6 +2249,7 @@ def main(argv: list[str] | None = None) -> int:
                     args,
                     quality,
                     spec if described else None,
+                    card,
                 ),
             )
         if res["true_hrfs"] != [res["hrf"]]:
@@ -2222,16 +2374,8 @@ def main(argv: list[str] | None = None) -> int:
                      path=f"{prefix}_liu.png")  # fmt: skip
         if live:
             from fastfuncstuff.simulation.plots import plot_robustness
-            from fastfuncstuff.simulation.power import hrf_robustness
 
-            plot_robustness(
-                hrf_robustness(
-                    reals[0], args.tr, {c: contrasts[c] for c in live},
-                    next(c for c in conds if c["label"] == ref), pattern, args.hrf,
-                    args.shared, args.alpha, args.target, args.polort,
-                ),
-                live, args.hrf, ref, args.target, path=f"{prefix}_robust.png",
-            )  # fmt: skip
+            plot_robustness(robust, live, args.hrf, ref, args.target, path=f"{prefix}_robust.png")
         if live:
             from fastfuncstuff.simulation.plots import plot_tsnr
             from fastfuncstuff.simulation.power import RealizationScorer, effect_needed

@@ -500,3 +500,22 @@ def test_rank_by_picks_best_and_worst_by_a_goal(tmp_path):
     assert _goal("efficiency", {"A": [1.0]}, [1.0], "-rank_by") == "detection"
     with pytest.raises(ValueError, match="-rank_by 'nope'"):
         _goal("nope", {"A": [1.0]}, [1.0], "-rank_by")
+
+
+def test_scorecard_gives_one_value_per_measure(tmp_path, capsys):
+    _sim(tmp_path / "s", "-ndesigns", "2", "-no_plots", "-contrast", "A", "-contrast", "A-B")
+    out = capsys.readouterr().out
+    block = out[out.index("Scorecard at") : out.index("\n\n", out.index("Scorecard at"))]
+    for measure in (
+        "detection",
+        "per minute",
+        "shape precision",
+        "shape resolution",
+        "single trials",
+        "HRF robustness",
+        "false positives",
+        "collinearity",
+    ):
+        assert measure in block, measure  # fmt: skip
+    card = json.loads((tmp_path / "s_spec.json").read_text())["scorecard"]
+    assert card["detection, % (mean)"] > 0 and 0 <= card["HRFs detectable, frac"] <= 1

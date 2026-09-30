@@ -228,7 +228,7 @@ def _draw_summary(ax, summary: dict[str, Any], width: float) -> None:
     for k, (key, line) in enumerate(_wrap_facts(summary, width)):
         y = y0 - k * dy
         ax.text(0.0, y, key, fontsize=8.5, color=INK2, va="top", fontweight="bold")
-        ax.text(0.075, y, line, fontsize=8.5, color=INK, va="top")
+        ax.text(0.105, y, line, fontsize=8.5, color=INK, va="top")
     header, rows = summary.get("header", []), summary.get("rows", [])
     if not header:
         return
