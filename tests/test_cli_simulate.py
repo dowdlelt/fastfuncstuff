@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 
+import numpy as np
 import pytest
 
 from fastfuncstuff.cli.simulate import main
@@ -334,7 +335,20 @@ def test_compare_summarises_each_design_over_its_realizations(tmp_path, capsys):
         )
         == 0
     )
-    assert "scan times differ" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "scan times differ" in out
+    # ... and the per-minute table puts them on one footing: effect x sqrt(min)
+    assert "effect x sqrt(total minutes)" in out
+    from fastfuncstuff.simulation.power import compare_designs, load_power_table
+
+    rows = compare_designs(
+        {
+            "a": load_power_table(tmp_path / "a_power.tsv"),
+            "c": load_power_table(tmp_path / "c_power.tsv"),
+        }
+    )
+    r = next(x for x in rows if x["design"] == "c" and x["contrast"] == "A")
+    assert r["per_minute"] == pytest.approx(r["median"] * np.sqrt(r["scan_s"] / 60))
 
 
 def test_compare_needs_matching_names(tmp_path, capsys):

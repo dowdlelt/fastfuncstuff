@@ -560,43 +560,53 @@ def plot_design_comparison(
     Dot: median over realizations (and true HRFs); whisker: range. Designs that
     never reach ``target`` within the sweep are drawn as an arrow at its edge.
     Lower is better -- read across a row for how much tSNR buys.
+
+    When every design's scan time is known, a second panel shows the effect x
+    sqrt(total minutes): a longer scan wins the first panel partly by having
+    more data, and for a fixed design the effect falls as 1/sqrt(T), so this
+    compares designs per unit of scan time.
     """
     import matplotlib.pyplot as plt
-
-    from .power import effect_needed
-
-    names = list(results)
-    colors = ramp(len(noise_labels))
-    fig, ax = plt.subplots(figsize=(9, 0.7 * len(names) + 1.6))
-    fig.patch.set_facecolor(SURFACE)
-    _style(ax)
-    top = max(r["amplitude"] for res in results.values() for r in res["table"])
-    offsets = np.linspace(-0.22, 0.22, len(noise_labels)) if len(noise_labels) > 1 else [0.0]
-    for row, name in enumerate(names):
-        need = effect_needed(results[name], target)
-        for label, col, dy in zip(noise_labels, colors, offsets, strict=True):
-            v = need.get((label, contrast), np.full(1, np.nan))
-            y = row + dy
-            if np.all(np.isnan(v)):
-                ax.annotate(
-                    "",
-                    (top * 1.05, y),
-                    (top * 0.9, y),
-                    arrowprops={"arrowstyle": "->", "color": col, "lw": 2},
-                )
-                continue
-            ax.plot([np.nanmin(v), np.nanmax(v)], [y, y], color=col, linewidth=2)
-            ax.plot(
-                np.nanmedian(v),
-                y,
-                "o",
-                color=col,
-                markersize=7,
-                markeredgecolor=SURFACE,
-                markeredgewidth=1.2,
-            )
     from matplotlib.lines import Line2D
 
+    from .power import effect_needed, scan_seconds
+
+    names = list(results)
+    minutes = {n: scan_seconds(results[n]) for n in names}
+    per_min = all(m is not None for m in minutes.values())
+    need = {n: effect_needed(results[n], target) for n in names}
+    top = max(r["amplitude"] for res in results.values() for r in res["table"])
+    fig, axes = plt.subplots(
+        1, 1 + per_min, figsize=(9 + 5 * per_min, 0.7 * len(names) + 1.6), squeeze=False
+    )
+    fig.patch.set_facecolor(SURFACE)
+    labels = [f"{n}\n{minutes[n] / 60:.1f} min" if minutes[n] is not None else n for n in names]
+    panels = [(axes[0, 0], {n: 1.0 for n in names}, top, "amplitude")]
+    if per_min:
+        scale = {n: float(np.sqrt(minutes[n] / 60)) for n in names}  # type: ignore[operator]
+        panels.append((axes[0, 1], scale, top * max(scale.values()), "per minute"))
+    colors = ramp(len(noise_labels))
+    for ax, scale, edge, kind in panels:
+        _comparison_panel(ax, names, need, scale, contrast, noise_labels, colors, edge)
+        ax.set_yticks(range(len(names)), labels if ax is axes[0, 0] else [""] * len(names))
+        if kind == "amplitude":
+            ax.set_xlabel(
+                f"amplitude for {target:.0%} power (% signal change)", color=INK2, fontsize=9
+            )
+            ax.set_title(
+                title or f"{contrast}: effect needed (lower is better)",
+                color=INK,
+                fontsize=10,
+                loc="left",
+            )
+        else:
+            ax.set_xlabel("effect x sqrt(total minutes)", color=INK2, fontsize=9)
+            ax.set_title(
+                "per unit of scan time (lower = more per minute)",
+                color=INK,
+                fontsize=10,
+                loc="left",
+            )
     handles = [
         Line2D([], [], marker="o", color=col, linewidth=2, markersize=7, label=label)
         for label, col in zip(noise_labels, colors, strict=True)
@@ -612,17 +622,7 @@ def plot_design_comparison(
             label=f"not reached by {top:g}%",
         )
     )
-    ax.set_yticks(range(len(names)), names)
-    ax.set_ylim(len(names) - 0.5, -0.5)  # first design on top, every offset inside
-    ax.set_xlim(0, top * 1.08)
-    ax.set_xlabel(f"amplitude for {target:.0%} power (% signal change)", color=INK2, fontsize=9)
-    ax.set_title(
-        title or f"{contrast}: amplitude needed (lower is better)",
-        color=INK,
-        fontsize=10,
-        loc="left",
-    )
-    ax.legend(
+    axes[0, -1].legend(
         handles=handles,
         frameon=False,
         fontsize=8,
@@ -632,6 +632,46 @@ def plot_design_comparison(
     )
     fig.tight_layout()
     return _finish(fig, path)
+
+
+def _comparison_panel(ax, names, need, scale, contrast, noise_labels, colors, edge) -> None:
+    """One design-comparison panel: median dot and range whisker per design x noise level."""
+    _style(ax)
+    offsets = np.linspace(-0.22, 0.22, len(noise_labels)) if len(noise_labels) > 1 else [0.0]
+    for row, name in enumerate(names):
+        for label, col, dy in zip(noise_labels, colors, offsets, strict=True):
+            v = need[name].get((label, contrast), np.full(1, np.nan)) * scale[name]
+            y = row + dy
+            if np.all(np.isnan(v)):
+                ax.annotate(
+                    "",
+                    (edge * 1.05, y),
+                    (edge * 0.9, y),
+                    arrowprops={"arrowstyle": "->", "color": col, "lw": 2},
+                )
+                continue
+            ax.plot([np.nanmin(v), np.nanmax(v)], [y, y], color=col, linewidth=2)
+            ax.plot(
+                np.nanmedian(v),
+                y,
+                "o",
+                color=col,
+                markersize=7,
+                markeredgecolor=SURFACE,
+                markeredgewidth=1.2,
+            )
+    ax.set_ylim(len(names) - 0.5, -0.5)  # first design on top, every offset inside
+    # Sized to the data: to the sweep's edge only when an arrow has to sit there,
+    # otherwise the dots crowd into the left of an axis running to the sweep's top.
+    vals = [
+        need[n].get((lab, contrast), np.full(1, np.nan)) * scale[n]
+        for n in names
+        for lab in noise_labels
+    ]
+    finite = np.concatenate([v[np.isfinite(v)] for v in vals])
+    unreached = any(np.all(np.isnan(v)) for v in vals)
+    right = edge if unreached or not finite.size else float(finite.max())
+    ax.set_xlim(0, right * (1.08 if unreached else 1.15))
 
 
 def plot_hrf_recovery(

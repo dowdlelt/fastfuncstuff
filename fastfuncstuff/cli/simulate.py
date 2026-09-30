@@ -756,9 +756,17 @@ def _run_compare(args) -> int:
             f"  {n:<28} {'scan time unknown (no _spec.json)' if s is None else f'{s:.0f} s total'}"
         )
     known = [s for s in scans.values() if s is not None]
+    all_known = len(known) == len(scans)
     if known and (max(known) - min(known)) > 0.02 * max(known):
         out.append(
-            "WARNING: scan times differ -- the longer design wins partly by having more data"
+            "note: scan times differ -- the longer design wins the effect table partly by "
+            "having more data"
+            + (
+                "; the x sqrt(minutes) table below each contrast compares them per unit of "
+                "scan time"
+                if all_known
+                else "; some files have no _spec.json, so there is no per-minute view"
+            )
         )
     contrasts = list(dict.fromkeys(r["contrast"] for r in rows))
     noises = list(dict.fromkeys(r["noise"] for r in rows))
@@ -791,6 +799,22 @@ def _run_compare(args) -> int:
                         text += f" +{r['n_unreached']}"
                 cells.append(f"{text:>22}")
             out.append(f"{n:<28}" + "".join(cells))
+        if all_known:
+            out.append(
+                "  per unit of scan time: effect x sqrt(total minutes), lower = more per minute"
+            )
+            for n in names:
+                cells = []
+                for noise in noises:
+                    r = next(
+                        x
+                        for x in rows
+                        if x["design"] == n and x["contrast"] == c and x["noise"] == noise
+                    )
+                    pm = r["per_minute"]
+                    text = "-" if not r["has_effect"] or np.isnan(pm) else f"{pm:.2f}"
+                    cells.append(f"{text:>22}")
+                out.append(f"  {n:<26}" + "".join(cells))
     out.append("  +k: k realizations never reach the target within their sweep")
     text = "\n".join(out)
     print(text)

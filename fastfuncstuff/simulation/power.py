@@ -874,6 +874,7 @@ def compare_designs(
     for name in names:
         rows = results[name]["table"]
         need = effect_needed(results[name], target)
+        scan = scan_seconds(results[name])
         for noise in shared_noise:
             for c in shared_con:
                 v = need[(noise, c)]
@@ -889,7 +890,14 @@ def compare_designs(
                         "min": float(np.nanmin(v)) if np.isfinite(v).any() else np.nan,
                         "max": float(np.nanmax(v)) if np.isfinite(v).any() else np.nan,
                         "n_unreached": int(np.isnan(v).sum()),
-                        "scan_s": scan_seconds(results[name]),
+                        "scan_s": scan,
+                        # effect x sqrt(total minutes): per unit of scan time,
+                        # since for a fixed design the effect falls as 1/sqrt(T)
+                        "per_minute": (
+                            float(np.nanmedian(v)) * np.sqrt(scan / 60)
+                            if scan is not None and np.isfinite(v).any()
+                            else np.nan
+                        ),
                     }
                 )
     return out
