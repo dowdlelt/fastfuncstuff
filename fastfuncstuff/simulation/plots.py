@@ -1258,6 +1258,120 @@ def plot_shape_steps(
     return _finish(fig, path)
 
 
+def plot_soa(
+    result: dict[str, Any],
+    contrasts: dict[str, Any],
+    this: list[dict[str, Any]] | None = None,
+    target: float = 0.8,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """Efficiency against SOA: the classic curves, with this design marked.
+
+    Panels: the first condition contrast, the first difference contrast (if
+    any), and the response shape. Lines: a fixed SOA, jittered gaps and
+    jittered with a third blank (median over realizations; band: range). The
+    star is this design, at its mean SOA. Fixed SOAs are good only very short
+    or long; jitter keeps short SOAs efficient; blanks help the main effect.
+    ``result`` is :func:`~.power.soa_sweep`; ``this`` its scores for this design.
+    """
+    import matplotlib.pyplot as plt
+
+    from .power import SOA_FAMILIES, is_difference
+
+    ref = result["ref"]
+    panels = []
+    first = next((c for c, w in contrasts.items() if not is_difference(w)), None)
+    diff = next((c for c, w in contrasts.items() if is_difference(w)), None)
+    for c, what in ((first, "main effect"), (diff, "difference")):
+        if c is not None:
+            panels.append((f"{c} ({what}): % signal for {target:.0%} power",
+                           lambda sc, c=c: sc["needed"][(ref, c)]))  # fmt: skip
+    panels.append(("response shape: SD per FIR bin (%)", lambda sc: sc["shape_sd"][ref]))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.8 * len(panels) + 0.6, 4.0),
+                             squeeze=False, layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    soa = result["soa"]
+    for ax, (label, get) in zip(axes[0], panels, strict=True):
+        _style(ax)
+        ax.set_xscale("log")
+        for fam, col in zip(SOA_FAMILIES, CATEGORICAL, strict=False):
+            vals = [[get(sc) for sc in per] for per in result["families"][fam]]
+            med = [float(np.median(v)) if v else np.nan for v in vals]
+            ax.fill_between(soa, [min(v) if v else np.nan for v in vals],
+                            [max(v) if v else np.nan for v in vals], color=col, alpha=0.15,
+                            linewidth=0)  # fmt: skip
+            ax.plot(soa, med, "o-", color=col, linewidth=2, markersize=3.5, label=fam)
+        if this and np.isfinite(result["this_soa"]):
+            v = float(np.median([get(sc) for sc in this]))
+            ax.plot([result["this_soa"]], [v], "*", color=INK, markersize=14, label="this design")
+        ax.set_xlabel("mean SOA, onset to onset (s)", color=INK2, fontsize=9)
+        ax.set_title(label, color=INK, fontsize=9, loc="left")
+        _plain_log_ticks(ax, "x")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
+               loc="outside lower center", ncol=len(labels))  # fmt: skip
+    fig.suptitle(
+        title or f"Efficiency against SOA at {ref}: the same trials, rearranged (lower is "
+        "better; same run length)",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
+def plot_liu(
+    points: dict[str, list[tuple[float, float]]],
+    k: int,
+    n_conditions: int,
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """Designs on Liu et al. (2001)'s plane: estimation efficiency against detection power.
+
+    Both axes are fractions of their theoretical bounds (Liu & Frank 2004,
+    Eqs. 26-27). The curves are the theoretical trade-off -- no design sits
+    outside the outer one -- for the angle theta between the HRF and the
+    design's dominant eigenvector (0 deg: the outer bound). Random designs sit
+    at high efficiency, blocks at high power; nothing gets both. ``points``:
+    {label: [(xi, R), ...]} -- families and this design's realizations.
+    """
+    import matplotlib.pyplot as plt
+
+    from .metrics import compute_efficiency_power_tradeoff
+
+    fig, ax = plt.subplots(figsize=(7.6, 5.6))
+    fig.patch.set_facecolor(SURFACE)
+    _style(ax)
+    for th, ls in ((0.0, "-"), (45.0, (0, (4, 3))), (70.0, ":")):
+        curve = compute_efficiency_power_tradeoff(k, n_conditions, theta_deg=th)
+        ax.plot(curve["efficiency"], curve["power"], color=INK2, linewidth=1.2, linestyle=ls,
+                label=f"theoretical, theta {th:g} deg")  # fmt: skip
+    cols = iter(CATEGORICAL)
+    for label, pts in points.items():
+        if not pts:
+            continue
+        xi, r = np.array(pts, dtype=float).T
+        if label == "this design":
+            ax.scatter(xi, r, s=90, marker="*", color=INK, zorder=4, label=label)
+            continue
+        col = next(cols)
+        order = np.argsort(xi)
+        ax.plot(xi[order], r[order], "o-", color=col, linewidth=1.2, markersize=4, alpha=0.9,
+                label=label)  # fmt: skip
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel("estimation efficiency (fraction of its bound)", color=INK2, fontsize=9)
+    ax.set_ylabel("detection power (fraction of its bound)", color=INK2, fontsize=9)
+    ax.legend(frameon=False, fontsize=7.5, labelcolor=INK2, loc="upper right")
+    ax.set_title(
+        title or "Liu et al. (2001): estimation against detection -- random designs right, "
+        "blocks up; the bound caps both",
+        color=INK, fontsize=9.5, loc="left",
+    )  # fmt: skip
+    fig.tight_layout()
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

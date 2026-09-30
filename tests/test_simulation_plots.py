@@ -147,3 +147,31 @@ def test_spectrum_puts_block_power_at_the_block_frequency(tmp_path):
     assert sp["noise_psd"][0] == pytest.approx(1.0) and sp["noise_psd"][-1] < 0.5
     plot_spectrum(sp, ["A-B"], path=tmp_path / "s.png")
     assert (tmp_path / "s.png").stat().st_size > 10_000
+
+
+def test_soa_sweep_and_liu_plane(tmp_path):
+    from fastfuncstuff.simulation.plots import plot_liu, plot_soa
+    from fastfuncstuff.simulation.power import RealizationScorer, soa_sweep
+
+    spec = ExperimentSpec(
+        tr=1.0,
+        units=[Unit.parse("A", "A:1", 1), Unit.parse("B", "B:1", 1)],
+        isi=Interval.parse("exp:4,1,12"),
+        post_fix=15,
+        scan_time=240,
+    )
+    r = realize(spec, 0)
+    noise = [{"label": "t60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}]
+    con = {"A": [1.0, 0.0], "A-B": [1.0, -1.0]}
+    sc = RealizationScorer(1.0, con, noise)
+    out = soa_sweep(r, 1.0, sc, "t60", 0.0, 15.0, n_soa=4, n_designs=1)
+    assert out["this_soa"] == pytest.approx(5.0, abs=1.0)
+    # random events are efficient estimators, long blocks detect: the Liu axes
+    ev = out["families"]["jittered"][0][0]
+    bl = out["blocks"][20.0][0]
+    assert ev["xi"] > 3 * bl["xi"] and bl["liu_power"] > 2 * ev["liu_power"]
+    plot_soa(out, con, [sc.score(r)], path=tmp_path / "s.png")
+    plot_liu({"events": [(ev["xi"], ev["liu_power"])], "this design": [(0.2, 0.1)]}, 16, 2,
+             path=tmp_path / "l.png")  # fmt: skip
+    for name in ("s.png", "l.png"):
+        assert (tmp_path / name).stat().st_size > 10_000

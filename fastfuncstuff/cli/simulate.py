@@ -2157,6 +2157,34 @@ def main(argv: list[str] | None = None) -> int:
                 live,
                 path=f"{prefix}_spectrum.png",
             )  # fmt: skip
+        if live:
+            from fastfuncstuff.simulation.plots import plot_liu, plot_soa
+            from fastfuncstuff.simulation.power import RealizationScorer, soa_sweep
+
+            ref_noise = [c for c in conds if c["label"] == ref]
+            soa_scorer = RealizationScorer(
+                args.tr, {c: contrasts[c] for c in live}, ref_noise, pattern, args.hrf,
+                args.alpha, args.target, poly_degree=args.polort,
+            )  # fmt: skip
+            soa = soa_sweep(
+                reals[0], args.tr, soa_scorer, ref, args.initial_fix, args.post_fix,
+                seed=args.seed,
+            )  # fmt: skip
+            this = [sc for sc in (soa_scorer.score(r) for r in reals[:10]) if sc]
+            plot_soa(soa, {c: contrasts[c] for c in live}, this, args.target,
+                     path=f"{prefix}_soa.png")  # fmt: skip
+            pts = {
+                f"events, {fam}": [
+                    (sc["xi"], sc["liu_power"]) for per in soa["families"][fam] for sc in per[:1]
+                ]
+                for fam in soa["families"]
+            }
+            pts["blocks, 4-40 s"] = [
+                (v[0]["xi"], v[0]["liu_power"]) for v in soa["blocks"].values() if v
+            ]
+            pts["this design"] = [(sc["xi"], sc["liu_power"]) for sc in this]
+            plot_liu(pts, int(round(16.0 / args.tr)), len(reals[0].conditions),
+                     path=f"{prefix}_liu.png")  # fmt: skip
         if sweep is not None and sweep["rows"]:
             from fastfuncstuff.simulation.plots import plot_scan_time
 

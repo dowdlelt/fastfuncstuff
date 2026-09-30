@@ -530,9 +530,10 @@ class RealizationScorer:
             finite = [v for v in vals if np.isfinite(v)]
             out["needed"][(label, "detection")] = float(np.mean(finite)) if finite else np.nan
         if shape:
-            est = estimation_quality(real, self.tr, self.noise, poly_degree=pdeg)
+            est = estimation_quality(real, self.tr, self.noise, poly_degree=pdeg, hrf=self.hrf)
             out["shape_sd"] = {k: float(np.mean(v)) for k, v in est["shape_sd"].items()}
             out["xi"] = est["xi"]
+            out["liu_power"] = est["liu_power"]
         if single:
             st = single_trial_quality(
                 real, self.tr, self.noise, self.hrf, pdeg, self.mean_response, self.trial_sd
@@ -781,7 +782,7 @@ def realizations_design_quality(
         )
         q = design_quality(X, list(real.run_lengths), tr, noise, alpha, target, poly_degree)
         if not q["deficient"]:
-            q.update(estimation_quality(real, tr, noise, poly_degree=q["poly_degree"]))
+            q.update(estimation_quality(real, tr, noise, poly_degree=q["poly_degree"], hrf=hrf))
             if k < single_trial_designs:  # per-trial numbers barely vary across realizations
                 q["single"] = single_trial_quality(
                     real, tr, noise, hrf, q["poly_degree"], mean_response, trial_sd
@@ -805,12 +806,34 @@ def fir_onsets(realization: Any, tr: float) -> np.ndarray:
     return on
 
 
+def stimulus_pattern(realization: Any, tr: float) -> np.ndarray:
+    """(n_timepoints, n_conditions): 1 where a condition's stimulus is on in that TR bin.
+
+    Liu & Frank's designs are stimulus patterns on the TR grid -- an event is
+    one bin, a 30 s block thirty -- not onsets; with onsets only, a block was a
+    single impulse and scored like a sparse event.
+    """
+    n = sum(realization.run_lengths)
+    pat = np.zeros((n, len(realization.conditions)))
+    start = 0
+    for run, n_run in enumerate(realization.run_lengths):
+        for q, per_run in enumerate(realization.onsets):
+            d = float(realization.durations[q])
+            for t in per_run[run]:
+                a = int(np.floor(t / tr + 1e-9))
+                b = max(a + 1, int(np.ceil((t + d) / tr - 1e-9)))
+                pat[start + max(a, 0) : start + min(b, n_run), q] = 1.0
+        start += n_run
+    return pat
+
+
 def estimation_quality(
     realization: Any,
     tr: float,
     noise: list[dict[str, Any]],
     window: float = 16.0,
     poly_degree: int | None = None,
+    hrf: str = "spmg1",
 ) -> dict[str, Any]:
     """How well the design estimates each condition's response *shape* (FIR), not its size.
 
@@ -828,11 +851,13 @@ def estimation_quality(
                       FIR is not estimable (e.g. a fixed SOA aliasing the lags)
         'xi'        : Liu & Frank's estimation efficiency as a fraction of its
                       bound (white noise, design only; comparable to the papers)
+        'liu_power' : their detection power as a fraction of its bound -- with
+                      xi, a point on Liu et al. (2001)'s trade-off plane
         'fir_lags'  : bins per condition
     """
     from fastfuncstuff.cli_utils import auto_polort
 
-    from .metrics import compute_estimation_efficiency
+    from .metrics import compute_detection_power, compute_estimation_efficiency
 
     lengths = list(realization.run_lengths)
     if poly_degree is None:
@@ -853,11 +878,24 @@ def estimation_quality(
     D = _nuisance(lengths, poly_degree)
     X = torch.cat([torch.as_tensor(np.stack(cols, 1)), D], dim=1)
     out: dict[str, Any] = {"fir_lags": k}
+    # Liu & Frank's two numbers need no FIR: the stimulus pattern on the TR grid.
+    # Estimation efficiency, and detection power beside it -- the two axes of
+    # Liu et al. (2001)'s trade-off plane -- with the same k, and the HRF on the
+    # TR grid, as their model has it.
+    from .core import hrfs_from_spec
+
+    pat = stimulus_pattern(realization, tr)
+    eff = compute_estimation_efficiency(
+        pat, n_cond, k, poly_degree=-1, nuisance=D.numpy(), normalize=True
+    )
+    h0 = hrfs_from_spec(hrf, tr, torch.device("cpu"))[0][1][0].numpy()[:k]
+    det = compute_detection_power(pat, h0, n_cond, poly_degree=-1, nuisance=D.numpy())
+    liu = {"xi": float(eff["total_normalized"]), "liu_power": float(det["total_normalized"])}
     if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
         out["shape_sd"] = {
             str(c.get("label", f"noise{i}")): np.full(n_cond, np.inf) for i, c in enumerate(noise)
         }
-        out["xi"] = 0.0
+        out.update(liu)
         return out
     P = torch.linalg.inv(X.T @ X) @ X.T
     shape: dict[str, np.ndarray] = {}
@@ -875,10 +913,7 @@ def estimation_quality(
             cache[ab] = var[: n_cond * k].reshape(n_cond, k).mean(dim=1).sqrt().numpy()
         shape[label] = 100.0 / float(kw["tsnr"]) * cache[ab]
     out["shape_sd"] = shape
-    eff = compute_estimation_efficiency(
-        on, n_cond, k, poly_degree=-1, nuisance=D.numpy(), normalize=True
-    )
-    out["xi"] = float(eff["total_normalized"])
+    out.update(liu)
     return out
 
 
@@ -1510,6 +1545,85 @@ def shape_steps(
                 )
         out["steps"][label], out["power"][label] = steps, power
     return out
+
+
+def mean_soa(realization: Any) -> float:
+    """Mean onset-to-onset interval (s) over all events, within runs."""
+    gaps = []
+    for run in range(len(realization.run_lengths)):
+        on = np.sort(np.concatenate([np.asarray(c[run], dtype=float) for c in realization.onsets]))
+        gaps += np.diff(on).tolist()
+    return float(np.mean(gaps)) if gaps else float("nan")
+
+
+SOA_FAMILIES = ("fixed SOA", "jittered", "jittered, 1/3 blank")
+
+
+def soa_sweep(
+    realization: Any,
+    tr: float,
+    scorer: Any,
+    ref_noise: str,
+    initial_fix: float = 0.0,
+    post_fix: float = 16.0,
+    n_soa: int = 10,
+    n_designs: int = 2,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Efficiency against SOA (Dale 1999; Friston 1999; Josephs & Henson 1999).
+
+    The same conditions, durations, runs and run length as ``realization``,
+    rearranged as three classic event designs at each mean SOA (onset to
+    onset): a fixed SOA; jittered (exponential gaps, same mean); jittered with
+    a third of the slots blank. Each is scored by ``scorer``
+    (:class:`RealizationScorer`, shape included). Plus, for the Liu plane,
+    blocks of each condition from 4 to 40 s with equal rest.
+
+    Returns 'soa' (grid), 'this_soa', 'families' {name: list of per-SOA lists
+    of scores}, 'blocks' {length: [scores]}.
+    """
+    from .experiment import ExperimentSpec, Interval, Unit, realize
+
+    conds = list(realization.conditions)
+    durs = [float(d) for d in realization.durations]
+    d = float(np.mean(durs))
+    n_runs = len(realization.run_lengths)
+    run_s = float(np.mean(realization.run_durations))
+    this = mean_soa(realization)
+    hi = max(20.0, 1.5 * this if np.isfinite(this) else 20.0)
+    soas = np.geomspace(d + max(0.25, 0.25 * tr), hi, n_soa)
+
+    def spec(units, isi):
+        return ExperimentSpec(tr=tr, units=units, isi=isi, n_runs=n_runs, initial_fix=initial_fix,
+                              post_fix=post_fix, scan_time=run_s)  # fmt: skip
+
+    def score(sp):
+        out = []
+        for r in range(n_designs):
+            try:
+                sc = scorer.score(realize(sp, seed + r))
+            except ValueError:
+                sc = None
+            if sc is not None:
+                out.append(sc)
+        return out
+
+    trials = [Unit.parse(c, f"{c}:{dd:g}", 1) for c, dd in zip(conds, durs, strict=True)]
+    fams: dict[str, list[list[dict[str, Any]]]] = {f: [] for f in SOA_FAMILIES}
+    for soa in soas:
+        g = soa - d
+        fixed = Interval.parse(round(g, 4))
+        jit = Interval.parse(f"exp:{g:.4g},{0.25 * g:.4g},{4 * g:.4g}")
+        blank = Unit.parse("null0", f"null:{d:g}", 0.5 * len(conds))
+        fams["fixed SOA"].append(score(spec(trials, fixed)))
+        fams["jittered"].append(score(spec(trials, jit)))
+        fams["jittered, 1/3 blank"].append(score(spec([*trials, blank], jit)))
+    blocks: dict[float, list[dict[str, Any]]] = {}
+    for length in (4.0, 6.0, 8.0, 12.0, 16.0, 20.0, 30.0, 40.0):
+        units = [Unit.parse(c, f"{c}:{length:g}", 1, "block") for c in conds]
+        blocks[length] = score(spec(units, Interval.parse(length)))
+    return {"soa": soas, "this_soa": this, "families": fams, "blocks": blocks,
+            "ref": ref_noise}  # fmt: skip
 
 
 def simulate_realizations_power(
