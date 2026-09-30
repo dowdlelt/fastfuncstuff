@@ -35,11 +35,13 @@ fixed by exactly one thing:
                        (-trial A 2 3 -trial B 2 1 -num_events 40 -> 30 A, 10 B),
                        and -null scales along with them
     -num_blocks N      the same for -block/-miniblock units
-    -scan_time S       S seconds per run (fixed volumes). Families without a
-                       total are scaled to fill it on average; with every
-                       family fixed it only sets the run length (leftover time
-                       is trailing fixation). Events jitter pushes past the end
-                       are dropped and counted, as on a scanner.
+    -scan_time S       at most S seconds per run. Families without a total
+                       are scaled to the whole units that fit, and the run is
+                       trimmed to them (noted) when that saves 5% or more --
+                       padding with fixation would understate the design per
+                       minute. With every family fixed, S sets the run length
+                       and leftover time is trailing fixation. Events jitter
+                       pushes past the end are dropped and counted.
 
 NOISE -- tSNR levels (-tsnr 20 50 100) with a physiological share and its
 correlation time in seconds (-phys_fraction, -tau), or calibrated from a real
@@ -161,7 +163,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Order of units within a run.",
     )
     t.add_argument("-nruns", type=int, default=1, help="Runs (described experiment).")
-    t.add_argument("-scan_time", type=float, metavar="S", help="Seconds per run (fixed volumes).")
+    t.add_argument(
+        "-scan_time",
+        type=float,
+        metavar="S",
+        help="Seconds per run, at most: trimmed to the units that fit (see HOW MANY).",
+    )
     t.add_argument("-num_events", type=int, metavar="N", help="-trial units per run in total.")
     t.add_argument("-num_blocks", type=int, metavar="N", help="-block/-miniblock units per run.")
     t.add_argument(

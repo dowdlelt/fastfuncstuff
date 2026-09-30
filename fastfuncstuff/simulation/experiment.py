@@ -332,6 +332,35 @@ class ExperimentSpec:
                 )
         return out
 
+    def scan_sized(self) -> bool:
+        """Whether -scan_time chose any family's count (a family without its own total)."""
+        if self.scan_time is None:
+            return False
+        fams = {u.family for u in self.units}
+        return ("event" in fams and self.num_events is None) or (
+            "block" in fams and self.num_blocks is None
+        )
+
+    def run_seconds(self, counts: list[int]) -> float | None:
+        """Seconds per run: -scan_time, trimmed to the content when -scan_time sized it.
+
+        A count sized to fill the scan is rounded, usually down (5.73 blocks
+        -> 5), and padding the remainder with fixation would understate the
+        design: per minute it is better than the padded scan says, and the
+        time freed on every run adds up to more runs. So the run ends when
+        its content does (rounded up to a whole TR), if that saves at least 5%
+        of the scan -- a TR or two is not worth it, and a jittered realization
+        that runs long would lose events to it. Counts the user fixed keep
+        -scan_time's padding: that is chosen.
+        """
+        if self.scan_time is None:
+            return None
+        if not self.scan_sized():
+            return self.scan_time
+        need = self.expected_duration([float(c) for c in counts])
+        trimmed = float(np.ceil(need / self.tr - 1e-9) * self.tr)
+        return trimmed if self.scan_time - trimmed >= 0.05 * self.scan_time else self.scan_time
+
     def describe(self) -> str:
         counts = self.resolve_counts()
         lines = [
@@ -340,11 +369,25 @@ class ExperimentSpec:
             f"between units: {self.isi}   within units: {self.within_isi}",
         ]
         if self.scan_time is not None:
+            run_s = self.run_seconds(counts)
+            assert run_s is not None
             lines.append(
-                f"scan time {self.scan_time:g} s per run "
-                f"({int(round(self.scan_time / self.tr))} volumes); expected content "
-                f"{self.expected_duration([float(c) for c in counts]):.0f} s"
+                f"scan time {run_s:g} s per run ({int(round(run_s / self.tr))} volumes); "
+                f"expected content {self.expected_duration([float(c) for c in counts]):.0f} s"
             )
+            if run_s < self.scan_time:
+                saved = self.scan_time - run_s
+                lines.append(
+                    f"  note: trimmed from -scan_time {self.scan_time:g} s -- the whole units "
+                    f"that fit end at {run_s:g} s. {saved:g} s saved per run, "
+                    f"{saved * self.n_runs:g} s over {self.n_runs} run(s)"
+                    + (
+                        f" ({saved * self.n_runs / run_s:.2f} of a run)"
+                        if saved * self.n_runs < run_s
+                        else f" -- enough for {int(saved * self.n_runs // run_s)} more run(s)"
+                    )
+                    + "."
+                )
         for u, c in zip(self.units, counts, strict=True):
             items = ", ".join(
                 f"{it.condition}:{it.duration:g}" + (f":{it.off}" if it.off else "")
@@ -355,12 +398,20 @@ class ExperimentSpec:
             idx = [i for i, u in enumerate(self.units) if u.family == fam and not u.is_null]
             got = {counts[i] for i in idx}
             if len({self.units[i].count for i in idx}) == 1 and len(got) > 1:
-                k = len(idx)
+                k, total = len(idx), sum(counts[i] for i in idx)
+                options = []
+                for n in (total // k * k, (total // k + 1) * k):
+                    if n == 0:
+                        continue
+                    trial = [float(c) for c in counts]
+                    for i in idx:
+                        trial[i] = n / k
+                    run = float(np.ceil(self.expected_duration(trial) / self.tr - 1e-9) * self.tr)
+                    options.append(f"{flag} {n} (runs of {run:g} s)")
                 lines.append(
                     f"  note: equally weighted {fam} units got uneven counts "
-                    f"({'/'.join(str(counts[i]) for i in idx)} per run): {sum(counts[i] for i in idx)} "
-                    f"is not a multiple of {k}. For a balanced design set {flag} to a "
-                    f"multiple of {k}, or change -scan_time."
+                    f"({'/'.join(str(counts[i]) for i in idx)} per run): {total} is not a "
+                    f"multiple of {k}. Balanced: " + " or ".join(options) + "."
                 )
         return "\n".join(lines)
 
@@ -393,6 +444,7 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
     run_lengths, run_durations = [], []
     n_dropped = 0
 
+    run_s = spec.run_seconds(counts)
     for run in range(spec.n_runs):
         order = [
             int(u)
@@ -429,15 +481,15 @@ def realize(spec: ExperimentSpec, seed: int) -> Realization:
                 if item.condition != NULL:
                     # A fixed scan acquires a fixed number of volumes; an event
                     # that jitter pushed past the end is simply not recorded.
-                    if spec.scan_time is not None and t >= spec.scan_time:
+                    if run_s is not None and t >= run_s:
                         n_dropped += 1
                     else:
                         onsets[item.condition][run].append(t)
                 t += item.duration + gap.get((k, j), 0.0)
         t += spec.post_fix
-        if spec.scan_time is not None:
-            run_durations.append(spec.scan_time)
-            run_lengths.append(int(round(spec.scan_time / spec.tr)))
+        if run_s is not None:
+            run_durations.append(run_s)
+            run_lengths.append(int(round(run_s / spec.tr)))
         else:
             run_durations.append(t)
             run_lengths.append(int(np.ceil(t / spec.tr - 1e-9)))

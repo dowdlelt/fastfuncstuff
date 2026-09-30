@@ -213,7 +213,13 @@ class TestCountsAndScanTime:
         counts = spec.resolve_counts()
         assert sum(counts) == 5
         assert spec.expected_duration([float(c) for c in counts]) <= 330
-        assert "uneven counts (3/2 per run)" in spec.describe()
+        text = spec.describe()
+        assert "uneven counts (3/2 per run)" in text and "-num_blocks 4 (runs of 235 s)" in text
+        # ... and the run is trimmed to the 5 blocks: padding the leftover 40 s
+        # with fixation would understate the design per minute.
+        assert "trimmed from -scan_time 330 s" in text
+        r = realize(spec, 0)
+        assert r.run_lengths == [290] and r.run_durations == [290.0] and r.n_dropped == 0
 
     def test_fixed_counts_under_scan_time_keep_the_volumes(self):
         spec = ExperimentSpec(
