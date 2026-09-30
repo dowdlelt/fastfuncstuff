@@ -252,6 +252,7 @@ def score_configs(
                 "worst": {c: float(np.max(v)) for c, v in per.items()},
                 "shape_sd": float(np.median([s["shape_sd"][ref_noise] for s in scores])),
                 "xi": float(np.median([s["xi"] for s in scores])),
+                "liu_power": float(np.median([s["liu_power"] for s in scores])),
                 **{
                     key: float(
                         np.median(

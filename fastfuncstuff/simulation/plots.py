@@ -1325,6 +1325,7 @@ def plot_liu(
     n_conditions: int,
     path: str | Path | None = None,
     title: str | None = None,
+    scatter: bool = False,
 ):
     """Designs on Liu et al. (2001)'s plane: estimation efficiency against detection power.
 
@@ -1332,8 +1333,13 @@ def plot_liu(
     Eqs. 26-27). The curves are the theoretical trade-off -- no design sits
     outside the outer one -- for the angle theta between the HRF and the
     design's dominant eigenvector (0 deg: the outer bound). Random designs sit
-    at high efficiency, blocks at high power; nothing gets both. ``points``:
-    {label: [(xi, R), ...]} -- families and this design's realizations.
+    at high efficiency, blocks at high power; nothing gets both. Liu's axes
+    assume white noise and a constant baseline: the effect-needed numbers
+    elsewhere include the ARMA noise and the per-run drift, which cost slow,
+    block-like designs most -- so a design chosen on those can sit at low R here
+    (the footnote says so). ``points``:
+    {label: [(xi, R), ...]} -- families and this design's realizations; with
+    ``scatter`` each label is a cloud (designs, realizations), not a curve.
     """
     import matplotlib.pyplot as plt
 
@@ -1355,6 +1361,12 @@ def plot_liu(
             ax.scatter(xi, r, s=90, marker="*", color=INK, zorder=4, label=label)
             continue
         col = next(cols)
+        if scatter:
+            big = len(pts) == 1
+            ax.scatter(xi, r, s=70 if big else 12, color=col, alpha=0.9 if big else 0.45,
+                       edgecolors=SURFACE if big else "none", zorder=3 if big else 2,
+                       label=label)  # fmt: skip
+            continue
         order = np.argsort(xi)
         ax.plot(xi[order], r[order], "o-", color=col, linewidth=1.2, markersize=4, alpha=0.9,
                 label=label)  # fmt: skip
@@ -1363,12 +1375,18 @@ def plot_liu(
     ax.set_xlabel("estimation efficiency (fraction of its bound)", color=INK2, fontsize=9)
     ax.set_ylabel("detection power (fraction of its bound)", color=INK2, fontsize=9)
     ax.legend(frameon=False, fontsize=7.5, labelcolor=INK2, loc="upper right")
+    fig.text(
+        0.01, 0.005,
+        "Liu's axes assume white noise and a constant baseline. The effect needed elsewhere "
+        "includes autocorrelation and drift, which cost slow designs most.",
+        fontsize=7.5, color=INK2, ha="left", va="bottom",
+    )  # fmt: skip
     ax.set_title(
         title or "Liu et al. (2001): estimation against detection -- random designs right, "
         "blocks up; the bound caps both",
         color=INK, fontsize=9.5, loc="left",
     )  # fmt: skip
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
     return _finish(fig, path)
 
 

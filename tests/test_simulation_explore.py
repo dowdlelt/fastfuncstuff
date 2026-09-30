@@ -54,7 +54,10 @@ def test_explore_writes_a_small_set_of_outputs(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Pareto front" in out and "recipe:" in out and "what matters" in out
     names = {p.name for p in tmp_path.iterdir()}
-    assert names <= {"x_explore.tsv", "x_explore.png", "x_explore_summary.txt", "x_explore_best"}
+    assert names <= {
+        "x_explore.tsv", "x_explore.png", "x_explore_liu.png", "x_explore_summary.txt",
+        "x_explore_best",
+    }  # fmt: skip
     assert len((tmp_path / "x_explore.tsv").read_text().splitlines()) == 13
     assert any((tmp_path / "x_explore_best").rglob("A.txt"))
     # the recipe line is a runnable command with every placeholder filled in

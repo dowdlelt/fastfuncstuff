@@ -1631,6 +1631,16 @@ def _run_explore(raw: list[str], started: float) -> int:
                 }.get(objective)
             ),
         )
+        from fastfuncstuff.simulation.plots import plot_liu
+
+        ok = [i for i, sc in enumerate(scores) if sc]
+        pts = {"explored designs": [(scores[i]["xi"], scores[i]["liu_power"]) for i in ok]}
+        for rank, i in enumerate(keep, start=1):
+            pts[f"shortlist #{rank}"] = [(scores[i]["xi"], scores[i]["liu_power"])]
+        plot_liu(
+            pts, int(round(16.0 / args.tr)), len(conditions), path=f"{prefix}_explore_liu.png",
+            scatter=True,
+        )  # fmt: skip
     written = sorted(
         str(q.name).removeprefix(prefix.name)
         for q in prefix.parent.glob(f"{prefix.name}_*")
@@ -1802,6 +1812,17 @@ def _run_compare(args) -> int:
                     args.target,
                     path=f"{prefix}_compare_tradeoff_{safe}.png",
                 )
+        liu = {
+            n: list(zip(q["xi"], q["liu_power"], strict=True))
+            for n, q in quals.items()
+            if q and "liu_power" in q
+        }
+        if liu:
+            from fastfuncstuff.simulation.plots import plot_liu
+
+            k = next(int(q["fir_lags"]) for q in quals.values() if q and "fir_lags" in q)
+            n_cond = max(len(r.get("spec", {}).get("conditions", [1])) for r in results.values())
+            plot_liu(liu, k, n_cond, path=f"{prefix}_compare_liu.png", scatter=True)
     return 0
 
 
@@ -2003,6 +2024,7 @@ def main(argv: list[str] | None = None) -> int:
                         for c in conds
                     },
                     "xi": [q["xi"] for q in quality],
+                    "liu_power": [q.get("liu_power", np.nan) for q in quality],
                     "fir_lags": quality[0]["fir_lags"],
                     "single": {
                         "lss_sd": {
