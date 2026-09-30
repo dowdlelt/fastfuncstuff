@@ -185,6 +185,7 @@ class ExperimentSpec:
     scan_time: float | None = None  # seconds per run; fixes the number of volumes
     num_events: int | None = None  # per-run total of non-null event units
     num_blocks: int | None = None  # per-run total of block units
+    tr_lock: bool = False  # every onset on a TR boundary (gaps snapped to TR steps)
 
     @property
     def conditions(self) -> list[str]:
@@ -374,7 +375,8 @@ class ExperimentSpec:
         lines = [
             f"TR {self.tr:g} s, {self.n_runs} run(s), fixation {self.initial_fix:g} s before / "
             f"{self.post_fix:g} s after, order {self.order}",
-            f"between units: {self.isi}   within units: {self.within_isi}",
+            f"between units: {self.isi}   within units: {self.within_isi}"
+            + ("   onsets locked to the TR grid" if self.tr_lock else ""),
         ]
         if self.scan_time is not None:
             run_s = self.run_seconds(counts)
@@ -529,7 +531,7 @@ def assemble(
         # dropping events that *started* past the scan let jitter that is not
         # mean-matched (uniform) eat the final fixation -- 3.5 s of a 15 s one.
         limit = None if run_s is None else run_s - spec.post_fix
-        t = spec.initial_fix
+        t = _lock(spec.initial_fix, spec.initial_fix, spec) if spec.tr_lock else spec.initial_fix
         for k, (ui, gaps) in enumerate(plan.entries):
             unit_events = []
             items = spec.units[ui].items
@@ -537,7 +539,8 @@ def assemble(
                 if item.condition != NULL:
                     unit_events.append((item.condition, t, item.duration))
                 final = k == len(plan.entries) - 1 and j == len(items) - 1
-                t += item.duration + (0.0 if final else gaps[j])
+                nxt = t + item.duration + (0.0 if final else gaps[j])
+                t = _lock(nxt, t + item.duration, spec) if spec.tr_lock and not final else nxt
             if limit is not None and unit_events:
                 if max(on + d for _, on, d in unit_events) > limit + 1e-9:
                     n_dropped += len(unit_events)
@@ -561,6 +564,18 @@ def assemble(
         counts=counts,
         n_dropped=n_dropped,
     )
+
+
+def _lock(t: float, earliest: float, spec: ExperimentSpec) -> float:
+    """-tr_lock: the TR boundary nearest ``t``, but not before ``earliest``.
+
+    Nearest, not next, so the mean gap stays what was asked for; never before
+    the previous item has ended, so a snap cannot make items overlap.
+    """
+    snapped = round(t / spec.tr) * spec.tr
+    if snapped < earliest - 1e-9:
+        snapped = float(np.ceil(earliest / spec.tr - 1e-9)) * spec.tr
+    return float(snapped)
 
 
 def realize(spec: ExperimentSpec, seed: int) -> Realization:

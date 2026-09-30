@@ -244,6 +244,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("-nruns", type=int, default=1, help="Runs (described experiment).")
     t.add_argument(
+        "-tr_lock",
+        action="store_true",
+        help="Every onset on a TR boundary: each gap is drawn as usual and the next onset "
+        "snaps to the nearest boundary (later if it would overlap), so gaps come in TR steps "
+        "with their mean kept. Described experiments; -explore/-optimize respect it.",
+    )
+    t.add_argument(
         "-scan_time",
         type=float,
         metavar="S",
@@ -529,6 +536,7 @@ def _spec_from_args(args):
         scan_time=args.scan_time,
         num_events=args.num_events,
         num_blocks=args.num_blocks,
+        tr_lock=args.tr_lock,
     )
 
 

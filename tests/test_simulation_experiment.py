@@ -275,3 +275,39 @@ def test_scan_time_rounds_up_to_whole_volumes():
     )  # fmt: skip
     r = realize(spec, 0)
     assert r.run_lengths == [166] and r.run_durations == [332.0]
+
+
+def test_tr_lock_puts_every_onset_on_the_grid_and_keeps_the_mean_gap():
+    import copy
+
+    from fastfuncstuff.simulation.experiment import assemble, draw_plans
+    from fastfuncstuff.simulation.optimize import mutate
+
+    def spec(lock):
+        return ExperimentSpec(
+            tr=1.5,
+            units=[Unit.parse("A", "A:0.5", 1), Unit.parse("B", "B:0.5", 1)],
+            isi=Interval.parse("exp:4,1,12"),
+            n_runs=2,
+            initial_fix=10,
+            post_fix=15,
+            scan_time=330,
+            tr_lock=lock,
+        )
+
+    def onsets(r):
+        return np.concatenate([np.concatenate(c) for c in r.onsets])
+
+    locked, free = realize(spec(True), 0), realize(spec(False), 0)
+    grid = onsets(locked) / 1.5
+    assert np.allclose(grid, np.round(grid))
+    assert not np.allclose(onsets(free) / 1.5, np.round(onsets(free) / 1.5))
+    gap = np.mean(np.diff(np.sort(locked.onsets[0][0])))
+    assert gap == pytest.approx(np.mean(np.diff(np.sort(free.onsets[0][0]))), rel=0.1)
+    # a design search goes through the same layout: still on the grid
+    counts, plans = draw_plans(spec(True), 1)
+    plans = copy.deepcopy(plans)
+    for _ in range(50):
+        mutate(spec(True), plans, np.random.default_rng(0))
+    g = onsets(assemble(spec(True), counts, plans)) / 1.5
+    assert np.allclose(g, np.round(g))
