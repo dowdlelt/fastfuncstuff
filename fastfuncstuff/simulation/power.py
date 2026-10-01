@@ -1970,6 +1970,19 @@ def _auto_grids(
     }
 
 
+def neural_durations(durations: list[float], true_duration: str | float | None) -> list[float]:
+    """Durations the data are generated with: the stimulus's, a fixed S, or "+S" longer."""
+    if true_duration is None:
+        return list(durations)
+    text = str(true_duration).strip()
+    value = float(text)
+    if value < 0:
+        raise ValueError(f"true duration {text!r} must be >= 0")
+    if text.startswith("+"):
+        return [d + value for d in durations]
+    return [value] * len(durations)
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,
@@ -1986,6 +1999,7 @@ def simulate_realizations_power(
     progress: bool = True,
     hrf: str = "spmg1",
     true_hrf: str = "same",
+    true_duration: str | float | None = None,
     shared: float = 0.0,
     estimator: str = "ols",
     null_reps: int | None = None,
@@ -2003,8 +2017,11 @@ def simulate_realizations_power(
     ``hrf`` is the response the GLM fits; ``true_hrf`` generates the data
     (``same``, ``spmg1``, ``lib:K``, or ``lib:all`` to sweep the library as the
     truth), and rows carry a ``true_hrf`` label. ``true_delay`` additionally
-    generates the response that many seconds late. Any mismatch shows up as
-    bias in ``mean_est`` and lost power.
+    generates the response that many seconds late, and ``true_duration``
+    with neural activity that long ("+S": S seconds longer than each
+    condition's stimulus) while the model keeps the stimulus durations --
+    activity that outlasts the stimulus, as in memory or decision tasks.
+    Any mismatch shows up as bias in ``mean_est`` and lost power.
 
     What is swept depends on the contrast. A **condition contrast** (weights
     not summing to zero, e.g. ``A``) sweeps the response amplitude, every
@@ -2051,10 +2068,10 @@ def simulate_realizations_power(
         )
         t_label, t_bases = truths[ti]
         X_true = None
-        if true_delay or t_label != fit_label:
+        if true_delay or t_label != fit_label or true_duration is not None:
             X_true = build_task_design(
-                real.onsets, real.durations, tr, real.run_lengths, t_bases, dt,
-                delay=true_delay, device=cpu,
+                real.onsets, neural_durations(real.durations, true_duration), tr,
+                real.run_lengths, t_bases, dt, delay=true_delay, device=cpu,
             )  # fmt: skip
         return X, X_true
 

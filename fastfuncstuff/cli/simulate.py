@@ -63,7 +63,9 @@ weights do not sum to zero; -pattern sets relative responses), and the
 difference itself for a difference contrast (A-B, A+B-2*C): at 1%, A is 1%
 above B. -shared X puts every condition at X% underneath the difference
 (A = X + d, B = X) -- it cancels under a correct HRF, and with -true_hrf or
--true_delay shows what a large common response costs.
+-true_delay shows what a large common response costs. -true_duration generates
+neural activity that outlasts the stimulus (+S seconds longer) while the model
+keeps the stimulus durations.
 
 WHAT IT REPORTS -- for each design, at each noise level:
     detection    the effect each contrast needs for -target power, 80% (the classic design
@@ -372,6 +374,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Generate the response this many seconds late (fit nominal onsets).",
+    )
+    e.add_argument(
+        "-true_duration",
+        metavar="S|+S",
+        help="Generate with neural activity S seconds long (+S: S longer than each "
+        "stimulus) while fitting the stimulus durations -- activity that outlasts the "
+        "stimulus, as in memory or decision tasks.",
     )
 
     a = p.add_argument_group("Analysis")
@@ -903,7 +912,7 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, 
     foot = [
         f"effect for {args.target:.0%} power, % signal change -- the contrast's true value "
         "(a condition's response, or the difference for A-B); median [range] over realizations"
-        + ("; Monte Carlo, the fitted HRF is wrong" if has_mismatch(rows) else "")
+        + ("; Monte Carlo, the fitted response model is wrong" if has_mismatch(rows) else "")
     ]
     if partial:
         live = {c for c in contrasts if has_true_effect(contrasts[c], pattern)}
@@ -1047,6 +1056,13 @@ def _summarise(
         out.append(f"HRF {fit} (generated and fitted)")
     if args.true_delay:
         out.append(f"true response delayed {args.true_delay:g} s relative to the fitted model")
+    if args.true_duration is not None:
+        d = args.true_duration
+        out.append(
+            f"neural activity {d.lstrip('+')} s longer than each stimulus"
+            if str(d).startswith("+")
+            else f"neural activity {d} s long; the model fits the stimulus durations"
+        )
     if profile_text:
         out += ["", profile_text]
     out += ["", f"threshold: two-tailed p < {args.alpha:g}; {args.nreps} replicates per cell", ""]
@@ -1057,7 +1073,7 @@ def _summarise(
 
     over = "realizations" + (" x true HRFs" if len(truths) > 1 else "")
     if has_mismatch(rows):
-        over += "; Monte Carlo power, since the fitted HRF is wrong"
+        over += "; Monte Carlo power, since the fitted response model is wrong"
     out.append(
         "Effect (% signal change: the contrast's true value -- a condition's response, or "
         f"the difference for A-B) for {args.target:.0%} power -- "
@@ -1083,7 +1099,7 @@ def _summarise(
         why = _missing_note(res, need, live, args.target, max(r["amplitude"] for r in rows))
         out.append(f"  * {why}; the median and range leave them out")
 
-    if truths != [fit] or args.true_delay:
+    if truths != [fit] or args.true_delay or args.true_duration is not None:
         top = max(r["amplitude"] for r in rows)
         out += [
             "",
@@ -1591,6 +1607,7 @@ def _validate_candidate(
         hrf=args.hrf,
         true_hrf=args.true_hrf,
         true_delay=args.true_delay,
+        true_duration=args.true_duration,
         shared=args.shared,
         estimator="reml",
         null_reps=args.null_reps,
@@ -2227,6 +2244,9 @@ def main(argv: list[str] | None = None) -> int:
 
         for hrf_spec in {args.hrf, args.true_hrf} - {"same"}:
             hrfs_from_spec(hrf_spec, 0.1, torch.device("cpu"))  # fail before simulating
+        from fastfuncstuff.simulation.power import neural_durations
+
+        neural_durations([1.0], args.true_duration)
     except (ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -2296,6 +2316,7 @@ def main(argv: list[str] | None = None) -> int:
         n_reps=args.nreps,
         alpha=args.alpha,
         true_delay=args.true_delay,
+        true_duration=args.true_duration,
         hrf=args.hrf,
         true_hrf=args.true_hrf,
         shared=args.shared,

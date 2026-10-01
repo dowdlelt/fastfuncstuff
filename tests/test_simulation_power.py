@@ -729,3 +729,27 @@ def test_tabulated_noncentrality_matches_the_root_finder():
         for dof in (1.5, 2.0, 7.3, 150.4, 1e5):
             ref = _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
             assert _nc_needed(target, alpha, dof) == pytest.approx(ref, rel=1e-7)
+
+
+def test_neural_activity_outlasting_the_stimulus_is_a_mismatch():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import neural_durations, simulate_realizations_power
+
+    assert neural_durations([0.5, 2.0], None) == [0.5, 2.0]
+    assert neural_durations([0.5, 2.0], "+3") == [3.5, 5.0]
+    assert neural_durations([0.5, 2.0], 4) == [4.0, 4.0]
+    with pytest.raises(ValueError):
+        neural_durations([1.0], "-2")
+    spec = ExperimentSpec(
+        tr=1.0, units=[Unit.parse("A", "A:0.5", 40)], isi=Interval.parse("exp:3,1,8"), post_fix=12
+    )
+    reals = [realize(spec, 0)]
+    noise = [{"label": "t60", "tsnr": 60.0}]
+    kw = dict(n_reps=200, device=CPU, progress=False)
+    same = simulate_realizations_power(reals, 1.0, {"A": [1]}, [1.0], noise, **kw)
+    longer = simulate_realizations_power(
+        reals, 1.0, {"A": [1]}, [1.0], noise, true_duration="+4", **kw
+    )
+    pick = lambda res: next(r for r in res["table"] if r["amplitude"] == 1.0)  # noqa: E731
+    assert pick(same)["expected_est"] == pytest.approx(1.0, rel=1e-6)
+    assert abs(pick(longer)["expected_est"] - 1.0) > 0.02  # the model no longer fits the truth
