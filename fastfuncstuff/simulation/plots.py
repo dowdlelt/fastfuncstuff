@@ -148,21 +148,17 @@ def plot_power(
             # Plotted against the contrast's true effect, as every table reports
             # it -- the sweep differs from it under -pattern.
             amps = [abs(by[a][0]["true_effect"]) for a in sweep]
-            # REML withholds (NaN) a realization whose nulls show inflation; a
-            # plain median then blanked the whole line, and min/max over NaN
-            # drew an arbitrary band.
+            # nan-aware: a plain median over one nan (a realization REML once
+            # withheld) blanked the whole line, and min/max drew an arbitrary band.
             pred = np.array(
-                [
-                    [r["power_validated" if reml else "power_predicted"] for r in by[a]]
-                    for a in sweep
-                ]
+                [[r["power" if reml else "power_predicted"] for r in by[a]] for a in sweep]
             )
             ok = np.isfinite(pred).any(axis=1)
             if not ok.any():
                 ax.plot([], [], color=col, linewidth=2, label=label)
                 continue
-            pred, amps = pred[ok], [x for x, keep in zip(amps, ok, strict=True) if keep]
-            sweep = [a for a, keep in zip(sweep, ok, strict=True) if keep]
+            keep = np.flatnonzero(ok)
+            pred, amps, sweep = pred[keep], [amps[i] for i in keep], [sweep[i] for i in keep]
             med = np.nanmedian(pred, axis=1)
             ax.fill_between(
                 amps,
@@ -230,7 +226,7 @@ def plot_power(
     )
     fig.suptitle(
         title
-        or f"Power at two-tailed p < {alpha:g} -- line: {'null-checked REML' if reml else 'analytic'} (band: range over "
+        or f"Power at two-tailed p < {alpha:g} -- line: {'fitted REML' if reml else 'analytic'} (band: range over "
         f"realizations), dots: Monte Carlo; dashed: 80%{note}",
         color=INK,
         fontsize=10,

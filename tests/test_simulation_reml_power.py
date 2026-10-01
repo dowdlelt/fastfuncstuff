@@ -82,7 +82,7 @@ def test_reml_reuses_noise_fits_across_effects_and_tsnr(monkeypatch):
         assert corrected.mean() == pytest.approx(r["mean_t"])
 
 
-def test_slow_noise_cannot_turn_liberal_reml_t_into_good_timing():
+def test_slow_noise_flags_liberal_reml_but_still_reports_its_power():
     n = 180
     x = torch.sin(torch.arange(n, dtype=torch.float64) * 0.06)
     x += 0.1 * torch.as_tensor(np.random.default_rng(2).normal(size=n))
@@ -101,13 +101,14 @@ def test_slow_noise_cannot_turn_liberal_reml_t_into_good_timing():
         estimator="reml",
         device=torch.device("cpu"),
     )
+    # Flagged, not hidden: the power is what the analysis would report.
     assert all(r["calibration"] == "inflated" for r in result["table"])
-    assert all(np.isnan(r["power_validated"]) for r in result["table"])
-    assert np.isnan(amplitude_for_power(result)[("fast", "A")])
+    assert all(np.isfinite(r["power"]) for r in result["table"])
+    assert all(r["null_rate"] > 0.05 for r in result["table"])
     assert result["table"][0]["generating_a"] > 0.8
 
 
-def test_insufficient_nulls_withhold_a_verdict():
+def test_insufficient_nulls_are_labelled_limited():
     x = torch.sin(torch.arange(60, dtype=torch.float64) * 0.2)[:, None]
     result = simulate_design_power(
         x,
@@ -123,7 +124,7 @@ def test_insufficient_nulls_withhold_a_verdict():
         device=torch.device("cpu"),
     )
     assert all(r["calibration"] == "limited" for r in result["table"])
-    assert np.isnan(amplitude_for_power(result)[("noise0", "A")])
+    assert all(np.isfinite(r["power"]) for r in result["table"])
 
 
 def test_near_unit_stationary_arma_is_supported():

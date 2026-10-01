@@ -228,9 +228,9 @@ def test_design_matrix_figure(tmp_path):
     del fig
 
 
-def test_power_line_survives_withheld_reml_realizations():
-    # REML sets power_validated to nan for a realization whose nulls show
-    # inflation; 3 such of 20 used to blank every point of the median line.
+def test_power_line_survives_nan_realizations():
+    # One nan realization (REML once withheld them) blanked every point of the
+    # median line; the line is nan-aware.
     amps = [0.0, 0.5, 1.0, 2.0]
     rows = [
         {
@@ -240,8 +240,7 @@ def test_power_line_survives_withheld_reml_realizations():
             "amplitude": a,
             "true_effect": a,
             "estimator": "reml",
-            "power": min(1.0, a),
-            "power_validated": float("nan") if d < 3 else min(1.0, a),
+            "power": float("nan") if d < 3 else min(1.0, a),
         }
         for d in range(20)
         for a in amps

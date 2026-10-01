@@ -792,32 +792,6 @@ def _needed_cell(vals: np.ndarray, has_effect: bool, top: float) -> tuple[str, b
     return text + ("*" if partial else ""), partial
 
 
-def _missing_note(res, need, live: set[str], target: float, top: float) -> str:
-    """Why some realizations are left out of an effect-needed cell: withheld or unreached.
-
-    Both are nan in :func:`effect_needed`; the footnote used to blame the sweep
-    for realizations REML had withheld for null inflation.
-    """
-    rows = res["table"]
-    keys = sorted({(r["design"], r.get("true_hrf", "")) for r in rows})
-    inflated = {(r["noise"], r["design"]) for r in rows if r.get("calibration") == "inflated"}
-    withheld = {d for _, d in inflated}
-    unreached = any(
-        np.isnan(v[[(noise, k[0]) not in inflated for k in keys]]).any()
-        for (noise, c), v in need.items()
-        if c in live and v.size == len(keys)
-    )
-    parts = []
-    if withheld:
-        parts.append(
-            f"{len(withheld)} of {len({k[0] for k in keys})} realizations withheld "
-            "(REML null rejection inflated)"
-        )
-    if unreached:
-        parts.append(f"some never reach {target:.0%} within the sweep (max {top:g}%)")
-    return "; ".join(parts)
-
-
 def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, card=None) -> dict:
     """The headline facts and the answer table, for the text panel of _power.png."""
     from fastfuncstuff.simulation.power import effect_needed, has_mismatch, has_true_effect
@@ -931,8 +905,9 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, 
         + ("; Monte Carlo, the fitted response model is wrong" if has_mismatch(rows) else "")
     ]
     if partial:
-        live = {c for c in contrasts if has_true_effect(contrasts[c], pattern)}
-        foot.append("* " + _missing_note(res, need, live, args.target, top))
+        foot.append(
+            f"* some realizations never reach {args.target:.0%} within the sweep (max {top:g}%)"
+        )
     if card:  # the scorecard first: one value per measure (it covers shape and trials)
         facts = [f for f in facts if f[0] not in ("shape", "trials")]
         facts = [(k.strip(), v) for k, v, _ in card] + [("", "")] + facts
@@ -944,36 +919,39 @@ def _verdict(power: float) -> str:
 
 
 def _reml_calibration_notes(res) -> list[str]:
+    """The REML null check as a caveat: how liberal p < alpha is, against naive OLS."""
     rows = [r for r in res["table"] if r.get("estimator") == "reml" and r["amplitude"] == 0]
     if not rows:
         return []
     rates = [r["null_rate"] for r in rows]
+    naive = np.mean([r["power_naive"] for r in rows])
+    alpha = res["alpha"]
     inflated = sorted({r["contrast"] for r in rows if r["calibration"] == "inflated"})
-    limited = any(r["calibration"] == "limited" for r in rows)
-    status = "no detected inflation"
+    n_real = len({r["design"] for r in rows})
+    head = (
+        f"REML false positives {min(rates):.4f}–{max(rates):.4f} at nominal {alpha:g} "
+        f"(naive OLS {naive:.4f})"
+    )
     if inflated:
-        n_real = len({r["design"] for r in rows})
-        status = (
-            "inflation in "
-            + ", ".join(
-                f"{c} ({len({r['design'] for r in rows if r['contrast'] == c and r['calibration'] == 'inflated'})}"
-                f" of {n_real} realizations)"
-                for c in inflated
-            )
-            + "; those realizations withheld"
+        per = ", ".join(
+            f"{c} in {len({r['design'] for r in rows if r['contrast'] == c and r['calibration'] == 'inflated'})}"
+            f"/{n_real} realizations"
+            for c in inflated
         )
-    elif limited:
-        status = "too few null replicates; timing verdict withheld (increase -null_reps)"
-    notes = [
-        f"REML calibration: {status}. Null rejection "
-        f"{min(rates):.4f}–{max(rates):.4f} (nominal {res['alpha']:g})."
-    ]
+        head += (
+            f": somewhat liberal ({per}, up to {max(rates) / alpha:.1f}x nominal) -- power is "
+            "what this analysis reports, a little optimistic"
+        )
+    elif any(r["calibration"] == "limited" for r in rows):
+        head += ": too few null replicates to check (raise -null_reps)"
+    notes = [head + "."]
     outside = [r for r in rows if r["generating_a"] > r["reml_maxa"]]
     if outside:
         r = max(outside, key=lambda r: r["generating_a"])
         notes.append(
-            f"Noise AR {r['generating_a']:.3f} exceeds fitted maximum "
-            f"{r['reml_maxa']:g}: widen -reml_maxa and the analysis -a_grid."
+            f"Noise AR {r['generating_a']:.3f} is above REML's cap {r['reml_maxa']:g} "
+            "(3dREMLfit's default, -reml_maxa); the fit uses the cap, part of any "
+            "liberal p above."
         )
     return notes
 
@@ -1112,9 +1090,10 @@ def _summarise(
             cells.append(f"{text:>18}")
         out.append(f"{cond['label']:<24}" + "".join(cells))
     if unreached:
-        live = {c for c in contrasts if has_true_effect(contrasts[c], pattern)}
-        why = _missing_note(res, need, live, args.target, max(r["amplitude"] for r in rows))
-        out.append(f"  * {why}; the median and range leave them out")
+        out.append(
+            f"  * some realizations/HRFs never reach {args.target:.0%} within the sweep (max "
+            f"{max(r['amplitude'] for r in rows):g}%); the median and range leave them out"
+        )
 
     if truths != [fit] or args.true_delay or args.true_duration is not None:
         top = max(r["amplitude"] for r in rows)
@@ -1180,8 +1159,8 @@ def _summarise(
     if args.effect is not None:
         column = power_column(rows)
         judged = (
-            "null-checked REML"
-            if column == "power_validated"
+            "fitted REML"
+            if column == "power" and any(r.get("estimator") == "reml" for r in rows)
             else ("Monte Carlo" if column == "power" else "analytic")
         )
         out += [
@@ -2425,7 +2404,6 @@ def main(argv: list[str] | None = None) -> int:
         "estimator",
         "power_ols",
         "mean_t_ols",
-        "power_validated",
         "null_rate",
         "null_reps",
         "null_p",

@@ -700,7 +700,7 @@ def power_column(rows: list[dict[str, Any]]) -> str:
     response), and the Monte Carlo is the referee.
     """
     if any(r.get("estimator") == "reml" for r in rows):
-        return "power_validated"
+        return "power"  # the fitted-REML Monte Carlo
     return "power" if has_mismatch(rows) else "power_predicted"
 
 
@@ -2162,7 +2162,6 @@ def simulate_realizations_power(
 _NUMERIC = {
     "power_ols",
     "mean_t_ols",
-    "power_validated",
     "null_rate",
     "null_reps",
     "null_p",

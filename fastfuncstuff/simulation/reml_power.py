@@ -30,10 +30,13 @@ def validate_reml_power(
 ) -> None:
     """Replace OLS Monte Carlo results with fitted REML results, preserving the OLS reference.
 
-    An independent null sample tests the *nominal* REML threshold. Recommendations
-    use ``power_validated``: NaN if nulls detect inflation (one-sided exact binomial
-    p < .01), or there are fewer than five expected null exceedances. This does not
-    recalibrate the threshold or turn a liberal analysis into apparent sensitivity.
+    An independent null sample tests the *nominal* REML threshold and labels each
+    cell ``calibration``: "inflated" (one-sided exact binomial p < .01), "limited"
+    (fewer than five expected exceedances) or "checked". Power is reported either
+    way -- it is what the analysis gives, and an approximate ARMA correction is
+    still far better than naive OLS -- with the null rate beside it as a caveat.
+    (Withholding inflated cells blanked whole contrasts for slow designs, whose
+    few effective low-frequency samples leave REML mildly liberal.)
     """
     from fastfuncstuff.glm.arma import (
         calculate_grid_memory_footprint,
@@ -176,7 +179,6 @@ def validate_reml_power(
                     power_ols=row["power"],
                     mean_t_ols=row["mean_t"],
                     power=power,
-                    power_validated=power if status == "checked" else float("nan"),
                     mean_est=float(b[:, ci].mean()),
                     sd_est=float(b[:, ci].std()),
                     mean_t=float(ts[:, ci].mean()),
