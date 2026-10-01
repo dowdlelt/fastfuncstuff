@@ -750,6 +750,32 @@ def _needed_cell(vals: np.ndarray, has_effect: bool, top: float) -> tuple[str, b
     return text + ("*" if partial else ""), partial
 
 
+def _missing_note(res, need, live: set[str], target: float, top: float) -> str:
+    """Why some realizations are left out of an effect-needed cell: withheld or unreached.
+
+    Both are nan in :func:`effect_needed`; the footnote used to blame the sweep
+    for realizations REML had withheld for null inflation.
+    """
+    rows = res["table"]
+    keys = sorted({(r["design"], r.get("true_hrf", "")) for r in rows})
+    inflated = {(r["noise"], r["design"]) for r in rows if r.get("calibration") == "inflated"}
+    withheld = {d for _, d in inflated}
+    unreached = any(
+        np.isnan(v[[(noise, k[0]) not in inflated for k in keys]]).any()
+        for (noise, c), v in need.items()
+        if c in live and v.size == len(keys)
+    )
+    parts = []
+    if withheld:
+        parts.append(
+            f"{len(withheld)} of {len({k[0] for k in keys})} realizations withheld "
+            "(REML null rejection inflated)"
+        )
+    if unreached:
+        parts.append(f"some never reach {target:.0%} within the sweep (max {top:g}%)")
+    return "; ".join(parts)
+
+
 def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, card=None) -> dict:
     """The headline facts and the answer table, for the text panel of _power.png."""
     from fastfuncstuff.simulation.power import effect_needed, has_mismatch, has_true_effect
@@ -863,9 +889,8 @@ def _figure_summary(res, reals, conds, contrasts, pattern, args, quality, spec, 
         + ("; Monte Carlo, the fitted HRF is wrong" if has_mismatch(rows) else "")
     ]
     if partial:
-        foot.append(
-            f"* some realizations never reach {args.target:.0%} within the sweep (max {top:g}%)"
-        )
+        live = {c for c in contrasts if has_true_effect(contrasts[c], pattern)}
+        foot.append("* " + _missing_note(res, need, live, args.target, top))
     if card:  # the scorecard first: one value per measure (it covers shape and trials)
         facts = [f for f in facts if f[0] not in ("shape", "trials")]
         facts = [(k.strip(), v) for k, v, _ in card] + [("", "")] + facts
@@ -1037,10 +1062,9 @@ def _summarise(
             cells.append(f"{text:>18}")
         out.append(f"{cond['label']:<24}" + "".join(cells))
     if unreached:
-        out.append(
-            f"  * some realizations/HRFs never reach {args.target:.0%} within the sweep (max "
-            f"{max(r['amplitude'] for r in rows):g}%); the median and range leave them out"
-        )
+        live = {c for c in contrasts if has_true_effect(contrasts[c], pattern)}
+        why = _missing_note(res, need, live, args.target, max(r["amplitude"] for r in rows))
+        out.append(f"  * {why}; the median and range leave them out")
 
     if truths != [fit] or args.true_delay:
         top = max(r["amplitude"] for r in rows)

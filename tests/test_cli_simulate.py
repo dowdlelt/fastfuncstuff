@@ -519,3 +519,23 @@ def test_scorecard_gives_one_value_per_measure(tmp_path, capsys):
         assert measure in block, measure  # fmt: skip
     card = json.loads((tmp_path / "s_spec.json").read_text())["scorecard"]
     assert card["detection, % (mean)"] > 0 and 0 <= card["HRFs detectable, frac"] <= 1
+
+
+def test_missing_note_tells_withheld_from_unreached():
+    from fastfuncstuff.cli.simulate import _missing_note
+
+    rows = [
+        {
+            "design": d,
+            "noise": "n",
+            "contrast": "A",
+            "calibration": "inflated" if d == 0 else "checked",
+        }
+        for d in range(3)
+    ]
+    res = {"table": rows}
+    withheld_only = {("n", "A"): np.array([np.nan, 0.5, 0.6])}
+    note = _missing_note(res, withheld_only, {"A"}, 0.8, 3.0)
+    assert "1 of 3 realizations withheld" in note and "never reach" not in note
+    both = {("n", "A"): np.array([np.nan, np.nan, 0.6])}
+    assert "never reach 80%" in _missing_note(res, both, {"A"}, 0.8, 3.0)
