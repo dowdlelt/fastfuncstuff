@@ -792,9 +792,19 @@ def parse_contrast(expr: str, conditions: list[str]) -> np.ndarray:
     return w
 
 
+PAIRWISE_LIMIT = 8  # beyond this many conditions the default leaves out the pairs
+
+
 def default_contrasts(conditions: list[str]) -> dict[str, np.ndarray]:
-    """Each condition against baseline, then every pairwise difference (Liu & Frank's set)."""
+    """Each condition against baseline, then every pairwise difference (Liu & Frank's set).
+
+    Pairs only up to :data:`PAIRWISE_LIMIT` conditions: each difference is its
+    own simulation, and 32 conditions have 496 of them -- hours of REML for a
+    default nobody asked for.
+    """
     out = {c: parse_contrast(c, conditions) for c in conditions}
+    if len(conditions) > PAIRWISE_LIMIT:
+        return out
     for i, a in enumerate(conditions):
         for b in conditions[i + 1 :]:
             out[f"{a}-{b}"] = parse_contrast(f"{a}-{b}", conditions)

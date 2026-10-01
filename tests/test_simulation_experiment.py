@@ -441,3 +441,10 @@ def test_a_scan_too_short_for_one_of_each_says_how_long_it_needs():
     )  # fmt: skip
     with pytest.raises(ValueError, match=r"one of each unit needs ~255 s .*-scan_time is 200 s"):
         spec.resolve_counts()
+
+
+def test_default_contrasts_leave_out_pairs_past_the_limit():
+    few = default_contrasts(["A", "B", "C"])
+    assert list(few) == ["A", "B", "C", "A-B", "A-C", "B-C"]
+    many = default_contrasts([f"T{i}" for i in range(32)])
+    assert len(many) == 32 and all("-" not in k for k in many)

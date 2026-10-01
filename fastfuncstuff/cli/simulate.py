@@ -2413,7 +2413,12 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: -tr is required (unless -compare)", file=sys.stderr)
         return 1
     from fastfuncstuff.cli_utils import setup_device
-    from fastfuncstuff.simulation.experiment import default_contrasts, parse_contrast, realize
+    from fastfuncstuff.simulation.experiment import (
+        PAIRWISE_LIMIT,
+        default_contrasts,
+        parse_contrast,
+        realize,
+    )
     from fastfuncstuff.simulation.power import has_true_effect, simulate_realizations_power
 
     described = bool(args.trial or args.miniblock or args.block)
@@ -2437,6 +2442,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.contrast
             else default_contrasts(conditions)
         )
+        if not args.contrast and len(conditions) > PAIRWISE_LIMIT:
+            print(
+                f"note: {len(conditions)} conditions -- without -contrast, each is tested "
+                f"against baseline but the {len(conditions) * (len(conditions) - 1) // 2} "
+                "pairwise differences are left out (each would be its own simulation). Name "
+                "the ones you need: -contrast A1-B1, or a group, -contrast "
+                '"0.0625*A1+...-0.0625*B16".'
+            )
         pattern = _pattern(args.pattern, conditions)
         responses = _responses(args.responses, conditions)
         amps = _amplitudes(args.amplitudes, args.effect)
