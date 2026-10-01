@@ -128,8 +128,16 @@ def test_tent_and_single_trial_figures_render(tmp_path):
     noise = [{"label": "tSNR 80", "tsnr": 80.0, "phys_fraction": 0.5, "tau": 6.0}]
     t = tent_estimate(r, 1.25, noise, [1.0, 1.0])
     # the truth peaks at the planted amplitude; the knots start at onset
-    assert t["truth"].max() == pytest.approx(1.0, abs=0.02) and t["knots"][0] == 0.0
+    assert t["truth"][0].max() == pytest.approx(1.0, abs=0.02) and t["knots"][0][0] == 0.0
     plot_tent(t, r.conditions, ["tSNR 80"], [1.0, 1.0], path=tmp_path / "t.png")
+    # a block gets a window to its duration + 20 s, so the response is seen returning
+    blocked = ExperimentSpec(tr=1.0, units=[Unit.parse("A", "A:0.5", 10),
+                                            Unit.parse("B", "B:18", 4, "block")],
+                             isi=Interval.parse("exp:6,3,12"), post_fix=15)  # fmt: skip
+    tb = tent_estimate(realize(blocked, 0), 1.0, noise, [1.0, 1.0])
+    assert tb["knots"][0][-1] == 22 and tb["knots"][1][-1] == 38
+    assert abs(tb["truth"][1][-1]) < 0.05 * tb["truth"][1].max()
+    assert len(tb["est"]["tSNR 80"][1]) == len(tb["knots"][1])
     ex = single_trial_example(r, 1.25, noise[0], sd_grid=(0.25, 1.0))
     assert ex["curve"]["lsa"][1] > ex["curve"]["lsa"][0]  # more variable trials: more reliable
     plot_single_trials(ex, r.conditions, 0.5, path=tmp_path / "s.png")

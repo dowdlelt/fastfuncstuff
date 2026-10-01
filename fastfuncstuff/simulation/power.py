@@ -1323,24 +1323,29 @@ def tent_estimate(
     noise: list[dict[str, Any]],
     amplitudes: list[float] | np.ndarray,
     true_hrf: str = "spmg1",
-    window: float = 20.0,
+    window: float | None = None,
     spacing: float = 2.0,
     poly_degree: int | None = None,
     seed: int = 0,
+    tail: float = 20.0,
 ) -> dict[str, Any]:
     """Deconvolve one simulated voxel with TENTs: the response shape a design lets you see.
 
-    AFNI-style TENT (piecewise-linear) knots every ``spacing`` seconds over
-    ``window`` after onset, evaluated at the exact time since each onset --
-    not TR-locked, so jittered sub-TR onsets are fine (a TR-grid FIR would
-    round them). One voxel per noise condition responds with ``amplitudes``
-    (PSC, per condition) through ``true_hrf``; the fit is TENTs for every
-    condition plus the per-run drift.
+    AFNI-style TENT (piecewise-linear) knots every ``spacing`` seconds after
+    onset, evaluated at the exact time since each onset -- not TR-locked, so
+    jittered sub-TR onsets are fine (a TR-grid FIR would round them). Each
+    condition gets its own window, its duration plus ``tail`` (the HRF's
+    return to baseline), rounded up to a knot: a fixed 20 s showed an 18 s
+    block's response cut off at its plateau. ``window`` fixes one for all.
+    One voxel per noise condition responds with ``amplitudes`` (PSC, per
+    condition) through ``true_hrf``; the fit is TENTs for every condition plus
+    the per-run drift.
 
-    Returns 'knots' (s), 'fine_t' and 'truth' (n_cond, len(fine_t)) -- the
-    true response to one event, duration included -- and per noise label
-    'est' and 'se' (n_cond, n_knots): the estimate from that voxel and its
-    SE under the noise ARMA (what a fresh voxel would scatter by).
+    Returns per condition (lists, one entry each) 'knots' (s), 'fine_t' and
+    'truth' -- the true response to one event, duration included -- and per
+    noise label 'est' and 'se' (lists of arrays over that condition's knots):
+    the estimate from that voxel and its SE under the noise ARMA (what a fresh
+    voxel would scatter by).
     """
     from fastfuncstuff.cli_utils import auto_polort
     from fastfuncstuff.design.matrices import make_tent_design
@@ -1352,23 +1357,27 @@ def tent_estimate(
     n_cond = len(realization.conditions)
     if poly_degree is None:
         poly_degree = auto_polort(max(lengths) * tr)
-    k = int(round(window / spacing)) + 1
-    knots = np.linspace(0.0, window, k)
+    windows = [
+        float(window)
+        if window is not None
+        else float(np.ceil((d + tail) / spacing - 1e-9) * spacing)
+        for d in realization.durations
+    ]
+    ks = [int(round(w / spacing)) + 1 for w in windows]
     blocks = []
-    start = 0
     for r, n_run in enumerate(lengths):
         cols = [
             make_tent_design(
-                [np.asarray(realization.onsets[q][r], dtype=float)], 0.0, window, tr, n_run,
-                n_basis=k, device=cpu,
+                [np.asarray(realization.onsets[q][r], dtype=float)], 0.0, windows[q], tr, n_run,
+                n_basis=ks[q], device=cpu,
             ).double()
             for q in range(n_cond)
         ]  # fmt: skip
         blocks.append(torch.cat(cols, dim=1))
-        start += n_run
-    T = torch.cat(blocks, dim=0)  # (n_t, n_cond * k), condition-major
+    T = torch.cat(blocks, dim=0)  # (n_t, sum(ks)), condition-major
     X = torch.cat([T, _nuisance(lengths, poly_degree)], dim=1)
     P = torch.linalg.pinv(X)
+    edges = np.cumsum([0, *ks])
 
     dt = default_microtime_dt(tr)
     bases = hrfs_from_spec(true_hrf, dt, cpu)[0][1]
@@ -1380,19 +1389,18 @@ def tent_estimate(
     fine_dt = 0.1
     fdt = default_microtime_dt(fine_dt)
     fbases = hrfs_from_spec(true_hrf, fdt, cpu)[0][1]
-    n_fine = int(round(window / fine_dt)) + 1
-    truth = np.stack(
-        [
-            float(amps[q])
-            * build_task_design([[np.array([0.0])]], [realization.durations[q]], fine_dt,
-                                [n_fine], fbases, fdt, device=cpu)[:, 0].numpy()
-            for q in range(n_cond)
-        ]
-    )  # fmt: skip
+    n_fine = [int(round(w / fine_dt)) + 1 for w in windows]
+    truth = [
+        float(amps[q])
+        * build_task_design([[np.array([0.0])]], [realization.durations[q]], fine_dt,
+                            [n_fine[q]], fbases, fdt, device=cpu)[:, 0].numpy()
+        for q in range(n_cond)
+    ]  # fmt: skip
 
     gen = torch.Generator().manual_seed(seed)
     out: dict[str, Any] = {
-        "knots": knots, "fine_t": np.arange(n_fine) * fine_dt, "truth": truth,
+        "knots": [np.linspace(0.0, w, k) for w, k in zip(windows, ks, strict=True)],
+        "fine_t": [np.arange(n) * fine_dt for n in n_fine], "truth": truth,
         "est": {}, "se": {},
     }  # fmt: skip
     for i, c in enumerate(noise):
@@ -1402,11 +1410,11 @@ def tent_estimate(
         L = _noise_correlation(kw, tr, lengths, factor=True)
         z = torch.randn(X.shape[0], generator=gen, dtype=torch.float64)
         y = X_true @ amps + sd * (z if L is None else L @ z)
-        beta = (P @ y)[: n_cond * k]
+        beta = (P @ y).numpy()
         R = _noise_correlation(kw, tr, lengths)
-        var = (P * P).sum(1) if R is None else ((P @ R) * P).sum(1)
-        out["est"][label] = beta.reshape(n_cond, k).numpy()
-        out["se"][label] = (sd * var[: n_cond * k].sqrt()).reshape(n_cond, k).numpy()
+        var = ((P * P).sum(1) if R is None else ((P @ R) * P).sum(1)).numpy()
+        out["est"][label] = [beta[edges[q] : edges[q + 1]] for q in range(n_cond)]
+        out["se"][label] = [sd * np.sqrt(var[edges[q] : edges[q + 1]]) for q in range(n_cond)]
     return out
 
 
@@ -1819,8 +1827,11 @@ def hrf_robustness(
 
     Returns 'labels', 'peaks' (s), and per contrast: 'needed' (true effect,
     PSC, for ``target`` power; inf past the ceiling), 'recovered' (estimate /
-    truth), 'ceiling' (the highest power any amplitude gives), and 'fitted'
-    (the effect needed when the truth *is* ``fit_hrf``).
+    truth), 'ceiling' (the highest power any amplitude gives), 'fitted'
+    (the effect needed when the truth *is* ``fit_hrf``), and 'matched' (the
+    effect needed when the truth is library HRF k *and* the model fits HRF k:
+    no mismatch, only what that shape does to this design -- a fast HRF
+    passes more of a rapid design's high frequencies than a slow one).
     """
     from fastfuncstuff.cli_utils import auto_polort
 
@@ -1840,20 +1851,28 @@ def hrf_robustness(
 
     Xf = design(fit_hrf)
     n_t, n_cond = Xf.shape
-    X = torch.cat([Xf, _nuisance(lengths, poly_degree)], dim=1)
-    P = torch.linalg.inv(X.T @ X) @ X.T
+    nuisance = _nuisance(lengths, poly_degree)
     kw = {key: v for key, v in noise.items() if key != "label"}
     R = _noise_correlation(kw, tr, lengths)
-    if R is None:
-        PRPt, tr_MR, dof = P @ P.T, float(n_t - X.shape[1]), float(n_t - X.shape[1])
-    else:
-        PRPt, tr_MR, dof = _corrected_terms(X, P, R)
-    crit = float(stats.t.ppf(1 - alpha / 2, dof))
+
+    def fit(X_task: torch.Tensor) -> tuple[Any, ...]:
+        X = torch.cat([X_task, nuisance], dim=1)
+        P = torch.linalg.inv(X.T @ X) @ X.T
+        if R is None:
+            PRPt, tr_MR, dof = P @ P.T, float(n_t - X.shape[1]), float(n_t - X.shape[1])
+        else:
+            PRPt, tr_MR, dof = _corrected_terms(X, P, R)
+        return X, P, PRPt, tr_MR, dof, float(stats.t.ppf(1 - alpha / 2, dof))
+
+    fitted = fit(Xf)
     sd2 = (100.0 / float(kw["tsnr"])) ** 2
     pattern = np.ones(n_cond) if beta_pattern is None else np.asarray(beta_pattern, float)
     amps = np.geomspace(1e-3, 1e3, 400)
 
-    def cost(X_true: torch.Tensor, w: np.ndarray) -> tuple[float, float, float]:
+    def cost(
+        X_true: torch.Tensor, w: np.ndarray, terms: tuple[Any, ...] = fitted
+    ) -> tuple[float, float, float]:
+        X, P, PRPt, tr_MR, dof, crit = terms
         if is_difference(w):
             pos = np.clip(w, 0, None)
             p_, off = pos / float(pos @ pos), np.full(n_cond, shared)
@@ -1885,6 +1904,7 @@ def hrf_robustness(
     peaks = [float(np.argmax(b[0].numpy())) * 0.1 for _, b in lib]
     out: dict[str, Any] = {"labels": labels, "peaks": peaks, "contrasts": {}}
     X_libs = [design(lab) for lab in labels]
+    own = [fit(Xt) for Xt in X_libs]
     for name, w in contrasts.items():
         w = np.asarray(w, dtype=float)
         rows = [cost(Xt, w) for Xt in X_libs]
@@ -1893,6 +1913,7 @@ def hrf_robustness(
             "recovered": [r[1] for r in rows],
             "ceiling": [r[2] for r in rows],
             "fitted": cost(Xf, w)[0],
+            "matched": [cost(Xt, w, t)[0] for Xt, t in zip(X_libs, own, strict=True)],
         }
     return out
 

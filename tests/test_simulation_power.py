@@ -678,6 +678,11 @@ def test_hrf_robustness_ceiling_for_events_and_blocks_hold_up():
     assert np.all(np.isfinite(bl["needed"])) and min(bl["recovered"]) > 0.4
     # at the library shape nearest the fitted one, the cost is close to a right HRF
     assert min(ev["needed"]) == pytest.approx(ev["fitted"], rel=0.15)
+    # Fitting the true shape itself: always detectable, never worse than the
+    # mismatched fit, and a slow response costs a rapid design more than a fast one
+    m, n = np.asarray(ev["matched"]), np.asarray(ev["needed"])
+    assert np.all(np.isfinite(m)) and np.all(m <= n * 1.001)
+    assert m[-1] > m[0]
 
 
 def test_sweep_grid_stops_at_the_plateau_and_reaches_past_a_fixed_edge():

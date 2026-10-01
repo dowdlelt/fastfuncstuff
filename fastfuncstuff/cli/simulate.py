@@ -713,6 +713,16 @@ def _pattern(tokens: list[str] | None, conditions: list[str]) -> list[float]:
     return w
 
 
+def _matched_span(r: dict[str, Any], peaks: list[float]) -> str:
+    """How much the true shape alone moves the cost: earliest vs latest-peaking library HRF."""
+    m = np.asarray(r["matched"], dtype=float)
+    lo, hi = int(np.argmin(peaks)), int(np.argmax(peaks))
+    return (
+        f"fitting the true shape, {m[lo]:.2f}% if it peaks at {peaks[lo]:.1f} s, "
+        f"{m[hi]:.2f}% at {peaks[hi]:.1f} s"
+    )
+
+
 def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robust):
     """One value per measure at the reference noise level: [(name, text, number)].
 
@@ -811,8 +821,8 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
             (
                 "HRF robustness",
                 f"{c0} detectable under {n_ok}/{len(r['needed'])} library HRFs (fitting "
-                f"{args.hrf}); median cost x{ratio:.2f} relative to matched {args.hrf} "
-                "(first realization)",
+                f"{args.hrf}); median cost x{ratio:.2f} relative to matched {args.hrf}; "
+                f"{_matched_span(r, robust['peaks'])} (first realization)",
                 n_ok / len(r["needed"]),
             )
         )

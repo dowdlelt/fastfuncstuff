@@ -1014,7 +1014,8 @@ def plot_tent(
 ):
     """The response shape one voxel would give: TENT deconvolution against the truth.
 
-    One row per noise level, one column per condition. The ink line is the
+    One row per noise level, one column per condition (each its own window).
+    The ink line is the
     true response to one event (the true HRF, duration included); the dots are
     the TENT estimate from one simulated voxel, the band its 95% confidence
     interval (+-1.96 SE under the noise ARMA). A band as wide as the response
@@ -1027,13 +1028,13 @@ def plot_tent(
     rows = len(noise_labels)
     fig, axes = plt.subplots(
         rows, len(names), figsize=(3.4 * len(names) + 0.8, 2.3 * rows + 1.0),
-        squeeze=False, sharex=True, sharey="row", layout="constrained",
+        squeeze=False, sharex="col", sharey="row", layout="constrained",
     )  # fmt: skip
     fig.patch.set_facecolor(SURFACE)
-    kn, ft = result["knots"], result["fine_t"]
     for i, label in enumerate(noise_labels):
         for q, cond in enumerate(names):
             ax = axes[i, q]
+            kn, ft = result["knots"][q], result["fine_t"][q]
             _style(ax)
             col = CATEGORICAL[q % len(CATEGORICAL)]
             est, se = result["est"][label][q], result["se"][label][q]
@@ -1055,7 +1056,8 @@ def plot_tent(
     fig.suptitle(
         title
         or "Response shape from one voxel: TENT deconvolution (knots every "
-        f"{kn[1] - kn[0]:g} s, not TR-locked); band: 95% confidence interval",
+        f"{kn[1] - kn[0]:g} s to each condition's duration + 20 s, not TR-locked); band: 95% "
+        "confidence interval",
         color=INK, fontsize=10,
     )  # fmt: skip
     return _finish(fig, path)
@@ -1452,7 +1454,8 @@ def plot_robustness(
     """What a wrong HRF costs: every library HRF as the truth, the model fitting ``fit_hrf``.
 
     Top: the effect each contrast needs for ``target`` power, against the true
-    HRF's peak latency; the dashed line is the cost when the fitted HRF is
+    HRF's peak latency; dotted, the same when the model fits that HRF too (the
+    shape alone, no mismatch: a slow response needs more); the dashed line is the cost when the fitted HRF is
     right; a cross at the top is a truth under which no amplitude gets there
     (power levels off, the annotation says where). Bottom: the fraction of the
     true amplitude the estimate recovers. Blocks are robust (a boxcar smooths
@@ -1479,10 +1482,14 @@ def plot_robustness(
             _style(ax)
         need = np.asarray(r["needed"], dtype=float)
         ok = np.isfinite(need)
-        finite = np.concatenate([need[ok], [r["fitted"]]])
+        matched = np.asarray(r.get("matched", np.full(len(need), np.nan)), dtype=float)
+        finite = np.concatenate([need[ok], matched, [r["fitted"]]])
         finite = finite[np.isfinite(finite)]
         ymax = max(float(finite.max()) * 1.25, 0.01) if finite.size else 1.0
-        top.plot(peaks[ok], need[ok], "o-", color=col, linewidth=2, markersize=4)
+        top.plot(peaks, matched, "s:", color=col, alpha=0.55, linewidth=1.6, markersize=3.5,
+                 label="truth and fit both HRF k")  # fmt: skip
+        top.plot(peaks[ok], need[ok], "o-", color=col, linewidth=2, markersize=4,
+                 label=f"truth HRF k, fitting {fit_hrf}")  # fmt: skip
         top.axhline(r["fitted"], color=INK2, linewidth=1, linestyle=(0, (4, 3)))
         for i in np.flatnonzero(~ok):
             top.plot([peaks[i]], [ymax * 0.97], "x", color=CATEGORICAL[7], markersize=8,
@@ -1492,6 +1499,8 @@ def plot_robustness(
         top.set_ylim(0, ymax)
         top.set_title(f"{c}: % signal for {target:.0%} power", color=INK, fontsize=10,
                       loc="left")  # fmt: skip
+        if q == 0:
+            top.legend(frameon=False, fontsize=7.5, labelcolor=INK2, loc="upper center")
         rec = np.asarray(r["recovered"], dtype=float)
         bot.plot(peaks, rec, "o-", color=col, linewidth=2, markersize=4)
         bot.axhline(1.0, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
@@ -1504,9 +1513,10 @@ def plot_robustness(
     import textwrap
 
     heading = title or (
-        f"HRF mismatch at {noise_label} (fitting {fit_hrf})\n"
-        "Dashed: matched HRF; ×: target not reached\n"
-        "Numbers beside × show maximum power (analytic)"
+        f"The response is library HRF k, at {noise_label}: fitting {fit_hrf} (solid) or HRF k "
+        "itself (dotted: no mismatch, only what that shape does to the design)\n"
+        f"Dashed: the response is {fit_hrf}; ×: target not reached, number = maximum power "
+        "(analytic)"
     )
     heading = "\n".join(
         textwrap.fill(line, width=int(fig.get_figwidth() * 11)) for line in heading.splitlines()
