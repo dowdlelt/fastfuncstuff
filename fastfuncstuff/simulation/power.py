@@ -1814,6 +1814,7 @@ def hrf_robustness(
     alpha: float = 0.001,
     target: float = 0.8,
     poly_degree: int | None = None,
+    responses: list[float] | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """What each contrast costs when the true HRF is each of the 20 library shapes.
 
@@ -1823,7 +1824,8 @@ def hrf_robustness(
     sigma^2 + |M X_true beta|^2 / tr(MR). Both grow with the amplitude, so under
     a mismatch power has a *ceiling* -- some contrasts are never detected, at
     any amplitude. Differences sweep the difference on ``shared`` underneath,
-    as the engine does.
+    as the engine does; with ``responses`` each contrast is swept with every
+    other condition at its given response (:func:`response_sweep`).
 
     Returns 'labels', 'peaks' (s), and per contrast: 'needed' (true effect,
     PSC, for ``target`` power; inf past the ceiling), 'recovered' (estimate /
@@ -1873,7 +1875,9 @@ def hrf_robustness(
         X_true: torch.Tensor, w: np.ndarray, terms: tuple[Any, ...] = fitted
     ) -> tuple[float, float, float]:
         X, P, PRPt, tr_MR, dof, crit = terms
-        if is_difference(w):
+        if responses is not None:
+            p_, off = response_sweep(w, responses)
+        elif is_difference(w):
             pos = np.clip(w, 0, None)
             p_, off = pos / float(pos @ pos), np.full(n_cond, shared)
         else:
@@ -2027,6 +2031,7 @@ def simulate_realizations_power(
     reml_maxa: float = 0.8,
     reml_maxb: float = 0.8,
     reml_cache: dict | None = None,
+    responses: list[float] | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """:func:`simulate_design_power` over several realizations of one experiment.
 
@@ -2053,6 +2058,12 @@ def simulate_realizations_power(
     B = shared). Under a correct HRF the shared level cancels exactly; under a
     mismatch it does not, which is the case ``shared`` exists to measure. Rows
     carry ``swept`` ("amplitude" or "difference") and ``shared``.
+
+    ``responses`` (PSC per condition) replaces both: each contrast is swept on
+    its own (:func:`response_sweep`, rows ``swept`` "contrast") with every
+    other condition at its given response, so the curve passes through the
+    specified experiment at c @ responses. Only a mismatch makes it differ
+    from the plain sweep -- under the fitted HRF the other betas cancel.
     """
     from tqdm import tqdm
 
@@ -2069,7 +2080,11 @@ def simulate_realizations_power(
     # (each plants its own responses).
     groups: list[tuple[str, dict[str, Any], np.ndarray, np.ndarray]] = []
     condition = {k: w for k, w in contrasts.items() if abs(float(np.sum(w))) > 1e-9}
-    if condition:
+    if responses is not None:
+        for k, w in contrasts.items():
+            groups.append(("contrast", {k: w}, *response_sweep(w, responses)))
+        condition = dict(contrasts)  # every contrast is grouped already
+    elif condition:
         groups.append(("amplitude", condition, pattern, np.zeros(n_cond)))
     for k, w in contrasts.items():
         if k in condition:
@@ -2295,6 +2310,22 @@ def compare_designs(
                     }
                 )
     return out
+
+
+def response_sweep(weights, responses) -> tuple[np.ndarray, np.ndarray]:
+    """(pattern, offset) that sweep one contrast with every condition at ``responses``.
+
+    The swept value is the contrast's own: betas = offset + v * pattern with
+    c @ pattern = 1, and at v = c @ responses the betas are ``responses``
+    exactly. The raised side is the positive weights (A in A-B, so B stays at
+    its response), as for a difference without -responses; conditions
+    outside the contrast never move.
+    """
+    w = np.asarray(weights, dtype=float)
+    r = np.asarray(responses, dtype=float)
+    pos = np.clip(w, 0, None)
+    pattern = pos / float(pos @ pos) if pos.any() else w / float(w @ w)
+    return pattern, r - float(w @ r) * pattern
 
 
 def is_difference(weights) -> bool:

@@ -121,11 +121,20 @@ figures (-no_plots skips them):
     _shape.png     shape resolution: power against library steps apart
     _trials.png    single trials by LSS, LSA and ridge, against the truth
     _hrf.png       with -true_hrf: the true shapes and what was recovered
-    _robust.png    every library HRF as the truth: effect needed, fraction recovered
+    _robust.png    every library HRF as the truth: effect needed, fraction recovered;
+                   dotted, the same HRF fitted (the shape alone, no mismatch)
     _soa.png       efficiency against SOA: fixed, jittered, with blanks; this design
     _liu.png       Liu's estimation-vs-detection plane, with the theoretical bound
     _tsnr.png      the effect needed against tSNR: what tSNR an effect needs
     _matrix.png    the design matrix, SPM-style
+With -responses (each condition's actual response; the outputs above assume
+every condition responds as -pattern says): the summary adds each contrast's
+power at those values, plus _robust_responses.png and _tent_responses.png;
+under a mismatch (-true_hrf/-true_delay/-true_duration) also
+_responses_power.tsv/.png, every contrast simulated with the other conditions
+at their responses. Under a wrong HRF, "everything responds" is not always the
+worst case: what the model misses of the neighbours can load onto a condition
+and prop its estimate up.
 """
 
 from __future__ import annotations
@@ -361,6 +370,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Response per unit amplitude, e.g. A=1 B=0 (default all 1).",
     )
     e.add_argument(
+        "-responses",
+        nargs="+",
+        metavar="COND=PSC",
+        help="A second scenario next to the sweep: each condition's actual response in %% "
+        "signal (unlisted: 0), e.g. DI=1.5 DP=0.8 SI=1. Reports each contrast's power at "
+        "those values and adds _robust_responses.png and _tent_responses.png. Under a correct "
+        "HRF the other conditions cancel and power is read off the sweep; with -true_hrf, "
+        "-true_delay or -true_duration they do not, and each contrast is simulated again "
+        "with every other condition at its response (_responses_power.tsv/.png).",
+    )
+    e.add_argument(
         "-contrast",
         action="append",
         metavar="EXPR",
@@ -575,6 +595,23 @@ def _amplitudes(tokens: list[str], effect: float | None) -> list[float] | Any:
     return sorted({round(v, 6) for v in vals})
 
 
+def _with_response_points(amps, contrasts, responses, pattern):
+    """Add the amplitudes at which the sweep gives each contrast its -responses value."""
+    from dataclasses import replace
+
+    from fastfuncstuff.simulation.power import AutoSweep, is_difference
+
+    extra = []
+    for w in contrasts.values():
+        value = float(np.asarray(w) @ np.asarray(responses))
+        per = 1.0 if is_difference(w) else float(np.asarray(w) @ np.asarray(pattern))
+        if abs(value) > 1e-9 and per != 0:
+            extra.append(round(abs(value) / abs(per), 6))
+    if isinstance(amps, AutoSweep):
+        return replace(amps, extra=tuple(sorted({*amps.extra, *extra})))
+    return sorted({*amps, *extra})
+
+
 def _explicit_realization(args) -> Any:
     from fastfuncstuff.io.afni import read_afni_onset_files
     from fastfuncstuff.simulation.experiment import Realization
@@ -711,6 +748,62 @@ def _pattern(tokens: list[str] | None, conditions: list[str]) -> list[float]:
             raise ValueError(f"-pattern {tok!r}: use COND=W with COND in {conditions}")
         w[conditions.index(name)] = float(val)
     return w
+
+
+def _responses(tokens: list[str] | None, conditions: list[str]) -> list[float] | None:
+    """-responses COND=PSC ... -> one PSC per condition (unlisted: 0), or None."""
+    if not tokens:
+        return None
+    r = [0.0] * len(conditions)
+    for tok in tokens:
+        name, _, val = tok.partition("=")
+        if name not in conditions or not val:
+            raise ValueError(f"-responses {tok!r}: use COND=PSC with COND in {conditions}")
+        r[conditions.index(name)] = float(val)
+    return r
+
+
+def _response_lines(res, contrasts, responses, pattern, conditions, scenario: bool) -> list[str]:
+    """Each contrast's power at -responses, per noise level: median [range] over designs.
+
+    ``scenario``: ``res`` swept each contrast with the others at their responses
+    (amplitude = the contrast's value); otherwise it is the plain sweep, read at
+    the amplitude that gives the contrast that value -- the same power when the
+    fitted HRF is right.
+    """
+    from fastfuncstuff.simulation.power import is_difference, power_column
+
+    given = ", ".join(f"{c} {v:g}%" for c, v in zip(conditions, responses, strict=True) if v)
+    out = [f"At the given responses ({given or 'none'}; -responses):"]
+    rows = res["table"]
+    col = power_column(rows)
+    labels = list(dict.fromkeys(r["noise"] for r in rows))
+    for c, w in contrasts.items():
+        value = float(np.asarray(w) @ np.asarray(responses))
+        per = 1.0 if scenario or is_difference(w) else float(np.asarray(w) @ np.asarray(pattern))
+        if abs(value) < 1e-9 or per == 0:
+            out.append(f"  {c:<14} 0% -- no effect to detect (power is the false-positive rate)")
+            continue
+        amp = abs(value) / abs(per)
+        parts = []
+        for lab in labels:
+            pw = [
+                float(r[col])
+                for r in rows
+                if r["contrast"] == c and r["noise"] == lab and abs(r["amplitude"] - amp) < 1e-5
+            ]
+            pw = [x for x in pw if np.isfinite(x)]
+            if pw:
+                parts.append(
+                    f"{lab} {np.median(pw):.2f} [{min(pw):.2f}-{max(pw):.2f}]"
+                    if len(pw) > 1
+                    else f"{lab} {pw[0]:.2f}"
+                )
+        flip = " (swept sign-flipped; power is two-tailed)" if value < 0 else ""
+        out.append(
+            f"  {c:<14} {value:+.3g}% -> power " + ("; ".join(parts) or "not sampled") + flip
+        )
+    return out
 
 
 def _matched_span(r: dict[str, Any], peaks: list[float]) -> str:
@@ -2316,7 +2409,10 @@ def main(argv: list[str] | None = None) -> int:
             else default_contrasts(conditions)
         )
         pattern = _pattern(args.pattern, conditions)
+        responses = _responses(args.responses, conditions)
         amps = _amplitudes(args.amplitudes, args.effect)
+        if responses is not None:
+            amps = _with_response_points(amps, contrasts, responses, pattern)
         conds, profile_text = _noise_conditions(args)
         import torch
 
@@ -2411,6 +2507,22 @@ def main(argv: list[str] | None = None) -> int:
 
     prefix = Path(args.prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
+    res_r, r_contrasts = None, {}
+    if responses is not None:
+        # A contrast whose value is negative at the given responses is swept
+        # flipped, so the sweep runs through them (power is two-tailed).
+        r_contrasts = {
+            c: -w if float(np.asarray(w) @ np.asarray(responses)) < 0 else w
+            for c, w in contrasts.items()
+        }
+        if args.true_hrf != "same" or args.true_delay or args.true_duration is not None:
+            res_r = simulate_realizations_power(
+                reals, args.tr, r_contrasts, amps, conds, n_reps=args.nreps, alpha=args.alpha,
+                true_delay=args.true_delay, true_duration=args.true_duration, hrf=args.hrf,
+                true_hrf=args.true_hrf, poly_degree=args.polort, device=device, seed=args.seed,
+                estimator=args.estimator, null_reps=args.null_reps, reml_maxa=args.reml_maxa,
+                reml_maxb=args.reml_maxb, responses=responses,
+            )  # fmt: skip
     from fastfuncstuff.simulation.power import shape_steps
 
     shape_amps = [(args.effect if args.effect is not None else 1.0) * w for w in pattern]
@@ -2435,6 +2547,19 @@ def main(argv: list[str] | None = None) -> int:
         summary += "\n\n" + "\n".join(
             _sweep_lines(sweep, conds, contrasts, reals, args.tr, args.target)
         )
+    if responses is not None:
+        lines = _response_lines(
+            res if res_r is None else res_r, contrasts, responses, pattern, conditions,
+            scenario=res_r is not None,
+        )  # fmt: skip
+        lines.append(
+            "  (every other condition at its given response -- simulated again, since the "
+            "fitted HRF is wrong and they leak into the residuals: _responses_power)"
+            if res_r is not None
+            else "  (read off the sweep: with the fitted HRF right, what the other conditions "
+            "do cancels from a contrast exactly, so only its own value matters)"
+        )
+        summary += "\n\n" + "\n".join(lines)
     print(summary)
     Path(f"{prefix}_summary.txt").write_text(summary + "\n")
     if sweep is not None:
@@ -2478,6 +2603,11 @@ def main(argv: list[str] | None = None) -> int:
         w = csv.DictWriter(f, fieldnames=cols, delimiter="\t", extrasaction="ignore")
         w.writeheader()
         w.writerows(res["table"])
+    if res_r is not None:
+        with open(f"{prefix}_responses_power.tsv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, delimiter="\t", extrasaction="ignore")
+            w.writeheader()
+            w.writerows(res_r["table"])
 
     Path(f"{prefix}_spec.json").write_text(
         json.dumps(
@@ -2487,6 +2617,7 @@ def main(argv: list[str] | None = None) -> int:
                 "durations": reals[0].durations,
                 "contrasts": {k: v.tolist() for k, v in contrasts.items()},
                 "pattern": pattern,
+                "responses": responses,
                 "shared": args.shared,
                 "amplitudes": {
                     n: sorted({r["amplitude"] for r in res["table"] if r["noise"] == n})
@@ -2612,6 +2743,20 @@ def main(argv: list[str] | None = None) -> int:
             tent_amps,
             path=f"{prefix}_tent.png",
         )  # fmt: skip
+        if responses is not None:
+            plot_tent(
+                tent_estimate(reals[0], args.tr, conds, responses, truth, seed=args.seed,
+                              poly_degree=args.polort),
+                reals[0].conditions, [c["label"] for c in conds], responses,
+                path=f"{prefix}_tent_responses.png",
+            )  # fmt: skip
+        if res_r is not None:
+            plot_power(
+                res_r, labels, r_contrasts, np.ones(len(conditions)), args.alpha,
+                path=f"{prefix}_responses_power.png",
+                title="Power with every other condition at its -responses value: each contrast "
+                "swept through the given experiment",
+            )  # fmt: skip
         from fastfuncstuff.simulation.plots import plot_shape_steps
 
         plot_shape_steps(
@@ -2703,6 +2848,23 @@ def main(argv: list[str] | None = None) -> int:
             from fastfuncstuff.simulation.plots import plot_robustness
 
             plot_robustness(robust, live, args.hrf, ref, args.target, path=f"{prefix}_robust.png")
+        if responses is not None:
+            from fastfuncstuff.simulation.plots import plot_robustness
+            from fastfuncstuff.simulation.power import hrf_robustness
+
+            robust_r = hrf_robustness(
+                reals[0], args.tr, r_contrasts, next(c for c in conds if c["label"] == ref),
+                fit_hrf=args.hrf, alpha=args.alpha, target=args.target, poly_degree=args.polort,
+                responses=responses,
+            )  # fmt: skip
+            plot_robustness(
+                robust_r, list(r_contrasts), args.hrf, ref, args.target,
+                path=f"{prefix}_robust_responses.png",
+                title=f"The response is library HRF k, every other condition at its -responses "
+                f"value, at {ref}: fitting {args.hrf} (solid) or HRF k itself (dotted)\n"
+                f"Dashed: the response is {args.hrf}; ×: target not reached, number = maximum "
+                "power",
+            )  # fmt: skip
         if live:
             from fastfuncstuff.simulation.plots import plot_tsnr
             from fastfuncstuff.simulation.power import RealizationScorer, effect_needed

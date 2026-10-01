@@ -497,6 +497,25 @@ def test_isi_list_names_a_pool_any_spec_can_use():
     assert str(spec.isi) == "even:GAP-1" and spec.units[0].items[0].off.kind == "choice"
 
 
+def test_responses_report_power_at_the_given_experiment(tmp_path, capsys):
+    base = ["-tr", "1", "-nruns", "1", "-trial", "A", "0.5", "12", "-trial", "B", "0.5", "12",
+            "-isi", "exp:4,2,10", "-post_fix", "15", "-contrast", "A", "-contrast", "A-B",
+            "-tsnr", "60", "-ndesigns", "1", "-nreps", "50", "-estimator", "ols",
+            "-device", "cpu", "-responses", "A=1", "B=2"]  # fmt: skip
+    assert main([*base, "-prefix", str(tmp_path / "r")]) == 0
+    out = capsys.readouterr().out
+    assert "At the given responses (A 1%, B 2%" in out and "read off the sweep" in out
+    assert "A-B            -1% -> power" in out and "sign-flipped" in out
+    names = {p.name for p in tmp_path.iterdir()}
+    assert {"r_robust_responses.png", "r_tent_responses.png"} <= names
+    assert "r_responses_power.tsv" not in names  # nothing to simulate again
+    assert main([*base, "-true_hrf", "lib:0", "-prefix", str(tmp_path / "m")]) == 0
+    assert "simulated again" in capsys.readouterr().out
+    assert (tmp_path / "m_responses_power.tsv").exists()
+    assert main([*base[:-2], "C=1", "-prefix", str(tmp_path / "x")]) == 1
+    assert "COND=PSC" in capsys.readouterr().err
+
+
 def test_target_reaches_the_summary_and_mismatch_false_positives_are_split(tmp_path, capsys):
     _sim(tmp_path / "t", "-ndesigns", "1", "-no_plots", "-target", "0.9")
     assert "for 90% power" in capsys.readouterr().out

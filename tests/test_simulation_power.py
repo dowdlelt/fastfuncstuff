@@ -758,3 +758,34 @@ def test_neural_activity_outlasting_the_stimulus_is_a_mismatch():
     pick = lambda res: next(r for r in res["table"] if r["amplitude"] == 1.0)  # noqa: E731
     assert pick(same)["expected_est"] == pytest.approx(1.0, rel=1e-6)
     assert abs(pick(longer)["expected_est"] - 1.0) > 0.02  # the model no longer fits the truth
+
+
+def test_responses_sweep_each_contrast_through_the_given_experiment():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import hrf_robustness, response_sweep
+
+    r = np.array([2.5, 1.5, 1.0])
+    for w in ([1.0, 0, 0], [1.0, -1.0, 0], [-1.0, 1.0, 0]):
+        pattern, offset = response_sweep(w, r)
+        assert np.dot(w, pattern) == pytest.approx(1.0)
+        assert offset + np.dot(w, r) * pattern == pytest.approx(r)  # passes through r
+        assert offset[2] == r[2] and pattern[2] == 0  # outside the contrast: fixed
+
+    noise = {"label": "t60", "tsnr": 60.0, "phys_fraction": 0.5, "tau": 6.0}
+    spec = ExperimentSpec(
+        tr=1.0, units=[Unit.parse(c, f"{c}:0.5", 10) for c in "ABC"],
+        isi=Interval.parse("exp:4,2,10"), post_fix=15,
+    )  # fmt: skip
+    real = realize(spec, 0)
+    con = {"A": [1.0, 0, 0], "A-B": [1.0, -1.0, 0]}
+    every = hrf_robustness(real, 1.0, con, noise)["contrasts"]
+    given = hrf_robustness(real, 1.0, con, noise, responses=r)["contrasts"]
+    for c in con:
+        # with the fitted HRF right, the other conditions cancel exactly...
+        assert given[c]["fitted"] == pytest.approx(every[c]["fitted"], rel=1e-6)
+        assert given[c]["matched"] == pytest.approx(every[c]["matched"], rel=1e-6)
+    # ...under a mismatch they do not: what the model misses of B and C loads onto
+    # A's regressor, so every condition responding at A's (large, swept) amplitude
+    # props up A's estimate -- "all respond" is not a worst case for rapid events
+    assert given["A"]["recovered"][0] < every["A"]["recovered"][0]
+    assert given["A"]["ceiling"][3] < every["A"]["ceiling"][3]

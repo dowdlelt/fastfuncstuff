@@ -201,6 +201,8 @@ def plot_power(
             shared = next(r.get("shared", 0.0) for r in rows if r["contrast"] == c)
             on = f" on {shared:g}% shared" if shared else ""
             ax.set_xlabel(f"{c} difference (% signal change{on})", color=INK2, fontsize=9)
+        elif swept == "contrast":
+            ax.set_xlabel(f"{c} (% signal change; others at -responses)", color=INK2, fontsize=9)
         else:
             ax.set_xlabel(f"{c} effect (% signal change)", color=INK2, fontsize=9)
     axes[0][0].set_ylabel("power", color=INK2, fontsize=9)
