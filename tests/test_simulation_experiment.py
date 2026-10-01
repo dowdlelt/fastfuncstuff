@@ -432,3 +432,12 @@ def test_unshuffled_plans_are_unchanged_by_the_item_order_field():
 
     for _, _, shown in draw_plans(spec, 0)[1][0].entries:
         assert shown == [0, 1]
+
+
+def test_a_scan_too_short_for_one_of_each_says_how_long_it_needs():
+    spec = ExperimentSpec(
+        tr=1.0, units=[Unit.parse("A", "A:1:5x20", 1, "block"), Unit.parse("B", "B:1:5x20", 1, "block")],
+        initial_fix=10, post_fix=10, scan_time=200,
+    )  # fmt: skip
+    with pytest.raises(ValueError, match=r"one of each unit needs ~255 s .*-scan_time is 200 s"):
+        spec.resolve_counts()

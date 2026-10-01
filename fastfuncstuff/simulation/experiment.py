@@ -450,9 +450,12 @@ class ExperimentSpec:
             out = whole(set(free))
         for i, u in enumerate(self.units):
             if out[i] < 1 and not u.is_null:
+                one = self.expected_duration([0.0 if v.is_null else 1.0 for v in self.units])
+                limit = f"-scan_time is {self.scan_time:g} s" if self.scan_time else ""
                 raise ValueError(
                     f"unit {u.name!r} rounds to 0 per run -- -scan_time or the totals are "
-                    "too small for the design"
+                    f"too small for the design: one of each unit needs ~{one:.0f} s per run "
+                    f"on average (fixation included)" + (f"; {limit}" if limit else "")
                 )
         if self.scan_time is not None:
             need = self.expected_duration([float(c) for c in out])
