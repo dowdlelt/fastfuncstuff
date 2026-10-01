@@ -203,7 +203,8 @@ def _split_items(text: str) -> list[str]:
 
     Separators inside parentheses (``even:(2,5,9)``) never split. A new item
     starts only at ``NAME:`` where NAME is not an interval kind; any other
-    piece belongs to the item before it (the ``4`` of ``uniform:2,4``).
+    piece belongs to the item before it (the ``4`` of ``uniform:2,4``, the
+    ``x15`` of ``A:1:4 x15``).
     """
     pieces, depth, cur = [], 0, ""
     for ch in text:
@@ -222,6 +223,8 @@ def _split_items(text: str) -> list[str]:
         starts_item = head is not None and head.group(1).lower() not in _INTERVAL_KINDS
         if starts_item or not items:
             items.append(piece)
+        elif re.fullmatch(r"[x*]\d+", piece):
+            items[-1] += piece  # "A:1:J x15": a repeat written apart from its item
         else:
             items[-1] += "," + piece
     return [i for i in items if i]

@@ -339,6 +339,8 @@ def test_items_split_on_spaces_and_a_gap_item_can_open_a_unit():
     # the old comma form and range specs with commas still parse
     old = Unit.parse("c", "A:0.5:0, B:2:2, C:3:uniform:2,4", 1)
     assert old.items[2].off == Interval.parse("uniform:2,4")
+    spaced = Unit.parse("c", "A:1:uniform:3,7 x15 A:1:10", 1, "block")
+    assert len(spaced.items) == 16 and spaced.items[-1].off == Interval.parse(10)
     with pytest.raises(ValueError, match="reserved"):
         Unit.parse("c", "isi:2 ISI:3:1", 1)
     spec = ExperimentSpec(tr=1.0, units=[Unit.parse("c", "isi:7 A:1", 3, "block")], initial_fix=10)
