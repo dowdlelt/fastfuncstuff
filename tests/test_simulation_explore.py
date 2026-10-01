@@ -177,9 +177,27 @@ def test_worker_pool_scores_exactly_like_the_serial_loop():
     ]  # fmt: skip
     noise = [{"label": "t50", "tsnr": 50.0}]
     scorer = RealizationScorer(1.5, {"A": [1]}, noise)
-    serial = score_configs(specs, scorer, 2, "t50", progress=False)
-    pooled = score_configs(specs, scorer, 2, "t50", progress=False, jobs=2)
+    serial = score_configs(specs, scorer, 50, "t50", progress=False)
+    pooled = score_configs(specs, scorer, 50, "t50", progress=False, jobs=2)
     # Workers run single-threaded BLAS: the same numbers up to reduction order.
     for a, b in zip(pooled, serial, strict=True):
         assert a["needed"] == pytest.approx(b["needed"], rel=1e-6)
         assert a["shape_sd"] == pytest.approx(b["shape_sd"], rel=1e-6)
+
+
+def test_refine_rescores_the_designs_near_the_front(tmp_path, capsys):
+    import csv
+
+    from fastfuncstuff.cli.simulate import main
+
+    argv = ["-tr", "1", "-nruns", "1", "-initial_fix", "10", "-post_fix", "15",
+            "-trial", "A", "0.25", "1", "-null", "0.25", "[0-30%]",
+            "-isi", "exp:[3.0-6.0],1,10", "-tsnr", "50", "-scan_time", "200",
+            "-explore", "20", "-explore_refine", "6", "-explore_keep", "2",
+            "-explore_pick", "2", "-jobs", "1", "-device", "cpu", "-prefix", str(tmp_path / "x")]  # fmt: skip
+    assert main(argv) == 0
+    assert "refining" in capsys.readouterr().out
+    rows = list(csv.DictReader((tmp_path / "x_explore.tsv").open(), delimiter="\t"))
+    refined = [r for r in rows if r["realizations"] == "6"]
+    assert refined and len(refined) < len(rows)
+    assert all(r["realizations"] == "6" for r in rows if r["on_front"] == "1")

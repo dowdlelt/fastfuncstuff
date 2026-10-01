@@ -480,6 +480,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     x.add_argument("-explore_keep", type=int, default=5, help="Shortlisted designs (5).")
     x.add_argument(
+        "-explore_refine",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Rescore the designs near the front (the front and the best tenth on each "
+        "axis) with N realizations before shortlisting -- precision where it decides the "
+        "ranking (default 0: off).",
+    )
+    x.add_argument(
         "-jobs",
         type=int,
         help="Worker processes scoring -explore designs (default: CPU count - 1; 1 = serial).",
@@ -1395,7 +1404,7 @@ def _sweep_lines(sweep, conds, contrasts, reals, tr, target: float = 0.8) -> lis
 
 EXPLORE_ONLY = (
     "explore", "objective", "explore_designs", "explore_keep", "explore_pick",
-    "optimize", "optimize_pop", "optimize_hrfs", "max_repeat", "jobs",
+    "optimize", "optimize_pop", "optimize_hrfs", "max_repeat", "jobs", "explore_refine",
 )  # fmt: skip
 TIMING_FLAGS = (
     "trial", "block", "miniblock", "null", "isi", "within_isi", "initial_fix", "post_fix",
@@ -1742,17 +1751,40 @@ def _run_explore(raw: list[str], started: float) -> int:
     # The trade-off: detection against response shape -- or, when single trials are
     # the target, against LSS leakage (neighbours mixed into each trial's estimate).
     y_key = {"trials": "unreliability", "shape_diff": "shape_steps"}.get(objective, "shape_sd")
-    x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
-    y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
-    combined = None
-    if len(goals) > 1:
-        # Each goal relative to its median over the explored designs (1 = typical);
-        # the shortlist is the best on the weighted mean, not only the 2-D front.
-        vals = [{g: _goal_of(sc, g) for g in goals} if sc else None for sc in scores]
-        typical = {g: float(np.nanmedian([v[g] for v in vals if v])) for g in goals}
-        combined = np.array([combine(v, goals, typical) if v else np.nan for v in vals])
-        y = combined
-    front = ex.pareto_front(x, y)
+
+    def rank(scores):
+        x = np.array([sc["needed"][det_c] if sc else np.nan for sc in scores])
+        y = np.array([sc.get(y_key, np.nan) if sc else np.nan for sc in scores])
+        combined = None
+        if len(goals) > 1:
+            # Each goal relative to its median over the explored designs (1 = typical);
+            # the shortlist is the best on the weighted mean, not only the 2-D front.
+            vals = [{g: _goal_of(sc, g) for g in goals} if sc else None for sc in scores]
+            typical = {g: float(np.nanmedian([v[g] for v in vals if v])) for g in goals}
+            combined = np.array([combine(v, goals, typical) if v else np.nan for v in vals])
+            y = combined
+        return x, y, combined, ex.pareto_front(x, y)
+
+    x, y, combined, front = rank(scores)
+    n_real = np.full(len(scores), args.explore_designs)
+    if args.explore_refine > args.explore_designs:
+        # Racing: a median of a few realizations is noisier than the gap between
+        # neighbouring designs, but only the designs that can make the shortlist
+        # need the precision -- the front and the best tenth on each axis.
+        near = set(np.flatnonzero(front))
+        for v in (x, y):
+            fin = np.flatnonzero(np.isfinite(v))
+            near |= set(fin[np.argsort(v[fin])][: max(1, len(fin) // 10)])
+        idx = sorted(int(i) for i in near)
+        print(f"refining {len(idx)} designs near the front with {args.explore_refine} realizations")
+        again = ex.score_configs(
+            [specs[i] for i in idx], scorer, args.explore_refine, ref, args.seed,
+            single_all="trials" in goals, steps_all="shape_diff" in goals,
+            jobs=_explore_jobs(args.jobs),
+        )  # fmt: skip
+        for i, sc in zip(idx, again, strict=True):
+            scores[i], n_real[i] = sc, args.explore_refine
+        x, y, combined, front = rank(scores)
     if combined is not None:
         order = [int(i) for i in np.argsort(np.where(np.isfinite(combined), combined, np.inf))]
         keep = [i for i in order if np.isfinite(combined[i])][: args.explore_keep]
@@ -1768,7 +1800,7 @@ def _run_explore(raw: list[str], started: float) -> int:
             *[f"needed_{c}" for c in [*live, "detection"]],
             *[f"worst_{c}" for c in [*live, "detection"]],
             "shape_sd", "estimation_efficiency", "lss_sd", "leakage", "lsa_sd", "unreliability",
-            "ridge_frac", "shape_steps", "combined", "dropped"]  # fmt: skip
+            "ridge_frac", "shape_steps", "combined", "dropped", "realizations"]  # fmt: skip
     with open(f"{prefix}_explore.tsv", "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
         w.writerow(cols)
@@ -1792,7 +1824,7 @@ def _run_explore(raw: list[str], started: float) -> int:
                         )
                     ]  # fmt: skip
                     + [f"{combined[k]:.4f}" if combined is not None else ""]
-                    + [f"{sc['dropped']:.2f}"]
+                    + [f"{sc['dropped']:.2f}", str(n_real[k])]
                     if sc
                     else [""] * (len(cols) - len(axes) - 3)
                 )

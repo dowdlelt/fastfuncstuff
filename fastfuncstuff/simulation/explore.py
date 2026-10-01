@@ -245,7 +245,9 @@ def score_configs(
 
     from .experiment import realize
 
-    if jobs > 1 and len(specs) >= 2 * jobs:
+    # Below ~50 realizations a worker, spawning (a torch import each) costs
+    # more than it saves.
+    if jobs > 1 and len(specs) >= 2 * jobs and len(specs) * n_realizations >= 50 * jobs:
         # Configs are independent and each is ~10 ms of small CPU work, so
         # processes (not the GPU, not BLAS threads) are what scale. Chunks
         # keep the order; several per worker keep the progress bar moving.
