@@ -24,7 +24,11 @@ Items may be separated by commas or spaces, and ``isi:SPEC`` is an item that
 is only a gap (a zero-length ``null`` with that OFF), so a unit can open with
 one: ``"isi:uniform:2,8 A:0.5 B:2"``. OFF can also come from a list:
 ``uniform:(2,5,9)`` (any of them each time) or ``even:(2,5,9)`` (equally often
-within a run). The reserved condition ``null`` occupies time without
+within a run). A list can also be named once and shared, ``-isi_list SP
+(4,9,11)``, then used as ``even:SP`` (or just ``SP``) and ``uniform:SP``,
+optionally shifted, ``SP-3``. Every ``even:SP`` gap in a run -- whichever unit
+or item it follows -- is balanced as one pool, and the leftovers are dealt
+across runs so the experiment is balanced too. The reserved condition ``null`` occupies time without
 producing an event, and ``uniform``/``even``/``exp``/``poisson``/``isi``
 cannot be condition names (they start interval specs or gaps). Intervals are offset-to-onset. Every realization is one seed: a
 jittered design is a distribution over event lists, and power is a property
@@ -52,6 +56,12 @@ class Interval:
     list: ``uniform:(2,5,9)`` draws each gap from the values, ``even:(2,5,9)``
     uses them equally often within a run (the remainder, when the count does
     not divide, drawn without replacement) in shuffled order.
+
+    A named list (``lists``, from -isi_list) is ``even:NAME``, ``uniform:NAME``
+    or bare ``NAME`` (even), with an optional shift, ``NAME-3`` / ``NAME+0.5``
+    (inline lists take one too). ``values`` keeps the unshifted list; mean, low
+    and high are of the shifted gaps. A named even interval is a ``pool``:
+    :func:`draw_plans` balances every gap that names it together, not per item.
     """
 
     kind: Literal["fixed", "uniform", "exp", "poisson", "choice", "even"]
@@ -59,20 +69,58 @@ class Interval:
     low: float
     high: float
     values: tuple[float, ...] = ()
+    pool: str = ""  # the -isi_list name an even interval is balanced across
+    shift: float = 0.0  # added to every value drawn from ``values``
 
     @classmethod
-    def parse(cls, spec: str | float) -> Interval:
+    def parse(
+        cls, spec: str | float, lists: dict[str, tuple[float, ...]] | None = None
+    ) -> Interval:
         if isinstance(spec, (int, float)):
             return cls("fixed", float(spec), float(spec), float(spec))
         text = str(spec).strip().replace(" ", "")
-        listed = re.fullmatch(r"(uniform|even):\((.+)\)", text, flags=re.IGNORECASE)
+        listed = re.fullmatch(
+            r"(?:(uniform|even):)?(\(.+\)|[A-Za-z_]\w*)([+-][\d.]+)?", text, flags=re.IGNORECASE
+        )
+        if listed and listed.group(2).startswith("(") and not listed.group(1):
+            listed = None  # a bare (2,5,9) is not a spec
+        if listed:
+            body, name = listed.group(2), ""
+            if not body.startswith("("):
+                name = body
+                if name not in (lists or {}):
+                    known = ", ".join(lists or {}) or "none defined"
+                    raise ValueError(
+                        f"cannot parse interval {spec!r}: {name!r} is not an -isi_list "
+                        f"({known}); define it with -isi_list {name} (4,9,11)"
+                    )
+            try:
+                vals = (
+                    list((lists or {})[name])
+                    if name
+                    else [float(x) for x in body[1:-1].split(",") if x]
+                )
+                shift = float(listed.group(3) or 0)
+            except ValueError:
+                raise ValueError(f"cannot parse interval {spec!r}") from None
+            if not vals:
+                raise ValueError(f"cannot parse interval {spec!r}: the list is empty")
+            if min(vals) + shift < 0:
+                raise ValueError(
+                    f"{spec!r}: shifted by {shift:g}, the smallest gap is "
+                    f"{min(vals) + shift:g} s -- gaps cannot be negative"
+                )
+            even = (listed.group(1) or "even").lower() == "even"
+            return cls(
+                "even" if even else "choice",
+                float(np.mean(vals)) + shift,
+                min(vals) + shift,
+                max(vals) + shift,
+                tuple(vals),
+                name if even else "",
+                shift,
+            )
         try:
-            if listed:
-                vals = [float(x) for x in listed.group(2).split(",") if x]
-                if not vals or min(vals) < 0:
-                    raise ValueError
-                kind = "choice" if listed.group(1).lower() == "uniform" else "even"
-                return cls(kind, float(np.mean(vals)), min(vals), max(vals), tuple(vals))
             if ":" not in text:
                 v = float(text)
                 return cls("fixed", v, v, v)
@@ -108,11 +156,11 @@ class Interval:
             return np.full(n, self.mean)
         vals = np.asarray(self.values, dtype=float)
         if self.kind == "choice":
-            return rng.choice(vals, n)
+            return rng.choice(vals, n) + self.shift
         if self.kind == "even":
             whole, rest = divmod(n, len(vals))
             out = np.concatenate([np.repeat(vals, whole), rng.choice(vals, rest, replace=False)])
-            return rng.permutation(out)
+            return rng.permutation(out) + self.shift
         from fastfuncstuff.design.optimization import ISIConstraints, generate_isi_sequence
 
         dist = {"uniform": "uniform", "exp": "truncated_exponential", "poisson": "poisson"}[
@@ -128,7 +176,8 @@ class Interval:
             return f"uniform:{self.low:g},{self.high:g}"
         if self.kind in ("choice", "even"):
             kind = "uniform" if self.kind == "choice" else "even"
-            return f"{kind}:({','.join(f'{v:g}' for v in self.values)})"
+            body = self.pool or f"({','.join(f'{v:g}' for v in self.values)})"
+            return f"{kind}:{body}" + (f"{self.shift:+g}" if self.shift else "")
         return f"{self.kind}:{self.mean:g},{self.low:g},{self.high:g}"
 
 
@@ -142,6 +191,11 @@ class Item:
 _INTERVAL_KINDS = ("uniform", "exp", "poisson", "even")
 _GAP = "isi"  # an item that is only a gap: isi:4, isi:uniform:2,8
 _ITEM = re.compile(r"([A-Za-z_][\w.]*):([\d.]+)(?::(.+?))?(?:[x*](\d+))?")
+
+
+def reserved_name(name: str) -> bool:
+    """Names that start interval specs or gap items, and so cannot label anything."""
+    return name.lower() in (*_INTERVAL_KINDS, _GAP, NULL)
 
 
 def _split_items(text: str) -> list[str]:
@@ -194,9 +248,15 @@ class Unit:
 
     @classmethod
     def parse(
-        cls, name: str, items: str, count: float, family: Literal["event", "block"] = "event"
+        cls,
+        name: str,
+        items: str,
+        count: float,
+        family: Literal["event", "block"] = "event",
+        lists: dict[str, tuple[float, ...]] | None = None,
     ) -> Unit:
-        """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring)."""
+        """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring);
+        ``lists`` are the named gap lists an OFF may use."""
         parsed: list[Item] = []
         for token in _split_items(items):
             gap = re.fullmatch(rf"{_GAP}:(.+?)(?:[x*](\d+))?", token.replace(" ", ""), re.I)
@@ -204,7 +264,7 @@ class Unit:
                 # Time with no event, e.g. before the first item: a zero-length
                 # null item whose OFF is the gap.
                 try:
-                    off = Interval.parse(gap.group(1))
+                    off = Interval.parse(gap.group(1), lists)
                 except ValueError as exc:
                     raise ValueError(
                         f"{token!r}: isi is reserved for a gap item (isi:SPEC) and cannot "
@@ -220,7 +280,7 @@ class Unit:
             label = m.group(1)
             if label.lower() in _INTERVAL_KINDS:
                 raise ValueError(f"{label!r} starts an interval spec and cannot name a condition")
-            off = Interval.parse(m.group(3)) if m.group(3) else None
+            off = Interval.parse(m.group(3), lists) if m.group(3) else None
             parsed += [Item(label, float(m.group(2)), off)] * int(m.group(4) or 1)
         if not parsed:
             raise ValueError(f"unit {name!r} has no items")
@@ -522,36 +582,48 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
     spare_rng = np.random.default_rng([seed, 1])
     counts = spec.resolve_counts()
     plans = []
+    decks: dict[Any, list[int]] = {}  # a pooled list's leftovers, dealt across runs
     for _ in range(spec.n_runs):
         order = [
             int(u)
             for u in generate_event_sequence(counts, len(spec.units), ordering=spec.order, rng=rng)
         ]
         # Every gap slot in the run: (unit position k, item j) -> the interval it
-        # draws from.
+        # draws from. A named even list is one slot family wherever it is used.
         slots: dict[Any, list[tuple[int, int]]] = {}
         specs: dict[Any, Interval] = {}
-        spare: tuple[Any, tuple[int, int]] | None = None
+        shift: dict[tuple[int, int], float] = {}  # pooled slots: each its own shift
+        spare: tuple[Interval, tuple[int, int]] | None = None
         for k, ui in enumerate(order):
             items = spec.units[ui].items
             for j, item in enumerate(items):
                 last = j == len(items) - 1
                 if item.off is not None:
                     key: Any = ("item", ui, j)
-                    specs[key] = item.off
+                    off = item.off
                 else:
                     key = "isi" if last else "within"
-                    specs[key] = spec.isi if last else spec.within_isi
+                    off = spec.isi if last else spec.within_isi
                 if last and k == len(order) - 1:
-                    spare = (key, (k, j))
+                    spare = (off, (k, j))
                     continue
+                if off.pool:
+                    key = ("pool", off.pool)
+                    shift[(k, j)] = off.shift
+                specs[key] = off
                 slots.setdefault(key, []).append((k, j))
         # Draw each slot family in one call over the whole run. The mean-matched
         # generators force a single draw to the mean, so drawing gap by gap (as
         # the within-unit gaps once were) silently removed all jitter.
         gap: dict[tuple[int, int], float] = {}
         for key, where in slots.items():
-            for pos, value in zip(where, specs[key].sample(len(where), rng, spec.tr), strict=True):
+            if isinstance(key, tuple) and key[0] == "pool":
+                vals = specs[key].values
+                drawn = _deal(len(vals), len(where), decks.setdefault(key, []), rng)
+                values = np.asarray(vals)[drawn] + [shift[pos] for pos in where]
+            else:
+                values = specs[key].sample(len(where), rng, spec.tr)
+            for pos, value in zip(where, values, strict=True):
                 gap[pos] = float(value)
         if spare is not None:
             # One value from a mean-matched generator can fail its own constraints
@@ -561,7 +633,7 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                gap[spare[1]] = float(specs[spare[0]].sample(1, spare_rng, spec.tr)[0])
+                gap[spare[1]] = float(spare[0].sample(1, spare_rng, spec.tr)[0])
         plans.append(
             RunPlan(
                 [
@@ -571,6 +643,31 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
             )
         )
     return counts, plans
+
+
+def _deal(n_values: int, n: int, deck: list[int], rng: np.random.Generator) -> np.ndarray:
+    """``n`` indices into a list of ``n_values``, each used equally often, shuffled.
+
+    The whole multiples are this run's; the remainder comes off ``deck``, a
+    shuffled stack of every index refilled as it runs out and kept across
+    runs, so leftovers rotate: 10 gaps over (4,9,11) in each of 3 runs is
+    3/3/3 per run plus one extra that is a different value each run, 10 of
+    each overall -- drawing each run's remainder afresh could give 4 every time.
+    """
+    whole, rest = divmod(n, n_values)
+    extra: list[int] = []
+    while len(extra) < rest:
+        if not deck:
+            deck.extend(rng.permutation(n_values).tolist())
+        # a refill can hold an index this run already took: skip past it
+        pick = next((d for d in deck if d not in extra), None)
+        if pick is None:
+            deck.extend(rng.permutation(n_values).tolist())
+            continue
+        deck.remove(pick)
+        extra.append(pick)
+    out = np.concatenate([np.repeat(np.arange(n_values), whole), np.asarray(extra, dtype=int)])
+    return rng.permutation(out).astype(int)
 
 
 def assemble(

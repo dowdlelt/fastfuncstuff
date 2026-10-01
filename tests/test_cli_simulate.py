@@ -483,6 +483,20 @@ def test_null_count_can_be_a_share_of_the_trials():
     assert counts == [60, 15]
 
 
+def test_isi_list_names_a_pool_any_spec_can_use():
+    from fastfuncstuff.cli.simulate import _build_parser, _isi_lists, _spec_from_args
+
+    assert _isi_lists([["GAP", "(4, 9,11)"], ["B", "2 4"]]) == {"GAP": (4, 9, 11), "B": (2, 4)}
+    for bad, why in ((["box3", "(1)"], "x<digits>"), (["even", "(1)"], "reserved"),
+                     (["G", "(a,b)"], "numbers")):  # fmt: skip
+        with pytest.raises(ValueError, match=why):
+            _isi_lists([bad])
+    argv = ["-tr", "1", "-isi_list", "GAP", "(4,9,11)", "-isi", "GAP-1",
+            "-miniblock", "M", "isi:uniform:GAP A:2", "3", "-prefix", "x"]  # fmt: skip
+    spec = _spec_from_args(_build_parser().parse_args(argv))
+    assert str(spec.isi) == "even:GAP-1" and spec.units[0].items[0].off.kind == "choice"
+
+
 def test_target_reaches_the_summary_and_mismatch_false_positives_are_split(tmp_path, capsys):
     _sim(tmp_path / "t", "-ndesigns", "1", "-no_plots", "-target", "0.9")
     assert "for 90% power" in capsys.readouterr().out

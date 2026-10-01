@@ -344,3 +344,50 @@ def test_items_split_on_spaces_and_a_gap_item_can_open_a_unit():
     spec = ExperimentSpec(tr=1.0, units=[Unit.parse("c", "isi:7 A:1", 3, "block")], initial_fix=10)
     real = realize(spec, 0)
     assert real.onsets[0][0][0] == pytest.approx(17.0)  # 10 s fixation + the 7 s gap
+
+
+def test_a_named_list_is_one_pool_across_units_and_shifts_keep_their_draw():
+    from collections import Counter
+
+    from fastfuncstuff.simulation.experiment import draw_plans
+
+    lists = {"GAP": (4.0, 9.0, 11.0)}
+    units = [
+        Unit.parse("d", "DP:15:GAP DI:18:2 R:4:1", 1, "block", lists),
+        Unit.parse("s", "SP:15:even:GAP SI:18:2 R:4:1", 1, "block", lists),
+        Unit.parse("p", "isi:GAP-3 PI:18:2 R:4:1", 1, "block", lists),
+    ]
+    assert str(units[2].items[0].off) == "even:GAP-3" and units[2].items[0].off.low == 1
+    spec = ExperimentSpec(tr=1.0, units=units, n_runs=2, initial_fix=10, post_fix=15, num_blocks=6)
+    for seed in range(5):
+        _, plans = draw_plans(spec, seed)
+        for plan in plans:
+            # 6 draws over 3 values: 2 each per run, counted before the -3 shift --
+            # per item it would be 2 draws over 3 values, never balanced
+            drawn = Counter(g[0] + 3 * (ui == 2) for ui, g in plan.entries)
+            assert drawn == {4.0: 2, 9.0: 2, 11.0: 2}
+    # the pool fixes the content length, so nothing is dropped from a fixed scan
+    spec.scan_time = 330
+    assert sum(realize(spec, s).n_dropped for s in range(20)) == 0
+    # a condition used by several units is one condition: one column, all onsets
+    real = realize(spec, 0)
+    assert real.conditions.count("R") == 1
+    assert sum(len(r) for r in real.onsets[real.conditions.index("R")]) == 12
+
+    pick = Interval.parse("uniform:GAP+1", lists)
+    assert pick.kind == "choice" and not pick.pool
+    assert set(pick.sample(100, np.random.default_rng(0))) == {5.0, 10.0, 12.0}
+    with pytest.raises(ValueError, match="not an -isi_list"):
+        Interval.parse("even:GAPS", lists)
+    with pytest.raises(ValueError, match="negative"):
+        Interval.parse("GAP-5", lists)
+
+
+def test_pool_leftovers_rotate_across_runs():
+    from fastfuncstuff.simulation.experiment import _deal
+
+    rng, deck = np.random.default_rng(1), []
+    runs = [np.bincount(_deal(3, 10, deck, rng), minlength=3) for _ in range(3)]
+    for r in runs:  # each run balanced: 3/3/3 and one extra
+        assert sorted(r) == [3, 3, 4]
+    assert sum(runs).tolist() == [10, 10, 10]  # and so is the experiment

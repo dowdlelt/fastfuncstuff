@@ -24,6 +24,15 @@ the values, even:(2,5,9) uses them equally often within a run (8 gaps over 4
 values: 2 each; a remainder is drawn without replacement), shuffled. A block
 is a -trial with a long duration.
 
+A list used in several places can be named once, and then is balanced as one
+pool -- over every unit and item that uses it, not per item:
+    -isi_list SP "(4,9,11)"
+    -miniblock M1 "R1:2:SP E1:15:even:SP" 2 -miniblock M2 "R1:2:SP-3 E2:15" 2
+even:SP (or bare SP) uses 4, 9 and 11 equally often across all those gaps in a
+run, leftovers rotating across runs; uniform:SP draws each gap from them; SP-3
+draws from the list, then subtracts 3. A condition named in several units
+(R1 above) is one condition -- one regressor, one design column.
+
 An item's OFF is the gap after it, and takes any SPEC, so every position can
 have its own (jittered) gap:
     -miniblock ABC "A:0.5:0, B:2:2, C:3:uniform:2,4" 10
@@ -124,6 +133,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -254,6 +264,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Blank trials: DUR seconds (DUR:OFF for its own gap, as in a -miniblock item), "
         "COUNT per run, or a share of all units -- 20%% or 0.2 -- as a weight (repeatable). "
         "With a fixed -isi this is 'identical ISIs, then drop trials'.",
+    )
+    t.add_argument(
+        "-isi_list",
+        nargs=2,
+        action="append",
+        metavar=("NAME", "VALUES"),
+        help='A named list of gaps, e.g. -isi_list SP "(4,9,11)" (repeatable). Use it as an '
+        "OFF or SPEC: even:SP (or just SP) uses the values equally often over every gap that "
+        "names SP in a run -- across units and items, not per item -- with leftovers rotated "
+        "across runs; uniform:SP draws each gap from them; SP-3 / even:SP+1 shift every value.",
     )
     t.add_argument("-isi", default="0", metavar="SPEC", help="Gap between units (default 0).")
     t.add_argument("-within_isi", default="0", metavar="SPEC", help="Gap inside a miniblock.")
@@ -587,12 +607,42 @@ def _null_fraction(token: str) -> float | None:
     return frac
 
 
+def _isi_lists(pairs) -> dict[str, tuple[float, ...]]:
+    """-isi_list NAME VALUES pairs -> {NAME: values}; VALUES as (4,9,11), 4,9,11 or 4 9 11."""
+    from fastfuncstuff.simulation.experiment import reserved_name
+
+    lists: dict[str, tuple[float, ...]] = {}
+    for name, text in pairs or []:
+        if not re.fullmatch(r"[A-Za-z_]\w*", name) or re.search(r"x\d+$", name):
+            raise ValueError(
+                f"-isi_list {name!r}: a name is letters, digits and _, starting with a letter, "
+                "and not ending in x<digits> (that would read as a repeat, A:2:x3)"
+            )
+        if reserved_name(name):
+            raise ValueError(f"-isi_list {name!r}: {name} is reserved")
+        if name in lists:
+            raise ValueError(f"-isi_list {name!r} is defined twice")
+        try:
+            vals = tuple(float(v) for v in re.split(r"[,\s]+", text.strip().strip("()")) if v)
+        except ValueError:
+            raise ValueError(f"-isi_list {name} {text!r}: not a list of numbers") from None
+        if not vals or min(vals) < 0:
+            raise ValueError(f"-isi_list {name} {text!r}: need one or more gaps >= 0")
+        lists[name] = vals
+    return lists
+
+
 def _spec_from_args(args):
     from fastfuncstuff.simulation.experiment import NULL, ExperimentSpec, Interval, Unit
 
-    units = [Unit.parse(nm, f"{nm}:{d}", int(c)) for nm, d, c in (args.trial or [])]
-    units += [Unit.parse(nm, f"{nm}:{d}", int(c), "block") for nm, d, c in (args.block or [])]
-    units += [Unit.parse(nm, items, int(c), "block") for nm, items, c in (args.miniblock or [])]
+    lists = _isi_lists(args.isi_list)
+    units = [Unit.parse(nm, f"{nm}:{d}", int(c), lists=lists) for nm, d, c in (args.trial or [])]
+    units += [
+        Unit.parse(nm, f"{nm}:{d}", int(c), "block", lists) for nm, d, c in (args.block or [])
+    ]
+    units += [
+        Unit.parse(nm, items, int(c), "block", lists) for nm, items, c in (args.miniblock or [])
+    ]
     # A -null COUNT that is a fraction ("20%", "0.2") is that share of all units:
     # weight p / (1 - p) against the rest, so it survives -num_events/-scan_time
     # scaling. A whole number is a count.
@@ -602,13 +652,13 @@ def _spec_from_args(args):
         if frac == 0:  # an explored share can draw 0%: no blank trials
             continue
         weight = frac / (1 - frac) * rest if frac is not None else int(c)
-        units.append(Unit.parse(f"null{i}", f"{NULL}:{d}", weight))
+        units.append(Unit.parse(f"null{i}", f"{NULL}:{d}", weight, lists=lists))
     return ExperimentSpec(
         tr=args.tr,
         units=units,
         n_runs=args.nruns,
-        isi=Interval.parse(args.isi),
-        within_isi=Interval.parse(args.within_isi),
+        isi=Interval.parse(args.isi, lists),
+        within_isi=Interval.parse(args.within_isi, lists),
         initial_fix=args.initial_fix,
         post_fix=args.post_fix,
         order=args.order,
@@ -1394,7 +1444,8 @@ EXPLORE_ONLY = (
     "optimize", "optimize_pop", "optimize_hrfs", "max_repeat", "jobs", "explore_refine",
 )  # fmt: skip
 TIMING_FLAGS = (
-    "trial", "block", "miniblock", "null", "isi", "within_isi", "initial_fix", "post_fix",
+    "trial", "block", "miniblock", "null", "isi_list", "isi", "within_isi", "initial_fix",
+    "post_fix",
     "order", "nruns", "scan_time", "num_events", "num_blocks", "ndesigns", "scan_times",
     "events", "labels", "durations", "nt",
 )  # fmt: skip
