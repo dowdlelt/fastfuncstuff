@@ -55,7 +55,9 @@ known ARMA(1,1) (sandwich variance + Satterthwaite dof), so no per-voxel REML is
 needed; naive OLS false positives are reported alongside. 0 is always
 simulated, so the false-positive rate is measured.
 
-WHAT IS SWEPT -- -amplitudes (peak % signal change of an isolated event) means
+WHAT IS SWEPT -- -amplitudes (peak % signal change of an isolated event; by
+default placed per noise level along the analytic power curve, dense where it
+rises and stopping once every contrast is near 100%) means
 the response amplitude for a condition contrast (A, or any contrast whose
 weights do not sum to zero; -pattern sets relative responses), and the
 difference itself for a difference contrast (A-B, A+B-2*C): at 1%, A is 1%
@@ -316,8 +318,9 @@ def _build_parser() -> argparse.ArgumentParser:
     e.add_argument(
         "-amplitudes",
         nargs="+",
-        default=["0.1:3:15"],
-        help="Peak %% signal change to sweep: values, or START:STOP:NUM.",
+        default=["auto"],
+        help="Peak %% signal change to sweep: auto[:N] (default auto:12 -- N points per "
+        "noise level, placed along its power curve up to ~100%%), values, or START:STOP:NUM.",
     )
     e.add_argument(
         "-effect", type=float, help="Report a verdict at this amplitude (added to the sweep)."
@@ -500,7 +503,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _amplitudes(tokens: list[str], effect: float | None) -> list[float]:
+def _amplitudes(tokens: list[str], effect: float | None) -> list[float] | Any:
+    """The swept amplitudes, or an AutoSweep that places them per noise level."""
+    if len(tokens) == 1 and tokens[0].split(":")[0] == "auto":
+        from fastfuncstuff.simulation.power import AutoSweep
+
+        n = tokens[0].partition(":")[2]
+        if n and (not n.isdigit() or int(n) < 2):
+            raise ValueError(f"-amplitudes {tokens[0]}: auto:N needs a whole N >= 2")
+        extra = () if effect is None else (round(effect, 6),)
+        return AutoSweep(n_points=int(n) if n else 12, extra=extra)
     vals: list[float] = []
     for tok in tokens:
         if ":" in tok:
@@ -2364,7 +2376,10 @@ def main(argv: list[str] | None = None) -> int:
                 "contrasts": {k: v.tolist() for k, v in contrasts.items()},
                 "pattern": pattern,
                 "shared": args.shared,
-                "amplitudes": amps,
+                "amplitudes": {
+                    n: sorted({r["amplitude"] for r in res["table"] if r["noise"] == n})
+                    for n in dict.fromkeys(r["noise"] for r in res["table"])
+                },
                 "noise": conds,
                 "seeds": [r.seed for r in reals],
                 "run_lengths": [r.run_lengths for r in reals],

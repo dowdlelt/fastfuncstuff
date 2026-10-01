@@ -23,6 +23,7 @@ answer to "does autocorrelation matter for this design".
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -126,12 +127,139 @@ def _corrected_terms(
     return P @ RPt, tr_MR, tr_MR**2 / tr_MRMR
 
 
+def _noise_terms(
+    ab: tuple[float, float] | None,
+    X: torch.Tensor,
+    P: torch.Tensor,
+    C: torch.Tensor,
+    run_lengths: list[int],
+) -> tuple[torch.Tensor, float, float]:
+    """Contrast variances (unit noise), tr(MR) and dof under ARMA ``ab``; white if None."""
+    n_t, n_p = X.shape
+    if ab is None:
+        return torch.einsum("ip,pq,iq->i", C, P @ P.T, C), float(n_t - n_p), float(n_t - n_p)
+    R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
+    PRPt, tr_MR, dof = _corrected_terms(X, P, R)
+    return torch.einsum("ip,pq,iq->i", C, PRPt, C), tr_MR, dof
+
+
+def _predicted(
+    a: torch.Tensor, sigma: float, scale: float, v_true: torch.Tensor, tr_MR: float,
+    crit: float, dof: float, glm: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # fmt: skip
+    """Analytic mean estimate, misfit energy and power at amplitudes ``a`` (A, 1).
+
+    Returns (expected estimate (A, K) PSC, misfit sum of squares (A,), power
+    (A, K)). The misfit -- what the fitted model cannot absorb of the true
+    response -- inflates E[RSS] and shrinks every t; an unbiased-noise formula
+    missed it (it promised 80% where Monte Carlo gave ~0 for A-B on a 4%
+    shared response).
+    """
+    exp_est = glm["exp_base"][None] + a * glm["exp_unit"][None]  # (A, K), PSC
+    mis2 = scale**2 * ((glm["mis_base"][None] + a * glm["mis_unit"][None]) ** 2).sum(dim=1)
+    sigma2_hat = sigma**2 + mis2 / tr_MR  # E[RSS] / tr(MR), (A,)
+    se_hat = torch.sqrt(v_true)[None] * torch.sqrt(sigma2_hat)[:, None] / scale
+    nc = torch.where(se_hat > 0, exp_est / se_hat, torch.zeros_like(se_hat))
+    power = torch.as_tensor(_two_tailed_power(crit, dof, nc.numpy()), dtype=torch.float64)
+    return exp_est, mis2, power.reshape(exp_est.shape)
+
+
+def _glm_setup(
+    design: torch.Tensor | np.ndarray,
+    run_lengths: list[int],
+    tr: float,
+    contrasts: dict[str, list[float] | np.ndarray],
+    poly_degree: int | None,
+    true_design: torch.Tensor | np.ndarray | None,
+    beta_pattern: list[float] | np.ndarray | None,
+    beta_offset: list[float] | np.ndarray | float,
+) -> dict[str, Any]:
+    """The fitted GLM and the planted signal's deterministic parts, shared by both engines."""
+    from fastfuncstuff.cli_utils import auto_polort
+
+    X_task = torch.as_tensor(design, dtype=torch.float64)
+    n_t, n_cond = X_task.shape
+    if sum(run_lengths) != n_t:
+        raise ValueError(f"run lengths sum to {sum(run_lengths)}, design has {n_t} rows")
+    X_true = X_task if true_design is None else torch.as_tensor(true_design, dtype=torch.float64)
+    if X_true.shape != X_task.shape:
+        raise ValueError(f"true_design {tuple(X_true.shape)} must match design {(n_t, n_cond)}")
+    pattern = torch.ones(n_cond, dtype=torch.float64)
+    if beta_pattern is not None:
+        pattern = torch.as_tensor(beta_pattern, dtype=torch.float64)
+    offset = torch.as_tensor(beta_offset, dtype=torch.float64).expand(n_cond).clone()
+    if poly_degree is None:
+        poly_degree = auto_polort(max(run_lengths) * tr)
+
+    X = torch.cat([X_task, _nuisance(run_lengths, poly_degree)], dim=1)
+    n_p = X.shape[1]
+    if torch.linalg.matrix_rank(X) < n_p:
+        raise ValueError("design + drift polynomials are rank-deficient; check the conditions")
+    XtX_inv = torch.linalg.inv(X.T @ X)
+    P = XtX_inv @ X.T  # (n_p, n_t)
+
+    names = list(contrasts)
+    C = torch.zeros(len(names), n_p, dtype=torch.float64)
+    for i, name in enumerate(names):
+        w = torch.as_tensor(np.asarray(contrasts[name], dtype=np.float64))
+        if w.numel() != n_cond:
+            raise ValueError(f"contrast {name!r} has {w.numel()} weights, design {n_cond}")
+        C[i, :n_cond] = w
+    # Expected contrast estimate c P X_true beta and the misfit (I - X P) X_true
+    # beta: both affine in the amplitude, split into base and unit parts.
+    s_unit, s_base = X_true @ pattern, X_true @ offset
+    return {
+        "X": X, "X_true": X_true, "P": P, "XtX_inv": XtX_inv, "C": C, "names": names,
+        "pattern": pattern, "offset": offset, "poly_degree": poly_degree, "n_cond": n_cond,
+        "exp_unit": C @ P @ s_unit, "exp_base": C @ P @ s_base,
+        "mis_unit": s_unit - X @ (P @ s_unit), "mis_base": s_base - X @ (P @ s_base),
+    }  # fmt: skip
+
+
+def analytic_power(
+    design: torch.Tensor | np.ndarray,
+    run_lengths: list[int],
+    tr: float,
+    contrasts: dict[str, list[float] | np.ndarray],
+    amplitudes: np.ndarray,
+    noise: list[dict[str, Any]],
+    beta_pattern: list[float] | np.ndarray | None = None,
+    beta_offset: list[float] | np.ndarray | float = 0.0,
+    poly_degree: int | None = None,
+    alpha: float = 0.001,
+    true_design: torch.Tensor | np.ndarray | None = None,
+    baseline: float = 100.0,
+) -> dict[str, np.ndarray]:
+    """The analytic power curve of :func:`simulate_design_power`, without the Monte Carlo.
+
+    {noise label: (n_amplitudes, n_contrasts) power}. Cheap enough to evaluate
+    on a fine grid -- which is how ``AutoSweep`` places the simulated points.
+    """
+    glm = _glm_setup(
+        design, run_lengths, tr, contrasts, poly_degree, true_design, beta_pattern, beta_offset
+    )
+    a = torch.as_tensor(np.asarray(amplitudes, dtype=float), dtype=torch.float64)[:, None]
+    scale = baseline / 100.0
+    out: dict[str, np.ndarray] = {}
+    terms: dict[tuple[float, float] | None, tuple] = {}
+    for k, cond in enumerate(noise):
+        label = str(cond.get("label", f"noise{k}"))
+        ab = _noise_arma(cond, tr)
+        if ab not in terms:
+            terms[ab] = _noise_terms(ab, glm["X"], glm["P"], glm["C"], run_lengths)
+        v_true, tr_MR, dof = terms[ab]
+        crit = float(stats.t.ppf(1 - alpha / 2, dof))
+        sigma = baseline / float(cond["tsnr"])
+        out[label] = _predicted(a, sigma, scale, v_true, tr_MR, crit, dof, glm)[2].numpy()
+    return out
+
+
 def simulate_design_power(
     design: torch.Tensor | np.ndarray,
     run_lengths: list[int],
     tr: float,
     contrasts: dict[str, list[float] | np.ndarray],
-    amplitudes: list[float] | np.ndarray,
+    amplitudes: list[float] | np.ndarray | dict[str, list[float]],
     noise: list[dict[str, Any]],
     beta_pattern: list[float] | np.ndarray | None = None,
     n_reps: int = 500,
@@ -164,7 +292,8 @@ def simulate_design_power(
     run_lengths : timepoints per run; each run gets its own Legendre drift block
     tr : seconds
     contrasts : name -> weights over the conditions
-    amplitudes : peak percent signal change swept; 0 is always added (the null)
+    amplitudes : peak percent signal change swept, or {noise label: list} for a
+        grid per noise level; 0 is always added (the null)
     noise : noise conditions, each a dict of generate_thermal_physio_noise
         keywords (``tsnr`` plus ``phys_fraction``/``tau`` or ``arma``), optionally
         with a ``label``. ``TsnrBin.simulation_kwargs()`` returns exactly this.
@@ -191,55 +320,22 @@ def simulate_design_power(
         'alpha', 'poly_degree', 'dof' ({noise label: (naive, corrected)}),
         'n_reps'
     """
-    from fastfuncstuff.cli_utils import auto_polort
     from fastfuncstuff.utils import get_device
 
     if estimator not in {"ols", "reml"}:
         raise ValueError("estimator must be 'ols' or 'reml'")
     if device is None:
         device = get_device()
-    X_task = torch.as_tensor(design, dtype=torch.float64)
-    n_t, n_cond = X_task.shape
-    if sum(run_lengths) != n_t:
-        raise ValueError(f"run lengths sum to {sum(run_lengths)}, design has {n_t} rows")
-    X_true = X_task if true_design is None else torch.as_tensor(true_design, dtype=torch.float64)
-    if X_true.shape != X_task.shape:
-        raise ValueError(f"true_design {tuple(X_true.shape)} must match design {(n_t, n_cond)}")
-    pattern = torch.ones(n_cond, dtype=torch.float64)
-    if beta_pattern is not None:
-        pattern = torch.as_tensor(beta_pattern, dtype=torch.float64)
-    offset = torch.as_tensor(beta_offset, dtype=torch.float64).expand(n_cond).clone()
-    if poly_degree is None:
-        poly_degree = auto_polort(max(run_lengths) * tr)
-
-    X = torch.cat([X_task, _nuisance(run_lengths, poly_degree)], dim=1)
-    n_p = X.shape[1]
-    if torch.linalg.matrix_rank(X) < n_p:
-        raise ValueError("design + drift polynomials are rank-deficient; check the conditions")
-    XtX_inv = torch.linalg.inv(X.T @ X)
-    P = XtX_inv @ X.T  # (n_p, n_t)
-
-    names = list(contrasts)
-    C = torch.zeros(len(names), n_p, dtype=torch.float64)
-    for i, name in enumerate(names):
-        w = torch.as_tensor(np.asarray(contrasts[name], dtype=np.float64))
-        if w.numel() != n_cond:
-            raise ValueError(f"contrast {name!r} has {w.numel()} weights, design {n_cond}")
-        C[i, :n_cond] = w
-
-    amps = sorted({0.0, *(float(a) for a in amplitudes)})
-    # Expected contrast estimate: c P X_true beta, affine in the amplitude.
-    expected_unit = C @ P @ (X_true @ pattern)
-    expected_base = C @ P @ (X_true @ offset)
-    # What the fitted model cannot absorb of the true response stays in the
-    # residuals: E[RSS] = sigma^2 tr(MR) + ||M X_true beta||^2. Under a correct
-    # HRF M X_true = 0 and this vanishes; under a mismatch it inflates the
-    # variance estimate and shrinks every t -- which an unbiased-noise power
-    # formula misses (it promised 80% where Monte Carlo gave ~0 for A-B on a
-    # 4% shared response).
-    s_unit, s_base = X_true @ pattern, X_true @ offset
-    misfit_unit = s_unit - X @ (P @ s_unit)
-    misfit_base = s_base - X @ (P @ s_base)
+    glm = _glm_setup(
+        design, run_lengths, tr, contrasts, poly_degree, true_design, beta_pattern, beta_offset
+    )
+    X, X_true, P, C, names = glm["X"], glm["X_true"], glm["P"], glm["C"], glm["names"]
+    XtX_inv, pattern, offset = glm["XtX_inv"], glm["pattern"], glm["offset"]
+    poly_degree, n_cond = glm["poly_degree"], glm["n_cond"]
+    n_t, n_p = X.shape
+    expected_unit, expected_base = glm["exp_unit"], glm["exp_base"]
+    misfit_unit, misfit_base = glm["mis_unit"], glm["mis_base"]
+    per_label = isinstance(amplitudes, dict)
     P_dev = P.to(device=device, dtype=torch.float32)
     X_dev = X.to(device=device, dtype=torch.float32)
     CP_dev = (C @ P).to(device=device, dtype=torch.float32)  # contrast estimates directly
@@ -260,6 +356,8 @@ def simulate_design_power(
         label = str(cond.get("label", f"noise{k}"))
         kw = {key: v for key, v in cond.items() if key != "label"}
         sigma = baseline / float(kw["tsnr"])
+        sweep = amplitudes[label] if per_label else amplitudes  # type: ignore[index]
+        amps = sorted({0.0, *(float(x) for x in sweep)})
 
         # Everything below depends on the noise only through its ARMA (a, b)
         # and scales with sigma, so noise levels that share (a, b) -- every
@@ -280,19 +378,16 @@ def simulate_design_power(
         # run once the draw itself was cheap.
         a = torch.tensor(amps, dtype=torch.float64)[:, None]  # (A, 1)
         est = est_n[None] + (est_base + a * est_unit)[:, :, None]  # (A, K, reps)
-        mis2 = scale**2 * ((misfit_base[None] + a * misfit_unit[None]) ** 2).sum(dim=1)  # (A,)
+        exp_est, mis2, power_pred = _predicted(
+            a, sigma, scale, v_true, tr_MR, crit_corr, dof_corr, glm
+        )
         rss = rss_n[None] + 2.0 * (cross[0][None] + a * cross[1][None]) + mis2[:, None]
         t_naive = est / torch.sqrt(rss[:, None] / dof_naive * v_naive[None, :, None])
         t_corr = est / torch.sqrt(rss[:, None] / tr_MR * v_true[None, :, None])
         true_eff = (offset[None] + a * pattern[None]) @ C[:, :n_cond].T  # (A, K), PSC
-        # What the fit returns on average: c P X_true beta. It equals the true
-        # effect only when the fitted and generating regressors agree; with an
-        # HRF mismatch it is biased, and power must be computed from it.
-        exp_est = expected_base[None] + a * expected_unit[None]  # (A, K), PSC
+        # exp_est is what the fit returns on average, c P X_true beta: the true
+        # effect only when the fitted and generating regressors agree.
         sd_pred = sigma * torch.sqrt(v_true) / scale  # (K,), PSC
-        sigma2_hat = sigma**2 + mis2 / tr_MR  # E[RSS] / tr(MR), (A,)
-        se_hat = torch.sqrt(v_true)[None] * torch.sqrt(sigma2_hat)[:, None] / scale
-        nc = torch.where(se_hat > 0, exp_est / se_hat, torch.zeros_like(se_hat))
         cols = {
             "true_effect": true_eff,
             "mean_est": est.mean(dim=-1) / scale,
@@ -301,9 +396,7 @@ def simulate_design_power(
             "sd_predicted": sd_pred.expand_as(exp_est),
             "mean_t": t_corr.mean(dim=-1),
             "power": (t_corr.abs() > crit_corr).double().mean(dim=-1),
-            "power_predicted": torch.as_tensor(
-                _two_tailed_power(crit_corr, dof_corr, nc.numpy()), dtype=torch.float64
-            ),
+            "power_predicted": power_pred,
             "mean_t_naive": t_naive.mean(dim=-1),
             "power_naive": (t_naive.abs() > crit_naive).double().mean(dim=-1),
         }
@@ -378,16 +471,12 @@ def _unit_noise_fit(
     """
     P_dev, X_dev, CP_dev, mis_dev = dev_mats
     device = X_dev.device
-    n_t, n_p = X.shape
-    v_naive = torch.einsum("ip,pq,iq->i", C, P @ P.T, C)
+    n_t = X.shape[0]
     Z = torch.randn(n_t, n_reps, device=device, generator=gen, dtype=torch.float32)
+    v_true, tr_MR, dof = _noise_terms(ab, X, P, C, run_lengths)
     if ab is None:
-        v_true, tr_MR, dof = v_naive, float(n_t - n_p), float(n_t - n_p)
         y = Z
     else:
-        R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
-        PRPt, tr_MR, dof = _corrected_terms(X, P, R)
-        v_true = torch.einsum("ip,pq,iq->i", C, PRPt, C)
         y = torch.empty_like(Z)
         start = 0
         for n in run_lengths:
@@ -1787,11 +1876,84 @@ def hrf_robustness(
     return out
 
 
+@dataclass(frozen=True)
+class AutoSweep:
+    """Place the swept amplitudes from the analytic power curve, per noise level.
+
+    A fixed grid (0.1-3% in 15 steps) spent most of its points on the flat
+    top at high tSNR -- tSNR 100 saturated by 0.6%, leaving 12 of 16 cells at
+    power 1.0 -- and could stop short of the target at low tSNR. Instead the
+    analytic curve (median over realizations) is evaluated on a fine log grid
+    and ``n_points`` amplitudes are spaced evenly in *power travelled*, up to
+    where every contrast passes ``ceiling``: dense on the rise, none on the
+    plateau, and the range extends itself however hard the contrast is.
+    ``extra`` amplitudes (e.g. -effect) join every level's grid.
+    """
+
+    n_points: int = 12
+    ceiling: float = 0.99
+    extra: tuple[float, ...] = ()
+    low: float = 1e-3
+    high: float = 100.0
+
+
+def sweep_grid(fine: np.ndarray, power: np.ndarray, auto: AutoSweep) -> list[float]:
+    """``auto.n_points`` amplitudes along ``power`` (G, K) evaluated at ``fine`` (G,).
+
+    Spaced evenly in the summed absolute power change (the curve's arc length
+    in power), so a non-monotone curve -- a wrong-HRF shared response that dips
+    before it rises -- still gets points where it moves.
+    """
+    reached = np.nonzero(np.all(power >= auto.ceiling, axis=1))[0]
+    end = int(reached[0]) if reached.size else len(fine) - 1
+    step = np.abs(np.diff(power[: end + 1], axis=0)).max(axis=1) if end else np.zeros(0)
+    travelled = np.concatenate([[0.0], np.cumsum(step)])
+    if travelled[-1] <= 0:
+        return sorted({*auto.extra, float(fine[end])})
+    if not reached.size:
+        # A curve that plateaus below the ceiling (a mismatched HRF): stop
+        # where it has done ~all the moving it will do, not at the grid's edge.
+        end = int(np.searchsorted(travelled, auto.ceiling * travelled[-1]))
+        travelled = travelled[: end + 1]
+    # Half-step offsets put the first point on the toe (~4% of the climb at
+    # N=12) rather than a full step up it; the end point closes the curve.
+    levels = travelled[-1] * np.append(
+        (np.arange(auto.n_points - 1) + 0.5) / (auto.n_points - 1), 1.0
+    )
+    picked = np.interp(levels, travelled, fine[: end + 1])
+    return sorted({*(float(f"{v:.3g}") for v in picked), *auto.extra})
+
+
+def _auto_grids(
+    designs: list[tuple[torch.Tensor, torch.Tensor | None, list[int]]],
+    tr: float,
+    group: dict[str, Any],
+    noise: list[dict[str, Any]],
+    pattern: np.ndarray,
+    offset: np.ndarray,
+    poly_degree: int | None,
+    alpha: float,
+    auto: AutoSweep,
+) -> dict[str, list[float]]:
+    """One amplitude grid per noise level for a contrast group, from the median analytic curve."""
+    fine = np.geomspace(auto.low, auto.high, 400)
+    curves: dict[str, list[np.ndarray]] = {}
+    for X, X_true, lengths in designs:
+        pw = analytic_power(
+            X, lengths, tr, group, fine, noise, pattern, offset, poly_degree, alpha, X_true
+        )
+        for label, v in pw.items():
+            curves.setdefault(label, []).append(v)
+    return {
+        label: sweep_grid(fine, np.median(np.stack(v), axis=0), auto) for label, v in curves.items()
+    }
+
+
 def simulate_realizations_power(
     realizations: list[Any],
     tr: float,
     contrasts: dict[str, list[float] | np.ndarray],
-    amplitudes: list[float] | np.ndarray,
+    amplitudes: list[float] | np.ndarray | AutoSweep,
     noise: list[dict[str, Any]],
     beta_pattern: list[float] | np.ndarray | None = None,
     n_reps: int = 500,
@@ -1861,9 +2023,8 @@ def simulate_realizations_power(
     per_design = []
     jobs = [(i, real, t) for i, real in enumerate(realizations) for t in range(len(truths))]
     reml_cache = {} if reml_cache is None else reml_cache
-    for i, real, ti in tqdm(
-        jobs, desc="designs", leave=True, disable=not progress or len(jobs) < 2
-    ):
+
+    def matrices(real: Any, ti: int) -> tuple[torch.Tensor, torch.Tensor | None]:
         X = build_task_design(
             real.onsets, real.durations, tr, real.run_lengths, fit_bases, dt, device=cpu
         )
@@ -1871,22 +2032,38 @@ def simulate_realizations_power(
         X_true = None
         if true_delay or t_label != fit_label:
             X_true = build_task_design(
-                real.onsets,
-                real.durations,
-                tr,
-                real.run_lengths,
-                t_bases,
-                dt,
-                delay=true_delay,
-                device=cpu,
-            )
+                real.onsets, real.durations, tr, real.run_lengths, t_bases, dt,
+                delay=true_delay, device=cpu,
+            )  # fmt: skip
+        return X, X_true
+
+    built = [matrices(real, ti) for _, real, ti in jobs]
+    sweeps: list[Any] = [amplitudes] * len(groups)
+    if isinstance(amplitudes, AutoSweep):
+        designs = [
+            (X, Xt, list(real.run_lengths))
+            for (X, Xt), (_, real, _) in zip(built, jobs, strict=True)
+        ]
+        sweeps = [
+            _auto_grids(
+                designs, tr, group, noise, g_pattern, g_offset, poly_degree, alpha, amplitudes
+            )  # fmt: skip
+            for _, group, g_pattern, g_offset in groups
+        ]
+    for (i, real, ti), (X, X_true) in tqdm(
+        list(zip(jobs, built, strict=True)),
+        desc="designs",
+        leave=True,
+        disable=not progress or len(jobs) < 2,
+    ):
+        t_label = truths[ti][0]
         for g, (swept, group, g_pattern, g_offset) in enumerate(groups):
             res = simulate_design_power(
                 X,
                 list(real.run_lengths),
                 tr,
                 group,
-                amplitudes,
+                sweeps[g],
                 noise,
                 beta_pattern=g_pattern,
                 beta_offset=g_offset,

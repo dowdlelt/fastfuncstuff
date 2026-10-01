@@ -678,3 +678,43 @@ def test_hrf_robustness_ceiling_for_events_and_blocks_hold_up():
     assert np.all(np.isfinite(bl["needed"])) and min(bl["recovered"]) > 0.4
     # at the library shape nearest the fitted one, the cost is close to a right HRF
     assert min(ev["needed"]) == pytest.approx(ev["fitted"], rel=0.15)
+
+
+def test_sweep_grid_stops_at_the_plateau_and_reaches_past_a_fixed_edge():
+    from fastfuncstuff.simulation.power import AutoSweep, sweep_grid
+
+    fine = np.geomspace(1e-3, 100, 400)
+    auto = AutoSweep(n_points=10)
+    easy = 1 - np.exp(-((fine / 0.3) ** 3))  # saturated by ~0.6
+    hard = 1 - np.exp(-((fine / 8.0) ** 3))  # 80% near 9.3, past the old 3% edge
+    for curve, lo, hi in ((easy, 0.05, 0.6), (hard, 1.0, 16.0)):
+        grid = sweep_grid(fine, curve[:, None], auto)
+        assert len(grid) == 10 and lo < grid[-1] < hi
+        assert np.interp(grid[-1], fine, curve) >= 0.98
+        assert np.interp(grid[0], fine, curve) < 0.15  # a point on the toe
+    # A curve that plateaus below the ceiling stops where it stops moving.
+    capped = 0.6 * easy
+    assert sweep_grid(fine, capped[:, None], auto)[-1] < 1.0
+
+
+def test_auto_sweep_gives_each_noise_level_its_own_grid():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit, realize
+    from fastfuncstuff.simulation.power import AutoSweep, simulate_realizations_power
+
+    spec = ExperimentSpec(
+        tr=1.5, units=[Unit.parse("A", "A:1", 12)], isi=Interval.parse("exp:4,2,10"), post_fix=12
+    )
+    reals = [realize(spec, s) for s in range(2)]
+    noise = [{"label": "lo", "tsnr": 30.0}, {"label": "hi", "tsnr": 120.0}]
+    res = simulate_realizations_power(
+        reals, 1.5, {"A": [1]}, AutoSweep(8, extra=(1.0,)), noise, n_reps=200,
+        device=CPU, progress=False,
+    )  # fmt: skip
+    grid = {
+        n: sorted({r["amplitude"] for r in res["table"] if r["noise"] == n}) for n in ("lo", "hi")
+    }
+    assert 0.0 in grid["lo"] and 1.0 in grid["lo"] and 1.0 in grid["hi"]
+    assert grid["hi"][-1] < grid["lo"][-1]  # cleaner data saturates sooner
+    for n in grid:
+        top = [r for r in res["table"] if r["noise"] == n and r["amplitude"] == grid[n][-1]]
+        assert np.mean([r["power_predicted"] for r in top]) > 0.95
