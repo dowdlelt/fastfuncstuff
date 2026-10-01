@@ -161,3 +161,25 @@ def test_combined_objective_in_explore(tmp_path, capsys):
     assert "combined: detection x1 + shape x0.5" in out and "combined 0." in out
     header = (tmp_path / "c_explore.tsv").read_text().splitlines()[0].split("\t")
     assert "combined" in header
+
+
+def test_worker_pool_scores_exactly_like_the_serial_loop():
+    from fastfuncstuff.simulation.experiment import ExperimentSpec, Interval, Unit
+    from fastfuncstuff.simulation.explore import score_configs
+    from fastfuncstuff.simulation.power import RealizationScorer
+
+    specs = [
+        ExperimentSpec(
+            tr=1.5, units=[Unit.parse("A", "A:1", n)], isi=Interval.parse(f"exp:{m},2,10"),
+            post_fix=12,
+        )
+        for n, m in ((10, 4), (12, 5), (14, 3), (9, 6))
+    ]  # fmt: skip
+    noise = [{"label": "t50", "tsnr": 50.0}]
+    scorer = RealizationScorer(1.5, {"A": [1]}, noise)
+    serial = score_configs(specs, scorer, 2, "t50", progress=False)
+    pooled = score_configs(specs, scorer, 2, "t50", progress=False, jobs=2)
+    # Workers run single-threaded BLAS: the same numbers up to reduction order.
+    for a, b in zip(pooled, serial, strict=True):
+        assert a["needed"] == pytest.approx(b["needed"], rel=1e-6)
+        assert a["shape_sd"] == pytest.approx(b["shape_sd"], rel=1e-6)

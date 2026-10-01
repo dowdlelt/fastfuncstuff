@@ -776,6 +776,33 @@ def _nc_for_power(target: float, crit: float, dof: float) -> float:
     )
 
 
+_NC_U_MAX = 0.5  # 1/dof: the table covers dof >= 2
+
+
+@lru_cache(maxsize=16)
+def _nc_table(target: float, alpha: float) -> Any:
+    """Noncentrality for ``target`` power at two-tailed ``alpha``, as a function of 1/dof.
+
+    Smooth in u = 1/dof, so 64 Chebyshev nodes interpolate it to ~1e-10. A
+    brentq per realization (~12 noncentral-t evaluations) was 2 ms of every
+    design a -explore scored.
+    """
+    from scipy.interpolate import BarycentricInterpolator
+
+    k = np.arange(64)
+    u = 0.5 * _NC_U_MAX * (1 - np.cos(np.pi * k / 63))  # Chebyshev-Lobatto on [0, max]
+    dof = 1.0 / np.maximum(u, 1e-9)
+    nc = [_nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, d)), float(d)) for d in dof]
+    return BarycentricInterpolator(u, nc)
+
+
+def _nc_needed(target: float, alpha: float, dof: float) -> float:
+    """:func:`_nc_for_power` at the two-tailed ``alpha`` critical value, tabulated in 1/dof."""
+    if dof < 1.0 / _NC_U_MAX:
+        return _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
+    return float(_nc_table(float(target), float(alpha))(1.0 / dof))
+
+
 def design_quality(
     design: torch.Tensor | np.ndarray,
     run_lengths: list[int],
@@ -867,11 +894,10 @@ def _contrast_needed(
     the engine's ARMA-corrected t, so under a correct HRF it is what the
     simulation finds. One value per row of W, per noise label.
     """
-    n_t, n_p = X.shape
+    n_p = X.shape[1]
     P = torch.linalg.inv(X.T @ X) @ X.T
     C = torch.zeros(W.shape[0], n_p, dtype=torch.float64)
     C[:, : W.shape[1]] = torch.as_tensor(W, dtype=torch.float64)
-    CP = C @ P
     out: dict[str, np.ndarray] = {}
     terms: dict[tuple[float, float] | None, tuple[torch.Tensor, float]] = {}  # var, nc
     for k, cond in enumerate(noise):
@@ -879,13 +905,8 @@ def _contrast_needed(
         kw = {key: v for key, v in cond.items() if key != "label"}
         ab = _noise_arma(kw, tr)
         if ab not in terms:  # every -tsnr level shares (a, b)
-            if ab is None:
-                var, dof = (CP * CP).sum(dim=1), float(n_t - n_p)
-            else:
-                R = _block_correlation(tuple(int(n) for n in run_lengths), *ab, False)
-                PRPt, _, dof = _corrected_terms(X, P, R)
-                var = ((C @ PRPt) * C).sum(dim=1)
-            terms[ab] = (var, _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof))
+            var, _, dof = _noise_terms(ab, X, P, C, run_lengths)
+            terms[ab] = (var, _nc_needed(target, alpha, dof))
         var, nc = terms[ab]
         sd = 100.0 / float(kw["tsnr"])  # noise SD in PSC
         out[label] = nc * sd * np.sqrt(var.numpy())

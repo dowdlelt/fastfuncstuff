@@ -208,6 +208,20 @@ def shortlist(x: np.ndarray, front: np.ndarray, k: int) -> list[int]:
     return [idx[int(round(j))] for j in np.linspace(0, len(idx) - 1, k)]
 
 
+def _worker_init(n_threads: int) -> None:
+    import torch
+
+    torch.set_num_threads(n_threads)
+
+
+def _score_chunk(args: tuple) -> list[dict[str, Any]]:
+    specs, scorer, n_real, ref, seed, single_all, steps_all = args
+    return score_configs(
+        specs, scorer, n_real, ref, seed, progress=False, single_all=single_all,
+        steps_all=steps_all, jobs=1,
+    )  # fmt: skip
+
+
 def score_configs(
     specs: list[Any],
     scorer: Any,
@@ -217,6 +231,7 @@ def score_configs(
     progress: bool = True,
     single_all: bool = False,
     steps_all: bool = False,
+    jobs: int = 1,
 ) -> list[dict[str, Any]]:
     """Median scores over ``n_realizations`` for each spec (None: the config was refused).
 
@@ -229,6 +244,38 @@ def score_configs(
     from tqdm import tqdm
 
     from .experiment import realize
+
+    if jobs > 1 and len(specs) >= 2 * jobs:
+        # Configs are independent and each is ~10 ms of small CPU work, so
+        # processes (not the GPU, not BLAS threads) are what scale. Chunks
+        # keep the order; several per worker keep the progress bar moving.
+        import multiprocessing as mp
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+
+        bounds = np.linspace(0, len(specs), 4 * jobs + 1).astype(int)
+        chunks = [
+            (specs[a:b], scorer, n_realizations, ref_noise, seed, single_all, steps_all)
+            for a, b in zip(bounds[:-1], bounds[1:], strict=True)
+            if b > a
+        ]  # fmt: skip
+        threads = max(1, (os.cpu_count() or 1) // jobs)
+        with ProcessPoolExecutor(
+            max_workers=jobs,
+            mp_context=mp.get_context("spawn"),
+            initializer=_worker_init,
+            initargs=(threads,),
+        ) as pool:
+            parts = list(
+                tqdm(
+                    pool.map(_score_chunk, chunks),
+                    total=len(chunks),
+                    desc=f"designs ({jobs} workers)",
+                    leave=True,
+                    disable=not progress,
+                )
+            )
+        return [sc for part in parts for sc in part]
 
     out: list[dict[str, Any]] = []
     for spec in tqdm(specs, desc="designs", leave=True, disable=not progress or len(specs) < 2):

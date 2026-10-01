@@ -718,3 +718,14 @@ def test_auto_sweep_gives_each_noise_level_its_own_grid():
     for n in grid:
         top = [r for r in res["table"] if r["noise"] == n and r["amplitude"] == grid[n][-1]]
         assert np.mean([r["power_predicted"] for r in top]) > 0.95
+
+
+def test_tabulated_noncentrality_matches_the_root_finder():
+    from scipy import stats
+
+    from fastfuncstuff.simulation.power import _nc_for_power, _nc_needed
+
+    for alpha, target in ((0.001, 0.8), (0.05, 0.95)):
+        for dof in (1.5, 2.0, 7.3, 150.4, 1e5):
+            ref = _nc_for_power(target, float(stats.t.ppf(1 - alpha / 2, dof)), dof)
+            assert _nc_needed(target, alpha, dof) == pytest.approx(ref, rel=1e-7)

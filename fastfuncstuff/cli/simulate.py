@@ -471,6 +471,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     x.add_argument("-explore_keep", type=int, default=5, help="Shortlisted designs (5).")
     x.add_argument(
+        "-jobs",
+        type=int,
+        help="Worker processes scoring -explore designs (default: CPU count - 1; 1 = serial).",
+    )
+    x.add_argument(
         "-explore_pick",
         type=int,
         default=50,
@@ -1374,7 +1379,7 @@ def _sweep_lines(sweep, conds, contrasts, reals, tr, target: float = 0.8) -> lis
 
 EXPLORE_ONLY = (
     "explore", "objective", "explore_designs", "explore_keep", "explore_pick",
-    "optimize", "optimize_pop", "optimize_hrfs", "max_repeat",
+    "optimize", "optimize_pop", "optimize_hrfs", "max_repeat", "jobs",
 )  # fmt: skip
 TIMING_FLAGS = (
     "trial", "block", "miniblock", "null", "isi", "within_isi", "initial_fix", "post_fix",
@@ -1626,6 +1631,12 @@ def _strip_flags(argv: list[str], parser, drop: tuple[str, ...]) -> list[str]:
     return out
 
 
+def _explore_jobs(jobs: int | None) -> int:
+    import os
+
+    return max(1, (os.cpu_count() or 2) - 1) if jobs is None else max(1, jobs)
+
+
 def _run_explore(raw: list[str], started: float) -> int:
     """-explore: score N designs drawn from the placeholders, shortlist the Pareto front."""
     import shlex
@@ -1707,6 +1718,7 @@ def _run_explore(raw: list[str], started: float) -> int:
         args.seed,
         single_all="trials" in goals,
         steps_all="shape_diff" in goals,
+        jobs=_explore_jobs(args.jobs),
     )
     live = [c for c, w in contrasts.items() if has_true_effect(w, pattern)]
     det_c = next((g for g in goals if g in contrasts or g == "detection"), live[0])
