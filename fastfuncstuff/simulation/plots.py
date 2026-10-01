@@ -148,14 +148,26 @@ def plot_power(
             # Plotted against the contrast's true effect, as every table reports
             # it -- the sweep differs from it under -pattern.
             amps = [abs(by[a][0]["true_effect"]) for a in sweep]
-            pred = [
-                [r["power_validated" if reml else "power_predicted"] for r in by[a]] for a in sweep
-            ]
-            med = [float(np.median(p)) for p in pred]
+            # REML withholds (NaN) a realization whose nulls show inflation; a
+            # plain median then blanked the whole line, and min/max over NaN
+            # drew an arbitrary band.
+            pred = np.array(
+                [
+                    [r["power_validated" if reml else "power_predicted"] for r in by[a]]
+                    for a in sweep
+                ]
+            )
+            ok = np.isfinite(pred).any(axis=1)
+            if not ok.any():
+                ax.plot([], [], color=col, linewidth=2, label=label)
+                continue
+            pred, amps = pred[ok], [x for x, keep in zip(amps, ok, strict=True) if keep]
+            sweep = [a for a, keep in zip(sweep, ok, strict=True) if keep]
+            med = np.nanmedian(pred, axis=1)
             ax.fill_between(
                 amps,
-                [min(p) for p in pred],
-                [max(p) for p in pred],
+                np.nanmin(pred, axis=1),
+                np.nanmax(pred, axis=1),
                 color=col,
                 alpha=0.18,
                 linewidth=0,
@@ -170,10 +182,10 @@ def plot_power(
                 markeredgecolor=SURFACE,
                 markeredgewidth=1,
             )
-            if len(noise_labels) <= 4 and np.isfinite(med).any():
+            if len(noise_labels) <= 4:
                 # At the 50% crossing: saturated curves all end at 1.0, where
                 # right-edge labels land on top of each other.
-                k = int(np.nanargmin(np.abs(np.asarray(med) - 0.5)))
+                k = int(np.argmin(np.abs(med - 0.5)))
                 ax.annotate(
                     label.split(" (")[0],
                     (amps[k], med[k]),

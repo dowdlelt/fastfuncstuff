@@ -634,10 +634,16 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
     minutes = float(np.mean([sum(r.run_lengths) for r in reals])) * args.tr / 60
     out = []
     need = effect_needed(res, args.target)
+    # nanmedian, as the answer table does: a realization is nan when it never
+    # reaches the target OR when REML withheld it for null inflation, and
+    # requiring all-finite turned 3 withheld of 20 into "unavailable".
     det = {
-        c: float(np.median(need[(ref, c)])) if np.isfinite(need[(ref, c)]).all() else float("inf")
+        c: float(np.nanmedian(need[(ref, c)]))
+        if np.isfinite(need[(ref, c)]).any()
+        else float("inf")
         for c in live
     }
+    partial = {c for c in live if np.isnan(need[(ref, c)]).any()}
     if live and not det:  # say so, rather than leave the measure out
         top = max(abs(x["true_effect"]) for x in res["table"])
         out.append(("detection", f"> {top:g}% for every contrast: {args.target:.0%} power not "
@@ -648,10 +654,14 @@ def _scorecard(res, reals, conds, contrasts, pattern, args, quality, steps, robu
             (
                 "detection",
                 ", ".join(
-                    f"{c} {v:.2f}%" if np.isfinite(v) else f"{c} unavailable"
+                    f"{c} {v:.2f}%{'*' if c in partial else ''}"
+                    if np.isfinite(v)
+                    else f"{c} unavailable"
                     for c, v in det.items()
                 )
-                + f"  (% signal for {args.target:.0%} power)",
+                + f"  (% signal for {args.target:.0%} power"
+                + ("; * median of the realizations that got there" if partial else "")
+                + ")",
                 float(np.mean(list(det.values()))),
             )
         )
@@ -875,7 +885,16 @@ def _reml_calibration_notes(res) -> list[str]:
     limited = any(r["calibration"] == "limited" for r in rows)
     status = "no detected inflation"
     if inflated:
-        status = "inflation in " + ", ".join(inflated) + "; timing verdict withheld"
+        n_real = len({r["design"] for r in rows})
+        status = (
+            "inflation in "
+            + ", ".join(
+                f"{c} ({len({r['design'] for r in rows if r['contrast'] == c and r['calibration'] == 'inflated'})}"
+                f" of {n_real} realizations)"
+                for c in inflated
+            )
+            + "; those realizations withheld"
+        )
     elif limited:
         status = "too few null replicates; timing verdict withheld (increase -null_reps)"
     notes = [

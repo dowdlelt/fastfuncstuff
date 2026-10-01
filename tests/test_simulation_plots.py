@@ -226,3 +226,26 @@ def test_design_matrix_figure(tmp_path):
     fig = plot_design_matrix(task, ["A", "B"], [30, 30], 2, 1.0, path=tmp_path / "m.png")
     assert (tmp_path / "m.png").stat().st_size > 10_000
     del fig
+
+
+def test_power_line_survives_withheld_reml_realizations():
+    # REML sets power_validated to nan for a realization whose nulls show
+    # inflation; 3 such of 20 used to blank every point of the median line.
+    amps = [0.0, 0.5, 1.0, 2.0]
+    rows = [
+        {
+            "design": d,
+            "noise": "tSNR 60",
+            "contrast": "A",
+            "amplitude": a,
+            "true_effect": a,
+            "estimator": "reml",
+            "power": min(1.0, a),
+            "power_validated": float("nan") if d < 3 else min(1.0, a),
+        }
+        for d in range(20)
+        for a in amps
+    ]
+    fig = plot_power({"table": rows}, ["tSNR 60"], {"A": [1]}, [1])
+    line = next(ln for ln in fig.axes[0].get_lines() if ln.get_label() == "tSNR 60")
+    np.testing.assert_allclose(line.get_ydata(), [0.0, 0.5, 1.0, 1.0])
