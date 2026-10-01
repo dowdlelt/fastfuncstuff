@@ -552,3 +552,15 @@ def test_scorecard_gives_one_value_per_measure(tmp_path, capsys):
         assert measure in block, measure  # fmt: skip
     card = json.loads((tmp_path / "s_spec.json").read_text())["scorecard"]
     assert card["detection, % (mean)"] > 0 and 0 <= card["HRFs detectable, frac"] <= 1
+
+
+def test_shuffle_items_names_miniblocks():
+    from fastfuncstuff.cli.simulate import _build_parser, _spec_from_args
+
+    argv = ["-tr", "1", "-miniblock", "M", "A:1 B:1", "2", "-miniblock", "N", "C:1 D:1", "2",
+            "-shuffle_items", "M", "-prefix", "x"]  # fmt: skip
+    spec = _spec_from_args(_build_parser().parse_args(argv))
+    assert [u.shuffle for u in spec.units] == [True, False]
+    assert "items shuffled each time" in spec.describe()
+    with pytest.raises(ValueError, match="not a -miniblock"):
+        _spec_from_args(_build_parser().parse_args([*argv[:-3], "Q", "-prefix", "x"]))

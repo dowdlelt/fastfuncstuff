@@ -28,18 +28,19 @@ def test_mutations_keep_the_recipe_exact():
     spec = _spec()
     _, plans = draw_plans(spec, 0)
     before = [
-        (Counter(u for u, _ in p.entries), sorted(g[-1] for _, g in p.entries)) for p in plans
+        (Counter(u for u, _, _ in p.entries), sorted(g[-1] for _, g, _ in p.entries)) for p in plans
     ]
     rng = np.random.default_rng(0)
     mutated = copy.deepcopy(plans)
     for _ in range(200):
         mutate(spec, mutated, rng)
     after = [
-        (Counter(u for u, _ in p.entries), sorted(g[-1] for _, g in p.entries)) for p in mutated
+        (Counter(u for u, _, _ in p.entries), sorted(g[-1] for _, g, _ in p.entries))
+        for p in mutated
     ]
     assert before == after  # same units per run, same multiset of gaps
-    assert [[u for u, _ in p.entries] for p in plans] != [
-        [u for u, _ in p.entries] for p in mutated
+    assert [[u for u, _, _ in p.entries] for p in plans] != [
+        [u for u, _, _ in p.entries] for p in mutated
     ]
 
 
@@ -116,3 +117,21 @@ def test_combined_goals_are_scaled_to_a_typical_design():
     draws = [realize(spec, s) for s in range(9)]
     fit = make_fitness(*args, reference=draws)
     assert np.median([fit(r) for r in draws]) == pytest.approx(1.0, abs=0.15)
+
+
+def test_mutations_reorder_a_shuffled_units_items_and_keep_them():
+    from collections import Counter
+
+    u = Unit.parse("M", "A:1:2 B:1:2 C:1:2 D:1:9", 3, "block")
+    u.shuffle = True
+    spec = ExperimentSpec(tr=1.0, units=[u], post_fix=15)
+    _, plans = draw_plans(spec, 0)
+    before = [list(s) for _, _, s in plans[0].entries]
+    rng = np.random.default_rng(0)
+    mutated = copy.deepcopy(plans)
+    for _ in range(30):
+        mutate(spec, mutated, rng)
+    after = [list(s) for _, _, s in mutated[0].entries]
+    assert after != before
+    assert all(sorted(s) == [0, 1, 2, 3] for s in after)  # a reorder, never a loss
+    assert Counter(g[-1] for _, g, _ in mutated[0].entries)[9.0] == 3  # gaps by position

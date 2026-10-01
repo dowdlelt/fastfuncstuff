@@ -366,7 +366,7 @@ def test_a_named_list_is_one_pool_across_units_and_shifts_keep_their_draw():
         for plan in plans:
             # 6 draws over 3 values: 2 each per run, counted before the -3 shift --
             # per item it would be 2 draws over 3 values, never balanced
-            drawn = Counter(g[0] + 3 * (ui == 2) for ui, g in plan.entries)
+            drawn = Counter(g[0] + 3 * (ui == 2) for ui, g, _ in plan.entries)
             assert drawn == {4.0: 2, 9.0: 2, 11.0: 2}
     # the pool fixes the content length, so nothing is dropped from a fixed scan
     spec.scan_time = 330
@@ -393,3 +393,42 @@ def test_pool_leftovers_rotate_across_runs():
     for r in runs:  # each run balanced: 3/3/3 and one extra
         assert sorted(r) == [3, 3, 4]
     assert sum(runs).tolist() == [10, 10, 10]  # and so is the experiment
+
+
+def test_shuffled_items_move_but_gaps_stay_with_their_positions():
+    from collections import Counter
+
+    from fastfuncstuff.simulation.experiment import draw_plans
+
+    lists = {"J": (3.0, 5.0, 7.0)}
+    items = " ".join(f"T{i}:{i}:Jx2" for i in range(1, 4)) + " isi:0 T4:4:J T4:4:10"
+    u = Unit.parse("cond", items, 1, "block", lists)
+    u.shuffle = True
+    spec = ExperimentSpec(tr=1.0, units=[u, Unit.parse("B", "B:1", 2)], n_runs=3, post_fix=15)
+    orders = set()
+    for seed in range(4):
+        _, plans = draw_plans(spec, seed)
+        for plan in plans:
+            for ui, gaps, shown in plan.entries:
+                if ui != 0:
+                    continue
+                labels = [u.items[i].condition for i in shown]
+                assert Counter(labels) == {"T1": 2, "T2": 2, "T3": 2, "T4": 2, "null": 1}
+                assert labels[6] == "null"  # the gap item stays where it was written
+                assert gaps[-1] == 10  # the block's own trailing gap, whoever is last
+                orders.add(tuple(shown))
+    assert len(orders) > 5
+    real = realize(spec, 0)
+    # durations travel with their condition, whatever slot it lands in
+    assert real.durations[real.conditions.index("T3")] == 3
+
+
+def test_unshuffled_plans_are_unchanged_by_the_item_order_field():
+    spec = ExperimentSpec(
+        tr=1.0, units=[Unit.parse("M", "A:1:2 B:2:uniform:2,4", 4, "block")],
+        isi=Interval.parse("exp:4,2,10"), n_runs=2, post_fix=15,
+    )  # fmt: skip
+    from fastfuncstuff.simulation.experiment import draw_plans
+
+    for _, _, shown in draw_plans(spec, 0)[1][0].entries:
+        assert shown == [0, 1]

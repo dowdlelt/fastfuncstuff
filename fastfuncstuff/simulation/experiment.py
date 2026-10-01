@@ -234,6 +234,11 @@ def _split_items(text: str) -> list[str]:
 class Unit:
     """A trial, block or miniblock: items shown in order, ``count`` times per run.
 
+    ``shuffle`` (-shuffle_items) draws a new order of its items every time
+    the unit occurs: the conditions, with their durations, move; each gap
+    belongs to its position, so the last written item's OFF is always the gap
+    after the unit. Gap items (``isi:``) stay where they are written.
+
     ``family`` says which total governs it: ``"event"`` units (trials and null
     trials) are scaled by ``num_events``, ``"block"`` units (blocks and
     miniblocks) by ``num_blocks``. When a total or ``scan_time`` decides the
@@ -244,6 +249,7 @@ class Unit:
     items: list[Item]
     count: float  # whole for trials and blocks; a null unit's may be a fractional weight
     family: Literal["event", "block"] = "event"
+    shuffle: bool = False  # items in a fresh order each time; gaps stay by position
 
     @property
     def is_null(self) -> bool:
@@ -524,7 +530,10 @@ class ExperimentSpec:
                 f"{it.condition}:{it.duration:g}" + (f":{it.off}" if it.off else "")
                 for it in u.items
             )
-            lines.append(f"  {u.family:<5} {u.name:<10} x{c:<4} [{items}]")
+            lines.append(
+                f"  {u.family:<5} {u.name:<10} x{c:<4} [{items}]"
+                + ("  items shuffled each time" if u.shuffle else "")
+            )
         for fam, flag in (("event", "-num_events"), ("block", "-num_blocks")):
             idx = [i for i, u in enumerate(self.units) if u.family == fam and not u.is_null]
             got = {counts[i] for i in idx}
@@ -568,10 +577,12 @@ class RunPlan:
 
     Every entry carries its full gap list, the last unit's trailing gap
     included (it is replaced by -post_fix when assembled), so reordering keeps
-    each unit's gaps with it -- which is what a design search mutates.
+    each unit's gaps with it -- which is what a design search mutates -- and
+    the order its items are shown in (``range(n_items)`` unless the unit is
+    shuffled; the gaps are by position, not by item).
     """
 
-    entries: list[tuple[int, list[float]]]  # (unit index, gap after each item)
+    entries: list[tuple[int, list[float], list[int]]]  # (unit, gap after each slot, items)
 
 
 def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan]]:
@@ -640,12 +651,27 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
         plans.append(
             RunPlan(
                 [
-                    (ui, [gap.get((k, j), 0.0) for j in range(len(spec.units[ui].items))])
+                    (
+                        ui,
+                        [gap.get((k, j), 0.0) for j in range(len(spec.units[ui].items))],
+                        item_order(spec.units[ui], rng),
+                    )
                     for k, ui in enumerate(order)
                 ]
             )
         )
     return counts, plans
+
+
+def item_order(unit: Unit, rng: np.random.Generator) -> list[int]:
+    """The order a unit's items are shown in: as written, or (``shuffle``) the
+    non-gap items permuted among their own positions."""
+    order = list(range(len(unit.items)))
+    if unit.shuffle:
+        movable = [j for j, it in enumerate(unit.items) if it.condition != NULL]
+        for j, src in zip(movable, rng.permutation(movable), strict=True):
+            order[j] = int(src)
+    return order
 
 
 def _deal(n_values: int, n: int, deck: list[int], rng: np.random.Generator) -> np.ndarray:
@@ -690,9 +716,9 @@ def assemble(
         # mean-matched (uniform) eat the final fixation -- 3.5 s of a 15 s one.
         limit = None if run_s is None else run_s - spec.post_fix
         t = _lock(spec.initial_fix, spec.initial_fix, spec) if spec.tr_lock else spec.initial_fix
-        for k, (ui, gaps) in enumerate(plan.entries):
+        for k, (ui, gaps, shown) in enumerate(plan.entries):
             unit_events = []
-            items = spec.units[ui].items
+            items = [spec.units[ui].items[i] for i in shown]
             for j, item in enumerate(items):
                 if item.condition != NULL:
                     unit_events.append((item.condition, t, item.duration))

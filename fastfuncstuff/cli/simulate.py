@@ -33,6 +33,16 @@ run, leftovers rotating across runs; uniform:SP draws each gap from them; SP-3
 draws from the list, then subtracts 3. A condition named in several units
 (R1 above) is one condition -- one regressor, one design column.
 
+Trial types grouped under a condition, shuffled within each block:
+    -isi_list JA "(3,4,5,6,7)" -isi_list JB "(3,4,5,6,7)"
+    -miniblock condA "$(printf 'A%d:1:JAx2 ' {1..15}) A16:1:JA A16:1:10" 1
+    -miniblock condB "$(printf 'B%d:1:JBx2 ' {1..15}) B16:1:JB B16:1:10" 1
+    -shuffle_items all
+is 16 trial types twice each, in a new order every block, 3-7 s apart, 10 s
+before the other condition's block. Gaps belong to positions, so the last
+written OFF (10) always follows the block. (printf is the shell's, writing
+out the 32 items.)
+
 An item's OFF is the gap after it, and takes any SPEC, so every position can
 have its own (jittered) gap:
     -miniblock ABC "A:0.5:0, B:2:2, C:3:uniform:2,4" 10
@@ -257,6 +267,15 @@ def _build_parser() -> argparse.ArgumentParser:
         '"isi:uniform:2,8 A:0.5:0 B:2:even:(2,4,6)" (repeatable). isi:SPEC is a gap with no '
         "event, anywhere in the unit (before the first item too). The last item's OFF is the "
         "gap to the next unit.",
+    )
+    t.add_argument(
+        "-shuffle_items",
+        nargs="+",
+        metavar="NAME",
+        help="Miniblocks (or 'all') whose items come in a new random order every time the "
+        "miniblock occurs -- trial types grouped under a condition. Gaps belong to positions: "
+        "the last written item's OFF is always the gap after the miniblock, whichever trial "
+        "lands last. isi: gap items stay in place.",
     )
     t.add_argument(
         "-block",
@@ -680,6 +699,15 @@ def _spec_from_args(args):
     units += [
         Unit.parse(nm, items, int(c), "block", lists) for nm, items, c in (args.miniblock or [])
     ]
+    shuffle = set(args.shuffle_items or [])
+    names = {nm for nm, _, _ in args.miniblock or []}
+    if shuffle - names - {"all"}:
+        raise ValueError(
+            f"-shuffle_items {' '.join(sorted(shuffle - names - {'all'}))}: not a -miniblock "
+            f"({', '.join(sorted(names)) or 'none given'})"
+        )
+    for u in units:
+        u.shuffle = u.name in names and ("all" in shuffle or u.name in shuffle)
     # A -null COUNT that is a fraction ("20%", "0.2") is that share of all units:
     # weight p / (1 - p) against the rest, so it survives -num_events/-scan_time
     # scaling. A whole number is a count.
@@ -1547,7 +1575,8 @@ EXPLORE_ONLY = (
     "optimize", "optimize_pop", "optimize_hrfs", "max_repeat", "jobs", "explore_refine",
 )  # fmt: skip
 TIMING_FLAGS = (
-    "trial", "block", "miniblock", "null", "isi_list", "isi", "within_isi", "initial_fix",
+    "trial", "block", "miniblock", "shuffle_items", "null", "isi_list", "isi", "within_isi",
+    "initial_fix",
     "post_fix",
     "order", "nruns", "scan_time", "num_events", "num_blocks", "ndesigns", "scan_times",
     "events", "labels", "durations", "nt",

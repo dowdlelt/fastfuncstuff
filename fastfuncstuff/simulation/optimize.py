@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from .experiment import ExperimentSpec, Realization, RunPlan, assemble, draw_plans
+from .experiment import NULL, ExperimentSpec, Realization, RunPlan, assemble, draw_plans
 
 
 def _trailing_key(spec: ExperimentSpec, ui: int) -> Any:
@@ -48,25 +48,37 @@ def longest_repeat(plan: RunPlan) -> int:
 
 
 def mutate(spec: ExperimentSpec, plans: list[RunPlan], rng: np.random.Generator) -> None:
-    """One recipe-preserving change, in place: swap two units, or two same-kind trailing gaps."""
+    """One recipe-preserving change, in place: swap two units, two same-kind trailing
+    gaps, or (in a shuffled unit) two of its items."""
     run = plans[int(rng.integers(len(plans)))]
     n = len(run.entries)
+    shuffled = [k for k, (ui, _, _) in enumerate(run.entries) if spec.units[ui].shuffle]
+    if shuffled and (n < 2 or rng.random() < 0.3):
+        k = int(rng.choice(shuffled))
+        ui, gaps, shown = run.entries[k]
+        movable = [j for j, i in enumerate(shown) if spec.units[ui].items[i].condition != NULL]
+        if len(movable) >= 2:
+            a, b = rng.choice(movable, 2, replace=False)
+            shown = list(shown)
+            shown[a], shown[b] = shown[b], shown[a]
+            run.entries[k] = (ui, gaps, shown)
+        return
     if n < 2:
         return
     if rng.random() < 0.6:
         a, b = rng.choice(n, 2, replace=False)
         run.entries[a], run.entries[b] = run.entries[b], run.entries[a]
         return
-    keys = [_trailing_key(spec, ui) for ui, _ in run.entries]
+    keys = [_trailing_key(spec, ui) for ui, _, _ in run.entries]
     a = int(rng.integers(n))
     same = [k for k in range(n) if k != a and keys[k] == keys[a]]
     if not same:
         return
     b = int(rng.choice(same))
-    (ua, ga), (ub, gb) = run.entries[a], run.entries[b]
+    (ua, ga, oa), (ub, gb, ob) = run.entries[a], run.entries[b]
     ga, gb = list(ga), list(gb)
     ga[-1], gb[-1] = gb[-1], ga[-1]
-    run.entries[a], run.entries[b] = (ua, ga), (ub, gb)
+    run.entries[a], run.entries[b] = (ua, ga, oa), (ub, gb, ob)
 
 
 def evolve(
