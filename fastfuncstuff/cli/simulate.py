@@ -19,7 +19,10 @@ or a described experiment, realized -ndesigns times with fresh jitter/order:
     -within_isi SPEC              default gap between items inside a miniblock
     -initial_fix S / -post_fix S  fixation before the first / after the last
 SPEC is a fixed number of seconds, uniform:LO,HI, exp:MEAN,MIN,MAX or
-poisson:MEAN,MIN,MAX. A block is a -trial with a long duration.
+poisson:MEAN,MIN,MAX -- or from a list: uniform:(2,5,9) draws each gap from
+the values, even:(2,5,9) uses them equally often within a run (8 gaps over 4
+values: 2 each; a remainder is drawn without replacement), shuffled. A block
+is a -trial with a long duration.
 
 An item's OFF is the gap after it, and takes any SPEC, so every position can
 have its own (jittered) gap:
@@ -27,8 +30,10 @@ have its own (jittered) gap:
 is A 0.5 s, straight into B 2 s, 2 s off, C 3 s, then 2-4 s to the next
 miniblock: the LAST item's OFF is the gap to the next unit and overrides -isi.
 Items without an OFF use -within_isi (inside) and -isi (after the unit).
-"A:1:0.5x10" repeats an item. "null" is time without an event; uniform, exp
-and poisson cannot be condition names.
+"A:1:0.5x10" repeats an item. Items may be separated by spaces or commas.
+isi:SPEC is a gap on its own -- "isi:uniform:2,8 A:0.5 B:2" waits 2-8 s before
+A. "null" is time without an event; uniform, even, exp, poisson and isi cannot
+be condition names.
 
 HOW MANY -- each family (events: -trial/-null; blocks: -block/-miniblock) is
 fixed by exactly one thing:
@@ -229,8 +234,10 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=3,
         action="append",
         metavar=("NAME", "ITEMS", "COUNT"),
-        help='Items in order, each LABEL:DUR[:OFF][xN], e.g. "A:0.5:0, B:2:uniform:2,4" '
-        "(repeatable). The last item's OFF is the gap to the next unit.",
+        help="Items in order, each LABEL:DUR[:OFF][xN], separated by spaces or commas, e.g. "
+        '"isi:uniform:2,8 A:0.5:0 B:2:even:(2,4,6)" (repeatable). isi:SPEC is a gap with no '
+        "event, anywhere in the unit (before the first item too). The last item's OFF is the "
+        "gap to the next unit.",
     )
     t.add_argument(
         "-block",
@@ -1024,7 +1031,8 @@ def _summarise(
         out.append(
             f"note: {dropped} event(s) over {len(reals)} realization(s) did not end -post_fix "
             "before the end of the scan and were dropped, whole units at a time -- jitter "
-            "that is not mean-matched (uniform) makes some runs longer than the average"
+            "that is not mean-matched (uniform, or drawn from a list) makes some runs longer than "
+            "the average"
         )
     out.append("events per condition: " + ", ".join(f"{c} {np.mean(v):g}" for c, v in n_ev.items()))
     out += ["", *_quality_lines(quality, reals[0].conditions, conds, args.target)]

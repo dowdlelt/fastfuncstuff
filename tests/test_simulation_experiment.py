@@ -311,3 +311,36 @@ def test_tr_lock_puts_every_onset_on_the_grid_and_keeps_the_mean_gap():
         mutate(spec(True), plans, np.random.default_rng(0))
     g = onsets(assemble(spec(True), counts, plans)) / 1.5
     assert np.allclose(g, np.round(g))
+
+
+def test_list_intervals_draw_from_the_values_and_even_balances_them():
+    rng = np.random.default_rng(0)
+    pick = Interval.parse("uniform:(2, 5, 9)")
+    assert str(pick) == "uniform:(2,5,9)" and pick.mean == pytest.approx(16 / 3)
+    assert set(pick.sample(200, rng)) == {2.0, 5.0, 9.0}
+    even = Interval.parse("even:(2,5,9,15)")
+    drawn = even.sample(8, rng)
+    assert sorted(drawn) == [2, 2, 5, 5, 9, 9, 15, 15]
+    assert list(drawn) != sorted(drawn) or list(even.sample(8, rng)) != sorted(drawn)  # shuffled
+    rest = even.sample(6, rng)  # 6 over 4: one of each, two more without replacement
+    vals, counts = np.unique(rest, return_counts=True)
+    assert len(vals) == 4 and sorted(counts) == [1, 1, 2, 2]
+    with pytest.raises(ValueError, match=r"uniform:\(4,9,11\)"):
+        Interval.parse("uniform:4,9,11")
+
+
+def test_items_split_on_spaces_and_a_gap_item_can_open_a_unit():
+    u = Unit.parse(
+        "c", "isi:4 DP:15:even:(4,9,11) DI:18:uniform:(2, 4, 6) DRV:4:0 DRD:4:1", 1, "block"
+    )
+    assert [it.condition for it in u.items] == ["null", "DP", "DI", "DRV", "DRD"]
+    assert u.items[0].duration == 0 and u.items[0].off == Interval.parse(4)
+    assert u.items[1].off.kind == "even" and u.items[2].off.kind == "choice"
+    # the old comma form and range specs with commas still parse
+    old = Unit.parse("c", "A:0.5:0, B:2:2, C:3:uniform:2,4", 1)
+    assert old.items[2].off == Interval.parse("uniform:2,4")
+    with pytest.raises(ValueError, match="reserved"):
+        Unit.parse("c", "isi:2 ISI:3:1", 1)
+    spec = ExperimentSpec(tr=1.0, units=[Unit.parse("c", "isi:7 A:1", 3, "block")], initial_fix=10)
+    real = realize(spec, 0)
+    assert real.onsets[0][0][0] == pytest.approx(17.0)  # 10 s fixation + the 7 s gap

@@ -20,9 +20,13 @@ an OFF fall back to ``-within_isi`` inside a unit and ``-isi`` after it, so
     block                 -trial A 20 5
     block of events       -miniblock A "A:1:0.5x10" 5
 
-The reserved condition ``null`` occupies time without producing an event, and
-``uniform``/``exp``/``poisson`` cannot be condition names (they start interval
-specs). Intervals are offset-to-onset. Every realization is one seed: a
+Items may be separated by commas or spaces, and ``isi:SPEC`` is an item that
+is only a gap (a zero-length ``null`` with that OFF), so a unit can open with
+one: ``"isi:uniform:2,8 A:0.5 B:2"``. OFF can also come from a list:
+``uniform:(2,5,9)`` (any of them each time) or ``even:(2,5,9)`` (equally often
+within a run). The reserved condition ``null`` occupies time without
+producing an event, and ``uniform``/``even``/``exp``/``poisson``/``isi``
+cannot be condition names (they start interval specs or gaps). Intervals are offset-to-onset. Every realization is one seed: a
 jittered design is a distribution over event lists, and power is a property
 of that distribution, not of one draw from it.
 """
@@ -44,20 +48,31 @@ class Interval:
 
     Spec strings: ``4`` (fixed), ``uniform:2,6``, ``exp:MEAN,MIN,MAX``
     (truncated exponential above MIN, mean-matched -- the usual jittered-ISI
-    choice), ``poisson:MEAN,MIN,MAX`` (whole multiples of the TR).
+    choice), ``poisson:MEAN,MIN,MAX`` (whole multiples of the TR), and from a
+    list: ``uniform:(2,5,9)`` draws each gap from the values, ``even:(2,5,9)``
+    uses them equally often within a run (the remainder, when the count does
+    not divide, drawn without replacement) in shuffled order.
     """
 
-    kind: Literal["fixed", "uniform", "exp", "poisson"]
+    kind: Literal["fixed", "uniform", "exp", "poisson", "choice", "even"]
     mean: float
     low: float
     high: float
+    values: tuple[float, ...] = ()
 
     @classmethod
     def parse(cls, spec: str | float) -> Interval:
         if isinstance(spec, (int, float)):
             return cls("fixed", float(spec), float(spec), float(spec))
-        text = str(spec).strip()
+        text = str(spec).strip().replace(" ", "")
+        listed = re.fullmatch(r"(uniform|even):\((.+)\)", text, flags=re.IGNORECASE)
         try:
+            if listed:
+                vals = [float(x) for x in listed.group(2).split(",") if x]
+                if not vals or min(vals) < 0:
+                    raise ValueError
+                kind = "choice" if listed.group(1).lower() == "uniform" else "even"
+                return cls(kind, float(np.mean(vals)), min(vals), max(vals), tuple(vals))
             if ":" not in text:
                 v = float(text)
                 return cls("fixed", v, v, v)
@@ -69,6 +84,13 @@ class Interval:
         if kind == "uniform" and len(vals) == 2:
             lo, hi = sorted(vals)
             return cls("uniform", (lo + hi) / 2, lo, hi)
+        if kind in ("uniform", "even") and len(vals) != 2:
+            a = ",".join(f"{v:g}" for v in vals)
+            raise ValueError(
+                f"{spec!r}: uniform:LO,HI is a range of two values. To draw from a list, "
+                f"write uniform:({a}) (each gap any of them) or even:({a}) (all equally "
+                "often within a run)"
+            )
         if kind in ("exp", "poisson") and len(vals) == 3:
             mean, lo, hi = vals
             if not lo <= mean <= hi or lo >= hi:
@@ -84,6 +106,13 @@ class Interval:
             return np.zeros(0)
         if self.kind == "fixed":
             return np.full(n, self.mean)
+        vals = np.asarray(self.values, dtype=float)
+        if self.kind == "choice":
+            return rng.choice(vals, n)
+        if self.kind == "even":
+            whole, rest = divmod(n, len(vals))
+            out = np.concatenate([np.repeat(vals, whole), rng.choice(vals, rest, replace=False)])
+            return rng.permutation(out)
         from fastfuncstuff.design.optimization import ISIConstraints, generate_isi_sequence
 
         dist = {"uniform": "uniform", "exp": "truncated_exponential", "poisson": "poisson"}[
@@ -97,6 +126,9 @@ class Interval:
             return f"{self.mean:g}"
         if self.kind == "uniform":
             return f"uniform:{self.low:g},{self.high:g}"
+        if self.kind in ("choice", "even"):
+            kind = "uniform" if self.kind == "choice" else "even"
+            return f"{kind}:({','.join(f'{v:g}' for v in self.values)})"
         return f"{self.kind}:{self.mean:g},{self.low:g},{self.high:g}"
 
 
@@ -107,18 +139,31 @@ class Item:
     off: Interval | None = None  # gap after this item; None -> -within_isi / -isi
 
 
-_INTERVAL_KINDS = ("uniform", "exp", "poisson")
+_INTERVAL_KINDS = ("uniform", "exp", "poisson", "even")
+_GAP = "isi"  # an item that is only a gap: isi:4, isi:uniform:2,8
 _ITEM = re.compile(r"([A-Za-z_][\w.]*):([\d.]+)(?::(.+?))?(?:[x*](\d+))?")
 
 
 def _split_items(text: str) -> list[str]:
-    """Split on commas, except those inside an OFF spec such as ``uniform:2,4``.
+    """Split on commas, semicolons or spaces, except inside an OFF spec.
 
-    A new item starts only at ``NAME:`` where NAME is not an interval kind; any
-    other comma-separated piece belongs to the item before it.
+    Separators inside parentheses (``even:(2,5,9)``) never split. A new item
+    starts only at ``NAME:`` where NAME is not an interval kind; any other
+    piece belongs to the item before it (the ``4`` of ``uniform:2,4``).
     """
+    pieces, depth, cur = [], 0, ""
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if depth == 0 and (ch in ",;" or ch.isspace()):
+            pieces.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    pieces.append(cur)
     items: list[str] = []
-    for piece in (p.strip() for p in text.replace(";", ",").split(",")):
+    for piece in (p.strip() for p in pieces):
+        if not piece:
+            continue
         head = re.match(r"([A-Za-z_][\w.]*):", piece)
         starts_item = head is not None and head.group(1).lower() not in _INTERVAL_KINDS
         if starts_item or not items:
@@ -154,6 +199,19 @@ class Unit:
         """``items`` is ``LABEL:DUR[:OFF][xN]`` joined by commas (see module docstring)."""
         parsed: list[Item] = []
         for token in _split_items(items):
+            gap = re.fullmatch(rf"{_GAP}:(.+?)(?:[x*](\d+))?", token.replace(" ", ""), re.I)
+            if gap:
+                # Time with no event, e.g. before the first item: a zero-length
+                # null item whose OFF is the gap.
+                try:
+                    off = Interval.parse(gap.group(1))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{token!r}: isi is reserved for a gap item (isi:SPEC) and cannot "
+                        f"name a condition -- {exc}"
+                    ) from None
+                parsed += [Item(NULL, 0.0, off)] * int(gap.group(2) or 1)
+                continue
             m = _ITEM.fullmatch(token.replace(" ", ""))
             if m is None:
                 raise ValueError(
