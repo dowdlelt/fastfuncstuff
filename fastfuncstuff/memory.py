@@ -456,6 +456,20 @@ def bytes_per_voxel_prf(
     return (6 * n_pixels + 30 * n_timepoints) * 4
 
 
+def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
+    """
+    Estimate memory per voxel for the batched L1 detrend (outlier counting).
+
+    The Frisch-Newton interior point keeps ~6 (T,) float64 state vectors per
+    voxel (data, dual, slack, two multipliers, residual) and builds ~20 more per
+    iteration for the predictor and corrector directions; 28 x T float64 covers
+    both plus kthvalue's working copy for the median. The p x p normal
+    equations are negligible next to that.
+    """
+    del n_basis  # (V, p, p) systems are tiny next to the (T, V) work arrays
+    return 28 * n_timepoints * 8
+
+
 def bytes_per_voxel_ridge(
     n_timepoints: int,
     n_regressors: int,
@@ -1517,6 +1531,8 @@ def estimate_chunk_size(
             n_combos=max(1, n_designs),
             n_conditions=n_regressors,
         )
+    elif operation == "l1_detrend":
+        bytes_per_voxel = bytes_per_voxel_l1_detrend(n_timepoints, n_regressors)
     elif operation == "denoise":
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
     elif operation == "ica_varnorm":

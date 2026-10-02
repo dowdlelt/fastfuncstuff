@@ -551,6 +551,181 @@ def automask(
     return mask
 
 
+def _afni_cliplevel(im: numpy.ndarray, mfrac: float = 0.5) -> float:
+    """``THD_cliplevel`` on a float image, bin for bin (10000-bin histogram)."""
+    if mfrac <= 0.0 or mfrac >= 0.99:
+        mfrac = 0.5
+    nhist = 10000
+    v = im.ravel().astype(numpy.float32)
+    fac = float(v.max()) if v.size else 0.0
+    if fac < 1.0e-100:
+        return 0.0
+    sfac = nhist / fac
+    pos = v[v > 0.0]
+    kk = (sfac * pos.astype(numpy.float64) + 0.499).astype(numpy.int64)
+    kk = kk[kk <= nhist]
+    npos = kk.size
+    if npos <= 222:
+        return 0.0
+    hist = numpy.bincount(kk, minlength=nhist + 1)
+    dsum = float((kk.astype(numpy.float64) ** 2).sum())
+
+    # Start at the cut holding the upper 65% of positive voxels.
+    qq = int(0.65 * npos)
+    ib = int(numpy.rint(0.5 * numpy.sqrt(dsum / npos)))
+    ii, acc = nhist - 1, 0
+    while ii >= ib and acc < qq:
+        acc += int(hist[ii])
+        ii -= 1
+    ncut = ii
+    # cut = mfrac * median of everything at or above the cut, to a fixed point.
+    cum_from_top = numpy.cumsum(hist[:nhist][::-1])[::-1]  # count in [i, nhist)
+    for _ in range(66):
+        nabove = int(cum_from_top[ncut]) if ncut < nhist else 0
+        nhalf = nabove // 2
+        ii, acc = ncut, 0
+        while ii < nhist and acc < nhalf:
+            acc += int(hist[ii])
+            ii += 1
+        nold = ncut
+        ncut = int(mfrac * ii)
+        if ncut == nold:
+            break
+    return float(numpy.float32(ncut / sfac))
+
+
+def _afni_cliplevel_gradual(im: numpy.ndarray, mfrac: float = 0.5) -> numpy.ndarray:
+    """``THD_cliplevel_gradual``: octant clip levels about the centre of mass,
+    trilinearly blended. ``im`` is (nz, ny, nx); AFNI's i/j/k are x/y/z."""
+    nz, ny, nx = im.shape
+    it, jt, kt = nx - 1, ny - 1, nz - 1
+    w = numpy.abs(im.astype(numpy.float64))
+    tot = w.sum()
+    zc_, yc_, xc_ = (
+        (w.sum(axis=(1, 2)) * numpy.arange(nz)).sum() / tot,
+        (w.sum(axis=(0, 2)) * numpy.arange(ny)).sum() / tot,
+        (w.sum(axis=(0, 1)) * numpy.arange(nx)).sum() / tot,
+    )
+    ic, jc, kc = (int(numpy.rint(numpy.float32(c))) for c in (xc_, yc_, zc_))
+    floor_val = 0.333 * _afni_cliplevel(im, mfrac)
+    di = max(int(numpy.rint(0.01 * nx)), 1)
+    dj = max(int(numpy.rint(0.01 * ny)), 1)
+    dk = max(int(numpy.rint(0.01 * nz)), 1)
+    icm, icp = max(ic - di, 0), min(ic + di, it)
+    jcm, jcp = max(jc - dj, 0), min(jc + dj, jt)
+    kcm, kcp = max(kc - dk, 0), min(kc + dk, kt)
+    xr = ((0, icp), (icm, it))
+    yr = ((0, jcp), (jcm, jt))
+    zr = ((0, kcp), (kcm, kt))
+    clip = numpy.zeros((2, 2, 2))  # [z][y][x] octant
+    for a in range(2):
+        for b in range(2):
+            for c in range(2):
+                (za, zb), (ya, yb), (xa, xb) = zr[a], yr[b], xr[c]
+                val = _afni_cliplevel(im[za : zb + 1, ya : yb + 1, xa : xb + 1], mfrac)
+                clip[a, b, c] = max(val, floor_val)
+
+    def frac(n_idx: int, c: int, t: int) -> numpy.ndarray:
+        p0, p1 = 0.5 * c, 0.5 * (c + t)
+        inv = 1.0 / (p1 - p0) if p1 > p0 else 0.0
+        return numpy.clip((numpy.arange(n_idx) - p0) * inv, 0.0, 1.0)
+
+    x1 = frac(nx, ic, it)[None, None, :]
+    y1 = frac(ny, jc, jt)[None, :, None]
+    z1 = frac(nz, kc, kt)[:, None, None]
+    x0, y0, z0 = 1.0 - x1, 1.0 - y1, 1.0 - z1
+    out = numpy.zeros(im.shape)
+    for a, za in ((0, z0), (1, z1)):
+        for b, yb in ((0, y0), (1, y1)):
+            for c, xc in ((0, x0), (1, x1)):
+                out = out + clip[a, b, c] * za * yb * xc
+    return out.astype(numpy.float32)
+
+
+def _afni_fillin_once(mask: numpy.ndarray, nside: int) -> tuple[numpy.ndarray, int]:
+    """``THD_mask_fillin_once``: fill an unset voxel with a set voxel within
+    1..nside on BOTH sides along some axis. Voxels within nside of any edge are
+    never considered, and fills are applied after the sweep (simultaneously)."""
+    nz, ny, nx = mask.shape
+    ns = [min((n - 1) // 2, nside) for n in (nz, ny, nx)]
+    if not any(ns):
+        return mask, 0
+    fill = numpy.zeros_like(mask)
+    core = tuple(slice(s, n - s) for s, n in zip(ns, (nz, ny, nx), strict=True))
+    for axis in range(3):
+        s, n = ns[axis], mask.shape[axis]
+        if s == 0:
+            continue
+        plus = numpy.zeros_like(mask)
+        minus = numpy.zeros_like(mask)
+        for d in range(1, s + 1):
+            src = [slice(None)] * 3
+            dst = [slice(None)] * 3
+            src[axis], dst[axis] = slice(d, n), slice(0, n - d)
+            plus[tuple(dst)] |= mask[tuple(src)]
+            minus[tuple(src)] |= mask[tuple(dst)]
+        fill[core] |= (plus & minus)[core]
+    fill &= ~mask
+    return mask | fill, int(fill.sum())
+
+
+def afni_automask(
+    vol: Tensor,
+    clfrac: float = 0.5,
+    peelcount: int = 1,
+    peelthr: int = 17,
+    gradual: bool = True,
+) -> Tensor:
+    """AFNI ``mri_automask_image`` step for step (what 3dAutomask / 3dToutcount use).
+
+    Differs from :func:`automask` in four ways, each measured to matter: the exact
+    histogram clip level, the spatially *gradual* clip (on by default in AFNI),
+    the peel that re-dilates (:func:`erode_many`), and the clustering/fill order
+    including the final erode + recluster. On a 64x64x34 EPI, :func:`automask`
+    (with no extra dilation) kept 27,786 voxels against AFNI's 34,797.
+
+    Runs on the CPU: one small volume of branchy, sequential logic.
+    """
+    im = vol.detach().cpu().numpy().astype(numpy.float32)
+    im = numpy.nan_to_num(im, nan=0.0, posinf=0.0, neginf=0.0)
+    if gradual:
+        m = im >= _afni_cliplevel_gradual(im, clfrac)
+    else:
+        m = im >= _afni_cliplevel(im, clfrac)
+    out_device = vol.device
+    if not m.any() or min(im.shape) < 2:
+        return torch.from_numpy(m).to(out_device)
+
+    def clust(a: numpy.ndarray) -> numpy.ndarray:
+        return largest_cluster_6conn(torch.from_numpy(a)).numpy()
+
+    def erode(a: numpy.ndarray, n: int) -> numpy.ndarray:
+        return erode_many(torch.from_numpy(a), npeel=n, peelthr=peelthr).numpy()
+
+    m = clust(m)
+    m = erode(m, peelcount)
+    m = clust(m)
+    for _ in range(3):
+        m, n = _afni_fillin_once(m, 1)
+        if n == 0:
+            break
+    nz, ny, nx = im.shape
+    nmm = max(1, int(numpy.rint(0.016 * nx)), int(numpy.rint(0.016 * ny)))
+    jj = int(numpy.rint(0.016 * nz))
+    nmm = max(nmm, jj)
+    if nmm > 1 or jj > 0:
+        for ii in range(2, nmm):
+            m, _ = _afni_fillin_once(m, ii)
+        while True:
+            m, n = _afni_fillin_once(m, nmm)
+            if n == 0:
+                break
+    m = erode(m, 1)
+    m = clust(m)
+    m = ~clust(~m)  # fill every hole that does not reach the volume edge
+    return torch.from_numpy(m).to(out_device)
+
+
 def data_coverage_mask(
     vol: Tensor,
     erode: int = 1,
