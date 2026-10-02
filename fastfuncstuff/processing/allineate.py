@@ -353,7 +353,7 @@ class _AffineMovie:
     def capture(self, params, label: str, pinned: bool = False) -> None:
         """Frame from a (12,) residual parameter vector (tensor or array)."""
         p = torch.as_tensor(params, dtype=torch.float32, device=self.device)
-        self.capture_residual(params_to_matrix(p), label, pinned)
+        self.capture_residual(_p2m_fns()[0](p), label, pinned)
 
     def capture_residual(self, residual: Tensor, label: str, pinned: bool = False) -> None:
         """Frame from a residual (4, 4) on the current stage's grid."""
@@ -379,6 +379,73 @@ def _recording_movie(recorder, device: torch.device):
         yield movie
     finally:
         _movie.reset(token)
+
+
+# Rotation pivot of the residual parametrization, (x, y, z) voxels of the grid
+# being searched. params_to_matrix rotates about voxel (0,0,0) -- here the corner
+# of the cropped base box -- which makes a rotation drag the brain through a
+# ~half-diagonal lever: rotation and translation become strongly correlated, the
+# descent valley turns diagonal, and coordinate search, Powell and the coarse
+# rotation grid all pay for it (the random-direction stencil and part of CMA-ES's
+# case were workarounds). Pivoting at the grid centre removes the lever; matrices
+# stay ordinary voxel pulls, so nothing outside the search changes. Same finding
+# as ffs_moco's centered_rigid_p2m. A ContextVar, like _movie, because the pivot
+# is a property of the grid each stage runs on; search functions read it ONCE at
+# entry via _p2m_fns, so a torch.compile'd forward sees only a closure constant.
+_pivot: ContextVar[Tensor | None] = ContextVar("_ffs_allineate_pivot", default=None)
+
+
+def _grid_centre(shape: tuple[int, ...], device: torch.device) -> Tensor:
+    nz, ny, nx = shape[-3:]
+    return torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], device=device)
+
+
+@contextmanager
+def _pivot_scope():
+    """One alignment's pivot lifetime: whatever its stages set is undone on exit,
+    so a -batch run (or a caught failure) never hands a stale pivot onward."""
+    token = _pivot.set(None)
+    try:
+        yield
+    finally:
+        _pivot.reset(token)
+
+
+@contextmanager
+def _pivot_at(shape: tuple[int, ...], device: torch.device):
+    """Pivot at the centre of a (nz, ny, nx) grid for this block, then restore."""
+    token = _pivot.set(_grid_centre(shape, device))
+    try:
+        yield
+    finally:
+        _pivot.reset(token)
+
+
+def _p2m_fns():
+    """(p2m, p2m_batched, m2p) for the current pivot; plain functions when unset."""
+    c = _pivot.get()
+    if c is None:
+        return params_to_matrix, params_to_matrix_batched, matrix_to_params
+
+    def p2m(p: Tensor) -> Tensor:
+        M = params_to_matrix(p)
+        cc = c.to(device=M.device, dtype=M.dtype)
+        t = M[:3, 3] + cc - M[:3, :3] @ cc
+        return torch.cat([torch.cat([M[:3, :3], t[:, None]], dim=1), M[3:]], dim=0)
+
+    def p2m_b(p: Tensor) -> Tensor:
+        M = params_to_matrix_batched(p)
+        cc = c.to(device=M.device, dtype=M.dtype)
+        t = M[:, :3, 3] + cc - M[:, :3, :3] @ cc
+        return torch.cat([torch.cat([M[:, :3, :3], t[:, :, None]], dim=2), M[:, 3:]], dim=1)
+
+    def m2p(M: Tensor) -> Tensor:
+        cc = c.to(device=M.device, dtype=M.dtype)
+        M0 = M.clone()
+        M0[:3, 3] = M[:3, 3] - cc + M[:3, :3] @ cc
+        return matrix_to_params(M0)
+
+    return p2m, p2m_b, m2p
 
 
 # ---------------------------------------------------------------------------
@@ -1307,7 +1374,7 @@ def _coarse_search_joint(
         seeds = torch.cat([seeds, rnd], dim=0)
 
     # --- batched subsampled evaluation of every seed ---
-    matrices = params_to_matrix_batched(seeds)
+    matrices = _p2m_fns()[1](seeds)
     B = matrices.shape[0]
     chunk = compute_registration_candidate_batch_size(
         n_coarse,
@@ -1459,7 +1526,7 @@ def _eval_candidates(
     verb: int,
 ) -> Tensor:
     """Cost of every (B, 12) candidate against base (chunked) -> (B,)."""
-    matrices = params_to_matrix_batched(candidates)
+    matrices = _p2m_fns()[1](candidates)
     B = candidates.shape[0]
     chunk_size = _estimate_chunk_size(base.shape, device, B)
     all_costs = []
@@ -1611,6 +1678,7 @@ def _refine_adam_normalized(
     Returns:
         (params_phys, best_cost): refined params and best cost achieved.
     """
+    p2m = _p2m_fns()[0]
     free_mask_np = _get_free_mask(config.dof)
     free_mask = torch.tensor(free_mask_np, dtype=torch.bool, device=device)
     identity_phys = _identity_physical()
@@ -1660,7 +1728,7 @@ def _refine_adam_normalized(
 
         # Denormalize (differentiable) and build matrix
         params_phys = _denormalize_t(params_norm, bmin, span)
-        matrix = params_to_matrix(params_phys)
+        matrix = p2m(params_phys)
         if cost_fn is not None:
             cost = cost_fn(matrix)
         else:
@@ -1868,6 +1936,7 @@ def _refine_cmaes_batched(
     Returns:
         (params_phys, costs): (T, 12) refined params and (T,) best costs.
     """
+    p2m_b = _p2m_fns()[1]
     free_mask = _get_free_mask(config.dof)
     free_idx = torch.as_tensor(np.flatnonzero(free_mask), device=device)
     n = int(free_idx.numel())
@@ -1933,7 +2002,7 @@ def _refine_cmaes_batched(
     # random population.  Without this evaluation the first sampled point replaced a
     # possibly exact optimum simply because the incumbent started at -inf.
     start_phys = _denormalize_t(x0, bmin, span)
-    best_c = batched_cost_fn(params_to_matrix_batched(start_phys)).detach()
+    best_c = batched_cost_fn(p2m_b(start_phys)).detach()
     alive = torch.ones(T, dtype=torch.bool, device=device)
     n_eval = T
 
@@ -1976,9 +2045,7 @@ def _refine_cmaes_batched(
         full[:, :, free_idx] = cand_free.to(torch.float32)
         full = full.clamp_(0.0, 1.0)
         flat = full.reshape(T * L, 12)
-        return batched_cost_fn(params_to_matrix_batched(_denormalize_t(flat, bmin, span))).reshape(
-            T, L
-        )
+        return batched_cost_fn(p2m_b(_denormalize_t(flat, bmin, span))).reshape(T, L)
 
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for gi in pbar:
@@ -2111,6 +2178,7 @@ def _refine_pattern_batched(
     Returns:
         (params_phys, costs): (T, 12) refined params and (T,) best costs.
     """
+    p2m_b = _p2m_fns()[1]
     free_mask = _get_free_mask(config.dof)
     free_idx = np.flatnonzero(free_mask)
     nfree = int(free_idx.size)
@@ -2156,7 +2224,7 @@ def _refine_pattern_batched(
     alive = torch.ones(T, dtype=torch.bool, device=device)
 
     def _costs(flat_x: Tensor) -> Tensor:
-        return batched_cost_fn(params_to_matrix_batched(_denormalize_t(flat_x, bmin, span)))
+        return batched_cost_fn(p2m_b(_denormalize_t(flat_x, bmin, span)))
 
     # Seed the incumbent cost for all trials in one evaluation.
     best_c = _costs(x)
@@ -2253,6 +2321,7 @@ def _refine_adam_batched(
     Returns:
         (params_phys, costs): (T, 12) refined params and (T,) best costs.
     """
+    p2m_b = _p2m_fns()[1]  # pivot read once, outside the compiled forward
     free_mask = torch.tensor(_get_free_mask(config.dof), dtype=torch.bool, device=device)
     bmin, span = _bounds_to_torch(bounds, device)
     identity_norm = _normalize_t(
@@ -2278,7 +2347,7 @@ def _refine_adam_batched(
     # while it's validated for speed on real GPUs; the sync / early-stop break
     # live outside it, so they don't fragment the compiled graph.
     def _forward(pn: Tensor) -> Tensor:
-        return batched_cost_fn(params_to_matrix_batched(_denormalize_t(pn, bmin, span)))
+        return batched_cost_fn(p2m_b(_denormalize_t(pn, bmin, span)))
 
     use_compile = compile_fwd or os.environ.get("FFS_ALLINEATE_COMPILE") == "1"
     forward = torch.compile(_forward) if use_compile else _forward
@@ -2402,6 +2471,7 @@ def _make_powell_cost(
     ``matrix_cost_fn``, when given, maps a (4,4) matrix to a scalar cost (higher
     == better) and replaces the full-grid path (subsampled blok refinement).
     """
+    p2m = _p2m_fns()[0]  # pivot read once, outside any trace
 
     best_seen = [-float("inf")]
 
@@ -2414,7 +2484,7 @@ def _make_powell_cost(
         params_phys = _denormalize(full_norm, param_bounds)
 
         params_t = torch.tensor(params_phys, dtype=torch.float32, device=device)
-        matrix = params_to_matrix(params_t)
+        matrix = p2m(params_t)
 
         with torch.no_grad():
             if matrix_cost_fn is not None:
@@ -2823,7 +2893,7 @@ def _refine_progressive(
             # Nothing downstream will re-optimize, so the reported cost must at
             # least be the pure one the caller asked for, not the combined one.
             with torch.no_grad():
-                _m = params_to_matrix(torch.tensor(best_params, dtype=torch.float32, device=device))
+                _m = _p2m_fns()[0](torch.tensor(best_params, dtype=torch.float32, device=device))
                 _w = apply_affine_interp(source, _m, ctx.interp, base.shape, zero_outside=True)
                 best_cost = float(_compute_cost(base, _w, weight, ctx, voxdims, matrix=_m))
                 del _w
@@ -3310,7 +3380,7 @@ def allineate(
         config = AffineAlignConfig()
     # The recorder is reached through a ContextVar rather than five more parameters,
     # so it is opened here and the whole alignment runs inside it.
-    with _recording_movie(movie_recorder, _align_device(base, config)):
+    with _recording_movie(movie_recorder, _align_device(base, config)), _pivot_scope():
         return _align(
             base,
             source,
@@ -3440,7 +3510,9 @@ def _align(
                 pinned=True,
             )
 
-    # Stage 2: coarse search to seed the refinement.
+    # Stage 2: coarse search to seed the refinement. Everything from here searches
+    # the residual on base_opt, so rotations pivot at its centre (see _pivot).
+    _pivot.set(_grid_centre(base_opt.shape, device))
     if not config.twopass:
         trial_params_list = [init_params.cpu().numpy().copy()]
     elif sample is not None:
@@ -3480,17 +3552,20 @@ def _align(
                 print(f"  Coarse resolution ({base_ds.shape}, {ds_factor}x downsample):")
 
             voxdims_coarse = tuple(v * ds_factor for v in voxdims)
-            best_list = _coarse_search(
-                base_ds,
-                source_ds,
-                weight_ds,
-                config,
-                ctx,
-                voxdims_coarse,
-                coarse_init[:3],
-                device,
-                verb,
-            )
+            # Its own grid, its own centre: the two centres correspond under the
+            # decimation, so scaling the translations back by ds_factor stays exact.
+            with _pivot_at(base_ds.shape, device):
+                best_list = _coarse_search(
+                    base_ds,
+                    source_ds,
+                    weight_ds,
+                    config,
+                    ctx,
+                    voxdims_coarse,
+                    coarse_init[:3],
+                    device,
+                    verb,
+                )
 
             trial_params_list = []
             for p in best_list:
@@ -3546,7 +3621,7 @@ def _align(
             print(f"  Saved cost trace: {save_cost_trace_path} ({len(cost_trace.rows)} steps)")
 
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
-    final_matrix = _residual_to_final(params_to_matrix(best_t), setup, full_to_work)
+    final_matrix = _residual_to_final(_p2m_fns()[0](best_t), setup, full_to_work)
 
     if full_to_work is not None:
         # --- resolution ladder, second rung ---------------------------------
@@ -3576,11 +3651,14 @@ def _align(
         residual_f = _crop_conj(
             torch.linalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
         )
+        # The hand-off is a matrix, so it re-reads as params about the NEW grid's
+        # centre -- a fit means the same transform on either side.
+        _pivot.set(_grid_centre(setup.base_opt.shape, device))
         best_params_phys, best_refine_cost = _refine_progressive(
             setup.base_opt,
             setup.source_opt,
             setup.weight_opt,
-            [matrix_to_params(residual_f).cpu().numpy()],
+            [_p2m_fns()[2](residual_f).cpu().numpy()],
             config,
             setup.ctx,
             setup.voxdims,
@@ -3591,7 +3669,7 @@ def _align(
             skip_blur=True,
         )
         best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
-        final_matrix = _residual_to_final(params_to_matrix(best_t), setup, None)
+        final_matrix = _residual_to_final(_p2m_fns()[0](best_t), setup, None)
         # Downstream (the final-cost report) now reads the base grid directly.
         base, weight, ctx, voxdims, sample = (
             setup.base,
