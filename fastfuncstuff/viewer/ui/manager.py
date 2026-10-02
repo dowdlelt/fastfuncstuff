@@ -97,6 +97,7 @@ class WindowManager(QtCore.QObject):
     def _build(self, viewport: Viewport) -> Companion:
         if viewport.is_image:
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.action_requested.connect(self.mode_action_requested)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
