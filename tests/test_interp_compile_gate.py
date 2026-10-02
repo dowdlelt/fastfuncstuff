@@ -202,3 +202,45 @@ def test_the_resampler_asks_the_mps_policy_where_to_run(monkeypatch):
     monkeypatch.setattr(interp, "cpu_if_mps", spy)
     _resample()
     assert ("cpu", "separable_resample") in asked
+
+
+def test_a_compile_that_fails_on_first_call_falls_back_to_eager(monkeypatch, capsys):
+    """torch.compile is lazy: inductor's C++ build error surfaces on the first call.
+
+    Bug of record: under torch 2.12 the CPU codegen for the shear's 1D pass emitted
+    undeclared temporaries, and ffs_moco -device cpu died mid-registration.
+    """
+
+    class InductorError(Exception):
+        pass
+
+    InductorError.__module__ = "torch._inductor.exc"
+    calls = {"compiled": 0}
+
+    def _broken_compile(fn, **kwargs):
+        def compiled(*a, **k):
+            calls["compiled"] += 1
+            raise InductorError("CppCompileError: tmp30 was not declared")
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", _broken_compile)
+    fn = interp.compile_with_eager_fallback(lambda x: x * 2)
+    x = torch.arange(3.0)
+    assert torch.equal(fn(x), x * 2)
+    assert torch.equal(fn(x), x * 2)
+    assert calls["compiled"] == 1  # one failed attempt, then latched eager
+    assert "continuing eager" in capsys.readouterr().out
+
+
+def test_a_runtime_error_inside_compiled_code_is_not_swallowed(monkeypatch):
+    def _compile(fn, **kwargs):
+        def compiled(*a, **k):
+            raise ValueError("genuine bug")
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", _compile)
+    fn = interp.compile_with_eager_fallback(lambda x: x)
+    with pytest.raises(ValueError, match="genuine bug"):
+        fn(torch.zeros(1))

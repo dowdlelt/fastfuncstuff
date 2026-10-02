@@ -658,7 +658,7 @@ def _get_shear_interp(device: torch.device):
     ):
         return _interp_1d_along
     try:
-        compiled = torch.compile(_interp_1d_along, dynamic=False)
+        compiled = _interp.compile_with_eager_fallback(_interp_1d_along, dynamic=False)
     except Exception:
         compiled = _interp_1d_along  # compile unavailable on this build
     _compiled_shear_interp[dt] = compiled
