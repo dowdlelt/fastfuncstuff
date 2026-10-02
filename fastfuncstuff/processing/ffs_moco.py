@@ -326,12 +326,19 @@ def _prefer_wls_incumbent(
     output_shape: tuple[int, int, int],
     resample_fn=resample_affine_fast,
     p2m_fn=params_to_matrix,
+    incumbent_rms: float | None = None,
 ) -> Tensor:
-    """Return the candidate only when it improves on a stage's incoming transform."""
+    """Return the candidate only when it improves on a stage's incoming transform.
+
+    ``incumbent_rms``: the incumbent's weighted RMS when the caller already has
+    it -- gauss_newton_rigid's ``init_rms_out`` -- saving one full resample per
+    stage per volume (a quarter of CPU -twopass time went to these checks).
+    """
     with torch.no_grad():
-        incumbent_warped = resample_fn(source, p2m_fn(incumbent), coords, interp, output_shape)
+        if incumbent_rms is None:
+            incumbent_warped = resample_fn(source, p2m_fn(incumbent), coords, interp, output_shape)
+            incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
         candidate_warped = resample_fn(source, p2m_fn(candidate), coords, interp, output_shape)
-        incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
         candidate_rms = _weighted_rms(base_flat, candidate_warped.reshape(-1), weight_flat)
     return incumbent.clone() if incumbent_rms < candidate_rms else candidate
 
@@ -385,6 +392,7 @@ def gauss_newton_rigid(
     coords: Tensor | None = None,
     p2m_fn=params_to_matrix,
     resample_fn=resample_affine_fast,
+    init_rms_out: list[float] | None = None,
 ) -> tuple[Tensor, int]:
     """Per-volume Gauss-Newton WLS rigid body registration.
 
@@ -400,6 +408,9 @@ def gauss_newton_rigid(
             If provided, avoids rebuilding meshgrid every iteration.
         p2m_fn: Function to convert params to matrix (default: params_to_matrix).
         resample_fn: Function to resample source (default: resample_affine_fast).
+        init_rms_out: if given, receives the weighted RMS at ``init_params`` --
+            free from the first iteration's residual, and exactly what
+            ``_weighted_rms`` would compute after a resample of its own.
 
     Returns:
         (params, n_iters): optimized (12,) parameters and iteration count.
@@ -421,7 +432,11 @@ def gauss_newton_rigid(
         warped_flat = warped.reshape(-1)
 
         # Weighted residual
-        residual = weight_flat * (base_flat - warped_flat)
+        diff = base_flat - warped_flat
+        residual = weight_flat * diff
+        if it == 0 and init_rms_out is not None:
+            w_sum = weight_flat.sum().clamp(min=1e-10)
+            init_rms_out.append(float(((residual * diff).sum() / w_sum).sqrt().item()))
 
         # Right-hand side: J^T W r
         JtWr = WJ @ residual  # (6,)
@@ -1558,6 +1573,7 @@ def moco(
         if config.twopass and config.cost == "wls":
             source_coarse = _blur_volume(source, coarse_fwhm)
             coarse_incumbent = init_params.clone()
+            coarse_rms: list[float] = []
             if config.fixed_iter:
                 init_params = _gn_fixed(
                     bf_coarse,
@@ -1583,6 +1599,7 @@ def moco(
                     coords=homo_coords,
                     p2m_fn=_p2m,
                     resample_fn=_resample,
+                    init_rms_out=coarse_rms,
                 )
             init_params = _prefer_wls_incumbent(
                 bf_coarse,
@@ -1595,10 +1612,12 @@ def moco(
                 vol_shape,
                 resample_fn=_resample,
                 p2m_fn=_p2m,
+                incumbent_rms=coarse_rms[0] if coarse_rms else None,
             )
 
         # Main alignment
         fine_incumbent = init_params.clone()
+        fine_rms: list[float] = []
         if config.cost == "wls":
             if config.fixed_iter:
                 if use_masked:
@@ -1653,6 +1672,7 @@ def moco(
                         coords=homo_coords,
                         p2m_fn=_p2m,
                         resample_fn=_resample,
+                        init_rms_out=fine_rms,
                     )
         elif config.cost == "lpa":
             params, n_iter = gn_lpa_rigid(
@@ -1708,6 +1728,7 @@ def moco(
                 vol_shape,
                 resample_fn=_resample,
                 p2m_fn=_p2m,
+                incumbent_rms=fine_rms[0] if fine_rms else None,
             )
 
         # Fallback: if result is worse than identity, retry from identity (skip in fixed_iter mode)
