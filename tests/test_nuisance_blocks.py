@@ -886,3 +886,25 @@ def test_out_of_range_selector_names_the_axis(selector_file, selector, message):
 
     with pytest.raises(ValueError, match=message):
         load_nuisance_file(f"{selector_file}{selector}")
+
+
+def test_block_diagonal_assembly_applies_the_transform():
+    # -ortvec_run FILE:deriv used to reach the block-diagonal builder raw: the
+    # design held the (demeaned) parameters, not their derivative.
+    import torch
+
+    from fastfuncstuff.cli_utils import build_nuisance_block_diag
+
+    m = (np.arange(10, dtype=np.float32) ** 2)[:, None]
+    blk = NuisanceBlock("mot", [m[:5], m[5:]], block_diagonal=True, transform="deriv")
+    X = build_nuisance_block_diag(
+        blocks=[blk],
+        run_starts=[0, 5],
+        n_timepoints=10,
+        polort=-1,
+        device=torch.device("cpu"),
+        verbose=False,
+    ).numpy()
+    d0 = np.array([0, 1, 3, 5, 7], dtype=np.float32)
+    np.testing.assert_allclose(X[:5, 0], d0 - d0.mean(), atol=1e-6)
+    assert np.all(X[5:, 0] == 0)

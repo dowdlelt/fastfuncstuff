@@ -1261,6 +1261,18 @@ class NuisanceBlock:
         """Max columns across runs — the assembled block's width."""
         return max((m.shape[1] for m in self.per_run if m is not None), default=0)
 
+    def transformed_run(self, run_idx: int) -> np.ndarray | None:
+        """Run ``run_idx`` with the block's transform applied, unpadded (None if empty).
+
+        The one place the transform is applied: the block-diagonal assembly
+        once read ``per_run`` directly and silently fitted the raw columns of
+        an ``-ortvec_run FILE:deriv`` block.
+        """
+        m = self.per_run[run_idx]
+        if m is None:
+            return None
+        return apply_nuisance_transform(m, self.transform).astype(np.float32, copy=False)
+
     def get_run(self, run_idx: int, run_length: int) -> np.ndarray:
         """Return ``(run_length, n_columns)`` for ``run_idx``, zero-padded.
 
@@ -1278,7 +1290,8 @@ class NuisanceBlock:
             )
         # Transform before padding: the zero columns of a short run must stay
         # zero, and the derivative is defined on this run's rows alone.
-        m = apply_nuisance_transform(m, self.transform).astype(np.float32, copy=False)
+        m = self.transformed_run(run_idx)
+        assert m is not None
         if m.shape[1] < ncols:
             pad = np.zeros((run_length, ncols - m.shape[1]), dtype=np.float32)
             return np.hstack([m, pad])
@@ -2303,10 +2316,10 @@ def build_nuisance_block_diag(
             col_groups: list[np.ndarray] = []
             demeaned = False
             for i in range(n_runs):
-                m = block.per_run[i]
+                m = block.transformed_run(i)
                 if m is None:
                     continue
-                m = np.asarray(m, dtype=np.float32).copy()
+                m = m.copy()
                 col_mean = m.mean(axis=0, keepdims=True)
                 if np.max(np.abs(col_mean)) > 1e-4:
                     m = m - col_mean
