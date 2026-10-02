@@ -141,3 +141,39 @@ def test_afni_automask_keeps_a_solid_head_whole():
     inside = head > 500
     # The peel re-dilates: the boundary shell must come back.
     assert int((m & inside).sum()) == int(inside.sum())
+
+
+def test_util_outcount_cli_writes_fractions_and_censor(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.cli import util_outcount
+
+    rng = np.random.default_rng(4)
+    zz, yy, xx = np.meshgrid(*(np.arange(12),) * 3, indexing="ij")
+    brain = ((zz - 6) ** 2 + (yy - 6) ** 2 + (xx - 6) ** 2) < 20
+    data = 100.0 * brain[..., None] + rng.normal(0, 1, (12, 12, 12, 20))
+    data[..., 9] += 50.0 * brain
+    img = nib.Nifti1Image(data.astype(np.float32), np.eye(4))
+    img.header.set_xyzt_units("mm", "sec")
+    img.header["pixdim"][4] = 2.0
+    nib.save(img, tmp_path / "run.nii.gz")
+    out, cen = tmp_path / "out.1D", tmp_path / "cen.1D"
+    util_outcount.main(
+        [
+            "-input",
+            str(tmp_path / "run.nii.gz"),
+            "-prefix",
+            str(out),
+            "-censor_outliers",
+            "-censor",
+            str(cen),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
+    frac = np.loadtxt(out)
+    keep = np.loadtxt(cen)
+    assert frac.shape == (20,) and frac[9] > 0.9
+    np.testing.assert_array_equal(keep, (frac <= C.DEFAULT_OUTLIER_LIMIT).astype(int))
