@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -134,11 +134,62 @@ def _rigid_params(device, dtype) -> Tensor:
     return identity_params(device=device, dtype=dtype)
 
 
+def centered_rigid_p2m(shape: tuple[int, int, int]):
+    """``params_to_matrix`` (and batched) with the rotation pivot at the grid centre.
+
+    ``params_to_matrix`` rotates about voxel index (0,0,0), a corner of the
+    volume. As a GN parametrization that is poor: a corner rotation is a centre
+    rotation plus a translation with a ~100-voxel lever, so the rotation and
+    translation Jacobian columns are nearly collinear -- the ill-conditioning the
+    float64 normal equations were added to survive -- and every additive step
+    carries more nonlinearity. 3dvolreg pivots at the centre (THD_rota3D);
+    doing the same halved moco's GN iterations and its gap to 3dvolreg.
+
+    Only the parametrization moves: the matrices returned are ordinary
+    voxel-index pulls, so everything downstream of ``matrices_vox`` is unchanged.
+    """
+    nz, ny, nx = shape
+    c64 = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+
+    def p2m(params: Tensor) -> Tensor:
+        M = params_to_matrix(params)
+        c = c64.to(device=M.device, dtype=M.dtype)
+        t = M[:3, 3] + c - M[:3, :3] @ c
+        return torch.cat([torch.cat([M[:3, :3], t[:, None]], dim=1), M[3:]], dim=0)
+
+    def p2m_batched(params: Tensor) -> Tensor:
+        M = params_to_matrix_batched(params)
+        c = c64.to(device=M.device, dtype=M.dtype)
+        t = M[:, :3, 3] + c - M[:, :3, :3] @ c
+        return torch.cat([torch.cat([M[:, :3, :3], t[:, :, None]], dim=2), M[:, 3:]], dim=1)
+
+    return p2m, p2m_batched
+
+
+def _coarse_config(config: MocoConfig) -> MocoConfig:
+    """The -twopass coarse stage's solver settings, as 3dvolreg runs them.
+
+    3dvolreg's first pass interpolates LINEARLY on the blurred volumes and
+    doubles its convergence thresholds (VL_twoblur * VL_dxy/VL_dph): heptic
+    buys nothing on a 4 mm-blurred image, and the coarse result only seeds the
+    fine pass. Linear is 2 taps per 1D shear pass against heptic's 8.
+    """
+    return replace(
+        config,
+        interp="linear",
+        dxy_thresh=2.0 * config.dxy_thresh,
+        dph_thresh=2.0 * config.dph_thresh,
+    )
+
+
 def compute_derivative_images(
     base: Tensor,
     device: torch.device,
     verb: int = 0,
     use_shear: bool = False,
+    p2m_batched_fn=params_to_matrix_batched,
+    trans_delta: float = 0.07,
+    rot_delfac: float = 1.5,
 ) -> Tensor:
     """Compute 6 spatial derivative images of the base via central differences.
 
@@ -156,14 +207,19 @@ def compute_derivative_images(
 
     Returns:
         (6, nz*ny*nx) derivative images flattened.
+
+    ``trans_delta`` (voxels) and ``rot_delfac`` set the finite-difference steps,
+    as 3dvolreg's -delta does (rotation step 2*rot_delfac/(nx+ny+nz) rad). These
+    are SECANT derivatives on purpose: 3dvolreg uses 0.7 for both. The defaults
+    are the historical values (0.07 looks like a dropped zero from 0.70) kept for
+    other callers; moco passes 3dvolreg's.
     """
     nz, ny, nx = base.shape
     dtype = base.dtype
 
     # Deltas from AFNI mri_3dalign.c
-    rot_delta = 2.0 * 1.5 / (nx + ny + nz)  # radians
+    rot_delta = 2.0 * rot_delfac / (nx + ny + nz)  # radians
     rot_delta_deg = math.degrees(rot_delta)
-    trans_delta = 0.07  # voxels
 
     deltas = torch.tensor(
         [
@@ -190,7 +246,7 @@ def compute_derivative_images(
         all_params.append(p_minus)
 
     param_batch = torch.stack(all_params)  # (12, 12)
-    matrices = params_to_matrix_batched(param_batch)  # (12, 4, 4)
+    matrices = p2m_batched_fn(param_batch)  # (12, 4, 4)
 
     # Resample all 12 at once using wsinc5 for accuracy
     if verb >= 2:
@@ -285,16 +341,20 @@ def _prefer_wls_incumbent(
     interp: str,
     output_shape: tuple[int, int, int],
     resample_fn=resample_affine_fast,
+    p2m_fn=params_to_matrix,
+    incumbent_rms: float | None = None,
 ) -> Tensor:
-    """Return the candidate only when it improves on a stage's incoming transform."""
+    """Return the candidate only when it improves on a stage's incoming transform.
+
+    ``incumbent_rms``: the incumbent's weighted RMS when the caller already has
+    it -- gauss_newton_rigid's ``init_rms_out`` -- saving one full resample per
+    stage per volume (a quarter of CPU -twopass time went to these checks).
+    """
     with torch.no_grad():
-        incumbent_warped = resample_fn(
-            source, params_to_matrix(incumbent), coords, interp, output_shape
-        )
-        candidate_warped = resample_fn(
-            source, params_to_matrix(candidate), coords, interp, output_shape
-        )
-        incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
+        if incumbent_rms is None:
+            incumbent_warped = resample_fn(source, p2m_fn(incumbent), coords, interp, output_shape)
+            incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
+        candidate_warped = resample_fn(source, p2m_fn(candidate), coords, interp, output_shape)
         candidate_rms = _weighted_rms(base_flat, candidate_warped.reshape(-1), weight_flat)
     return incumbent.clone() if incumbent_rms < candidate_rms else candidate
 
@@ -348,6 +408,7 @@ def gauss_newton_rigid(
     coords: Tensor | None = None,
     p2m_fn=params_to_matrix,
     resample_fn=resample_affine_fast,
+    init_rms_out: list[float] | None = None,
 ) -> tuple[Tensor, int]:
     """Per-volume Gauss-Newton WLS rigid body registration.
 
@@ -363,6 +424,9 @@ def gauss_newton_rigid(
             If provided, avoids rebuilding meshgrid every iteration.
         p2m_fn: Function to convert params to matrix (default: params_to_matrix).
         resample_fn: Function to resample source (default: resample_affine_fast).
+        init_rms_out: if given, receives the weighted RMS at ``init_params`` --
+            free from the first iteration's residual, and exactly what
+            ``_weighted_rms`` would compute after a resample of its own.
 
     Returns:
         (params, n_iters): optimized (12,) parameters and iteration count.
@@ -384,7 +448,11 @@ def gauss_newton_rigid(
         warped_flat = warped.reshape(-1)
 
         # Weighted residual
-        residual = weight_flat * (base_flat - warped_flat)
+        diff = base_flat - warped_flat
+        residual = weight_flat * diff
+        if it == 0 and init_rms_out is not None:
+            w_sum = weight_flat.sum().clamp(min=1e-10)
+            init_rms_out.append(float(((residual * diff).sum() / w_sum).sqrt().item()))
 
         # Right-hand side: J^T W r
         JtWr = WJ @ residual  # (6,)
@@ -452,6 +520,7 @@ def gauss_newton_rigid_fixed(
     max_iter: int,
     interp: str,
     resample_fn=resample_affine_fast,
+    p2m_fn=params_to_matrix,
 ) -> Tensor:
     device = source.device
     params = init_params.clone()
@@ -460,7 +529,7 @@ def gauss_newton_rigid_fixed(
     normal_solve = _prepare_normal_solve(JtWJ, device, source.dtype)
 
     for _ in range(max_iter):
-        matrix = params_to_matrix(params)
+        matrix = p2m_fn(params)
         warped = resample_fn(source, matrix, coords, interp, output_shape)
         residual = weight_flat * (base_flat - warped.reshape(-1))
 
@@ -482,6 +551,7 @@ def gauss_newton_rigid_fixed_masked(
     coords_masked: Tensor,
     max_iter: int,
     interp: str,
+    p2m_fn=params_to_matrix,
 ) -> Tensor:
     """GN solver operating only on masked (non-zero weight) voxels.
 
@@ -493,7 +563,7 @@ def gauss_newton_rigid_fixed_masked(
     normal_solve = _prepare_normal_solve(JtWJ, device, source.dtype)
 
     for _ in range(max_iter):
-        matrix = params_to_matrix(params)
+        matrix = p2m_fn(params)
         src_coords = matrix @ coords_masked  # (4, M)
         warped = _separable_resample_3d(
             source, src_coords[0], src_coords[1], src_coords[2], interp
@@ -521,6 +591,7 @@ def batched_gn_estimate(
     dph_thresh: float,
     fixed_iter: bool,
     init_params: Tensor | None = None,
+    p2m_batched_fn=params_to_matrix_batched,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Gauss-Newton WLS for a whole batch of volumes at once (Triton shears).
 
@@ -555,7 +626,7 @@ def batched_gn_estimate(
     invalid = torch.zeros(B, dtype=torch.bool, device=device)
 
     for it in range(max_iter):
-        mats = params_to_matrix_batched(params)  # (B,4,4)
+        mats = p2m_batched_fn(params)  # (B,4,4)
         warped, valid = shear_resample_triton(sources, mats, shape, interp)
         invalid = invalid | ~valid
         residual = weight_flat_1d[None] * (base_flat[None] - warped.reshape(B, N))
@@ -580,10 +651,10 @@ def batched_gn_estimate(
         # it volume by volume where the attempted fine solve finishes worse. The
         # ordinary one-pass path avoids these two extra resamples entirely.
         incumbent_warped, incumbent_valid = shear_resample_triton(
-            sources, params_to_matrix_batched(incumbent), shape, interp
+            sources, p2m_batched_fn(incumbent), shape, interp
         )
         candidate_warped, candidate_valid = shear_resample_triton(
-            sources, params_to_matrix_batched(params), shape, interp
+            sources, p2m_batched_fn(params), shape, interp
         )
         denom = weight_flat_1d.sum().clamp_min(1e-10)
         incumbent_mse = (
@@ -609,6 +680,7 @@ def gn_lpa_rigid(
     weight: Tensor,
     init_params: Tensor,
     config: MocoConfig,
+    p2m_fn=params_to_matrix,
 ) -> tuple[Tensor, int]:
     """Per-volume LPA-based rigid registration using Powell optimizer.
 
@@ -637,7 +709,7 @@ def gn_lpa_rigid(
         eval_count[0] += 1
         p = identity_params(device=device, dtype=dtype)
         p[:6] = torch.tensor(x6, device=device, dtype=dtype)
-        matrix = params_to_matrix(p)
+        matrix = p2m_fn(p)
         warped = apply_affine_interp(source, matrix, config.interp, output_shape)
         # lpa_correlation returns higher = better, so negate for minimization
         cost = -lpa_correlation(
@@ -726,6 +798,35 @@ def _get_voxel_sizes(affine: np.ndarray) -> np.ndarray:
 #: AFNI 3dvolreg's motion-parameter columns, in its order, with their units.
 AFNI_MOTION_LABELS: tuple[str, ...] = ("roll", "pitch", "yaw", "dS", "dL", "dP")
 AFNI_MOTION_UNITS: tuple[str, ...] = ("deg", "deg", "deg", "mm", "mm", "mm")
+
+
+def afni_motion_params(
+    M_dicom: Tensor, affine: np.ndarray, vol_shape: tuple[int, int, int]
+) -> np.ndarray:
+    """(6,) correction params in 3dvolreg's convention for one DICOM matrix.
+
+    Rotations are pivot-free; translations are not. ``matrix_to_params`` reads
+    them about the DICOM origin -- the scanner isocentre, ~57 mm from this
+    sub-pilot02 slab's centre -- so every degree of pitch leaked ~1 mm into dS
+    and dP, inflating translation regressors and FD on rotating runs.
+    3dvolreg's dS/dL/dP are the inverse matrix's translation about the
+    CARDINAL grid centre (reproduced from its own aff12 + 1D files to 1e-4 mm).
+    Returned negated, in solver order, so ``to_afni_motion`` stays the one
+    place that flips signs and reorders columns.
+    """
+    from .nwarpforge import compute_cardinal_affine
+
+    nz, ny, nx = vol_shape
+    card = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))
+    centre_ras = card @ np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0, 1.0])
+    c = np.array([-centre_ras[0], -centre_ras[1], centre_ras[2]])  # RAS -> DICOM
+    M = M_dicom.detach().cpu().double().numpy()
+    Ai = np.linalg.inv(M[:3, :3])
+    t_inv = -Ai @ M[:3, 3]
+    t_c = t_inv + Ai @ c - c
+    params = matrix_to_params(M_dicom)[:6].double().numpy().copy()
+    params[:3] = -t_c
+    return params
 
 
 def to_afni_motion(params_array: np.ndarray) -> np.ndarray:
@@ -839,6 +940,8 @@ def _run_batched_estimation(
     base_copy_idx,
     disable_pbar,
     coarse=None,
+    p2m_fn=params_to_matrix,
+    p2m_batched_fn=params_to_matrix_batched,
 ):
     """Estimate all volumes' rigid params with the whole-batch shear GN solver.
 
@@ -893,6 +996,7 @@ def _run_batched_estimation(
         if coarse is not None:
             bf_c, wf1_c, WJ_c, JtWJ_c = coarse
             srcs_coarse = torch.stack([_blur_volume(srcs_raw[i], coarse_fwhm) for i in range(B)])
+            ccfg = _coarse_config(config)
             init_params, _, _ = batched_gn_estimate(
                 srcs_coarse,
                 bf_c,
@@ -900,11 +1004,12 @@ def _run_batched_estimation(
                 WJ_c,
                 JtWJ_c,
                 vol_shape,
-                config.max_iter,
-                config.interp,
-                config.dxy_thresh,
-                config.dph_thresh,
-                config.fixed_iter,
+                ccfg.max_iter,
+                ccfg.interp,
+                ccfg.dxy_thresh,
+                ccfg.dph_thresh,
+                ccfg.fixed_iter,
+                p2m_batched_fn=p2m_batched_fn,
             )
 
         params, nit, invalid = batched_gn_estimate(
@@ -920,6 +1025,7 @@ def _run_batched_estimation(
             config.dph_thresh,
             config.fixed_iter,
             init_params=init_params,
+            p2m_batched_fn=p2m_batched_fn,
         )
 
         # Re-fit any degenerate-decomposition volumes with the trusted solver.
@@ -935,11 +1041,12 @@ def _run_batched_estimation(
                     init_params[j] if init_params is not None else identity.clone(),
                     config,
                     coords=homo,
+                    p2m_fn=p2m_fn,
                 )
                 params[j] = p
                 nit[j] = ni
 
-        mats = params_to_matrix_batched(params)  # (B,4,4)
+        mats = p2m_batched_fn(params)  # (B,4,4)
         idx_t = torch.as_tensor(idx)
         all_params[idx] = params.detach().cpu().numpy()
         matrices_vox[idx_t] = mats.cpu()
@@ -1170,6 +1277,16 @@ def moco(
     # This is the CPU/MPS gap.
     use_shear_est = config.use_shear and device.type != "cuda"
 
+    # Centre-pivot GN parametrization (see centered_rigid_p2m). The quadrature
+    # solver builds its own corner-pivot matrices internally, so it keeps those.
+    if config.cost == "quad":
+        p2m_piv, p2m_piv_b = params_to_matrix, params_to_matrix_batched
+    else:
+        p2m_piv, p2m_piv_b = centered_rigid_p2m(vol_shape)
+    # 3dvolreg's -delta 0.7 for both steps; its -twopass coarse pass doubles it.
+    deriv_kw = {"p2m_batched_fn": p2m_piv_b, "trans_delta": 0.7, "rot_delfac": 0.7}
+    deriv_kw_coarse = {**deriv_kw, "trans_delta": 1.4, "rot_delfac": 1.4}
+
     # Derivative images are shared by the WLS pass and the reweight pre-pass; they
     # depend only on the (blurred) base, not the weight, so compute them at most
     # once. An override (from the recursive global/preweight call) skips the
@@ -1187,7 +1304,7 @@ def moco(
 
         t0 = time.time()
         derivs = compute_derivative_images(
-            base_est, device, verb=config.verb, use_shear=use_shear_est
+            base_est, device, verb=config.verb, use_shear=use_shear_est, **deriv_kw
         )
         if config.verb >= 1:
             print(f"  Derivative images: {time.time() - t0:.2f}s")
@@ -1237,7 +1354,7 @@ def moco(
         t0 = time.time()
         if derivs is None:
             derivs = compute_derivative_images(
-                base_est, device, verb=config.verb, use_shear=use_shear_est
+                base_est, device, verb=config.verb, use_shear=use_shear_est, **deriv_kw
             )
             if config.verb >= 1:
                 print(f"  Derivative images: {time.time() - t0:.2f}s")
@@ -1341,16 +1458,16 @@ def moco(
                 _gn_fixed = torch.compile(gauss_newton_rigid_fixed_masked, dynamic=True)
             else:
                 _gn_fixed = torch.compile(gauss_newton_rigid_fixed, dynamic=True)
-            _p2m = params_to_matrix  # Uncompiled - called from within compiled _gn_fixed
+            _p2m = p2m_piv  # Uncompiled - called from within compiled _gn_fixed
             _resample = resample_affine_fast  # Uncompiled - called from within compiled _gn_fixed
         else:
             # In slow mode, compile individual functions (convergence check breaks graph)
-            _p2m = torch.compile(params_to_matrix, dynamic=True)
+            _p2m = torch.compile(p2m_piv, dynamic=True)
             _resample = torch.compile(resample_affine_fast, dynamic=True)
             _gn_fixed = gauss_newton_rigid_fixed
         use_cudagraphs = False  # default mode doesn't use CUDA graphs
     else:
-        _p2m = params_to_matrix
+        _p2m = p2m_piv
         _resample = _shear_resample_fn if use_shear_est else resample_affine_fast
         if use_masked:
             _gn_fixed = gauss_newton_rigid_fixed_masked
@@ -1362,6 +1479,7 @@ def moco(
     # and an explicitly-passed callable becomes a dynamo guard where the default
     # is baked into the code object. Empty kwargs keeps that path as it was.
     _gn_fixed_kw = {"resample_fn": _resample} if use_shear_est else {}
+    _gn_fixed_kw["p2m_fn"] = p2m_piv
 
     # Pre-compute coarse-pass normal equations for twopass (done once, not per-volume)
     if config.twopass and config.cost == "wls":
@@ -1369,7 +1487,7 @@ def moco(
         base_coarse = _blur_volume(base, coarse_fwhm)
         weight_coarse = _blur_volume(weight, coarse_fwhm / 2)
         derivs_coarse = compute_derivative_images(
-            base_coarse, device, verb=config.verb, use_shear=use_shear_est
+            base_coarse, device, verb=config.verb, use_shear=use_shear_est, **deriv_kw_coarse
         )
         wf_coarse = weight_coarse.reshape(1, -1)
         bf_coarse = base_coarse.reshape(-1)
@@ -1424,6 +1542,8 @@ def moco(
             config.base_index if base_vol is None else -1,
             disable_pbar,
             coarse=_coarse,
+            p2m_fn=p2m_piv,
+            p2m_batched_fn=p2m_piv_b,
         )
 
     # ── Pass 1 (per-volume): estimate parameters ─────────────────────────
@@ -1470,6 +1590,8 @@ def moco(
         if config.twopass and config.cost == "wls":
             source_coarse = _blur_volume(source, coarse_fwhm)
             coarse_incumbent = init_params.clone()
+            coarse_rms: list[float] = []
+            ccfg = _coarse_config(config)
             if config.fixed_iter:
                 init_params = _gn_fixed(
                     bf_coarse,
@@ -1479,8 +1601,8 @@ def moco(
                     JtWJ_c,
                     init_params,
                     homo_coords,
-                    config.max_iter,
-                    config.interp,
+                    ccfg.max_iter,
+                    ccfg.interp,
                     **_gn_fixed_kw,
                 )
             else:
@@ -1491,10 +1613,11 @@ def moco(
                     WJ_c,
                     JtWJ_c,
                     init_params,
-                    config,
+                    ccfg,
                     coords=homo_coords,
                     p2m_fn=_p2m,
                     resample_fn=_resample,
+                    init_rms_out=coarse_rms,
                 )
             init_params = _prefer_wls_incumbent(
                 bf_coarse,
@@ -1503,13 +1626,16 @@ def moco(
                 coarse_incumbent,
                 init_params,
                 homo_coords,
-                config.interp,
+                ccfg.interp,
                 vol_shape,
                 resample_fn=_resample,
+                p2m_fn=_p2m,
+                incumbent_rms=coarse_rms[0] if coarse_rms else None,
             )
 
         # Main alignment
         fine_incumbent = init_params.clone()
+        fine_rms: list[float] = []
         if config.cost == "wls":
             if config.fixed_iter:
                 if use_masked:
@@ -1523,6 +1649,7 @@ def moco(
                         coords_masked,
                         config.max_iter,
                         config.interp,
+                        p2m_fn=p2m_piv,
                     )
                 else:
                     params = _gn_fixed(
@@ -1563,6 +1690,7 @@ def moco(
                         coords=homo_coords,
                         p2m_fn=_p2m,
                         resample_fn=_resample,
+                        init_rms_out=fine_rms,
                     )
         elif config.cost == "lpa":
             params, n_iter = gn_lpa_rigid(
@@ -1571,6 +1699,7 @@ def moco(
                 weight,
                 init_params,
                 config,
+                p2m_fn=_p2m,
             )
         elif config.cost == "quad":
             from .quadrature import quadrature_gn_rigid, quadrature_gn_rigid_fixed
@@ -1616,6 +1745,8 @@ def moco(
                 config.interp,
                 vol_shape,
                 resample_fn=_resample,
+                p2m_fn=_p2m,
+                incumbent_rms=fine_rms[0] if fine_rms else None,
             )
 
         # Fallback: if result is worse than identity, retry from identity (skip in fixed_iter mode)
@@ -1664,6 +1795,7 @@ def moco(
                         weight,
                         identity.clone(),
                         config,
+                        p2m_fn=_p2m,
                     )
                 elif config.cost == "quad":
                     from .quadrature import quadrature_gn_rigid
@@ -1746,9 +1878,7 @@ def moco(
         M_dicom = voxel_matrix_to_dicom(M_vox, affine, affine)
         matrices_dicom_np[t] = M_dicom.numpy()
 
-        # Extract parameters from the forward transformation
-        p12 = matrix_to_params(M_dicom)
-        params_dicom[t] = p12[:6].numpy()
+        params_dicom[t] = afni_motion_params(M_dicom, affine, vol_shape)
 
         # Max displacement
         max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
@@ -2017,7 +2147,7 @@ def moco_spacetime(
         M_vox = poses[t]
         M_dicom = voxel_matrix_to_dicom(M_vox, affine, affine)
         matrices_dicom_np[t] = M_dicom.numpy()
-        params_dicom[t] = matrix_to_params(M_dicom)[:6].numpy()
+        params_dicom[t] = afni_motion_params(M_dicom, affine, vol_shape)
         max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
 
     assert result is not None

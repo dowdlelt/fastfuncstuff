@@ -53,6 +53,9 @@ class ImageWindow(QtWidgets.QWidget):
     """One image viewport as a top-level window."""
 
     closed = QtCore.Signal(str)
+    #: A review key asked the mode to do something: the action's name. Ignored
+    #: by the controller in a mode that does not declare that action.
+    action_requested = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -145,6 +148,9 @@ class ImageWindow(QtWidgets.QWidget):
         self.resize(280, 280)
         self.setMinimumSize(64, 64)
 
+        def ask(name: str) -> Callable[[], None]:
+            return lambda: self.action_requested.emit(name)
+
         self.help = ShortcutHelp(self, f"image · {vid}")
         self.help.apply(
             [
@@ -191,6 +197,14 @@ class ImageWindow(QtWidgets.QWidget):
                     None,
                     group="align mode",
                 ),
+                # The review loop (ICA, InstaPCA) is judged on the map, so its
+                # keys belong here as well as in the trace windows. Left/Right
+                # move the crosshair here, hence < and > for stepping.
+                Binding(">", "next component", ask("next"), group="review"),
+                Binding("<", "previous component", ask("prev"), group="review"),
+                Binding("s", "label signal, then next", ask("signal"), group="review"),
+                Binding("n", "label noise, then next", ask("noise"), group="review"),
+                Binding("u", "clear the label", ask("unlabel"), group="review"),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]

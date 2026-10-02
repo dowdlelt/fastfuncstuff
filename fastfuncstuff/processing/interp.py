@@ -12,6 +12,7 @@ Key functions:
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import time
@@ -544,6 +545,40 @@ _M3_A, _M3_B, _M3_C = 0.4243801, 0.4973406, 0.0782793
 _HW_A, _HW_B = 0.53836, 0.46164
 
 
+def _is_compile_failure(exc: BaseException) -> bool:
+    """True for a dynamo/inductor build failure rather than a runtime error."""
+    return type(exc).__module__.startswith(("torch._inductor", "torch._dynamo"))
+
+
+def compile_with_eager_fallback(fn, **compile_kwargs):
+    """``torch.compile(fn)`` that latches to ``fn`` if the build fails.
+
+    ``torch.compile`` is lazy: a toolchain that cannot build the kernel (inductor's
+    CPU C++ codegen emitting undeclared temporaries under torch 2.12 is the bug of
+    record) raises on the first CALL, past any try around ``torch.compile`` itself,
+    and used to abort ffs_moco -device cpu outright. One failed attempt, then eager
+    for the rest of the process. Callers keep this out of dynamo traces already.
+    """
+    state = {"fn": torch.compile(fn, **compile_kwargs)}
+
+    def call(*args, **kwargs):
+        if state["fn"] is fn:
+            return fn(*args, **kwargs)
+        try:
+            return state["fn"](*args, **kwargs)
+        except Exception as exc:
+            if not _is_compile_failure(exc):
+                raise
+            state["fn"] = fn
+            print(
+                f"  [compile] {getattr(fn, '__name__', 'kernel')}: torch.compile failed "
+                f"({type(exc).__name__}); continuing eager"
+            )
+            return fn(*args, **kwargs)
+
+    return functools.update_wrapper(call, state["fn"])
+
+
 @lru_cache(maxsize=1)
 def _wsinc5_params() -> tuple[int, float, float, bool]:
     """Read the ``AFNI_WSINC5_*`` env vars once, mirroring AFNI ``setup_wsinc5``.
@@ -876,12 +911,12 @@ def _get_kernel_fn(kernel_fn, device: torch.device):
         if kernel_fn is _wsinc5_kernel:
             # Read the params per call and pass them in, so they are guarded
             # values rather than constants frozen into the trace.
-            inner = torch.compile(_wsinc5_taps, dynamic=True)
+            inner = compile_with_eager_fallback(_wsinc5_taps, dynamic=True)
 
             def compiled(fx: Tensor) -> Tensor:
                 return inner(fx, *_wsinc5_params())
         else:
-            compiled = torch.compile(kernel_fn, dynamic=True)
+            compiled = compile_with_eager_fallback(kernel_fn, dynamic=True)
     except Exception:
         compiled = kernel_fn  # compile unavailable on this build
     _compiled_kernel_fns[key] = compiled
@@ -1181,7 +1216,7 @@ def _get_gather_contract(device: torch.device):
     if _eager_seconds[dt] < _measured_compile_cost(dt):
         return _gather_contract
     try:
-        compiled = torch.compile(_gather_contract, dynamic=True)
+        compiled = compile_with_eager_fallback(_gather_contract, dynamic=True)
     except Exception:
         compiled = _gather_contract  # compile unavailable
     _compiled_gather_contract[dt] = compiled

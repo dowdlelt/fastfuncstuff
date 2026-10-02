@@ -18,6 +18,7 @@ See ``../afni/src/fastreg/fr_gpu_rota.cu`` and ``thd_shear3d.c``.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -522,6 +523,32 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
 # ---------------------------------------------------------------------------
 
 
+def _shear_taps(aa: Tensor, mode: str) -> tuple[tuple[int, ...], list[Tensor]]:
+    """Tap offsets and per-tap weights (each shaped like ``aa``) for one 1D shear."""
+    if mode == "linear":
+        return (0, 1), [1.0 - aa, aa]
+    if mode == "nn":
+        return (0,), [torch.ones_like(aa)]
+    if mode == "wsinc5":
+        offs = tuple(range(-4, 6))  # AFNI floor wsinc5: 10 taps, raw
+        wlist = []
+        for k in offs:
+            dist = (aa - k).abs()
+            pid = torch.pi * dist
+            s = torch.where(dist > 0.01, torch.sin(pid) / pid, 1.0 - 1.6449341 * dist * dist)
+            mx = 0.19999 * dist
+            m3 = (
+                0.4243801
+                + 0.4973406 * torch.cos(torch.pi * mx)
+                + 0.0782793 * torch.cos(torch.pi * mx * 2.0)
+            )
+            wlist.append(s * m3)
+        return offs, wlist
+    kfn, H = _FLOOR_KERNELS[mode]
+    w = kfn(aa.reshape(-1))  # (K, ntaps)
+    return tuple(range(-(H - 1), H + 1)), [w[:, j].reshape(aa.shape) for j in range(w.shape[1])]
+
+
 def _interp_1d_along(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     """Shift each row of ``vol`` along ``dim``: out[..,p,..] = vol[..,p-af,..].
 
@@ -536,33 +563,7 @@ def _interp_1d_along(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     ia = torch.floor(nshift)
     aa = nshift - ia  # in [0,1), shape S
     ia_l = ia.to(torch.long)
-    aa_flat = aa.reshape(-1)  # (K,) over the two non-dim axes
-
-    if mode == "linear":
-        offs = (0, 1)
-        wlist = [1.0 - aa, aa]
-    elif mode == "nn":
-        offs = (0,)
-        wlist = [torch.ones_like(aa)]
-    elif mode == "wsinc5":
-        offs = tuple(range(-4, 6))  # AFNI floor wsinc5: 10 taps, raw
-        wlist = []
-        for k in offs:
-            dist = (aa - k).abs()
-            pid = torch.pi * dist
-            s = torch.where(dist > 0.01, torch.sin(pid) / pid, 1.0 - 1.6449341 * dist * dist)
-            mx = 0.19999 * dist
-            m3 = (
-                0.4243801
-                + 0.4973406 * torch.cos(torch.pi * mx)
-                + 0.0782793 * torch.cos(torch.pi * mx * 2.0)
-            )
-            wlist.append(s * m3)
-    else:
-        kfn, H = _FLOOR_KERNELS[mode]
-        offs = tuple(range(-(H - 1), H + 1))
-        w = kfn(aa_flat)  # (K, ntaps)
-        wlist = [w[:, j].reshape(aa.shape) for j in range(w.shape[1])]
+    offs, wlist = _shear_taps(aa, mode)
 
     p_shape = [1, 1, 1]
     p_shape[dim] = n
@@ -576,6 +577,43 @@ def _interp_1d_along(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
         acc = acc + w * torch.where(inb, g, torch.zeros((), device=device, dtype=vol.dtype))
 
     return acc
+
+
+def _interp_1d_rowconv(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
+    """:func:`_interp_1d_along` as one depthwise FIR per row, then one gather.
+
+    The shift is constant along a row, so a row's taps are a fixed filter: run
+    every row through its own filter (``conv1d`` with one group per row) over a
+    zero-padded copy, then pick each output's window start. That replaces the
+    per-tap index/mask/gather/where passes with one conv and one gather -- ~10x
+    on a single CPU thread (heptic 154 -> 16 ms per pass on 85x130x130), equal
+    to float rounding.
+
+    Only ONE full-size integer op may build the gather index: the per-row
+    constants fold into a (K, 1) offset first, and the pad is sized from the
+    largest actual shift so no clamp is needed. Written the obvious way,
+    ``(p + shift - lo + pad).clamp(...)`` was four full-volume int64 passes and
+    half the pass's time. A shift is capped at row length + kernel width, past
+    which the window lies wholly in the zero pad either way: AFNI's zero-fill.
+    """
+    n = vol.shape[dim]
+    nshift = -af
+    ia = torch.floor(nshift)
+    aa = nshift - ia
+    offs, wlist = _shear_taps(aa, mode)
+    ntaps, lo = len(offs), -offs[0]
+
+    rows = vol.movedim(dim, -1)
+    lead = rows.shape[:-1]
+    K = rows[..., 0].numel()
+    cap = n + ntaps
+    shift = ia.to(torch.long).movedim(dim, -1).reshape(K, 1).clamp(-cap, cap)
+    pad = int(shift.abs().max()) + ntaps
+    padded = torch.nn.functional.pad(rows.reshape(1, K, n), (pad, pad))
+    w = torch.stack([wt.expand(af.shape).movedim(dim, -1).reshape(K) for wt in wlist], dim=-1)
+    filt = torch.nn.functional.conv1d(padded, w.reshape(K, 1, ntaps).to(vol.dtype), groups=K)[0]
+    start = torch.arange(n, device=vol.device) + (shift + (pad - lo))
+    return torch.gather(filt, -1, start).reshape(*lead, n).movedim(-1, dim)
 
 
 # The eager pass above runs ~6 unfused full-volume ops per tap (materialized
@@ -647,6 +685,10 @@ def _get_shear_interp(device: torch.device):
     must not touch module globals while traced (that mutation becomes a guard
     and recompiles every call -- interp._get_gather_contract has the full story).
     """
+    if device.type == "cpu":
+        # Eager row-conv already beats the compiled tap loop here, and needs no
+        # inductor C++ toolchain (whose CPU codegen broke under torch 2.12).
+        return _interp_1d_rowconv
     if not _shear_compile_allowed(device):
         return _interp_1d_along
     dt = device.type
@@ -658,7 +700,7 @@ def _get_shear_interp(device: torch.device):
     ):
         return _interp_1d_along
     try:
-        compiled = torch.compile(_interp_1d_along, dynamic=False)
+        compiled = _interp.compile_with_eager_fallback(_interp_1d_along, dynamic=False)
     except Exception:
         compiled = _interp_1d_along  # compile unavailable on this build
     _compiled_shear_interp[dt] = compiled
@@ -709,6 +751,54 @@ def _unpack(ax: int, scl3) -> tuple[float, float]:
         return scl3[0], scl3[1]
 
 
+def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
+    """Paeth plan for a pull that rotates about ONE voxel axis, else ``None``.
+
+    The 4-shear factorization is NaN for an exact single-axis rotation, and
+    AFNI's remedy (conjugate by a 1e-6 rad rotation, thd_shear3d.c:rot_to_shear)
+    yields a valid but cancelling +/-0.65 vox/slice shear pair whose zero-filled
+    output measured 57% wrong. A plane rotation needs only three well-conditioned
+    shears, R = Su(-tan t/2) Sv(sin t) Su(-tan t/2), so take that route instead.
+    It matters because moco's rotation derivative images are exactly this case;
+    on the gather they cost ~50 s on one CPU thread.
+
+    Returns a list of ``(fr_axis, a, b, s)`` steps for ``_apply_one_shear``, in
+    its centred coordinates. The in-plane shift rides on the shears' offsets
+    (folding it in halved the error vs separate translation passes); only a shift
+    along the rotation axis costs a pass of its own.
+    """
+    M = matrix.detach().to("cpu", torch.float64).reshape(-1, 4, 4)[0]
+    A, t = M[:3, :3], M[:3, 3]
+    nz, ny, nx = shape
+    c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    for k in range(3):
+        u, v = [i for i in range(3) if i != k]
+        off = A[k, u].abs() + A[k, v].abs() + A[u, k].abs() + A[v, k].abs()
+        if off > 1e-12 or abs(float(A[k, k]) - 1.0) > 1e-12:
+            continue
+        cos_t, sin_t = float(A[u, u]), float(A[v, u])
+        if abs(float(A[v, v]) - cos_t) > 1e-9 or abs(float(A[u, v]) + sin_t) > 1e-9:
+            return None  # not a proper rotation in the (u, v) plane
+        theta = math.atan2(sin_t, cos_t)
+        alpha, beta = -math.tan(theta / 2.0), math.sin(theta)
+        d = A @ c + t - c  # out(p) = src(c + A (p - c) + d), p centred
+
+        def step(axis: int, other: int, coef: float, off: float):
+            # pull out(p) = in(p + (coef * p_other + off) e_axis)  <=>  af = -(...)
+            p1fr = _AXIS_INFO[axis][1][0]
+            a, b = (-coef, 0.0) if other == p1fr else (0.0, -coef)
+            return (axis, a, b, -off)
+
+        # src(S1 (S2 (S3 p) + s2 e_v) + s1 e_u) = src(A p + S1 s2 e_v + s1 e_u)
+        s2 = float(d[v])
+        s1 = float(d[u]) - alpha * s2
+        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, alpha, 0.0)]
+        if abs(float(d[k])) > 0.0:
+            steps.insert(0, (k, 0.0, 0.0, -float(d[k])))
+        return steps
+    return None
+
+
 def shear_resample(
     source: Tensor, matrix: Tensor, shape: tuple[int, int, int], mode: str
 ) -> Tensor | None:
@@ -720,7 +810,14 @@ def shear_resample(
     """
     ax_t, scl_t, sft_t, valid = rigid_matrix_to_shears(matrix, shape)
     if not bool(valid.all()):
-        return None
+        plan = _single_axis_plan(matrix, shape)
+        if plan is None:
+            return None
+        interp_fn = _get_shear_interp(source.device)
+        vol = source
+        for axis, a, b, sft in plan:
+            vol = _apply_one_shear(vol, axis, a, b, sft, mode, interp_fn)
+        return vol
     ax_l = ax_t[0].tolist()
     scl_l = scl_t[0].tolist()
     sft_l = sft_t[0].tolist()

@@ -19,6 +19,7 @@ from fastfuncstuff.viewer.modes.denoise import DenoiseMode  # noqa: E402
 from fastfuncstuff.viewer.modes.ica import ICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instaglm import InstaGLMMode  # noqa: E402
+from fastfuncstuff.viewer.modes.instapca import InstaPCAMode  # noqa: E402
 
 # Registration is an import side effect, so every built-in mode must be
 # imported here or it will not appear in the mode selector.
@@ -37,6 +38,7 @@ __all__ = [
     "ICAMode",
     "InstaCorrMode",
     "InstaGLMMode",
+    "InstaPCAMode",
     "IntControl",
     "Mode",
     "OverlayKind",

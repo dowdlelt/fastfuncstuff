@@ -1408,9 +1408,7 @@ class TestDerivativeFreeRefinement:
         start = _identity_physical()
         cost = self._bowl(_normalize(start, bounds), bounds, device)
 
-        out, costs = _refine_cmaes_batched(
-            [start], config, bounds, device, cost, verb=0, n_iters=1
-        )
+        out, costs = _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=1)
 
         np.testing.assert_array_equal(out[0], start)
         assert costs[0] == pytest.approx(0.0)
@@ -1946,3 +1944,32 @@ class TestMovie:
         final = rec._frames[-1].values[0].float()
         inner = expected > 0.05
         torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)
+
+
+def test_search_pivot_is_the_grid_centre_and_round_trips():
+    """Allineate's residual rotations pivot at the searched grid's centre.
+
+    params_to_matrix pivots at voxel (0,0,0), the corner of the cropped base box,
+    so a rotation dragged the brain through a ~half-diagonal lever and the search
+    fought a diagonal rotation/translation valley. The hand-off between ladder
+    rungs converts with m2p under the new grid's pivot, so it must invert p2m.
+    """
+    from fastfuncstuff.processing.affine import identity_params, params_to_matrix
+    from fastfuncstuff.processing.allineate import _p2m_fns, _pivot_at, _pivot_scope
+
+    dev = torch.device("cpu")
+    shape = (20, 30, 26)  # (nz, ny, nx)
+    p = identity_params(device=dev)
+    p[3:6] = torch.tensor([4.0, -3.0, 2.0])
+    p[0:3] = torch.tensor([1.5, -0.5, 2.0])
+    with _pivot_scope():
+        assert _p2m_fns()[0] is params_to_matrix  # unset: legacy corner pivot
+        with _pivot_at(shape, dev):
+            p2m, p2m_b, m2p = _p2m_fns()
+            c = torch.tensor([12.5, 14.5, 9.5, 1.0])
+            rot = p.clone()
+            rot[0:3] = 0.0
+            torch.testing.assert_close(p2m(rot) @ c, c, atol=1e-5, rtol=0)
+            torch.testing.assert_close(p2m_b(p[None])[0], p2m(p))
+            torch.testing.assert_close(m2p(p2m(p))[:6], p[:6], atol=1e-4, rtol=0)
+        assert _p2m_fns()[0] is params_to_matrix  # restored on exit

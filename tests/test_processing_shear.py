@@ -102,12 +102,14 @@ def test_pitch_dominated_rotation_not_corrupted():
         assert rel < 0.01, f"pitch-dominated eps={eps}: relative error {rel:.4f}"
 
 
-def test_pure_axis_rotation_falls_back():
-    # exactly axis-aligned rotations are degenerate for every xzyx ordering;
-    # shear_resample returns None so the caller uses a general resample.
+def test_pure_axis_rotation_takes_the_paeth_path():
+    # Exactly axis-aligned rotations are degenerate for every xzyx ordering, so
+    # the 4-shear plan is invalid -- but a plane rotation needs only 3 shears.
+    # Accuracy is pinned by test_single_axis_rotation_shears_like_its_neighbour.
     vol = _make_volume()
     M = _rigid_matrix(0, 0, 0, 2.0, 0, 0)
-    assert shear_resample(vol, M, vol.shape, "heptic") is None
+    assert not bool(rigid_matrix_to_shears(M, vol.shape)[3].all())
+    assert shear_resample(vol, M, vol.shape, "heptic") is not None
 
 
 def test_identity_is_near_exact():
@@ -254,3 +256,55 @@ def test_degenerate_matrix_is_still_reported_invalid():
     d = torch.zeros(1, 3, dtype=torch.float64)
     _, _, _, valid = _shear_best(q, d)
     assert not bool(valid.all())
+
+
+@pytest.mark.parametrize("mode", ["nn", "linear", "cubic", "quintic", "heptic", "wsinc5"])
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_rowconv_shear_matches_the_tap_loop(mode, dim):
+    """The CPU row-conv pass must equal the reference tap loop, edges included.
+
+    Its pad has to cover a whole kernel width: at H+1 a window starting just
+    outside the row clamped onto real voxels and the edge rows came out wrong.
+    """
+    from fastfuncstuff.processing.shear import _interp_1d_along, _interp_1d_rowconv
+
+    g = torch.Generator().manual_seed(dim)
+    vol = torch.randn(9, 11, 13, generator=g)
+    shp = [9, 11, 13]
+    shp[dim] = 1
+    af = torch.randn(shp, generator=g) * 4.0
+    af.view(-1)[:3] = torch.tensor([40.0, -40.0, 10.5])  # rows shifted out of the FOV
+    ref = _interp_1d_along(vol, dim, af, mode)
+    out = _interp_1d_rowconv(vol, dim, af, mode)
+    torch.testing.assert_close(out, ref, rtol=0, atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "setp",
+    [{3: 0.5}, {4: -0.5}, {5: 0.7}, {4: 8.0, 1: 2.0}, {5: -3.0, 2: 1.5, 0: 0.4}],
+)
+def test_single_axis_rotation_shears_like_its_neighbour(setp):
+    """An exact single-axis rotation used to come back None (NaN factorization).
+
+    That is what moco's rotation derivative images request; the gather fallback
+    took ~50 s on one CPU thread. The Paeth path must agree with the 4-shear plan
+    of a rotation 1e-3 deg away, as closely as two shear plans agree at all.
+    """
+    from fastfuncstuff.processing.affine import identity_params, params_to_matrix
+
+    g = torch.Generator().manual_seed(0)
+    vol = torch.randn(1, 1, 30, 40, 36, generator=g)
+    for _ in range(3):
+        vol = torch.nn.functional.avg_pool3d(vol, 5, 1, 2)
+    vol = vol[0, 0]
+    p = identity_params(device=torch.device("cpu"), dtype=torch.float64)
+    for k, v in setp.items():
+        p[k] = v
+    near = p.clone()
+    near[3 + (max(k for k in setp if k >= 3) - 2) % 3] += 1e-3
+    out = shear_resample(vol, params_to_matrix(p).float(), tuple(vol.shape), "heptic")
+    ref = shear_resample(vol, params_to_matrix(near).float(), tuple(vol.shape), "heptic")
+    assert out is not None and ref is not None
+    inner = (slice(6, -6),) * 3
+    err = (out - ref)[inner].pow(2).mean().sqrt() / vol[inner].std()
+    assert err < 0.01
