@@ -587,8 +587,14 @@ def _interp_1d_rowconv(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     zero-padded copy, then pick each output's window start. That replaces the
     per-tap index/mask/gather/where passes with one conv and one gather -- ~10x
     on a single CPU thread (heptic 154 -> 16 ms per pass on 85x130x130), equal
-    to float rounding. The pad is a full kernel width, so a window that starts
-    outside the row clamps onto pure padding: AFNI's zero-fill.
+    to float rounding.
+
+    Only ONE full-size integer op may build the gather index: the per-row
+    constants fold into a (K, 1) offset first, and the pad is sized from the
+    largest actual shift so no clamp is needed. Written the obvious way,
+    ``(p + shift - lo + pad).clamp(...)`` was four full-volume int64 passes and
+    half the pass's time. A shift is capped at row length + kernel width, past
+    which the window lies wholly in the zero pad either way: AFNI's zero-fill.
     """
     n = vol.shape[dim]
     nshift = -af
@@ -596,17 +602,17 @@ def _interp_1d_rowconv(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     aa = nshift - ia
     offs, wlist = _shear_taps(aa, mode)
     ntaps, lo = len(offs), -offs[0]
-    pad = ntaps
 
     rows = vol.movedim(dim, -1)
     lead = rows.shape[:-1]
     K = rows[..., 0].numel()
+    cap = n + ntaps
+    shift = ia.to(torch.long).movedim(dim, -1).reshape(K, 1).clamp(-cap, cap)
+    pad = int(shift.abs().max()) + ntaps
     padded = torch.nn.functional.pad(rows.reshape(1, K, n), (pad, pad))
     w = torch.stack([wt.expand(af.shape).movedim(dim, -1).reshape(K) for wt in wlist], dim=-1)
     filt = torch.nn.functional.conv1d(padded, w.reshape(K, 1, ntaps).to(vol.dtype), groups=K)[0]
-    shift = ia.to(torch.long).movedim(dim, -1).reshape(K, 1)
-    p = torch.arange(n, device=vol.device)
-    start = (p + shift - lo + pad).clamp(0, filt.shape[-1] - 1)
+    start = torch.arange(n, device=vol.device) + (shift + (pad - lo))
     return torch.gather(filt, -1, start).reshape(*lead, n).movedim(-1, dim)
 
 
