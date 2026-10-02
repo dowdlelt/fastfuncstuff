@@ -1163,7 +1163,10 @@ def auto_polort(
 # Per-run transforms a nuisance block may declare. Adding one here (plus a
 # branch in apply_nuisance_transform) makes it available to every input mode
 # and to design.toml's `transform =` field at once.
-NUISANCE_TRANSFORMS = ("none", "deriv", "deriv_back", "deriv_fwd")
+NUISANCE_TRANSFORMS = ("none", "deriv", "deriv_back", "deriv_fwd", "spikes")
+# Transforms whose output width is not the input's: the block's width must be
+# measured after transforming, not from the file.
+_WIDTH_CHANGING_TRANSFORMS = ("spikes",)
 
 
 def apply_nuisance_transform(arr: np.ndarray, transform: str) -> np.ndarray:
@@ -1183,9 +1186,26 @@ def apply_nuisance_transform(arr: np.ndarray, transform: str) -> np.ndarray:
 
     Per run is not an optimisation: differencing across a run boundary turns the
     between-run offset into a spike in a regressor that then eats real signal.
+
+    - ``spikes`` — a censor keep mask (one 0/1 column, 0 = censor, as ffs_moco
+      ``-censor`` writes) becomes one one-hot column per censored TR
+      (``1d_tool.py -write_censor_spikes``). For OLS this is exactly dropping
+      those rows; prefer ffs_reml ``-censor`` for an ARMA noise model. A run with
+      nothing censored comes out with zero columns.
     """
     if transform in (None, "", "none"):
         return arr
+    if transform == "spikes":
+        from fastfuncstuff.processing.censor import censor_to_spikes
+
+        a = np.asarray(arr)
+        a = a.reshape(len(a), -1)
+        if a.shape[1] != 1 or not np.isin(a, (0, 1)).all():
+            raise ValueError(
+                "the spikes transform takes a censor keep mask: one column of 0 (censor) "
+                f"and 1 (keep), got shape {a.shape}"
+            )
+        return censor_to_spikes(a[:, 0])
     a = np.asarray(arr, dtype=np.float64)
     out = np.zeros_like(a)
     if transform in ("deriv", "deriv_back"):
@@ -1248,6 +1268,11 @@ class NuisanceBlock:
     transform: str = "none"
 
     def __post_init__(self):
+        # A spike lives in one run. Shared (-ortvec) semantics would merge run 1's
+        # first spike and run 2's first spike into ONE regressor with two ones --
+        # censoring neither TR.
+        if self.transform == "spikes":
+            self.block_diagonal = True
         if not self.source:
             self.source = [None] * len(self.per_run)
         elif len(self.source) != len(self.per_run):
@@ -1259,6 +1284,9 @@ class NuisanceBlock:
     @property
     def n_columns(self) -> int:
         """Max columns across runs — the assembled block's width."""
+        if self.transform in _WIDTH_CHANGING_TRANSFORMS:
+            widths = (self.transformed_run(i) for i in range(len(self.per_run)))
+            return max((m.shape[1] for m in widths if m is not None), default=0)
         return max((m.shape[1] for m in self.per_run if m is not None), default=0)
 
     def transformed_run(self, run_idx: int) -> np.ndarray | None:
@@ -1598,7 +1626,9 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
     transform_note = (
         " LABEL may carry a transform modifier: LABEL:deriv (per-run backward "
         "difference, as 1d_tool.py -derivative), LABEL:deriv_fwd (forward "
-        "difference), LABEL:deriv_back (explicit synonym of :deriv)."
+        "difference), LABEL:deriv_back (explicit synonym of :deriv), LABEL:spikes "
+        "(a censor keep mask from ffs_moco -censor, expanded to one 1-at-the-TR "
+        "column per censored TR; ffs_reml should prefer -censor)."
         "\nFILE may carry AFNI 1D selectors: [cols] and {rows}, the same way round as"
         " AFNI reads them for a .1D file. Quote them so the shell does not expand the"
         " brackets.\n"
@@ -2317,7 +2347,8 @@ def build_nuisance_block_diag(
             demeaned = False
             for i in range(n_runs):
                 m = block.transformed_run(i)
-                if m is None:
+                # A spike block for a run with nothing censored has zero columns.
+                if m is None or m.shape[1] == 0:
                     continue
                 m = m.copy()
                 col_mean = m.mean(axis=0, keepdims=True)

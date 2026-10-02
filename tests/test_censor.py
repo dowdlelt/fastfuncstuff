@@ -212,3 +212,79 @@ def test_moco_batch_skip_sees_the_censor_outputs():
     )
     moco._validate_run_args(a)
     assert {"e.1D", "f.1D", "o.1D", "c.1D"} <= set(moco._expected_outputs(a))
+
+
+# --- the :spikes ortvec transform -------------------------------------------
+
+
+def test_spikes_transform_rejects_anything_but_a_keep_mask():
+    from fastfuncstuff.cli_utils import apply_nuisance_transform
+
+    np.testing.assert_array_equal(
+        apply_nuisance_transform(np.array([[1], [0], [1]]), "spikes"), [[0], [1], [0]]
+    )
+    with pytest.raises(ValueError, match="keep mask"):
+        apply_nuisance_transform(np.ones((4, 6)), "spikes")  # a motion file by mistake
+
+
+def _censor_file(tmp_path, keep):
+    path = tmp_path / "censor.1D"
+    np.savetxt(path, np.asarray(keep), fmt="%d")
+    return path
+
+
+def test_full_length_spikes_get_one_column_per_censored_tr(tmp_path):
+    from fastfuncstuff.cli_utils import (
+        build_nuisance_block_diag,
+        make_nuisance_block_from_full_length,
+    )
+
+    keep = np.ones(12, dtype=int)
+    keep[[1, 2, 9]] = 0  # two spikes in run 1, one in run 3, none in run 2
+    blk = make_nuisance_block_from_full_length(
+        _censor_file(tmp_path, keep), "cen", [0, 4, 8], 12, transform="spikes"
+    )
+    # A full-length file is normally SHARED across runs; spikes must not be, or
+    # run 1's first spike and run 3's would collapse into one regressor.
+    assert blk.block_diagonal and blk.n_columns == 2
+    X = build_nuisance_block_diag(
+        blocks=[blk], run_starts=[0, 4, 8], n_timepoints=12, polort=0, device=CPU, verbose=False
+    ).numpy()
+    spikes = X[:, 3:]  # after the three per-run constants
+    assert spikes.shape[1] == 3
+    for col, tr in zip(spikes.T, (1, 2, 9), strict=True):
+        assert np.argmax(np.abs(col)) == tr  # demeaned per run, peak at the censored TR
+
+
+def test_spikes_fit_equals_dropping_the_rows():
+    from fastfuncstuff.cli_utils import NuisanceBlock, build_nuisance_block_diag
+
+    rng = np.random.default_rng(5)
+    T = 40
+    keep = np.ones(T, dtype=int)
+    keep[[3, 17, 18, 30]] = 0
+    task = rng.normal(size=(T, 2))
+    y = task @ [1.5, -0.7] + rng.normal(size=T)
+    y[keep == 0] += 25.0  # the junk censoring is meant to remove
+    blk = NuisanceBlock("cen", [keep[:20, None], keep[20:, None]], transform="spikes")
+    N = build_nuisance_block_diag(
+        blocks=[blk], run_starts=[0, 20], n_timepoints=T, polort=1, device=CPU, verbose=False
+    ).numpy()
+    b_spike = np.linalg.lstsq(np.hstack([task, N]), y, rcond=None)[0][:2]
+    poly = N[:, :4]  # the two runs' constant + linear
+    k = keep == 1
+    b_drop = np.linalg.lstsq(np.hstack([task, poly])[k], y[k], rcond=None)[0][:2]
+    np.testing.assert_allclose(b_spike, b_drop, atol=1e-5)
+
+
+def test_design_spec_skips_a_spike_block_with_nothing_censored(tmp_path):
+    from fastfuncstuff.cli.design_spec import _materialize_nuisance
+    from fastfuncstuff.design.spec import NuisanceSpec
+
+    clean = _censor_file(tmp_path, np.ones(10, dtype=int))
+    spec = NuisanceSpec(file=str(clean), label="cen", transform="spikes")
+    assert _materialize_nuisance(clean, spec, tmp_path, run_lengths=[5, 5]) is None
+    keep = np.ones(10, dtype=int)
+    keep[[2, 7]] = 0
+    out = _materialize_nuisance(_censor_file(tmp_path, keep), spec, tmp_path, run_lengths=[5, 5])
+    np.testing.assert_array_equal(np.flatnonzero(np.loadtxt(out, ndmin=2).sum(axis=1)), [2, 7])

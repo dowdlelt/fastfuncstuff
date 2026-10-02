@@ -528,10 +528,11 @@ def _materialize_nuisance(
     n_spec: NuisanceSpec,
     tmpdir: Path | None,
     run_lengths: list[int] | None = None,
-) -> Path:
+) -> Path | None:
     """Apply a nuisance block's transform + rescale, writing the result to
     *tmpdir* and returning its path. The original file is untouched; a block
-    that asks for neither is passed straight through.
+    that asks for neither is passed straight through. None means the block
+    has no columns (``spikes`` with nothing censored) and must be skipped.
 
     ``run_lengths`` splits a scope="full" file into runs so the derivative never
     crosses a run boundary (per-run and glob files are one run by construction,
@@ -546,7 +547,13 @@ def _materialize_nuisance(
             f"nuisance '{n_spec.label}': transform/rescale requires a tmpdir to write to"
         )
     arr = np.loadtxt(path, ndmin=2)
-    if n_spec.transform != "none":
+    if n_spec.transform == "spikes":
+        # One-hot columns over the whole file are already run-correct: each
+        # censored TR belongs to exactly one run.
+        arr = apply_nuisance_transform(arr, "spikes")
+        if arr.shape[1] == 0:
+            return None
+    elif n_spec.transform != "none":
         if run_lengths:
             if sum(run_lengths) != arr.shape[0]:
                 raise ValueError(
@@ -716,36 +723,27 @@ def _resolve_nuisance_for_compile(
 
     for n in nuisance:
         if n.scope == "full":
-            ortvec_files.append(
-                (
-                    _materialize_nuisance(
-                        _trim_1d_for_compile(
-                            Path(n.file or ""), n_timepoints_per_run, trim, tmpdir
-                        ),
-                        n,
-                        tmpdir,
-                        run_lengths=n_timepoints_per_run,
-                    ),
-                    n.label,
-                )
+            out = _materialize_nuisance(
+                _trim_1d_for_compile(Path(n.file or ""), n_timepoints_per_run, trim, tmpdir),
+                n,
+                tmpdir,
+                run_lengths=n_timepoints_per_run,
             )
+            if out is not None:
+                ortvec_files.append((out, n.label))
         elif n.scope.startswith("run:"):
             run_idx = int(n.scope.split(":", 1)[1])
             if run_idx < 1 or run_idx > n_runs:
                 raise ValueError(f"nuisance '{n.label}': run {run_idx} out of range [1, {n_runs}]")
-            padortvec_files.append(
-                (
-                    _materialize_nuisance(
-                        _trim_1d_for_compile(
-                            Path(n.file or ""), [n_timepoints_per_run[run_idx - 1]], trim, tmpdir
-                        ),
-                        n,
-                        tmpdir,
-                    ),
-                    n.label,
-                    run_idx,
-                )
+            out = _materialize_nuisance(
+                _trim_1d_for_compile(
+                    Path(n.file or ""), [n_timepoints_per_run[run_idx - 1]], trim, tmpdir
+                ),
+                n,
+                tmpdir,
             )
+            if out is not None:
+                padortvec_files.append((out, n.label, run_idx))
         elif n.scope == "glob":
             if not n.pattern:
                 raise ValueError(f"nuisance '{n.label}': scope='glob' but no pattern")
@@ -768,9 +766,9 @@ def _resolve_nuisance_for_compile(
                         f"but run {run_idx0 + 1} expects {expected} "
                         "(glob mode requires one-run-length files)"
                     )
-                padortvec_files.append(
-                    (_materialize_nuisance(path, n, tmpdir), n.label, run_idx0 + 1)
-                )
+                out = _materialize_nuisance(path, n, tmpdir)
+                if out is not None:
+                    padortvec_files.append((out, n.label, run_idx0 + 1))
         else:
             raise ValueError(f"nuisance '{n.label}': unknown scope {n.scope!r}")
 
