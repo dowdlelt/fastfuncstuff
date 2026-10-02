@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -164,6 +164,22 @@ def centered_rigid_p2m(shape: tuple[int, int, int]):
         return torch.cat([torch.cat([M[:, :3, :3], t[:, :, None]], dim=2), M[:, 3:]], dim=1)
 
     return p2m, p2m_batched
+
+
+def _coarse_config(config: MocoConfig) -> MocoConfig:
+    """The -twopass coarse stage's solver settings, as 3dvolreg runs them.
+
+    3dvolreg's first pass interpolates LINEARLY on the blurred volumes and
+    doubles its convergence thresholds (VL_twoblur * VL_dxy/VL_dph): heptic
+    buys nothing on a 4 mm-blurred image, and the coarse result only seeds the
+    fine pass. Linear is 2 taps per 1D shear pass against heptic's 8.
+    """
+    return replace(
+        config,
+        interp="linear",
+        dxy_thresh=2.0 * config.dxy_thresh,
+        dph_thresh=2.0 * config.dph_thresh,
+    )
 
 
 def compute_derivative_images(
@@ -980,6 +996,7 @@ def _run_batched_estimation(
         if coarse is not None:
             bf_c, wf1_c, WJ_c, JtWJ_c = coarse
             srcs_coarse = torch.stack([_blur_volume(srcs_raw[i], coarse_fwhm) for i in range(B)])
+            ccfg = _coarse_config(config)
             init_params, _, _ = batched_gn_estimate(
                 srcs_coarse,
                 bf_c,
@@ -987,11 +1004,11 @@ def _run_batched_estimation(
                 WJ_c,
                 JtWJ_c,
                 vol_shape,
-                config.max_iter,
-                config.interp,
-                config.dxy_thresh,
-                config.dph_thresh,
-                config.fixed_iter,
+                ccfg.max_iter,
+                ccfg.interp,
+                ccfg.dxy_thresh,
+                ccfg.dph_thresh,
+                ccfg.fixed_iter,
                 p2m_batched_fn=p2m_batched_fn,
             )
 
@@ -1574,6 +1591,7 @@ def moco(
             source_coarse = _blur_volume(source, coarse_fwhm)
             coarse_incumbent = init_params.clone()
             coarse_rms: list[float] = []
+            ccfg = _coarse_config(config)
             if config.fixed_iter:
                 init_params = _gn_fixed(
                     bf_coarse,
@@ -1583,8 +1601,8 @@ def moco(
                     JtWJ_c,
                     init_params,
                     homo_coords,
-                    config.max_iter,
-                    config.interp,
+                    ccfg.max_iter,
+                    ccfg.interp,
                     **_gn_fixed_kw,
                 )
             else:
@@ -1595,7 +1613,7 @@ def moco(
                     WJ_c,
                     JtWJ_c,
                     init_params,
-                    config,
+                    ccfg,
                     coords=homo_coords,
                     p2m_fn=_p2m,
                     resample_fn=_resample,
@@ -1608,7 +1626,7 @@ def moco(
                 coarse_incumbent,
                 init_params,
                 homo_coords,
-                config.interp,
+                ccfg.interp,
                 vol_shape,
                 resample_fn=_resample,
                 p2m_fn=_p2m,
