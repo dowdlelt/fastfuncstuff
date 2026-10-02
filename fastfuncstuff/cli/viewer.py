@@ -15,7 +15,7 @@ from fastfuncstuff.cli_utils import add_device_arg
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
 OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
-(View / InstaCorr / InstaGLM / ICA / Denoise / Preproc). the main window is a
+(View / InstaCorr / InstaGLM / InstaPCA / ICA / Denoise / Preproc). the main window is a
 controller -- every image and every graph is a companion window you open,
 arrange and close.
 
@@ -31,6 +31,13 @@ variance only that one regressor explains -- and each graph window draws the
 measurement, the same measurement with the nuisance taken out, the fit and the
 residual at every voxel it shows. Changing the design refits; changing which map
 you are looking at does not.
+
+INSTAPCA decomposes the input run on the spot -- drift out, every voxel scaled to
+unit length, as ffs_denoise extracts its noise PCs -- so each map is the
+correlation of a voxel's series with the component. Step through with the
+arrows in a trace window, label with s / n, and SAVE NOISE writes the noise
+components' time courses as an ortvec 1D file. The mask defaults to an
+automask; give a mask file on the run's grid to use your own.
 
 A CARPET window (grayplot) draws every voxel of one run at once, automasked and
 row-sorted -- by correlation with the dominant component, with the seed voxel,
