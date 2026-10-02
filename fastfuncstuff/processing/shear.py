@@ -18,6 +18,7 @@ See ``../afni/src/fastreg/fr_gpu_rota.cu`` and ``thd_shear3d.c``.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -744,6 +745,54 @@ def _unpack(ax: int, scl3) -> tuple[float, float]:
         return scl3[0], scl3[1]
 
 
+def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
+    """Paeth plan for a pull that rotates about ONE voxel axis, else ``None``.
+
+    The 4-shear factorization is NaN for an exact single-axis rotation, and
+    AFNI's remedy (conjugate by a 1e-6 rad rotation, thd_shear3d.c:rot_to_shear)
+    yields a valid but cancelling +/-0.65 vox/slice shear pair whose zero-filled
+    output measured 57% wrong. A plane rotation needs only three well-conditioned
+    shears, R = Su(-tan t/2) Sv(sin t) Su(-tan t/2), so take that route instead.
+    It matters because moco's rotation derivative images are exactly this case;
+    on the gather they cost ~50 s on one CPU thread.
+
+    Returns a list of ``(fr_axis, a, b, s)`` steps for ``_apply_one_shear``, in
+    its centred coordinates. The in-plane shift rides on the shears' offsets
+    (folding it in halved the error vs separate translation passes); only a shift
+    along the rotation axis costs a pass of its own.
+    """
+    M = matrix.detach().to("cpu", torch.float64).reshape(-1, 4, 4)[0]
+    A, t = M[:3, :3], M[:3, 3]
+    nz, ny, nx = shape
+    c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    for k in range(3):
+        u, v = [i for i in range(3) if i != k]
+        off = A[k, u].abs() + A[k, v].abs() + A[u, k].abs() + A[v, k].abs()
+        if off > 1e-12 or abs(float(A[k, k]) - 1.0) > 1e-12:
+            continue
+        cos_t, sin_t = float(A[u, u]), float(A[v, u])
+        if abs(float(A[v, v]) - cos_t) > 1e-9 or abs(float(A[u, v]) + sin_t) > 1e-9:
+            return None  # not a proper rotation in the (u, v) plane
+        theta = math.atan2(sin_t, cos_t)
+        alpha, beta = -math.tan(theta / 2.0), math.sin(theta)
+        d = A @ c + t - c  # out(p) = src(c + A (p - c) + d), p centred
+
+        def step(axis: int, other: int, coef: float, off: float):
+            # pull out(p) = in(p + (coef * p_other + off) e_axis)  <=>  af = -(...)
+            p1fr = _AXIS_INFO[axis][1][0]
+            a, b = (-coef, 0.0) if other == p1fr else (0.0, -coef)
+            return (axis, a, b, -off)
+
+        # src(S1 (S2 (S3 p) + s2 e_v) + s1 e_u) = src(A p + S1 s2 e_v + s1 e_u)
+        s2 = float(d[v])
+        s1 = float(d[u]) - alpha * s2
+        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, alpha, 0.0)]
+        if abs(float(d[k])) > 0.0:
+            steps.insert(0, (k, 0.0, 0.0, -float(d[k])))
+        return steps
+    return None
+
+
 def shear_resample(
     source: Tensor, matrix: Tensor, shape: tuple[int, int, int], mode: str
 ) -> Tensor | None:
@@ -755,7 +804,14 @@ def shear_resample(
     """
     ax_t, scl_t, sft_t, valid = rigid_matrix_to_shears(matrix, shape)
     if not bool(valid.all()):
-        return None
+        plan = _single_axis_plan(matrix, shape)
+        if plan is None:
+            return None
+        interp_fn = _get_shear_interp(source.device)
+        vol = source
+        for axis, a, b, sft in plan:
+            vol = _apply_one_shear(vol, axis, a, b, sft, mode, interp_fn)
+        return vol
     ax_l = ax_t[0].tolist()
     scl_l = scl_t[0].tolist()
     sft_l = sft_t[0].tolist()
