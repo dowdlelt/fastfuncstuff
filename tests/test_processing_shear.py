@@ -254,3 +254,24 @@ def test_degenerate_matrix_is_still_reported_invalid():
     d = torch.zeros(1, 3, dtype=torch.float64)
     _, _, _, valid = _shear_best(q, d)
     assert not bool(valid.all())
+
+
+@pytest.mark.parametrize("mode", ["nn", "linear", "cubic", "quintic", "heptic", "wsinc5"])
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_rowconv_shear_matches_the_tap_loop(mode, dim):
+    """The CPU row-conv pass must equal the reference tap loop, edges included.
+
+    Its pad has to cover a whole kernel width: at H+1 a window starting just
+    outside the row clamped onto real voxels and the edge rows came out wrong.
+    """
+    from fastfuncstuff.processing.shear import _interp_1d_along, _interp_1d_rowconv
+
+    g = torch.Generator().manual_seed(dim)
+    vol = torch.randn(9, 11, 13, generator=g)
+    shp = [9, 11, 13]
+    shp[dim] = 1
+    af = torch.randn(shp, generator=g) * 4.0
+    af.view(-1)[:3] = torch.tensor([40.0, -40.0, 10.5])  # rows shifted out of the FOV
+    ref = _interp_1d_along(vol, dim, af, mode)
+    out = _interp_1d_rowconv(vol, dim, af, mode)
+    torch.testing.assert_close(out, ref, rtol=0, atol=2e-5)
