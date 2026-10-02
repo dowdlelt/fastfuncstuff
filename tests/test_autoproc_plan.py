@@ -2685,3 +2685,32 @@ def test_cut_task_vols_task_has_no_noise_vols(tmp_path: Path):
     rows = write_design_specs(build_plan(subj, opt), str(tmp_path), str(tmp_path / "wd2"))
     paths = {task: path for task, path, _ in rows}
     assert load_spec(paths["floc"]).meta.n_timepoints_per_run == [12, 12, 11]
+
+
+def test_censoring_is_off_by_default_and_wired_through_moco_and_reml_when_on(tmp_path: Path):
+    """-censor_motion / -censor_outliers: stage02's ffs_moco writes a keep mask per
+    run, stage12 joins each task's in -input order and hands it to ffs_reml
+    -censor (the gap-aware route, not spike regressors)."""
+    import subprocess
+
+    from fastfuncstuff.autoproc.bids import scan_subject
+
+    _bids_with_events(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    off = write_script(
+        build_plan(subj, Options(run_glm=True)), str(tmp_path / "wd0"), bids_root=str(tmp_path)
+    )
+    assert "-censor" not in off and "censor.1D" not in off
+
+    plan = build_plan(subj, Options(run_glm=True, censor_motion=0.5, censor_outliers=0.1))
+    s = write_script(plan, str(tmp_path / "wd"), bids_root=str(tmp_path))
+    manifest = next(line for line in s.splitlines() if "mocobatch" in line and "printf" in line)
+    for flag in ("-censor_motion 0.5", "-censor_outliers 0.1", "-outcount", "-enorm", "-censor "):
+        assert flag in manifest
+    cat = next(line for line in s.splitlines() if line.startswith("cat ") and "censor" in line)
+    assert cat.index("run-01") < cat.index("run-02")  # same order as -input
+    assert cat.endswith('> "stage12.censor.task-floc.1D"')
+    assert '-censor "stage12.censor.task-floc.1D"' in s
+    script = tmp_path / "proc.sh"
+    script.write_text(s)
+    assert subprocess.run(["bash", "-n", str(script)], capture_output=True).returncode == 0

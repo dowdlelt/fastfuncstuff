@@ -1589,6 +1589,32 @@ def _moco_reduction_flags() -> str:
     )
 
 
+def _censoring_on(opt) -> bool:
+    return opt.censor_motion is not None or opt.censor_outliers is not None
+
+
+def _moco_censor_flags(plan: Plan) -> str:
+    """Per-run censoring outputs for the stage02 manifest line (escaped for its printf).
+
+    Computed inside moco because the motion parameters and the raw series are
+    both already in memory there; the traces ride along as QC whenever any
+    censoring is on. stage12 concatenates the per-run keep masks per task.
+    """
+    opt = plan.options
+    if not _censoring_on(opt):
+        return ""
+    parts = ['-enorm \\"${mstem}.enorm.1D\\"']
+    if opt.censor_motion is not None:
+        parts.append(f"-censor_motion {opt.censor_motion:g}")
+    if opt.censor_outliers is not None:
+        parts += [
+            '-outcount \\"${mstem}.outcount.1D\\"',
+            f"-censor_outliers {opt.censor_outliers:g}",
+        ]
+    parts.append('-censor \\"${mstem}.censor.1D\\"')
+    return " " + " ".join(parts)
+
+
 def _stage_moco(plan: Plan, script_stem: str) -> str:
     moco_flags = " ".join(_split_flags(config.DEFAULT_OPTS["moco"]))
     batchfile = f"{script_stem}_mocobatch.txt"
@@ -1604,6 +1630,7 @@ def _stage_moco(plan: Plan, script_stem: str) -> str:
         if plan.options.motsim
         else ""
     )
+    censor_arg = _moco_censor_flags(plan)
     return f"""
 # ============================ stage02: motion correction ====================
 # Batched: ONE ffs_moco process motion-corrects every run, so the Python/CUDA/
@@ -1629,7 +1656,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     last)  nv=$(ffs_info -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}" >> "$mocobatch"
+  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}{censor_arg}" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -3531,9 +3558,12 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             # mispaired-timing-file symptom ffs_reml otherwise stops for.
             *(["-allow_late_events"] if task in opt.cut_task_vols else []),
             *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
+            *([f'-censor "{_task_censor_path(task)}"'] if _censoring_on(opt) else []),
             *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
             '-device "$DEVICE"',
         ]
+        if _censoring_on(opt):
+            out.append(_concat_censor(task, prs))
         if resolved:
             spec = spec_path(task, opt)
             _, skipped = nuisance_specs(task, opt)
@@ -3585,6 +3615,23 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         out.append(_stats_guard_close(task))
     out.append("fi")
     return "\n".join(out) + "\n"
+
+
+def _task_censor_path(task: str) -> str:
+    return f"stage12.censor.task-{task}.1D"
+
+
+def _concat_censor(task: str, prs) -> str:
+    """Bash joining a task's per-run stage02 keep masks into the one file ffs_reml
+    -censor reads, in the order the runs are given to -input (the order the
+    design's runs are in). Lengths are the moco series', i.e. before -drop_first:
+    ffs_reml trims the censor file the same way it trims the data."""
+    srcs = " ".join(f'"stage02.moco.{_frag(pr)}.censor.1D"' for pr in prs)
+    dest = _task_censor_path(task)
+    return (
+        f'cat {srcs} > "{dest}"\n'
+        f'echo "task-{task}: censoring $(grep -c \'^0\' "{dest}") of $(wc -l < "{dest}") TRs"'
+    )
 
 
 def _task_blur(opt, task: str) -> float | None:

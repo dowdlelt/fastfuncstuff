@@ -25,10 +25,12 @@ ARMA/REML noise model, which should drop the rows (ffs_reml ``-censor``).
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-from tqdm import tqdm
+
+if TYPE_CHECKING:
+    import torch
 
 # afni_proc.py's documented values for a bare -censor_motion / -censor_outliers
 # are task-dependent (0.2-0.3, 0.05-0.1); these are the ffs defaults, chosen to
@@ -194,6 +196,8 @@ def afni_median(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     ``torch.median`` returns the lower middle value, which shifts every MAD on
     even-length runs.
     """
+    import torch
+
     n = x.shape[dim]
     hi = torch.kthvalue(x, n // 2 + 1, dim=dim).values
     if n % 2:
@@ -204,6 +208,8 @@ def afni_median(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 def _ipm_step_bound(v: torch.Tensor, dv: torch.Tensor) -> torch.Tensor:
     """Largest step keeping ``v + f*dv >= 0``, per column (lp.fnm's ``bound``)."""
+    import torch
+
     f = torch.where(dv < 0, -v / dv, torch.full_like(v, 1e20))
     return f.amin(dim=0)
 
@@ -224,6 +230,8 @@ def l1_detrend(
     ``rq.fit.fnb``) on the dual LP at tau = 0.5, every voxel at once: each Newton
     step is one p x p solve per voxel, and it reaches the optimum in ~20 steps.
     """
+    import torch
+
     T, p = basis.shape
     X = basis.to(dtype=y.dtype)
     XX = (X[:, :, None] * X[:, None, :]).reshape(T, p * p)
@@ -326,6 +334,9 @@ def outlier_counts(
     denominator of the fraction, as in AFNI. ``series`` may live on the CPU while
     ``device`` computes: chunks are streamed.
     """
+    import torch
+    from tqdm import tqdm
+
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.memory import estimate_chunk_size
     from fastfuncstuff.utils import linalg_device
@@ -383,6 +394,8 @@ def outlier_fraction_4d(
     and its own polort (``1 + floor(TR*nt/150)`` unless ``polort`` is given).
     Returns the concatenated fractions and the voxel count each run used.
     """
+    import torch
+
     from fastfuncstuff.processing.mask import afni_automask
 
     T = data.shape[0]

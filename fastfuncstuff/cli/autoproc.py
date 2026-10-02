@@ -32,6 +32,7 @@ from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
+from fastfuncstuff.processing import censor as censor_defaults
 
 # The tuned-preset recipe -do_mni runs under. Named once: the op string says it
 # (`-type MNI_T1a`) and the family→engine resolution has to agree with it.
@@ -388,6 +389,30 @@ def build_parser() -> argparse.ArgumentParser:
         "pass and the paper found it no worse. Selecting it for the GLM is\n"
         "-glm_ortvec motsim; in a DEFAULT nuisance set it replaces motion and\n"
         "motion_deriv, which its PCs are derived from.",
+    )
+    g.add_argument(
+        "-censor_motion",
+        nargs="?",
+        const=censor_defaults.DEFAULT_MOTION_LIMIT,
+        type=float,
+        default=None,
+        metavar="L",
+        help="censor TRs whose motion enorm exceeds L, plus the TR before each\n"
+        "(afni_proc -regress_censor_motion, via ffs_moco in stage02). Bare flag =\n"
+        f"{censor_defaults.DEFAULT_MOTION_LIMIT}. Off by default. Censored TRs are dropped from the GLM\n"
+        "(ffs_reml -censor), with the noise model stepping across each gap.",
+    )
+    g.add_argument(
+        "-censor_outliers",
+        nargs="?",
+        const=censor_defaults.DEFAULT_OUTLIER_LIMIT,
+        type=float,
+        default=None,
+        metavar="F",
+        help="censor TRs where more than a fraction F of automask voxels are\n"
+        "outliers (afni_proc -regress_censor_outliers, 3dToutcount's rule). Bare\n"
+        f"flag = {censor_defaults.DEFAULT_OUTLIER_LIMIT}. Off by default. Counted on the series moco reads,\n"
+        "which is the NORDIC output when NORDIC runs (AFNI counts raw data).",
     )
     g.add_argument(
         "-locomoco",
@@ -1118,6 +1143,16 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "puts MotSim in place of motion/motion_deriv) to model with them."
             )
 
+    if opt.censor_motion is not None and opt.censor_motion < 0:
+        errors.append("-censor_motion: the limit must be >= 0.")
+    if opt.censor_outliers is not None and not 0.0 <= opt.censor_outliers <= 1.0:
+        errors.append("-censor_outliers: the fraction must be in [0, 1].")
+    if (opt.censor_motion is not None or opt.censor_outliers is not None) and not opt.run_glm:
+        warnings.append(
+            "censoring is on but the GLM is not: the per-run censor files are written "
+            "in stage02 and nothing in this script uses them."
+        )
+
     # A regressor named explicitly but not produced by this pipeline is a real
     # mismatch worth saying out loud; the same entry coming from the default set
     # is dropped silently (config.GLM_ORTVEC[...]["requires"]).
@@ -1741,6 +1776,8 @@ def main(argv: list[str] | None = None) -> int:
         event_filters=_resolve_event_filters(args),
         prebuilt_contrasts=_resolve_prebuilt_contrasts(args),
         motsim=eff(args.motsim, "motsim", None),
+        censor_motion=eff(args.censor_motion, "censor_motion", None),
+        censor_outliers=eff(args.censor_outliers, "censor_outliers", None),
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,

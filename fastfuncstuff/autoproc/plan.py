@@ -159,6 +159,11 @@ class Options:
     # re-registration then inherits the settings of the correction that ran.
     # Feeds the GLM through GLM_ORTVEC["motsim"].
     motsim: str | None = None
+    # TR censoring limits (ffs_moco -censor_motion / -censor_outliers); None = off.
+    # stage02 writes a per-run keep mask, stage12 concatenates each task's and
+    # hands it to ffs_reml -censor (the gap-aware path, not spike regressors).
+    censor_motion: float | None = None
+    censor_outliers: float | None = None
     locomoco: bool = False
     # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
     # CHANGES the field the correction applies, where the -events diagnostic the
