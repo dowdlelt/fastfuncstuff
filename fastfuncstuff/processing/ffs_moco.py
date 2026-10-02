@@ -769,6 +769,35 @@ AFNI_MOTION_LABELS: tuple[str, ...] = ("roll", "pitch", "yaw", "dS", "dL", "dP")
 AFNI_MOTION_UNITS: tuple[str, ...] = ("deg", "deg", "deg", "mm", "mm", "mm")
 
 
+def afni_motion_params(
+    M_dicom: Tensor, affine: np.ndarray, vol_shape: tuple[int, int, int]
+) -> np.ndarray:
+    """(6,) correction params in 3dvolreg's convention for one DICOM matrix.
+
+    Rotations are pivot-free; translations are not. ``matrix_to_params`` reads
+    them about the DICOM origin -- the scanner isocentre, ~57 mm from this
+    sub-pilot02 slab's centre -- so every degree of pitch leaked ~1 mm into dS
+    and dP, inflating translation regressors and FD on rotating runs.
+    3dvolreg's dS/dL/dP are the inverse matrix's translation about the
+    CARDINAL grid centre (reproduced from its own aff12 + 1D files to 1e-4 mm).
+    Returned negated, in solver order, so ``to_afni_motion`` stays the one
+    place that flips signs and reorders columns.
+    """
+    from .nwarpforge import compute_cardinal_affine
+
+    nz, ny, nx = vol_shape
+    card = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))
+    centre_ras = card @ np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0, 1.0])
+    c = np.array([-centre_ras[0], -centre_ras[1], centre_ras[2]])  # RAS -> DICOM
+    M = M_dicom.detach().cpu().double().numpy()
+    Ai = np.linalg.inv(M[:3, :3])
+    t_inv = -Ai @ M[:3, 3]
+    t_c = t_inv + Ai @ c - c
+    params = matrix_to_params(M_dicom)[:6].double().numpy().copy()
+    params[:3] = -t_c
+    return params
+
+
 def to_afni_motion(params_array: np.ndarray) -> np.ndarray:
     """``(nt, 6)`` DICOM correction params to AFNI's reported motion.
 
@@ -1810,9 +1839,7 @@ def moco(
         M_dicom = voxel_matrix_to_dicom(M_vox, affine, affine)
         matrices_dicom_np[t] = M_dicom.numpy()
 
-        # Extract parameters from the forward transformation
-        p12 = matrix_to_params(M_dicom)
-        params_dicom[t] = p12[:6].numpy()
+        params_dicom[t] = afni_motion_params(M_dicom, affine, vol_shape)
 
         # Max displacement
         max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
@@ -2081,7 +2108,7 @@ def moco_spacetime(
         M_vox = poses[t]
         M_dicom = voxel_matrix_to_dicom(M_vox, affine, affine)
         matrices_dicom_np[t] = M_dicom.numpy()
-        params_dicom[t] = matrix_to_params(M_dicom)[:6].numpy()
+        params_dicom[t] = afni_motion_params(M_dicom, affine, vol_shape)
         max_disp[t] = compute_max_displacement(M_vox, vol_shape, voxel_sizes)
 
     assert result is not None

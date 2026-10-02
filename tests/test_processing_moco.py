@@ -644,3 +644,32 @@ def test_centred_pivot_rotation_fixes_the_grid_centre():
     c = torch.tensor([(26 - 1) / 2, (30 - 1) / 2, (20 - 1) / 2, 1.0], dtype=torch.float64)
     torch.testing.assert_close(p2m(p) @ c, c)
     torch.testing.assert_close(p2m_b(p[None])[0], p2m(p))
+
+
+def test_afni_motion_params_pivot_at_the_cardinal_grid_centre():
+    """A pure rotation about the grid centre must report zero translation.
+
+    The old extraction pivoted at the DICOM origin (scanner isocentre), so on
+    sub-pilot02 run-05 dS/dP carried 4.5/3.8 mm rms of rotation lever versus
+    3dvolreg's own .1D.
+    """
+    from fastfuncstuff.processing.affine import identity_params, voxel_matrix_to_dicom
+    from fastfuncstuff.processing.ffs_moco import afni_motion_params, centered_rigid_p2m
+
+    shape = (40, 64, 64)
+    # Oblique, off-isocentre grid: the case where pivots disagree the most.
+    th = np.deg2rad(24.0)
+    rot = np.array([[1, 0, 0], [0, np.cos(th), -np.sin(th)], [0, np.sin(th), np.cos(th)]])
+    affine = np.eye(4)
+    affine[:3, :3] = rot * 2.0
+    affine[:3, 3] = [-60.0, -20.0, 10.0]
+    p2m, _ = centered_rigid_p2m(shape)
+    p = identity_params(device=torch.device("cpu"), dtype=torch.float64)
+    p[3:6] = torch.tensor([2.0, -3.0, 1.0])
+    M_dicom = voxel_matrix_to_dicom(p2m(p).float(), affine, affine)
+    params = afni_motion_params(M_dicom, affine, shape)
+    assert np.abs(params[:3]).max() < 1e-3
+    # ...while a genuine shift comes through in mm.
+    p[:3] = torch.tensor([1.0, 0.0, 0.0])
+    M_dicom = voxel_matrix_to_dicom(p2m(p).float(), affine, affine)
+    assert np.abs(afni_motion_params(M_dicom, affine, shape)[:3]).max() > 0.5
