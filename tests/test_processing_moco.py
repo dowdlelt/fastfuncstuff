@@ -625,3 +625,22 @@ class TestMocoIntegration:
         )
         result = moco(ts, cfg)
         assert result.aligned.shape == ts.shape
+
+
+def test_centred_pivot_rotation_fixes_the_grid_centre():
+    """The GN parametrization pivots at the grid centre, like 3dvolreg.
+
+    params_to_matrix pivots at voxel (0,0,0): a corner rotation is a centre
+    rotation plus a ~100-voxel lever translation, which made the rotation and
+    translation Jacobian columns nearly collinear and doubled GN iterations.
+    """
+    from fastfuncstuff.processing.affine import identity_params
+    from fastfuncstuff.processing.ffs_moco import centered_rigid_p2m
+
+    shape = (20, 30, 26)  # (nz, ny, nx)
+    p2m, p2m_b = centered_rigid_p2m(shape)
+    p = identity_params(device=torch.device("cpu"), dtype=torch.float64)
+    p[3:6] = torch.tensor([3.0, -2.0, 1.5])
+    c = torch.tensor([(26 - 1) / 2, (30 - 1) / 2, (20 - 1) / 2, 1.0], dtype=torch.float64)
+    torch.testing.assert_close(p2m(p) @ c, c)
+    torch.testing.assert_close(p2m_b(p[None])[0], p2m(p))
