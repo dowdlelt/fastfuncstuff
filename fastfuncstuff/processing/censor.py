@@ -318,11 +318,13 @@ def outlier_counts(
     qthr: float = DEFAULT_QTHR,
     chunk_size: int | None = None,
     progress: bool = False,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """(T,) count of outlier voxels per TR in ``series`` (T, V), 3dToutcount's rule.
 
     Voxels with MAD = 0 contribute no outliers but still sit in V, the
-    denominator of the fraction, as in AFNI.
+    denominator of the fraction, as in AFNI. ``series`` may live on the CPU while
+    ``device`` computes: chunks are streamed.
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.memory import estimate_chunk_size
@@ -332,7 +334,7 @@ def outlier_counts(
     # float64 everywhere: in float32 the interior point loses the optimum
     # (measured up to 569 voxels/TR off AFNI, vs <= 1 in float64). On CUDA it
     # is still ~10x faster than 3dToutcount; Metal has no float64 at all.
-    device = linalg_device(series.device)
+    device = linalg_device(device if device is not None else series.device)
     dtype = torch.float64
     alpha = outlier_alpha(T, qthr)
     basis = (
@@ -372,6 +374,7 @@ def outlier_fraction_4d(
     mask: torch.Tensor | None = None,
     qthr: float = DEFAULT_QTHR,
     progress: bool = False,
+    device: torch.device | None = None,
 ) -> tuple[np.ndarray, list[int]]:
     """Per-TR outlier fraction for a (T, nz, ny, nx) series, run by run.
 
@@ -399,7 +402,7 @@ def outlier_fraction_4d(
                 raise ValueError("outlier polort needs either polort= or tr=")
             p = default_outlier_polort(tr, nt)
         flat = run.reshape(nt, -1)[:, m.reshape(-1).to(run.device)]
-        counts = outlier_counts(flat, p, qthr=qthr, progress=progress)
+        counts = outlier_counts(flat, p, qthr=qthr, progress=progress, device=device)
         nvox.append(int(flat.shape[1]))
         fractions.append(counts.cpu().numpy() / max(flat.shape[1], 1))
     return np.concatenate(fractions), nvox

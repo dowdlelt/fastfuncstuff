@@ -2599,6 +2599,41 @@ def resolve_microtime_offset(
     return offset
 
 
+def add_outlier_censor_args(parser_or_group) -> None:
+    """``-censor_outliers [F]`` / ``-skip_first_outliers N`` / ``-outlier_polort P``.
+
+    One spelling for ffs_moco and ffs_util_outcount.
+    """
+    from fastfuncstuff.processing import censor as C
+
+    parser_or_group.add_argument(
+        "-censor_outliers",
+        nargs="?",
+        const=C.DEFAULT_OUTLIER_LIMIT,
+        type=float,
+        default=None,
+        metavar="F",
+        help="Censor TRs whose outlier fraction is strictly greater than F "
+        f"(afni_proc -regress_censor_outliers). Bare flag = {C.DEFAULT_OUTLIER_LIMIT}.",
+    )
+    parser_or_group.add_argument(
+        "-skip_first_outliers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Never outlier-censor the first N TRs of each run (afni_proc "
+        "-regress_skip_first_outliers) -- for leading volumes dropped another way.",
+    )
+    parser_or_group.add_argument(
+        "-outlier_polort",
+        type=int,
+        default=None,
+        metavar="P",
+        help="Legendre detrend order for outlier counting (default per run: "
+        "1 + floor(TR*nt/150), afni_proc's and 3dDeconvolve's rule).",
+    )
+
+
 def add_device_arg(
     parser_or_group,
     *,

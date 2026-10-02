@@ -21,6 +21,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
+    add_outlier_censor_args,
     add_verbose_arg,
     collect_batch_jobs,
     parse_prefix,
@@ -31,6 +32,7 @@ from fastfuncstuff.cli_utils import (
     setup_device,
     spinner,
 )
+from fastfuncstuff.processing import censor as censor_lib
 from fastfuncstuff.processing.affine import (
     matrix_to_params,
     save_matrix_1D,
@@ -45,6 +47,7 @@ from fastfuncstuff.processing.ffs_moco import (
     save_maxdisp_1D,
     save_moco_1D,
     save_moco_dfile,
+    to_afni_motion,
 )
 from fastfuncstuff.processing.io import (
     derive_prefixed_output_path,
@@ -644,6 +647,75 @@ def parse_args(
         "first/last when no other QC flag is given.",
     )
 
+    # --- Censoring ---
+    cen_group = parser.add_argument_group(
+        "Censoring",
+        "Per-TR traces and an AFNI-style censor file (1=keep, 0=censor), computed "
+        "here because the motion and the raw series are both in memory. Matches "
+        "afni_proc.py: motion = 1d_tool.py -censor_motion, outliers = 3dToutcount.",
+    )
+    cen_group.add_argument(
+        "-enorm",
+        default=None,
+        metavar="FILE.1D",
+        help="Save the Euclidean norm of the per-TR motion derivative (AFNI enorm; "
+        "degrees and mm summed as-is).",
+    )
+    cen_group.add_argument(
+        "-fd",
+        default=None,
+        metavar="FILE.1D",
+        help="Save framewise displacement (Power 2012: rotations as arc length on a 50 mm sphere).",
+    )
+    cen_group.add_argument(
+        "-outcount",
+        default=None,
+        metavar="FILE.1D",
+        help="Save the per-TR outlier fraction of the input series (3dToutcount "
+        "-automask -fraction -legendre; see ffs_util_outcount). Multi-echo counts "
+        "the registration source (-reg_echo).",
+    )
+    cen_group.add_argument(
+        "-censor_motion",
+        nargs="?",
+        const=censor_lib.DEFAULT_MOTION_LIMIT,
+        type=float,
+        default=None,
+        metavar="L",
+        help="Censor TRs whose motion trace exceeds L (afni_proc "
+        f"-regress_censor_motion). Bare flag = {censor_lib.DEFAULT_MOTION_LIMIT}.",
+    )
+    cen_group.add_argument(
+        "-censor_metric",
+        choices=censor_lib.MOTION_METRICS,
+        default="enorm",
+        help="Trace that -censor_motion thresholds.",
+    )
+    cen_group.add_argument(
+        "-censor_prev",
+        choices=("yes", "no"),
+        default="yes",
+        help="Also censor the TR before each motion-censored one (afni_proc "
+        "-regress_censor_prev): a backward difference spans both volumes.",
+    )
+    cen_group.add_argument(
+        "-censor_first_trs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="With -censor_motion, also censor the first N TRs (afni_proc "
+        "-regress_censor_first_trs).",
+    )
+    add_outlier_censor_args(cen_group)
+    cen_group.add_argument(
+        "-censor",
+        default=None,
+        metavar="FILE.1D",
+        help="Write the combined keep mask (product of the motion and outlier "
+        "masks). Feed it to ffs_reml -censor, or to any -ortvec tool as "
+        "FILE.1D:spikes.",
+    )
+
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
@@ -938,6 +1010,97 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
                 save_image(result.patch_labels.float(), w_patch, header_info=header_info)
 
 
+def _want_censor_outputs(args) -> bool:
+    return any(getattr(args, n, None) is not None for n in ("enorm", "fd", "outcount", "censor"))
+
+
+def _save_censor_outputs(args, result, series, input_file, device, verb) -> None:
+    """Motion traces, outlier fractions and the combined censor file for one run.
+
+    ``series`` is the trimmed, uncorrected estimation source: afni_proc counts
+    outliers on the raw (tcat) data, before any resampling smooths spikes out.
+    """
+    if not _want_censor_outputs(args):
+        return
+    afni_params = to_afni_motion(result.params)
+    traces = {m: censor_lib.motion_trace(afni_params, m) for m in censor_lib.MOTION_METRICS}
+    for metric in censor_lib.MOTION_METRICS:
+        path = getattr(args, metric, None)
+        if path is not None:
+            censor_lib.write_1d(path, traces[metric], fmt="%.6f")
+            if verb >= 1:
+                print(f"Saved {metric}: {path}")
+
+    masks = []
+    if args.censor_motion is not None:
+        keep = censor_lib.censor_from_trace(
+            traces[args.censor_metric],
+            args.censor_motion,
+            censor_prev=args.censor_prev == "yes",
+            first_trs=args.censor_first_trs,
+        )
+        masks.append(keep)
+        if verb >= 1:
+            print(
+                f"  motion censoring ({args.censor_metric} > {args.censor_motion:g}): "
+                f"{int((keep == 0).sum())} of {keep.size} TRs"
+            )
+
+    if args.outcount is not None or args.censor_outliers is not None:
+        tr = None
+        if args.outlier_polort is None:
+            from fastfuncstuff.io.afni import get_tr_from_file
+
+            tr = get_tr_from_file(input_file)
+        frac, nvox = censor_lib.outlier_fraction_4d(
+            series.float(), tr=tr, polort=args.outlier_polort, progress=verb >= 1, device=device
+        )
+        if args.outcount is not None:
+            censor_lib.write_1d(args.outcount, frac, fmt="%0.5f")
+            if verb >= 1:
+                print(f"Saved outcount: {args.outcount} ({nvox[0]:,} automask voxels)")
+        if verb >= 1 and frac[0] > censor_lib.PRE_STEADY_STATE_LIMIT:
+            print(f"  ** TR #0 outliers ({frac[0]:.2f}): possible pre-steady state TRs")
+        if args.censor_outliers is not None:
+            keep = censor_lib.censor_from_outliers(
+                frac, args.censor_outliers, skip_first=args.skip_first_outliers
+            )
+            masks.append(keep)
+            if verb >= 1:
+                print(
+                    f"  outlier censoring (fraction > {args.censor_outliers:g}): "
+                    f"{int((keep == 0).sum())} of {keep.size} TRs"
+                )
+
+    if args.censor is not None:
+        keep = censor_lib.combine_censor(*masks)
+        censor_lib.write_1d(args.censor, keep, fmt="%d")
+        if verb >= 1:
+            print(f"Saved censor: {args.censor} ({int((keep == 0).sum())} of {keep.size} censored)")
+
+
+def _validate_censor_args(args) -> None:
+    sources = args.censor_motion is not None or args.censor_outliers is not None
+    if sources and args.censor is None:
+        print(
+            "Error: -censor_motion / -censor_outliers need -censor FILE.1D to write to.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.censor is not None and not sources:
+        print(
+            "Error: -censor needs -censor_motion and/or -censor_outliers.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.censor_motion is not None and args.censor_motion < 0:
+        print("Error: -censor_motion limit must be >= 0.", file=sys.stderr)
+        sys.exit(1)
+    if args.censor_outliers is not None and not 0.0 <= args.censor_outliers <= 1.0:
+        print("Error: -censor_outliers must be in [0, 1].", file=sys.stderr)
+        sys.exit(1)
+
+
 def _motsim_path(args) -> str | None:
     """Where ``-motsim`` writes, or None when it is off."""
     if args.motsim is None:
@@ -1070,18 +1233,23 @@ def _validate_run_args(args: argparse.Namespace) -> None:
             "onedfile_shiftcorr",
             "onedmatrix_shiftcorr",
             "motsim",
+            "enorm",
+            "fd",
+            "outcount",
+            "censor",
         )
     ) or _want_qc(args)
     if not _any_output:
         print(
             "Error: no outputs requested. Give at least one of -prefix, "
             "-save_mean, -save_max, -save_min, -1Dfile, -1Dmatrix_save, -dfile, "
-            "-maxdisp1D, -iterfile.",
+            "-maxdisp1D, -iterfile, -enorm, -fd, -outcount, -censor.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     _validate_shiftcorr_args(args)
+    _validate_censor_args(args)
 
     # A bare -save_mean/-save_max/-save_min/-save_weight derives its path from
     # -prefix, and without one the run cannot write what it was asked for. Catch
@@ -1343,7 +1511,17 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
                     outs.append(derive_prefixed_output_path(base_file, "tsnr_initial"))
 
     # Single-instance outputs (once per run, echo-independent).
-    for name in ("1Dfile", "1Dmatrix_save", "dfile", "maxdisp1D", "iterfile"):
+    for name in (
+        "1Dfile",
+        "1Dmatrix_save",
+        "dfile",
+        "maxdisp1D",
+        "iterfile",
+        "enorm",
+        "fd",
+        "outcount",
+        "censor",
+    ):
         val = getattr(args, name, None)
         if val is not None:
             outs.append(val)
@@ -1489,6 +1667,7 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         _write_qc(args, result.aligned, data, base_path, header_info, verb)
 
     _save_estimation_outputs(args, result, header_info, verb)
+    _save_censor_outputs(args, result, data, input_file, device, verb)
     _save_motsim(
         args,
         result,
@@ -1560,6 +1739,9 @@ def _run_multi_echo(
         None
         if args.motsim is None
         else (base_vol if base_vol is not None else reg_data[base_index].clone())
+    )
+    _save_censor_outputs(
+        args, result, reg_data, input_files[0 if reg_mean else reg_index], device, verb
     )
     del reg_data  # free the estimation series before loading echoes for resampling
 

@@ -177,3 +177,38 @@ def test_util_outcount_cli_writes_fractions_and_censor(tmp_path):
     keep = np.loadtxt(cen)
     assert frac.shape == (20,) and frac[9] > 0.9
     np.testing.assert_array_equal(keep, (frac <= C.DEFAULT_OUTLIER_LIMIT).astype(int))
+
+
+def _moco_args(*extra):
+    from fastfuncstuff.cli import moco
+
+    return moco.parse_args(["-input", "epi.nii.gz", "-1Dfile", "m.1D", *extra])
+
+
+def test_moco_bare_censor_flags_take_the_ffs_defaults():
+    a = _moco_args("-censor_motion", "-censor_outliers", "-censor", "c.1D")
+    assert a.censor_motion == C.DEFAULT_MOTION_LIMIT == 0.5
+    assert a.censor_outliers == C.DEFAULT_OUTLIER_LIMIT == 0.1
+    b = _moco_args("-censor_motion", "0.3", "-censor", "c.1D")
+    assert b.censor_motion == 0.3 and b.censor_outliers is None
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [("-censor_motion",), ("-censor", "c.1D"), ("-censor_outliers", "1.5", "-censor", "c.1D")],
+)
+def test_moco_rejects_censor_requests_that_write_nothing_or_are_invalid(extra):
+    from fastfuncstuff.cli import moco
+
+    with pytest.raises(SystemExit):
+        moco._validate_run_args(_moco_args(*extra))
+
+
+def test_moco_batch_skip_sees_the_censor_outputs():
+    from fastfuncstuff.cli import moco
+
+    a = _moco_args(
+        "-enorm", "e.1D", "-fd", "f.1D", "-outcount", "o.1D", "-censor_motion", "-censor", "c.1D"
+    )
+    moco._validate_run_args(a)
+    assert {"e.1D", "f.1D", "o.1D", "c.1D"} <= set(moco._expected_outputs(a))
