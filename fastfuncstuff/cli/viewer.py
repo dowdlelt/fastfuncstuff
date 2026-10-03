@@ -74,6 +74,9 @@ keys (image window)
 surface editing (image window, with -surfaces loaded)
   g                    edit mode: drag a white/pial outline toward where it
                        belongs; it snaps to the anatomy's edge over a 3-D brush
+  G                    draw mode: press on an outline, draw where it should
+                       run, release on the same outline; the stretch moves onto
+                       the line and the surface around follows
   ( )                  brush radius         m  snap / follow the hand
   ctrl+Z               undo                 Esc  cancel the drag
 

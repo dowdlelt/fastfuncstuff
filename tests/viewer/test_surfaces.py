@@ -468,3 +468,70 @@ def test_a_stroke_off_the_outline_is_refused(session, tmp_path):
                 -1,
             )
         )
+
+
+def test_draw_gesture_through_the_window(tmp_path):
+    """Press on the outline, draw, release on it: one EDIT_SURFACE_STROKE."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetXYZ
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 15.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image.draw_button.click()
+        assert session.state.surface_editing and session.state.surface_tool == "draw"
+        st = session.state
+        view = plane_view(st, image._viewport())
+        assert st.grid is not None and view is not None
+        inv = np.linalg.inv(st.grid.affine)
+
+        def to_image(mm):
+            return view.points_to_image(inv[:3, :3] @ np.asarray(mm, float) + inv[:3, 3])
+
+        z = st.grid.ijk_to_mm(st.crosshair)[2]
+        rho_now, rho_new = np.sqrt(20.0**2 - z**2), np.sqrt(21.0**2 - z**2)
+        a, b = -0.6, 0.6
+        press = to_image([rho_now * np.cos(a), rho_now * np.sin(a), z])
+        release = to_image([rho_now * np.cos(b), rho_now * np.sin(b), z])
+        n_before = len(session.to_script().splitlines())
+        image.pane.edit_pressed.emit(*map(float, press))
+        assert image._stroke is not None
+        for t in np.linspace(a, b, 20):
+            image.pane.edit_dragged.emit(
+                *map(float, to_image([rho_new * np.cos(t), rho_new * np.sin(t), z]))
+            )
+        image.pane.edit_dragged.emit(*map(float, release))
+        image.pane.edit_released.emit()
+        app.processEvents()
+        lines = session.to_script().splitlines()[n_before:]
+        assert sum(ln.startswith("EDIT_SURFACE_STROKE") for ln in lines) == 1
+        assert ("lh", "white") in session.surfaces.edited
+
+        # A stroke released away from the outline does nothing, and says why.
+        n_before = len(session.to_script().splitlines())
+        image.pane.edit_pressed.emit(*map(float, press))
+        for t in np.linspace(a, 0, 10):
+            image.pane.edit_dragged.emit(
+                *map(float, to_image([rho_new * np.cos(t), rho_new * np.sin(t), z]))
+            )
+        image.pane.edit_dragged.emit(*map(float, to_image([0.0, 0.0, z])))
+        image.pane.edit_released.emit()
+        assert len(session.to_script().splitlines()) == n_before
+        assert "end the stroke" in image.pane._brush_label
+    finally:
+        win.close()

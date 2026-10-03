@@ -29,6 +29,7 @@ from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_f
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     EditSurface,
+    EditSurfaceStroke,
     SetEdges,
     SetIJK,
     SetLayerOpacity,
@@ -36,6 +37,7 @@ from fastfuncstuff.viewer.vocab import (
     SetSeed,
     SetSurfaceBrush,
     SetSurfaceEditing,
+    SetSurfaceTool,
     SetViewLocked,
     SetViewPlane,
     SetViewPosition,
@@ -121,8 +123,19 @@ class ImageWindow(QtWidgets.QWidget):
             "and it snaps to the edge in the anatomy, over a brush in 3-D.\n"
             "( ) brush radius, ctrl+Z undo, Esc cancel a drag.",
         )
-        self.edit_button.clicked.connect(lambda on: self._dispatch(SetSurfaceEditing(bool(on))))
+        self.edit_button.clicked.connect(self._toggle_grab)
         bar.addWidget(self.edit_button)
+
+        self.draw_button = self._button(
+            "DRAW",
+            "G",
+            "Redraw surfaces: press on a white or pial outline, draw where it\n"
+            "should run, release on the same outline. The stretch between moves\n"
+            "onto the line (m: snapped to the edge, or exactly as drawn) and the\n"
+            "surface around follows, over the brush radius in 3-D.",
+        )
+        self.draw_button.clicked.connect(self._toggle_draw)
+        bar.addWidget(self.draw_button)
 
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
@@ -161,6 +174,9 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.edit_pressed.connect(self._edit_press)
         self.pane.edit_dragged.connect(self._edit_drag)
         self.pane.edit_released.connect(self._edit_release)
+        #: A stroke being drawn: the outline it started on, its points in mm,
+        #: and the same points in image pixels for drawing it.
+        self._stroke: tuple[Grab, list[np.ndarray], list[tuple[float, float]]] | None = None
         #: (grab, press mm) of the drag in progress, if this window started one.
         self._edit: tuple[Grab, np.ndarray] | None = None
         self._edit_drag_mm: np.ndarray | None = None
@@ -215,7 +231,13 @@ class ImageWindow(QtWidgets.QWidget):
                     group="layer",
                 ),
                 Binding(
-                    "g", "edit surfaces (grab an outline)", self.edit_button.click, group="surface"
+                    "g", "edit surfaces: grab an outline", self.edit_button.click, group="surface"
+                ),
+                Binding(
+                    "shift+g",
+                    "edit surfaces: draw a stretch of outline anew",
+                    self.draw_button.click,
+                    group="surface",
                 ),
                 Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
                 Binding(")", "larger brush", lambda: self._scale_brush(1.25), group="surface"),
@@ -491,7 +513,8 @@ class ImageWindow(QtWidgets.QWidget):
         self._sync_opacity()
         state = self.session.state
         self._redraw_outlines(vp)
-        self.edit_button.setChecked(state.surface_editing)
+        self.edit_button.setChecked(state.surface_editing and state.surface_tool == "grab")
+        self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
         self._sync_brush()
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
@@ -532,10 +555,25 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetSurfaceBrush(r, 0.0 if snap > 0 else 1.0, smooth, search, sign))
         self._sync_brush()
 
-    def _sync_brush(self) -> None:
-        r, snap, *_ = self.session.state.surface_brush
+    def _sync_brush(self, note: str = "") -> None:
+        state = self.session.state
+        r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
-        self.pane.set_brush(self._brush_px(), f"EDIT  r={r:g} mm  {mode}")
+        tool = "DRAW" if state.surface_tool == "draw" else "EDIT"
+        label = f"{tool}  r={r:g} mm  {mode}" + (f"   {note}" if note else "")
+        self.pane.set_brush(self._brush_px(), label)
+
+    def _toggle_grab(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "grab")
+        self._dispatch(SetSurfaceTool("grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    def _toggle_draw(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "draw")
+        self._dispatch(SetSurfaceTool("draw" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
 
     def _press_point_mm(self, row: float, col: float) -> np.ndarray | None:
         state = self.session.state
@@ -567,6 +605,13 @@ class ImageWindow(QtWidgets.QWidget):
             # Not near an outline: the press still means "look here".
             self._pick(int(round(row)), int(round(col)), seed=False)
             return
+        if state.surface_tool == "draw":
+            # A stroke starts on the outline it was pressed on.
+            start = np.asarray(grab.at_mm, np.float64)
+            self._stroke = (grab, [start], [(row, col)])
+            self.pane.set_stroke([(row, col)])
+            self._sync_brush()
+            return
         r, snap, smooth, search, sign = state.surface_brush
         params = SnapParams(radius=r, snap=snap, smooth=smooth, search=search, edge_sign=sign)
         try:
@@ -579,6 +624,13 @@ class ImageWindow(QtWidgets.QWidget):
         self._edit_drag_mm = np.zeros(3)
 
     def _edit_drag(self, row: float, col: float) -> None:
+        if self._stroke is not None:
+            here = self._press_point_mm(row, col)
+            if here is not None:
+                self._stroke[1].append(here)
+                self._stroke[2].append((row, col))
+                self.pane.set_stroke(self._stroke[2])
+            return
         if self._edit is None:
             return
         here = self._press_point_mm(row, col)
@@ -589,6 +641,9 @@ class ImageWindow(QtWidgets.QWidget):
         self.surfaces_previewed.emit()
 
     def _edit_release(self) -> None:
+        if self._stroke is not None:
+            self._finish_stroke()
+            return
         if self._edit is None:
             return
         grab, _ = self._edit
@@ -615,7 +670,60 @@ class ImageWindow(QtWidgets.QWidget):
             )
         )
 
+    def _finish_stroke(self) -> None:
+        """End a stroke: it must land on the outline it started on."""
+        assert self._stroke is not None
+        start, points, pixels = self._stroke
+        self._stroke = None
+        self.pane.set_stroke([])
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        if view is None or pos is None or state.grid is None or len(points) < 3:
+            return
+        row, col = pixels[-1]
+        end = self.session.surfaces.grab(
+            state.grid.affine,
+            view,
+            pos,
+            state.surfaces_shown,
+            row,
+            col,
+            8.0 / self.pane._image_scale(),
+        )
+        if end is None or (end.hemi, end.surface) != (start.hemi, start.surface):
+            self._sync_brush(f"end the stroke on the {start.surface} outline it began on")
+            return
+        # Anchor both ends on the outline itself, so the redrawn stretch meets
+        # the untouched surface rather than wherever the hand let go.
+        line = [np.asarray(start.at_mm), *points[1:-1], np.asarray(end.at_mm)]
+        r, snap, smooth, search, sign = state.surface_brush
+        try:
+            self._dispatch(
+                EditSurfaceStroke(
+                    start.hemi,
+                    start.surface,
+                    int(view.layout.fixed),
+                    float(pos),
+                    EditSurfaceStroke.encode(line),
+                    r,
+                    snap,
+                    smooth,
+                    search,
+                    sign,
+                    state.surface_snap_key or "",
+                )
+            )
+        except ValueError as exc:
+            self._sync_brush(str(exc))
+            return
+        self._sync_brush()
+
     def _cancel_edit(self) -> None:
+        if self._stroke is not None:
+            self._stroke = None
+            self.pane.set_stroke([])
         if self._edit is not None:
             self._edit = None
             self._edit_drag_mm = None

@@ -106,6 +106,8 @@ class ImagePane(QtWidgets.QWidget):
         self._hover: QtCore.QPointF | None = None
         self._editing_drag = False
         self._brush_label = ""
+        #: A stroke being drawn, as fractional (row, col) image pixels.
+        self._stroke_pts: list[tuple[float, float]] = []
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -181,6 +183,11 @@ class ImagePane(QtWidgets.QWidget):
             changed = True
         if changed:
             self.update()
+
+    def set_stroke(self, points: list[tuple[float, float]]) -> None:
+        """The line being drawn, in fractional image pixels; empty clears it."""
+        self._stroke_pts = list(points)
+        self.update()
 
     def set_brush(self, radius_px: float | None, label: str = "") -> None:
         """Enter (radius in image pixels) or leave (``None``) surface editing."""
@@ -280,6 +287,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_crosshair(p, rect)
         if self._brush is not None and self._hover is not None:
             self._paint_brush(p)
+        if len(self._stroke_pts) > 1:
+            self._paint_stroke(p, rect)
         if self._handle is not None:
             self._paint_handle(p, rect)
 
@@ -327,6 +336,24 @@ class ImagePane(QtWidgets.QWidget):
             pen.setWidthF(1.25)
             p.setPen(pen)
             p.drawPath(path)
+        p.restore()
+
+    def _paint_stroke(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        assert self._image is not None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        poly = QtGui.QPolygonF(
+            [
+                QtCore.QPointF(rect.x() + (c + 0.5) * sx, rect.y() + (r + 0.5) * sy)
+                for r, c in self._stroke_pts
+            ]
+        )
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        pen = QtGui.QPen(QtGui.QColor(theme.palette().accent))
+        pen.setWidthF(2.0)
+        p.setPen(pen)
+        p.drawPolyline(poly)
         p.restore()
 
     def _paint_brush(self, p: QtGui.QPainter) -> None:
