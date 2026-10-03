@@ -31,6 +31,9 @@ layout(std140, binding = 0) uniform Block {
 layout(binding = 1) uniform sampler3D valueTex;
 layout(binding = 2) uniform sampler3D statTex;
 layout(binding = 3) uniform sampler2D lut;
+// Label colours by value, PALETTE_W per row: FreeSurfer ids run past 14000.
+layout(binding = 4) uniform sampler2D palette;
+const int PALETTE_W = 4096;
 
 const int MAX_SAMPLES = 16;
 
@@ -82,7 +85,21 @@ void main()
     // under any volume overlay.
     col = mix(col, vColor.rgb * light, vColor.a * extra.y);
 
-    if (modes.w > 0.5) {
+    if (modes.w > 1.5) {
+        // A label layer: one sample at the middle of the depth range, nearest
+        // (the sampler is), never averaged -- half of region 12 and half of
+        // region 40 is not region 26.
+        float d = 0.5 * (depth.x + depth.y);
+        if (extra.x > 0.5) d = equivolume(d);
+        vec4 p = vec4(mix(vWhite, vPial, d), 1.0);
+        vec3 t = (texFromMm * p).xyz;
+        int label = int(floor(texture(valueTex, t).r + 0.5));
+        ivec2 size = textureSize(palette, 0);
+        if (inside(t) && label > 0 && label < size.x * size.y) {
+            vec3 rgb = texelFetch(palette, ivec2(label % PALETTE_W, label / PALETTE_W), 0).rgb;
+            col = mix(col, rgb * mix(1.0, light, 0.4), cmap.w);
+        }
+    } else if (modes.w > 0.5) {
         int ns = clamp(int(depth.z + 0.5), 1, MAX_SAMPLES);
         float v = 0.0, s = 0.0;
         bool ok = true;

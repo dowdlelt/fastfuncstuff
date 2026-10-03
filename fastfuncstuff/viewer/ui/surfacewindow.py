@@ -133,6 +133,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._tex_from_mm = np.eye(4)
         self._stat_from_mm = np.eye(4)
         self._lut: np.ndarray | None = None
+        self._palette: np.ndarray | None = None
         self._gpu: dict[str, _HemiGPU] = {}
         self._rhi_ready = False
         self._press: QtCore.QPointF | None = None
@@ -230,6 +231,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._volume_dirty = True
         self.update()
 
+    def set_palette(self, image: np.ndarray | None) -> None:
+        """``(rows, PALETTE_W, 4)`` uint8 label colours (see surface3d.palette_texture)."""
+        self._palette = None if image is None else np.ascontiguousarray(image, np.uint8)
+        self._palette_dirty = self._palette is not None
+        self.update()
+
     def set_lut(self, rgba: np.ndarray) -> None:
         self._lut = np.ascontiguousarray(rgba, np.uint8)
         self._lut_dirty = True
@@ -297,6 +304,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._stat_tex = self._value_tex
         self._lut_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QtCore.QSize(256, 1))
         self._lut_tex.create()
+        self._palette_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QtCore.QSize(s3.PALETTE_W, 1))
+        self._palette_tex.create()
+        self._palette_dirty = self._palette is not None
         self._pipeline = None
         self._rhi_ready = True
 
@@ -362,7 +372,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 QRhiBuffer.Type.Dynamic, QRhiBuffer.UsageFlag.UniformBuffer, s3.UNIFORM_BYTES
             )
             gpu.ubuf.create()
-        sampler = self._linear_s if self.linear else self._nearest
+        # Labels are never interpolated: a blend of 12 and 40 is not 26.
+        sampler = self._linear_s if self.linear and not self.shade.labels else self._nearest
         srb = gpu.srb or rhi.newShaderResourceBindings()
         stage = _STAGE.VertexStage | _STAGE.FragmentStage
         srb.setBindings(
@@ -371,6 +382,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 Binding.sampledTexture(1, _STAGE.FragmentStage, self._value_tex, sampler),
                 Binding.sampledTexture(2, _STAGE.FragmentStage, self._stat_tex, sampler),
                 Binding.sampledTexture(3, _STAGE.FragmentStage, self._lut_tex, self._nearest),
+                Binding.sampledTexture(4, _STAGE.FragmentStage, self._palette_tex, self._nearest),
             ]
         )
         srb.create()
@@ -420,6 +432,20 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     self._upload_3d(batch, self._stat_tex, sdata)
             for gpu in self._gpu.values():
                 self._bindings(gpu)
+        if getattr(self, "_palette_dirty", False) and self._palette is not None:
+            self._palette_dirty = False
+            rows, width = self._palette.shape[:2]
+            if self._palette_tex.pixelSize() != QtCore.QSize(width, rows):
+                self._palette_tex = rhi.newTexture(
+                    QRhiTexture.Format.RGBA8, QtCore.QSize(width, rows)
+                )
+                self._palette_tex.create()
+                for gpu in self._gpu.values():
+                    self._bindings(gpu)
+            img = QtGui.QImage(
+                self._palette.tobytes(), width, rows, 4 * width, QtGui.QImage.Format.Format_RGBA8888
+            ).copy()
+            batch.uploadTexture(self._palette_tex, img)
         if getattr(self, "_lut_dirty", False) and self._lut is not None:
             self._lut_dirty = False
             img = QtGui.QImage(
@@ -672,6 +698,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.located.connect(self.located)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self._built_map: tuple | None = None
+        self._built_palette: tuple | None = None
         self._map_hemis: set[str] = set()
         v.addWidget(self.canvas, 1)
         self.resize(640, 520)
@@ -1037,12 +1064,12 @@ class SurfaceWindow(QtWidgets.QWidget):
         st = self.session.state
         base = st.layers.base
         sel = st.layers.find(st.selected) if st.selected else None
-        if sel is not None and (base is None or sel.key != base.key) and not sel.roi:
+        if sel is not None and (base is None or sel.key != base.key):
             return sel
         for layer in reversed(list(st.layers)):
             if base is not None and layer.key == base.key:
                 continue
-            if layer.visible and not layer.roi:
+            if layer.visible:
                 return layer
         return None
 
@@ -1087,8 +1114,24 @@ class SurfaceWindow(QtWidgets.QWidget):
             rgba = np.concatenate([np.round(rgb * 255), np.full((rgb.shape[0], 1), 255.0)], 1)
             c.set_lut(rgba.astype(np.uint8))
             self._built_lut = lut_key
+        if layer.roi:
+            palette = self.session.roi_palette(layer.key, torch.device("cpu"))
+            labels_key = ("roi", layer.key, None if palette is None else palette.shape[0])
+            if labels_key != self._built_palette:
+                c.set_palette(None if palette is None else s3.palette_texture(palette.numpy()))
+                self._built_palette = labels_key
+            before = c.shade.labels
+            c.shade = s3.ShadeParams(
+                opacity=float(layer.opacity) if layer.visible else 0.0,
+                has_data=palette is not None,
+                labels=True,
+            )
+            if not before:
+                c.set_linear(c.linear)  # rebind with the nearest sampler
+            return
         signs = {SignMode.BOTH: 0, SignMode.POS: 1, SignMode.NEG: 2}
         alphas = {AlphaMode.OFF: 0, AlphaMode.LINEAR: 1, AlphaMode.QUADRATIC: 2}
+        was_labels = c.shade.labels
         c.shade = s3.ShadeParams(
             lo=float(layer.range_lo if layer.range_lo is not None else 0.0),
             hi=float(layer.range_hi if layer.range_hi is not None else 1.0),
@@ -1099,6 +1142,8 @@ class SurfaceWindow(QtWidgets.QWidget):
             n_panes=int(layer.n_panes),
             has_data=True,
         )
+        if was_labels:
+            c.set_linear(c.linear)  # labels forced nearest; restore the choice
 
     def _refresh_cross(self) -> None:
         mm = self.session.state.crosshair_mm

@@ -281,6 +281,9 @@ class ShadeParams:
     alpha_mode: int = 0  # 0 off, 1 linear, 2 quadratic
     n_panes: int = 0
     has_data: bool = False
+    #: A label layer: colour by value from the palette, sampled nearest at
+    #: mid-depth only.
+    labels: bool = False
 
 
 def pack_uniforms(
@@ -316,7 +319,12 @@ def pack_uniforms(
             vec(morph, 0.0, 0.0, 0.0),
             vec(depth[0], depth[1], float(samples), curv_contrast),
             vec(shade.lo, shade.hi, shade.threshold, shade.opacity),
-            vec(shade.sign_mode, shade.alpha_mode, shade.n_panes, 1.0 if shade.has_data else 0.0),
+            vec(
+                shade.sign_mode,
+                shade.alpha_mode,
+                shade.n_panes,
+                (2.0 if shade.labels else 1.0) if shade.has_data else 0.0,
+            ),
             vec(*cross),
             vec(*cross_rgb, 0.0),
             vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
@@ -421,6 +429,20 @@ def vertex_colors(
     return out
 
 
+#: Palette entries per texture row; must match PALETTE_W in surface.frag.
+PALETTE_W = 4096
+
+
+def palette_texture(rgb: np.ndarray) -> np.ndarray:
+    """``(N, 3)`` label colours in [0, 1] as an ``(rows, PALETTE_W, 4)`` uint8 image."""
+    n = rgb.shape[0]
+    rows = max(1, -(-n // PALETTE_W))
+    out = np.zeros((rows * PALETTE_W, 4), np.uint8)
+    out[:n, :3] = np.clip(np.round(np.asarray(rgb) * 255), 0, 255)
+    out[:n, 3] = 255
+    return out.reshape(rows, PALETTE_W, 4)
+
+
 def depth_fractions(depth: tuple[float, float], samples: int) -> np.ndarray:
     """Where the shader samples between white (0) and pial (1)."""
     if samples <= 1:
@@ -464,7 +486,9 @@ __all__ = [
     "VIEWS",
     "Camera",
     "ShadeParams",
+    "PALETTE_W",
     "VERTEX_MAPS",
+    "palette_texture",
     "depth_fractions",
     "equivolume_fraction",
     "vertex_colors",
