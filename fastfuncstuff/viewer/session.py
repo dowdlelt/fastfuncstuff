@@ -25,6 +25,7 @@ from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
 from fastfuncstuff.viewer.rois import RoiSet, looks_like_labels, rois_from_frames, rois_from_labels
 from fastfuncstuff.viewer.state import Plane, ViewerState
+from fastfuncstuff.viewer.surfaces import SurfaceStore
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddLayer,
@@ -221,6 +222,9 @@ class ViewerSession:
         self.bus = install(
             CommandBus(self.state, record=record), open_layer=self._open, session=self
         )
+        #: FreeSurfer meshes. Beside the layer stack, not in it: see
+        #: :mod:`viewer.surfaces` for why a surface is not a layer.
+        self.surfaces = SurfaceStore()
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
         self.catalog_recursive = False

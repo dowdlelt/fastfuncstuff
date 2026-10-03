@@ -409,6 +409,33 @@ class Load(Command):
 
 @command
 @dataclass(frozen=True)
+class LoadSurfaces(Command):
+    """Read a FreeSurfer subject's surfaces and outline them on the slices.
+
+    ``hemis`` is comma-separated. The meshes are placed in scanner RAS from
+    the geometry each surface file carries, so they land on whatever anatomy
+    shares that space -- no SUMA spec, no surface volume to align.
+    """
+
+    name = "LOAD_SURFACES"
+    aspects = Aspect.SLICES
+    major = True
+    subject_dir: str
+    hemis: str = "lh,rh"
+
+
+@command
+@dataclass(frozen=True)
+class ShowSurfaces(Command):
+    """Which surfaces are outlined, comma-separated (``white,pial``); empty hides all."""
+
+    name = "SHOW_SURFACES"
+    aspects = Aspect.SLICES
+    names: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetUnderlay(Command):
     """Replace the base image, keeping whatever is stacked over it.
 
@@ -958,6 +985,22 @@ def install(
         if base is not None and base.key == cmd.key and regridded:
             dirty |= _adopt_grid_preserving_position(st, fresh)
         return dirty
+
+    @bus.handle(LoadSurfaces.name)
+    def _load_surfaces(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, LoadSurfaces)
+        if session is None:
+            raise RuntimeError("LOAD_SURFACES needs a session")
+        hemis = tuple(h for h in cmd.hemis.split(",") if h)
+        session.surfaces.load(cmd.subject_dir, hemis)
+        st.surface_subject = cmd.subject_dir
+        return LoadSurfaces.aspects
+
+    @bus.handle(ShowSurfaces.name)
+    def _show_surfaces(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, ShowSurfaces)
+        st.surfaces_shown = tuple(n for n in cmd.names.split(",") if n)
+        return ShowSurfaces.aspects
 
     @bus.handle(Load.name)
     def _load_layer(cmd: Command, st: ViewerState) -> Aspect:

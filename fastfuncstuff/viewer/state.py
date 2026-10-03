@@ -86,6 +86,10 @@ class ViewerState:
     #: session comes back looking the way it was recorded -- a screenshot from
     #: a replay should match the one that prompted it.
     theme: str = "light"
+    #: FreeSurfer subject whose surfaces are loaded (the meshes themselves are
+    #: on the session), and which of them are drawn as slice outlines.
+    surface_subject: str | None = None
+    surfaces_shown: tuple[str, ...] = ("white", "pial")
 
     @property
     def crosshair_mm(self) -> tuple[float, float, float] | None:

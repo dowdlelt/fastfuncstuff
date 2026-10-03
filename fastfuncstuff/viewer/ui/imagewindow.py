@@ -457,6 +457,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_pane(render_viewport(self.session, vp))
         self._sync_opacity()
         state = self.session.state
+        self._redraw_outlines(vp)
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
             extent = state.grid.shape[layout.fixed]
@@ -464,6 +465,19 @@ class ImageWindow(QtWidgets.QWidget):
             follow = "" if vp.locked else " parked"
             self.slice_label.setText(f"{'--' if pos is None else pos}/{extent - 1}{follow}")
         self.redraw_crosshair()
+
+    def _redraw_outlines(self, vp: Viewport) -> None:
+        state = self.session.state
+        surfaces = self.session.surfaces
+        view = plane_view(state, vp)
+        pos = self.pane.position
+        if not surfaces.hemis or not state.surfaces_shown or view is None or pos is None:
+            self.pane.set_outlines([])
+            return
+        assert state.grid is not None
+        self.pane.set_outlines(
+            surfaces.outlines(state.grid.affine, view, pos, state.surfaces_shown)
+        )
 
     def redraw_crosshair(self) -> None:
         state = self.session.state

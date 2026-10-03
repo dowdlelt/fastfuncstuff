@@ -64,6 +64,9 @@ class ImagePane(QtWidgets.QWidget):
         self._grab: str | None = None
         self._grab_at: QtCore.QPointF | None = None
         self._grab_angle = 0.0
+        #: Surface outlines as (colour, lines) in image-pixel coordinates,
+        #: built once per slice and scaled at paint time.
+        self._outlines: list[tuple[QtGui.QColor, list[QtCore.QLineF]]] = []
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -115,6 +118,18 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_outlines(self, outlines) -> None:
+        """Surface/slice crossings, as :class:`viewer.surfaces.Outline` records."""
+        built = []
+        for o in outlines:
+            # (row, col) -> (x, y) = (col, row), pixel centres at +0.5.
+            seg = o.segments[..., ::-1].reshape(-1, 4) + 0.5
+            lines = [QtCore.QLineF(x0, y0, x1, y1) for x0, y0, x1, y1 in seg.tolist()]
+            built.append((QtGui.QColor.fromRgbF(*o.rgb), lines))
+        if built or self._outlines:
+            self._outlines = built
+            self.update()
 
     def set_handle(self, where: tuple[float, float] | None) -> None:
         """Show the align ring around an image point, or hide it (``None``)."""
@@ -189,6 +204,8 @@ class ImagePane(QtWidgets.QWidget):
         # Nearest-neighbour: a viewer must not invent voxels that are not there.
         p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, False)
         p.drawImage(rect, self._image)
+        if self._outlines:
+            self._paint_outlines(p, rect)
 
         if self._cross is not None:
             self._paint_crosshair(p, rect)
@@ -220,6 +237,24 @@ class ImagePane(QtWidgets.QWidget):
         if self._readout:
             self._paint_readout(p)
         p.end()
+
+    def _paint_outlines(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        assert self._image is not None
+        p.save()
+        p.setClipRect(rect)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.translate(rect.x(), rect.y())
+        p.scale(rect.width() / self._image.width(), rect.height() / self._image.height())
+        for colour, lines in self._outlines:
+            pen = QtGui.QPen(colour)
+            # Cosmetic: a screen-pixel width however far the slice is
+            # magnified, so zooming in to judge a boundary makes the line
+            # relatively thinner rather than hiding the edge under it.
+            pen.setCosmetic(True)
+            pen.setWidthF(1.25)
+            p.setPen(pen)
+            p.drawLines(lines)
+        p.restore()
 
     def _paint_readout(self, p: QtGui.QPainter) -> None:
         """Values in the corner, on a translucent plate so they read over the brain."""

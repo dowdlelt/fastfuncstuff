@@ -157,6 +157,24 @@ class PlaneView:
         r0, c0 = self.origin
         return (row - r0, col - c0)
 
+    def points_to_image(self, ijk: np.ndarray) -> np.ndarray:
+        """Continuous display-grid points ``(..., 3)`` to fractional (row, col).
+
+        The vectorised, unrounded twin of :meth:`to_image`, for geometry drawn
+        over the image (surface outlines) that must not snap to voxel centres.
+        Integer coordinates land on the same pixel :meth:`to_image` gives;
+        pixel ``r`` is centred at ``r + 0.5`` in the drawn image.
+        """
+        ijk = np.asarray(ijk, dtype=np.float64)
+        lay = self.layout
+        row, col = ijk[..., lay.row], ijk[..., lay.col]
+        if lay.row_flip:
+            row = self.shape[lay.row] - 1 - row
+        if lay.col_flip:
+            col = self.shape[lay.col] - 1 - col
+        r0, c0 = self.origin
+        return np.stack([row - r0, col - c0], axis=-1)
+
     def to_ijk(self, row: int, col: int, current: tuple[int, int, int]) -> tuple[int, int, int]:
         """(row, col) in the drawn image back to display-grid indices."""
         r0, c0 = self.origin
