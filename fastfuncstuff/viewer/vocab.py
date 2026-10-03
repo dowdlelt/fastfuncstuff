@@ -541,6 +541,28 @@ class SetSurfaceDepth(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceEquivolume(Command):
+    """Sample depth by equal volume (on) or equal distance (off) between white and pial."""
+
+    name = "SET_SURFACE_EQUIVOLUME"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    on: bool = True
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceMap(Command):
+    """Paint a per-vertex map under the overlay: thickness, sulc, curv, annot, or none."""
+
+    name = "SET_SURFACE_MAP"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    map: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceHemis(Command):
     """Which hemispheres a surface window draws, and how far apart (mm)."""
 
@@ -562,6 +584,18 @@ class SetProfileView(Command):
     mode: str = "fraction"
     score: str = "worst"
     tube: float = 0.5
+
+
+@command
+@dataclass(frozen=True)
+class SetAtlas(Command):
+    """Name regions from this parcellation (``aparc``, ``aparc.a2009s``...) and label
+    volume (``aparc+aseg``, ``aseg``...); empty turns either off."""
+
+    name = "SET_ATLAS"
+    aspects = Aspect.CROSSHAIR
+    annot: str = "aparc"
+    volume: str = "aparc+aseg"
 
 
 @command
@@ -1132,6 +1166,13 @@ def install(
         st.surfaces_shown = tuple(n for n in cmd.names.split(",") if n)
         return ShowSurfaces.aspects
 
+    @bus.handle(SetAtlas.name)
+    def _set_atlas(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetAtlas)
+        st.surface_annot = cmd.annot
+        st.volume_atlas = cmd.volume
+        return SetAtlas.aspects
+
     @bus.handle(SetSurfaceEditing.name)
     def _set_surface_editing(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceEditing)
@@ -1412,6 +1453,22 @@ def install(
             raise ValueError("surface depth is a fraction from white (0) to pial (1)")
         samples = int(min(max(cmd.samples, 1), 16))
         return _set_view(st, cmd.view, SetSurfaceDepth.aspects, depth=(lo, hi), samples=samples)
+
+    @bus.handle(SetSurfaceEquivolume.name)
+    def _set_surface_equivolume(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceEquivolume)
+        return _set_view(st, cmd.view, SetSurfaceEquivolume.aspects, equivolume=bool(cmd.on))
+
+    @bus.handle(SetSurfaceMap.name)
+    def _set_surface_map(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceMap)
+        from fastfuncstuff.viewer.surface3d import VERTEX_MAPS
+
+        if cmd.map not in VERTEX_MAPS:
+            raise ValueError(
+                f"unknown surface map {cmd.map!r}; one of {', '.join(m for m in VERTEX_MAPS if m)}"
+            )
+        return _set_view(st, cmd.view, SetSurfaceMap.aspects, vertex_map=cmd.map)
 
     @bus.handle(SetSurfaceHemis.name)
     def _set_surface_hemis(cmd: Command, st: ViewerState) -> Aspect:

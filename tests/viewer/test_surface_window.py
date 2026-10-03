@@ -66,7 +66,8 @@ def test_an_edit_under_a_laid_out_shape_uploads_only_where_data_is_sampled(windo
     from fastfuncstuff.viewer.commands import Aspect
 
     win.refresh(Aspect.SLICES)
-    assert set(c._pending["lh"]) == {"white", "pial"}
+    # Areas too: equivolume depth depends on them, and an edit changes them.
+    assert set(c._pending["lh"]) == {"white", "pial", "areas"}
     np.testing.assert_array_equal(c._cpu["lh"]["pial"], hemi.states["pial"])
 
 

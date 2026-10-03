@@ -100,3 +100,52 @@ def test_uniform_block_is_column_major_and_sized():
 def test_depth_fractions():
     np.testing.assert_allclose(s3.depth_fractions((0.3, 0.9), 1), [0.3])
     np.testing.assert_allclose(s3.depth_fractions((0.0, 1.0), 3), [0.0, 0.5, 1.0])
+
+
+def test_equivolume_depth_encloses_the_asked_volume_fraction():
+    from scipy.integrate import quad
+
+    for aw, ap in [(1.0, 2.5), (2.0, 0.6), (1.3, 1.3)]:
+        for alpha in (0.0, 0.2, 0.5, 0.9, 1.0):
+            rho = float(s3.equivolume_fraction(alpha, aw, ap))
+
+            def area(r, aw=aw, ap=ap):
+                return aw + (ap - aw) * r
+
+            total = quad(area, 0, 1)[0]
+            assert quad(area, 0, rho)[0] / total == pytest.approx(alpha, abs=1e-9)
+    # A gyral crown (pial area > white): outer layers are the thin ones, so the
+    # mid-volume surface sits nearer pial. A fundus: nearer white.
+    assert s3.equivolume_fraction(0.5, 1.0, 3.0) > 0.5
+    assert s3.equivolume_fraction(0.5, 3.0, 1.0) < 0.5
+
+
+def test_vertex_maps_leave_the_medial_wall_transparent():
+    from fastfuncstuff.io.freesurfer import Annotation, Hemisphere
+
+    n = 6
+    cortex = np.array([True, True, True, True, False, False])
+    hemi = Hemisphere(
+        name="lh",
+        faces=np.array([[0, 1, 2], [3, 4, 5]], np.int32),
+        states={"white": np.zeros((n, 3), np.float32)},
+        tkr_to_scanner=np.eye(4),
+        morph={"thickness": np.array([1.0, 2.5, 4.5, 9.0, 2.0, 2.0], np.float32)},
+        cortex=cortex,
+    )
+    thick = s3.vertex_colors(hemi, "thickness")
+    assert thick is not None
+    assert (thick[~cortex, 3] == 0).all() and (thick[cortex, 3] == 255).all()
+    # Clipped at 4.5 mm: 4.5 and 9 mm get the same top colour.
+    np.testing.assert_array_equal(thick[2], thick[3])
+    ann = Annotation(
+        labels=np.array([0, 1, 1, 2, 1, -1]),
+        names=["unknown", "precentral", "insula"],
+        rgba=np.array([[1, 1, 1, 255], [200, 0, 0, 255], [0, 200, 0, 255]], np.uint8),
+    )
+    rgba = s3.vertex_colors(hemi, "annot", ann)
+    assert rgba is not None
+    assert rgba[0, 3] == 0  # "unknown" names no region
+    assert tuple(rgba[1, :3]) == (200, 0, 0) and rgba[1, 3] == 255
+    assert rgba[4, 3] == 0  # medial wall
+    assert ann.name_at(3) == "insula" and ann.name_at(0) is None and ann.name_at(5) is None

@@ -98,6 +98,11 @@ class ViewerState:
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.
     surface_snap_key: str | None = None
+    #: Which FreeSurfer parcellation (``label/?h.<name>.annot``) and which
+    #: label volume (``mri/<name>.mgz``) the readout names regions from.
+    #: Empty turns that line off.
+    surface_annot: str = "aparc"
+    volume_atlas: str = "aparc+aseg"
 
     @property
     def crosshair_mm(self) -> tuple[float, float, float] | None:

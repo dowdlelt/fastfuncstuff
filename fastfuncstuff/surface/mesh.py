@@ -93,6 +93,17 @@ def vertex_normals(vertices: np.ndarray, topo: MeshTopology) -> np.ndarray:
     return n / np.maximum(norm, 1e-12)
 
 
+def vertex_areas(
+    vertices: np.ndarray, faces: np.ndarray, n_vertices: int | None = None
+) -> np.ndarray:
+    """Barycentric area per vertex (a third of each incident face), mm^2."""
+    n = int(faces.max()) + 1 if n_vertices is None else int(n_vertices)
+    face_area = 0.5 * np.linalg.norm(face_normals(np.asarray(vertices, np.float64), faces), axis=1)
+    out = np.zeros(n)
+    np.add.at(out, np.asarray(faces).ravel(), np.repeat(face_area / 3.0, 3))
+    return out
+
+
 def geodesic_ball(
     vertices: np.ndarray, topo: MeshTopology, centre: int, radius: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -114,5 +125,6 @@ __all__ = [
     "MeshTopology",
     "face_normals",
     "geodesic_ball",
+    "vertex_areas",
     "vertex_normals",
 ]

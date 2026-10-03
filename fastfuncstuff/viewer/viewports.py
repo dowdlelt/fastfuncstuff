@@ -158,6 +158,13 @@ class Viewport:
     #: beyond their layout (mm) -- splitting is how the medial wall is seen.
     hemis: str = "lh,rh"
     split: float = 0.0
+    #: Depth as equal *volume* fractions (Waehnert 2014) rather than equal
+    #: distances -- the default, because a laminar question is about layers,
+    #: and layers keep their volume, not their distance, through a fold.
+    equivolume: bool = True
+    #: Per-vertex map painted under the overlay: "", thickness, sulc, curv,
+    #: or annot (the state's selected parcellation).
+    vertex_map: str = ""
 
     # -- ribbon profiles ------------------------------------------------
     #: ``fraction`` (white and pial on fixed columns) or ``mm`` (pial where

@@ -836,6 +836,9 @@ class ViewerSession:
                     stat = voxel_value(stat_vol, st.grid, layer.affine, st.crosshair)
                     parts.append(f"{_brick_name(layer, layer.threshold_index)}{_fmt(stat)}")
             lines.append(prefix + "   ".join(parts))
+        # The region the crosshair is in, from the subject's own parcellation
+        # and label volume -- whatever else is loaded.
+        lines.extend(self.surfaces.region_lines(st.crosshair_mm, st.surface_annot, st.volume_atlas))
         return lines
 
     # -- overlay colour per voxel ---------------------------------------

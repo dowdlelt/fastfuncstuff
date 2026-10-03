@@ -9,6 +9,8 @@ layout(location = 0) in vec3 vWhite;
 layout(location = 1) in vec3 vPial;
 layout(location = 2) in vec3 vNormal;
 layout(location = 3) in float vCurv;
+layout(location = 4) in vec4 vColor;
+layout(location = 5) in vec2 vAreas;
 
 layout(location = 0) out vec4 fragColor;
 
@@ -23,7 +25,7 @@ layout(std140, binding = 0) uniform Block {
     vec4 modes;
     vec4 cross;
     vec4 crossRgb;
-    vec4 spare;
+    vec4 extra;
 };
 
 layout(binding = 1) uniform sampler3D valueTex;
@@ -33,6 +35,16 @@ layout(binding = 3) uniform sampler2D lut;
 const int MAX_SAMPLES = 16;
 
 bool inside(vec3 t) { return all(greaterThanEqual(t, vec3(0.0))) && all(lessThanEqual(t, vec3(1.0))); }
+
+// Equivolume depth (Waehnert 2014, per-vertex areas as pycortex): area varies
+// linearly from white to pial, so the depth enclosing volume fraction a solves
+// a quadratic. Twin of surface3d.py:equivolume_fraction.
+float equivolume(float a)
+{
+    float aw = vAreas.x, ap = vAreas.y, delta = ap - aw;
+    if (abs(delta) <= 1e-4 * max(aw + ap, 1e-12)) return a;
+    return (sqrt(max((1.0 - a) * aw * aw + a * ap * ap, 0.0)) - aw) / delta;
+}
 
 float unitOf(float v)
 {
@@ -66,6 +78,9 @@ void main()
     // FreeSurfer curvature is positive in sulci: darker there.
     float base = 0.62 - depth.w * clamp(vCurv * 2.5, -1.0, 1.0);
     vec3 col = vec3(base) * light;
+    // A per-vertex map (thickness, parcellation...) sits on the anatomy and
+    // under any volume overlay.
+    col = mix(col, vColor.rgb * light, vColor.a * extra.y);
 
     if (modes.w > 0.5) {
         int ns = clamp(int(depth.z + 0.5), 1, MAX_SAMPLES);
@@ -74,6 +89,7 @@ void main()
         for (int i = 0; i < MAX_SAMPLES; ++i) {
             if (i >= ns) break;
             float d = ns == 1 ? depth.x : mix(depth.x, depth.y, float(i) / float(ns - 1));
+            if (extra.x > 0.5) d = equivolume(d);
             vec4 p = vec4(mix(vWhite, vPial, d), 1.0);
             vec3 t = (texFromMm * p).xyz;
             vec3 ts = (statFromMm * p).xyz;

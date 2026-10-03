@@ -49,17 +49,27 @@ from PySide6.QtGui import (
 )
 from PySide6.QtGui import QRhiShaderResourceBinding as Binding
 
-from fastfuncstuff.surface.mesh import MeshTopology, vertex_normals
+from fastfuncstuff.io.freesurfer import available_annotations, available_volume_atlases
+from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas, vertex_normals
 from fastfuncstuff.viewer import surface3d as s3
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
 from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
-from fastfuncstuff.viewer.vocab import SetSurfaceDepth, SetSurfaceHemis, SetSurfaceShape
+from fastfuncstuff.viewer.vocab import (
+    SetAtlas,
+    SetSurfaceDepth,
+    SetSurfaceEquivolume,
+    SetSurfaceHemis,
+    SetSurfaceMap,
+    SetSurfaceShape,
+)
 
 _STAGE = Binding.StageFlag
-_ATTRS = ("posA", "posB", "nrmA", "nrmB", "white", "pial", "curv")
+_ATTRS = ("posA", "posB", "nrmA", "nrmB", "white", "pial", "curv", "vcolor", "areas")
+#: Bytes per vertex and vertex format of each attribute; Float3 unless listed.
+_STRIDE = {"curv": 4, "vcolor": 4, "areas": 8}
 
 
 def _shader(name: str) -> QShader:
@@ -90,6 +100,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
 
     #: A click on the surface, in scanner mm.
     located = QtCore.Signal(float, float, float)
+    #: Shift+wheel: move the sampled depth by this fraction.
+    depth_scrolled = QtCore.Signal(float)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -99,6 +111,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.depth: tuple[float, float] = (0.5, 0.5)
         self.samples = 1
         self.curv_contrast = 0.12
+        self.equivolume = True
+        self.map_opacity = 0.85
         self.shade = s3.ShadeParams()
         self.cross: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self.linear = False
@@ -141,6 +155,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         white: np.ndarray | None = None,
         pial: np.ndarray | None = None,
         curv: np.ndarray | None = None,
+        vcolor: np.ndarray | None = None,
+        areas: np.ndarray | None = None,
         faces: np.ndarray | None = None,
         flat_faces: np.ndarray | None = None,
     ) -> None:
@@ -153,12 +169,15 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             "white": white,
             "pial": pial,
             "curv": curv,
+            "vcolor": vcolor,
+            "areas": areas,
         }
         pend = self._pending.setdefault(hemi, {})
         cpu = self._cpu.setdefault(hemi, {})
         for k, v in given.items():
             if v is not None:
-                arr = np.ascontiguousarray(v, dtype=np.float32)
+                kind = np.uint8 if k == "vcolor" else np.float32
+                arr = np.ascontiguousarray(v, dtype=kind)
                 pend[k] = arr
                 cpu[k] = arr
         if faces is not None:
@@ -311,11 +330,18 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             ]
         )
         layout = QRhiVertexInputLayout()
-        layout.setBindings([QRhiVertexInputBinding(4 if a == "curv" else 12) for a in _ATTRS])
+        layout.setBindings([QRhiVertexInputBinding(_STRIDE.get(a, 12)) for a in _ATTRS])
         fmt = QRhiVertexInputAttribute.Format
         layout.setAttributes(
             [
-                QRhiVertexInputAttribute(i, i, fmt.Float if a == "curv" else fmt.Float3, 0)
+                QRhiVertexInputAttribute(
+                    i,
+                    i,
+                    {"curv": fmt.Float, "vcolor": fmt.UNormByte4, "areas": fmt.Float2}.get(
+                        a, fmt.Float3
+                    ),
+                    0,
+                )
                 for i, a in enumerate(_ATTRS)
             ]
         )
@@ -446,6 +472,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     shade=self.shade,
                     cross=self.cross,
                     cross_rgb=tuple(theme.palette().crosshair[:3]),
+                    equivolume=self.equivolume,
+                    map_opacity=self.map_opacity,
                 ),
             )
             draws.append((gpu, index, count))
@@ -515,7 +543,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._press = self._last = None
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 (Qt)
-        steps = event.angleDelta().y() / 120.0
+        delta = event.angleDelta()
+        steps = (delta.y() or delta.x()) / 120.0
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
+            # Scroll through cortical depth -- the laminar view.
+            self.depth_scrolled.emit(0.05 * steps)
+            return
         self.camera.zoom(0.9**steps)
         self.update()
 
@@ -544,7 +577,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         _, hemi, face, bary = best
         corners = self._faces[hemi]["flat" if self._flat.get(hemi) else "full"].reshape(-1, 3)[face]
         cpu = self._cpu[hemi]
-        d = 0.5 * (self.depth[0] + self.depth[1])
+        d = np.full(3, 0.5 * (self.depth[0] + self.depth[1]))
+        if self.equivolume and "areas" in cpu:
+            # Where the shader samples: the same equivolume depth per corner.
+            aw, ap = cpu["areas"][corners, 0], cpu["areas"][corners, 1]
+            d = s3.equivolume_fraction(d, aw, ap)
+        d = d[:, None]
         point = (1 - d) * cpu["white"][corners] + d * cpu["pial"][corners]
         mm = bary @ point
         return hemi, (float(mm[0]), float(mm[1]), float(mm[2]))
@@ -608,14 +646,33 @@ class SurfaceWindow(QtWidgets.QWidget):
             b.clicked.connect(lambda _=False, h=hemi: self._toggle_hemi(h))
             bar.addWidget(b)
             self._hemi_buttons[hemi] = b
+        bar.addSpacing(8)
+        self.map_box = self._combo("Per-vertex map painted under the overlay (c cycles)")
+        self.map_box.activated.connect(self._pick_map)
+        bar.addWidget(self.map_box)
+        self.annot_box = self._combo(
+            "Surface parcellation: the map's colours and the region readout"
+        )
+        self.annot_box.activated.connect(self._pick_atlas)
+        bar.addWidget(self.annot_box)
+        self.atlas_box = self._combo("Label volume the readout names regions from")
+        self.atlas_box.activated.connect(self._pick_atlas)
+        bar.addWidget(self.atlas_box)
         bar.addStretch(1)
         self.depth_label = QtWidgets.QLabel("")
         self.depth_label.setObjectName("value")
         bar.addWidget(self.depth_label)
         v.addLayout(bar)
+        self.region_label = QtWidgets.QLabel("")
+        self.region_label.setObjectName("value")
+        self.region_label.setContentsMargins(8, 0, 8, 2)
+        v.addWidget(self.region_label)
 
         self.canvas = SurfaceCanvas(self)
         self.canvas.located.connect(self.located)
+        self.canvas.depth_scrolled.connect(self._scroll_depth)
+        self._built_map: tuple | None = None
+        self._map_hemis: set[str] = set()
         v.addWidget(self.canvas, 1)
         self.resize(640, 520)
 
@@ -637,6 +694,9 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("]", "sample deeper (toward pial)", depth_step(0.1), group="depth"),
                 Key("{", "fewer depth samples", lambda: self._samples_by(-1), group="depth"),
                 Key("}", "more depth samples (average white..pial)", lambda: self._samples_by(1), group="depth"),
+                Key("shift+scroll", "scroll through cortical depth", None, group="depth"),
+                Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
+                Key("c", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
                 Key("n", "nearest / linear voxel sampling", self._toggle_linear, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
                 Key("shift+v", "previous view", lambda: self._cycle_view(-1), group="view"),
@@ -651,6 +711,13 @@ class SurfaceWindow(QtWidgets.QWidget):
             ]
         )  # fmt: skip
         keep_keys_for_shortcuts(self)
+
+    def _combo(self, tip: str) -> QtWidgets.QComboBox:
+        box = QtWidgets.QComboBox()
+        box.setToolTip(tip)
+        box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        return box
 
     # -- viewport plumbing --------------------------------------------------
     def _viewport(self) -> Viewport | None:
@@ -799,6 +866,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                     nrm_b=None,
                     white=hemi.states["white"],
                     pial=hemi.states["pial"],
+                    areas=self._areas(h),
                 )
             self._built_versions = {h: surfaces.version.get(h, 0) for h in surfaces.hemis}
             moved = set()
@@ -828,6 +896,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                     white=hemi.states["white"],
                     pial=hemi.states["pial"],
                     curv=hemi.morph.get("curv", np.zeros(hemi.n_vertices, np.float32)),
+                    areas=self._areas(h),
                     faces=hemi.faces.astype(np.uint32) if h not in self._built_versions else None,
                     flat_faces=flat_faces if h not in self._built_versions else None,
                 )
@@ -840,16 +909,103 @@ class SurfaceWindow(QtWidgets.QWidget):
                 self._frame()
             self._built_shape = vp.shape
             self._built_versions = {h: surfaces.version.get(h, 0) for h in surfaces.hemis}
+        self._refresh_map(vp)
         self._apply_layout(vp)
         c.depth = vp.depth
         c.samples = vp.samples
+        c.equivolume = vp.equivolume
         self._refresh_data()
         self._refresh_cross()
-        lo, hi = vp.depth
-        self.depth_label.setText(
-            f"depth {lo:.2f}" if vp.samples <= 1 else f"depth {lo:.2f}-{hi:.2f} x{vp.samples}"
-        )
+        self._sync_header(vp)
         c.update()
+
+    def _areas(self, hemi: str) -> np.ndarray:
+        """``(V, 2)`` white and pial vertex areas, for equivolume depth.
+
+        From the current meshes rather than ``?h.area``/``?h.area.pial``, so an
+        edit's change of area is in the next frame.
+        """
+        h = self.session.surfaces.hemis[hemi]
+        faces = h.faces.astype(np.int64)
+        return np.stack(
+            [
+                vertex_areas(h.states["white"], faces, h.n_vertices),
+                vertex_areas(h.states["pial"], faces, h.n_vertices),
+            ],
+            axis=1,
+        ).astype(np.float32)
+
+    def _refresh_map(self, vp: Viewport) -> None:
+        surfaces = self.session.surfaces
+        annot = self.session.state.surface_annot
+        key = (vp.vertex_map, annot if vp.vertex_map == "annot" else "", surfaces.subject)
+        fresh = {h for h in surfaces.hemis if h not in self._map_hemis}
+        if key == self._built_map and not fresh:
+            return
+        for h, hemi in surfaces.hemis.items():
+            ann = surfaces.annotation(h, annot) if vp.vertex_map == "annot" else None
+            colours = s3.vertex_colors(hemi, vp.vertex_map, ann)
+            if colours is None:
+                colours = np.zeros((hemi.n_vertices, 4), np.uint8)
+            self.canvas.set_hemisphere(
+                h, pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=colours
+            )
+        self._built_map = key
+        self._map_hemis = set(surfaces.hemis)
+
+    def _sync_header(self, vp: Viewport) -> None:
+        lo, hi = vp.depth
+        how = "equivol" if vp.equivolume else "linear"
+        self.depth_label.setText(
+            f"{how} {lo:.2f}" if vp.samples <= 1 else f"{how} {lo:.2f}-{hi:.2f} x{vp.samples}"
+        )
+        st = self.session.state
+        for box, items, current in (
+            (self.map_box, list(s3.VERTEX_MAPS), vp.vertex_map),
+            (self.annot_box, ["", *self._annots()], st.surface_annot),
+            (self.atlas_box, ["", *self._atlases()], st.volume_atlas),
+        ):
+            box.blockSignals(True)
+            if [box.itemText(i) for i in range(box.count())] != items:
+                box.clear()
+                box.addItems(items)
+            box.setCurrentText(current)
+            box.blockSignals(False)
+        lines = self.session.surfaces.region_lines(
+            st.crosshair_mm, st.surface_annot, st.volume_atlas
+        )
+        self.region_label.setText("   ".join(lines) if lines else "")
+
+    def _annots(self) -> list[str]:
+        subject = self.session.surfaces.subject
+        return available_annotations(subject) if subject is not None else []
+
+    def _atlases(self) -> list[str]:
+        subject = self.session.surfaces.subject
+        return available_volume_atlases(subject) if subject is not None else []
+
+    def _pick_map(self, _index: int) -> None:
+        self._dispatch(SetSurfaceMap(self.vid, self.map_box.currentText()))
+
+    def _pick_atlas(self, _index: int) -> None:
+        self._dispatch(SetAtlas(self.annot_box.currentText(), self.atlas_box.currentText()))
+
+    def _cycle_map(self) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            maps = list(s3.VERTEX_MAPS)
+            self._dispatch(
+                SetSurfaceMap(self.vid, maps[(maps.index(vp.vertex_map) + 1) % len(maps)])
+            )
+
+    def _toggle_equivolume(self) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetSurfaceEquivolume(self.vid, not vp.equivolume))
+
+    def _scroll_depth(self, delta: float) -> None:
+        """Shift+wheel: slide the sampled depth (or depth window) by ``delta``."""
+        self._shift_depth(delta)
 
     def _apply_layout(self, vp: Viewport) -> None:
         shown = {h for h in vp.hemis.split(",") if h}

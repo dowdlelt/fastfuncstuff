@@ -253,3 +253,43 @@ def test_drag_gesture_previews_live_and_records_one_edit(tmp_path):
         assert st.crosshair != cross
     finally:
         win.close()
+
+
+def test_region_lines_name_the_surface_parcel_and_the_atlas_voxel(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetAtlas, SetXYZ
+
+    subj = _subject(tmp_path)
+    (subj / "label").mkdir()
+    (subj / "mri").mkdir()
+    white = nfs.read_geometry(str(subj / "surf" / "lh.white"))[0]
+    labels = np.where(white[:, 2] > 0, 1, 2)  # top half "precentral", bottom "insula"
+    ctab = np.array([[25, 5, 25, 0, 0], [60, 20, 220, 0, 0], [255, 192, 32, 0, 0]], np.int32)
+    nfs.write_annot(
+        str(subj / "label" / "lh.aparc.annot"), labels, ctab, ["unknown", "precentral", "insula"]
+    )
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = -40.0
+    atlas = np.zeros((41, 41, 41), np.int32)
+    atlas[:, :, 20:] = 17  # upper half: Left-Hippocampus, as far as the LUT is concerned
+    nib.save(nib.MGHImage(atlas, aff), str(subj / "mri" / "aparc+aseg.mgz"))
+    lut = tmp_path / "lut.txt"
+    lut.write_text("0 Unknown 0 0 0 0\n17 Left-Hippocampus 220 216 20 0\n")
+
+    session.load(_anat(tmp_path))
+    session.do(LoadSurfaces(str(subj), "lh"))
+    session.surfaces._lut = read_color_lut(lut)
+    top = 22.0  # mid-thickness of the r=20/24 sphere pair, at the top
+    session.do(SetXYZ(0.0, 0.0, top))
+    lines = session.surfaces.region_lines(session.state.crosshair_mm, "aparc", "aparc+aseg")
+    assert any("precentral" in ln and "(aparc)" in ln for ln in lines)
+    assert any("Left-Hippocampus" in ln for ln in lines)
+    assert any("precentral" in ln for ln in session.overlay_readout())
+    # Far from cortex, no surface name; switching parcellation off drops the line.
+    assert not any(
+        "(aparc)" in ln for ln in session.surfaces.region_lines((0.0, 0.0, 0.0), "aparc", "")
+    )
+    session.do(SetAtlas("", "aparc+aseg"))
+    assert not any("(aparc)" in ln for ln in session.overlay_readout())
+
+
+from fastfuncstuff.io.freesurfer import read_color_lut  # noqa: E402

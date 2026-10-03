@@ -287,6 +287,97 @@ def load_hemisphere(
     return hemisphere
 
 
+#: Annotation labels that name no region: drawn transparent, never reported.
+NOT_A_REGION = frozenset({"unknown", "Unknown", "Medial_wall", "corpuscallosum"})
+
+
+@dataclass
+class Annotation:
+    """A surface parcellation: one label index per vertex, and the label table."""
+
+    labels: np.ndarray  # (V,) int, index into names/rgba; -1 = unlabelled
+    names: list[str]
+    rgba: np.ndarray  # (K, 4) uint8
+
+    def name_at(self, vertex: int) -> str | None:
+        k = int(self.labels[int(vertex)])
+        if k < 0 or k >= len(self.names) or self.names[k] in NOT_A_REGION:
+            return None
+        return self.names[k]
+
+    def vertex_rgba(self) -> np.ndarray:
+        """``(V, 4)`` uint8 colours; vertices in no region are transparent."""
+        out = np.zeros((self.labels.size, 4), np.uint8)
+        real = np.array([n not in NOT_A_REGION for n in self.names] + [False])
+        idx = np.where((self.labels >= 0) & (self.labels < len(self.names)), self.labels, -1)
+        ok = real[idx]
+        out[ok] = self.rgba[idx[ok]]
+        return out
+
+
+def read_annotation(path: str | os.PathLike, n_vertices: int | None = None) -> Annotation:
+    """Read ``?h.<name>.annot``. Vertices it does not cover are unlabelled."""
+    import nibabel.freesurfer as nfs
+
+    labels, ctab, names = nfs.read_annot(str(path))
+    labels = np.asarray(labels, np.int64)
+    if n_vertices is not None and labels.size != n_vertices:
+        raise ValueError(f"{path} labels {labels.size} vertices, surface has {n_vertices}")
+    rgba = np.zeros((ctab.shape[0], 4), np.uint8)
+    rgba[:, :3] = np.clip(ctab[:, :3], 0, 255)
+    rgba[:, 3] = 255
+    return Annotation(labels, [n.decode() if isinstance(n, bytes) else str(n) for n in names], rgba)
+
+
+def available_annotations(subject_dir: str | os.PathLike) -> list[str]:
+    """Parcellations present for both hemispheres, e.g. ``aparc``, ``aparc.a2009s``."""
+    label = Path(subject_dir) / "label"
+    lh = {p.name[3:-6] for p in label.glob("lh.*.annot")}
+    rh = {p.name[3:-6] for p in label.glob("rh.*.annot")}
+    order = ["aparc", "aparc.a2009s", "aparc.DKTatlas"]
+    both = lh & rh
+    return [n for n in order if n in both] + sorted(both - set(order))
+
+
+def available_volume_atlases(subject_dir: str | os.PathLike) -> list[str]:
+    """Label volumes under ``mri/``, e.g. ``aparc+aseg``, ``aseg``."""
+    mri = Path(subject_dir) / "mri"
+    names = {
+        p.name[: -len(".mgz")] for p in mri.glob("*.mgz") if "aseg" in p.name or "aparc" in p.name
+    }
+    names -= {n for n in names if n.startswith("wm.") or "presurf" in n or n.endswith(".auto")}
+    order = ["aparc+aseg", "aparc.a2009s+aseg", "aparc.DKTatlas+aseg", "aseg"]
+    return [n for n in order if n in names] + sorted(names - set(order))
+
+
+def read_color_lut(
+    path: str | os.PathLike | None = None,
+) -> dict[int, tuple[str, tuple[int, int, int]]]:
+    """``FreeSurferColorLUT.txt`` as ``{id: (name, rgb)}``; ``{}`` if it cannot be found.
+
+    Defaults to ``$FREESURFER_HOME/FreeSurferColorLUT.txt``. Without it a
+    volume atlas still answers, with numbers instead of names.
+    """
+    if path is None:
+        home = os.environ.get("FREESURFER_HOME")
+        if not home:
+            return {}
+        path = Path(home) / "FreeSurferColorLUT.txt"
+    path = Path(path)
+    if not path.exists():
+        return {}
+    out: dict[int, tuple[str, tuple[int, int, int]]] = {}
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 5 or line.lstrip().startswith("#"):
+            continue
+        try:
+            out[int(parts[0])] = (parts[1], (int(parts[2]), int(parts[3]), int(parts[4])))
+        except ValueError:
+            continue
+    return out
+
+
 def load_subject(
     subject_dir: str | os.PathLike, hemis: tuple[str, ...] = ("lh", "rh"), **kwargs
 ) -> dict[str, Hemisphere]:

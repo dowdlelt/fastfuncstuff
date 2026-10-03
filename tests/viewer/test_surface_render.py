@@ -22,7 +22,7 @@ nib = pytest.importorskip("nibabel")
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
 
 
-def _sheet(n: int = 41, size: float = 40.0):
+def _sheet(n: int = 41, size: float = 40.0, pial_scale: float = 1.0):
     """A square grid in z=0, as a one-hemisphere FreeSurfer-like object."""
     from fastfuncstuff.io.freesurfer import FlatPatch, Hemisphere
 
@@ -31,7 +31,7 @@ def _sheet(n: int = 41, size: float = 40.0):
     white = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], 1).astype(np.float32)
     # Mid-depth z = 1.5 mm is inside voxel k = 5 (centre 1.0), not on a face --
     # at z = 2 the CPU and GPU nearest samplers legitimately round apart.
-    pial = white + np.float32([0, 0, 3.0])
+    pial = white * np.float32([pial_scale, pial_scale, 1.0]) + np.float32([0, 0, 3.0])
     faces = []
     for i in range(n - 1):
         for j in range(n - 1):
@@ -50,7 +50,10 @@ def _sheet(n: int = 41, size: float = 40.0):
     )
 
 
-def test_rendered_pixels_match_the_cpu_colouring(tmp_path):
+@pytest.mark.parametrize("pial_scale", [1.0, 1.5])
+def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale):
+    """``pial_scale`` 1.5 makes pial's area 2.25x white's, so equivolume depth
+    is not the identity and the shader's has to agree with the CPU twin."""
     if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
         pytest.skip("QRhi needs a real platform plugin")
     from fastfuncstuff.viewer import surface3d as s3
@@ -77,7 +80,7 @@ def test_rendered_pixels_match_the_cpu_colouring(tmp_path):
         session.load(str(tmp_path / "base.nii.gz"))
         key = session.load(str(tmp_path / "over.nii.gz"))
         session.do(SetRange(key, 0.0, 63.0))
-        session.surfaces.hemis = {"lh": _sheet()}
+        session.surfaces.hemis = {"lh": _sheet(pial_scale=pial_scale)}
         session.surfaces.version = {"lh": 1}
         session.do(OpenView("S1", "surface", "axial"))
         session.do(SetSurfaceShape("S1", "flat"))

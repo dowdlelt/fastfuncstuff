@@ -296,6 +296,8 @@ def pack_uniforms(
     shade: ShadeParams,
     cross: tuple[float, float, float, float],
     cross_rgb: tuple[float, float, float],
+    equivolume: bool = False,
+    map_opacity: float = 1.0,
 ) -> bytes:
     """The uniform block as bytes. Matrices go column-major, as GLSL reads them."""
 
@@ -317,10 +319,76 @@ def pack_uniforms(
             vec(shade.sign_mode, shade.alpha_mode, shade.n_panes, 1.0 if shade.has_data else 0.0),
             vec(*cross),
             vec(*cross_rgb, 0.0),
-            vec(0.0, 0.0, 0.0, 0.0),
+            vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
         ]
     )
     assert len(out) == UNIFORM_BYTES
+    return out
+
+
+def equivolume_fraction(alpha, white_area, pial_area):
+    """Depth fraction (white 0 .. pial 1) enclosing volume fraction ``alpha``.
+
+    Equivolume layering (Waehnert et al. 2014), in the per-vertex form
+    pycortex uses: cortical area varies linearly with depth from the white
+    area to the pial area, so the volume between white and depth rho is a
+    quadratic in rho, solved here for rho. In a gyral crown (pial area >
+    white) the outer layers are the thin ones, so the mid-volume surface
+    sits nearer pial; in a fundus, nearer white. Equal areas give
+    rho = alpha. Works elementwise on scalars or arrays; the
+    fragment shader does the same per pixel.
+    """
+    a = np.asarray(alpha, np.float64)
+    aw = np.asarray(white_area, np.float64)
+    ap = np.asarray(pial_area, np.float64)
+    delta = ap - aw
+    root = np.sqrt(np.maximum((1.0 - a) * aw * aw + a * ap * ap, 0.0))
+    flat = np.abs(delta) <= 1e-4 * np.maximum(aw + ap, 1e-12)
+    return np.where(flat, a, (root - aw) / np.where(flat, 1.0, delta))
+
+
+#: Per-vertex maps a surface window can paint, in the order offered.
+VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot")
+
+
+def vertex_colors(hemi: Hemisphere, kind: str, annotation=None) -> np.ndarray | None:
+    """``(V, 4)`` uint8 colours of a per-vertex map, or ``None`` for no map.
+
+    Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
+    same; sulc and curv on a symmetric red-blue scale at their 98th
+    percentile; ``annot`` in the parcellation's own colours. The medial wall
+    is left transparent: it has no thickness and no region.
+    """
+    import torch
+
+    from fastfuncstuff.viewer.colormap import build_lut
+
+    if not kind:
+        return None
+    n = hemi.n_vertices
+    cortex = hemi.cortex if hemi.cortex is not None else np.ones(n, bool)
+    if kind == "annot":
+        if annotation is None:
+            return None
+        out = annotation.vertex_rgba()
+        out[~cortex, 3] = 0
+        return out
+    values = hemi.morph.get(kind)
+    if values is None:
+        return None
+    if kind == "thickness":
+        lo, hi, name = 1.0, 4.5, "viridis"
+    else:
+        top = float(np.percentile(np.abs(values[cortex]), 98)) or 1.0
+        # FreeSurfer's sign: positive sulc/curv is sulcal (deep); show it blue.
+        lo, hi, name = top, -top, "RdBu"
+    lut = (np.clip(build_lut(name, 256, device=torch.device("cpu")).numpy(), 0, 1) * 255).astype(
+        np.uint8
+    )
+    unit = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+    out = np.zeros((n, 4), np.uint8)
+    out[:, :3] = lut[np.round(unit * 255).astype(int)][:, :3]
+    out[:, 3] = np.where(cortex, 255, 0)
     return out
 
 
@@ -367,7 +435,10 @@ __all__ = [
     "VIEWS",
     "Camera",
     "ShadeParams",
+    "VERTEX_MAPS",
     "depth_fractions",
+    "equivolume_fraction",
+    "vertex_colors",
     "flat_patch",
     "layout_offsets",
     "pack_uniforms",

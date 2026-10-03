@@ -20,7 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.io.freesurfer import Hemisphere, load_subject
+from fastfuncstuff.io.freesurfer import (
+    Annotation,
+    Hemisphere,
+    load_subject,
+    read_annotation,
+    read_color_lut,
+)
 from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
 from fastfuncstuff.surface.mesh import MeshTopology
@@ -98,6 +104,10 @@ class SurfaceStore:
         #: Bumped whenever any vertex moves or surfaces are (re)loaded, per
         #: hemisphere, so a 3-D window knows when to re-upload its buffers.
         self.version: dict[str, int] = {}
+        self._annots: dict[tuple[str, str], Annotation | None] = {}
+        self._atlases: dict[str, tuple[np.ndarray, np.ndarray] | None] = {}
+        self._lut: dict[int, tuple[str, tuple[int, int, int]]] | None = None
+        self._trees: dict[str, tuple[int, object, np.ndarray]] = {}
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -115,6 +125,9 @@ class SurfaceStore:
         self._reset_edits()
 
     def _reset_edits(self) -> None:
+        self._annots.clear()
+        self._atlases.clear()
+        self._trees.clear()
         self._index.clear()
         self._topo.clear()
         self._active = None
@@ -188,6 +201,98 @@ class SurfaceStore:
                 rgb = OUTLINE_RGB.get(surface, (1.0, 1.0, 1.0))
                 out.append(Outline(hemi, surface, rgb, view.points_to_image(seg)))
         return out
+
+    # -- atlases ---------------------------------------------------------------
+    def annotation(self, hemi: str, name: str) -> Annotation | None:
+        """``label/<hemi>.<name>.annot``, cached; ``None`` if absent or unreadable."""
+        key = (hemi, name)
+        if key not in self._annots:
+            found = None
+            if self.subject is not None and hemi in self.hemis:
+                path = self.subject / "label" / f"{hemi}.{name}.annot"
+                if path.exists():
+                    try:
+                        found = read_annotation(path, self.hemis[hemi].n_vertices)
+                    except (OSError, ValueError):
+                        found = None
+            self._annots[key] = found
+        return self._annots[key]
+
+    def volume_atlas(self, name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """``mri/<name>.mgz`` as (integer labels, affine), cached."""
+        if name not in self._atlases:
+            found = None
+            if self.subject is not None:
+                path = self.subject / "mri" / f"{name}.mgz"
+                if path.exists():
+                    import nibabel as nib
+
+                    img = nib.load(str(path))
+                    found = (np.asarray(img.dataobj).astype(np.int32), np.asarray(img.affine))
+            self._atlases[name] = found
+        return self._atlases[name]
+
+    def color_lut(self) -> dict[int, tuple[str, tuple[int, int, int]]]:
+        if self._lut is None:
+            self._lut = read_color_lut()
+        return self._lut
+
+    def nearest_vertex(
+        self, mm: tuple[float, float, float], max_mm: float = 3.0
+    ) -> tuple[str, int, float] | None:
+        """The cortex vertex whose mid-thickness point is nearest ``mm``, if within ``max_mm``.
+
+        Mid-thickness, so a point anywhere in the ribbon finds the column it
+        belongs to; cortex only, because the medial wall names nothing.
+        """
+        from scipy.spatial import cKDTree
+
+        best: tuple[str, int, float] | None = None
+        for hemi, h in self.hemis.items():
+            version = self.version.get(hemi, 0)
+            cached = self._trees.get(hemi)
+            if cached is None or cached[0] != version:
+                ids = np.flatnonzero(h.cortex) if h.cortex is not None else np.arange(h.n_vertices)
+                mid = 0.5 * (h.states["white"][ids] + h.states["pial"][ids])
+                cached = (version, cKDTree(mid), ids)
+                self._trees[hemi] = cached
+            _, tree, ids = cached
+            d, k = tree.query(np.asarray(mm, np.float64))  # type: ignore[attr-defined]
+            if d <= max_mm and (best is None or d < best[2]):
+                best = (hemi, int(ids[k]), float(d))
+        return best
+
+    def region_lines(
+        self, mm: tuple[float, float, float] | None, annot: str, atlas: str
+    ) -> list[str]:
+        """What the selected parcellation and volume atlas call the point ``mm``.
+
+        The surface name comes from the nearest cortex vertex (within 3 mm),
+        so it answers in the ribbon and on the surface; the volume atlas from
+        the voxel itself, so it also names white matter and subcortex.
+        """
+        if mm is None or not self.hemis:
+            return []
+        lines: list[str] = []
+        if annot:
+            near = self.nearest_vertex(mm)
+            if near is not None:
+                ann = self.annotation(near[0], annot)
+                name = ann.name_at(near[1]) if ann is not None else None
+                if name:
+                    lines.append(f"{near[0]} {name}  ({annot})")
+        if atlas:
+            vol = self.volume_atlas(atlas)
+            if vol is not None:
+                data, aff = vol
+                ijk = np.linalg.inv(aff) @ np.array([*mm, 1.0])
+                i, j, k = np.floor(ijk[:3] + 0.5).astype(int)
+                if all(0 <= a < n for a, n in zip((i, j, k), data.shape, strict=True)):
+                    label = int(data[i, j, k])
+                    if label:
+                        name = self.color_lut().get(label, (str(label), (0, 0, 0)))[0]
+                        lines.append(f"{name}  ({atlas})")
+        return lines
 
     # -- editing -----------------------------------------------------------
     def grab(
