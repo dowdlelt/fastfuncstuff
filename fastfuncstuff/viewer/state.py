@@ -96,6 +96,9 @@ class ViewerState:
     surface_editing: bool = False
     #: ``grab`` drags an outline; ``draw`` redraws a stretch of it.
     surface_tool: str = "grab"
+    #: The vertex the point tool selected, as (hemi, vertex); ``None`` when none.
+    #: Topology edits act on it and leave it on the vertex they produce.
+    surface_selected: tuple[str, int] | None = None
     surface_brush: tuple[float, float, float, float, int] = (4.0, 1.0, 0.2, 1.5, -1)
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.

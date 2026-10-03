@@ -530,6 +530,47 @@ class EditSurfaceStroke(Command):
 
 @command
 @dataclass(frozen=True)
+class SelectSurfaceVertex(Command):
+    """Select a vertex for the point tool (vertex -1 clears the selection)."""
+
+    name = "SELECT_SURFACE_VERTEX"
+    aspects = Aspect.SLICES
+    hemi: str
+    vertex: int
+
+
+@command
+@dataclass(frozen=True)
+class DeleteSurfaceVertex(Command):
+    """Delete a vertex from every surface and per-vertex file of its hemisphere.
+
+    An edge collapse into its nearest valid neighbour, which becomes the
+    selection. Refused when it would pinch the mesh or turn a triangle over
+    on any surface.
+    """
+
+    name = "DELETE_SURFACE_VERTEX"
+    aspects = Aspect.SLICES | Aspect.LAYERS
+    major = True
+    hemi: str
+    vertex: int
+
+
+@command
+@dataclass(frozen=True)
+class SplitSurfaceEdge(Command):
+    """Add a vertex at the middle of edge (a, b) on every surface; it becomes the selection."""
+
+    name = "SPLIT_SURFACE_EDGE"
+    aspects = Aspect.SLICES | Aspect.LAYERS
+    major = True
+    hemi: str
+    a: int
+    b: int
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceTool(Command):
     """What a press near an outline does while editing: grab (drag) or draw (redraw)."""
 
@@ -1314,11 +1355,42 @@ def install(
         )
         return EditSurfaceStroke.aspects
 
+    @bus.handle(SelectSurfaceVertex.name)
+    def _select_surface_vertex(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SelectSurfaceVertex)
+        if cmd.vertex < 0:
+            st.surface_selected = None
+        else:
+            if session is None or cmd.hemi not in session.surfaces.hemis:
+                raise KeyError(f"no hemisphere {cmd.hemi!r} loaded")
+            if cmd.vertex >= session.surfaces.hemis[cmd.hemi].n_vertices:
+                raise ValueError(f"{cmd.hemi} has no vertex {cmd.vertex}")
+            st.surface_selected = (cmd.hemi, int(cmd.vertex))
+        return SelectSurfaceVertex.aspects
+
+    @bus.handle(DeleteSurfaceVertex.name)
+    def _delete_surface_vertex(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, DeleteSurfaceVertex)
+        if session is None:
+            raise RuntimeError("DELETE_SURFACE_VERTEX needs a session")
+        kept = session.surfaces.delete_vertex(cmd.hemi, int(cmd.vertex))
+        st.surface_selected = (cmd.hemi, int(kept))
+        return DeleteSurfaceVertex.aspects
+
+    @bus.handle(SplitSurfaceEdge.name)
+    def _split_surface_edge(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SplitSurfaceEdge)
+        if session is None:
+            raise RuntimeError("SPLIT_SURFACE_EDGE needs a session")
+        new = session.surfaces.split_edge(cmd.hemi, int(cmd.a), int(cmd.b))
+        st.surface_selected = (cmd.hemi, int(new))
+        return SplitSurfaceEdge.aspects
+
     @bus.handle(SetSurfaceTool.name)
     def _set_surface_tool(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceTool)
-        if cmd.tool not in ("grab", "draw"):
-            raise ValueError("surface tool is grab or draw")
+        if cmd.tool not in ("grab", "draw", "point"):
+            raise ValueError("surface tool is grab, draw or point")
         st.surface_tool = cmd.tool
         return SetSurfaceTool.aspects
 
@@ -1326,7 +1398,15 @@ def install(
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:
         if session is None:
             raise RuntimeError("UNDO_SURFACE_EDIT needs a session")
-        return UndoSurfaceEdit.aspects if session.surfaces.undo() else Aspect.NOTHING
+        if not session.surfaces.undo():
+            return Aspect.NOTHING
+        sel = st.surface_selected
+        if sel is not None and (
+            sel[0] not in session.surfaces.hemis
+            or sel[1] >= session.surfaces.hemis[sel[0]].n_vertices
+        ):
+            st.surface_selected = None
+        return UndoSurfaceEdit.aspects | Aspect.LAYERS
 
     @bus.handle(SaveSurfaces.name)
     def _save_surfaces(cmd: Command, st: ViewerState) -> Aspect:

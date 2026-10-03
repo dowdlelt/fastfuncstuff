@@ -367,7 +367,16 @@ class ProfileWindow(QtWidgets.QWidget):
             return
         layer, idx = found
         spec = ProfileSpec(mode=vp.profile_mode, tube_radius=float(vp.tube))
-        key = (spec, layer.key, idx, np.asarray(layer.affine).tobytes(), surfaces.subject)
+        key = (
+            spec,
+            layer.key,
+            idx,
+            np.asarray(layer.affine).tobytes(),
+            surfaces.subject,
+            # A topology edit renumbers vertices: re-sampling only "what moved"
+            # would index the wrong rows.
+            surfaces.topology_version,
+        )
         device = getattr(self.session, "display_device", None)
         if key != self._built_key:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)

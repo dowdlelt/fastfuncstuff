@@ -535,3 +535,46 @@ def test_draw_gesture_through_the_window(tmp_path):
         assert "end the stroke" in image.pane._brush_label
     finally:
         win.close()
+
+
+def test_topology_commands_delete_split_undo_and_save_everything(session, tmp_path):
+    from fastfuncstuff.io.freesurfer import read_surface
+    from fastfuncstuff.viewer.vocab import (
+        DeleteSurfaceVertex,
+        SaveSurfaces,
+        SplitSurfaceEdge,
+        UndoSurfaceEdit,
+    )
+
+    session.load(_shell_anat(tmp_path))
+    subj = _subject(tmp_path)
+    nfs.write_morph_data(str(subj / "surf" / "lh.thickness"), np.full(3000, 2.5, np.float32))
+    session.do(LoadSurfaces(str(subj), "lh"))
+    store = session.surfaces
+    hemi = store.hemis["lh"]
+    n0, faces0 = hemi.n_vertices, hemi.faces.copy()
+    a, b = store.longest_edge("lh", 10)
+    session.do(SplitSurfaceEdge("lh", a, b))
+    assert hemi.n_vertices == n0 + 1 and session.state.surface_selected == ("lh", n0)
+    assert hemi.morph["thickness"].shape == (n0 + 1,)
+    assert hemi.states["pial"].shape == (n0 + 1, 3)
+    session.do(DeleteSurfaceVertex("lh", 500))
+    assert hemi.n_vertices == n0
+    # Outlines still draw from the new mesh.
+    st = session.state
+    view = PlaneView(layout=plane_layout(st.grid.affine, Plane.AXIAL), shape=st.grid.shape)
+    assert store.outlines(st.grid.affine, view, st.grid.shape[2] // 2, ("white",))
+    session.do(SaveSurfaces("topo"))
+    for name in ("lh.white.topo", "lh.pial.topo", "lh.thickness.topo"):
+        assert (subj / "surf" / name).exists(), name
+    assert read_surface(subj / "surf" / "lh.pial.topo").faces.shape[0] == hemi.faces.shape[0]
+    assert nfs.read_morph_data(str(subj / "surf" / "lh.thickness.topo")).shape == (n0,)
+    session.do(UndoSurfaceEdit())
+    session.do(UndoSurfaceEdit())
+    assert hemi.n_vertices == n0
+    np.testing.assert_array_equal(hemi.faces, faces0)
+    assert not store.topology_changed
+    assert (
+        "SPLIT_SURFACE_EDGE" in session.to_script()
+        and "DELETE_SURFACE_VERTEX" in session.to_script()
+    )

@@ -78,6 +78,15 @@ class _Undo:
 
 
 @dataclass
+class _TopoUndo:
+    """A topology edit's undo: the whole mesh bundle as it was."""
+
+    hemi: str
+    bundle: object  # surface.topology.MeshBundle
+    had_bundle: bool
+
+
+@dataclass
 class EditLog:
     """Every committed edit, for the JSON written next to saved surfaces."""
 
@@ -118,6 +127,13 @@ class SurfaceStore:
         self.depth_roi_vertices: dict[str, np.ndarray] = {}
         self.depth_roi_version = 0
         self._areas: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+        #: Per hemisphere, once its topology has been edited: every surface and
+        #: per-vertex file of its mesh (MeshBundle, BundleSources). Saving or
+        #: installing such a hemisphere writes all of them.
+        self._bundles: dict[str, tuple] = {}
+        self.topology_changed: set[str] = set()
+        #: Bumped on every topology edit, so windows rebuild from scratch.
+        self.topology_version = 0
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -139,6 +155,8 @@ class SurfaceStore:
         self.flags_version += 1
 
     def _reset_edits(self) -> None:
+        self._bundles.clear()
+        self.topology_changed.clear()
         self.flags = {}
         self.depth_roi_vertices = {}
         self._areas.clear()
@@ -223,6 +241,16 @@ class SurfaceStore:
     def annotation(self, hemi: str, name: str) -> Annotation | None:
         """``label/<hemi>.<name>.annot``, cached; ``None`` if absent or unreadable."""
         key = (hemi, name)
+        bundled = self._bundles.get(hemi)
+        if bundled is not None and f"annot:{name}" in bundled[0].labels:
+            # After a topology edit the file's vertex numbering is stale; the
+            # bundle carries the labels along with the mesh.
+            labels = bundled[0].labels[f"annot:{name}"]
+            ctab, names = bundled[1].annot_tables[f"annot:{name}"]
+            rgba = np.zeros((ctab.shape[0], 4), np.uint8)
+            rgba[:, :3] = np.clip(ctab[:, :3], 0, 255)
+            rgba[:, 3] = 255
+            return Annotation(labels, list(names), rgba)
         if key not in self._annots:
             found = None
             if self.subject is not None and hemi in self.hemis:
@@ -397,6 +425,116 @@ class SurfaceStore:
     def publish_depth_roi(self, vertices: dict[str, np.ndarray]) -> None:
         self.depth_roi_vertices = vertices
         self.depth_roi_version += 1
+
+    # -- topology ------------------------------------------------------------
+    def _bundle(self, hemi: str):
+        """This hemisphere's whole mesh bundle, loaded on first need and kept in step."""
+        from fastfuncstuff.io.freesurfer import bundle_from_subject
+
+        if hemi not in self._bundles:
+            if self.subject is None:
+                raise ValueError("no subject loaded")
+            self._bundles[hemi] = bundle_from_subject(self.subject, self.hemis[hemi])
+        self._sync_bundle(hemi)
+        return self._bundles[hemi]
+
+    def _sync_bundle(self, hemi: str) -> None:
+        """Copy the live (possibly edited) positions into the bundle.
+
+        White's displacement since the last sync goes to smoothwm as well, the
+        rule saving applies to a geometric edit.
+        """
+        bundle, _ = self._bundles[hemi]
+        h = self.hemis[hemi]
+        if "surf:white" in bundle.positions and "smoothwm" in h.states:
+            delta = h.states["white"] - bundle.positions["surf:white"]
+            h.states["smoothwm"] = (h.states["smoothwm"] + delta).astype(np.float32)
+        for name, pos in h.states.items():
+            if f"surf:{name}" in bundle.positions:
+                bundle.positions[f"surf:{name}"] = pos.astype(np.float64)
+
+    def _adopt(self, hemi: str, bundle) -> None:
+        """Make ``bundle`` this hemisphere's mesh in the viewer, and drop stale caches."""
+        from fastfuncstuff.io.freesurfer import FlatPatch
+
+        h = self.hemis[hemi]
+        h.faces = bundle.faces.astype(np.int32)
+        for name in list(h.states):
+            if f"surf:{name}" in bundle.positions:
+                h.states[name] = bundle.positions[f"surf:{name}"].astype(np.float32)
+        for name in list(h.morph):
+            if f"morph:{name}" in bundle.scalars:
+                h.morph[name] = bundle.scalars[f"morph:{name}"]
+        for name in list(h.patches):
+            if f"patch:{name}" in bundle.positions:
+                h.patches[name] = FlatPatch(
+                    name,
+                    bundle.positions[f"patch:{name}"].astype(np.float32),
+                    bundle.masks[f"patch:{name}"],
+                    bundle.masks[f"patchborder:{name}"],
+                )
+        if "label:cortex" in bundle.masks:
+            h.cortex = bundle.masks["label:cortex"]
+        for key in [k for k in self._index if k[0] == hemi]:
+            del self._index[key]
+        self._topo.pop(hemi, None)
+        self._trees.pop(hemi, None)
+        self._areas.pop(hemi, None)
+        self._annots = {k: v for k, v in self._annots.items() if k[0] != hemi}
+        self.flags.pop(hemi, None)
+        self.depth_roi_vertices.pop(hemi, None)
+        self._active = None
+        self._pending = None
+        self.version[hemi] = self.version.get(hemi, 0) + 1
+        self.topology_version += 1
+
+    def _topology_edit(self, hemi: str, change, entry: dict):
+        from fastfuncstuff.surface.topology import MeshBundle
+
+        had = hemi in self._bundles
+        bundle, src = self._bundle(hemi)
+        assert isinstance(bundle, MeshBundle)
+        new, *rest = change(bundle)
+        self._undo.append(_TopoUndo(hemi, bundle, had))  # type: ignore[arg-type]
+        self._bundles[hemi] = (new, src)
+        self._adopt(hemi, new)
+        self.topology_changed.add(hemi)
+        self.log.entries.append({"hemi": hemi, **entry, "vertices": new.n_vertices})
+        return rest
+
+    def delete_vertex(self, hemi: str, vertex: int) -> int:
+        """Delete a vertex (on every surface and file); returns the one it merged into."""
+        from fastfuncstuff.surface.topology import collapse_vertex
+
+        _, kept = self._topology_edit(
+            hemi,
+            lambda b: collapse_vertex(b, int(vertex)),
+            {"tool": "delete", "vertex": int(vertex)},
+        )
+        return kept
+
+    def split_edge(self, hemi: str, a: int, b: int) -> int:
+        """Insert a vertex mid-edge (on every surface and file); returns its index."""
+        from fastfuncstuff.surface.topology import split_edge
+
+        (m,) = self._topology_edit(
+            hemi,
+            lambda bd: split_edge(bd, int(a), int(b)),
+            {"tool": "split", "edge": [int(a), int(b)]},
+        )
+        return m
+
+    def neighbours(self, hemi: str, vertex: int) -> np.ndarray:
+        from fastfuncstuff.surface.topology import neighbours
+
+        return neighbours(self.hemis[hemi].faces, int(vertex))
+
+    def longest_edge(self, hemi: str, vertex: int) -> tuple[int, int]:
+        """The longest edge at ``vertex`` on white -- where a split helps most."""
+        white = self.hemis[hemi].states["white"]
+        nbrs = self.neighbours(hemi, vertex)
+        u = int(nbrs[np.argmax(np.linalg.norm(white[nbrs] - white[int(vertex)], axis=1))])
+        return int(vertex), u
 
     # -- editing -----------------------------------------------------------
     def grab(
@@ -643,6 +781,14 @@ class SurfaceStore:
         if not self._undo:
             return False
         entry = self._undo.pop()
+        if isinstance(entry, _TopoUndo):
+            if entry.had_bundle or entry.hemi in self._bundles:
+                self._bundles[entry.hemi] = (entry.bundle, self._bundles[entry.hemi][1])
+            self._adopt(entry.hemi, entry.bundle)
+            if not any(isinstance(u, _TopoUndo) and u.hemi == entry.hemi for u in self._undo):
+                self.topology_changed.discard(entry.hemi)
+            self.log.entries.append({"undo": True})
+            return True
         topo = self.topology(entry.hemi)
         for surface, ids, old in entry.moves:
             self._move(entry.hemi, surface, ids, old, topo.faces_of(ids))
@@ -651,7 +797,7 @@ class SurfaceStore:
 
     def _installed_states(self) -> list[tuple[str, str]]:
         """(hemi, surface) pairs an install writes: the edited, plus smoothwm with white."""
-        out = sorted(self.edited)
+        out = sorted(e for e in self.edited if e[0] not in self.topology_changed)
         for hemi, surface in list(out):
             if surface == "white" and "smoothwm" in self.hemis[hemi].paths:
                 out.append((hemi, "smoothwm"))
@@ -662,15 +808,22 @@ class SurfaceStore:
         import time
 
         stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
-        files = []
-        for hemi, surface in self._installed_states():
-            original = self.hemis[hemi].paths[surface]
+
+        def backup_for(original: Path) -> Path:
             backup = original.with_name(f"{original.name}.pre-ffsedit-{stamp}")
             n = 1
             while backup.exists():
                 n += 1
                 backup = original.with_name(f"{original.name}.pre-ffsedit-{stamp}-{n}")
-            files.append((original, backup))
+            return backup
+
+        files = [
+            (self.hemis[h].paths[s], backup_for(self.hemis[h].paths[s]))
+            for h, s in self._installed_states()
+        ]
+        for hemi in sorted(self.topology_changed):
+            for original in sorted(self._bundles[hemi][1].files.values()):
+                files.append((original, backup_for(original)))
         return InstallPlan(files, stamp)
 
     def install(self, plan: InstallPlan | None = None) -> InstallPlan:
@@ -685,9 +838,10 @@ class SurfaceStore:
         """
         import shutil
 
-        if not self.edited:
+        if not self.edited and not self.topology_changed:
             raise ValueError("no edited surfaces to install")
         plan = plan or self.install_plan()
+        geometric = self._installed_states()
         # Work out every position before touching any file: smoothwm's
         # displacement is white's current position against white's *file*.
         positions: dict[tuple[str, str], np.ndarray] = {}
@@ -700,7 +854,7 @@ class SurfaceStore:
             else:
                 positions[(hemi, surface)] = h.states[surface].copy()
         for (hemi, surface), (original, backup) in zip(
-            self._installed_states(), plan.files, strict=True
+            geometric, plan.files[: len(geometric)], strict=True
         ):
             shutil.copy2(original, backup)
             tmp = original.with_name(f".{original.name}.ffsedit-tmp")
@@ -708,6 +862,17 @@ class SurfaceStore:
             tmp.replace(original)
             if surface in self.hemis[hemi].states:
                 self.hemis[hemi].states[surface] = positions[(hemi, surface)].astype(np.float32)
+        # A hemisphere whose topology changed: every file of its mesh, the same way.
+        by_original = dict(plan.files[len(geometric) :])
+        for hemi in sorted(self.topology_changed):
+            from fastfuncstuff.io.freesurfer import write_bundle
+
+            bundle, src = self._bundle(hemi)
+            for key, original in sorted(src.files.items()):
+                shutil.copy2(original, by_original[original])
+                tmp = original.with_name(f".{original.name}.ffsedit-tmp")
+                write_bundle(bundle, src, {key: tmp})
+                tmp.replace(original)
         if plan.files:
             log = plan.files[0][0].with_name(f"surface_edits.installed-{plan.stamp}.json")
             installed = [[str(o), str(b)] for o, b in plan.files]
@@ -715,6 +880,7 @@ class SurfaceStore:
                 json.dumps({"installed": installed, "edits": self.log.entries}, indent=1)
             )
         self.edited.clear()
+        self.topology_changed.clear()
         self._undo.clear()
         self.log = EditLog()
         return plan
@@ -729,7 +895,15 @@ class SurfaceStore:
         if not suffix or "/" in suffix:
             raise ValueError(f"bad suffix {suffix!r}")
         written: list[Path] = []
-        for hemi, surface in sorted(self.edited):
+        for hemi in sorted(self.topology_changed):
+            # Its topology changed: every surface and per-vertex file of the
+            # mesh, as copies, or the subject would hold two meshes.
+            from fastfuncstuff.io.freesurfer import write_bundle
+
+            bundle, src = self._bundle(hemi)
+            targets = {k: p.with_name(f"{p.name}.{suffix}") for k, p in src.files.items()}
+            written += write_bundle(bundle, src, targets)
+        for hemi, surface in sorted(e for e in self.edited if e[0] not in self.topology_changed):
             h = self.hemis[hemi]
             out = h.paths[surface].with_name(f"{hemi}.{surface}.{suffix}")
             h.save_state(surface, out)

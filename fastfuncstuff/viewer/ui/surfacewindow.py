@@ -741,6 +741,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.located.connect(self.located)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self._built_map: tuple | None = None
+        self._built_topology: int | None = None
         self._built_fold: tuple | None = None
         self._fold_hemis: set[str] = set()
         self._map_hemis: set[str] = set()
@@ -918,6 +919,17 @@ class SurfaceWindow(QtWidgets.QWidget):
             self._fold_hemis = set()
             return
         c = self.canvas
+        if surfaces.topology_version != self._built_topology:
+            # The mesh itself changed: every buffer, map and fold is stale.
+            if self._built_topology is not None:
+                c.drop_hemispheres()
+                self._built_shape = None
+                self._built_versions = {}
+                self._map_hemis = set()
+                self._fold_hemis = set()
+                self._built_map = None
+                self._built_fold = None
+            self._built_topology = surfaces.topology_version
         shape_changed = vp.shape != self._built_shape
         moved = {
             h for h in surfaces.hemis if surfaces.version.get(h) != self._built_versions.get(h)
