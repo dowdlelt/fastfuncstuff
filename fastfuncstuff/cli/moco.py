@@ -34,13 +34,13 @@ from fastfuncstuff.cli_utils import (
 )
 from fastfuncstuff.processing import censor as censor_lib
 from fastfuncstuff.processing.affine import (
-    matrix_to_params,
     save_matrix_1D,
     voxel_matrix_to_dicom,
 )
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
     _blur_volume,
+    afni_motion_params,
     moco,
     moco_spacetime,
     resample_timeseries,
@@ -1390,7 +1390,9 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
     return est, axis
 
 
-def _save_shiftcorr_params(args, result, est, axis: int, header_info, verb: int) -> None:
+def _save_shiftcorr_params(
+    args, result, est, axis: int, header_info, vol_shape: tuple[int, int, int], verb: int
+) -> None:
     """Write the per-echo TOTAL transforms (rigid motion + that echo's shift).
 
     -1Dfile / -1Dmatrix_save report the one rigid pose shared by every echo;
@@ -1419,7 +1421,7 @@ def _save_shiftcorr_params(args, result, est, axis: int, header_info, verb: int)
         if args.onedfile_shiftcorr is not None:
             params = np.stack(
                 [
-                    matrix_to_params(torch.from_numpy(dicom[t]))[:6].numpy()
+                    afni_motion_params(torch.from_numpy(dicom[t]), affine, vol_shape)
                     for t in range(len(dicom))
                 ]
             )
@@ -1728,6 +1730,8 @@ def _run_multi_echo(
         print_cli_section("Estimating motion")
     t1 = time.time()
     result = moco(reg_data, config, header_info=header_info, base_vol=base_vol)
+    _, nz_, ny_, nx_ = reg_data.shape
+    vol_shape = (int(nz_), int(ny_), int(nx_))
     if verb >= 1:
         print(f"  Registration: {time.time() - t1:.2f}s")
     # The dfile's post-alignment RMS must be measured against the SHIFT-CORRECTED
@@ -1825,7 +1829,7 @@ def _run_multi_echo(
     if motsim_base is not None:
         _save_motsim(args, result, motsim_base, config, device, header_info, verb)
     if est is not None:
-        _save_shiftcorr_params(args, result, est, shift_axis, header_info, verb)
+        _save_shiftcorr_params(args, result, est, shift_axis, header_info, vol_shape, verb)
 
 
 if __name__ == "__main__":
