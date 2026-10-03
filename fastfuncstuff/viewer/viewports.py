@@ -61,6 +61,7 @@ class ViewKind(StrEnum):
     MATRIX = "matrix"
     CLUSTERS = "clusters"
     TRACE = "trace"
+    SURFACE = "surface"
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,21 @@ class Viewport:
     #: that opened the spectrum window still opens it when a mode adds a panel.
     panel: str = ""
 
+    # -- surface (3-D) ---------------------------------------------------
+    #: Which shape the hemispheres are drawn as -- see
+    #: :data:`viewer.surface3d.SHAPES`. Data is always *sampled* between white
+    #: and pial; this only says where it is drawn.
+    shape: str = "inflated"
+    #: Cortical depth sampled, as fractions from white (0) to pial (1), and how
+    #: many samples are averaged across that range. One sample reads at
+    #: ``depth[0]``.
+    depth: tuple[float, float] = (0.5, 0.5)
+    samples: int = 1
+    #: Hemispheres drawn, comma-separated, and how far apart they are pushed
+    #: beyond their layout (mm) -- splitting is how the medial wall is seen.
+    hemis: str = "lh,rh"
+    split: float = 0.0
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -174,6 +190,10 @@ class Viewport:
         return self.kind is ViewKind.TRACE
 
     @property
+    def is_surface(self) -> bool:
+        return self.kind is ViewKind.SURFACE
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -193,6 +213,8 @@ class Viewport:
             return f"clusters  [{self.id}]"
         if self.is_trace:
             return f"{self.panel or 'trace'}  [{self.id}]"
+        if self.is_surface:
+            return f"surface · {self.shape}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -218,7 +240,7 @@ class ViewportSet:
         return [v.id for v in self.viewports]
 
     def mint_id(self, kind: ViewKind) -> str:
-        """A fresh id: ``V1`` image, ``G1`` graph, ``C1`` carpet, ``M1`` matrix, ``K1`` clusters."""
+        """A fresh id: ``V1`` image, ``G1`` graph, ``C1`` carpet, ``M1`` matrix, ``K1`` clusters, ``S1`` surface."""
         stem = {
             ViewKind.IMAGE: "V",
             ViewKind.GRAPH: "G",
@@ -226,6 +248,7 @@ class ViewportSet:
             ViewKind.MATRIX: "M",
             ViewKind.CLUSTERS: "K",
             ViewKind.TRACE: "T",
+            ViewKind.SURFACE: "S",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:

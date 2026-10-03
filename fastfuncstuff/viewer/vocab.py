@@ -517,6 +517,42 @@ class SaveSurfaces(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceShape(Command):
+    """Draw a surface window's hemispheres as another shape (mid, inflated, flat...)."""
+
+    name = "SET_SURFACE_SHAPE"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    shape: str
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceDepth(Command):
+    """Cortical depth a surface window samples: white=0 .. pial=1, and how many samples."""
+
+    name = "SET_SURFACE_DEPTH"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    lo: float
+    hi: float
+    samples: int = 1
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceHemis(Command):
+    """Which hemispheres a surface window draws, and how far apart (mm)."""
+
+    name = "SET_SURFACE_HEMIS"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    hemis: str = "lh,rh"
+    split: float = 0.0
+
+
+@command
+@dataclass(frozen=True)
 class SetUnderlay(Command):
     """Replace the base image, keeping whatever is stacked over it.
 
@@ -1325,6 +1361,31 @@ def install(
     def _set_view_plane(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewPlane)
         return _set_view(st, cmd.view, SetViewPlane.aspects, plane=Plane(cmd.plane))
+
+    @bus.handle(SetSurfaceShape.name)
+    def _set_surface_shape(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceShape)
+        from fastfuncstuff.viewer.surface3d import SHAPES
+
+        if cmd.shape not in SHAPES:
+            raise ValueError(f"unknown surface shape {cmd.shape!r}; one of {', '.join(SHAPES)}")
+        return _set_view(st, cmd.view, SetSurfaceShape.aspects, shape=cmd.shape)
+
+    @bus.handle(SetSurfaceDepth.name)
+    def _set_surface_depth(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceDepth)
+        lo, hi = float(cmd.lo), float(cmd.hi)
+        if not (-0.5 <= lo <= 1.5 and -0.5 <= hi <= 1.5):
+            raise ValueError("surface depth is a fraction from white (0) to pial (1)")
+        samples = int(min(max(cmd.samples, 1), 16))
+        return _set_view(st, cmd.view, SetSurfaceDepth.aspects, depth=(lo, hi), samples=samples)
+
+    @bus.handle(SetSurfaceHemis.name)
+    def _set_surface_hemis(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceHemis)
+        return _set_view(
+            st, cmd.view, SetSurfaceHemis.aspects, hemis=cmd.hemis, split=float(cmd.split)
+        )
 
     @bus.handle(SetViewSolo.name)
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:

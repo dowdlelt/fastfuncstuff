@@ -95,6 +95,9 @@ class SurfaceStore:
         self._undo: list[_Undo] = []
         self.edited: set[tuple[str, str]] = set()
         self.log = EditLog()
+        #: Bumped whenever any vertex moves or surfaces are (re)loaded, per
+        #: hemisphere, so a 3-D window knows when to re-upload its buffers.
+        self.version: dict[str, int] = {}
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -103,6 +106,8 @@ class SurfaceStore:
         self.subject = Path(subject_dir)
         self.hemis = loaded
         self._reset_edits()
+        for h in loaded:
+            self.version[h] = self.version.get(h, 0) + 1
 
     def clear(self) -> None:
         self.subject = None
@@ -149,6 +154,7 @@ class SurfaceStore:
         if ids.size == 0:
             return
         self.hemis[hemi].states[surface][ids] = positions
+        self.version[hemi] = self.version.get(hemi, 0) + 1
         index = self._index.get((hemi, surface))
         if index is not None and self._grid_inverse is not None:
             index.move(ids, apply_affine(self._grid_inverse, positions), faces)

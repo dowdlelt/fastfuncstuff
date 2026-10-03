@@ -866,6 +866,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.manager.open(ViewKind.GRAPH, self._next_plane())
         self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
 
+    def _new_surface(self) -> None:
+        if not self.session.surfaces.hemis:
+            self.statusBar().showMessage("surface window: load a subject first (SURF)", 5000)
+            return
+        self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+
     def _new_carpet(self) -> None:
         self._open_built(ViewKind.CARPET)
 
@@ -1558,6 +1565,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
+                Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
                 Binding(
                     "ctrl+shift+s",
                     "save edited surfaces (as copies)",

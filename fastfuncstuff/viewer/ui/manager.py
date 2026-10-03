@@ -24,6 +24,7 @@ from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
+from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
 from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
 from fastfuncstuff.viewer.vocab import CloseView, SetViewGeometry
@@ -37,7 +38,15 @@ PLACE_STEPS = 6
 
 #: Every kind of companion window. They share no base class on purpose -- what
 #: they have in common is the four methods the manager calls, not an ancestry.
-Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow | ClusterWindow | TraceWindow
+Companion = (
+    ImageWindow
+    | GraphWindow
+    | CarpetWindow
+    | MatrixWindow
+    | ClusterWindow
+    | TraceWindow
+    | SurfaceWindow
+)
 
 
 class WindowManager(QtCore.QObject):
@@ -99,6 +108,9 @@ class WindowManager(QtCore.QObject):
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
             win.surfaces_previewed.connect(self._redraw_outlines)
+        elif viewport.is_surface:
+            win = SurfaceWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.located.connect(self._on_located)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
@@ -177,10 +189,23 @@ class WindowManager(QtCore.QObject):
             | Aspect.THRESHOLD
             | Aspect.COLORMAP
         )
+        # A surface window shows the overlay (colour, threshold, time), the
+        # crosshair and the meshes -- which an edit (SLICES) moves.
+        surfaces = dirty & (
+            Aspect.SLICES
+            | Aspect.COLORMAP
+            | Aspect.THRESHOLD
+            | Aspect.TIME
+            | Aspect.CROSSHAIR
+            | Aspect.LAYERS
+        )
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 if images:
                     win.redraw()
+            elif isinstance(win, SurfaceWindow):
+                if surfaces:
+                    win.refresh(dirty)
             elif graphs:
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
@@ -191,6 +216,8 @@ class WindowManager(QtCore.QObject):
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 win.redraw_outlines()
+            elif isinstance(win, SurfaceWindow):
+                win.refresh(Aspect.SLICES)
 
     def restyle(self) -> None:
         """Re-read the palette in every companion window."""
