@@ -114,3 +114,14 @@ def test_patch_ids_are_one_based_and_negated_on_the_border(tmp_path):
     assert np.flatnonzero(in_patch).tolist() == [0, 2, 4]
     assert np.flatnonzero(border).tolist() == [2]
     assert coords[[0, 2, 4], 0].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_cortex_label_becomes_a_vertex_mask(tmp_path):
+    subj = _subject(tmp_path)
+    (subj / "label").mkdir()
+    ids = np.array([0, 2, 4])
+    lines = ["#!ascii label", str(ids.size)] + [f"{i} 0 0 0 0" for i in ids]
+    (subj / "label" / "lh.cortex.label").write_text("\n".join(lines) + "\n")
+    hemi = load_hemisphere(subj, "lh", patches=False)
+    assert hemi.cortex is not None
+    assert np.flatnonzero(hemi.cortex).tolist() == [0, 2, 4]

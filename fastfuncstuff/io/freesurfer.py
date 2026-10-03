@@ -196,6 +196,11 @@ class Hemisphere:
     paths: dict[str, Path] = field(default_factory=dict)
     morph: dict[str, np.ndarray] = field(default_factory=dict)
     patches: dict[str, FlatPatch] = field(default_factory=dict)
+    #: ``label/?h.cortex.label`` as a vertex mask, or ``None`` when absent.
+    #: The medial wall (callosum, the brainstem cut) is mesh but not cortex:
+    #: white and pial coincide there, and anything sampled between them is
+    #: meaningless -- QC and depth sampling should skip it.
+    cortex: np.ndarray | None = None
 
     @property
     def n_vertices(self) -> int:
@@ -268,6 +273,12 @@ def load_hemisphere(
             values = nfs.read_morph_data(str(path)).astype(np.float32)
             if values.shape[0] == nv:
                 hemisphere.morph[name] = values
+    label = Path(subject_dir) / "label" / f"{hemi}.cortex.label"
+    if label.exists():
+        ids = nfs.read_label(str(label))
+        mask = np.zeros(nv, bool)
+        mask[ids[(ids >= 0) & (ids < nv)]] = True
+        hemisphere.cortex = mask
     if patches:
         for path in sorted(surf.glob(f"{hemi}.*.patch.3d")):
             name = path.name[len(hemi) + 1 : -len(".patch.3d")]
