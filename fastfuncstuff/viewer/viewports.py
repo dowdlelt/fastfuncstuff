@@ -63,6 +63,7 @@ class ViewKind(StrEnum):
     TRACE = "trace"
     SURFACE = "surface"
     PROFILE = "profile"
+    DEPTH = "depth"
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,17 @@ class Viewport:
     profile_score: str = "worst"
     tube: float = 0.5
 
+    # -- depth profiles --------------------------------------------------
+    #: How the region grows from the clicked spot (disc / annot / layer), the
+    #: disc radius along the surface (mm), the layer profiled ("" = the
+    #: selected, else the top overlay), the ROI layer for ``layer`` regions,
+    #: and how many depths from just inside white to just past pial.
+    depth_source: str = "disc"
+    radius: float = 5.0
+    depth_layer: str = ""
+    depth_roi_layer: str = ""
+    depth_bins: int = 31
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -207,6 +219,10 @@ class Viewport:
     @property
     def is_trace(self) -> bool:
         return self.kind is ViewKind.TRACE
+
+    @property
+    def is_depth(self) -> bool:
+        return self.kind is ViewKind.DEPTH
 
     @property
     def is_profile(self) -> bool:
@@ -240,6 +256,8 @@ class Viewport:
             return f"surface · {self.shape}  [{self.id}]"
         if self.is_profile:
             return f"profiles · {self.profile_score}  [{self.id}]"
+        if self.is_depth:
+            return f"depth · {self.depth_source}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -275,6 +293,7 @@ class ViewportSet:
             ViewKind.TRACE: "T",
             ViewKind.SURFACE: "S",
             ViewKind.PROFILE: "P",
+            ViewKind.DEPTH: "D",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:

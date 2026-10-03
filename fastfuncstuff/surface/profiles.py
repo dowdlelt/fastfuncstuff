@@ -169,6 +169,89 @@ def sample_profiles(
     return Profiles(out, cols, kind, spec.mode, thick)
 
 
+def equivolume_fraction(alpha, white_area, pial_area):
+    """Depth fraction (white 0 .. pial 1) enclosing volume fraction ``alpha``.
+
+    Equivolume layering (Waehnert et al. 2014), in the per-vertex form
+    pycortex uses: cortical area varies linearly with depth from the white
+    area to the pial area, so the volume between white and depth rho is a
+    quadratic in rho, solved here for rho. In a gyral crown (pial area >
+    white) the outer layers are the thin ones, so the mid-volume surface
+    sits nearer pial; in a fundus, nearer white. Equal areas give
+    rho = alpha. Works elementwise on scalars or arrays; the
+    fragment shader does the same per pixel.
+    """
+    a = np.asarray(alpha, np.float64)
+    aw = np.asarray(white_area, np.float64)
+    ap = np.asarray(pial_area, np.float64)
+    delta = ap - aw
+    root = np.sqrt(np.maximum((1.0 - a) * aw * aw + a * ap * ap, 0.0))
+    flat = np.abs(delta) <= 1e-4 * np.maximum(aw + ap, 1e-12)
+    return np.where(flat, a, (root - aw) / np.where(flat, 1.0, delta))
+
+
+def sample_depths(
+    white: np.ndarray,
+    pial: np.ndarray,
+    volume: np.ndarray,
+    affine: np.ndarray,
+    fractions: np.ndarray,
+    *,
+    white_area: np.ndarray | None = None,
+    pial_area: np.ndarray | None = None,
+    device: torch.device | None = None,
+) -> np.ndarray:
+    """A volume at given cortical depths for each vertex: ``(V, K)`` or ``(V, K, T)``.
+
+    ``fractions`` run white (0) to pial (1); outside that range the line is
+    extended linearly into white matter and past pial, so a profile can show
+    where the ribbon starts and stops. Inside it, with both areas given, the
+    fractions are **equivolume** (:func:`equivolume_fraction`), as the 3-D
+    view samples. A 4-D volume ``(X, Y, Z, T)`` is read for every time point
+    in one pass, time as channels -- the depth timecourses laminar models eat.
+    """
+    device = device or torch.device("cpu")
+    frac = np.asarray(fractions, np.float64)
+    w = np.asarray(white, np.float64)
+    p = np.asarray(pial, np.float64)
+    if white_area is not None and pial_area is not None:
+        inside = (frac >= 0) & (frac <= 1)
+        rho = np.broadcast_to(frac, (w.shape[0], frac.size)).copy()
+        rho[:, inside] = equivolume_fraction(
+            frac[None, inside], np.asarray(white_area)[:, None], np.asarray(pial_area)[:, None]
+        )
+    else:
+        rho = np.broadcast_to(frac, (w.shape[0], frac.size))
+    pts = w[:, None, :] + rho[..., None] * (p - w)[:, None, :]  # (V, K, 3)
+    inv = np.linalg.inv(np.asarray(affine, np.float64))
+    ijk = pts @ inv[:3, :3].T + inv[:3, 3]
+    vol = np.asarray(volume, np.float32)
+    four_d = vol.ndim == 4
+    if not four_d:
+        vol = vol[..., None]
+    shape = np.array(vol.shape[:3], np.float64)
+    # grid_sample's (x, y, z) index (W, H, D); the array is (X, Y, Z), taken
+    # as (D, H, W) -- so the grid is (k, j, i), normalised to [-1, 1] at the
+    # first and last voxel centres (align_corners=True).
+    grid = 2.0 * ijk[..., ::-1] / np.maximum(shape[::-1] - 1, 1) - 1.0
+    g = torch.as_tensor(grid.reshape(1, 1, 1, -1, 3), dtype=torch.float32, device=device)
+    n_t = vol.shape[3]
+    out = np.empty((pts.shape[0] * pts.shape[1], n_t), np.float32)
+    per_channel = int(np.prod(vol.shape[:3])) * 4 + g.numel() * 4
+    step = int(
+        max(1, min(n_t, get_available_memory(device, empty_cache=False) // max(per_channel, 1)))
+    )
+    for t0 in range(0, n_t, step):
+        block = np.ascontiguousarray(np.moveaxis(vol[..., t0 : t0 + step], 3, 0))
+        x = torch.as_tensor(block, device=device)[None]  # (1, C, X, Y, Z)
+        s = torch.nn.functional.grid_sample(
+            x, g, mode="bilinear", padding_mode="zeros", align_corners=True
+        )  # (1, C, 1, 1, N)
+        out[:, t0 : t0 + step] = s[0, :, 0, 0, :].T.cpu().numpy()
+    out = out.reshape(pts.shape[0], pts.shape[1], n_t)
+    return out if four_d else out[..., 0]
+
+
 @dataclass
 class TissueLevels:
     wm: float
@@ -306,6 +389,8 @@ def slab_contour_order(
 
 __all__ = [
     "SCORES",
+    "equivolume_fraction",
+    "sample_depths",
     "ProfileSpec",
     "Profiles",
     "TissueLevels",

@@ -51,7 +51,7 @@ from PySide6.QtGui import (
 from PySide6.QtGui import QRhiShaderResourceBinding as Binding
 
 from fastfuncstuff.io.freesurfer import available_annotations, available_volume_atlases
-from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas, vertex_normals
+from fastfuncstuff.surface.mesh import MeshTopology, vertex_normals
 from fastfuncstuff.viewer import surface3d as s3
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
@@ -994,20 +994,9 @@ class SurfaceWindow(QtWidgets.QWidget):
         c.update()
 
     def _areas(self, hemi: str) -> np.ndarray:
-        """``(V, 2)`` white and pial vertex areas, for equivolume depth.
-
-        From the current meshes rather than ``?h.area``/``?h.area.pial``, so an
-        edit's change of area is in the next frame.
-        """
-        h = self.session.surfaces.hemis[hemi]
-        faces = h.faces.astype(np.int64)
-        return np.stack(
-            [
-                vertex_areas(h.states["white"], faces, h.n_vertices),
-                vertex_areas(h.states["pial"], faces, h.n_vertices),
-            ],
-            axis=1,
-        ).astype(np.float32)
+        """``(V, 2)`` white and pial vertex areas, for equivolume depth (cached per edit)."""
+        aw, ap = self.session.surfaces.vertex_areas(hemi)
+        return np.stack([aw, ap], axis=1).astype(np.float32)
 
     def _refresh_folding(self, vp: Viewport) -> None:
         surfaces = self.session.surfaces
@@ -1041,6 +1030,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             vp.vertex_map,
             annot if vp.vertex_map == "annot" else "",
             surfaces.flags_version if vp.vertex_map == "flags" else 0,
+            surfaces.depth_roi_version,
             surfaces.subject,
         )
         fresh = {h for h in surfaces.hemis if h not in self._map_hemis}
@@ -1051,6 +1041,17 @@ class SurfaceWindow(QtWidgets.QWidget):
             colours = s3.vertex_colors(hemi, vp.vertex_map, ann, surfaces.flags.get(h))
             if colours is None:
                 colours = np.zeros((hemi.n_vertices, 4), np.uint8)
+            roi = surfaces.depth_roi_vertices.get(h)
+            if roi is not None and roi.size:
+                # The depth window's region, tinted over whatever map is on.
+                accent = QtGui.QColor(theme.palette().accent)
+                tint = np.array([accent.red(), accent.green(), accent.blue()], np.float64)
+                base = colours[roi, :3].astype(np.float64)
+                alpha = colours[roi, 3:4].astype(np.float64) / 255.0
+                colours[roi, :3] = np.round(base * alpha * 0.4 + tint * (1 - alpha * 0.4)).astype(
+                    np.uint8
+                )
+                colours[roi, 3] = np.maximum(colours[roi, 3], 170)
             self.canvas.set_hemisphere(
                 h, pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=colours
             )

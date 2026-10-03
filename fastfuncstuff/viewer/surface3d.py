@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from fastfuncstuff.io.freesurfer import Hemisphere
+from fastfuncstuff.surface.profiles import equivolume_fraction
 
 #: Shapes a hemisphere can be drawn as, in the order the window offers them.
 #: ``mid`` is half-way between white and pial (pycortex's "fiducial"); ``flat``
@@ -387,27 +388,6 @@ def folding_values(hemi: Hemisphere, mode: str) -> np.ndarray:
         return np.sign(values).astype(np.float32)
     top = float(np.percentile(np.abs(values), 98)) or 1.0
     return np.clip(values / top, -1.0, 1.0).astype(np.float32)
-
-
-def equivolume_fraction(alpha, white_area, pial_area):
-    """Depth fraction (white 0 .. pial 1) enclosing volume fraction ``alpha``.
-
-    Equivolume layering (Waehnert et al. 2014), in the per-vertex form
-    pycortex uses: cortical area varies linearly with depth from the white
-    area to the pial area, so the volume between white and depth rho is a
-    quadratic in rho, solved here for rho. In a gyral crown (pial area >
-    white) the outer layers are the thin ones, so the mid-volume surface
-    sits nearer pial; in a fundus, nearer white. Equal areas give
-    rho = alpha. Works elementwise on scalars or arrays; the
-    fragment shader does the same per pixel.
-    """
-    a = np.asarray(alpha, np.float64)
-    aw = np.asarray(white_area, np.float64)
-    ap = np.asarray(pial_area, np.float64)
-    delta = ap - aw
-    root = np.sqrt(np.maximum((1.0 - a) * aw * aw + a * ap * ap, 0.0))
-    flat = np.abs(delta) <= 1e-4 * np.maximum(aw + ap, 1e-12)
-    return np.where(flat, a, (root - aw) / np.where(flat, 1.0, delta))
 
 
 #: Per-vertex maps a surface window can paint, in the order offered.

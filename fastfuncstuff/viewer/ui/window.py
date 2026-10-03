@@ -480,6 +480,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self.surf_button.clicked.connect(self._surfaces_dialog)
         bar.addWidget(self.surf_button)
+        # The surface windows, as buttons as well as keys: a window nobody can
+        # find is a window that does not exist.
+        for text, tip, slot in (
+            (
+                "3D",
+                "3-D surface window: overlays on folded/inflated/flat (shift+V)",
+                self._new_surface,
+            ),
+            (
+                "DEPTH",
+                "Depth profiles of the overlay around the crosshair (shift+L)",
+                self._new_depth,
+            ),
+            (
+                "QC",
+                "Ribbon profile column: surface QC, back to front (shift+P)",
+                self._new_profiles,
+            ),
+        ):
+            button = QtWidgets.QPushButton(text)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            bar.addWidget(button)
 
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
@@ -904,6 +927,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("surface window: load a subject first (SURF)", 5000)
             return
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+
+    def _new_depth(self) -> None:
+        if not self.session.surfaces.hemis:
+            self.statusBar().showMessage("depth profiles: load a subject first (SURF)", 5000)
+            return
+        self.manager.open(ViewKind.DEPTH, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
     def _new_profiles(self) -> None:
@@ -1607,6 +1637,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
+                Binding(
+                    "shift+l",
+                    "open depth profiles (laminar) of the overlay around the crosshair",
+                    self._new_depth,
+                    group="windows",
+                ),
                 Binding(
                     "shift+p",
                     "open the ribbon profile column (surface QC)",

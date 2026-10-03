@@ -61,6 +61,7 @@ keys (main window)
   ctrl+shift+I         install edits over the originals (asks; keeps backups)
   V                    3-D surface window (data sampled between white and pial)
   P                    ribbon profile column: every vertex, back to front, flagged
+  L                    depth profiles of the overlay around the crosshair (laminar)
 
 keys (image window)
   1 2 3                axial / sagittal / coronal

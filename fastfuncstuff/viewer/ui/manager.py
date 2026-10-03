@@ -21,6 +21,7 @@ from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
 from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
+from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
@@ -48,6 +49,7 @@ Companion = (
     | TraceWindow
     | SurfaceWindow
     | ProfileWindow
+    | DepthWindow
 )
 
 
@@ -110,6 +112,9 @@ class WindowManager(QtCore.QObject):
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
             win.surfaces_previewed.connect(self._redraw_outlines)
+        elif viewport.is_depth:
+            win = DepthWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.roi_changed.connect(self._refresh_surface_windows)
         elif viewport.is_profile:
             win = ProfileWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
@@ -211,6 +216,11 @@ class WindowManager(QtCore.QObject):
                     win.redraw()
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
+                    win.refresh(dirty)
+            elif isinstance(win, DepthWindow):
+                # The clicked spot (CROSSHAIR), the volume shown (TIME), what
+                # is loaded (LAYERS) and an edit moving white/pial (SLICES).
+                if dirty & (Aspect.CROSSHAIR | Aspect.TIME | Aspect.LAYERS | Aspect.SLICES):
                     win.refresh(dirty)
             elif isinstance(win, ProfileWindow):
                 # The crosshair (to follow), an edit (SLICES: re-sample what

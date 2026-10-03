@@ -113,6 +113,11 @@ class SurfaceStore:
         #: paint them. Bumped ``flags_version`` tells it they changed.
         self.flags: dict[str, np.ndarray] = {}
         self.flags_version = 0
+        #: The depth window's current ROI, ``{hemi: vertex ids}``, so a surface
+        #: window can show which cortex the profile is from.
+        self.depth_roi_vertices: dict[str, np.ndarray] = {}
+        self.depth_roi_version = 0
+        self._areas: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -135,6 +140,8 @@ class SurfaceStore:
 
     def _reset_edits(self) -> None:
         self.flags = {}
+        self.depth_roi_vertices = {}
+        self._areas.clear()
         self._annots.clear()
         self._atlases.clear()
         self._trees.clear()
@@ -303,6 +310,93 @@ class SurfaceStore:
                         name = self.color_lut().get(label, (str(label), (0, 0, 0)))[0]
                         lines.append(f"{name}  ({atlas})")
         return lines
+
+    # -- regions of cortex -----------------------------------------------------
+    def depth_roi(
+        self,
+        mm: tuple[float, float, float],
+        source: str,
+        *,
+        radius: float = 5.0,
+        annot: str = "aparc",
+        labels: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Cortex vertices of a region anchored at the vertex nearest ``mm``.
+
+        ``source``:
+
+        * ``disc`` -- within ``radius`` mm of it *along the mid-thickness
+          surface* (geodesic, so a disc on one bank of a sulcus stays there);
+        * ``annot`` -- every vertex of its parcel in the ``annot`` parcellation;
+        * ``layer`` -- every vertex whose mid-thickness point falls in the same
+          label of ``labels`` (a label volume and its affine: an ROI layer).
+
+        Empty when ``mm`` is not within 3 mm of cortex.
+        """
+        from fastfuncstuff.surface.mesh import geodesic_ball
+
+        near = self.nearest_vertex(mm)
+        if near is None:
+            return {}
+        hemi, vertex, _ = near
+        h = self.hemis[hemi]
+        cortex = h.cortex if h.cortex is not None else np.ones(h.n_vertices, bool)
+        mid = 0.5 * (h.states["white"] + h.states["pial"])
+        if source == "disc":
+            ids, _ = geodesic_ball(mid, self.topology(hemi), vertex, float(radius))
+            return {hemi: ids[cortex[ids]]}
+        if source == "annot":
+            ann = self.annotation(hemi, annot)
+            if ann is None or ann.name_at(vertex) is None:
+                return {}
+            same = (ann.labels == ann.labels[vertex]) & cortex
+            return {hemi: np.flatnonzero(same)}
+        if source == "layer":
+            if labels is None:
+                return {}
+            data, aff = labels
+            out: dict[str, np.ndarray] = {}
+            inv = np.linalg.inv(aff)
+
+            def label_at(points: np.ndarray) -> np.ndarray:
+                ijk = np.floor(points @ inv[:3, :3].T + inv[:3, 3] + 0.5).astype(np.int64)
+                ok = np.all((ijk >= 0) & (ijk < np.array(data.shape[:3])), axis=1)
+                vals = np.zeros(points.shape[0], np.int64)
+                vals[ok] = data[ijk[ok, 0], ijk[ok, 1], ijk[ok, 2]]
+                return vals
+
+            target = int(label_at(mid[vertex][None])[0])
+            if target == 0:
+                return {}
+            for name, other in self.hemis.items():
+                c = other.cortex if other.cortex is not None else np.ones(other.n_vertices, bool)
+                m = 0.5 * (other.states["white"] + other.states["pial"])
+                hit = np.flatnonzero((label_at(m) == target) & c)
+                if hit.size:
+                    out[name] = hit
+            return out
+        raise ValueError(f"depth ROI source must be disc, annot or layer, not {source!r}")
+
+    def vertex_areas(self, hemi: str) -> tuple[np.ndarray, np.ndarray]:
+        """White and pial vertex areas (mm^2), for equivolume depth; cached per edit."""
+        from fastfuncstuff.surface.mesh import vertex_areas
+
+        version = self.version.get(hemi, 0)
+        cached = self._areas.get(hemi)
+        if cached is None or cached[0] != version:
+            h = self.hemis[hemi]
+            faces = h.faces.astype(np.int64)
+            cached = (
+                version,
+                vertex_areas(h.states["white"], faces, h.n_vertices),
+                vertex_areas(h.states["pial"], faces, h.n_vertices),
+            )
+            self._areas[hemi] = cached
+        return cached[1], cached[2]
+
+    def publish_depth_roi(self, vertices: dict[str, np.ndarray]) -> None:
+        self.depth_roi_vertices = vertices
+        self.depth_roi_version += 1
 
     # -- editing -----------------------------------------------------------
     def grab(

@@ -586,6 +586,21 @@ class SetSurfaceHemis(Command):
 
 @command
 @dataclass(frozen=True)
+class SetDepthView(Command):
+    """A depth window's region: source (disc / annot / layer), disc radius (mm),
+    the layer profiled ("" = auto) and the ROI layer a ``layer`` region uses."""
+
+    name = "SET_DEPTH_VIEW"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    source: str = "disc"
+    radius: float = 5.0
+    layer: str = ""
+    roi: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetProfileView(Command):
     """A profile window's depth axis (fraction / mm), flag, and tube radius (mm)."""
 
@@ -1426,6 +1441,26 @@ def install(
     def _set_view_plane(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewPlane)
         return _set_view(st, cmd.view, SetViewPlane.aspects, plane=Plane(cmd.plane))
+
+    @bus.handle(SetDepthView.name)
+    def _set_depth_view(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetDepthView)
+        if cmd.source not in ("disc", "annot", "layer"):
+            raise ValueError("depth region source is disc, annot or layer")
+        if not 0.25 <= cmd.radius <= 100.0:
+            raise ValueError("depth disc radius is 0.25-100 mm")
+        for key in (cmd.layer, cmd.roi):
+            if key and st.layers.find(key) is None:
+                raise KeyError(f"no layer {key!r}")
+        return _set_view(
+            st,
+            cmd.view,
+            SetDepthView.aspects,
+            depth_source=cmd.source,
+            radius=float(cmd.radius),
+            depth_layer=cmd.layer,
+            depth_roi_layer=cmd.roi,
+        )
 
     @bus.handle(SetProfileView.name)
     def _set_profile_view(cmd: Command, st: ViewerState) -> Aspect:

@@ -117,3 +117,40 @@ def test_rows_walk_the_ring_rather_than_jump_across_it():
     ring_step = np.median(np.linalg.norm(np.diff(folded, axis=0), axis=1))
     assert np.median(step) == pytest.approx(ring_step, rel=0.05)
     assert sorted(good.tolist()) == list(range(len(t)))
+
+
+def test_sample_depths_matches_the_cpu_sampler_and_extends_past_the_ribbon(phantom):
+    from fastfuncstuff.surface.profiles import sample_depths
+    from fastfuncstuff.surface.sampling import VolumeSampler
+
+    img, aff, u = phantom
+    white, pial = WHITE_R * u[:200], PIAL_R * u[:200]
+    fr = np.array([-0.5, 0.0, 0.5, 1.0, 1.5])
+    got = sample_depths(white, pial, img, aff, fr, device=CPU)
+    pts = white[:, None, :] + fr[None, :, None] * (pial - white)[:, None, :]
+    np.testing.assert_allclose(got, VolumeSampler(img, aff)(pts), atol=1e-2)
+    # Past white is WM, past pial CSF -- the margins see beyond the ribbon.
+    assert got[:, 0].mean() > got[:, 2].mean() > got[:, 4].mean()
+
+
+def test_sample_depths_equivolume_and_time_as_channels(phantom):
+    from fastfuncstuff.surface.profiles import equivolume_fraction, sample_depths
+
+    img, aff, u = phantom
+    white, pial = WHITE_R * u[:100], PIAL_R * u[:100]
+    aw, ap = np.full(100, 1.0), np.full(100, 2.5)
+    fr = np.linspace(-0.2, 1.2, 8)
+    eq = sample_depths(white, pial, img, aff, fr, white_area=aw, pial_area=ap, device=CPU)
+    rho = fr.copy()
+    inside = (fr >= 0) & (fr <= 1)
+    rho[inside] = equivolume_fraction(fr[inside], 1.0, 2.5)
+    lin = sample_depths(white, pial, img, aff, rho, device=CPU)
+    np.testing.assert_allclose(eq, lin, atol=1e-4)
+    # A 4-D volume: every time point in one pass, identical to one at a time.
+    series = np.stack([img, 2 * img, img - 5], axis=-1)
+    four = sample_depths(white, pial, series, aff, fr, device=CPU)
+    assert four.shape == (100, 8, 3)
+    one = sample_depths(white, pial, img, aff, fr, device=CPU)
+    np.testing.assert_allclose(four[..., 0], one, atol=1e-4)
+    np.testing.assert_allclose(four[..., 1], 2 * one, atol=1e-3)
+    np.testing.assert_allclose(four[..., 2], one - 5, atol=1e-3)

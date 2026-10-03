@@ -123,7 +123,8 @@ def _shell_anat(tmp_path, cras=(0.0, 0.0, 0.0)):
     aff[:3, 3] = -(n - 1) * vox / 2 + np.asarray(cras)
     ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
     r = np.linalg.norm(ijk * vox + aff[:3, 3] - np.asarray(cras), axis=-1)
-    img = np.where(r < 21, 110.0, np.where(r < 24, 70.0, 20.0)).astype(np.float32)
+    # +0.25: integer intensities read as a label map on load.
+    img = np.where(r < 21, 110.25, np.where(r < 24, 70.25, 20.25)).astype(np.float32)
     p = tmp_path / "t1.nii.gz"
     nib.save(nib.Nifti1Image(img, aff), str(p))
     return p
@@ -363,3 +364,36 @@ def test_install_replaces_originals_and_keeps_backups(session, tmp_path):
     assert all(b.name.endswith("-2") for _, b in again.files)
     # And installing is not something a replayed script can do.
     assert "INSTALL" not in session.to_script()
+
+
+def test_depth_roi_disc_parcel_and_label_layer(session, tmp_path):
+    subj = _subject(tmp_path)
+    (subj / "label").mkdir()
+    white = nfs.read_geometry(str(subj / "surf" / "lh.white"))[0]
+    labels = np.where(white[:, 2] > 10, 1, 2)
+    ctab = np.array([[25, 5, 25, 0, 0], [60, 20, 220, 0, 0], [255, 192, 32, 0, 0]], np.int32)
+    nfs.write_annot(
+        str(subj / "label" / "lh.aparc.annot"), labels, ctab, ["unknown", "cap", "rest"]
+    )
+    session.load(_anat(tmp_path))
+    session.do(LoadSurfaces(str(subj), "lh"))
+    store = session.surfaces
+    top = (0.0, 0.0, 22.0)  # mid-thickness at the top of the r=20/24 pair
+    disc = store.depth_roi(top, "disc", radius=5.0)["lh"]
+    mid = 0.5 * (store.hemis["lh"].states["white"] + store.hemis["lh"].states["pial"])
+    # Radius is along the surface from the anchor vertex (nearest the click):
+    # every chord from it is at most the geodesic 5 mm.
+    anchor = mid[store.nearest_vertex(top)[1]]
+    assert disc.size > 5 and np.linalg.norm(mid[disc] - anchor, axis=1).max() <= 5.0
+    parcel = store.depth_roi(top, "annot", annot="aparc")["lh"]
+    np.testing.assert_array_equal(np.sort(parcel), np.flatnonzero(labels == 1))
+    # A label volume: everything above z = 15 mm is label 7.
+    aff = np.diag([1.0, 1.0, 1.0, 1.0])
+    aff[:3, 3] = -40.0
+    vol = np.zeros((81, 81, 81), np.int64)
+    vol[:, :, 55:] = 7
+    region = store.depth_roi(top, "layer", labels=(vol, aff))["lh"]
+    np.testing.assert_array_equal(np.sort(region), np.flatnonzero(mid[:, 2] >= 14.5))
+    assert store.depth_roi((0.0, 0.0, 0.0), "disc") == {}  # 22 mm from cortex
+    with pytest.raises(ValueError):
+        store.depth_roi(top, "blob")
