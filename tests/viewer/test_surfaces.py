@@ -578,3 +578,53 @@ def test_topology_commands_delete_split_undo_and_save_everything(session, tmp_pa
         "SPLIT_SURFACE_EDGE" in session.to_script()
         and "DELETE_SURFACE_VERTEX" in session.to_script()
     )
+
+
+def test_point_tool_selects_marks_deletes_and_splits(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image.point_button.click()
+        st = session.state
+        assert st.surface_tool == "point" and st.surface_editing
+        view = plane_view(st, image._viewport())
+        assert st.grid is not None and view is not None
+        outline = {
+            o.surface: o
+            for o in session.surfaces.outlines(
+                st.grid.affine, view, image.pane.position, ("white",)
+            )
+        }["white"]
+        image.pane.edit_pressed.emit(*map(float, outline.segments[0, 0]))
+        assert st.surface_selected is not None and st.surface_selected[0] == "lh"
+        app.processEvents()
+        assert image.pane._marks  # the selection is drawn on this slice
+        hemi = session.surfaces.hemis["lh"]
+        n0 = hemi.n_vertices
+        image._split_selected(False)
+        assert hemi.n_vertices == n0 + 1 and st.surface_selected == ("lh", n0)
+        image._delete_selected()
+        assert hemi.n_vertices == n0
+        v = st.surface_selected[1]
+        valence = session.surfaces.neighbours("lh", v).size
+        image._split_selected(True)
+        assert hemi.n_vertices == n0 + valence and st.surface_selected == ("lh", v)
+    finally:
+        win.close()

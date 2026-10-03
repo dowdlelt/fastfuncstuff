@@ -108,6 +108,8 @@ class ImagePane(QtWidgets.QWidget):
         self._brush_label = ""
         #: A stroke being drawn, as fractional (row, col) image pixels.
         self._stroke_pts: list[tuple[float, float]] = []
+        #: The selected vertex on this slice, per surface: (row, col, surface).
+        self._marks: list[tuple[float, float, str]] = []
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -182,6 +184,11 @@ class ImagePane(QtWidgets.QWidget):
             self._outlines.update(built)
             changed = True
         if changed:
+            self.update()
+
+    def set_marks(self, marks: list[tuple[float, float, str]]) -> None:
+        if marks != self._marks:
+            self._marks = list(marks)
             self.update()
 
     def set_stroke(self, points: list[tuple[float, float]]) -> None:
@@ -289,6 +296,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_brush(p)
         if len(self._stroke_pts) > 1:
             self._paint_stroke(p, rect)
+        if self._marks:
+            self._paint_marks(p, rect)
         if self._handle is not None:
             self._paint_handle(p, rect)
 
@@ -336,6 +345,24 @@ class ImagePane(QtWidgets.QWidget):
             pen.setWidthF(1.25)
             p.setPen(pen)
             p.drawPath(path)
+        p.restore()
+
+    def _paint_marks(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        """The selected vertex: a ring in its surface's outline colour."""
+        from fastfuncstuff.viewer.surfaces import OUTLINE_RGB
+
+        assert self._image is not None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        for row, col, surface in self._marks:
+            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*OUTLINE_RGB.get(surface, (1, 1, 1))))
+            pen.setWidthF(2.0)
+            p.setPen(pen)
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            centre = QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy)
+            p.drawEllipse(centre, 6.0, 6.0)
         p.restore()
 
     def _paint_stroke(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:

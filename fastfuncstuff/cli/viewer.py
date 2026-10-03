@@ -77,6 +77,8 @@ surface editing (image window, with -surfaces loaded)
   G                    draw mode: press on an outline, draw where it should
                        run, release on the same outline; the stretch moves onto
                        the line and the surface around follows
+  p                    point mode: select a vertex; Delete removes it, i splits
+                       its longest edge, I all its edges (every surface + file)
   ( )                  brush radius         m  snap / follow the hand
   ctrl+Z               undo                 Esc  cancel the drag
 

@@ -28,8 +28,10 @@ from fastfuncstuff.viewer.ui.panes import ImagePane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
+    DeleteSurfaceVertex,
     EditSurface,
     EditSurfaceStroke,
+    SelectSurfaceVertex,
     SetEdges,
     SetIJK,
     SetLayerOpacity,
@@ -42,7 +44,9 @@ from fastfuncstuff.viewer.vocab import (
     SetViewPlane,
     SetViewPosition,
     SetViewSolo,
+    SetXYZ,
     SetZoom,
+    SplitSurfaceEdge,
     UndoSurfaceEdit,
 )
 
@@ -136,6 +140,17 @@ class ImageWindow(QtWidgets.QWidget):
         )
         self.draw_button.clicked.connect(self._toggle_draw)
         bar.addWidget(self.draw_button)
+
+        self.point_button = self._button(
+            "POINT",
+            "p",
+            "Select a surface vertex (press near an outline): Delete removes it\n"
+            "from every surface and file of the hemisphere, i splits its longest\n"
+            "edge, shift+I splits all its edges -- for more triangles where a\n"
+            "fold needs them.",
+        )
+        self.point_button.clicked.connect(self._toggle_point)
+        bar.addWidget(self.point_button)
 
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
@@ -237,6 +252,28 @@ class ImageWindow(QtWidgets.QWidget):
                     "shift+g",
                     "edit surfaces: draw a stretch of outline anew",
                     self.draw_button.click,
+                    group="surface",
+                ),
+                Binding(
+                    "p", "edit surfaces: select a vertex", self.point_button.click, group="surface"
+                ),
+                Binding(
+                    "Delete",
+                    "delete the selected vertex",
+                    self._delete_selected,
+                    group="surface",
+                    aliases=("Backspace",),
+                ),
+                Binding(
+                    "i",
+                    "split the selected vertex's longest edge",
+                    lambda: self._split_selected(False),
+                    group="surface",
+                ),
+                Binding(
+                    "shift+i",
+                    "split all the selected vertex's edges",
+                    lambda: self._split_selected(True),
                     group="surface",
                 ),
                 Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
@@ -515,6 +552,8 @@ class ImageWindow(QtWidgets.QWidget):
         self._redraw_outlines(vp)
         self.edit_button.setChecked(state.surface_editing and state.surface_tool == "grab")
         self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
+        self.point_button.setChecked(state.surface_editing and state.surface_tool == "point")
+        self.pane.set_marks(self._selected_marks())
         self._sync_brush()
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
@@ -559,7 +598,10 @@ class ImageWindow(QtWidgets.QWidget):
         state = self.session.state
         r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
-        tool = "DRAW" if state.surface_tool == "draw" else "EDIT"
+        tool = {"draw": "DRAW", "point": "POINT"}.get(state.surface_tool, "EDIT")
+        if state.surface_tool == "point" and state.surface_selected is not None:
+            hemi, v = state.surface_selected
+            tool += f" {hemi} #{v}"
         label = f"{tool}  r={r:g} mm  {mode}" + (f"   {note}" if note else "")
         self.pane.set_brush(self._brush_px(), label)
 
@@ -568,6 +610,69 @@ class ImageWindow(QtWidgets.QWidget):
         on = not (state.surface_editing and state.surface_tool == "grab")
         self._dispatch(SetSurfaceTool("grab"))
         self._dispatch(SetSurfaceEditing(on))
+
+    def _toggle_point(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "point")
+        self._dispatch(SetSurfaceTool("point" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    def _topology(self, command) -> None:
+        try:
+            self._dispatch(command)
+        except ValueError as exc:
+            self._sync_brush(str(exc))
+            return
+        self._goto_selected()
+
+    def _delete_selected(self) -> None:
+        sel = self.session.state.surface_selected
+        if sel is not None:
+            self._topology(DeleteSurfaceVertex(sel[0], sel[1]))
+
+    def _split_selected(self, all_edges: bool) -> None:
+        sel = self.session.state.surface_selected
+        if sel is None:
+            return
+        hemi, v = sel
+        surfaces = self.session.surfaces
+        if not all_edges:
+            self._topology(SplitSurfaceEdge(hemi, *surfaces.longest_edge(hemi, v)))
+            return
+        # Splits append vertices, so v and its old neighbours keep their numbers.
+        for u in surfaces.neighbours(hemi, v):
+            self._topology(SplitSurfaceEdge(hemi, v, int(u)))
+        self._dispatch(SelectSurfaceVertex(hemi, v))
+
+    def _goto_selected(self) -> None:
+        """Put the crosshair on the selected vertex, so every view finds it."""
+        sel = self.session.state.surface_selected
+        if sel is None:
+            return
+        h = self.session.surfaces.hemis[sel[0]]
+        p = 0.5 * (h.states["white"][sel[1]] + h.states["pial"][sel[1]])
+        self._dispatch(SetXYZ(float(p[0]), float(p[1]), float(p[2])))
+
+    def _selected_marks(self) -> list[tuple[float, float, str]]:
+        """Where the selected vertex sits on this slice, per surface, if it is close."""
+        state = self.session.state
+        sel = state.surface_selected
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        if sel is None or view is None or pos is None or state.grid is None:
+            return []
+        h = self.session.surfaces.hemis.get(sel[0])
+        if h is None or sel[1] >= h.n_vertices:
+            return []
+        inv = np.linalg.inv(state.grid.affine)
+        marks = []
+        for surface in ("white", "pial"):
+            ijk = inv[:3, :3] @ h.states[surface][sel[1]] + inv[:3, 3]
+            if abs(ijk[view.layout.fixed] - pos) <= 1.5:
+                row, col = view.points_to_image(ijk)
+                marks.append((float(row), float(col), surface))
+        return marks
 
     def _toggle_draw(self) -> None:
         state = self.session.state
@@ -604,6 +709,10 @@ class ImageWindow(QtWidgets.QWidget):
         if grab is None:
             # Not near an outline: the press still means "look here".
             self._pick(int(round(row)), int(round(col)), seed=False)
+            return
+        if state.surface_tool == "point":
+            self._dispatch(SelectSurfaceVertex(grab.hemi, grab.vertex))
+            self._goto_selected()
             return
         if state.surface_tool == "draw":
             # A stroke starts on the outline it was pressed on.
