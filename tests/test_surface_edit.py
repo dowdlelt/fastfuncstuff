@@ -170,3 +170,19 @@ def test_pial_dragged_out_finds_the_csf_boundary(phantom):
     res = edit.update(np.array([0.0, 0.0, 0.6]))
     core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
     np.testing.assert_allclose(core, PIAL_TRUE, atol=0.15)
+
+
+def test_inward_wound_mesh_still_pushes_outward(phantom):
+    # Same sphere with every face reversed: normals point in. The edit must
+    # still treat white -> pial as outward.
+    sampler, u, f, _ = phantom
+    flipped = f[:, ::-1].copy()
+    topo = MeshTopology.from_faces(flipped)
+    white, pial = 20.0 * u, 23.0 * u
+    edit = SurfaceEdit(
+        white, topo, _top(u), sampler, SnapParams(radius=5.0), role="white", partner=pial
+    )
+    res = edit.update(np.array([0.0, 0.0, 0.6]))
+    core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
+    np.testing.assert_allclose(core, WHITE_TRUE, atol=0.15)
+    assert res.partner_ids.size == 0

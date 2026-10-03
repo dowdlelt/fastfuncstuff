@@ -123,6 +123,17 @@ class SurfaceEdit:
         self.partner_start = (
             None if partner is None else np.asarray(partner, np.float64)[self.ids].copy()
         )
+        if self.partner_start is not None:
+            # "Outward" must mean white -> pial. FreeSurfer winds every surface
+            # outward, but a mesh from elsewhere may not, and inward normals
+            # silently invert every push and clamp below.
+            outward = (
+                self.partner_start - self.start
+                if role == "white"
+                else self.start - self.partner_start
+            )
+            if np.einsum("ij,ij->i", outward, self.normals).mean() < 0:
+                self.normals = -self.normals
         # Fold checks need only the faces touching the patch, over the
         # vertices those faces use -- reindexed locally so a mouse move never
         # copies the whole hemisphere.
