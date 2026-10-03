@@ -49,10 +49,12 @@ class SnapParams:
     search: float = 1.5
     #: 0 follows the drag exactly; 1 goes all the way to the found edge.
     snap: float = 1.0
-    #: Neighbour coupling. Higher keeps the patch smoother at the cost of
-    #: following the image less closely. The coupling acts like a membrane
-    #: pinned at the brush rim, so a stiff one (~2) stops the centre about
-    #: halfway to an edge 1 mm away on a 5 mm brush; 0.2 reaches it.
+    #: Smoothing of the found boundary across neighbours, mm^2 (its sqrt is
+    #: roughly the length it is smoothed over). The data term is weighted by
+    #: each vertex's area, so the same value means the same thing on a 1 mm
+    #: and a 0.4 mm mesh -- per-vertex weighting made a coarse mesh several
+    #: times stiffer. Raise it when the anatomy is noisy and the snapped
+    #: line comes out jagged.
     smooth: float = 0.2
     #: Sign of the intensity change crossing the boundary *outward*. -1 for T1
     #: (WM > GM > CSF, both boundaries darken outward); +1 for T2.
@@ -130,29 +132,32 @@ class SurfaceEdit:
         self._fold_verts = vertices[used]
         self._fold_slot = np.searchsorted(used, self.ids)
         self._system = self._laplacian()
+        # Barycentric vertex area (a third of each incident face), mm^2.
+        area = np.zeros(used.size)
+        face_area = 0.5 * np.linalg.norm(face_normals(self._fold_verts, self._fold_faces), axis=1)
+        np.add.at(area, self._fold_faces.ravel(), np.repeat(face_area / 3.0, 3))
+        self.area = area[self._fold_slot]
         n = int(round(2 * params.search / (0.1 * sampler.voxel_mm))) + 1
         self._offsets = np.linspace(-params.search, params.search, max(n, 3))
 
     def _laplacian(self) -> sp.csr_matrix:
-        """Graph Laplacian over the patch, Dirichlet-zero at its rim.
+        """Graph Laplacian over the patch's own edges (free at its rim).
 
-        Edges to vertices outside the patch contribute to the degree but have
-        no unknown on the other end, which pins the displacement to zero just
-        beyond the brush -- the rim cannot tear away from the untouched mesh.
+        Free, not pinned: what is smoothed is the snap *correction*, and
+        the rim fade comes from the brush weight. A rim pinned to zero made
+        the whole patch a membrane that sagged short of an edge every vertex
+        had found -- a constant correction must pass through unchanged.
         """
         edges = self.topo.edges
-        inside = np.zeros(self.topo.n_vertices, bool)
-        inside[self.ids] = True
-        touching = inside[edges[:, 0]] | inside[edges[:, 1]]
-        e = edges[touching]
         n = self.ids.size
         lookup = np.full(self.topo.n_vertices, -1, np.int64)
         lookup[self.ids] = np.arange(n)
-        a, b = lookup[e[:, 0]], lookup[e[:, 1]]
-        degree = np.bincount(a[a >= 0], minlength=n) + np.bincount(b[b >= 0], minlength=n)
+        a, b = lookup[edges[:, 0]], lookup[edges[:, 1]]
         both = (a >= 0) & (b >= 0)
-        rows = np.concatenate([a[both], b[both]])
-        cols = np.concatenate([b[both], a[both]])
+        a, b = a[both], b[both]
+        degree = np.bincount(a, minlength=n) + np.bincount(b, minlength=n)
+        rows = np.concatenate([a, b])
+        cols = np.concatenate([b, a])
         off = sp.coo_matrix((-np.ones(rows.size), (rows, cols)), shape=(n, n))
         return (sp.diags(degree.astype(np.float64)) + off).tocsr()
 
@@ -183,13 +188,14 @@ class SurfaceEdit:
         drag = np.asarray(drag, np.float64)
         along = self.weight * (self.normals @ drag)
         found, confidence = self._find_edges(along)
-        # Snap fades toward the rim so it blends into the untouched mesh
-        # instead of jumping to whatever edge is nearby there; sqrt so most of
-        # the brush commits fully to the edge it found.
-        target = along + p.snap * np.sqrt(self.weight) * (found - along)
-        a = sp.diags(np.maximum(self.weight, 1e-3))
-        d = spsolve((a + p.smooth * self._system).tocsc(), a @ target)
-        d = np.asarray(d, np.float64)
+        # What is smooth in the anatomy is the boundary, so the found edge
+        # offsets are what get regularised -- weighted by how sure each vertex
+        # is of its edge -- and the result is faded in toward the rim (sqrt,
+        # so most of the brush commits fully). Smoothing the *correction*
+        # instead mixed the drag's own falloff into it and overshot.
+        a = sp.diags(np.maximum(confidence, 1e-3) * self.area)
+        edge = np.asarray(spsolve((a + p.smooth * self._system).tocsc(), a @ found), np.float64)
+        d = along + p.snap * np.sqrt(self.weight) * (edge - along)
 
         gap = None
         if self.partner_start is not None:
