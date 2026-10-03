@@ -11,7 +11,7 @@ import torch
 from scipy.optimize import linprog
 
 from fastfuncstuff.processing import censor as C
-from fastfuncstuff.processing.mask import _afni_fillin_once, afni_automask
+from fastfuncstuff.processing.mask import _afni_fillin_once, automask
 
 CPU = torch.device("cpu")
 
@@ -133,11 +133,11 @@ def test_fillin_accepts_set_voxels_at_different_distances():
     assert not out1[3, 3, 4]
 
 
-def test_afni_automask_keeps_a_solid_head_whole():
+def test_automask_keeps_a_solid_head_whole():
     zz, yy, xx = torch.meshgrid(*(torch.arange(32),) * 3, indexing="ij")
     head = (((zz - 16) ** 2 + (yy - 16) ** 2 + (xx - 16) ** 2) < 100).float() * 1000.0
     head += torch.rand(32, 32, 32) * 5.0
-    m = afni_automask(head)
+    m = automask(head)
     inside = head > 500
     # The peel re-dilates: the boundary shell must come back.
     assert int((m & inside).sum()) == int(inside.sum())
@@ -288,3 +288,17 @@ def test_design_spec_skips_a_spike_block_with_nothing_censored(tmp_path):
     keep[[2, 7]] = 0
     out = _materialize_nuisance(_censor_file(tmp_path, keep), spec, tmp_path, run_lengths=[5, 5])
     np.testing.assert_array_equal(np.flatnonzero(np.loadtxt(out, ndmin=2).sum(axis=1)), [2, 7])
+
+
+def test_automask_dilate_grows_one_face_layer_like_3dautomask():
+    """3dAutomask -dilate adds unset voxels with >= 3 of 18 neighbours set: on a
+    box that is exactly one face layer per step (edge-diagonal voxels see only one
+    in-mask edge neighbour), so it must not grow 18- or 26-connected corners."""
+    head = torch.zeros(24, 30, 30)
+    head[6:18, 8:22, 8:22] = 100.0
+    base = automask(head)
+    grown = automask(head, dilate_extra=1)
+    expected = base.clone()
+    for ax in range(3):
+        expected |= torch.roll(base, 1, ax) | torch.roll(base, -1, ax)
+    assert torch.equal(grown, expected)

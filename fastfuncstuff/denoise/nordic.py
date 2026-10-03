@@ -2449,7 +2449,7 @@ def run_nordic_multiecho(
             mag0 = load_nifti(magnitude_files[0]).get_fdata(dtype=np.float32)
             mag0 = np.abs(mag0)
             mag0 = mag0.mean(-1) if mag0.ndim == 4 else mag0  # (nx, ny, nz)
-            bm = automask(torch.from_numpy(mag0).float(), dilate_extra=3, verbose=False)
+            bm = automask(torch.from_numpy(mag0).float(), dilate_extra=2, verbose=False)
             brain_mask = bm.to(torch.bool).cpu()
             if not bool(brain_mask.any()):
                 brain_mask = None

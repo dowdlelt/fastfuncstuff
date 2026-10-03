@@ -903,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
 
         mean_mag = torch.stack([m.mean(dim=1) for m in mag_list]).mean(dim=0)
         mean3d = mean_mag.reshape(nx, ny, nz)
-        mask3d = automask(mean3d, dilate_extra=2, device=device, verbose=args.verb >= 1)
+        mask3d = automask(mean3d, dilate_extra=1, device=device, verbose=args.verb >= 1)
         mask_flat = mask3d.flatten().cpu()
         n_voxels = int(mask_flat.sum().item())
         mask_bool = mask_flat.bool()

@@ -561,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         if mag_arr is not None:
             from fastfuncstuff.processing.mask import automask
 
-            brain = automask(_to_tensor(mag_arr, device), device=device).bool()
+            brain = automask(_to_tensor(mag_arr, device), dilate_extra=1, device=device).bool()
             if brain.shape != neg.shape:  # field was moved onto the EPI grid
                 brain = None
         n_brain = int((neg & brain).sum()) if brain is not None else None

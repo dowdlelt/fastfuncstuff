@@ -1611,7 +1611,9 @@ class ViewerSession:
             else:
                 from fastfuncstuff.processing.mask import automask
 
-                native = automask(torch.as_tensor(values)).cpu().numpy().astype(bool)
+                native = (
+                    automask(torch.as_tensor(values), dilate_extra=1).cpu().numpy().astype(bool)
+                )
             for stale in [k for k in self._source_masks if k[0] == source_key]:
                 del self._source_masks[stale]
             self._source_masks[cache_key] = native

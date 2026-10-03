@@ -221,7 +221,7 @@ def _run_single_ica(
         from fastfuncstuff.processing.mask import automask
 
         mask3d = (
-            automask(torch.as_tensor(mean3d), dilate_extra=3, device=device, verbose=True)
+            automask(torch.as_tensor(mean3d), dilate_extra=2, device=device, verbose=True)
             .cpu()
             .numpy()
         )
@@ -1609,7 +1609,7 @@ def _run_concat_ica(
                 mask3d = (
                     automask(
                         torch.as_tensor(run_mean3d),
-                        dilate_extra=2,
+                        dilate_extra=1,
                         device=device,
                         verbose=args.verb >= 1,
                     )
@@ -2557,7 +2557,7 @@ def _temporal_ica_preprocess_runs(
                 mask3d = (
                     automask(
                         torch.as_tensor(run_mean3d),
-                        dilate_extra=2,
+                        dilate_extra=1,
                         device=device,
                         verbose=args.verb >= 1,
                     )
@@ -3070,7 +3070,7 @@ def _run_tensorial_ica(
                 mask3d = (
                     automask(
                         torch.as_tensor(run_mean3d),
-                        dilate_extra=2,
+                        dilate_extra=1,
                         device=device,
                         verbose=args.verb >= 1,
                     )

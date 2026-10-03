@@ -876,7 +876,7 @@ def compute_automask_from_data(
     run_starts: list[int],
     volume_shape: tuple,
     mask_flat: np.ndarray | None = None,
-    dilate_extra: int = 4,
+    dilate_extra: int = 2,
     verbose: bool = True,
 ) -> np.ndarray:
     """
@@ -909,7 +909,7 @@ def apply_automask(
     run_starts: list[int],
     volume_shape: tuple,
     mask_flat: np.ndarray | None,
-    dilate_extra: int = 4,
+    dilate_extra: int = 2,
     verbose: bool = True,
 ) -> tuple[torch.Tensor, np.ndarray, np.ndarray, int]:
     """
@@ -4572,7 +4572,7 @@ def image_support(
     v = vol.float().to(device)
     brain = None
     if want_automask:
-        brain = automask(v, device=device)
+        brain = automask(v, dilate_extra=1, device=device)
         if verb >= 1:
             print(f"Automask ({label}): {100.0 * brain.float().mean().item():.1f}% of voxels")
     cover = None

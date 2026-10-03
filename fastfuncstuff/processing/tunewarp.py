@@ -220,7 +220,7 @@ class Referee:
             clusterize=True,
             hist_cliplevel=True,
         )
-        self.brain = automask(self.base, device=device)
+        self.brain = automask(self.base, dilate_extra=1, device=device)
         self.labels: torch.Tensor | None = None
         if labels_path is not None:
             seg, _ = load_image(labels_path, device=device)

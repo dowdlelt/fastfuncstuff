@@ -1,18 +1,17 @@
 """Fast GPU automasking for brain volumes (AFNI-compatible).
 
-Implements the 3dAutomask algorithm on GPU using PyTorch:
-    1. Iterative clip-level estimation (THD_cliplevel)
-    2. Threshold → initial binary mask
-    3. Peel erosion with neighbor-count threshold (THD_mask_erodemany)
-    4. Largest connected component (6-connectivity, THD_mask_clust)
-    5. Small hole fill (opposite-side, THD_mask_fillin_once)
-    6. Large hole fill (distance-based, THD_mask_fillin_completely)
-    7. Interior hole fill (invert → cluster → invert)
+Implements 3dAutomask (mri_automask_image + -dilate), bit-identical to AFNI:
+    1. Gradual (octant-blended) histogram clip level (THD_cliplevel_gradual)
+    2. Threshold, largest 6-connected cluster
+    3. Peel + re-dilate (THD_mask_erodemany), recluster
+    4. Small and distance-based hole fill (THD_mask_fillin_once / _completely)
+    5. Final erode + recluster, interior hole fill
+    6. Optional -dilate (THD_mask_dilate + fill-in)
 
 Reference: https://github.com/afni/afni/blob/master/src/thd_automask.c
 
 Key function:
-    automask(vol) -> binary mask (nz, ny, nx) bool tensor
+    automask(vol, dilate_extra=0) -> binary mask (nz, ny, nx) bool tensor
 """
 
 from __future__ import annotations
@@ -366,56 +365,6 @@ def largest_cluster_6conn(mask: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _fillin_once(mask: Tensor, nside: int = 1) -> Tensor:
-    """Fill voxels that have mask on opposite sides within distance nside.
-
-    Matches THD_mask_fillin_once: a background voxel is filled if for any
-    axis (x, y, z), there is a set voxel within nside steps in the positive
-    AND negative direction along that axis.
-    """
-    m = mask.clone()
-    bg = ~mask
-
-    for axis in range(3):
-        for d in range(1, nside + 1):
-            sz = mask.shape[axis]
-            if 2 * d >= sz:
-                continue
-
-            # For voxel at position i (in range [d, sz-d)):
-            #   neighbor at i+d  →  pos_slice
-            #   neighbor at i-d  →  neg_slice
-            #   the voxel itself →  center_slice
-            pos_slice = [slice(None)] * 3
-            pos_slice[axis] = slice(2 * d, sz)  # i+d for i in [d, sz-d)
-            neg_slice = [slice(None)] * 3
-            neg_slice[axis] = slice(0, sz - 2 * d)  # i-d for i in [d, sz-d)
-            center_slice = [slice(None)] * 3
-            center_slice[axis] = slice(d, sz - d)  # i in [d, sz-d)
-
-            # Voxels that have a set neighbor at +d AND -d along this axis
-            has_both = mask[tuple(pos_slice)] & mask[tuple(neg_slice)]
-            # Only fill background voxels
-            fill_zone = has_both & bg[tuple(center_slice)]
-            m[tuple(center_slice)] |= fill_zone
-
-    return m
-
-
-def _fillin_completely(mask: Tensor, nside: int) -> Tensor:
-    """Iterate fillin_once until no new voxels are added.
-
-    Matches THD_mask_fillin_completely.
-    """
-    for _ in range(100):
-        new_mask = _fillin_once(mask, nside)
-        added = int(new_mask.sum().item()) - int(mask.sum().item())
-        mask = new_mask
-        if added == 0:
-            break
-    return mask
-
-
 def _fill_holes_3d(mask: Tensor) -> Tensor:
     """Fill interior holes by flood-filling background from border.
 
@@ -441,114 +390,6 @@ def _fill_holes_3d(mask: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-
-def automask(
-    vol: Tensor,
-    clip_frac: float = 0.5,
-    dilate_extra: int = 2,
-    peelcount: int = 1,
-    peelthr: int = 17,
-    device: torch.device | None = None,
-    verbose: bool = False,
-) -> Tensor:
-    """Create a binary brain mask from a 3D volume (AFNI-compatible).
-
-    Follows the 3dAutomask algorithm:
-        1. Compute clip level via iterative median (THD_cliplevel)
-        2. Threshold to create initial mask
-        3. Peel erosion: remove voxels with < peelthr/18 neighbors
-        4. Keep largest 6-connected component
-        5. Fill small holes (opposite-side fillin, nside=1, x3)
-        6. Fill large holes (distance-based, ~1.6% of volume dims)
-        7. Peel once more + recluster
-        8. Fill interior holes (flood from border)
-
-    Parameters
-    ----------
-    vol : Tensor
-        (nz, ny, nx) float tensor — 3D volume.
-    clip_frac : float
-        Fraction parameter for THD_cliplevel (default 0.5, matching AFNI).
-    dilate_extra : int
-        Extra dilation iterations after the algorithm (default 1).
-    peelcount : int
-        Number of peel iterations (AFNI default: 1).
-    peelthr : int
-        Minimum 18-neighbors to survive peeling (AFNI default: 17).
-    device : torch.device, optional
-        Device to run on. Defaults to vol.device.
-
-    Returns
-    -------
-    Tensor
-        (nz, ny, nx) bool tensor — binary brain mask.
-    """
-    if device is not None:
-        vol = vol.to(device)
-
-    nz, ny, nx = vol.shape
-
-    # A single NaN poisons the whole thing: the clip level comes out NaN, every
-    # `vol >= clip` comparison is False, and the mask is empty -- a silent 0%-brain
-    # answer rather than an error. NaN is not brain, so treat it as background.
-    if not bool(torch.isfinite(vol).all()):
-        vol = torch.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Step 1: clip level (matches THD_cliplevel)
-    clip = _cliplevel(vol, mfrac=clip_frac)
-    if verbose:
-        print(
-            f"  automask: shape=({nz},{ny},{nx}) clip={clip:.4f} "
-            f"range=[{vol.min().item():.4f}, {vol.max().item():.4f}]"
-        )
-
-    # Step 2: threshold
-    mask = vol.abs() >= clip
-    if verbose:
-        print(f"  automask: after threshold: {int(mask.sum().item()):,} voxels")
-
-    # Step 3: peel erosion (THD_mask_erodemany)
-    mask = _peel(mask, peelcount=peelcount, peelthr=peelthr)
-    if verbose:
-        print(f"  automask: after peel: {int(mask.sum().item()):,} voxels")
-
-    # Step 4: largest connected component (6-connectivity)
-    mask = largest_cluster_6conn(mask)
-    if verbose:
-        print(f"  automask: after cluster: {int(mask.sum().item()):,} voxels")
-
-    # Step 5: small hole fill (3 rounds of fillin_once with nside=1)
-    for _ in range(3):
-        mask = _fillin_once(mask, nside=1)
-    if verbose:
-        print(f"  automask: after small fill: {int(mask.sum().item()):,} voxels")
-
-    # Step 6: large hole fill (nside = ~1.6% of each dim, take max)
-    nside_large = max(
-        round(0.016 * nx),
-        round(0.016 * ny),
-        round(0.016 * nz),
-        1,
-    )
-    mask = _fillin_completely(mask, nside=nside_large)
-    if verbose:
-        print(
-            f"  automask: after large fill (nside={nside_large}): {int(mask.sum().item()):,} voxels"
-        )
-
-    # Step 7: fill interior holes (flood from border)
-    mask = _fill_holes_3d(mask)
-    if verbose:
-        print(f"  automask: after hole fill: {int(mask.sum().item()):,} voxels")
-
-    # Optional extra dilation
-    if dilate_extra > 0:
-        mask = _dilate_6conn(mask, iterations=dilate_extra)
-        if verbose:
-            print(f"  automask: after dilate({dilate_extra}): {int(mask.sum().item()):,} voxels")
-
-    return mask
 
 
 def _afni_cliplevel(im: numpy.ndarray, mfrac: float = 0.5) -> float:
@@ -669,30 +510,56 @@ def _afni_fillin_once(mask: numpy.ndarray, nside: int) -> tuple[numpy.ndarray, i
     return mask | fill, int(fill.sum())
 
 
-def afni_automask(
+def _afni_dilate_once(mask: numpy.ndarray, nmm: int) -> numpy.ndarray:
+    """3dAutomask's ``-dilate`` step: ``THD_mask_dilate(..., 3, NN2)`` adds every
+    unset voxel with at least 3 of its 18 neighbours set, then
+    ``THD_mask_fillin_completely`` closes what that opened."""
+    t = torch.from_numpy(mask)
+    m = (t | (~t & (_count_neighbors_18_replicate(t) >= 3))).numpy()
+    while True:
+        m, n = _afni_fillin_once(m, nmm)
+        if n == 0:
+            return m
+
+
+def automask(
     vol: Tensor,
-    clfrac: float = 0.5,
+    clip_frac: float = 0.5,
+    dilate_extra: int = 0,
     peelcount: int = 1,
     peelthr: int = 17,
     gradual: bool = True,
+    device: torch.device | None = None,
+    verbose: bool = False,
 ) -> Tensor:
-    """AFNI ``mri_automask_image`` step for step (what 3dAutomask / 3dToutcount use).
+    """3dAutomask: AFNI ``mri_automask_image`` step for step, then ``-dilate``.
 
-    Differs from :func:`automask` in four ways, each measured to matter: the exact
-    histogram clip level, the spatially *gradual* clip (on by default in AFNI),
-    the peel that re-dilates (:func:`erode_many`), and the clustering/fill order
-    including the final erode + recluster. On a 64x64x34 EPI, :func:`automask`
-    (with no extra dilation) kept 27,786 voxels against AFNI's 34,797.
+    Bit-identical to 3dAutomask on four ds000030 runs: the exact histogram clip
+    level, the spatially *gradual* clip (on by default in AFNI), the peel that
+    re-dilates (:func:`erode_many`), and the clustering/fill order including the
+    final erode + recluster. The toolbox's earlier automask got all four subtly
+    wrong and came out about a shell tight (27,786 vs 34,797 voxels on a
+    64x64x34 EPI), which is why callers that used to dilate it by 2-4 now ask
+    for 1-2.
 
-    Runs on the CPU: one small volume of branchy, sequential logic.
+    ``dilate_extra`` is 3dAutomask's ``-dilate``: AFNI's neighbour-count
+    dilation with a fill-in after each step and a final interior-hole fill, not
+    a plain 6-connected grow. Default 0, as in AFNI.
+
+    Runs on the CPU (one small volume of branchy, sequential logic -- faster
+    than the old GPU version even on a 1 mm head); the mask comes back on
+    ``device`` or, by default, on ``vol``'s device.
     """
+    out_device = device if device is not None else vol.device
     im = vol.detach().cpu().numpy().astype(numpy.float32)
     im = numpy.nan_to_num(im, nan=0.0, posinf=0.0, neginf=0.0)
+    if not (im > 0).any():
+        # 3dAutomask returns the whole volume here (cliplevel 0); no signal is no brain.
+        return torch.zeros(im.shape, dtype=torch.bool, device=out_device)
     if gradual:
-        m = im >= _afni_cliplevel_gradual(im, clfrac)
+        m = im >= _afni_cliplevel_gradual(im, clip_frac)
     else:
-        m = im >= _afni_cliplevel(im, clfrac)
-    out_device = vol.device
+        m = im >= _afni_cliplevel(im, clip_frac)
     if not m.any() or min(im.shape) < 2:
         return torch.from_numpy(m).to(out_device)
 
@@ -723,6 +590,15 @@ def afni_automask(
     m = erode(m, 1)
     m = clust(m)
     m = ~clust(~m)  # fill every hole that does not reach the volume edge
+    if verbose:
+        print(f"  automask: shape=({nz},{ny},{nx}) {int(m.sum()):,} voxels")
+    if dilate_extra > 0:
+        nmm_d = max(1, *(int(numpy.rint(0.032 * n)) for n in (nx, ny, nz)))
+        for _ in range(dilate_extra):
+            m = _afni_dilate_once(m, nmm_d)
+        m = ~clust(~m)
+        if verbose:
+            print(f"  automask: after dilate({dilate_extra}): {int(m.sum()):,} voxels")
     return torch.from_numpy(m).to(out_device)
 
 

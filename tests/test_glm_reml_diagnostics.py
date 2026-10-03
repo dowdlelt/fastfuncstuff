@@ -30,7 +30,9 @@ def test_temporal_mean_std_tsnr():
 
 
 def test_resolve_mask_supplied_vs_automask(capsys):
-    mean_vol = torch.zeros(12, 14, 14)
+    # Noise floor + bright blob: on a zero background 3dAutomask keeps everything.
+    g = torch.Generator().manual_seed(0)
+    mean_vol = torch.randn(12, 14, 14, generator=g).abs() * 3.0
     mean_vol[3:9, 4:10, 4:10] = 100.0  # a bright blob to automask
     supplied = mean_vol > 50
     out = resolve_mask(supplied, mean_vol, verbose=True)

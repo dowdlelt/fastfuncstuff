@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.automask:
         from fastfuncstuff.processing.mask import automask
 
-        mask = automask(data[0, 0], device=device, verbose=verb >= 1) > 0
+        mask = automask(data[0, 0], dilate_extra=1, device=device, verbose=verb >= 1) > 0
     else:
         # Default: voxels positive in every echo's temporal mean.
         mask = (data.mean(dim=1) > 0).all(dim=0)

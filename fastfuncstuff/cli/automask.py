@@ -49,7 +49,10 @@ def parse_args(
         help="Clip-level fraction for THD_cliplevel (default: 0.5, matching AFNI)",
     )
     parser.add_argument(
-        "-dilate", type=int, default=2, help="Extra dilation iterations after mask (default: 2)"
+        "-dilate",
+        type=int,
+        default=0,
+        help="Dilate the mask outward N times, as 3dAutomask -dilate",
     )
     parser.add_argument(
         "-peelcount", type=int, default=1, help="Peel erosion iterations (AFNI default: 1)"

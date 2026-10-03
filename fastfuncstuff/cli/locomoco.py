@@ -3388,7 +3388,7 @@ def _brain_mask_for_coupling(data, shape) -> torch.Tensor | None:
         ref = torch.from_numpy(np.ascontiguousarray(np.asarray(data).mean(axis=3))).float()
         if tuple(ref.shape) != tuple(shape):
             return None
-        m = automask(ref.permute(2, 1, 0).contiguous(), device=torch.device("cpu"))
+        m = automask(ref.permute(2, 1, 0).contiguous(), dilate_extra=1, device=torch.device("cpu"))
         return m.permute(2, 1, 0).contiguous().bool()
     except Exception:
         # A diagnostic mask is never worth failing the run over; fall back to the caller's.

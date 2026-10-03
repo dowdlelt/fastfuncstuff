@@ -266,7 +266,7 @@ def _build_masks(
 
             mag = np.abs(load_nifti(magnitude_file).get_fdata(dtype=np.float32))
             mag = mag.mean(-1) if mag.ndim == 4 else mag  # (nx, ny, nz)
-            bm = automask(torch.from_numpy(mag).float(), dilate_extra=2, verbose=False)
+            bm = automask(torch.from_numpy(mag).float(), dilate_extra=1, verbose=False)
             masks["in_brain"] = bm.to(torch.bool).reshape(-1).to(device)
         except Exception as exc:  # noqa: BLE001 — diagnostic is best-effort
             if verbose:

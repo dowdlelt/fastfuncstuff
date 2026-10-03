@@ -396,7 +396,7 @@ def outlier_fraction_4d(
     """
     import torch
 
-    from fastfuncstuff.processing.mask import afni_automask
+    from fastfuncstuff.processing.mask import automask
 
     T = data.shape[0]
     fractions, nvox = [], []
@@ -406,7 +406,7 @@ def outlier_fraction_4d(
         if nt < 5:
             raise ValueError(f"outlier counting needs >= 5 TRs per run, got {nt}")
         if mask is None:
-            m = afni_automask(run.abs().mean(dim=0))
+            m = automask(run.abs().mean(dim=0))
         else:
             m = mask.to(device=run.device, dtype=torch.bool)
         p = polort

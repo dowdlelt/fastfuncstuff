@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             source, source_header, base, base_header, args.matrix_apply, device
         )
         if args.source_automask:
-            on_base = on_base * automask(on_base, device=device).float()
+            on_base = on_base * automask(on_base, dilate_extra=1, device=device).float()
 
         weight = _prepare_weight(base, args.mask, autoweight, validity, device)
         inputs = build_cost_inputs(

@@ -44,7 +44,7 @@ def automask_from_series(data: np.ndarray, *, device: torch.device | None = None
     from fastfuncstuff.processing.mask import automask
 
     mean = torch.as_tensor(np.asarray(data, dtype=np.float32).mean(axis=3))
-    return automask(mean, device=device).cpu().numpy().astype(bool)
+    return automask(mean, dilate_extra=1, device=device).cpu().numpy().astype(bool)
 
 
 def normalize_rows(flat: torch.Tensor, how: str) -> tuple[torch.Tensor, str, float]:

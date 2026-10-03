@@ -942,7 +942,7 @@ def _brain_mask(reference: torch.Tensor, device) -> torch.Tensor:
 
     cut = reference > 0.1 * float(reference.max())
     try:
-        mask = automask(reference, device=device).to(torch.bool).cpu()
+        mask = automask(reference, dilate_extra=1, device=device).to(torch.bool).cpu()
     except (RuntimeError, ValueError) as exc:
         print(f"  ⚠️  automask failed ({exc}); falling back to an intensity cut")
         return cut

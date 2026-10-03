@@ -143,7 +143,10 @@ class TestMotionToVoxelMatrices:
 
 class TestBuildMotsimMask:
     def _phantom(self):
-        vol = torch.zeros(16, 20, 20, device=DEV)
+        # A noise floor, as in real data: on a zero background 3dAutomask's histogram
+        # clip has too few positive voxels and keeps the whole volume (so do we).
+        g = torch.Generator().manual_seed(0)
+        vol = torch.randn(16, 20, 20, generator=g).abs().to(DEV) * 3.0
         vol[5:11, 6:14, 6:14] = 100.0
         return vol
 
