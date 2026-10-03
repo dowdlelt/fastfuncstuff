@@ -24,8 +24,8 @@ from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
     load_dfile,
     load_motion_1d,
+    motion_to_voxel_matrices,
     motsim_regressors,
-    params_to_voxel_matrices,
     parse_motsim_spec,
     save_1d,
 )
@@ -208,12 +208,12 @@ def main(argv: list[str] | None = None) -> int:
         matrices_vox = aff_xform.matrices  # (nt, 4, 4) in voxel space
         src_label = args.aff12
     elif args.onedfile:
-        params_dicom = load_motion_1d(args.onedfile)
-        matrices_vox = params_to_voxel_matrices(params_dicom, nifti_affine)
+        motion = load_motion_1d(args.onedfile)
+        matrices_vox = motion_to_voxel_matrices(motion, nifti_affine, (nz, ny, nx))
         src_label = args.onedfile
     else:
-        params_dicom = load_dfile(args.dfile)
-        matrices_vox = params_to_voxel_matrices(params_dicom, nifti_affine)
+        motion = load_dfile(args.dfile)
+        matrices_vox = motion_to_voxel_matrices(motion, nifti_affine, (nz, ny, nx))
         src_label = args.dfile
     nt = matrices_vox.shape[0]
     if args.verb >= 1:

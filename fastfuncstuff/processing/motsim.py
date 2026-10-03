@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .affine import dicom_matrix_to_voxel, params_to_matrix
+from .affine import dicom_matrix_to_voxel
 
 # The paper's model names, and what a bare -motsim means.
 MOTSIM_VARIANTS = ("forward", "backward", "both")
@@ -117,10 +117,10 @@ class MotSimResult:
 
 
 def load_motion_1d(path: str) -> np.ndarray:
-    """Load 6-column .1D motion file (roll pitch yaw dS dL dP).
+    """Load a 6-column .1D motion file: (nt, 6) ``roll pitch yaw dS dL dP`` as written.
 
-    Returns (nt, 6) DICOM params [dx, dy, dz, rz, rx, ry] matching
-    the internal convention used by ffs_moco.
+    Feed it to :func:`motion_to_voxel_matrices`; the columns are not solver
+    params (signs, order and the translation pivot all differ).
     """
     rows = []
     with open(path) as f:
@@ -131,16 +131,14 @@ def load_motion_1d(path: str) -> np.ndarray:
             vals = [float(x) for x in line.split()]
             if len(vals) < 6:
                 raise ValueError(f"Expected 6 columns in {path}, got {len(vals)}")
-            roll, pitch, yaw, dS, dL, dP = vals[:6]
-            # Reverse AFNI mapping: rz=-roll, rx=pitch, ry=yaw, dz=-dS, dx=dL, dy=dP
-            rows.append([dL, dP, -dS, -roll, pitch, yaw])
+            rows.append(vals[:6])
     return np.array(rows, dtype=np.float64)
 
 
 def load_dfile(path: str) -> np.ndarray:
     """Load 9-column dfile (vol# roll pitch yaw dS dL dP rms_bef rms_aft).
 
-    Returns (nt, 6) DICOM params [dx, dy, dz, rz, rx, ry].
+    Returns (nt, 6) ``roll pitch yaw dS dL dP``, as :func:`load_motion_1d`.
     """
     rows = []
     with open(path) as f:
@@ -152,34 +150,29 @@ def load_dfile(path: str) -> np.ndarray:
             if len(vals) < 7:
                 raise ValueError(f"Expected >= 7 columns in dfile {path}, got {len(vals)}")
             # Columns: vol# roll pitch yaw dS dL dP [rms_bef rms_aft]
-            _, roll, pitch, yaw, dS, dL, dP = vals[:7]
-            # Reverse AFNI mapping (same as .1D)
-            rows.append([dL, dP, -dS, -roll, pitch, yaw])
+            rows.append(vals[1:7])
     return np.array(rows, dtype=np.float64)
 
 
-def params_to_voxel_matrices(
-    params_dicom: np.ndarray,
+def motion_to_voxel_matrices(
+    motion: np.ndarray,
     nifti_affine: np.ndarray,
+    vol_shape: tuple[int, int, int],
 ) -> Tensor:
-    """Convert (nt, 6) DICOM rigid params to (nt, 4, 4) voxel-space matrices.
+    """(nt, 4, 4) voxel-space correction matrices from (nt, 6) reported motion.
 
-    Builds 4x4 DICOM-space matrices from [dx, dy, dz, rz, rx, ry],
-    then converts to voxel index space using the NIfTI affine.
+    The translations in a .1D are about the cardinal grid centre (3dvolreg's
+    convention, and ffs_moco's), so rebuilding needs the grid's shape, not only
+    its affine. See ``ffs_moco.afni_motion_to_dicom_matrix``.
     """
-    nt = params_dicom.shape[0]
+    from .ffs_moco import afni_motion_to_dicom_matrix
+
+    nt = motion.shape[0]
     matrices_vox = torch.zeros(nt, 4, 4, dtype=torch.float32)
-
     for t in range(nt):
-        # Build full 12-param vector: [dx,dy,dz, rz,rx,ry, sx,sy,sz, shyx,shzx,shzy]
-        p12 = torch.zeros(12, dtype=torch.float32)
-        p12[:6] = torch.from_numpy(params_dicom[t].astype(np.float32))
-        p12[6:9] = 1.0  # scales = identity
-
-        M_dicom = params_to_matrix(p12)
-        M_vox = dicom_matrix_to_voxel(M_dicom, nifti_affine, nifti_affine)
-        matrices_vox[t] = M_vox
-
+        M_dicom = afni_motion_to_dicom_matrix(motion[t], nifti_affine, vol_shape)
+        M_dicom_t = torch.from_numpy(M_dicom).float()
+        matrices_vox[t] = dicom_matrix_to_voxel(M_dicom_t, nifti_affine, nifti_affine)
     return matrices_vox
 
 

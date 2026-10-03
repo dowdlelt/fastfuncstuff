@@ -11,8 +11,8 @@ from fastfuncstuff.processing.motsim import (
     extract_pcs,
     load_dfile,
     load_motion_1d,
+    motion_to_voxel_matrices,
     motsim_regressors,
-    params_to_voxel_matrices,
     parse_motsim_spec,
     run_forward_sim,
     save_1d,
@@ -46,16 +46,11 @@ class TestLoadMotion1D:
         with pytest.raises(ValueError, match="Expected 6 columns"):
             load_motion_1d(str(path))
 
-    def test_mapping_order(self, tmp_path):
-        """Verify AFNI→DICOM parameter mapping: roll→-rz, pitch→rx, yaw→ry,
-        dS→-dz, dL→dx, dP→dy."""
+    def test_columns_returned_as_written(self, tmp_path):
+        """The loader does no remapping; motion_to_voxel_matrices owns the convention."""
         path = tmp_path / "motion.1D"
-        # roll pitch yaw dS dL dP
         path.write_text("1.0 2.0 3.0 4.0 5.0 6.0\n")
-        params = load_motion_1d(str(path))
-        # Expected DICOM: [dL, dP, -dS, -roll, pitch, yaw]
-        #               = [5.0, 6.0, -4.0, -1.0, 2.0, 3.0]
-        np.testing.assert_allclose(params[0], [5.0, 6.0, -4.0, -1.0, 2.0, 3.0])
+        np.testing.assert_allclose(load_motion_1d(str(path))[0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
 
 # ── load_dfile ──
@@ -86,30 +81,61 @@ class TestLoadDfile:
         np.testing.assert_allclose(from_1d, from_df)
 
 
-# ── params_to_voxel_matrices ──
+# ── motion_to_voxel_matrices ──
 
 
-class TestParamsToVoxelMatrices:
-    def test_identity_for_zero_params(self):
-        params = np.zeros((2, 6), dtype=np.float64)
-        affine = np.eye(4)
-        matrices = params_to_voxel_matrices(params, affine)
+class TestMotionToVoxelMatrices:
+    SHAPE = (20, 30, 26)  # (nz, ny, nx)
+
+    def test_identity_for_zero_motion(self):
+        matrices = motion_to_voxel_matrices(np.zeros((2, 6)), np.eye(4), self.SHAPE)
         assert matrices.shape == (2, 4, 4)
-        # Zero params → identity matrix
         for t in range(2):
-            torch.testing.assert_close(
-                matrices[t],
-                torch.eye(4),
-                atol=1e-5,
-                rtol=1e-5,
-            )
+            torch.testing.assert_close(matrices[t], torch.eye(4), atol=1e-5, rtol=1e-5)
 
-    def test_output_shape(self):
-        nt = 5
-        params = np.zeros((nt, 6), dtype=np.float64)
-        affine = np.diag([2.0, 2.0, 2.0, 1.0])
-        matrices = params_to_voxel_matrices(params, affine)
-        assert matrices.shape == (nt, 4, 4)
+    def test_rebuilds_the_matrix_ffs_moco_wrote(self, tmp_path):
+        """ffs_moco .1D -> motsim must give back the correction it came from.
+
+        The loader used to flip only dS and roll back (the writer negates all six)
+        and rebuilt the translations about the DICOM origin, while the .1D holds
+        them about the cardinal grid centre: ~10 voxels of error at the corners
+        for a few degrees of motion on an off-isocentre, oblique grid.
+        """
+        from fastfuncstuff.processing.affine import identity_params, voxel_matrix_to_dicom
+        from fastfuncstuff.processing.ffs_moco import (
+            afni_motion_params,
+            centered_rigid_p2m,
+            save_moco_1D,
+            save_moco_dfile,
+        )
+
+        th = np.deg2rad(18.0)
+        affine = np.eye(4)
+        affine[:3, :3] = (
+            np.array([[1, 0, 0], [0, np.cos(th), -np.sin(th)], [0, np.sin(th), np.cos(th)]]) * 2.5
+        )
+        affine[:3, 3] = [-70.0, -40.0, -20.0]
+        p2m, _ = centered_rigid_p2m(self.SHAPE)
+        p = identity_params(dtype=torch.float64)
+        p[:6] = torch.tensor([0.4, -0.3, 0.2, 3.0, 5.0, -2.0], dtype=torch.float64)
+        M_vox = p2m(p)
+        M_dicom = voxel_matrix_to_dicom(M_vox.float(), affine, affine)
+        params = afni_motion_params(M_dicom, affine, self.SHAPE)[None]
+        save_moco_1D(params, str(tmp_path / "m.1D"))
+        save_moco_dfile(params, np.zeros(1), np.zeros(1), str(tmp_path / "m.dfile"))
+
+        nz, ny, nx = self.SHAPE
+        corners = torch.tensor(
+            [[i, j, k, 1.0] for i in (0, nx - 1) for j in (0, ny - 1) for k in (0, nz - 1)],
+            dtype=torch.float64,
+        ).T
+        for motion in (
+            load_motion_1d(str(tmp_path / "m.1D")),
+            load_dfile(str(tmp_path / "m.dfile")),
+        ):
+            rebuilt = motion_to_voxel_matrices(motion, affine, self.SHAPE)[0].double()
+            err = ((rebuilt - M_vox) @ corners)[:3].norm(dim=0).max()
+            assert err < 0.01, f"corner displacement error {err:.4f} voxels"
 
 
 # ── build_motsim_mask ──
@@ -348,18 +374,22 @@ class TestForwardSimDirection:
         fed in. Motion-correcting it has to recover the same parameters — an
         inverted sign here produces plausible-looking regressors of the wrong
         motion, which no shape assertion would catch."""
-        from fastfuncstuff.processing.ffs_moco import MocoConfig, moco
+        from fastfuncstuff.processing.ffs_moco import MocoConfig, moco, to_afni_motion
 
+        # Off the scanner isocentre, so a translation read about the wrong pivot
+        # (origin vs grid centre) would show up as rotation-sized error.
         affine = _affine()
-        params = np.array(
+        affine[:3, 3] += [30.0, -25.0, 20.0]
+        # Reported motion rows: roll pitch yaw dS dL dP.
+        motion = np.array(
             [
                 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [1.5, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, -2.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0, 2.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, -1.5, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 2.0],
+                [0.0, -2.0, 0.0, -1.0, 0.0, 0.0],
             ]
         )
-        matrices = params_to_voxel_matrices(params, affine)
+        matrices = motion_to_voxel_matrices(motion, affine, (24, 32, 32))
         sim = run_forward_sim(_phantom(), matrices, DEV, interp="wsinc5", verb=0)
 
         cfg = MocoConfig(
@@ -367,15 +397,15 @@ class TestForwardSimDirection:
         )
         recovered = moco(sim, cfg, header_info={"affine": affine}).params
 
-        np.testing.assert_allclose(recovered, params, atol=0.1)
+        np.testing.assert_allclose(to_afni_motion(recovered), motion, atol=0.1)
 
     def test_translation_moves_the_right_way(self):
         """A pure +x DICOM translation must shift the simulated volume, not the
         opposite direction and not nothing."""
         affine = _affine()
-        params = np.zeros((2, 6))
-        params[1, 0] = 6.0  # 2 voxels of dx
-        matrices = params_to_voxel_matrices(params, affine)
+        motion = np.zeros((2, 6))
+        motion[1, 4] = -6.0  # dL = -dx: a +6 mm (2 voxel) DICOM-x correction
+        matrices = motion_to_voxel_matrices(motion, affine, (24, 32, 32))
         ref = _phantom()
         sim = run_forward_sim(ref, matrices, DEV, interp="linear", verb=0)
 
@@ -391,9 +421,9 @@ class TestMotsimRegressors:
         affine = _affine()
         rng = np.random.default_rng(0)
         nt = 14
-        params = np.cumsum(rng.normal(0, 0.3, (nt, 6)), axis=0)
-        params[0] = 0.0
-        matrices = params_to_voxel_matrices(params, affine)
+        motion = np.cumsum(rng.normal(0, 0.3, (nt, 6)), axis=0)
+        motion[0] = 0.0
+        matrices = motion_to_voxel_matrices(motion, affine, (24, 32, 32))
         return (
             motsim_regressors(
                 _phantom(),

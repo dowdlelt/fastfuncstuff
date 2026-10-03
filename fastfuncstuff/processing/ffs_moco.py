@@ -814,12 +814,7 @@ def afni_motion_params(
     Returned negated, in solver order, so ``to_afni_motion`` stays the one
     place that flips signs and reorders columns.
     """
-    from .nwarpforge import compute_cardinal_affine
-
-    nz, ny, nx = vol_shape
-    card = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))
-    centre_ras = card @ np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0, 1.0])
-    c = np.array([-centre_ras[0], -centre_ras[1], centre_ras[2]])  # RAS -> DICOM
+    c = _cardinal_centre_dicom(affine, vol_shape)
     M = M_dicom.detach().cpu().double().numpy()
     Ai = np.linalg.inv(M[:3, :3])
     t_inv = -Ai @ M[:3, 3]
@@ -827,6 +822,39 @@ def afni_motion_params(
     params = matrix_to_params(M_dicom)[:6].double().numpy().copy()
     params[:3] = -t_c
     return params
+
+
+def _cardinal_centre_dicom(affine: np.ndarray, vol_shape: tuple[int, int, int]) -> np.ndarray:
+    """The grid centre in DICOM mm, read through the CARDINAL affine as 3dvolreg does."""
+    from .nwarpforge import compute_cardinal_affine
+
+    nz, ny, nx = vol_shape
+    card = compute_cardinal_affine(np.asarray(affine, dtype=np.float64))
+    centre_ras = card @ np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0, 1.0])
+    return np.array([-centre_ras[0], -centre_ras[1], centre_ras[2]])  # RAS -> DICOM
+
+
+def afni_motion_to_dicom_matrix(
+    motion: np.ndarray, affine: np.ndarray, vol_shape: tuple[int, int, int]
+) -> np.ndarray:
+    """(4, 4) DICOM correction matrix from one reported row ``roll pitch yaw dS dL dP``.
+
+    The exact inverse of ``to_afni_motion(afni_motion_params(...))``, so a .1D
+    written by ffs_moco -- or by 3dvolreg, same convention -- rebuilds the
+    transform it came from. Reading the translations about the DICOM origin
+    instead puts a rotation-sized lever into every rebuilt matrix.
+    """
+    roll, pitch, yaw, dS, dL, dP = (float(v) for v in motion[:6])
+    p = identity_params(dtype=torch.float64)
+    p[3:6] = torch.tensor([-roll, -pitch, -yaw], dtype=torch.float64)
+    A = params_to_matrix(p)[:3, :3].numpy()
+    Ai = np.linalg.inv(A)
+    c = _cardinal_centre_dicom(affine, vol_shape)
+    t_inv = np.array([dL, dP, dS]) - Ai @ c + c
+    M = np.eye(4)
+    M[:3, :3] = A
+    M[:3, 3] = -A @ t_inv
+    return M
 
 
 def to_afni_motion(params_array: np.ndarray) -> np.ndarray:
