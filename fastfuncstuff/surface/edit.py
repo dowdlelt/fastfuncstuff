@@ -139,6 +139,7 @@ class SurfaceEdit:
         self.area = area[self._fold_slot]
         n = int(round(2 * params.search / (0.1 * sampler.voxel_mm))) + 1
         self._offsets = np.linspace(-params.search, params.search, max(n, 3))
+        self.levels = self._tissue_levels()
 
     def _laplacian(self) -> sp.csr_matrix:
         """Graph Laplacian over the patch's own edges (free at its rim).
@@ -161,6 +162,36 @@ class SurfaceEdit:
         off = sp.coo_matrix((-np.ones(rows.size), (rows, cols)), shape=(n, n))
         return (sp.diags(degree.astype(np.float64)) + off).tocsr()
 
+    def _tissue_levels(self) -> tuple[float, float] | None:
+        """(crossing level, contrast) for this boundary, from the brush itself.
+
+        Both boundaries darken outward on T1, so edge strength alone cannot
+        tell them apart: pial dragged inward found the WM/GM edge and snapped
+        onto white. The border sits at an intensity between the two tissues it
+        separates (the principle FreeSurfer's placement rests on), and those
+        tissues can be read off the surfaces already there: GM at mid-depth,
+        WM 1 mm inside white, CSF as the darkest point 0.5-2 mm beyond pial
+        (the darkest, because a narrow sulcus puts the next gyrus's GM there
+        too). Medians over the brush keep one bad vertex from setting them.
+        """
+        if self.partner_start is None:
+            return None
+        white, pial = (
+            (self.start, self.partner_start)
+            if self.role == "white"
+            else (self.partner_start, self.start)
+        )
+        n = self.normals
+        gm = float(np.median(self.sampler(0.5 * (white + pial))))
+        wm = float(np.median(self.sampler(white - 1.0 * n)))
+        beyond = pial[:, None, :] + np.linspace(0.5, 2.0, 7)[None, :, None] * n[:, None, :]
+        csf = float(np.median(self.sampler(beyond).min(axis=1)))
+        inner, outer = (wm, gm) if self.role == "white" else (gm, csf)
+        contrast = abs(inner - outer)
+        if contrast <= 1e-6:
+            return None
+        return 0.5 * (inner + outer), contrast
+
     def _find_edges(self, along: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Best edge offset per vertex near ``along``, and its confidence."""
         p = self.params
@@ -177,6 +208,11 @@ class SurfaceEdit:
         if scale <= 0:
             return along.copy(), np.zeros_like(along)
         rel = strength / scale
+        if self.levels is not None:
+            # An edge at the wrong intensity is the other boundary; sigma of a
+            # quarter of the contrast puts a GM-level crossing at exp(-2).
+            level, contrast = self.levels
+            rel = rel * np.exp(-0.5 * ((prof - level) / (0.25 * contrast)) ** 2)
         score = rel - p.distance_penalty * (self._offsets[None, :] / p.search) ** 2
         best = np.argmax(score, axis=1)
         rows = np.arange(best.size)
@@ -195,14 +231,19 @@ class SurfaceEdit:
         # instead mixed the drag's own falloff into it and overshot.
         a = sp.diags(np.maximum(confidence, 1e-3) * self.area)
         edge = np.asarray(spsolve((a + p.smooth * self._system).tocsc(), a @ found), np.float64)
+        # Smoothing may carry a confident neighbour's edge further than this
+        # vertex searched; it has no evidence there.
+        edge = np.clip(edge, along - p.search, along + p.search)
         d = along + p.snap * np.sqrt(self.weight) * (edge - along)
 
         gap = None
         if self.partner_start is not None:
             gap = np.einsum("ij,ij->i", self.partner_start - self.start, self.normals)
             if self.role == "pial":
-                # Pial may not pass inward through white.
-                d = np.maximum(d, -(gap - p.min_thickness))
+                # Pial may not pass inward through white. ``gap`` is white
+                # relative to pial along the normal, so negative: pial may move
+                # in by at most -(gap) - min_thickness.
+                d = np.maximum(d, gap + p.min_thickness)
         d = self._unfold(d)
         positions = self.start + d[:, None] * self.normals
 

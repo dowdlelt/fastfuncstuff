@@ -86,6 +86,11 @@ def test_pial_cannot_be_dragged_through_white(phantom):
     res = edit.update(np.array([0.0, 0.0, -6.0]))
     thickness = np.linalg.norm(res.positions, axis=1) - 20.0
     assert thickness.min() >= 0.1 - 1e-6
+    # ...and stops *at* white rather than being thrown anywhere outside it.
+    assert thickness.min() == pytest.approx(0.1, abs=0.05)
+    # A small inward nudge well clear of white is not clamped at all.
+    small = edit.update(np.array([0.0, 0.0, -0.5]))
+    assert small.displacement.min() == pytest.approx(-0.5, abs=0.05)
 
 
 def test_white_pushed_out_pushes_pial_ahead(phantom):
@@ -138,3 +143,30 @@ def test_brush_does_not_jump_across_a_sulcus():
     centre = 10 * ny + 5
     inside, _ = geodesic_ball(verts, topo, centre, 3.0)
     assert np.all(inside < top.shape[0])
+
+
+def test_pial_dragged_inward_does_not_snap_onto_the_white_boundary(phantom):
+    # Pial at 23 dragged 1.5 mm in: the search band [20, 23] holds the WM/GM
+    # edge (r=21), which also darkens outward. It is the wrong boundary; with
+    # no GM/CSF crossing in reach the hand's position should stand.
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    edit = SurfaceEdit(
+        pial, topo, _top(u), sampler, SnapParams(radius=4.0), role="pial", partner=white
+    )
+    res = edit.update(np.array([0.0, 0.0, -1.5]))
+    core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
+    assert np.all(np.abs(core - WHITE_TRUE) > 0.5)
+
+
+def test_pial_dragged_out_finds_the_csf_boundary(phantom):
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    edit = SurfaceEdit(
+        pial, topo, _top(u), sampler, SnapParams(radius=5.0), role="pial", partner=white
+    )
+    level, contrast = edit.levels
+    assert level == pytest.approx(45.0, abs=3) and contrast == pytest.approx(50.0, abs=5)
+    res = edit.update(np.array([0.0, 0.0, 0.6]))
+    core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
+    np.testing.assert_allclose(core, PIAL_TRUE, atol=0.15)
