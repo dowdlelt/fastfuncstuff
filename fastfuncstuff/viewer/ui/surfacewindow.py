@@ -108,6 +108,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._flat: dict[str, bool] = {}
         self._visible: set[str] = set()
         self._model: dict[str, np.ndarray] = {}
+        #: Each hemisphere's own turn about its centre (alt+drag), on top of
+        #: the layout. View state like the camera, so not recorded.
+        self.hemi_rotation: dict[str, np.ndarray] = {}
+        self._grabbed: str | None = None
         #: CPU copies for picking: drawn positions A/B, white, pial, faces.
         self._cpu: dict[str, dict[str, np.ndarray]] = {}
         self._volume: tuple[np.ndarray, np.ndarray] | None = None
@@ -183,6 +187,19 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._flat = dict(flat)
         self.update()
 
+    def model(self, hemi: str) -> np.ndarray:
+        """Layout (split) composed with the hemisphere's own turn about its centre."""
+        base = self._model.get(hemi, np.eye(4))
+        r = self.hemi_rotation.get(hemi)
+        now = self.current(hemi)
+        if r is None or now is None:
+            return base
+        c = now[0].mean(axis=0).astype(np.float64)
+        turn = np.eye(4)
+        turn[:3, :3] = r
+        turn[:3, 3] = c - r @ c
+        return base @ turn
+
     def set_volume(
         self,
         value: tuple[np.ndarray, np.ndarray] | None,
@@ -224,7 +241,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         if not cpu or "posA" not in cpu or "posB" not in cpu:
             return None
         p = (1.0 - self.morph) * cpu["posA"] + self.morph * cpu["posB"]
-        m = self._model.get(hemi, np.eye(4))
+        m = self.model(hemi)
         return p @ m[:3, :3].T.astype(np.float32) + m[:3, 3].astype(np.float32)
 
     # -- RHI -----------------------------------------------------------------
@@ -412,7 +429,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 continue
             if gpu.srb is None:
                 self._bindings(gpu)
-            model = self._model.get(hemi, np.eye(4))
+            model = self.model(hemi)
             assert gpu.ubuf is not None
             batch.updateDynamicBuffer(
                 gpu.ubuf,
@@ -459,6 +476,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         self._press = self._last = event.position()
         self._moved = False
+        self._grabbed = None
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.AltModifier:
+            hit = self._hit(event.position())
+            self._grabbed = None if hit is None else hit[0]
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         if self._last is None:
@@ -471,7 +492,15 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         if event.buttons() & QtCore.Qt.MouseButton.RightButton:
             self.camera.pan(d.x() / h, d.y() / h)
         elif event.buttons() & QtCore.Qt.MouseButton.LeftButton:
-            self.camera.orbit(d.x() / h * np.pi, d.y() / h * np.pi)
+            if self._grabbed is not None:
+                # Turn the grabbed hemisphere about the screen's axes, in world
+                # terms, so the drag means the same thing from any view.
+                right, up = self.camera.rotation[0], self.camera.rotation[1]
+                turn = s3._rotation(up, d.x() / h * np.pi) @ s3._rotation(right, d.y() / h * np.pi)
+                r = self.hemi_rotation.get(self._grabbed, np.eye(3))
+                self.hemi_rotation[self._grabbed] = turn @ r
+            else:
+                self.camera.orbit(d.x() / h * np.pi, d.y() / h * np.pi)
         self.update()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
@@ -492,6 +521,11 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
 
     def pick_mm(self, pos: QtCore.QPointF) -> tuple[float, float, float] | None:
         """Scanner mm under a widget point, at the sampled mid-depth."""
+        hit = self._hit(pos)
+        return None if hit is None else hit[1]
+
+    def _hit(self, pos: QtCore.QPointF) -> tuple[str, tuple[float, float, float]] | None:
+        """Which hemisphere is under a widget point, and the scanner mm there."""
         w, h = max(self.width(), 1), max(self.height(), 1)
         x = 2.0 * pos.x() / w - 1.0
         y = 1.0 - 2.0 * pos.y() / h
@@ -513,7 +547,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         d = 0.5 * (self.depth[0] + self.depth[1])
         point = (1 - d) * cpu["white"][corners] + d * cpu["pial"][corners]
         mm = bary @ point
-        return (float(mm[0]), float(mm[1]), float(mm[2]))
+        return hemi, (float(mm[0]), float(mm[1]), float(mm[2]))
 
 
 class SurfaceWindow(QtWidgets.QWidget):
@@ -608,6 +642,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("shift+v", "previous view", lambda: self._cycle_view(-1), group="view"),
                 Key("0", "reset the camera", self._reset_camera, group="view"),
                 Key("drag", "rotate", None, group="view"),
+                Key("alt+drag", "turn one hemisphere about its centre", None, group="hemispheres"),
                 Key("right-drag", "pan", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
                 Key("click", "move the crosshair there", None, group="view"),
@@ -697,6 +732,7 @@ class SurfaceWindow(QtWidgets.QWidget):
 
     def _reset_camera(self) -> None:
         self.canvas.camera = s3.Camera()
+        self.canvas.hemi_rotation.clear()
         self._frame()
         self.canvas.update()
 

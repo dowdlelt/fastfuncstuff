@@ -104,3 +104,31 @@ def test_depth_and_hemisphere_commands_round_trip_through_a_script(window):
     script = session.to_script()
     assert "SET_SURFACE_DEPTH S1 0.0 1.0 5" in script
     assert "SET_SURFACE_HEMIS S1 rh 20.0" in script
+
+
+def test_a_turned_hemisphere_pivots_on_its_centre_and_still_picks_true_mm(window):
+    from PySide6.QtCore import QPointF
+
+    from fastfuncstuff.viewer import surface3d as s3
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    win._reset_camera()
+    before = c.drawn_positions("lh")
+    assert before is not None
+    c.hemi_rotation["lh"] = s3._rotation([0, 0, 1], np.pi / 3)
+    after = c.drawn_positions("lh")
+    assert after is not None
+    np.testing.assert_allclose(after.mean(0), before.mean(0), atol=1e-3)
+    assert np.abs(after - before).max() > 5.0
+    # Turned on screen, but the point under the cursor is still a point of the
+    # sheet in scanner space: picking goes through barycentrics, not display xyz.
+    mm = c.pick_mm(QPointF(160.0, 160.0))
+    assert mm is not None and mm[2] == pytest.approx(1.5, abs=1e-4)
+    win._reset_camera()
+    assert c.hemi_rotation == {}
