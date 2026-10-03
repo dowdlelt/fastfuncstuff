@@ -534,22 +534,30 @@ class SurfaceStore:
             _, edit, faces = self._active
             res = edit.update(np.asarray(drag_mm, np.float64))
             self._show(grab.hemi, grab.surface, edit, faces, res)
-        moves = [(grab.surface, edit.ids.copy(), edit.start.astype(np.float32))]
+        self._commit(
+            grab.hemi,
+            grab.surface,
+            edit,
+            res,
+            {"tool": "grab", "vertex": grab.vertex, "drag_mm": [float(x) for x in drag_mm]},
+        )
+        return res
+
+    def _commit(self, hemi: str, surface: str, edit, res: EditResult, entry: dict) -> None:
+        """Make a shown edit permanent: undo record, edited set, log."""
+        moves = [(surface, edit.ids.copy(), edit.start.astype(np.float32))]
         if edit.partner_start is not None:
-            moves.append(
-                (PARTNER[grab.surface], edit.ids.copy(), edit.partner_start.astype(np.float32))
-            )
-        self._undo.append(_Undo(grab.hemi, moves))
-        self.edited.add((grab.hemi, grab.surface))
+            moves.append((PARTNER[surface], edit.ids.copy(), edit.partner_start.astype(np.float32)))
+        self._undo.append(_Undo(hemi, moves))
+        self.edited.add((hemi, surface))
         if res.partner_ids.size:
-            self.edited.add((grab.hemi, PARTNER[grab.surface]))
+            self.edited.add((hemi, PARTNER[surface]))
         self.log.entries.append(
             {
-                "hemi": grab.hemi,
-                "surface": grab.surface,
-                "vertex": grab.vertex,
-                "drag_mm": [float(x) for x in drag_mm],
-                "params": params.__dict__,
+                "hemi": hemi,
+                "surface": surface,
+                **entry,
+                "params": edit.params.__dict__,
                 "moved": int(np.count_nonzero(res.displacement)),
                 "max_displacement_mm": float(np.abs(res.displacement).max(initial=0.0)),
                 "pushed_partner": int(res.partner_ids.size),
@@ -557,6 +565,77 @@ class SurfaceStore:
         )
         self._active = None
         self._pending = None
+
+    def stroke_seeds(
+        self,
+        hemi: str,
+        surface: str,
+        grid_affine: np.ndarray,
+        axis: int,
+        position: float,
+        stroke_mm: np.ndarray,
+    ) -> np.ndarray:
+        """Vertices of the outline stretch between a stroke's two ends, on this slice.
+
+        The stroke must start and end on the same piece of this surface's
+        outline; the stretch is walked along the contour (see
+        :func:`surface.geometry.contour_path`), never guessed by proximity.
+        """
+        from fastfuncstuff.surface.geometry import contour_path
+
+        index = self._slice_index(hemi, surface, grid_affine)
+        if index is None:
+            raise ValueError(f"no {hemi} {surface} surface")
+        seg, faces, edges = index.segments_with_edges(axis, float(position))
+        if not len(seg):
+            raise ValueError("the surface does not cross this slice")
+        inv = np.linalg.inv(grid_affine)
+        ends = apply_affine(inv, np.asarray(stroke_mm)[[0, -1]])
+        mids = seg.mean(axis=1)
+        a, b = (int(np.argmin(np.linalg.norm(mids - e, axis=1))) for e in ends)
+        path = contour_path(edges, a, b)
+        if path is None:
+            raise ValueError("the stroke must start and end on the same outline")
+        return np.unique(index.faces[faces[path]])
+
+    def apply_stroke(
+        self,
+        hemi: str,
+        surface: str,
+        grid_affine: np.ndarray,
+        axis: int,
+        position: float,
+        stroke_mm: np.ndarray,
+        sampler: VolumeSampler,
+        params: SnapParams,
+    ) -> EditResult:
+        """Redraw a stretch of outline along ``stroke_mm``; the surface around follows."""
+        from fastfuncstuff.surface.edit import StrokeEdit
+
+        self.cancel()
+        stroke_mm = np.asarray(stroke_mm, np.float64)
+        seeds = self.stroke_seeds(hemi, surface, grid_affine, axis, position, stroke_mm)
+        h = self.hemis[hemi]
+        topo = self.topology(hemi)
+        edit = StrokeEdit(
+            h.states[surface],
+            topo,
+            seeds,
+            stroke_mm,
+            sampler,
+            params,
+            role=surface,
+            partner=h.states.get(PARTNER[surface]),
+        )
+        res = edit.result()
+        self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)
+        self._commit(
+            hemi,
+            surface,
+            edit,
+            res,
+            {"tool": "draw", "seeds": int(seeds.size), "stroke_points": int(stroke_mm.shape[0])},
+        )
         return res
 
     def undo(self) -> bool:

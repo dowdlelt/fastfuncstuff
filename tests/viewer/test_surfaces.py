@@ -397,3 +397,74 @@ def test_depth_roi_disc_parcel_and_label_layer(session, tmp_path):
     assert store.depth_roi((0.0, 0.0, 0.0), "disc") == {}  # 22 mm from cortex
     with pytest.raises(ValueError):
         store.depth_roi(top, "blob")
+
+
+def _stroke_command(session, z=15.0, target_r=21.0, half=0.6, snap=0.0):
+    from fastfuncstuff.viewer.vocab import EditSurfaceStroke
+
+    st = session.state
+    assert st.grid is not None
+    pos = float((np.linalg.inv(st.grid.affine) @ [0, 0, z, 1])[2])
+    rho_now, rho_new = np.sqrt(20.0**2 - z**2), np.sqrt(target_r**2 - z**2)
+    arc = np.linspace(-half, half, 30)
+    pts = np.concatenate(
+        [
+            [[rho_now * np.cos(-half), rho_now * np.sin(-half), z]],
+            np.stack([rho_new * np.cos(arc), rho_new * np.sin(arc), np.full_like(arc, z)], 1),
+            [[rho_now * np.cos(half), rho_now * np.sin(half), z]],
+        ]
+    )
+    r, _, m, q, e = st.surface_brush
+    return EditSurfaceStroke("lh", "white", 2, pos, EditSurfaceStroke.encode(pts), r, snap, m, q, e)
+
+
+def test_stroke_command_redraws_replays_and_undoes(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetSurfaceTool, UndoSurfaceEdit
+
+    session.load(_shell_anat(tmp_path))
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    session.do(SetSurfaceTool("draw"))
+    hemi = session.surfaces.hemis["lh"]
+    before = hemi.states["white"].copy()
+    session.do(_stroke_command(session))
+    after = hemi.states["white"]
+    moved = np.flatnonzero(np.any(after != before, axis=1))
+    assert moved.size > 3
+    on_slice = moved[np.abs(before[moved, 2] - 15.0) < 0.8]
+    angle = np.abs(np.arctan2(before[on_slice, 1], before[on_slice, 0]))
+    mid = on_slice[angle < 0.3]
+    assert mid.size > 0
+    np.testing.assert_allclose(np.linalg.norm(after[mid], axis=1), 21.0, atol=0.3)
+    assert np.all(before[moved, 0] > 0)  # only the drawn side
+    script = session.to_script()
+    assert "EDIT_SURFACE_STROKE" in script and "SET_SURFACE_TOOL draw" in script
+    fresh = ViewerSession(device=CPU)
+    try:
+        fresh.run_script(script)
+        np.testing.assert_allclose(fresh.surfaces.hemis["lh"].states["white"], after, atol=1e-6)
+    finally:
+        fresh.close()
+    session.do(UndoSurfaceEdit())
+    np.testing.assert_array_equal(hemi.states["white"], before)
+
+
+def test_a_stroke_off_the_outline_is_refused(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import EditSurfaceStroke
+
+    session.load(_shell_anat(tmp_path))
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    with pytest.raises(ValueError, match="does not cross"):
+        session.do(
+            EditSurfaceStroke(
+                "lh",
+                "white",
+                2,
+                1.0,
+                EditSurfaceStroke.encode([[0, 0, -29], [1, 0, -29]]),
+                4,
+                0,
+                0.2,
+                1.5,
+                -1,
+            )
+        )

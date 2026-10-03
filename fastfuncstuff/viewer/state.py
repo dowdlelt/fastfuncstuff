@@ -94,6 +94,8 @@ class ViewerState:
     #: crosshair), and the brush it is dragged with: radius mm, snap 0-1,
     #: smoothing, search mm either side, and the outward edge sign (-1 = T1).
     surface_editing: bool = False
+    #: ``grab`` drags an outline; ``draw`` redraws a stretch of it.
+    surface_tool: str = "grab"
     surface_brush: tuple[float, float, float, float, int] = (4.0, 1.0, 0.2, 1.5, -1)
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.

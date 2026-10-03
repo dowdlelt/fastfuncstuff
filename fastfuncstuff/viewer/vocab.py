@@ -497,6 +497,49 @@ class EditSurface(Command):
 
 @command
 @dataclass(frozen=True)
+class EditSurfaceStroke(Command):
+    """A stretch of outline redrawn on one slice; the surface around follows.
+
+    ``axis``/``position`` name the display-grid slice; ``stroke`` is the drawn
+    line in scanner mm as ``x,y,z;x,y,z;...``. Like EDIT_SURFACE it records
+    the gesture, so a replay on the same image rebuilds the same surface.
+    """
+
+    name = "EDIT_SURFACE_STROKE"
+    aspects = Aspect.SLICES
+    major = True
+    hemi: str
+    surface: str
+    axis: int
+    position: float
+    stroke: str
+    radius: float
+    snap: float
+    smooth: float
+    search: float
+    edge_sign: int
+    snap_key: str = ""
+
+    @staticmethod
+    def encode(points) -> str:
+        return ";".join(",".join(f"{v:.4f}" for v in p) for p in np.asarray(points))
+
+    def points(self) -> np.ndarray:
+        return np.array([[float(v) for v in p.split(",")] for p in self.stroke.split(";") if p])
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceTool(Command):
+    """What a press near an outline does while editing: grab (drag) or draw (redraw)."""
+
+    name = "SET_SURFACE_TOOL"
+    aspects = Aspect.SLICES
+    tool: str = "grab"
+
+
+@command
+@dataclass(frozen=True)
 class UndoSurfaceEdit(Command):
     """Put the last committed surface edit back."""
 
@@ -1244,6 +1287,40 @@ def install(
         sampler = session.surface_sampler(cmd.snap_key or None)
         session.surfaces.apply(grab, tuple(cmd.drag), sampler, params)
         return EditSurface.aspects
+
+    @bus.handle(EditSurfaceStroke.name)
+    def _edit_surface_stroke(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, EditSurfaceStroke)
+        if session is None or st.grid is None:
+            raise RuntimeError("EDIT_SURFACE_STROKE needs a session and a display grid")
+        from fastfuncstuff.surface.edit import SnapParams
+
+        params = SnapParams(
+            radius=cmd.radius,
+            snap=cmd.snap,
+            smooth=cmd.smooth,
+            search=cmd.search,
+            edge_sign=int(cmd.edge_sign),
+        )
+        session.surfaces.apply_stroke(
+            cmd.hemi,
+            cmd.surface,
+            st.grid.affine,
+            int(cmd.axis),
+            float(cmd.position),
+            cmd.points(),
+            session.surface_sampler(cmd.snap_key or None),
+            params,
+        )
+        return EditSurfaceStroke.aspects
+
+    @bus.handle(SetSurfaceTool.name)
+    def _set_surface_tool(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceTool)
+        if cmd.tool not in ("grab", "draw"):
+            raise ValueError("surface tool is grab or draw")
+        st.surface_tool = cmd.tool
+        return SetSurfaceTool.aspects
 
     @bus.handle(UndoSurfaceEdit.name)
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:
