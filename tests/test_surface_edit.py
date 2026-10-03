@@ -186,3 +186,105 @@ def test_inward_wound_mesh_still_pushes_outward(phantom):
     core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
     np.testing.assert_allclose(core, WHITE_TRUE, atol=0.15)
     assert res.partner_ids.size == 0
+
+
+def _draw_on_slice(u, f, z=15.0, white_r=20.0, target_r=21.0, half_angle=0.6):
+    """The viewer's draw gesture on the phantom, in scanner mm.
+
+    Returns the seeds (vertices of the faces the slice cuts between the
+    stroke's ends) and the stroke: from the outline, out along the true
+    boundary, back to the outline.
+    """
+    from fastfuncstuff.surface.geometry import SliceIndex, contour_path
+
+    white = white_r * u
+    index = SliceIndex(white, f)
+    seg, faces, edges = index.segments_with_edges(2, z)
+    rho_now = np.sqrt(white_r**2 - z**2)
+    rho_new = np.sqrt(target_r**2 - z**2)
+    ends = [
+        np.array([rho_now * np.cos(a), rho_now * np.sin(a), z]) for a in (-half_angle, half_angle)
+    ]
+    mids = seg.mean(axis=1)
+    a_seg, b_seg = (int(np.argmin(np.linalg.norm(mids - e, axis=1))) for e in ends)
+    path = contour_path(edges, a_seg, b_seg)
+    assert path is not None
+    seeds = np.unique(f[faces[path]])
+    arc = np.linspace(-half_angle, half_angle, 40)
+    stroke = np.concatenate(
+        [
+            ends[0][None],
+            np.stack([rho_new * np.cos(arc), rho_new * np.sin(arc), np.full_like(arc, z)], 1),
+            ends[1][None],
+        ]
+    )
+    return white, seeds, stroke
+
+
+def test_a_drawn_stretch_moves_to_the_stroke_and_the_surface_around_follows(phantom):
+    from fastfuncstuff.surface.edit import StrokeEdit
+
+    sampler, u, f, topo = phantom
+    white, seeds, stroke = _draw_on_slice(u, f)
+    params = SnapParams(radius=4.0, snap=0.0)
+    edit = StrokeEdit(white, topo, seeds, stroke, sampler, params, role="white", partner=23.0 * u)
+    res = edit.result()
+    r_new = np.linalg.norm(res.positions, axis=1)
+    middle = edit.seed & (np.abs(np.arctan2(edit.start[:, 1], edit.start[:, 0])) < 0.3)
+    assert middle.sum() >= 3
+    # Hand mode: the redrawn stretch sits on the stroke (r = 21 on the slice).
+    np.testing.assert_allclose(r_new[middle], 21.0, atol=0.25)
+    # One slice-width above, the surface came along -- part of the way.
+    above = (
+        ~edit.seed
+        & (edit.start[:, 2] > 16.5)
+        & (np.abs(np.arctan2(edit.start[:, 1], edit.start[:, 0])) < 0.3)
+    )
+    assert above.any()
+    assert np.all((res.displacement[above] > 0.05) & (res.displacement[above] < 1.0))
+    # Nothing on the other side of the sphere moves.
+    assert np.all(edit.start[:, 0] > 0)
+
+
+def test_auto_mode_places_the_drawn_stretch_on_the_edge(phantom):
+    from fastfuncstuff.surface.edit import StrokeEdit
+
+    sampler, u, f, topo = phantom
+    # A sloppy stroke: drawn at r = 21.4, the true boundary is 21.
+    white, seeds, stroke = _draw_on_slice(u, f, target_r=21.4)
+    hand = StrokeEdit(
+        white,
+        topo,
+        seeds,
+        stroke,
+        sampler,
+        SnapParams(radius=4.0, snap=0.0),
+        role="white",
+        partner=23.0 * u,
+    )
+    auto = StrokeEdit(
+        white,
+        topo,
+        seeds,
+        stroke,
+        sampler,
+        SnapParams(radius=4.0, snap=1.0),
+        role="white",
+        partner=23.0 * u,
+    )
+    mid = hand.seed & (np.abs(np.arctan2(hand.start[:, 1], hand.start[:, 0])) < 0.3)
+    r_hand = np.linalg.norm(hand.result().positions[mid], axis=1)
+    r_auto = np.linalg.norm(auto.result().positions[mid], axis=1)
+    assert np.abs(r_auto - WHITE_TRUE).mean() < np.abs(r_hand - WHITE_TRUE).mean()
+    np.testing.assert_allclose(r_auto, WHITE_TRUE, atol=0.2)
+
+
+def test_contour_path_takes_the_short_way_and_refuses_separate_pieces():
+    from fastfuncstuff.surface.geometry import contour_path
+
+    # A ring of 10 segments: segment i joins edge i to edge i+1.
+    ring = np.array([[[i, i + 100], [(i + 1) % 10, (i + 1) % 10 + 100]] for i in range(10)])
+    np.testing.assert_array_equal(contour_path(ring, 1, 3), [1, 2, 3])
+    np.testing.assert_array_equal(contour_path(ring, 1, 9), [1, 0, 9])
+    two = np.concatenate([ring, ring + 1000])
+    assert contour_path(two, 1, 12) is None

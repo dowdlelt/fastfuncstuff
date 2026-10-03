@@ -112,7 +112,61 @@ class SliceIndex:
         # An on-plane vertex that is its face's lone corner yields a point, not
         # a segment; the neighbouring faces already carry the trace through it.
         keep = np.any(p0 != p1, axis=1)
+        self._last_edges = np.stack(
+            [np.sort(np.stack([a, b], 1), axis=1), np.sort(np.stack([a, c], 1), axis=1)], axis=1
+        )[keep]
         return np.stack([p0[keep], p1[keep]], axis=1), ids[keep]
+
+    def segments_with_edges(
+        self, axis: int, position: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:meth:`segments_with_faces`, plus the mesh edge each endpoint lies on.
+
+        ``(N, 2, 2)`` sorted vertex pairs. Two segments that end on the same
+        mesh edge are neighbours along the outline -- exactly, with no float
+        matching -- which is what lets a contour be walked.
+        """
+        seg, faces = self.segments_with_faces(axis, position)
+        edges = getattr(self, "_last_edges", np.zeros((0, 2, 2), np.int64))
+        if seg.shape[0] == 0:
+            edges = np.zeros((0, 2, 2), np.int64)
+        return seg, faces, edges
+
+
+def contour_path(edges: np.ndarray, start: int, stop: int) -> np.ndarray | None:
+    """Segments along an outline from segment ``start`` to ``stop``, inclusive.
+
+    ``edges`` is :meth:`SliceIndex.segments_with_edges`' third output.
+    Segments sharing an endpoint edge are adjacent; the shortest chain is
+    returned (on a closed contour, the shorter way round), or ``None`` when
+    the two are on different pieces of outline.
+    """
+    from collections import deque
+
+    n = edges.shape[0]
+    if not (0 <= start < n and 0 <= stop < n):
+        return None
+    by_edge: dict[tuple[int, int], list[int]] = {}
+    for i in range(n):
+        for e in edges[i]:
+            by_edge.setdefault((int(e[0]), int(e[1])), []).append(i)
+    previous = {start: -1}
+    queue = deque([start])
+    while queue:
+        i = queue.popleft()
+        if i == stop:
+            break
+        for e in edges[i]:
+            for j in by_edge[(int(e[0]), int(e[1]))]:
+                if j not in previous:
+                    previous[j] = i
+                    queue.append(j)
+    if stop not in previous:
+        return None
+    path = [stop]
+    while path[-1] != start:
+        path.append(previous[path[-1]])
+    return np.array(path[::-1], np.int64)
 
 
 def apply_affine(affine: np.ndarray, xyz: np.ndarray) -> np.ndarray:
@@ -121,4 +175,4 @@ def apply_affine(affine: np.ndarray, xyz: np.ndarray) -> np.ndarray:
     return np.asarray(xyz, dtype=np.float64) @ m[:3, :3].T + m[:3, 3]
 
 
-__all__ = ["SliceIndex", "apply_affine"]
+__all__ = ["SliceIndex", "apply_affine", "contour_path"]

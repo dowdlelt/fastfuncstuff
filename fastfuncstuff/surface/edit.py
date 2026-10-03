@@ -105,15 +105,20 @@ class SurfaceEdit:
         role: str = "white",
         partner: np.ndarray | None = None,
     ) -> None:
+        self.centre = int(centre)
+        vertices = np.asarray(vertices, np.float64)
+        ids, dist = geodesic_ball(vertices, topo, self.centre, params.radius)
+        self._setup(vertices, topo, ids, dist, sampler, params, role, partner)
+
+    def _setup(self, vertices, topo, ids, dist, sampler, params, role, partner) -> None:
+        """Everything about the patch except how it was chosen."""
         if role not in ("white", "pial"):
             raise ValueError(f"role must be 'white' or 'pial', got {role!r}")
         self.params = params
         self.role = role
         self.sampler = sampler
         self.topo = topo
-        self.centre = int(centre)
-        vertices = np.asarray(vertices, np.float64)
-        self.ids, dist = geodesic_ball(vertices, topo, self.centre, params.radius)
+        self.ids = ids
         self.weight = _brush_weight(dist, params.radius)
         self.start = vertices[self.ids].copy()
         # Normals of the *whole* mesh evaluated at the start, then frozen for
@@ -203,8 +208,14 @@ class SurfaceEdit:
             return None
         return 0.5 * (inner + outer), contrast
 
-    def _find_edges(self, along: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Best edge offset per vertex near ``along``, and its confidence."""
+    def _find_edges(
+        self, along: np.ndarray, limit: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Best edge offset per vertex near ``along``, and its confidence.
+
+        ``limit`` narrows each vertex's search (mm either side) below the
+        brush's ``search``.
+        """
         p = self.params
         t = along[:, None] + self._offsets[None, :]  # (n, S)
         pts = self.start[:, None, :] + t[..., None] * self.normals[:, None, :]
@@ -225,16 +236,21 @@ class SurfaceEdit:
             level, contrast = self.levels
             rel = rel * np.exp(-0.5 * ((prof - level) / (0.25 * contrast)) ** 2)
         score = rel - p.distance_penalty * (self._offsets[None, :] / p.search) ** 2
+        if limit is not None:
+            score = np.where(np.abs(self._offsets)[None, :] > limit[:, None], -np.inf, score)
         best = np.argmax(score, axis=1)
         rows = np.arange(best.size)
         return t[rows, best], rel[rows, best]
 
     def update(self, drag: np.ndarray) -> EditResult:
         """Positions for a cumulative drag vector ``drag`` (mm) from the press."""
-        p = self.params
         drag = np.asarray(drag, np.float64)
-        along = self.weight * (self.normals @ drag)
-        found, confidence = self._find_edges(along)
+        return self._finish(self.weight * (self.normals @ drag))
+
+    def _finish(self, along: np.ndarray, limit: np.ndarray | None = None) -> EditResult:
+        """From a rough along-normal displacement to the placed, guarded result."""
+        p = self.params
+        found, confidence = self._find_edges(along, limit)
         # What is smooth in the anatomy is the boundary, so the found edge
         # offsets are what get regularised -- weighted by how sure each vertex
         # is of its edge -- and the result is faded in toward the rim (sqrt,
@@ -244,7 +260,8 @@ class SurfaceEdit:
         edge = np.asarray(spsolve((a + p.smooth * self._system).tocsc(), a @ found), np.float64)
         # Smoothing may carry a confident neighbour's edge further than this
         # vertex searched; it has no evidence there.
-        edge = np.clip(edge, along - p.search, along + p.search)
+        reach = p.search if limit is None else limit
+        edge = np.clip(edge, along - reach, along + reach)
         d = along + p.snap * np.sqrt(self.weight) * (edge - along)
 
         gap = None
@@ -281,4 +298,98 @@ class SurfaceEdit:
         return np.zeros_like(d)
 
 
-__all__ = ["EditResult", "SnapParams", "SurfaceEdit"]
+class StrokeEdit(SurfaceEdit):
+    """A stretch of outline redrawn by hand, with the surface around it following.
+
+    ``seeds`` are the vertices of the faces the slice cut between the two
+    ends of the stroke -- the stretch that was redrawn -- and ``stroke`` the
+    drawn line, ``(M, 3)`` scanner mm. Each seed moves along its normal to the
+    stroke's nearest point; everything within ``params.radius`` mm *along the
+    surface* of any seed follows by harmonic interpolation, pinned to the
+    seeds and to zero just past the rim, so the change carries into the
+    slices above and below without a kink. With ``snap`` on, the result is
+    then placed on the image's edge as a grab is -- but the seeds search only
+    half as far: the hand drew them, and is trusted over the extrapolation.
+    """
+
+    def __init__(
+        self,
+        vertices: np.ndarray,
+        topo: MeshTopology,
+        seeds: np.ndarray,
+        stroke: np.ndarray,
+        sampler: VolumeSampler,
+        params: SnapParams = SnapParams(),
+        *,
+        role: str = "white",
+        partner: np.ndarray | None = None,
+    ) -> None:
+        from scipy.sparse.csgraph import dijkstra
+
+        vertices = np.asarray(vertices, np.float64)
+        seeds = np.unique(np.asarray(seeds, np.int64))
+        if seeds.size == 0:
+            raise ValueError("a stroke needs at least one vertex to move")
+        stroke = np.asarray(stroke, np.float64)
+        if stroke.ndim != 2 or stroke.shape[0] < 2:
+            raise ValueError("a stroke needs at least two points")
+        graph = topo.edge_graph(vertices)
+        dist = dijkstra(graph, indices=seeds, limit=float(params.radius), min_only=True)
+        ids = np.flatnonzero(np.isfinite(dist))
+        self.centre = int(seeds[0])
+        self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
+        self.seed = np.isin(self.ids, seeds)
+        targets = closest_on_polyline(self.start[self.seed], stroke)
+        self.seed_shift = np.einsum(
+            "ij,ij->i", targets - self.start[self.seed], self.normals[self.seed]
+        )
+        self.along = self._interpolate()
+
+    def _interpolate(self) -> np.ndarray:
+        """Harmonic fill: seeds fixed to their shift, zero just past the rim."""
+        edges = self.topo.edges
+        n = self.ids.size
+        lookup = np.full(self.topo.n_vertices, -1, np.int64)
+        lookup[self.ids] = np.arange(n)
+        a, b = lookup[edges[:, 0]], lookup[edges[:, 1]]
+        touching = (a >= 0) | (b >= 0)
+        a, b = a[touching], b[touching]
+        # Edges leaving the patch count in the degree with nothing on the far
+        # side: that is the zero the rim is pinned to.
+        degree = np.bincount(a[a >= 0], minlength=n) + np.bincount(b[b >= 0], minlength=n)
+        both = (a >= 0) & (b >= 0)
+        rows = np.concatenate([a[both], b[both]])
+        cols = np.concatenate([b[both], a[both]])
+        lap = sp.diags(degree.astype(np.float64)) + sp.coo_matrix(
+            (-np.ones(rows.size), (rows, cols)), shape=(n, n)
+        )
+        pin = np.zeros(n)
+        pin[self.seed] = 1e6
+        rhs = np.zeros(n)
+        rhs[self.seed] = 1e6 * self.seed_shift
+        return np.asarray(spsolve((lap + sp.diags(pin)).tocsc(), rhs), np.float64)
+
+    def result(self) -> EditResult:
+        """The redrawn surface. Computed from the start, like every update."""
+        p = self.params
+        if p.snap <= 0:
+            limit = np.zeros(self.ids.size)
+        else:
+            limit = np.where(self.seed, 0.5 * p.search, p.search)
+        return self._finish(self.along, limit)
+
+
+def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
+    """For each point, the nearest point on the polyline ``line`` (both in mm)."""
+    a, b = line[:-1], line[1:]
+    ab = b - a
+    t = np.einsum("pmk,mk->pm", points[:, None, :] - a[None], ab) / np.maximum(
+        np.einsum("mk,mk->m", ab, ab), 1e-12
+    )
+    t = np.clip(t, 0.0, 1.0)
+    near = a[None] + t[..., None] * ab[None]
+    k = np.argmin(np.linalg.norm(near - points[:, None, :], axis=2), axis=1)
+    return near[np.arange(points.shape[0]), k]
+
+
+__all__ = ["EditResult", "SnapParams", "StrokeEdit", "SurfaceEdit", "closest_on_polyline"]
