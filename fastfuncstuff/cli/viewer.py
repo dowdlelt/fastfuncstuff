@@ -57,6 +57,7 @@ keys (main window)
   D                    denoise the selected run into a new layer
   ctrl+O  open         ctrl+S  save session script       h  this list
   O                    cycle surface outlines (white+pial / white / pial / off)
+  ctrl+shift+S         save edited surfaces as ?h.<surf>.<suffix> copies
 
 keys (image window)
   1 2 3                axial / sagittal / coronal
@@ -65,6 +66,12 @@ keys (image window)
   + -  0               zoom in / out, fit the whole plane
   right-drag           pan            ctrl+click  set the InstaCorr seed
   w                    close
+
+surface editing (image window, with -surfaces loaded)
+  g                    edit mode: drag a white/pial outline toward where it
+                       belongs; it snaps to the anatomy's edge over a 3-D brush
+  ( )                  brush radius         m  snap / follow the hand
+  ctrl+Z               undo                 Esc  cancel the drag
 
 keys (graph window)
   + -                  more / fewer voxels    s  shared scale    w  close

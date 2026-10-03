@@ -71,6 +71,7 @@ from fastfuncstuff.viewer.vocab import (
     MoveLayer,
     Read,
     RemoveLayer,
+    SaveSurfaces,
     SelectLayer,
     SetAlpha,
     SetBoxed,
@@ -704,6 +705,27 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"({sum(h.n_vertices for h in hemis.values()):,} vertices)",
             5000,
         )
+
+    def _save_surfaces_dialog(self) -> None:
+        surfaces = self.session.surfaces
+        if not surfaces.edited:
+            self.statusBar().showMessage("surfaces: nothing edited to save", 4000)
+            return
+        names = ", ".join(f"{h}.{s}" for h, s in sorted(surfaces.edited))
+        suffix, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Save edited surfaces",
+            f"Write {names} as copies beside the originals, with suffix:",
+            text="ffsedit",
+        )
+        if not ok or not suffix.strip():
+            return
+        try:
+            self._dispatch(SaveSurfaces(suffix.strip()))
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"surfaces: {exc}", 8000)
+            return
+        self.statusBar().showMessage(f"surfaces: wrote {names} .{suffix.strip()}", 6000)
 
     #: What shift+O steps through. Both first, because judging one boundary
     #: needs the other in view to see the cortex between them.
@@ -1536,6 +1558,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
+                Binding(
+                    "ctrl+shift+s",
+                    "save edited surfaces (as copies)",
+                    self._save_surfaces_dialog,
+                    group="session",
+                ),
                 Binding(
                     "ctrl+l",
                     "load the chosen dataset",
