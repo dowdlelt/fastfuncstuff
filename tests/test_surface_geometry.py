@@ -59,3 +59,21 @@ def test_vertex_exactly_on_the_plane_gives_no_degenerate_or_doubled_segments():
 def test_plane_outside_the_mesh_is_empty():
     v, f = sphere()
     assert SliceIndex(v, f).segments(2, 25.0).shape == (0, 2, 3)
+
+
+def test_moved_vertices_are_cut_where_they_now_are():
+    from fastfuncstuff.surface.mesh import MeshTopology
+
+    v, f = sphere(n=2000)
+    topo = MeshTopology.from_faces(f)
+    idx = SliceIndex(v, f)
+    top = np.flatnonzero(v[:, 2] > 15.0)
+    pushed = v[top] * 1.3  # well past z=21, where the original sphere ends
+    idx.move(top, pushed, topo.faces_of(top))
+    moved = v.copy()
+    moved[top] = pushed
+    fresh = SliceIndex(moved, f)
+    for pos in (18.0, 21.0, 24.0):
+        a, b = idx.segments(2, pos), fresh.segments(2, pos)
+        assert len(a) == len(b) > 0
+        np.testing.assert_allclose(np.sort(a.reshape(-1, 3), 0), np.sort(b.reshape(-1, 3), 0))

@@ -436,6 +436,87 @@ class ShowSurfaces(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceEditing(Command):
+    """Presses near a white/pial outline grab it rather than move the crosshair."""
+
+    name = "SET_SURFACE_EDITING"
+    aspects = Aspect.SLICES
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceBrush(Command):
+    """The editing brush: radius (mm), snap (0-1), smoothing, search (mm), edge sign."""
+
+    name = "SET_SURFACE_BRUSH"
+    aspects = Aspect.NOTHING
+    radius: float
+    snap: float = 1.0
+    smooth: float = 0.2
+    search: float = 1.5
+    edge_sign: int = -1
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceSnap(Command):
+    """Which layer edits snap to; empty means the bottom of the stack."""
+
+    name = "SET_SURFACE_SNAP"
+    aspects = Aspect.NOTHING
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class EditSurface(Command):
+    """One committed drag on a surface.
+
+    Carries the gesture, not the result: the press (vertex, and where in mm),
+    the drag vector and the brush. Replayed on the same image it reproduces
+    the same displacement, so a script rebuilds an edited surface from a few
+    lines instead of embedding 100k coordinates.
+    """
+
+    name = "EDIT_SURFACE"
+    aspects = Aspect.SLICES
+    major = True
+    hemi: str
+    surface: str
+    vertex: int
+    at: tuple[float, float, float]
+    drag: tuple[float, float, float]
+    radius: float
+    snap: float
+    smooth: float
+    search: float
+    edge_sign: int
+    snap_key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class UndoSurfaceEdit(Command):
+    """Put the last committed surface edit back."""
+
+    name = "UNDO_SURFACE_EDIT"
+    aspects = Aspect.SLICES
+
+
+@command
+@dataclass(frozen=True)
+class SaveSurfaces(Command):
+    """Write every edited surface as ``?h.<surface>.<suffix>`` beside its original."""
+
+    name = "SAVE_SURFACES"
+    aspects = Aspect.NOTHING
+    major = True
+    suffix: str = "ffsedit"
+
+
+@command
+@dataclass(frozen=True)
 class SetUnderlay(Command):
     """Replace the base image, keeping whatever is stacked over it.
 
@@ -1001,6 +1082,66 @@ def install(
         assert isinstance(cmd, ShowSurfaces)
         st.surfaces_shown = tuple(n for n in cmd.names.split(",") if n)
         return ShowSurfaces.aspects
+
+    @bus.handle(SetSurfaceEditing.name)
+    def _set_surface_editing(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceEditing)
+        st.surface_editing = bool(cmd.on)
+        if not st.surface_editing and session is not None:
+            session.surfaces.cancel()
+        return SetSurfaceEditing.aspects
+
+    @bus.handle(SetSurfaceBrush.name)
+    def _set_surface_brush(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceBrush)
+        if cmd.radius <= 0 or cmd.search <= 0 or not 0 <= cmd.snap <= 1 or cmd.smooth < 0:
+            raise ValueError("brush: radius, search > 0; snap in [0, 1]; smooth >= 0")
+        if cmd.edge_sign not in (-1, 1):
+            raise ValueError("brush edge_sign must be -1 (T1) or 1 (T2)")
+        st.surface_brush = (cmd.radius, cmd.snap, cmd.smooth, cmd.search, cmd.edge_sign)
+        return SetSurfaceBrush.aspects
+
+    @bus.handle(SetSurfaceSnap.name)
+    def _set_surface_snap(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceSnap)
+        if cmd.key and st.layers.find(cmd.key) is None:
+            raise KeyError(f"no layer {cmd.key!r} to snap to")
+        st.surface_snap_key = cmd.key or None
+        return SetSurfaceSnap.aspects
+
+    @bus.handle(EditSurface.name)
+    def _edit_surface(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, EditSurface)
+        if session is None:
+            raise RuntimeError("EDIT_SURFACE needs a session")
+        from fastfuncstuff.surface.edit import SnapParams
+        from fastfuncstuff.viewer.surfaces import Grab
+
+        grab = Grab(cmd.hemi, cmd.surface, int(cmd.vertex), tuple(cmd.at))
+        params = SnapParams(
+            radius=cmd.radius,
+            snap=cmd.snap,
+            smooth=cmd.smooth,
+            search=cmd.search,
+            edge_sign=int(cmd.edge_sign),
+        )
+        sampler = session.surface_sampler(cmd.snap_key or None)
+        session.surfaces.apply(grab, tuple(cmd.drag), sampler, params)
+        return EditSurface.aspects
+
+    @bus.handle(UndoSurfaceEdit.name)
+    def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:
+        if session is None:
+            raise RuntimeError("UNDO_SURFACE_EDIT needs a session")
+        return UndoSurfaceEdit.aspects if session.surfaces.undo() else Aspect.NOTHING
+
+    @bus.handle(SaveSurfaces.name)
+    def _save_surfaces(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SaveSurfaces)
+        if session is None:
+            raise RuntimeError("SAVE_SURFACES needs a session")
+        session.surfaces.save(cmd.suffix)
+        return SaveSurfaces.aspects
 
     @bus.handle(Load.name)
     def _load_layer(cmd: Command, st: ViewerState) -> Aspect:

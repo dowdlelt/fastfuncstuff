@@ -107,3 +107,90 @@ def test_show_surfaces_is_a_replayable_command(session, tmp_path):
     session.do(ShowSurfaces(""))
     assert session.state.surfaces_shown == ()
     assert ShowSurfaces("white,pial").to_line() == "SHOW_SURFACES white,pial"
+
+
+def _shell_anat(tmp_path, cras=(0.0, 0.0, 0.0)):
+    """T1-like phantom: WM inside r=21 mm, GM to 24, CSF beyond, centred on c_ras."""
+    vox, n = 0.5, 120
+    aff = np.diag([vox, vox, vox, 1.0])
+    aff[:3, 3] = -(n - 1) * vox / 2 + np.asarray(cras)
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    r = np.linalg.norm(ijk * vox + aff[:3, 3] - np.asarray(cras), axis=-1)
+    img = np.where(r < 21, 110.0, np.where(r < 24, 70.0, 20.0)).astype(np.float32)
+    p = tmp_path / "t1.nii.gz"
+    nib.save(nib.Nifti1Image(img, aff), str(p))
+    return p
+
+
+def _edit(session, drag=(0.0, 0.0, 0.6)):
+    from fastfuncstuff.viewer.vocab import EditSurface
+
+    white = session.surfaces.hemis["lh"].states["white"]
+    top = int(np.argmax(white[:, 2]))
+    r, s, m, q, e = session.state.surface_brush
+    return EditSurface("lh", "white", top, tuple(white[top].tolist()), drag, r, s, m, q, e)
+
+
+def test_edit_undo_save_and_replay(session, tmp_path):
+    from fastfuncstuff.io.freesurfer import read_surface
+    from fastfuncstuff.viewer.vocab import SaveSurfaces, UndoSurfaceEdit
+
+    session.load(_shell_anat(tmp_path))
+    subj = _subject(tmp_path)
+    session.do(LoadSurfaces(str(subj), "lh"))
+    hemi = session.surfaces.hemis["lh"]
+    before = hemi.states["white"].copy()
+
+    session.do(_edit(session))
+    after = hemi.states["white"].copy()
+    moved = np.flatnonzero(np.any(after != before, axis=1))
+    assert moved.size > 0
+    # The sphere's white is at 20 mm; the phantom's boundary is at 21.
+    assert np.linalg.norm(after[moved], axis=1).max() == pytest.approx(21.0, abs=0.2)
+
+    session.do(UndoSurfaceEdit())
+    np.testing.assert_array_equal(hemi.states["white"], before)
+
+    session.do(_edit(session))
+    session.do(SaveSurfaces("test"))
+    saved = read_surface(subj / "surf" / "lh.white.test")
+    assert (subj / "surf" / "surface_edits.test.json").exists()
+    m = hemi.tkr_to_scanner
+    np.testing.assert_allclose(
+        saved.vertices @ m[:3, :3].T + m[:3, 3], hemi.states["white"], atol=1e-4
+    )
+
+    # Replay the recorded session from scratch: the gesture, not the result,
+    # is recorded, and it must rebuild the same surface.
+    script = session.to_script()
+    assert "EDIT_SURFACE" in script and "UNDO_SURFACE_EDIT" in script
+    fresh = ViewerSession(device=CPU)
+    try:
+        fresh.run_script(script)
+        np.testing.assert_allclose(
+            fresh.surfaces.hemis["lh"].states["white"], hemi.states["white"], atol=1e-6
+        )
+    finally:
+        fresh.close()
+
+
+def test_grab_takes_the_outline_under_the_press(session, tmp_path):
+    session.load(_shell_anat(tmp_path))
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    st = session.state
+    assert st.grid is not None
+    layout = plane_layout(st.grid.affine, Plane.AXIAL)
+    view = PlaneView(layout=layout, shape=st.grid.shape)
+    pos = st.grid.shape[layout.fixed] // 2
+    out = {
+        o.surface: o
+        for o in session.surfaces.outlines(st.grid.affine, view, pos, ("white", "pial"))
+    }
+    for name in ("white", "pial"):
+        row, col = out[name].segments[0, 0]
+        grab = session.surfaces.grab(st.grid.affine, view, pos, ("white", "pial"), row, col, 3.0)
+        assert grab is not None and grab.surface == name
+    # Far from both outlines: nothing to grab.
+    assert (
+        session.surfaces.grab(st.grid.affine, view, pos, ("white", "pial"), 1.0, 1.0, 3.0) is None
+    )

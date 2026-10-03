@@ -90,6 +90,14 @@ class ViewerState:
     #: on the session), and which of them are drawn as slice outlines.
     surface_subject: str | None = None
     surfaces_shown: tuple[str, ...] = ("white", "pial")
+    #: Whether a press near an outline grabs it (instead of moving the
+    #: crosshair), and the brush it is dragged with: radius mm, snap 0-1,
+    #: smoothing, search mm either side, and the outward edge sign (-1 = T1).
+    surface_editing: bool = False
+    surface_brush: tuple[float, float, float, float, int] = (4.0, 1.0, 0.2, 1.5, -1)
+    #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
+    #: the anatomy the surfaces are being checked against.
+    surface_snap_key: str | None = None
 
     @property
     def crosshair_mm(self) -> tuple[float, float, float] | None:

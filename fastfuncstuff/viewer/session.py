@@ -1390,6 +1390,27 @@ class ViewerSession:
             return res.array[..., idx]
         return self.store.preview(key, idx)
 
+    def surface_sampler(self, key: str | None = None):
+        """The image a surface edit snaps to: ``key``'s current volume, or the bottom layer's.
+
+        Built on the CPU from the layer's own voxels and affine -- an edit
+        reads a few thousand points, which a device round trip would only
+        slow down -- and cached until the layer or its sub-brick changes.
+        """
+        from fastfuncstuff.surface.sampling import VolumeSampler
+
+        layer = self.state.layers.find(key) if key else self.state.layers.base
+        if layer is None:
+            raise ValueError("no layer to snap surface edits to; load the anatomy first")
+        idx = self.state.time_index if layer.time_linked else layer.volume_index
+        cache = (layer.key, int(idx), np.asarray(layer.affine).tobytes())
+        hit = getattr(self, "_surface_sampler", None)
+        if hit is not None and hit[0] == cache:
+            return hit[1]
+        sampler = VolumeSampler(self.volume(layer.key, int(idx)), layer.affine)
+        self._surface_sampler = (cache, sampler)
+        return sampler
+
     def display_volume(self, key: str, index: int | None = None) -> torch.Tensor | None:
         """The currently displayed sub-brick as a device tensor, cached.
 

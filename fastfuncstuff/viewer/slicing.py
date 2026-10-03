@@ -175,6 +175,24 @@ class PlaneView:
         r0, c0 = self.origin
         return np.stack([row - r0, col - c0], axis=-1)
 
+    def image_to_points(self, row: float, col: float, position: float) -> np.ndarray:
+        """Fractional (row, col) on the slice at ``position`` to a display-grid point.
+
+        The inverse of :meth:`points_to_image` -- same flips, same crop -- for
+        gestures that act on geometry (grabbing an outline, dragging it) and
+        must not snap to voxel centres the way a crosshair click does.
+        """
+        lay = self.layout
+        r0, c0 = self.origin
+        r, c = float(row) + r0, float(col) + c0
+        if lay.row_flip:
+            r = self.shape[lay.row] - 1 - r
+        if lay.col_flip:
+            c = self.shape[lay.col] - 1 - c
+        out = np.zeros(3)
+        out[lay.fixed], out[lay.row], out[lay.col] = float(position), r, c
+        return out
+
     def to_ijk(self, row: int, col: int, current: tuple[int, int, int]) -> tuple[int, int, int]:
         """(row, col) in the drawn image back to display-grid indices."""
         r0, c0 = self.origin
