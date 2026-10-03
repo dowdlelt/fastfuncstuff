@@ -159,13 +159,19 @@ class SurfaceStore:
         view: PlaneView,
         position: int,
         shown: tuple[str, ...],
+        only: set[tuple[str, str]] | None = None,
     ) -> list[Outline]:
-        """Where each shown surface crosses the slice at ``position``."""
+        """Where each shown surface crosses the slice at ``position``.
+
+        ``only`` limits it to some (hemi, surface) pairs -- what a drag moved.
+        """
         out: list[Outline] = []
         axis = view.layout.fixed
         for hemi in self.hemis:
             for surface in shown:
                 if surface not in ANATOMICAL:
+                    continue
+                if only is not None and (hemi, surface) not in only:
                     continue
                 index = self._slice_index(hemi, surface, grid_affine)
                 if index is None:
@@ -240,6 +246,14 @@ class SurfaceStore:
     @property
     def editing(self) -> Grab | None:
         return None if self._active is None else self._active[0]
+
+    @property
+    def editing_keys(self) -> set[tuple[str, str]] | None:
+        """The (hemi, surface) pairs the active drag can move, or ``None``."""
+        if self._active is None:
+            return None
+        hemi = self._active[0].hemi
+        return {(hemi, "white"), (hemi, "pial")}
 
     def preview(self, drag_mm: np.ndarray) -> EditResult | None:
         """Show the active drag at ``drag_mm`` from the press, without committing."""

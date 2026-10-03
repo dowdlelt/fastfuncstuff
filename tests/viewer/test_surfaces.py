@@ -194,3 +194,62 @@ def test_grab_takes_the_outline_under_the_press(session, tmp_path):
     assert (
         session.surfaces.grab(st.grid.affine, view, pos, ("white", "pial"), 1.0, 1.0, 3.0) is None
     )
+
+
+def test_drag_gesture_previews_live_and_records_one_edit(tmp_path):
+    """Press, drag, release through the real window: one EDIT_SURFACE, outlines live."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetSurfaceEditing
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("S1", "image", "coronal"))
+        win._dispatch(SetSurfaceEditing(True))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "S1"
+        )
+        st = session.state
+        vp = image._viewport()
+        assert st.grid is not None and vp is not None
+        view = plane_view(st, vp)
+        pos = image.pane.position
+        assert view is not None and pos is not None
+        pial = {
+            o.surface: o
+            for o in session.surfaces.outlines(st.grid.affine, view, pos, ("white", "pial"))
+        }["pial"].segments
+        row, col = pial[0, 0]
+        n_before = len(session.to_script().splitlines())
+
+        image.pane.edit_pressed.emit(float(row), float(col))
+        assert session.surfaces.editing is not None
+        before = image.pane._outlines[("lh", "pial")][1].boundingRect()
+        for step in (1.0, 2.0, 3.0):
+            image.pane.edit_dragged.emit(float(row), float(col) + step)
+        app.processEvents()
+        assert image.pane._outlines[("lh", "pial")][1].boundingRect() != before
+        image.pane.edit_released.emit()
+        app.processEvents()
+
+        lines = session.to_script().splitlines()[n_before:]
+        assert sum(line.startswith("EDIT_SURFACE") for line in lines) == 1
+        assert session.surfaces.editing is None
+
+        # A press nowhere near an outline still means "look here".
+        cross = st.crosshair
+        image.pane.edit_pressed.emit(2.0, 2.0)
+        assert session.surfaces.editing is None
+        assert st.crosshair != cross
+    finally:
+        win.close()

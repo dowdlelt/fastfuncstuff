@@ -22,6 +22,30 @@ from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
 
 
+def _segment_path(segments: np.ndarray) -> QtGui.QPainterPath:
+    """``(N, 2, 2)`` (x, y) segments as one path of move-to/line-to pairs.
+
+    Built by deserialising bytes rather than one Python call per segment. A
+    slice crosses ~10k triangles: a ``QLineF`` per segment made object
+    construction most of a surface-drag redraw, and a ``QPolygonF`` of point
+    pairs was cheap to fill but ~4x slower to *draw* (the argument is
+    converted back through Python). A path is cheapest on both counts.
+    The layout is ``QDataStream``'s for ``QPainterPath``: element count,
+    then (type, x, y) per element with 0 = move-to and 1 = line-to, then
+    the fill rule.
+    """
+    pts = segments.reshape(-1, 2)
+    n = pts.shape[0]
+    rec = np.empty(n, dtype=[("type", ">i4"), ("x", ">f8"), ("y", ">f8")])
+    rec["type"] = np.tile(np.array([0, 1], ">i4"), n // 2)
+    rec["x"], rec["y"] = pts[:, 0], pts[:, 1]
+    raw = np.array([n], ">i4").tobytes() + rec.tobytes() + np.array([0], ">i4").tobytes()
+    path = QtGui.QPainterPath()
+    stream = QtCore.QDataStream(QtCore.QByteArray(raw))
+    stream >> path  # type: ignore[operator]
+    return path
+
+
 class ImagePane(QtWidgets.QWidget):
     """One display plane."""
 
@@ -39,6 +63,12 @@ class ImagePane(QtWidgets.QWidget):
     slid = QtCore.Signal(float, float)
     turned = QtCore.Signal(float)
     released = QtCore.Signal()
+    #: Surface-editing gestures, in *fractional* image pixels: an outline is
+    #: geometry, and snapping its grab to a voxel centre would put the drag
+    #: up to half a voxel from where the hand is.
+    edit_pressed = QtCore.Signal(float, float)
+    edit_dragged = QtCore.Signal(float, float)
+    edit_released = QtCore.Signal()
 
     #: The rotation ring's radius as a fraction of the drawn image's short side,
     #: and how close to it (widget pixels) a press counts as grabbing it.
@@ -66,7 +96,16 @@ class ImagePane(QtWidgets.QWidget):
         self._grab_angle = 0.0
         #: Surface outlines as (colour, lines) in image-pixel coordinates,
         #: built once per slice and scaled at paint time.
-        self._outlines: list[tuple[QtGui.QColor, list[QtCore.QLineF]]] = []
+        #: Keyed by (hemi, surface) so a drag that moves one hemisphere
+        #: rebuilds only its lines -- building QLineFs is most of the cost.
+        self._outlines: dict[tuple[str, str], tuple[QtGui.QColor, QtGui.QPainterPath]] = {}
+        #: Brush radius in image pixels while editing surfaces, else ``None``;
+        #: drawn as a circle at the cursor so its reach is visible before a
+        #: press commits to it.
+        self._brush: float | None = None
+        self._hover: QtCore.QPointF | None = None
+        self._editing_drag = False
+        self._brush_label = ""
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -119,17 +158,47 @@ class ImagePane(QtWidgets.QWidget):
         self._cross = (int(row), int(col))
         self.update()
 
-    def set_outlines(self, outlines) -> None:
-        """Surface/slice crossings, as :class:`viewer.surfaces.Outline` records."""
-        built = []
+    def set_outlines(self, outlines, only: set[tuple[str, str]] | None = None) -> None:
+        """Surface/slice crossings, as :class:`viewer.surfaces.Outline` records.
+
+        With ``only``, just those (hemi, surface) keys are replaced and every
+        other outline is kept as built.
+        """
+        built: dict[tuple[str, str], tuple[QtGui.QColor, QtGui.QPainterPath]] = {}
         for o in outlines:
             # (row, col) -> (x, y) = (col, row), pixel centres at +0.5.
-            seg = o.segments[..., ::-1].reshape(-1, 4) + 0.5
-            lines = [QtCore.QLineF(x0, y0, x1, y1) for x0, y0, x1, y1 in seg.tolist()]
-            built.append((QtGui.QColor.fromRgbF(*o.rgb), lines))
-        if built or self._outlines:
+            built[(o.hemi, o.surface)] = (
+                QtGui.QColor.fromRgbF(*o.rgb),
+                _segment_path(o.segments[..., ::-1] + 0.5),
+            )
+        if only is None:
+            changed = bool(built or self._outlines)
             self._outlines = built
+        else:
+            for key in only:
+                self._outlines.pop(key, None)
+            self._outlines.update(built)
+            changed = True
+        if changed:
             self.update()
+
+    def set_brush(self, radius_px: float | None, label: str = "") -> None:
+        """Enter (radius in image pixels) or leave (``None``) surface editing."""
+        if radius_px != self._brush or label != self._brush_label:
+            self._brush = radius_px
+            self._brush_label = label
+            if radius_px is None:
+                self._editing_drag = False
+            self.update()
+
+    def _to_fraction(self, pos: QtCore.QPointF) -> tuple[float, float] | None:
+        """Widget point to fractional (row, col), pixel ``r`` centred at ``r + 0.5``."""
+        rect = self._target_rect()
+        if self._image is None or rect.width() == 0 or rect.height() == 0:
+            return None
+        col = (pos.x() - rect.x()) / rect.width() * self._image.width() - 0.5
+        row = (pos.y() - rect.y()) / rect.height() * self._image.height() - 0.5
+        return (row, col)
 
     def set_handle(self, where: tuple[float, float] | None) -> None:
         """Show the align ring around an image point, or hide it (``None``)."""
@@ -209,6 +278,8 @@ class ImagePane(QtWidgets.QWidget):
 
         if self._cross is not None:
             self._paint_crosshair(p, rect)
+        if self._brush is not None and self._hover is not None:
+            self._paint_brush(p)
         if self._handle is not None:
             self._paint_handle(p, rect)
 
@@ -221,6 +292,8 @@ class ImagePane(QtWidgets.QWidget):
         # brain -- the same reason the edge labels are written on.
         zoom = "  zoom" if self._zoomed else ""
         p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}")
+        if self._brush is not None and self._brush_label:
+            p.drawText(6, 30, self._brush_label)
 
         # Anatomical edge labels. An upside-down or mirrored brain still looks
         # like a brain, so the only thing that says which way round it is, is
@@ -245,7 +318,7 @@ class ImagePane(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         p.translate(rect.x(), rect.y())
         p.scale(rect.width() / self._image.width(), rect.height() / self._image.height())
-        for colour, lines in self._outlines:
+        for colour, path in self._outlines.values():
             pen = QtGui.QPen(colour)
             # Cosmetic: a screen-pixel width however far the slice is
             # magnified, so zooming in to judge a boundary makes the line
@@ -253,7 +326,18 @@ class ImagePane(QtWidgets.QWidget):
             pen.setCosmetic(True)
             pen.setWidthF(1.25)
             p.setPen(pen)
-            p.drawLines(lines)
+            p.drawPath(path)
+        p.restore()
+
+    def _paint_brush(self, p: QtGui.QPainter) -> None:
+        assert self._brush is not None and self._hover is not None
+        r = self._brush * self._image_scale()
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        pen = QtGui.QPen(QtGui.QColor.fromRgbF(*theme.palette().crosshair, 0.9))
+        pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawEllipse(self._hover, r, r)
         p.restore()
 
     def _paint_readout(self, p: QtGui.QPainter) -> None:
@@ -391,6 +475,12 @@ class ImagePane(QtWidgets.QWidget):
             self._drag_from = event.position()
             return
         mods = event.modifiers()
+        if self._brush is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            frac = self._to_fraction(event.position())
+            if frac is not None:
+                self._editing_drag = True
+                self.edit_pressed.emit(*frac)
+            return
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
             kind = self._grab_kind(event.position(), shift)
@@ -420,7 +510,15 @@ class ImagePane(QtWidgets.QWidget):
                 # left into view, the way dragging a map works.
                 self.panned.emit(-delta.y() / scale, -delta.x() / scale)
             return
+        if self._brush is not None:
+            self._hover = event.position()
+            self.update()
         if not (event.buttons() & QtCore.Qt.MouseButton.LeftButton):
+            return
+        if self._editing_drag:
+            frac = self._to_fraction(event.position())
+            if frac is not None:
+                self.edit_dragged.emit(*frac)
             return
         if self._grab is not None and self._grab_at is not None:
             if self._grab == "slide":
@@ -440,6 +538,10 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._editing_drag and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._editing_drag = False
+            self.edit_released.emit()
+            return
         if self._grab is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
             self._grab = None
             self._grab_at = None
@@ -447,6 +549,12 @@ class ImagePane(QtWidgets.QWidget):
             self.released.emit()
             return
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802 (Qt)
+        if self._hover is not None:
+            self._hover = None
+            self.update()
+        super().leaveEvent(event)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 (Qt)
         delta = event.angleDelta().y()

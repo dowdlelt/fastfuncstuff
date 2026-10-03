@@ -98,6 +98,7 @@ class WindowManager(QtCore.QObject):
         if viewport.is_image:
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
+            win.surfaces_previewed.connect(self._redraw_outlines)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
@@ -184,6 +185,12 @@ class WindowManager(QtCore.QObject):
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
+
+    def _redraw_outlines(self) -> None:
+        """A surface drag in one window moves the outlines in all of them."""
+        for win in list(self.windows.values()):
+            if isinstance(win, ImageWindow):
+                win.redraw_outlines()
 
     def restyle(self) -> None:
         """Re-read the palette in every companion window."""

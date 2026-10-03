@@ -22,21 +22,26 @@ from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.compose import plane_view, render_viewport
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.surfaces import Grab
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.panes import ImagePane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
+    EditSurface,
     SetEdges,
     SetIJK,
     SetLayerOpacity,
     SetPan,
     SetSeed,
+    SetSurfaceBrush,
+    SetSurfaceEditing,
     SetViewLocked,
     SetViewPlane,
     SetViewPosition,
     SetViewSolo,
     SetZoom,
+    UndoSurfaceEdit,
 )
 
 PLANE_KEYS = {Plane.AXIAL: "1", Plane.SAGITTAL: "2", Plane.CORONAL: "3"}
@@ -56,6 +61,9 @@ class ImageWindow(QtWidgets.QWidget):
     #: A review key asked the mode to do something: the action's name. Ignored
     #: by the controller in a mode that does not declare that action.
     action_requested = QtCore.Signal(str)
+    #: A surface drag moved vertices without touching any image; every image
+    #: window should redraw its outlines (and nothing else).
+    surfaces_previewed = QtCore.Signal()
 
     def __init__(
         self,
@@ -106,6 +114,16 @@ class ImageWindow(QtWidgets.QWidget):
         self.lock_button.clicked.connect(self._toggle_lock)
         bar.addWidget(self.lock_button)
 
+        self.edit_button = self._button(
+            "EDIT",
+            "g",
+            "Edit surfaces: drag a white or pial outline toward where it should be\n"
+            "and it snaps to the edge in the anatomy, over a brush in 3-D.\n"
+            "( ) brush radius, ctrl+Z undo, Esc cancel a drag.",
+        )
+        self.edit_button.clicked.connect(lambda on: self._dispatch(SetSurfaceEditing(bool(on))))
+        bar.addWidget(self.edit_button)
+
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
         self.slice_label.setObjectName("value")
@@ -140,6 +158,12 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.panned.connect(self._pan_by)
         self.pane.slid.connect(self._slide)
         self.pane.turned.connect(self._turn)
+        self.pane.edit_pressed.connect(self._edit_press)
+        self.pane.edit_dragged.connect(self._edit_drag)
+        self.pane.edit_released.connect(self._edit_release)
+        #: (grab, press mm) of the drag in progress, if this window started one.
+        self._edit: tuple[Grab, np.ndarray] | None = None
+        self._edit_drag_mm: np.ndarray | None = None
         v.addWidget(self.pane, 1)
         # Two thirds of what it used to be. An EPI slice is 64 to 100 voxels
         # across, so a 420-pixel window was showing it at four times its own
@@ -190,6 +214,14 @@ class ImageWindow(QtWidgets.QWidget):
                     self._toggle_opacity,
                     group="layer",
                 ),
+                Binding(
+                    "g", "edit surfaces (grab an outline)", self.edit_button.click, group="surface"
+                ),
+                Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
+                Binding(")", "larger brush", lambda: self._scale_brush(1.25), group="surface"),
+                Binding("m", "snap to the image edge on / off", self._toggle_snap, group="surface"),
+                Binding("ctrl+z", "undo the last surface edit", self._undo_edit, group="surface"),
+                Binding("Escape", "cancel the drag", self._cancel_edit, group="surface"),
                 Binding("drag the ring", "turn the moving image", None, group="align mode"),
                 Binding(
                     "drag the centre",
@@ -443,6 +475,7 @@ class ImageWindow(QtWidgets.QWidget):
             button.setChecked(plane is viewport.plane)
         self.solo_button.setChecked(viewport.solo)
         self.lock_button.setChecked(viewport.locked)
+        self.edit_button.setChecked(self.session.state.surface_editing)
         self.pane.plane = viewport.plane
 
     def restyle(self) -> None:
@@ -458,6 +491,8 @@ class ImageWindow(QtWidgets.QWidget):
         self._sync_opacity()
         state = self.session.state
         self._redraw_outlines(vp)
+        self.edit_button.setChecked(state.surface_editing)
+        self._sync_brush()
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
             extent = state.grid.shape[layout.fixed]
@@ -466,7 +501,137 @@ class ImageWindow(QtWidgets.QWidget):
             self.slice_label.setText(f"{'--' if pos is None else pos}/{extent - 1}{follow}")
         self.redraw_crosshair()
 
-    def _redraw_outlines(self, vp: Viewport) -> None:
+    # -- surface editing ----------------------------------------------
+    def _brush_px(self) -> float | None:
+        """Brush radius in image pixels, or ``None`` when not editing."""
+        state = self.session.state
+        if not state.surface_editing or state.grid is None or not self.session.surfaces.hemis:
+            return None
+        vp = self._viewport()
+        if vp is None:
+            return None
+        layout = plane_layout(state.grid.affine, vp.plane)
+        # In-plane voxel size: the pane draws one display voxel per pixel.
+        cols = np.linalg.norm(state.grid.affine[:3, [layout.row, layout.col]], axis=0)
+        return float(state.surface_brush[0] / cols.mean())
+
+    def _scale_brush(self, factor: float) -> None:
+        r, snap, smooth, search, sign = self.session.state.surface_brush
+        r = float(np.clip(r * factor, 0.5, 30.0))
+        self._dispatch(SetSurfaceBrush(round(r, 2), snap, smooth, search, sign))
+        self._sync_brush()
+
+    def _toggle_snap(self) -> None:
+        """Snap fully to the found edge, or follow the hand exactly.
+
+        A toggle rather than a slider because the two uses are distinct: snap
+        when the image shows the boundary, hand when it does not (a vessel, a
+        dura fold) and the eye knows better than the gradient.
+        """
+        r, snap, smooth, search, sign = self.session.state.surface_brush
+        self._dispatch(SetSurfaceBrush(r, 0.0 if snap > 0 else 1.0, smooth, search, sign))
+        self._sync_brush()
+
+    def _sync_brush(self) -> None:
+        r, snap, *_ = self.session.state.surface_brush
+        mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
+        self.pane.set_brush(self._brush_px(), f"EDIT  r={r:g} mm  {mode}")
+
+    def _press_point_mm(self, row: float, col: float) -> np.ndarray | None:
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        if view is None or pos is None or state.grid is None:
+            return None
+        ijk = view.image_to_points(row, col, pos)
+        return state.grid.affine[:3, :3] @ ijk + state.grid.affine[:3, 3]
+
+    def _edit_press(self, row: float, col: float) -> None:
+        from fastfuncstuff.surface.edit import SnapParams
+
+        state = self.session.state
+        surfaces = self.session.surfaces
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        if view is None or pos is None or state.grid is None:
+            return
+        # Tolerance in image pixels from a screen distance, so grabbing feels
+        # the same at every zoom.
+        tolerance = 8.0 / self.pane._image_scale()
+        grab = surfaces.grab(
+            state.grid.affine, view, pos, state.surfaces_shown, row, col, tolerance
+        )
+        if grab is None:
+            # Not near an outline: the press still means "look here".
+            self._pick(int(round(row)), int(round(col)), seed=False)
+            return
+        r, snap, smooth, search, sign = state.surface_brush
+        params = SnapParams(radius=r, snap=snap, smooth=smooth, search=search, edge_sign=sign)
+        try:
+            sampler = self.session.surface_sampler(state.surface_snap_key)
+        except (ValueError, KeyError) as exc:
+            self.setToolTip(str(exc))
+            return
+        surfaces.begin(grab, sampler, params)
+        self._edit = (grab, np.asarray(grab.at_mm))
+        self._edit_drag_mm = np.zeros(3)
+
+    def _edit_drag(self, row: float, col: float) -> None:
+        if self._edit is None:
+            return
+        here = self._press_point_mm(row, col)
+        if here is None:
+            return
+        self._edit_drag_mm = here - self._edit[1]
+        self.session.surfaces.preview(self._edit_drag_mm)
+        self.surfaces_previewed.emit()
+
+    def _edit_release(self) -> None:
+        if self._edit is None:
+            return
+        grab, _ = self._edit
+        drag = self._edit_drag_mm if self._edit_drag_mm is not None else np.zeros(3)
+        self._edit = None
+        self._edit_drag_mm = None
+        if not np.any(drag):
+            self.session.surfaces.cancel()
+            return
+        r, snap, smooth, search, sign = self.session.state.surface_brush
+        self._dispatch(
+            EditSurface(
+                grab.hemi,
+                grab.surface,
+                grab.vertex,
+                grab.at_mm,
+                (float(drag[0]), float(drag[1]), float(drag[2])),
+                r,
+                snap,
+                smooth,
+                search,
+                sign,
+                self.session.state.surface_snap_key or "",
+            )
+        )
+
+    def _cancel_edit(self) -> None:
+        if self._edit is not None:
+            self._edit = None
+            self._edit_drag_mm = None
+            self.session.surfaces.cancel()
+            self.surfaces_previewed.emit()
+
+    def _undo_edit(self) -> None:
+        self._dispatch(UndoSurfaceEdit())
+
+    def redraw_outlines(self) -> None:
+        """Only the outlines a drag can move -- the image is unchanged."""
+        vp = self._viewport()
+        if vp is not None:
+            self._redraw_outlines(vp, only=self.session.surfaces.editing_keys)
+
+    def _redraw_outlines(self, vp: Viewport, only: set[tuple[str, str]] | None = None) -> None:
         state = self.session.state
         surfaces = self.session.surfaces
         view = plane_view(state, vp)
@@ -476,7 +641,8 @@ class ImageWindow(QtWidgets.QWidget):
             return
         assert state.grid is not None
         self.pane.set_outlines(
-            surfaces.outlines(state.grid.affine, view, pos, state.surfaces_shown)
+            surfaces.outlines(state.grid.affine, view, pos, state.surfaces_shown, only=only),
+            only=only,
         )
 
     def redraw_crosshair(self) -> None:
