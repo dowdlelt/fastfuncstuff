@@ -563,6 +563,17 @@ class SetSurfaceMap(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceFolding(Command):
+    """The folding shade under a surface window's overlays: curv, sulc, binary, off."""
+
+    name = "SET_SURFACE_FOLDING"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    mode: str = "curv"
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceHemis(Command):
     """Which hemispheres a surface window draws, and how far apart (mm)."""
 
@@ -1469,6 +1480,15 @@ def install(
                 f"unknown surface map {cmd.map!r}; one of {', '.join(m for m in VERTEX_MAPS if m)}"
             )
         return _set_view(st, cmd.view, SetSurfaceMap.aspects, vertex_map=cmd.map)
+
+    @bus.handle(SetSurfaceFolding.name)
+    def _set_surface_folding(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceFolding)
+        from fastfuncstuff.viewer.surface3d import FOLDING
+
+        if cmd.mode not in FOLDING:
+            raise ValueError(f"unknown folding {cmd.mode!r}; one of {', '.join(FOLDING)}")
+        return _set_view(st, cmd.view, SetSurfaceFolding.aspects, folding=cmd.mode)
 
     @bus.handle(SetSurfaceHemis.name)
     def _set_surface_hemis(cmd: Command, st: ViewerState) -> Aspect:

@@ -178,3 +178,59 @@ def test_label_layers_draw_their_palette_colour_unblended(tmp_path):
     finally:
         session.close()
         app.processEvents()
+
+
+def test_outline_only_labels_draw_borders_over_the_layer_below(tmp_path):
+    """The stack composites, and ``edges`` on a label layer draws only borders."""
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        pytest.skip("QRhi needs a real platform plugin")
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetEdges, SetRange, SetSurfaceShape
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shape = (30, 30, 10)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = [-29.0, -29.0, -9.0]
+    ijk = np.stack(np.meshgrid(*[np.arange(k) for k in shape], indexing="ij"), -1)
+    # Four quadrant regions, so borders are two straight lines through the middle.
+    labels = (1 + (ijk[..., 0] >= 15) + 2 * (ijk[..., 1] >= 15)).astype(np.int16)
+    nib.save(nib.Nifti1Image(np.zeros(shape, np.float32), aff), str(tmp_path / "base.nii.gz"))
+    # Not an integer: a constant integer volume is rightly taken for a label map.
+    nib.save(nib.Nifti1Image(np.full(shape, 62.5, np.float32), aff), str(tmp_path / "stat.nii.gz"))
+    nib.save(nib.Nifti1Image(labels, aff), str(tmp_path / "rois.nii.gz"))
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(tmp_path / "base.nii.gz"))
+        stat = session.load(str(tmp_path / "stat.nii.gz"))
+        assert not session.state.layers.get(stat).roi
+        session.do(SetRange(stat, 0.0, 62.5))
+        rois = session.load(str(tmp_path / "rois.nii.gz"))
+        session.do(SetEdges(rois, True))
+        palette = np.round(session.roi_palette(rois, torch.device("cpu")).numpy() * 255)
+        session.surfaces.hemis = {"lh": _sheet()}
+        session.surfaces.version = {"lh": 1}
+        session.do(OpenView("S1", "surface", "axial"))
+        session.do(SetSurfaceShape("S1", "flat"))
+        win = SurfaceWindow("S1", session, session.do)
+        win.canvas.resize(320, 320)
+        win.apply(session.state.viewports.get("S1"))
+        win.canvas._anim.stop()
+        win.canvas.morph = 1.0
+        grabbed = win.canvas.grabFramebuffer()
+        if grabbed.isNull():
+            pytest.skip("no QRhi available to render with")
+        img = grabbed.convertToFormat(grabbed.Format.Format_RGBA8888)
+        px = np.array(img.constBits()).reshape(img.height(), img.width(), 4)[..., :3].astype(int)
+        top = np.array([255, 255, 255])  # gray LUT at the top of its range
+        inner = px[60:260, 60:260].reshape(-1, 3)
+        is_stat = np.all(np.abs(inner - top) <= 2, axis=1)
+        is_border = np.zeros(len(inner), bool)
+        for c in palette[1:5]:
+            is_border |= np.all(np.abs(inner - c) <= 2, axis=1)
+        # Mostly the layer below; a thin set of border pixels in region colours.
+        assert is_stat.mean() > 0.9
+        assert 0.001 < is_border.mean() < 0.08
+    finally:
+        session.close()
+        app.processEvents()

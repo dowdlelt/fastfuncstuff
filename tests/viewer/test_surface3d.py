@@ -74,18 +74,21 @@ def test_laid_out_hemispheres_sit_left_and_right_with_a_gap():
     assert all(np.all(v == 0) for v in s3.layout_offsets(pos, "mid").values())
 
 
-def test_uniform_block_is_column_major_and_sized():
+def test_uniform_block_is_column_major_sized_and_layered():
     m = np.arange(16, dtype=np.float32).reshape(4, 4)
+    shade = s3.ShadeParams(lo=-2, hi=3, threshold=1.5, has_data=True, outline=s3.OUTLINE_ONLY)
+    labels = s3.ShadeParams(has_data=True, labels=True)
     raw = s3.pack_uniforms(
         m,
-        np.eye(4),
-        np.eye(4),
         np.eye(4),
         morph=0.25,
         depth=(0.1, 0.9),
         samples=3,
-        curv_contrast=0.1,
-        shade=s3.ShadeParams(),
+        fold_contrast=0.1,
+        layers=[
+            s3.LayerUniforms(np.eye(4), np.eye(4), shade, lut_row=0),
+            s3.LayerUniforms(np.eye(4) * 2, np.eye(4), labels, lut_row=1, palette_row=3),
+        ],
         cross=(1, 2, 3, 4),
         cross_rgb=(0.5, 0.5, 0.5),
     )
@@ -93,8 +96,42 @@ def test_uniform_block_is_column_major_and_sized():
     first = np.frombuffer(raw[:64], np.float32)
     # GLSL reads column 0 first: m[0,0], m[1,0], m[2,0], m[3,0].
     np.testing.assert_array_equal(first[:4], m[:, 0])
-    morph = np.frombuffer(raw[256:272], np.float32)
-    assert morph[0] == pytest.approx(0.25)
+    assert np.frombuffer(raw[128:144], np.float32)[0] == pytest.approx(0.25)
+    head = 2 * 64 + 5 * 16
+
+    def layer(k):
+        return raw[head + k * s3.LAYER_BYTES : head + (k + 1) * s3.LAYER_BYTES]
+
+    cmap = np.frombuffer(layer(0)[128:144], np.float32)
+    modes = np.frombuffer(layer(0)[144:160], np.float32)
+    info = np.frombuffer(layer(0)[160:176], np.float32)
+    np.testing.assert_allclose(cmap, [-2, 3, 1.5, 1])
+    assert modes[3] == 1.0 and info[2] == s3.OUTLINE_ONLY
+    assert np.frombuffer(layer(1)[144:160], np.float32)[3] == 2.0  # labels
+    assert np.frombuffer(layer(1)[160:176], np.float32)[1] == 3.0  # palette row
+    assert np.frombuffer(layer(1)[:4], np.float32)[0] == 2.0  # its own frame
+    # Unused slots are off.
+    assert not any(layer(2)) and not any(layer(3))
+
+
+def test_folding_shades_are_bounded_and_signed():
+    from fastfuncstuff.io.freesurfer import Hemisphere
+
+    curv = np.array([-0.4, -0.1, 0.0, 0.2, 0.9], np.float32)
+    hemi = Hemisphere(
+        name="lh",
+        faces=np.array([[0, 1, 2], [2, 3, 4]], np.int32),
+        states={"white": np.zeros((5, 3), np.float32)},
+        tkr_to_scanner=np.eye(4),
+        morph={"curv": curv},
+    )
+    for mode in s3.FOLDING:
+        f = s3.folding_values(hemi, mode)
+        assert f.shape == (5,) and np.all(np.abs(f) <= 1)
+    np.testing.assert_array_equal(s3.folding_values(hemi, "binary"), np.sign(curv))
+    assert not s3.folding_values(hemi, "off").any()
+    # No sulc file: falls back to curvature rather than to nothing.
+    np.testing.assert_array_equal(s3.folding_values(hemi, "sulc"), s3.folding_values(hemi, "curv"))
 
 
 def test_depth_fractions():

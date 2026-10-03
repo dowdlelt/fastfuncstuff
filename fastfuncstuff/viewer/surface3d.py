@@ -265,8 +265,17 @@ def pick(
 
 # -- uniforms -------------------------------------------------------------------
 
-#: std140 block shared by both shaders; field order must match surface.vert/.frag.
-UNIFORM_BYTES = 4 * 64 + 7 * 16
+#: Overlay layers the shader composites, bottom to top.
+MAX_LAYERS = 4
+#: Bytes of one ``Layer`` struct and of the whole block (std140); must match
+#: surface.vert/.frag.
+LAYER_BYTES = 2 * 64 + 3 * 16
+UNIFORM_BYTES = 2 * 64 + 5 * 16 + MAX_LAYERS * LAYER_BYTES
+
+#: Outline modes, from the layer's own flags so 2-D and 3-D agree: ``boxed``
+#: draws the fill and its border, ``edges`` the border alone -- for an ROI or
+#: atlas, the lines between regions; for a stat map, its clusters' contours.
+OUTLINE_NONE, OUTLINE_BOXED, OUTLINE_ONLY = 0, 1, 2
 
 
 @dataclass
@@ -284,54 +293,100 @@ class ShadeParams:
     #: A label layer: colour by value from the palette, sampled nearest at
     #: mid-depth only.
     labels: bool = False
+    outline: int = OUTLINE_NONE
+
+
+@dataclass
+class LayerUniforms:
+    """One overlay's slot in the uniform block."""
+
+    tex_from_mm: np.ndarray
+    stat_from_mm: np.ndarray
+    shade: ShadeParams
+    lut_row: int = 0
+    palette_row: int = 0
+
+
+def _mat(m: np.ndarray) -> bytes:
+    return np.asarray(m, np.float32).T.tobytes()
+
+
+def _vec(*xs: float) -> bytes:
+    return np.array(xs, np.float32).tobytes()
 
 
 def pack_uniforms(
     mvp: np.ndarray,
     view_model: np.ndarray,
-    tex_from_mm: np.ndarray,
-    stat_from_mm: np.ndarray,
     *,
     morph: float,
     depth: tuple[float, float],
     samples: int,
-    curv_contrast: float,
-    shade: ShadeParams,
+    fold_contrast: float,
+    layers: list[LayerUniforms],
     cross: tuple[float, float, float, float],
     cross_rgb: tuple[float, float, float],
     equivolume: bool = False,
     map_opacity: float = 1.0,
 ) -> bytes:
-    """The uniform block as bytes. Matrices go column-major, as GLSL reads them."""
+    """The uniform block as bytes. Matrices go column-major, as GLSL reads them.
 
-    def mat(m: np.ndarray) -> bytes:
-        return np.asarray(m, np.float32).T.tobytes()
-
-    def vec(*xs: float) -> bytes:
-        return np.array(xs, np.float32).tobytes()
-
-    out = b"".join(
-        [
-            mat(mvp),
-            mat(view_model),
-            mat(tex_from_mm),
-            mat(stat_from_mm),
-            vec(morph, 0.0, 0.0, 0.0),
-            vec(depth[0], depth[1], float(samples), curv_contrast),
-            vec(shade.lo, shade.hi, shade.threshold, shade.opacity),
-            vec(
-                shade.sign_mode,
-                shade.alpha_mode,
-                shade.n_panes,
-                (2.0 if shade.labels else 1.0) if shade.has_data else 0.0,
-            ),
-            vec(*cross),
-            vec(*cross_rgb, 0.0),
-            vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
-        ]
-    )
+    ``layers`` beyond :data:`MAX_LAYERS` are dropped from the bottom -- the
+    top of the stack is what is looked at; empty slots are kind 0 (off).
+    """
+    parts = [
+        _mat(mvp),
+        _mat(view_model),
+        _vec(morph, 0.0, 0.0, 0.0),
+        _vec(depth[0], depth[1], float(samples), fold_contrast),
+        _vec(*cross),
+        _vec(*cross_rgb, 0.0),
+        _vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
+    ]
+    shown = layers[-MAX_LAYERS:]
+    for k in range(MAX_LAYERS):
+        if k < len(shown):
+            L = shown[k]
+            sh = L.shade
+            kind = (2.0 if sh.labels else 1.0) if sh.has_data else 0.0
+            parts += [
+                _mat(L.tex_from_mm),
+                _mat(L.stat_from_mm),
+                _vec(sh.lo, sh.hi, sh.threshold, sh.opacity),
+                _vec(sh.sign_mode, sh.alpha_mode, sh.n_panes, kind),
+                _vec(L.lut_row, L.palette_row, sh.outline, 0.0),
+            ]
+        else:
+            parts.append(bytes(LAYER_BYTES))
+    out = b"".join(parts)
     assert len(out) == UNIFORM_BYTES
     return out
+
+
+#: Folding shades for the base, in the order ``k`` cycles them.
+FOLDING = ("curv", "sulc", "binary", "off")
+
+
+def folding_values(hemi: Hemisphere, mode: str) -> np.ndarray:
+    """Per-vertex folding shade in [-1, 1] (positive = sulcal = darker).
+
+    ``curv`` is the fine folding; ``sulc`` the broad sulcal depth, which
+    reads best on an inflated surface; ``binary`` FreeSurfer's two-tone
+    gyri/sulci. Scaled to the 98th percentile so subjects look alike.
+    """
+    n = hemi.n_vertices
+    if mode == "off":
+        return np.zeros(n, np.float32)
+    key = "curv" if mode == "binary" else mode
+    values = hemi.morph.get(key)
+    if values is None:
+        values = hemi.morph.get("curv")
+    if values is None:
+        return np.zeros(n, np.float32)
+    if mode == "binary":
+        return np.sign(values).astype(np.float32)
+    top = float(np.percentile(np.abs(values), 98)) or 1.0
+    return np.clip(values / top, -1.0, 1.0).astype(np.float32)
 
 
 def equivolume_fraction(alpha, white_area, pial_area):
@@ -483,8 +538,12 @@ def shade_reference(values: np.ndarray, stat: np.ndarray, shade: ShadeParams, lu
 __all__ = [
     "ANATOMICAL_SHAPES",
     "SHAPES",
+    "FOLDING",
+    "MAX_LAYERS",
     "VIEWS",
     "Camera",
+    "LayerUniforms",
+    "folding_values",
     "ShadeParams",
     "PALETTE_W",
     "VERTEX_MAPS",

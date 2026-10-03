@@ -165,6 +165,9 @@ class Viewport:
     #: Per-vertex map painted under the overlay: "", thickness, sulc, curv,
     #: or annot (the state's selected parcellation).
     vertex_map: str = ""
+    #: The shade under everything: curv (fine folding), sulc (broad, best on
+    #: an inflated surface), binary (two-tone gyri/sulci) or off.
+    folding: str = "curv"
 
     # -- ribbon profiles ------------------------------------------------
     #: ``fraction`` (white and pial on fixed columns) or ``mm`` (pial where

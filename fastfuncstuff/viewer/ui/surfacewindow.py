@@ -25,6 +25,7 @@ block, the colouring arithmetic -- is in :mod:`viewer.surface3d`.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from importlib import resources
 
 import numpy as np
@@ -61,6 +62,7 @@ from fastfuncstuff.viewer.vocab import (
     SetAtlas,
     SetSurfaceDepth,
     SetSurfaceEquivolume,
+    SetSurfaceFolding,
     SetSurfaceHemis,
     SetSurfaceMap,
     SetSurfaceShape,
@@ -80,6 +82,25 @@ def _shader(name: str) -> QShader:
 def _qmatrix(m: QtGui.QMatrix4x4) -> np.ndarray:
     # data() is column-major.
     return np.array(m.data(), np.float64).reshape(4, 4).T
+
+
+@dataclass
+class OverlaySlot:
+    """One overlay layer as the canvas needs it.
+
+    ``key`` identifies the voxels: the textures re-upload only when it changes,
+    so a threshold drag or a colormap change touches uniforms and the LUT, not
+    a 100 MB volume.
+    """
+
+    key: tuple
+    value: np.ndarray  # (nz, ny, nx) float32, see surface3d.texture_data
+    value_frame: np.ndarray  # mm -> texture
+    stat: np.ndarray | None
+    stat_frame: np.ndarray | None
+    shade: s3.ShadeParams
+    lut: np.ndarray | None = None  # (256, 4) uint8
+    palette: np.ndarray | None = None  # (rows, PALETTE_W, 4) uint8
 
 
 class _HemiGPU:
@@ -110,10 +131,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.morph = 1.0
         self.depth: tuple[float, float] = (0.5, 0.5)
         self.samples = 1
-        self.curv_contrast = 0.12
+        #: Folding shade strength under the overlays.
+        self.fold_contrast = 0.16
         self.equivolume = True
         self.map_opacity = 0.85
-        self.shade = s3.ShadeParams()
+        #: Overlay layers, bottom to top (at most MAX_LAYERS are drawn).
+        self.overlays: list[OverlaySlot] = []
         self.cross: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self.linear = False
         #: Per hemisphere: arrays waiting to upload, and what is drawn.
@@ -128,12 +151,13 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._grabbed: str | None = None
         #: CPU copies for picking: drawn positions A/B, white, pial, faces.
         self._cpu: dict[str, dict[str, np.ndarray]] = {}
-        self._volume: tuple[np.ndarray, np.ndarray] | None = None
-        self._stat: tuple[np.ndarray, np.ndarray] | None = None
-        self._tex_from_mm = np.eye(4)
-        self._stat_from_mm = np.eye(4)
-        self._lut: np.ndarray | None = None
-        self._palette: np.ndarray | None = None
+        #: Per drawn slot: the key its textures hold, and those textures.
+        self._uploaded: list[tuple | None] = [None] * s3.MAX_LAYERS
+        self._slot_tex: list[tuple[QRhiTexture, QRhiTexture] | None] = [None] * s3.MAX_LAYERS
+        self._lut_bytes: bytes | None = None
+        self._palette_bytes: bytes | None = None
+        self._palette_rows: list[int] = [0] * s3.MAX_LAYERS
+        self._rebind = True
         self._gpu: dict[str, _HemiGPU] = {}
         self._rhi_ready = False
         self._press: QtCore.QPointF | None = None
@@ -220,27 +244,13 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         turn[:3, 3] = c - r @ c
         return base @ turn
 
-    def set_volume(
-        self,
-        value: tuple[np.ndarray, np.ndarray] | None,
-        stat: tuple[np.ndarray, np.ndarray] | None,
-    ) -> None:
-        """``(texture data (nz, ny, nx), mm->texture 4x4)`` for value and threshold stat."""
-        self._volume = value
-        self._stat = stat
-        self._volume_dirty = True
+    def set_overlays(self, overlays: list[OverlaySlot]) -> None:
+        """The overlay stack, bottom to top. Textures follow on the next frame."""
+        self.overlays = list(overlays)
         self.update()
 
-    def set_palette(self, image: np.ndarray | None) -> None:
-        """``(rows, PALETTE_W, 4)`` uint8 label colours (see surface3d.palette_texture)."""
-        self._palette = None if image is None else np.ascontiguousarray(image, np.uint8)
-        self._palette_dirty = self._palette is not None
-        self.update()
-
-    def set_lut(self, rgba: np.ndarray) -> None:
-        self._lut = np.ascontiguousarray(rgba, np.uint8)
-        self._lut_dirty = True
-        self.update()
+    def _drawn(self) -> list[OverlaySlot]:
+        return self.overlays[-s3.MAX_LAYERS :]
 
     def animate_to(self) -> None:
         """Run the morph from shape A (0) to shape B (1)."""
@@ -274,8 +284,6 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     def initialize(self, cb: QRhiCommandBuffer) -> None:  # noqa: ARG002 (Qt)
         rhi = self.rhi()
         self._rhi_ptr = shiboken6.getCppPointer(rhi)[0]
-        self._lut_dirty = True
-        self._volume_dirty = True
         for gpu in self._gpu.values():
             for b in gpu.buffers.values():
                 b.destroy()
@@ -300,13 +308,17 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             QRhiSampler.Filter.None_, clamp, clamp, clamp,
         )  # fmt: skip
         self._linear_s.create()
-        self._value_tex = self._new_3d(np.zeros((1, 1, 1), np.float32))
-        self._stat_tex = self._value_tex
-        self._lut_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QtCore.QSize(256, 1))
+        self._empty = self._new_3d(np.zeros((1, 1, 1), np.float32))
+        self._empty_pending = True
+        self._uploaded = [None] * s3.MAX_LAYERS
+        self._slot_tex = [None] * s3.MAX_LAYERS
+        self._lut_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QtCore.QSize(256, s3.MAX_LAYERS))
         self._lut_tex.create()
+        self._lut_bytes = None
         self._palette_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, QtCore.QSize(s3.PALETTE_W, 1))
         self._palette_tex.create()
-        self._palette_dirty = self._palette is not None
+        self._palette_bytes = None
+        self._rebind = True
         self._pipeline = None
         self._rhi_ready = True
 
@@ -372,19 +384,21 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 QRhiBuffer.Type.Dynamic, QRhiBuffer.UsageFlag.UniformBuffer, s3.UNIFORM_BYTES
             )
             gpu.ubuf.create()
-        # Labels are never interpolated: a blend of 12 and 40 is not 26.
-        sampler = self._linear_s if self.linear and not self.shade.labels else self._nearest
         srb = gpu.srb or rhi.newShaderResourceBindings()
         stage = _STAGE.VertexStage | _STAGE.FragmentStage
-        srb.setBindings(
-            [
-                Binding.uniformBuffer(0, stage, gpu.ubuf),
-                Binding.sampledTexture(1, _STAGE.FragmentStage, self._value_tex, sampler),
-                Binding.sampledTexture(2, _STAGE.FragmentStage, self._stat_tex, sampler),
-                Binding.sampledTexture(3, _STAGE.FragmentStage, self._lut_tex, self._nearest),
-                Binding.sampledTexture(4, _STAGE.FragmentStage, self._palette_tex, self._nearest),
-            ]
-        )
+        frag = _STAGE.FragmentStage
+        bindings = [Binding.uniformBuffer(0, stage, gpu.ubuf)]
+        drawn = self._drawn()
+        for k in range(s3.MAX_LAYERS):
+            tex = self._slot_tex[k] or (self._empty, self._empty)
+            labels = k < len(drawn) and drawn[k].shade.labels
+            # Labels are never interpolated: a blend of 12 and 40 is not 26.
+            sampler = self._linear_s if self.linear and not labels else self._nearest
+            bindings.append(Binding.sampledTexture(1 + k, frag, tex[0], sampler))
+            bindings.append(Binding.sampledTexture(5 + k, frag, tex[1], sampler))
+        bindings.append(Binding.sampledTexture(9, frag, self._lut_tex, self._nearest))
+        bindings.append(Binding.sampledTexture(10, frag, self._palette_tex, self._nearest))
+        srb.setBindings(bindings)
         srb.create()
         gpu.srb = srb
 
@@ -415,49 +429,70 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     gpu.buffers[key] = buf
                 batch.updateDynamicBuffer(buf, 0, arr.tobytes())
         self._pending.clear()
-        if getattr(self, "_volume_dirty", False):
-            self._volume_dirty = False
-            if self._volume is None:
-                self._value_tex = self._stat_tex = self._new_3d(np.zeros((1, 1, 1), np.float32))
-                self._upload_3d(batch, self._value_tex, np.zeros((1, 1, 1), np.float32))
+        if self._empty_pending:
+            self._upload_3d(batch, self._empty, np.zeros((1, 1, 1), np.float32))
+            self._empty_pending = False
+        drawn = self._drawn()
+        for k in range(s3.MAX_LAYERS):
+            slot = drawn[k] if k < len(drawn) else None
+            key = None if slot is None else slot.key
+            if key == self._uploaded[k]:
+                continue
+            if slot is None:
+                self._slot_tex[k] = None
             else:
-                data, self._tex_from_mm = self._volume
-                self._value_tex = self._new_3d(data)
-                self._upload_3d(batch, self._value_tex, data)
-                if self._stat is None:
-                    self._stat_tex, self._stat_from_mm = self._value_tex, self._tex_from_mm
-                else:
-                    sdata, self._stat_from_mm = self._stat
-                    self._stat_tex = self._new_3d(sdata)
-                    self._upload_3d(batch, self._stat_tex, sdata)
+                value = self._new_3d(slot.value)
+                self._upload_3d(batch, value, slot.value)
+                stat = value
+                if slot.stat is not None:
+                    stat = self._new_3d(slot.stat)
+                    self._upload_3d(batch, stat, slot.stat)
+                self._slot_tex[k] = (value, stat)
+            self._uploaded[k] = key
+            self._rebind = True
+        # One LUT row per slot; label palettes stacked, each slot told its row.
+        lut = np.zeros((s3.MAX_LAYERS, 256, 4), np.uint8)
+        palettes: list[np.ndarray] = []
+        rows = 0
+        for k, slot in enumerate(drawn):
+            if slot.lut is not None:
+                lut[k] = slot.lut
+            self._palette_rows[k] = rows
+            if slot.palette is not None:
+                palettes.append(slot.palette)
+                rows += slot.palette.shape[0]
+        raw = lut.tobytes()
+        if raw != self._lut_bytes:
+            img = QtGui.QImage(
+                raw, 256, s3.MAX_LAYERS, 4 * 256, QtGui.QImage.Format.Format_RGBA8888
+            )
+            batch.uploadTexture(self._lut_tex, img.copy())
+            self._lut_bytes = raw
+        pal = np.concatenate(palettes) if palettes else np.zeros((1, s3.PALETTE_W, 4), np.uint8)
+        raw = pal.tobytes()
+        if raw != self._palette_bytes:
+            size = QtCore.QSize(s3.PALETTE_W, pal.shape[0])
+            if self._palette_tex.pixelSize() != size:
+                self._palette_tex = rhi.newTexture(QRhiTexture.Format.RGBA8, size)
+                self._palette_tex.create()
+                self._rebind = True
+            img = QtGui.QImage(raw, s3.PALETTE_W, pal.shape[0], 4 * s3.PALETTE_W,
+                               QtGui.QImage.Format.Format_RGBA8888)  # fmt: skip
+            batch.uploadTexture(self._palette_tex, img.copy())
+            self._palette_bytes = raw
+        # Which slots are labels decides their samplers.
+        labels = tuple(slot.shade.labels for slot in drawn)
+        if labels != getattr(self, "_bound_labels", None):
+            self._bound_labels = labels
+            self._rebind = True
+        if self._rebind:
             for gpu in self._gpu.values():
                 self._bindings(gpu)
-        if getattr(self, "_palette_dirty", False) and self._palette is not None:
-            self._palette_dirty = False
-            rows, width = self._palette.shape[:2]
-            if self._palette_tex.pixelSize() != QtCore.QSize(width, rows):
-                self._palette_tex = rhi.newTexture(
-                    QRhiTexture.Format.RGBA8, QtCore.QSize(width, rows)
-                )
-                self._palette_tex.create()
-                for gpu in self._gpu.values():
-                    self._bindings(gpu)
-            img = QtGui.QImage(
-                self._palette.tobytes(), width, rows, 4 * width, QtGui.QImage.Format.Format_RGBA8888
-            ).copy()
-            batch.uploadTexture(self._palette_tex, img)
-        if getattr(self, "_lut_dirty", False) and self._lut is not None:
-            self._lut_dirty = False
-            img = QtGui.QImage(
-                self._lut.tobytes(), self._lut.shape[0], 1, QtGui.QImage.Format.Format_RGBA8888
-            ).copy()
-            batch.uploadTexture(self._lut_tex, img)
+            self._rebind = False
 
     def set_linear(self, on: bool) -> None:
         self.linear = bool(on)
-        if self._rhi_ready:
-            for gpu in self._gpu.values():
-                self._bindings(gpu)
+        self._rebind = True
         self.update()
 
     def render(self, cb: QRhiCommandBuffer) -> None:
@@ -489,13 +524,20 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 s3.pack_uniforms(
                     proj @ view @ model,
                     view @ model,
-                    self._tex_from_mm,
-                    self._stat_from_mm,
                     morph=self.morph,
                     depth=self.depth,
                     samples=self.samples,
-                    curv_contrast=self.curv_contrast,
-                    shade=self.shade,
+                    fold_contrast=self.fold_contrast,
+                    layers=[
+                        s3.LayerUniforms(
+                            slot.value_frame,
+                            slot.stat_frame if slot.stat_frame is not None else slot.value_frame,
+                            slot.shade,
+                            lut_row=k,
+                            palette_row=self._palette_rows[k],
+                        )
+                        for k, slot in enumerate(self._drawn())
+                    ],
                     cross=self.cross,
                     cross_rgb=tuple(theme.palette().crosshair[:3]),
                     equivolume=self.equivolume,
@@ -646,8 +688,9 @@ class SurfaceWindow(QtWidgets.QWidget):
         #: What was last built, so refresh() rebuilds only what changed.
         self._built_shape: str | None = None
         self._built_versions: dict[str, int] = {}
-        self._built_volume: tuple | None = None
-        self._built_lut: tuple | None = None
+        #: Texture-ready voxels per overlay key, so a redraw that changes only
+        #: a threshold does not re-read or re-transpose a volume.
+        self._slot_cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -698,7 +741,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.located.connect(self.located)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self._built_map: tuple | None = None
-        self._built_palette: tuple | None = None
+        self._built_fold: tuple | None = None
+        self._fold_hemis: set[str] = set()
         self._map_hemis: set[str] = set()
         v.addWidget(self.canvas, 1)
         self.resize(640, 520)
@@ -724,6 +768,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("shift+scroll", "scroll through cortical depth", None, group="depth"),
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
                 Key("c", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
+                Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "nearest / linear voxel sampling", self._toggle_linear, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
                 Key("shift+v", "previous view", lambda: self._cycle_view(-1), group="view"),
@@ -869,6 +914,8 @@ class SurfaceWindow(QtWidgets.QWidget):
             self.canvas.drop_hemispheres()
             self._built_shape = None
             self._built_versions = {}
+            self._map_hemis = set()
+            self._fold_hemis = set()
             return
         c = self.canvas
         shape_changed = vp.shape != self._built_shape
@@ -922,7 +969,6 @@ class SurfaceWindow(QtWidgets.QWidget):
                     nrm_b=nrm,
                     white=hemi.states["white"],
                     pial=hemi.states["pial"],
-                    curv=hemi.morph.get("curv", np.zeros(hemi.n_vertices, np.float32)),
                     areas=self._areas(h),
                     faces=hemi.faces.astype(np.uint32) if h not in self._built_versions else None,
                     flat_faces=flat_faces if h not in self._built_versions else None,
@@ -937,6 +983,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             self._built_shape = vp.shape
             self._built_versions = {h: surfaces.version.get(h, 0) for h in surfaces.hemis}
         self._refresh_map(vp)
+        self._refresh_folding(vp)
         self._apply_layout(vp)
         c.depth = vp.depth
         c.samples = vp.samples
@@ -961,6 +1008,31 @@ class SurfaceWindow(QtWidgets.QWidget):
             ],
             axis=1,
         ).astype(np.float32)
+
+    def _refresh_folding(self, vp: Viewport) -> None:
+        surfaces = self.session.surfaces
+        key = (vp.folding, surfaces.subject)
+        fresh = {h for h in surfaces.hemis if h not in self._fold_hemis}
+        if key == self._built_fold and not fresh:
+            return
+        for h, hemi in surfaces.hemis.items():
+            self.canvas.set_hemisphere(
+                h,
+                pos_a=None,
+                pos_b=None,
+                nrm_a=None,
+                nrm_b=None,
+                curv=s3.folding_values(hemi, vp.folding),
+            )
+        self._built_fold = key
+        self._fold_hemis = set(surfaces.hemis)
+
+    def _cycle_folding(self) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            modes = list(s3.FOLDING)
+            nxt = modes[(modes.index(vp.folding) + 1) % len(modes)]
+            self._dispatch(SetSurfaceFolding(self.vid, nxt))
 
     def _refresh_map(self, vp: Viewport) -> None:
         surfaces = self.session.surfaces
@@ -1059,19 +1131,15 @@ class SurfaceWindow(QtWidgets.QWidget):
         if pts:
             self.canvas.camera.frame(np.concatenate(pts))
 
-    def _overlay_layer(self):
-        """The layer shown on the surface: the selected one, else the top visible non-base."""
+    def _overlay_layers(self) -> list:
+        """Every visible layer above the base, bottom to top -- the slices' stack.
+
+        The base (the anatomy) is not drawn: under the overlays is the folding,
+        which is what says where the sulci and gyri are on an inflated surface.
+        """
         st = self.session.state
-        base = st.layers.base
-        sel = st.layers.find(st.selected) if st.selected else None
-        if sel is not None and (base is None or sel.key != base.key):
-            return sel
-        for layer in reversed(list(st.layers)):
-            if base is not None and layer.key == base.key:
-                continue
-            if layer.visible:
-                return layer
-        return None
+        layers = list(st.layers)[1:]
+        return [layer for layer in layers if layer.visible]
 
     def _refresh_data(self) -> None:
         import torch
@@ -1079,71 +1147,80 @@ class SurfaceWindow(QtWidgets.QWidget):
         from fastfuncstuff.viewer.compose import cached_lut
         from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 
-        layer = self._overlay_layer()
-        c = self.canvas
-        if layer is None:
-            if self._built_volume is not None:
-                c.set_volume(None, None)
-                self._built_volume = None
-            c.shade = s3.ShadeParams(has_data=False)
-            return
         st = self.session.state
-        idx = st.time_index if layer.time_linked else layer.volume_index
-        thr_idx = layer.threshold_index
-        key = (layer.key, int(idx), thr_idx, np.asarray(layer.affine).tobytes())
-        if key != self._built_volume:
-            try:
-                value = self.session.volume(layer.key, int(idx))
-                stat = (
-                    None
-                    if thr_idx is None or thr_idx == idx
-                    else self.session.volume(layer.key, thr_idx)
-                )
-            except (KeyError, FileNotFoundError, ValueError):
-                return
+        signs = {SignMode.BOTH: 0, SignMode.POS: 1, SignMode.NEG: 2}
+        alphas = {AlphaMode.OFF: 0, AlphaMode.LINEAR: 1, AlphaMode.QUADRATIC: 2}
+        slots: list[OverlaySlot] = []
+        cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
+        for layer in self._overlay_layers()[-s3.MAX_LAYERS :]:
+            idx = int(st.time_index if layer.time_linked else layer.volume_index)
+            thr = layer.threshold_index
+            key = (layer.key, idx, thr if thr != idx else None, np.asarray(layer.affine).tobytes())
+            data = self._slot_cache.get(key)
+            if data is None:
+                try:
+                    value = s3.texture_data(self.session.volume(layer.key, idx))
+                    stat = (
+                        None
+                        if thr is None or thr == idx
+                        else s3.texture_data(self.session.volume(layer.key, thr))
+                    )
+                except (KeyError, FileNotFoundError, ValueError):
+                    continue
+                data = (value, stat)
+            cache[key] = data
             frame = s3.texture_from_mm(layer.shape, layer.affine)
-            c.set_volume(
-                (s3.texture_data(value), frame),
-                None if stat is None else (s3.texture_data(stat), frame),
+            outline = (
+                s3.OUTLINE_ONLY
+                if layer.edges
+                else (s3.OUTLINE_BOXED if layer.boxed else s3.OUTLINE_NONE)
             )
-            self._built_volume = key
-        lut_key = (layer.colormap, layer.colormap_reversed)
-        if lut_key != self._built_lut:
+            opacity = float(layer.opacity)
+            if layer.roi:
+                palette = self.session.roi_palette(layer.key, torch.device("cpu"))
+                if palette is None:
+                    continue
+                slots.append(
+                    OverlaySlot(
+                        key=key,
+                        value=data[0],
+                        value_frame=frame,
+                        stat=None,
+                        stat_frame=None,
+                        shade=s3.ShadeParams(
+                            opacity=opacity, has_data=True, labels=True, outline=outline
+                        ),
+                        palette=s3.palette_texture(palette.numpy()),
+                    )
+                )
+                continue
             lut = cached_lut(layer.colormap, torch.device("cpu"), reverse=layer.colormap_reversed)
             rgb = np.clip(np.asarray(lut.cpu().numpy(), np.float64), 0, 1)
             rgba = np.concatenate([np.round(rgb * 255), np.full((rgb.shape[0], 1), 255.0)], 1)
-            c.set_lut(rgba.astype(np.uint8))
-            self._built_lut = lut_key
-        if layer.roi:
-            palette = self.session.roi_palette(layer.key, torch.device("cpu"))
-            labels_key = ("roi", layer.key, None if palette is None else palette.shape[0])
-            if labels_key != self._built_palette:
-                c.set_palette(None if palette is None else s3.palette_texture(palette.numpy()))
-                self._built_palette = labels_key
-            before = c.shade.labels
-            c.shade = s3.ShadeParams(
-                opacity=float(layer.opacity) if layer.visible else 0.0,
-                has_data=palette is not None,
-                labels=True,
+            slots.append(
+                OverlaySlot(
+                    key=key,
+                    value=data[0],
+                    value_frame=frame,
+                    stat=data[1],
+                    stat_frame=None if data[1] is None else frame,
+                    shade=s3.ShadeParams(
+                        lo=float(layer.range_lo if layer.range_lo is not None else 0.0),
+                        hi=float(layer.range_hi if layer.range_hi is not None else 1.0),
+                        threshold=float(layer.threshold),
+                        opacity=opacity,
+                        sign_mode=signs[layer.sign_mode],
+                        alpha_mode=alphas[layer.alpha_mode],
+                        n_panes=int(layer.n_panes),
+                        has_data=True,
+                        outline=outline,
+                    ),
+                    lut=rgba.astype(np.uint8),
+                )
             )
-            if not before:
-                c.set_linear(c.linear)  # rebind with the nearest sampler
-            return
-        signs = {SignMode.BOTH: 0, SignMode.POS: 1, SignMode.NEG: 2}
-        alphas = {AlphaMode.OFF: 0, AlphaMode.LINEAR: 1, AlphaMode.QUADRATIC: 2}
-        was_labels = c.shade.labels
-        c.shade = s3.ShadeParams(
-            lo=float(layer.range_lo if layer.range_lo is not None else 0.0),
-            hi=float(layer.range_hi if layer.range_hi is not None else 1.0),
-            threshold=float(layer.threshold),
-            opacity=float(layer.opacity) if layer.visible else 0.0,
-            sign_mode=signs[layer.sign_mode],
-            alpha_mode=alphas[layer.alpha_mode],
-            n_panes=int(layer.n_panes),
-            has_data=True,
-        )
-        if was_labels:
-            c.set_linear(c.linear)  # labels forced nearest; restore the choice
+        # Keep only what is drawn: a dropped layer's 100 MB goes with it.
+        self._slot_cache = cache
+        self.canvas.set_overlays(slots)
 
     def _refresh_cross(self) -> None:
         mm = self.session.state.crosshair_mm
