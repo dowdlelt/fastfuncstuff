@@ -42,8 +42,11 @@ class MeshBundle:
     labels: dict[str, np.ndarray] = field(default_factory=dict)
     #: Per-vertex flags (cortex, in-patch, patch border), both ends across a split.
     masks: dict[str, np.ndarray] = field(default_factory=dict)
-    #: Position sets that lie on a sphere: a split's midpoint goes back onto it.
-    spherical: set[str] = field(default_factory=set)
+    #: Position sets that lie on a sphere, name -> its centre: a split's
+    #: midpoint goes back onto it. The centre is given, not the centroid --
+    #: FreeSurfer's spheres are radius 100 about the tkregister origin, and
+    #: their vertices are not evenly spread, so the centroid is off by mm.
+    spherical: dict[str, np.ndarray] = field(default_factory=dict)
     #: Position sets that only mean something where a mask says so (a flat
     #: patch: coordinates outside it are zero), name -> mask name.
     masked: dict[str, str] = field(default_factory=dict)
@@ -59,14 +62,14 @@ class MeshBundle:
             {k: v.copy() for k, v in self.scalars.items()},
             {k: v.copy() for k, v in self.labels.items()},
             {k: v.copy() for k, v in self.masks.items()},
-            set(self.spherical),
+            {k: v.copy() for k, v in self.spherical.items()},
             dict(self.masked),
         )
 
 
-def is_spherical(positions: np.ndarray, tolerance: float = 0.01) -> bool:
-    """Whether points lie on a sphere about their centroid (radius spread < 1%)."""
-    r = np.linalg.norm(positions - positions.mean(axis=0), axis=1)
+def is_spherical(positions: np.ndarray, centre: np.ndarray, tolerance: float = 0.01) -> bool:
+    """Whether points lie on a sphere about ``centre`` (radius spread < 1%)."""
+    r = np.linalg.norm(positions - np.asarray(centre), axis=1)
     return bool(r.std() < tolerance * max(r.mean(), 1e-12))
 
 
@@ -78,7 +81,8 @@ def neighbours(faces: np.ndarray, v: int) -> np.ndarray:
 def check_manifold(faces: np.ndarray, n_vertices: int) -> None:
     """Raise unless every edge has exactly two triangles and the surface is genus 0."""
     e = np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1)
-    _, counts = np.unique(e, axis=0, return_counts=True)
+    # 1-D keys: unique(axis=0) on ~850k rows is most of an edit's time.
+    _, counts = np.unique(e[:, 0].astype(np.int64) * n_vertices + e[:, 1], return_counts=True)
     if not np.all(counts == 2):
         raise ValueError("not a closed 2-manifold: an edge has other than two triangles")
     euler = n_vertices - counts.size + faces.shape[0]
@@ -179,7 +183,7 @@ def split_edge(bundle: MeshBundle, a: int, b: int) -> tuple[MeshBundle, int]:
     for name, p in out.positions.items():
         mid = 0.5 * (p[a] + p[b])
         if name in out.spherical:
-            c = p.mean(axis=0)
+            c = out.spherical[name]
             radius = 0.5 * (np.linalg.norm(p[a] - c) + np.linalg.norm(p[b] - c))
             mid = c + (mid - c) * radius / max(np.linalg.norm(mid - c), 1e-12)
         out.positions[name] = np.vstack([p, mid[None].astype(p.dtype)])

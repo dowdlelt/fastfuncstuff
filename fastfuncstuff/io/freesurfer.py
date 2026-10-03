@@ -386,6 +386,251 @@ def read_color_lut(
     return out
 
 
+# -- the whole mesh, for topology edits ----------------------------------------
+
+_CURV_MAGIC = b"\xff\xff\xff"
+
+
+def write_surface_topology(
+    path: str | os.PathLike, template: str | os.PathLike, vertices: np.ndarray, faces: np.ndarray
+) -> None:
+    """Write a surface whose vertex/face counts differ from ``template``'s.
+
+    The comment line and the trailer (volume geometry, command-line tags) are
+    the template's bytes; only the counts, coordinates (tkregister RAS) and
+    faces are new. Refuses to write over the template.
+    """
+    path, template = Path(path), Path(template)
+    if path.exists() and path.resolve() == template.resolve():
+        raise ValueError(f"refusing to overwrite the original surface {template}")
+    raw = template.read_bytes()
+    nv, nf, offset = _triangle_layout(raw)
+    head = raw[: offset - 8]
+    tail = raw[offset + nv * 12 + nf * 12 :]
+    v = np.asarray(vertices, ">f4")
+    f = np.asarray(faces, ">i4")
+    counts = np.array([v.shape[0], f.shape[0]], ">i4").tobytes()
+    path.write_bytes(head + counts + v.tobytes() + f.tobytes() + tail)
+
+
+def write_patch(
+    path: str | os.PathLike, coords: np.ndarray, in_patch: np.ndarray, border: np.ndarray
+) -> None:
+    """Write a ``?h.*.patch.3d``: one-based vertex numbers, negated on the border."""
+    ids = np.flatnonzero(in_patch)
+    rec = np.zeros(ids.size, dtype=[("v", ">i4"), ("x", ">f4"), ("y", ">f4"), ("z", ">f4")])
+    rec["v"] = np.where(border[ids], -(ids + 1), ids + 1)
+    rec["x"], rec["y"], rec["z"] = coords[ids, 0], coords[ids, 1], coords[ids, 2]
+    Path(path).write_bytes(np.array([_PATCH_MAGIC, ids.size], ">i4").tobytes() + rec.tobytes())
+
+
+def write_label(
+    path: str | os.PathLike,
+    vertices: np.ndarray,
+    coords: np.ndarray,
+    values: np.ndarray,
+    subject: str = "",
+) -> None:
+    """Write an ASCII ``.label`` (vertex, white tkregister x y z, value)."""
+    lines = [f"#!ascii label , from subject {subject} vox2ras=TkReg", str(len(vertices))]
+    lines += [
+        f"{int(v)}  {c[0]:.3f}  {c[1]:.3f}  {c[2]:.3f} {val:.10f}"
+        for v, c, val in zip(vertices, coords, values, strict=True)
+    ]
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
+@dataclass
+class BundleSources:
+    """Where each part of a :class:`surface.topology.MeshBundle` came from."""
+
+    hemi: str
+    subject_dir: Path
+    tkr_to_scanner: np.ndarray
+    #: bundle key -> file. Keys: ``surf:<name>``, ``morph:<name>``,
+    #: ``patch:<name>``, ``annot:<name>``, ``label:<name>``.
+    files: dict[str, Path] = field(default_factory=dict)
+    #: annotation tables, ``annot:<name>`` -> (ctab, names).
+    annot_tables: dict[str, tuple[np.ndarray, list[str]]] = field(default_factory=dict)
+    #: Files under surf/ and label/ that are not this mesh's and were left alone.
+    skipped: list[Path] = field(default_factory=list)
+
+
+def bundle_from_subject(subject_dir: str | os.PathLike, hemi: Hemisphere):
+    """Everything indexed by this hemisphere's vertices, as a MeshBundle in scanner mm.
+
+    Every triangle surface in ``surf/`` with white's exact faces, every
+    curvature-format per-vertex file of the right length, the flat patches,
+    and every annotation and ``.label`` in ``label/``. ``hemi``'s own (possibly
+    edited) positions win over the files for the states it holds. Anything
+    that is another mesh (``*.nofix``, defect files) is listed in
+    ``sources.skipped`` and never written.
+    """
+    import nibabel.freesurfer as nfs
+
+    from fastfuncstuff.surface.topology import MeshBundle, is_spherical
+
+    subject_dir = Path(subject_dir)
+    surf, label = subject_dir / "surf", subject_dir / "label"
+    nv = hemi.n_vertices
+    to_scanner = hemi.tkr_to_scanner
+    src = BundleSources(hemi.name, subject_dir, to_scanner)
+    bundle = MeshBundle(faces=hemi.faces.astype(np.int64))
+    for path in sorted(surf.glob(f"{hemi.name}.*")):
+        name = path.name[len(hemi.name) + 1 :]
+        if not path.is_file() or "nofix" in name or "defect" in name:
+            if path.is_file():
+                src.skipped.append(path)
+            continue
+        head = path.read_bytes()[:3]
+        if name.endswith(".patch.3d"):
+            # Before the magic sniffing: a patch starts ff ff ff ff, which
+            # reads as the curvature format's magic.
+            pname = name[: -len(".patch.3d")]
+            patch = hemi.patches.get(pname)
+            if patch is None:
+                src.skipped.append(path)
+                continue
+            bundle.positions[f"patch:{pname}"] = patch.coords.astype(np.float64)
+            bundle.masks[f"patch:{pname}"] = patch.in_patch.copy()
+            bundle.masks[f"patchborder:{pname}"] = patch.border.copy()
+            bundle.masked[f"patch:{pname}"] = f"patch:{pname}"
+            src.files[f"patch:{pname}"] = path
+        elif name.endswith(".mgh"):
+            import nibabel as nib
+
+            try:
+                data = np.asarray(nib.load(str(path)).dataobj)
+            except (ValueError, OSError):
+                src.skipped.append(path)
+                continue
+            if data.shape[0] != nv or data.size != nv:
+                src.skipped.append(path)
+                continue
+            bundle.scalars[f"mgh:{name}"] = data.reshape(nv).astype(np.float32)
+            src.files[f"mgh:{name}"] = path
+        elif head == _TRIANGLE_MAGIC:
+            try:
+                surface = read_surface(path)
+            except (ValueError, OSError):
+                src.skipped.append(path)
+                continue
+            if surface.vertices.shape[0] != nv or not np.array_equal(surface.faces, hemi.faces):
+                src.skipped.append(path)
+                continue
+            pos = hemi.states.get(name)
+            bundle.positions[f"surf:{name}"] = (
+                pos.astype(np.float64)
+                if pos is not None
+                else _apply(to_scanner, surface.vertices).astype(np.float64)
+            )
+            centre = to_scanner[:3, 3]  # the tkregister origin, in scanner mm
+            if is_spherical(bundle.positions[f"surf:{name}"], centre):
+                bundle.spherical[f"surf:{name}"] = centre.copy()
+            src.files[f"surf:{name}"] = path
+        elif head == _CURV_MAGIC:
+            try:
+                values = nfs.read_morph_data(str(path))
+            except (ValueError, OSError):
+                src.skipped.append(path)
+                continue
+            if values.shape[0] != nv:
+                src.skipped.append(path)
+                continue
+            bundle.scalars[f"morph:{name}"] = values.astype(np.float32)
+            src.files[f"morph:{name}"] = path
+        else:
+            src.skipped.append(path)
+    if "surf:white" in bundle.positions:
+        # White first: the reference collapse distances and label coordinates use.
+        bundle.positions = {"surf:white": bundle.positions.pop("surf:white"), **bundle.positions}
+    for path in sorted(label.glob(f"{hemi.name}.*")) if label.is_dir() else []:
+        name = path.name[len(hemi.name) + 1 :]
+        if "nofix" in name:
+            src.skipped.append(path)
+            continue
+        if name.endswith(".annot"):
+            try:
+                labels, ctab, names = nfs.read_annot(str(path))
+            except (ValueError, OSError):
+                src.skipped.append(path)
+                continue
+            if labels.shape[0] != nv:
+                src.skipped.append(path)
+                continue
+            key = f"annot:{name[: -len('.annot')]}"
+            bundle.labels[key] = np.asarray(labels, np.int64)
+            src.annot_tables[key] = (
+                np.asarray(ctab),
+                [n.decode() if isinstance(n, bytes) else str(n) for n in names],
+            )
+            src.files[key] = path
+        elif name.endswith(".label"):
+            try:
+                ids, values = nfs.read_label(str(path), read_scalars=True)
+            except (ValueError, OSError):
+                src.skipped.append(path)
+                continue
+            if ids.size and ids.max() >= nv:
+                src.skipped.append(path)
+                continue
+            key = f"label:{name[: -len('.label')]}"
+            mask = np.zeros(nv, bool)
+            mask[ids] = True
+            vals = np.zeros(nv, np.float32)
+            vals[ids] = values
+            bundle.masks[key] = mask
+            bundle.scalars[f"labelvalue:{name[: -len('.label')]}"] = vals
+            src.files[key] = path
+    return bundle, src
+
+
+def write_bundle(bundle, sources: BundleSources, targets: dict[str, Path]) -> list[Path]:
+    """Write every part of ``bundle`` named in ``targets`` (bundle key -> output path)."""
+    import nibabel.freesurfer as nfs
+
+    to_tkr = np.linalg.inv(sources.tkr_to_scanner)
+    white = bundle.positions.get("surf:white")
+    white_tkr = None if white is None else _apply(to_tkr, white)
+    written: list[Path] = []
+    for key, out in targets.items():
+        kind, _, name = key.partition(":")
+        template = sources.files[key]
+        if kind == "surf":
+            write_surface_topology(
+                out, template, _apply(to_tkr, bundle.positions[key]), bundle.faces
+            )
+        elif kind == "morph":
+            nfs.write_morph_data(str(out), bundle.scalars[key].astype(np.float32))
+        elif kind == "mgh":
+            import nibabel as nib
+
+            old = nib.load(str(template))
+            data = bundle.scalars[key].astype(np.float32).reshape(-1, 1, 1)
+            nib.save(nib.MGHImage(data, old.affine, old.header), str(out))
+        elif kind == "patch":
+            write_patch(
+                out, bundle.positions[key], bundle.masks[key], bundle.masks[f"patchborder:{name}"]
+            )
+        elif kind == "annot":
+            ctab, names = sources.annot_tables[key]
+            nfs.write_annot(str(out), bundle.labels[key], ctab, names, fill_ctab=False)
+        elif kind == "label":
+            ids = np.flatnonzero(bundle.masks[key])
+            coords = white_tkr[ids] if white_tkr is not None else np.zeros((ids.size, 3))
+            write_label(
+                out,
+                ids,
+                coords,
+                bundle.scalars[f"labelvalue:{name}"][ids],
+                sources.subject_dir.name,
+            )
+        else:
+            raise ValueError(f"unknown bundle key {key!r}")
+        written.append(Path(out))
+    return written
+
+
 def load_subject(
     subject_dir: str | os.PathLike, hemis: tuple[str, ...] = ("lh", "rh"), **kwargs
 ) -> dict[str, Hemisphere]:

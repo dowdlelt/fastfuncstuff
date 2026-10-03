@@ -35,7 +35,7 @@ def _bundle(n=400):
         scalars={"thickness": np.linspace(1, 4, n).astype(np.float32)},
         labels={"aparc": (u[:, 2] > 0).astype(np.int64)},
         masks={"cortex": u[:, 0] < 0.9},
-        spherical={"sphere"},
+        spherical={"sphere": np.array([7.0, 7.0, 7.0])},
     )
     check_manifold(b.faces, b.n_vertices)
     return b
@@ -78,7 +78,7 @@ def test_split_puts_the_new_vertex_mid_edge_on_every_surface_and_on_the_sphere()
     np.testing.assert_allclose(
         out.positions["white"][m], 0.5 * (b.positions["white"][a] + b.positions["white"][c])
     )
-    centre = b.positions["sphere"].mean(0)
+    centre = b.spherical["sphere"]
     r = np.linalg.norm(out.positions["sphere"][m] - centre)
     assert r == pytest.approx(np.linalg.norm(b.positions["sphere"][a] - centre), rel=1e-3)
     assert out.scalars["thickness"][m] == pytest.approx(

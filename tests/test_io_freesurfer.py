@@ -125,3 +125,46 @@ def test_cortex_label_becomes_a_vertex_mask(tmp_path):
     hemi = load_hemisphere(subj, "lh", patches=False)
     assert hemi.cortex is not None
     assert np.flatnonzero(hemi.cortex).tolist() == [0, 2, 4]
+
+
+def test_bundle_round_trip_after_a_split_writes_every_file_consistently(tmp_path):
+    from fastfuncstuff.io.freesurfer import bundle_from_subject, read_patch, write_bundle
+    from fastfuncstuff.surface.topology import split_edge
+
+    subj = _subject(tmp_path)
+    surf, label = subj / "surf", subj / "label"
+    label.mkdir()
+    v, f = _octahedron()
+    nfs.write_geometry(str(surf / "lh.sphere"), v * 10.0, f, volume_info=_volume_info())  # r = 100
+    nfs.write_morph_data(str(surf / "lh.thickness"), np.arange(6, dtype=np.float32))
+    nfs.write_annot(
+        str(label / "lh.aparc.annot"),
+        np.array([0, 0, 1, 1, 0, 1]),
+        np.array([[10, 20, 30, 0, 0], [40, 50, 60, 0, 0]], np.int32),
+        ["a", "b"],
+    )
+    (label / "lh.cortex.label").write_text("#!ascii label\n3\n0 0 0 0 0\n2 0 0 0 0\n4 0 0 0 0\n")
+    rec = np.zeros(6, dtype=[("v", ">i4"), ("x", ">f4"), ("y", ">f4"), ("z", ">f4")])
+    rec["v"] = np.arange(1, 7)
+    rec["x"] = np.arange(6)
+    (surf / "lh.flat.patch.3d").write_bytes(np.array([-1, 6], ">i4").tobytes() + rec.tobytes())
+    hemi = load_hemisphere(subj, "lh")
+    bundle, src = bundle_from_subject(subj, hemi)
+    assert set(src.files) >= {
+        "surf:white", "surf:pial", "surf:sphere", "morph:thickness",
+        "annot:aparc", "label:cortex", "patch:flat",
+    }  # fmt: skip
+    assert "surf:sphere" in bundle.spherical
+    grown, m = split_edge(bundle, 0, 2)  # an octahedron edge
+    out = tmp_path / "out"
+    out.mkdir()
+    write_bundle(grown, src, {k: out / p.name for k, p in src.files.items()})
+    white = read_surface(out / "lh.white")
+    assert white.vertices.shape == (7, 3) and white.faces.shape == (10, 3)
+    assert white.volume_info["cras"].tolist() == pytest.approx(CRAS.tolist())  # trailer kept
+    sphere = read_surface(out / "lh.sphere").vertices
+    assert np.linalg.norm(sphere[m]) == pytest.approx(100.0, rel=1e-4)
+    assert nfs.read_morph_data(str(out / "lh.thickness"))[m] == pytest.approx(1.0)  # mean of 0, 2
+    assert nfs.read_annot(str(out / "lh.aparc.annot"))[0][m] == 0
+    assert sorted(nfs.read_label(str(out / "lh.cortex.label")).tolist()) == [0, 2, 4, m]
+    assert read_patch(out / "lh.flat.patch.3d", 7)[1][m]
