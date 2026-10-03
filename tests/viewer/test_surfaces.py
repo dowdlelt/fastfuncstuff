@@ -293,3 +293,30 @@ def test_region_lines_name_the_surface_parcel_and_the_atlas_voxel(session, tmp_p
 
 
 from fastfuncstuff.io.freesurfer import read_color_lut  # noqa: E402
+
+
+def test_saving_an_edited_white_also_writes_smoothwm_with_its_displacement(session, tmp_path):
+    from fastfuncstuff.io.freesurfer import read_surface
+    from fastfuncstuff.viewer.vocab import SaveSurfaces
+
+    session.load(_shell_anat(tmp_path))
+    subj = _subject(tmp_path)
+    v, f = (
+        read_surface(subj / "surf" / "lh.white").vertices,
+        read_surface(subj / "surf" / "lh.white").faces,
+    )
+    smooth = v * 0.99  # a stand-in smoothwm, same mesh
+    info = nfs.read_geometry(str(subj / "surf" / "lh.white"), read_metadata=True)[2]
+    nfs.write_geometry(str(subj / "surf" / "lh.smoothwm"), smooth, f, volume_info=info)
+    session.do(LoadSurfaces(str(subj), "lh"))
+    session.do(_edit(session))
+    session.do(SaveSurfaces("t"))
+    white_before = read_surface(subj / "surf" / "lh.white").vertices
+    white_after = read_surface(subj / "surf" / "lh.white.t").vertices
+    sm_before = read_surface(subj / "surf" / "lh.smoothwm").vertices
+    sm_after = read_surface(subj / "surf" / "lh.smoothwm.t").vertices
+    moved = np.any(white_after != white_before, axis=1)
+    assert moved.any() and not moved.all()
+    np.testing.assert_allclose(sm_after - sm_before, white_after - white_before, atol=1e-4)
+    # Untouched vertices bit-identical in the smoothwm copy too.
+    np.testing.assert_array_equal(sm_after[~moved], sm_before[~moved])

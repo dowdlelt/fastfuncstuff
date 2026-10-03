@@ -215,9 +215,17 @@ class Hemisphere:
         the last bit, and a vertex nobody touched should come out
         bit-identical.
         """
+        self.save_positions(state, path, self.states[state])
+
+    def original(self, state: str) -> np.ndarray:
+        """``state`` as its file has it (scanner RAS), whatever has been edited since."""
+        return _apply(self.tkr_to_scanner, read_surface(self.paths[state]).vertices)
+
+    def save_positions(self, state: str, path: str | os.PathLike, positions: np.ndarray) -> None:
+        """Write ``positions`` (scanner RAS) as a copy of ``state``'s file; see :meth:`save_state`."""
         template = self.paths[state]
         tkr = read_surface(template).vertices
-        delta = (self.states[state] - _apply(self.tkr_to_scanner, tkr)).astype(np.float64)
+        delta = (np.asarray(positions) - _apply(self.tkr_to_scanner, tkr)).astype(np.float64)
         moved = np.any(delta != 0, axis=1)
         rotation = np.linalg.inv(self.tkr_to_scanner)[:3, :3]
         out = tkr.copy()

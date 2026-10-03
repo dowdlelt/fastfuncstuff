@@ -479,7 +479,8 @@ class SurfaceStore:
     def save(self, suffix: str = "ffsedit") -> list[Path]:
         """Write every edited surface as ``?h.<surface>.<suffix>`` beside its original.
 
-        Copies only -- :meth:`Hemisphere.save_state` refuses the original's own
+        An edited white also writes ``?h.smoothwm.<suffix>`` with white's
+        displacement. Copies only -- :meth:`Hemisphere.save_state` refuses the original's own
         path -- plus a JSON log of the edits that produced them.
         """
         if not suffix or "/" in suffix:
@@ -490,6 +491,16 @@ class SurfaceStore:
             out = h.paths[surface].with_name(f"{hemi}.{surface}.{suffix}")
             h.save_state(surface, out)
             written.append(out)
+            if surface == "white" and "smoothwm" in h.paths:
+                # smoothwm is a smoothed white; give it white's displacement so
+                # a rerun from these surfaces starts from a consistent pair.
+                # Untouched vertices have zero displacement and stay
+                # bit-identical, as in every other saved copy.
+                moved = h.states["white"] - h.original("white")
+                smooth = h.original("smoothwm") + moved
+                out = h.paths["smoothwm"].with_name(f"{hemi}.smoothwm.{suffix}")
+                h.save_positions("smoothwm", out, smooth)
+                written.append(out)
         if written:
             log = written[0].with_name(f"surface_edits.{suffix}.json")
             log.write_text(json.dumps(self.log.entries, indent=1))
