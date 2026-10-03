@@ -348,10 +348,28 @@ def equivolume_fraction(alpha, white_area, pial_area):
 
 
 #: Per-vertex maps a surface window can paint, in the order offered.
-VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot")
+VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot", "flags")
 
 
-def vertex_colors(hemi: Hemisphere, kind: str, annotation=None) -> np.ndarray | None:
+def flag_ramp() -> np.ndarray:
+    """256 RGB entries, quiet grey (fine) to saturated red (flagged).
+
+    Shared by the profile column and the surface map so a flag is the same
+    colour in both. Not ``hot``: on a light palette its worst end is the
+    colour of the background.
+    """
+    t = np.linspace(0.0, 1.0, 256)[:, None]
+    quiet = np.array([0.80, 0.80, 0.78])
+    mid = np.array([0.96, 0.62, 0.18])
+    alarm = np.array([0.86, 0.10, 0.08])
+    lo = quiet + (mid - quiet) * np.clip(t / 0.6, 0, 1)
+    rgb = np.where(t < 0.6, lo, mid + (alarm - mid) * np.clip((t - 0.6) / 0.4, 0, 1))
+    return (rgb * 255).astype(np.uint8)
+
+
+def vertex_colors(
+    hemi: Hemisphere, kind: str, annotation=None, flags: np.ndarray | None = None
+) -> np.ndarray | None:
     """``(V, 4)`` uint8 colours of a per-vertex map, or ``None`` for no map.
 
     Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
@@ -367,6 +385,17 @@ def vertex_colors(hemi: Hemisphere, kind: str, annotation=None) -> np.ndarray | 
         return None
     n = hemi.n_vertices
     cortex = hemi.cortex if hemi.cortex is not None else np.ones(n, bool)
+    if kind == "flags":
+        # Profile-column flags: transparent where fine, so the anatomy shows
+        # through and only the trouble is coloured.
+        if flags is None:
+            return None
+        f = np.nan_to_num(flags, nan=0.0)
+        out = np.zeros((n, 4), np.uint8)
+        out[:, :3] = flag_ramp()[np.round(np.clip(f, 0, 1) * 255).astype(int)]
+        out[:, 3] = (np.clip((f - 0.3) / 0.5, 0, 1) * 255).astype(np.uint8)
+        out[~cortex, 3] = 0
+        return out
     if kind == "annot":
         if annotation is None:
             return None
@@ -439,6 +468,7 @@ __all__ = [
     "depth_fractions",
     "equivolume_fraction",
     "vertex_colors",
+    "flag_ramp",
     "flat_patch",
     "layout_offsets",
     "pack_uniforms",

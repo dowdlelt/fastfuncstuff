@@ -132,6 +132,19 @@ class ProfileColumn:
         return int(ribbon[0]), int(ribbon[-1])
 
 
+def flags_by_vertex(col: ProfileColumn, score: str, sizes: dict[str, int]) -> dict[str, np.ndarray]:
+    """One flag per vertex of each hemisphere (NaN where there is no row: medial wall)."""
+    out: dict[str, np.ndarray] = {}
+    values = col.scores.get(score)
+    for i, h in enumerate(col.hemis):
+        arr = np.full(sizes[h], np.nan, np.float32)
+        if values is not None:
+            rows = col.row_hemi == i
+            arr[col.row_vertex[rows]] = values[rows]
+        out[h] = arr
+    return out
+
+
 def build_column(
     hemis: dict,
     volume: np.ndarray,
@@ -243,4 +256,4 @@ def update_column(
     return np.concatenate(changed_rows)
 
 
-__all__ = ["ProfileColumn", "build_column", "update_column"]
+__all__ = ["ProfileColumn", "build_column", "flags_by_vertex", "update_column"]

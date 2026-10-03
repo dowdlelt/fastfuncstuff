@@ -91,3 +91,25 @@ def test_an_edit_resamples_only_what_moved_and_the_flag_clears(scene):
     np.testing.assert_array_equal(col.profiles.values[others], before[others])
     assert col.scores["pial_out"][row] < 0.7
     assert col.nearest_row(tuple(0.5 * (21.0 + 24.0) * u[bad])) == row
+
+
+def test_flags_map_back_to_vertices_with_nan_on_the_medial_wall(scene):
+    from fastfuncstuff.viewer import surface3d as s3
+    from fastfuncstuff.viewer.profilecolumn import flags_by_vertex
+
+    img, aff, u, faces = scene
+    cortex = u[:, 0] < 0.8
+    h = _hemi(u, faces, cortex)
+    bad = int(np.argmax(np.where(cortex, u[:, 2], -9)))
+    h.states["pial"][bad] = (26.0 * u[bad]).astype(np.float32)
+    col = build_column({"lh": h}, img, aff, device=CPU)
+    flags = flags_by_vertex(col, "worst", {"lh": h.n_vertices})["lh"]
+    assert np.isnan(flags[~cortex]).all() and np.isfinite(flags[cortex]).all()
+    assert flags[bad] > 0.8
+    rgba = s3.vertex_colors(h, "flags", flags=flags)
+    assert rgba is not None
+    # Flagged: opaque and red; fine: transparent, so the anatomy shows.
+    assert rgba[bad, 3] == 255 and rgba[bad, 0] > 150 and rgba[bad, 1] < 100
+    fine = cortex & (flags < 0.3)
+    assert (rgba[fine, 3] == 0).all()
+    assert (rgba[~cortex, 3] == 0).all()

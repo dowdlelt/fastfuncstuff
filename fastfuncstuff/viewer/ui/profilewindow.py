@@ -20,7 +20,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.surface.profiles import SCORES, ProfileSpec
 from fastfuncstuff.viewer.commands import Aspect, Command
-from fastfuncstuff.viewer.profilecolumn import ProfileColumn, build_column, update_column
+from fastfuncstuff.viewer.profilecolumn import (
+    ProfileColumn,
+    build_column,
+    flags_by_vertex,
+    update_column,
+)
+from fastfuncstuff.viewer.surface3d import flag_ramp
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
 from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, keep_keys_for_shortcuts
@@ -30,21 +36,6 @@ from fastfuncstuff.viewer.vocab import SetProfileView
 OVERVIEW_W = 26
 SCORE_W = 14
 GAP = 4
-
-
-def _flag_ramp() -> np.ndarray:
-    """256 RGB entries from a quiet grey (fine) to saturated red (flagged).
-
-    Not ``hot``: it runs black -> white, and on a light palette its most
-    suspicious end is the colour of the background.
-    """
-    t = np.linspace(0.0, 1.0, 256)[:, None]
-    quiet = np.array([0.80, 0.80, 0.78])
-    alarm = np.array([0.86, 0.10, 0.08])
-    mid = np.array([0.96, 0.62, 0.18])
-    lo = quiet + (mid - quiet) * np.clip(t / 0.6, 0, 1)
-    rgb = np.where(t < 0.6, lo, mid + (alarm - mid) * np.clip((t - 0.6) / 0.4, 0, 1))
-    return (rgb * 255).astype(np.uint8)
 
 
 class ProfileView(QtWidgets.QWidget):
@@ -61,7 +52,7 @@ class ProfileView(QtWidgets.QWidget):
         self.top = 0.0
         self.rows_per_px = 1.0
         self.marked: int | None = None
-        self._ramp = _flag_ramp()
+        self._ramp = flag_ramp()
         self.setMinimumSize(160, 200)
         self.setMouseTracking(True)
 
@@ -222,6 +213,8 @@ class ProfileWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(str)
     located = QtCore.Signal(float, float, float)
+    #: New flags were published to the surface store.
+    flags_changed = QtCore.Signal()
 
     def __init__(
         self,
@@ -407,8 +400,22 @@ class ProfileWindow(QtWidgets.QWidget):
                     start, stop = self.view.visible_span()
                     if not start <= row < stop:
                         self.view.centre_on(row)
+        self._publish()
         self._sync_info()
         self.view.update()
+
+    def _publish(self) -> None:
+        """Hand the current flag to the surface windows (map: flags)."""
+        col = self.view.column
+        if col is None:
+            return
+        key = (id(col), self.view.score, tuple(sorted(self.session.surfaces.version.items())))
+        if key == getattr(self, "_published", None):
+            return
+        sizes = {h: hemi.n_vertices for h, hemi in self.session.surfaces.hemis.items()}
+        self.session.surfaces.publish_flags(flags_by_vertex(col, self.view.score, sizes))
+        self._published = key
+        self.flags_changed.emit()
 
     def _sync_info(self) -> None:
         vp = self._viewport()

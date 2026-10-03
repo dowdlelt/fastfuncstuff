@@ -108,6 +108,11 @@ class SurfaceStore:
         self._atlases: dict[str, tuple[np.ndarray, np.ndarray] | None] = {}
         self._lut: dict[int, tuple[str, tuple[int, int, int]]] | None = None
         self._trees: dict[str, tuple[int, object, np.ndarray]] = {}
+        #: The latest profile-column flags, ``{hemi: per-vertex score}`` (NaN
+        #: off cortex), published by a profile window so a surface window can
+        #: paint them. Bumped ``flags_version`` tells it they changed.
+        self.flags: dict[str, np.ndarray] = {}
+        self.flags_version = 0
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -124,7 +129,12 @@ class SurfaceStore:
         self.hemis = {}
         self._reset_edits()
 
+    def publish_flags(self, flags: dict[str, np.ndarray]) -> None:
+        self.flags = flags
+        self.flags_version += 1
+
     def _reset_edits(self) -> None:
+        self.flags = {}
         self._annots.clear()
         self._atlases.clear()
         self._trees.clear()

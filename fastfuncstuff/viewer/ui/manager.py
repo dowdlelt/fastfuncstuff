@@ -113,6 +113,7 @@ class WindowManager(QtCore.QObject):
         elif viewport.is_profile:
             win = ProfileWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
+            win.flags_changed.connect(self._refresh_surface_windows)
         elif viewport.is_surface:
             win = SurfaceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
@@ -227,6 +228,11 @@ class WindowManager(QtCore.QObject):
             if isinstance(win, ImageWindow):
                 win.redraw_outlines()
             elif isinstance(win, SurfaceWindow):
+                win.refresh(Aspect.SLICES)
+
+    def _refresh_surface_windows(self) -> None:
+        for win in list(self.windows.values()):
+            if isinstance(win, SurfaceWindow):
                 win.refresh(Aspect.SLICES)
 
     def restyle(self) -> None:

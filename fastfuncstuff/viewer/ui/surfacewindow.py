@@ -938,13 +938,18 @@ class SurfaceWindow(QtWidgets.QWidget):
     def _refresh_map(self, vp: Viewport) -> None:
         surfaces = self.session.surfaces
         annot = self.session.state.surface_annot
-        key = (vp.vertex_map, annot if vp.vertex_map == "annot" else "", surfaces.subject)
+        key = (
+            vp.vertex_map,
+            annot if vp.vertex_map == "annot" else "",
+            surfaces.flags_version if vp.vertex_map == "flags" else 0,
+            surfaces.subject,
+        )
         fresh = {h for h in surfaces.hemis if h not in self._map_hemis}
         if key == self._built_map and not fresh:
             return
         for h, hemi in surfaces.hemis.items():
             ann = surfaces.annotation(h, annot) if vp.vertex_map == "annot" else None
-            colours = s3.vertex_colors(hemi, vp.vertex_map, ann)
+            colours = s3.vertex_colors(hemi, vp.vertex_map, ann, surfaces.flags.get(h))
             if colours is None:
                 colours = np.zeros((hemi.n_vertices, 4), np.uint8)
             self.canvas.set_hemisphere(
