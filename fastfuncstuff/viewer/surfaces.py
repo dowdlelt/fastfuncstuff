@@ -476,6 +476,76 @@ class SurfaceStore:
         self.log.entries.append({"undo": True})
         return True
 
+    def _installed_states(self) -> list[tuple[str, str]]:
+        """(hemi, surface) pairs an install writes: the edited, plus smoothwm with white."""
+        out = sorted(self.edited)
+        for hemi, surface in list(out):
+            if surface == "white" and "smoothwm" in self.hemis[hemi].paths:
+                out.append((hemi, "smoothwm"))
+        return out
+
+    def install_plan(self, stamp: str | None = None) -> InstallPlan:
+        """The originals an install would replace, and where each is backed up."""
+        import time
+
+        stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+        files = []
+        for hemi, surface in self._installed_states():
+            original = self.hemis[hemi].paths[surface]
+            backup = original.with_name(f"{original.name}.pre-ffsedit-{stamp}")
+            n = 1
+            while backup.exists():
+                n += 1
+                backup = original.with_name(f"{original.name}.pre-ffsedit-{stamp}-{n}")
+            files.append((original, backup))
+        return InstallPlan(files, stamp)
+
+    def install(self, plan: InstallPlan | None = None) -> InstallPlan:
+        """Replace the original surface files with the edits, keeping backups.
+
+        Deliberately **not** a recorded command: a replayed script must never
+        overwrite a subject's surfaces. Each original is copied to its backup
+        first; the edited surface is written beside it and renamed over the
+        original, so an interruption leaves either the old file or the new
+        one, never half of one. Afterwards the installed surfaces are the new
+        baseline -- nothing is "edited" any more and undo starts afresh.
+        """
+        import shutil
+
+        if not self.edited:
+            raise ValueError("no edited surfaces to install")
+        plan = plan or self.install_plan()
+        # Work out every position before touching any file: smoothwm's
+        # displacement is white's current position against white's *file*.
+        positions: dict[tuple[str, str], np.ndarray] = {}
+        for hemi, surface in self._installed_states():
+            h = self.hemis[hemi]
+            if surface == "smoothwm":
+                positions[(hemi, surface)] = h.original("smoothwm") + (
+                    h.states["white"] - h.original("white")
+                )
+            else:
+                positions[(hemi, surface)] = h.states[surface].copy()
+        for (hemi, surface), (original, backup) in zip(
+            self._installed_states(), plan.files, strict=True
+        ):
+            shutil.copy2(original, backup)
+            tmp = original.with_name(f".{original.name}.ffsedit-tmp")
+            self.hemis[hemi].save_positions(surface, tmp, positions[(hemi, surface)])
+            tmp.replace(original)
+            if surface in self.hemis[hemi].states:
+                self.hemis[hemi].states[surface] = positions[(hemi, surface)].astype(np.float32)
+        if plan.files:
+            log = plan.files[0][0].with_name(f"surface_edits.installed-{plan.stamp}.json")
+            installed = [[str(o), str(b)] for o, b in plan.files]
+            log.write_text(
+                json.dumps({"installed": installed, "edits": self.log.entries}, indent=1)
+            )
+        self.edited.clear()
+        self._undo.clear()
+        self.log = EditLog()
+        return plan
+
     def save(self, suffix: str = "ffsedit") -> list[Path]:
         """Write every edited surface as ``?h.<surface>.<suffix>`` beside its original.
 
@@ -508,6 +578,14 @@ class SurfaceStore:
         return written
 
 
+@dataclass(frozen=True)
+class InstallPlan:
+    """What :meth:`SurfaceStore.install` would do: (original, backup) per file."""
+
+    files: list[tuple[Path, Path]]
+    stamp: str
+
+
 def _point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Distance from ``p`` (2,) to each segment ``a[i]-b[i]`` (N, 2)."""
     ab = b - a
@@ -516,4 +594,4 @@ def _point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.n
     return np.linalg.norm(closest - p, axis=1)
 
 
-__all__ = ["ANATOMICAL", "OUTLINE_RGB", "PARTNER", "Grab", "Outline", "SurfaceStore"]
+__all__ = ["ANATOMICAL", "OUTLINE_RGB", "PARTNER", "Grab", "InstallPlan", "Outline", "SurfaceStore"]

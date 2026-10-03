@@ -23,7 +23,14 @@ def _sphere(radius: float, n: int = 3000):
     i = np.arange(n) + 0.5
     phi, theta = np.arccos(1 - 2 * i / n), np.pi * (1 + 5**0.5) * i
     v = np.stack([np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)], 1)
-    return (v * radius).astype(np.float32), ConvexHull(v).simplices.astype(np.int32)
+    f = ConvexHull(v).simplices.astype(np.int32)
+    # Wound outward, as FreeSurfer stores every surface: the hull's own order
+    # is arbitrary per face, which made vertex normals point every which way
+    # and an edit of white "push" pial that was 4 mm clear of it.
+    n_face = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+    inward = np.einsum("ij,ij->i", n_face, v[f].mean(1)) < 0
+    f[inward] = f[inward][:, ::-1]
+    return (v * radius).astype(np.float32), f
 
 
 def _subject(tmp_path, cras=(0.0, 0.0, 0.0)):
@@ -320,3 +327,39 @@ def test_saving_an_edited_white_also_writes_smoothwm_with_its_displacement(sessi
     np.testing.assert_allclose(sm_after - sm_before, white_after - white_before, atol=1e-4)
     # Untouched vertices bit-identical in the smoothwm copy too.
     np.testing.assert_array_equal(sm_after[~moved], sm_before[~moved])
+
+
+def test_install_replaces_originals_and_keeps_backups(session, tmp_path):
+    from fastfuncstuff.io.freesurfer import read_surface
+
+    session.load(_shell_anat(tmp_path))
+    subj = _subject(tmp_path)
+    surf = subj / "surf"
+    v, f = read_surface(surf / "lh.white").vertices, read_surface(surf / "lh.white").faces
+    info = nfs.read_geometry(str(surf / "lh.white"), read_metadata=True)[2]
+    nfs.write_geometry(str(surf / "lh.smoothwm"), v * 0.99, f, volume_info=info)
+    originals = {n: (surf / n).read_bytes() for n in ("lh.white", "lh.pial", "lh.smoothwm")}
+    session.do(LoadSurfaces(str(subj), "lh"))
+    store = session.surfaces
+    with pytest.raises(ValueError, match="no edited"):
+        store.install()
+    session.do(_edit(session))
+    edited = store.hemis["lh"].states["white"].copy()
+    plan = store.install_plan(stamp="T")
+    # white was edited (and pushed nothing): white and smoothwm, not pial.
+    assert [o.name for o, _ in plan.files] == ["lh.white", "lh.smoothwm"]
+    store.install(plan)
+    for original, backup in plan.files:
+        assert backup.read_bytes() == originals[original.name]
+        assert original.read_bytes() != originals[original.name]
+    assert (surf / "lh.pial").read_bytes() == originals["lh.pial"]
+    hemi = store.hemis["lh"]
+    np.testing.assert_allclose(hemi.original("white"), edited, atol=1e-4)
+    assert not store.edited and not list(surf.glob(".*ffsedit-tmp"))
+    assert (surf / "surface_edits.installed-T.json").exists()
+    # A second install the same second does not clobber the first backups.
+    session.do(_edit(session, drag=(0.0, 0.0, -0.4)))
+    again = store.install_plan(stamp="T")
+    assert all(b.name.endswith("-2") for _, b in again.files)
+    # And installing is not something a replayed script can do.
+    assert "INSTALL" not in session.to_script()

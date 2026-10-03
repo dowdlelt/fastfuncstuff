@@ -58,6 +58,7 @@ keys (main window)
   ctrl+O  open         ctrl+S  save session script       h  this list
   O                    cycle surface outlines (white+pial / white / pial / off)
   ctrl+shift+S         save edited surfaces as ?h.<surf>.<suffix> copies
+  ctrl+shift+I         install edits over the originals (asks; keeps backups)
   V                    3-D surface window (data sampled between white and pial)
   P                    ribbon profile column: every vertex, back to front, flagged
 

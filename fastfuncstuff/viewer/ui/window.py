@@ -727,6 +727,39 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage(f"surfaces: wrote {names} .{suffix.strip()}", 6000)
 
+    def _install_surfaces_dialog(self) -> None:
+        """Replace the subject's surface files with the edits, after asking.
+
+        Not a command, on purpose: a recorded session that replays must never
+        overwrite a subject's surfaces. Saving copies (ctrl+shift+S) is the
+        recordable way to keep edits.
+        """
+        surfaces = self.session.surfaces
+        if not surfaces.edited:
+            self.statusBar().showMessage("surfaces: nothing edited to install", 4000)
+            return
+        plan = surfaces.install_plan()
+        listing = "\n".join(f"  {o.name}  ->  backup {b.name}" for o, b in plan.files)
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Install edited surfaces",
+            f"Replace these files in {plan.files[0][0].parent} with the edits?\n\n{listing}\n\n"
+            "Each original is kept as the backup shown. FreeSurfer stages that "
+            "regenerate these surfaces will overwrite them again.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            surfaces.install(plan)
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"surfaces: install failed: {exc}", 10000)
+            return
+        self.statusBar().showMessage(
+            f"surfaces: installed {len(plan.files)} files (backups *.pre-ffsedit-*)", 8000
+        )
+
     #: What shift+O steps through. Both first, because judging one boundary
     #: needs the other in view to see the cortex between them.
     _OUTLINE_CYCLE = ("white,pial", "white", "pial", "")
@@ -1579,6 +1612,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     "open the ribbon profile column (surface QC)",
                     self._new_profiles,
                     group="windows",
+                ),
+                Binding(
+                    "ctrl+shift+i",
+                    "install edited surfaces (replace originals, keep backups)",
+                    self._install_surfaces_dialog,
+                    group="session",
                 ),
                 Binding(
                     "ctrl+shift+s",
