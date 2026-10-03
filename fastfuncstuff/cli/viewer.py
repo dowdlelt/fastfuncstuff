@@ -56,6 +56,7 @@ keys (main window)
   a  alpha mode        s  sign mode       b  boxed      c  colormap
   D                    denoise the selected run into a new layer
   ctrl+O  open         ctrl+S  save session script       h  this list
+  O                    cycle surface outlines (white+pial / white / pial / off)
 
 keys (image window)
   1 2 3                axial / sagittal / coronal
@@ -76,6 +77,7 @@ examples
   ffs_viewer anat.nii.gz stats.nii.gz
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
+  ffs_viewer -surfaces $SUBJECTS_DIR/subj subj/SUMA/brain.nii.gz stats.nii.gz
 """
 
 
@@ -106,6 +108,13 @@ def build_parser() -> FfsArgumentParser:
         help="Run the script and exit without opening a window (for testing "
         "and for regenerating figures headlessly).",
     )
+    p.add_argument(
+        "-surfaces",
+        metavar="SUBJ_DIR",
+        help="FreeSurfer subject directory: outline its white and pial surfaces on "
+        "the slices. Placed in scanner space from the surface files themselves, so "
+        "they line up with orig.mgz, the SUMA SurfVol, or anything aligned to them.",
+    )
     add_device_arg(p, default="auto")
     return p
 
@@ -125,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
                 session.read_directory(args.read)
             for path in args.datasets:
                 session.load(path)
+            if args.surfaces:
+                from fastfuncstuff.viewer.vocab import LoadSurfaces
+
+                session.do(LoadSurfaces(args.surfaces))
             if args.script:
                 session.run_script(open(args.script).read())
             print(session.to_script(header="replayed"), end="")
@@ -141,7 +154,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    return launch(args.datasets, device=args.device, script=args.script, directory=args.read)
+    return launch(
+        args.datasets,
+        device=args.device,
+        script=args.script,
+        directory=args.read,
+        surfaces=args.surfaces,
+    )
 
 
 if __name__ == "__main__":

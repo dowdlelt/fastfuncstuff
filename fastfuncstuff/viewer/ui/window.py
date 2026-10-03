@@ -66,6 +66,7 @@ from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     Load,
+    LoadSurfaces,
     ModeAction,
     MoveLayer,
     Read,
@@ -103,6 +104,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewTraces,
     SetVolume,
     SetXYZ,
+    ShowSurfaces,
 )
 
 #: Commands that change what a built window draws, as opposed to what is around
@@ -470,6 +472,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rescan_button.clicked.connect(lambda: self._start_rescan(manual=True))
         bar.addWidget(self.rescan_button)
 
+        self.surf_button = QtWidgets.QPushButton("SURF")
+        self.surf_button.setToolTip(
+            "Load a FreeSurfer subject's surfaces and outline white/pial on the slices.\n"
+            "shift+O cycles which outlines are drawn."
+        )
+        self.surf_button.clicked.connect(self._surfaces_dialog)
+        bar.addWidget(self.surf_button)
+
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
 
@@ -671,6 +681,40 @@ class ViewerWindow(QtWidgets.QMainWindow):
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Read directory", start)
         if directory:
             self.read_directory(directory)
+
+    def _surfaces_dialog(self) -> None:
+        start = self.session.state.surface_subject or os.environ.get(
+            "SUBJECTS_DIR", str(Path.cwd())
+        )
+        subject = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "FreeSurfer subject directory", start
+        )
+        if subject:
+            self.load_surfaces(subject)
+
+    def load_surfaces(self, subject: str | Path) -> None:
+        try:
+            self._dispatch(LoadSurfaces(str(subject)))
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"surfaces: {exc}", 8000)
+            return
+        hemis = self.session.surfaces.hemis
+        self.statusBar().showMessage(
+            f"surfaces: {', '.join(hemis)} from {subject} "
+            f"({sum(h.n_vertices for h in hemis.values()):,} vertices)",
+            5000,
+        )
+
+    #: What shift+O steps through. Both first, because judging one boundary
+    #: needs the other in view to see the cortex between them.
+    _OUTLINE_CYCLE = ("white,pial", "white", "pial", "")
+
+    def _cycle_outlines(self) -> None:
+        now = ",".join(self.session.state.surfaces_shown)
+        cycle = self._OUTLINE_CYCLE
+        nxt = cycle[(cycle.index(now) + 1) % len(cycle)] if now in cycle else cycle[0]
+        self._dispatch(ShowSurfaces(nxt))
+        self.statusBar().showMessage(f"outlines: {nxt or 'off'}", 2000)
 
     def read_directory(self, directory: str | Path) -> None:
         self.session.do(Read(str(directory)))
@@ -1491,6 +1535,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     for n, letter in enumerate(LETTERS[:5], start=1)
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
+                Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding(
                     "ctrl+l",
                     "load the chosen dataset",
@@ -2180,6 +2225,7 @@ def launch(
     device: str | None = None,
     script: str | None = None,
     directory: str | None = None,
+    surfaces: str | None = None,
 ) -> int:
     """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
@@ -2200,6 +2246,8 @@ def launch(
         win.read_directory(start)
     for p in paths:
         win.open_path(p)
+    if surfaces:
+        win.load_surfaces(surfaces)
     if script:
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
