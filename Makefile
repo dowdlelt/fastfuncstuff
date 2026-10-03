@@ -1,4 +1,4 @@
-.PHONY: check lint fix install test clean help completions
+.PHONY: shaders check lint fix install test clean help completions
 
 help:
 	@echo "Available commands:"
@@ -44,3 +44,12 @@ clean:
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	rm -rf htmlcov/ .coverage .pytest_cache/ dist/ build/
+
+# The 3-D surface view's shaders, baked for every RHI backend (GL, GLES,
+# Vulkan/SPIR-V, D3D/HLSL, Metal/MSL). The .qsb files are committed so a user
+# never needs the baker; rerun after editing a .vert/.frag.
+SHADERS := fastfuncstuff/viewer/shaders
+shaders:
+	for f in $(SHADERS)/*.vert $(SHADERS)/*.frag; do \
+		pyside6-qsb --glsl "330,300 es" --hlsl 50 --msl 12 -o $$f.qsb $$f || exit 1; \
+	done

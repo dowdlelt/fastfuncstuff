@@ -167,6 +167,7 @@ exclude = ["tests*", "examples*"]
 "fastfuncstuff.design" = ["*.tsv"]
 "fastfuncstuff.benchmark.configs" = ["*.yaml"]
 "fastfuncstuff.benchmark" = ["assets/*.m"]
+"fastfuncstuff.viewer.shaders" = ["*.qsb", "*.vert", "*.frag"]
 
 [tool.pytest.ini_options]
 # Deselect GPU-touching tests by default. Most of this suite's problems are tiny, but
