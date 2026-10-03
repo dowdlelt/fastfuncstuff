@@ -62,6 +62,7 @@ class ViewKind(StrEnum):
     CLUSTERS = "clusters"
     TRACE = "trace"
     SURFACE = "surface"
+    PROFILE = "profile"
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,14 @@ class Viewport:
     hemis: str = "lh,rh"
     split: float = 0.0
 
+    # -- ribbon profiles ------------------------------------------------
+    #: ``fraction`` (white and pial on fixed columns) or ``mm`` (pial where
+    #: the cortex is thick); which flag colours the score bar and decides what
+    #: a zoomed-out row shows; and the tube radius each depth is averaged over.
+    profile_mode: str = "fraction"
+    profile_score: str = "worst"
+    tube: float = 0.5
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -190,6 +199,10 @@ class Viewport:
         return self.kind is ViewKind.TRACE
 
     @property
+    def is_profile(self) -> bool:
+        return self.kind is ViewKind.PROFILE
+
+    @property
     def is_surface(self) -> bool:
         return self.kind is ViewKind.SURFACE
 
@@ -215,6 +228,8 @@ class Viewport:
             return f"{self.panel or 'trace'}  [{self.id}]"
         if self.is_surface:
             return f"surface · {self.shape}  [{self.id}]"
+        if self.is_profile:
+            return f"profiles · {self.profile_score}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -249,6 +264,7 @@ class ViewportSet:
             ViewKind.CLUSTERS: "K",
             ViewKind.TRACE: "T",
             ViewKind.SURFACE: "S",
+            ViewKind.PROFILE: "P",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:

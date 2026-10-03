@@ -553,6 +553,19 @@ class SetSurfaceHemis(Command):
 
 @command
 @dataclass(frozen=True)
+class SetProfileView(Command):
+    """A profile window's depth axis (fraction / mm), flag, and tube radius (mm)."""
+
+    name = "SET_PROFILE_VIEW"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    mode: str = "fraction"
+    score: str = "worst"
+    tube: float = 0.5
+
+
+@command
+@dataclass(frozen=True)
 class SetUnderlay(Command):
     """Replace the base image, keeping whatever is stacked over it.
 
@@ -1361,6 +1374,26 @@ def install(
     def _set_view_plane(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewPlane)
         return _set_view(st, cmd.view, SetViewPlane.aspects, plane=Plane(cmd.plane))
+
+    @bus.handle(SetProfileView.name)
+    def _set_profile_view(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetProfileView)
+        from fastfuncstuff.surface.profiles import SCORES
+
+        if cmd.mode not in ("fraction", "mm"):
+            raise ValueError("profile mode is 'fraction' or 'mm'")
+        if cmd.score not in SCORES:
+            raise ValueError(f"unknown profile score {cmd.score!r}; one of {', '.join(SCORES)}")
+        if not 0.0 <= cmd.tube <= 5.0:
+            raise ValueError("tube radius is 0-5 mm")
+        return _set_view(
+            st,
+            cmd.view,
+            SetProfileView.aspects,
+            profile_mode=cmd.mode,
+            profile_score=cmd.score,
+            tube=float(cmd.tube),
+        )
 
     @bus.handle(SetSurfaceShape.name)
     def _set_surface_shape(cmd: Command, st: ViewerState) -> Aspect:

@@ -873,6 +873,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
+    def _new_profiles(self) -> None:
+        if not self.session.surfaces.hemis:
+            self.statusBar().showMessage("profile column: load a subject first (SURF)", 5000)
+            return
+        self.statusBar().showMessage("profile column: sampling every vertex...", 3000)
+        self.manager.open(ViewKind.PROFILE, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+
     def _new_carpet(self) -> None:
         self._open_built(ViewKind.CARPET)
 
@@ -1566,6 +1574,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
+                Binding(
+                    "shift+p",
+                    "open the ribbon profile column (surface QC)",
+                    self._new_profiles,
+                    group="windows",
+                ),
                 Binding(
                     "ctrl+shift+s",
                     "save edited surfaces (as copies)",

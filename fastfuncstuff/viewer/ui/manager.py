@@ -24,6 +24,7 @@ from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
+from fastfuncstuff.viewer.ui.profilewindow import ProfileWindow
 from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
 from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
@@ -46,6 +47,7 @@ Companion = (
     | ClusterWindow
     | TraceWindow
     | SurfaceWindow
+    | ProfileWindow
 )
 
 
@@ -108,6 +110,9 @@ class WindowManager(QtCore.QObject):
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
             win.surfaces_previewed.connect(self._redraw_outlines)
+        elif viewport.is_profile:
+            win = ProfileWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.located.connect(self._on_located)
         elif viewport.is_surface:
             win = SurfaceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
@@ -205,6 +210,11 @@ class WindowManager(QtCore.QObject):
                     win.redraw()
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
+                    win.refresh(dirty)
+            elif isinstance(win, ProfileWindow):
+                # The crosshair (to follow), an edit (SLICES: re-sample what
+                # moved), and the anatomy it reads (LAYERS, TIME).
+                if dirty & (Aspect.CROSSHAIR | Aspect.SLICES | Aspect.LAYERS | Aspect.TIME):
                     win.refresh(dirty)
             elif graphs:
                 # A carpet's refresh only moves its time cursor; the picture
