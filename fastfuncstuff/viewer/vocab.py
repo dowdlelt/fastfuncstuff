@@ -566,6 +566,9 @@ class EditSurfaceStroke(Command):
     #: The display grid the slice was cut in, when an oblique window tilted
     #: it -- 12 numbers, the affine's top three rows; empty is the shared grid.
     grid: str = ""
+    #: Hand redraws move the outline square to itself in the slice, not along
+    #: the surface normals (``SnapParams.free``).
+    free: bool = False
 
     @staticmethod
     def encode(points) -> str:
@@ -1497,6 +1500,7 @@ def install(
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
             gate=bool(cmd.gate),
+            free=bool(cmd.free),
         )
         tilted = cmd.grid_affine()
         session.surfaces.apply_stroke(

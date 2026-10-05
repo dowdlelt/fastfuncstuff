@@ -495,15 +495,25 @@ class StrokeEdit(SurfaceEdit):
         self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
         start, normals = self.start[self.seed], self.normals[self.seed]
+        self.disp: np.ndarray | None = None
         if plane_normal is None:
             targets = closest_on_polyline(start, stroke)
         else:
-            targets = stroke_targets(start, normals, stroke, plane_normal)
+            targets, feet = stroke_targets(start, normals, stroke, plane_normal, feet=True)
+            if params.free and params.snap <= 0:
+                # Free: each seed carries its outline point onto the stroke --
+                # in the slice, square to the outline, as the eye reads it --
+                # and the fill spreads that vector rather than a distance.
+                a = np.asarray(plane_normal, np.float64)
+                a = a / np.linalg.norm(a)
+                vec = targets - feet
+                vec -= np.outer(vec @ a, a)
+                self.disp = self._interpolate(vec)
         self.seed_shift = np.einsum("ij,ij->i", targets - start, normals)
         self.along = self._interpolate()
 
-    def _interpolate(self) -> np.ndarray:
-        """Harmonic fill: seeds fixed to their shift, zero just past the rim."""
+    def _interpolate(self, values: np.ndarray | None = None) -> np.ndarray:
+        """Harmonic fill: seeds fixed to their shift (or ``values``), zero just past the rim."""
         edges = self.topo.edges
         n = self.ids.size
         lookup = np.full(self.topo.n_vertices, -1, np.int64)
@@ -522,13 +532,17 @@ class StrokeEdit(SurfaceEdit):
         )
         pin = np.zeros(n)
         pin[self.seed] = 1e6
-        rhs = np.zeros(n)
-        rhs[self.seed] = 1e6 * self.seed_shift
-        return np.asarray(spsolve((lap + sp.diags(pin)).tocsc(), rhs), np.float64)
+        seed_values = self.seed_shift if values is None else np.asarray(values, np.float64)
+        rhs = np.zeros((n, *seed_values.shape[1:]))
+        rhs[self.seed] = 1e6 * seed_values
+        out = spsolve((lap + sp.diags(pin)).tocsc(), rhs)
+        return np.asarray(out.toarray() if sp.issparse(out) else out, np.float64).reshape(rhs.shape)
 
     def result(self) -> EditResult:
         """The redrawn surface. Computed from the start, like every update."""
         p = self.params
+        if self.disp is not None:
+            return self._finish_free(self.disp)
         if p.snap <= 0:
             limit = np.zeros(self.ids.size)
         else:
@@ -578,8 +592,13 @@ class HighlightEdit(StrokeEdit):
 
 
 def stroke_targets(
-    points: np.ndarray, normals: np.ndarray, stroke: np.ndarray, plane_normal: np.ndarray
-) -> np.ndarray:
+    points: np.ndarray,
+    normals: np.ndarray,
+    stroke: np.ndarray,
+    plane_normal: np.ndarray,
+    *,
+    feet: bool = False,
+):
     """Where each vertex's outline must pass through the stroke, ``(N, 3)`` mm.
 
     The nearest stroke point is the wrong partner near a stroke's ends: a
@@ -592,6 +611,9 @@ def stroke_targets(
     crossing. A vertex whose surface lies nearly in the slice has no stable
     outline point, and one whose cast misses the stroke has no crossing; both
     keep the nearest point.
+
+    With ``feet``, also returns each vertex's outline point (the vertex itself
+    where it has none), so ``target - foot`` is the move the outline makes.
     """
     pts = np.asarray(points, np.float64)
     nrm = np.asarray(normals, np.float64)
@@ -608,7 +630,7 @@ def stroke_targets(
     mlen = np.linalg.norm(m, axis=1)
     ok = (mlen > 0.2) & (np.abs(wa) > 1e-6)
     if not ok.any() or line.shape[0] < 2:
-        return out
+        return (out, pts.copy()) if feet else out
     foot = pts - (((pts - origin) @ a) / np.where(ok, wa, 1.0))[:, None] * w
     m = m / np.maximum(mlen, 1e-12)[:, None]
     # 2-D in the slice: e1, e2 span it.
@@ -637,6 +659,10 @@ def stroke_targets(
     rows = np.arange(pts.shape[0])
     use = ok & np.isfinite(reach[rows, k])
     out[use] = foot[use] + delta[rows, k][use, None] * m[use]
+    if feet:
+        where = pts.copy()
+        where[use] = foot[use]
+        return out, where
     return out
 
 

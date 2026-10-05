@@ -1270,6 +1270,7 @@ class ImageWindow(QtWidgets.QWidget):
                     state.surface_snap_key or "",
                     state.surface_snap_gate,
                     EditSurfaceStroke.encode_grid(self._grid().affine) if self._tilted() else "",
+                    state.surface_free,
                 )
             )
         except ValueError as exc:

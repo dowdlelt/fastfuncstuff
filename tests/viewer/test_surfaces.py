@@ -892,3 +892,37 @@ def test_free_hand_edits_follow_the_drag_and_are_recorded(session, tmp_path):
     np.testing.assert_allclose(white[top] - start, [0.8, 0.0, 0.0], atol=1e-5)
     # The script line ends with gate and free, both on.
     assert session.to_script().strip().splitlines()[-1].endswith("'' 1 1")
+
+
+def test_a_free_stroke_moves_the_outline_within_the_slice_and_replays(session, tmp_path):
+    """Free: the redrawn stretch moves square to the outline *in the slice*,
+    so its vertices keep their height and the outline lands on the line."""
+    import dataclasses
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceTool
+
+    session.load(_shell_anat(tmp_path))
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    session.do(SetSurfaceTool("draw"))
+    hemi = session.surfaces.hemis["lh"]
+    before = hemi.states["white"].copy()
+    cmd = dataclasses.replace(_stroke_command(session), free=True)
+    session.do(cmd)
+    after = hemi.states["white"]
+    moved = np.flatnonzero(np.any(after != before, axis=1))
+    on_slice = moved[np.abs(before[moved, 2] - 15.0) < 0.8]
+    angle = np.abs(np.arctan2(before[on_slice, 1], before[on_slice, 0]))
+    mid = on_slice[angle < 0.3]
+    assert mid.size > 0
+    # In-plane: no vertical motion; and the outline's in-slice radius moves
+    # from sqrt(20^2 - z^2) toward the stroke's sqrt(21^2 - 15^2).
+    np.testing.assert_allclose(after[moved, 2], before[moved, 2], atol=1e-9)
+    gain = np.linalg.norm(after[mid, :2], axis=1) - np.linalg.norm(before[mid, :2], axis=1)
+    want = np.sqrt(21.0**2 - 15.0**2) - np.sqrt(20.0**2 - 15.0**2)
+    assert np.median(gain) == pytest.approx(want, abs=0.25)
+    fresh = ViewerSession(device=CPU)
+    try:
+        fresh.run_script(session.to_script())
+        np.testing.assert_allclose(fresh.surfaces.hemis["lh"].states["white"], after, atol=1e-6)
+    finally:
+        fresh.close()
