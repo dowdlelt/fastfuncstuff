@@ -210,8 +210,11 @@ void main()
     if (layers[3].modes.w > 0.5) col = over(col, light, layers[3], value3, stat3, dx, dy);
 
     if (cross.w > 0.0) {
+        // A dot in the crosshair colour with a dark rim, so it reads over
+        // any overlay colour, including its own.
         float dd = distance(mix(vWhite, vPial, 0.5), cross.xyz);
         if (dd < cross.w) col = mix(col, crossRgb.rgb, 0.9);
+        else if (dd < 1.4 * cross.w) col = mix(col, vec3(0.0), 0.75);
     }
     fragColor = vec4(col, 1.0);
 }

@@ -286,6 +286,20 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         m = self.model(hemi)
         return p @ m[:3, :3].T.astype(np.float32) + m[:3, 3].astype(np.float32)
 
+    def nearest_vertex(self, mm) -> tuple[str, int] | None:
+        """The shown vertex whose mid-depth point is closest to scanner ``mm``."""
+        best: tuple[float, str, int] | None = None
+        p = np.asarray(mm, np.float32)
+        for hemi in self._visible:
+            cpu = self._cpu.get(hemi)
+            if not cpu or "white" not in cpu or "pial" not in cpu:
+                continue
+            d2 = np.einsum("ij,ij->i", *(2 * [0.5 * (cpu["white"] + cpu["pial"]) - p]))
+            k = int(np.argmin(d2))
+            if best is None or d2[k] < best[0]:
+                best = (float(d2[k]), hemi, k)
+        return None if best is None else (best[1], best[2])
+
     # -- RHI -----------------------------------------------------------------
     def initialize(self, cb: QRhiCommandBuffer) -> None:  # noqa: ARG002 (Qt)
         rhi = self.rhi()
@@ -682,6 +696,9 @@ class SurfaceWindow(QtWidgets.QWidget):
     #: Ctrl+click, scanner mm -- SET_XYZ there, then SET_SEED on that voxel.
     seeded = QtCore.Signal(float, float, float)
 
+    #: Radius of the crosshair's mark on the surface, mm.
+    CROSS_MM = 2.0
+
     _SHAPE_KEYS = {
         "mid": "1",
         "white": "2",
@@ -710,6 +727,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         #: Texture-ready voxels per overlay key, so a redraw that changes only
         #: a threshold does not re-read or re-transpose a volume.
         self._slot_cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
+        self.show_cross = True
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -735,7 +753,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             bar.addWidget(b)
             self._hemi_buttons[hemi] = b
         bar.addSpacing(8)
-        self.map_box = self._combo("Per-vertex map painted under the overlay (c cycles)")
+        self.map_box = self._combo("Per-vertex map painted under the overlay (m cycles)")
         self.map_box.activated.connect(self._pick_map)
         bar.addWidget(self.map_box)
         self.annot_box = self._combo(
@@ -788,7 +806,9 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("}", "more depth samples (average white..pial)", lambda: self._samples_by(1), group="depth"),
                 Key("shift+scroll", "scroll through cortical depth", None, group="depth"),
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
-                Key("c", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
+                Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
+                Key("c", "centre the view on the crosshair", self._centre_view, group="view"),
+                Key("x", "show / hide the crosshair", self._toggle_cross, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "nearest / linear voxel sampling", self._toggle_linear, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
@@ -891,6 +911,27 @@ class SurfaceWindow(QtWidgets.QWidget):
         self._frame()
         self.canvas.update()
         self.depth_label.setText(name)
+
+    def _centre_view(self) -> None:
+        """Aim the camera at the crosshair as drawn, in whatever shape is shown.
+
+        On an inflated or flat surface the crosshair's scanner mm is nowhere
+        near where it is drawn, so the camera aims at its nearest vertex.
+        """
+        mm = self.session.state.crosshair_mm
+        found = None if mm is None else self.canvas.nearest_vertex(mm)
+        if found is None:
+            return
+        hemi, k = found
+        drawn = self.canvas.drawn_positions(hemi)
+        if drawn is not None:
+            self.canvas.camera.target = drawn[k].astype(np.float64)
+            self.canvas.update()
+
+    def _toggle_cross(self) -> None:
+        self.show_cross = not self.show_cross
+        self._refresh_cross()
+        self.canvas.update()
 
     def _reset_camera(self) -> None:
         self.canvas.camera = s3.Camera()
@@ -1268,11 +1309,22 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.set_overlays(slots)
 
     def _refresh_cross(self) -> None:
+        """Mark the crosshair on its nearest vertex.
+
+        The shader marks fragments whose mid-depth point is near ``cross``; the
+        crosshair itself is usually in white matter or CSF, a few mm from any
+        mid-depth point, and drew nothing. Its nearest vertex is always on the
+        surface, so the mark shows wherever the crosshair is.
+        """
         mm = self.session.state.crosshair_mm
-        if mm is None:
+        found = None if mm is None or not self.show_cross else self.canvas.nearest_vertex(mm)
+        if found is None:
             self.canvas.cross = (0.0, 0.0, 0.0, 0.0)
             return
-        self.canvas.cross = (float(mm[0]), float(mm[1]), float(mm[2]), 1.5)
+        hemi, k = found
+        cpu = self.canvas._cpu[hemi]
+        mid = 0.5 * (cpu["white"][k] + cpu["pial"][k])
+        self.canvas.cross = (float(mid[0]), float(mid[1]), float(mid[2]), self.CROSS_MM)
 
 
 __all__ = ["SurfaceCanvas", "SurfaceWindow"]

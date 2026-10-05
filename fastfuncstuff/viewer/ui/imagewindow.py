@@ -232,6 +232,7 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
+                Binding("c", "centre the view on the crosshair", self._centre_view, group="view"),
                 Binding("right-drag", "zoom (up = in)", None, group="view"),
                 Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
@@ -507,6 +508,13 @@ class ImageWindow(QtWidgets.QWidget):
         if self._viewport() is not None:
             self._dispatch(SetZoom(self.vid, 1.0))
             self._dispatch(SetPan(self.vid, 0.0, 0.0))
+
+    def _centre_view(self) -> None:
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        if view is not None:
+            self._dispatch(SetPan(self.vid, *view.pan_centring(state.crosshair)))
 
     def _pan_by(self, d_row: float, d_col: float) -> None:
         vp = self._viewport()

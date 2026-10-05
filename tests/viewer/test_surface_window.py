@@ -13,6 +13,7 @@ import torch
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
 nib = pytest.importorskip("nibabel")
 
+from fastfuncstuff.viewer.commands import Aspect  # noqa: E402
 from tests.viewer.test_surface_render import _sheet  # noqa: E402
 
 
@@ -213,3 +214,29 @@ def test_a_surface_seed_lands_on_the_voxel_the_crosshair_moved_to(window):
     # The fixture's grid: origin (-29, -29, -9) mm, 2 mm voxels.
     assert session.state.crosshair == (10, 5, 5)
     assert session.state.seed == (10, 5, 5)
+
+
+def test_the_crosshair_marks_its_nearest_vertex_and_c_aims_the_camera_there(window):
+    """The crosshair is rarely at mid-depth; a mark only within 2 mm of it drew
+    nothing. And on an inflated surface its mm is not where it is drawn."""
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape, SetXYZ
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "flat"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    # 9 mm above the sheet (mid-depth is z = 1.5): far off the surface.
+    session.do(SetXYZ(5.0, -7.0, 9.0))
+    win.refresh(Aspect.ALL)
+    cx, cy, cz, r = c.cross
+    assert r > 0 and cz == pytest.approx(1.5, abs=1e-4)
+    assert abs(cx - 5.0) < 1.5 and abs(cy + 7.0) < 1.5
+
+    hemi, k = c.nearest_vertex((5.0, -7.0, 9.0))
+    win._centre_view()
+    assert np.allclose(c.camera.target, c.drawn_positions(hemi)[k], atol=1e-4)
+
+    win._toggle_cross()
+    assert c.cross[3] == 0.0
