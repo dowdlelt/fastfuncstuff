@@ -126,6 +126,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     #: Shift+wheel: move the sampled depth by this fraction.
     depth_scrolled = QtCore.Signal(float)
 
+    #: Radians turned by a drag the height of the window. pi read as sluggish:
+    #: a half turn to see the other side took two strokes.
+    ORBIT = 2.0 * np.pi
+
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setSampleCount(4)
@@ -587,9 +591,16 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         if self._press is not None and (event.position() - self._press).manhattanLength() > 3:
             self._moved = True
         h = max(self.height(), 1)
-        if event.buttons() & QtCore.Qt.MouseButton.RightButton:
+        buttons = event.buttons()
+        shift = event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier
+        if buttons & QtCore.Qt.MouseButton.RightButton:
+            # Up zooms in, as in the slice windows.
+            self.camera.zoom(float(np.exp(d.y() / 150.0)))
+        elif buttons & QtCore.Qt.MouseButton.MiddleButton or (
+            buttons & QtCore.Qt.MouseButton.LeftButton and shift and self._grabbed is None
+        ):
             self.camera.pan(d.x() / h, d.y() / h)
-        elif event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+        elif buttons & QtCore.Qt.MouseButton.LeftButton:
             if self._grabbed is not None:
                 # Turn the grabbed hemisphere about the screen's axes, in world
                 # terms, so the drag means the same thing from any view.
@@ -598,7 +609,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 r = self.hemi_rotation.get(self._grabbed, np.eye(3))
                 self.hemi_rotation[self._grabbed] = turn @ r
             else:
-                self.camera.orbit(d.x() / h * np.pi, d.y() / h * np.pi)
+                self.camera.orbit(d.x() / h * self.ORBIT, d.y() / h * self.ORBIT)
         self.update()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
@@ -785,7 +796,8 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("0", "reset the camera", self._reset_camera, group="view"),
                 Key("drag", "rotate", None, group="view"),
                 Key("alt+drag", "turn one hemisphere about its centre", None, group="hemispheres"),
-                Key("right-drag", "pan", None, group="view"),
+                Key("right-drag", "zoom (up = in)", None, group="view"),
+                Key("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
                 Key("click", "move the crosshair there", None, group="view"),
                 Key("ctrl+click", "set the InstaCorr seed there", None, group="view"),

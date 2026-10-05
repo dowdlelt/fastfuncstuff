@@ -55,9 +55,13 @@ class ImagePane(QtWidgets.QWidget):
     stepped = QtCore.Signal(int)
     #: Seed request (ctrl/cmd-click), same coordinates as ``picked``.
     seeded = QtCore.Signal(int, int)
-    #: Right-button drag, in image pixels. Left stays the crosshair, because
-    #: moving where you are looking is the gesture you make most.
+    #: Middle-button (or shift+left) drag, in image pixels. Left stays the
+    #: crosshair, because moving where you are looking is the gesture you
+    #: make most.
     panned = QtCore.Signal(float, float)
+    #: Right-button drag: multiply the zoom by this factor (up zooms in), the
+    #: same gesture as in the surface window.
+    zoomed = QtCore.Signal(float)
     #: Align-mode drags. ``slid`` is in image pixels (row, col); ``turned`` in
     #: degrees, positive clockwise on screen. ``released`` ends a drag.
     slid = QtCore.Signal(float, float)
@@ -82,6 +86,8 @@ class ImagePane(QtWidgets.QWidget):
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
         self._drag_from: QtCore.QPointF | None = None
+        #: What the drag from ``_drag_from`` does: "pan" or "zoom".
+        self._drag_kind = ""
         #: Voxel footprints of the open graphs, as (row, col, n_rows, n_cols)
         #: in image indices. The crosshair opens up around them.
         self._coverage: list[tuple[int, int, int, int]] = []
@@ -527,16 +533,25 @@ class ImagePane(QtWidgets.QWidget):
                     self.seeded.emit(*idx)
                 return
             self._drag_from = event.position()
+            self._drag_kind = "zoom"
             return
         mods = event.modifiers()
+        shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        left = event.button() == QtCore.Qt.MouseButton.LeftButton
+        if event.button() == QtCore.Qt.MouseButton.MiddleButton or (
+            # Shift+drag pans, except on the align handle, where shift slides.
+            left and shift and self._grab_kind(event.position(), True) is None
+        ):
+            self._drag_from = event.position()
+            self._drag_kind = "pan"
+            return
         if self._brush is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
             frac = self._to_fraction(event.position())
             if frac is not None:
                 self._editing_drag = True
                 self.edit_pressed.emit(*frac)
             return
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        if left:
             kind = self._grab_kind(event.position(), shift)
             if kind is not None:
                 self._grab = kind
@@ -555,11 +570,13 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
-        if event.buttons() & QtCore.Qt.MouseButton.RightButton:
-            if self._drag_from is not None:
+        if self._drag_from is not None:
+            delta = event.position() - self._drag_from
+            self._drag_from = event.position()
+            if self._drag_kind == "zoom":
+                self.zoomed.emit(float(np.exp(-delta.y() / 150.0)))
+            else:
                 scale = self._image_scale()
-                delta = event.position() - self._drag_from
-                self._drag_from = event.position()
                 # Negated: dragging the image right should bring what is on the
                 # left into view, the way dragging a map works.
                 self.panned.emit(-delta.y() / scale, -delta.x() / scale)
@@ -592,6 +609,10 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._drag_from is not None:
+            self._drag_from = None
+            self._drag_kind = ""
+            return
         if self._editing_drag and event.button() == QtCore.Qt.MouseButton.LeftButton:
             self._editing_drag = False
             self.edit_released.emit()

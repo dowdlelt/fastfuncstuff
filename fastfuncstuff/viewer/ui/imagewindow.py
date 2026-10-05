@@ -184,6 +184,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         self.pane.stepped.connect(self._step)
         self.pane.panned.connect(self._pan_by)
+        self.pane.zoomed.connect(self._zoom_by)
         self.pane.slid.connect(self._slide)
         self.pane.turned.connect(self._turn)
         self.pane.edit_pressed.connect(self._edit_press)
@@ -231,7 +232,8 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
-                Binding("right-drag", "pan", None, group="view"),
+                Binding("right-drag", "zoom (up = in)", None, group="view"),
+                Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
