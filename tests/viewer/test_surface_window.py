@@ -281,3 +281,19 @@ def test_a_continuous_map_shows_its_scale_and_a_parcellation_does_not(window):
     session.do(SetSurfaceMap("S1", ""))
     win.apply(session.state.viewports.get("S1"))
     assert win.legend.isHidden()
+
+
+def test_d_cycles_the_depth_statistic_and_it_reaches_the_canvas(window):
+    from fastfuncstuff.viewer.vocab import SetSurfaceDepth, SetSurfaceDepthStat
+
+    session, win = window
+    session.do(SetSurfaceDepth("S1", 0.0, 1.0, 6))
+    win._cycle_depth_stat()
+    vp = session.state.viewports.get("S1")
+    assert vp.depth_stat == "median"
+    win.refresh(Aspect.ALL)
+    assert win.canvas.depth_stat == "median"
+    assert "median" in win.depth_label.text()
+    assert "SET_SURFACE_DEPTH_STAT" in session.to_script()
+    with pytest.raises(ValueError, match="unknown depth statistic"):
+        session.do(SetSurfaceDepthStat("S1", "mode"))

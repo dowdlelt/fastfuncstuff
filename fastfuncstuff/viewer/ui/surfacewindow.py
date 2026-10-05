@@ -61,6 +61,7 @@ from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetAtlas,
     SetSurfaceDepth,
+    SetSurfaceDepthStat,
     SetSurfaceEquivolume,
     SetSurfaceFolding,
     SetSurfaceHemis,
@@ -140,6 +141,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         #: Folding shade strength under the overlays.
         self.fold_contrast = 0.16
         self.equivolume = True
+        self.depth_stat = "mean"
         self.map_opacity = 0.85
         #: Overlay layers, bottom to top (at most MAX_LAYERS are drawn).
         self.overlays: list[OverlaySlot] = []
@@ -575,6 +577,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     cross_rgb=tuple(theme.palette().crosshair[:3]),
                     equivolume=self.equivolume,
                     map_opacity=self.map_opacity,
+                    depth_stat=self.depth_stat,
                 ),
             )
             draws.append((gpu, index, count))
@@ -873,6 +876,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("}", "more depth samples (average white..pial)", lambda: self._samples_by(1), group="depth"),
                 Key("shift+scroll", "scroll through cortical depth", None, group="depth"),
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
+                Key("d", "depth statistic: mean, median, max, min, max_abs, nzmean", self._cycle_depth_stat, group="depth"),
                 Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
                 Key("c", "centre the view on the crosshair", self._centre_view, group="view"),
                 Key("x", "show / hide the crosshair", self._toggle_cross, group="view"),
@@ -1134,6 +1138,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         c.depth = vp.depth
         c.samples = vp.samples
         c.equivolume = vp.equivolume
+        c.depth_stat = vp.depth_stat
         self._refresh_data()
         self._refresh_cross()
         self._sync_header(vp)
@@ -1250,7 +1255,9 @@ class SurfaceWindow(QtWidgets.QWidget):
         lo, hi = vp.depth
         how = "equivol" if vp.equivolume else "linear"
         self.depth_label.setText(
-            f"{how} {lo:.2f}" if vp.samples <= 1 else f"{how} {lo:.2f}-{hi:.2f} x{vp.samples}"
+            f"{how} {lo:.2f}"
+            if vp.samples <= 1
+            else f"{how} {lo:.2f}-{hi:.2f} x{vp.samples} {vp.depth_stat}"
         )
         st = self.session.state
         for box, items, current in (
@@ -1290,6 +1297,17 @@ class SurfaceWindow(QtWidgets.QWidget):
             self._dispatch(
                 SetSurfaceMap(self.vid, maps[(maps.index(vp.vertex_map) + 1) % len(maps)])
             )
+
+    def _cycle_depth_stat(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        stats = list(s3.DEPTH_STATS)
+        nxt = stats[(stats.index(vp.depth_stat) + 1) % len(stats)]
+        self._dispatch(SetSurfaceDepthStat(self.vid, nxt))
+        if vp.samples <= 1:
+            # One sample has nothing to reduce; say so rather than do nothing.
+            self.depth_label.setText(f"{nxt} -- needs depth samples: }} adds them")
 
     def _toggle_equivolume(self) -> None:
         vp = self._viewport()

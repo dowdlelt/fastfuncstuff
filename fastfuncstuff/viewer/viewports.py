@@ -163,6 +163,9 @@ class Viewport:
     #: distances -- the default, because a laminar question is about layers,
     #: and layers keep their volume, not their distance, through a fold.
     equivolume: bool = True
+    #: How several depth samples become one colour -- see
+    #: :data:`viewer.surface3d.DEPTH_STATS`. ``mean`` is the old behaviour.
+    depth_stat: str = "mean"
     #: Per-vertex map painted under the overlay: "", thickness, sulc, curv,
     #: or annot (the state's selected parcellation).
     vertex_map: str = ""

@@ -329,6 +329,7 @@ def pack_uniforms(
     cross_rgb: tuple[float, float, float],
     equivolume: bool = False,
     map_opacity: float = 1.0,
+    depth_stat: str = "mean",
 ) -> bytes:
     """The uniform block as bytes. Matrices go column-major, as GLSL reads them.
 
@@ -342,7 +343,7 @@ def pack_uniforms(
         _vec(depth[0], depth[1], float(samples), fold_contrast),
         _vec(*cross),
         _vec(*cross_rgb, 0.0),
-        _vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
+        _vec(1.0 if equivolume else 0.0, map_opacity, float(DEPTH_STATS.index(depth_stat)), 0.0),
     ]
     shown = layers[-MAX_LAYERS:]
     for k in range(MAX_LAYERS):
@@ -505,6 +506,52 @@ def depth_fractions(depth: tuple[float, float], samples: int) -> np.ndarray:
     return np.linspace(depth[0], depth[1], samples)
 
 
+#: How the depth samples between white and pial become one value, in the
+#: order ``d`` cycles them; the index is what the shader receives. Names are
+#: 3dVol2Surf's map functions. Selections (median, max, min, max_abs) take
+#: the threshold statistic from the *same* depth as the value, so a colour
+#: and its threshold always describe one point; means average both over the
+#: same samples. No ``mode``: of continuous samples every value is unique,
+#: and label layers already vote across depth.
+DEPTH_STATS = ("mean", "median", "max", "min", "max_abs", "nzmean")
+
+
+def reduce_depth(values: np.ndarray, stats: np.ndarray, how: str) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce ``(..., S)`` depth samples to one value and threshold statistic.
+
+    CPU twin of the fragment shader's ``reduceDepth``. For an even sample
+    count ``median`` is the upper middle, as in the shader -- a sample that
+    exists, so its statistic is that sample's too.
+    """
+    v = np.asarray(values, np.float64)
+    s = np.asarray(stats, np.float64)
+    if how == "mean":
+        return v.mean(axis=-1), s.mean(axis=-1)
+    if how == "nzmean":
+        nz = v != 0
+        n = nz.sum(axis=-1)
+        safe = np.maximum(n, 1)
+        return (
+            np.where(n > 0, (v * nz).sum(axis=-1) / safe, 0.0),
+            np.where(n > 0, (s * nz).sum(axis=-1) / safe, 0.0),
+        )
+    if how == "median":
+        order = np.argsort(v, axis=-1, kind="stable")
+        pick = np.take(order, [v.shape[-1] // 2], axis=-1)
+    elif how == "max":
+        pick = np.argmax(v, axis=-1)[..., None]
+    elif how == "min":
+        pick = np.argmin(v, axis=-1)[..., None]
+    elif how == "max_abs":
+        pick = np.argmax(np.abs(v), axis=-1)[..., None]
+    else:
+        raise ValueError(f"unknown depth statistic {how!r}; one of {', '.join(DEPTH_STATS)}")
+    return (
+        np.take_along_axis(v, pick, axis=-1)[..., 0],
+        np.take_along_axis(s, pick, axis=-1)[..., 0],
+    )
+
+
 def shade_reference(values: np.ndarray, stat: np.ndarray, shade: ShadeParams, lut: np.ndarray):
     """CPU twin of the fragment shader's colouring, through :mod:`viewer.colormap`.
 
@@ -549,6 +596,8 @@ __all__ = [
     "VERTEX_MAPS",
     "palette_texture",
     "depth_fractions",
+    "DEPTH_STATS",
+    "reduce_depth",
     "equivolume_fraction",
     "vertex_colors",
     "vertex_map_scale",

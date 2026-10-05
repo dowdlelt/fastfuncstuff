@@ -50,17 +50,33 @@ def _sheet(n: int = 41, size: float = 40.0, pial_scale: float = 1.0):
     )
 
 
-@pytest.mark.parametrize("pial_scale", [1.0, 1.5])
-def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale):
+@pytest.mark.parametrize(
+    ("pial_scale", "stat"),
+    [
+        (1.0, None),
+        (1.5, None),
+        *[(1.0, stat) for stat in ("mean", "median", "max", "min", "max_abs", "nzmean")],
+    ],
+)
+def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale, stat):
     """``pial_scale`` 1.5 makes pial's area 2.25x white's, so equivolume depth
-    is not the identity and the shader's has to agree with the CPU twin."""
+    is not the identity and the shader's has to agree with the CPU twin.
+
+    With ``stat``, five depths from 0.1 to 0.9 straddle two voxels in z (three
+    in k=5, two in k=6), so every reduction picks something different."""
     if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
         pytest.skip("QRhi needs a real platform plugin")
     from fastfuncstuff.viewer import surface3d as s3
     from fastfuncstuff.viewer.compose import cached_lut
     from fastfuncstuff.viewer.session import ViewerSession
     from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
-    from fastfuncstuff.viewer.vocab import OpenView, SetRange, SetSurfaceShape
+    from fastfuncstuff.viewer.vocab import (
+        OpenView,
+        SetRange,
+        SetSurfaceDepth,
+        SetSurfaceDepthStat,
+        SetSurfaceShape,
+    )
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     vox = 2.0
@@ -84,6 +100,11 @@ def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale):
         session.surfaces.version = {"lh": 1}
         session.do(OpenView("S1", "surface", "axial"))
         session.do(SetSurfaceShape("S1", "flat"))
+        fractions = np.array([0.5])
+        if stat is not None:
+            fractions = np.linspace(0.1, 0.9, 5)
+            session.do(SetSurfaceDepth("S1", 0.1, 0.9, 5))
+            session.do(SetSurfaceDepthStat("S1", stat))
         win = SurfaceWindow("S1", session, session.do)
         win.canvas.resize(320, 320)
         win.apply(session.state.viewports.get("S1"))
@@ -107,8 +128,15 @@ def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale):
                 if mm is None:
                     continue
                 # Nearest voxel, as the shader's nearest sampler reads it.
-                i, j, k = np.floor(inv[:3, :3] @ mm + inv[:3, 3] + 0.5).astype(int)
-                v = data[i, j, k][None]
+                if stat is None:
+                    i, j, k = np.floor(inv[:3, :3] @ mm + inv[:3, 3] + 0.5).astype(int)
+                    v = data[i, j, k][None]
+                else:
+                    # Flat white at z=0, pial at z=3 over it (pial_scale 1).
+                    pts = np.array([[mm[0], mm[1], 3.0 * f] for f in fractions])
+                    idx = np.floor(pts @ inv[:3, :3].T + inv[:3, 3] + 0.5).astype(int)
+                    samples = data[idx[:, 0], idx[:, 1], idx[:, 2]]
+                    v = np.atleast_1d(s3.reduce_depth(samples, samples, stat)[0])
                 rgb, alpha = s3.shade_reference(v, v, shade, np.c_[lut, np.ones(len(lut))])
                 want = np.round(rgb[0] * 255)
                 checked += 1

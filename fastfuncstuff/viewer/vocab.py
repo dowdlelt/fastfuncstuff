@@ -636,6 +636,17 @@ class SetSurfaceEquivolume(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceDepthStat(Command):
+    """How a surface window reduces its depth samples: mean, median, max, min, max_abs, nzmean."""
+
+    name = "SET_SURFACE_DEPTH_STAT"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    stat: str = "mean"
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceMap(Command):
     """Paint a per-vertex map under the overlay: thickness, sulc, curv, annot, or none."""
 
@@ -1661,6 +1672,17 @@ def install(
     def _set_surface_equivolume(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceEquivolume)
         return _set_view(st, cmd.view, SetSurfaceEquivolume.aspects, equivolume=bool(cmd.on))
+
+    @bus.handle(SetSurfaceDepthStat.name)
+    def _set_surface_depth_stat(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceDepthStat)
+        from fastfuncstuff.viewer.surface3d import DEPTH_STATS
+
+        if cmd.stat not in DEPTH_STATS:
+            raise ValueError(
+                f"unknown depth statistic {cmd.stat!r}; one of {', '.join(DEPTH_STATS)}"
+            )
+        return _set_view(st, cmd.view, SetSurfaceDepthStat.aspects, depth_stat=cmd.stat)
 
     @bus.handle(SetSurfaceMap.name)
     def _set_surface_map(cmd: Command, st: ViewerState) -> Aspect:

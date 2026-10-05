@@ -186,3 +186,39 @@ def test_vertex_maps_leave_the_medial_wall_transparent():
     assert tuple(rgba[1, :3]) == (200, 0, 0) and rgba[1, 3] == 255
     assert rgba[4, 3] == 0  # medial wall
     assert ann.name_at(3) == "insula" and ann.name_at(0) is None and ann.name_at(5) is None
+
+
+def test_depth_reductions_pick_the_statistic_from_the_same_depth():
+    from fastfuncstuff.viewer.surface3d import DEPTH_STATS, reduce_depth
+
+    v = np.array([[0.0, 3.0, -5.0, 1.0, 0.0]])
+    s = np.array([[10.0, 11.0, 12.0, 13.0, 14.0]])
+    want = {
+        "mean": (-0.2, 12.0),
+        "max": (3.0, 11.0),
+        "min": (-5.0, 12.0),
+        "max_abs": (-5.0, 12.0),
+        "nzmean": (-1 / 3, 12.0),
+    }
+    # Stable sort: -5(12) 0(10) 0(14) 1(13) 3(11); the middle is 0 from depth 4.
+    want["median"] = (0.0, 14.0)
+    for how in DEPTH_STATS:
+        got = reduce_depth(v, s, how)
+        assert got[0][0] == pytest.approx(want[how][0]), how
+        assert got[1][0] == pytest.approx(want[how][1]), how
+    zeros = reduce_depth(np.zeros((1, 3)), np.ones((1, 3)), "nzmean")
+    assert zeros[0][0] == 0.0 and zeros[1][0] == 0.0
+    with pytest.raises(ValueError, match="unknown depth statistic"):
+        reduce_depth(v, s, "mode")
+
+
+def test_the_depth_statistic_reaches_the_uniform_block_by_index():
+    from fastfuncstuff.viewer.surface3d import DEPTH_STATS, pack_uniforms
+
+    for k, how in enumerate(DEPTH_STATS):
+        raw = pack_uniforms(
+            np.eye(4), np.eye(4), morph=1.0, depth=(0.0, 1.0), samples=4, fold_contrast=0.0,
+            layers=[], cross=(0, 0, 0, 0), cross_rgb=(1, 1, 1), depth_stat=how,
+        )  # fmt: skip
+        extra = np.frombuffer(raw[2 * 64 + 4 * 16 : 2 * 64 + 5 * 16], np.float32)
+        assert extra[2] == k

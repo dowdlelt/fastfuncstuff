@@ -34,7 +34,7 @@ layout(std140, binding = 0) uniform Block {
     vec4 depth;      // lo, hi, samples, folding contrast
     vec4 cross;      // crosshair mm, radius
     vec4 crossRgb;
-    vec4 extra;      // equivolume on, vertex-map opacity
+    vec4 extra;      // equivolume on, vertex-map opacity, depth statistic
     Layer layers[MAX_LAYERS];
 };
 
@@ -122,12 +122,17 @@ int labelVote(Layer L, sampler3D vt, vec3 off)
     return (lo == hi && lo > 0) ? lo : label;
 }
 
-// Depth-averaged value (x) and threshold statistic (y), and whether every
-// sample was inside the volume (z), at the fragment shifted by ``off`` mm.
+// Depth samples reduced to one value (x) and threshold statistic (y), and
+// whether every sample was inside the volume (z), at the fragment shifted by
+// ``off`` mm. extra.z picks the reduction, in surface3d.py:DEPTH_STATS order
+// (mean, median, max, min, max_abs, nzmean); reduce_depth is the CPU twin.
+// Selections take the statistic from the depth the value came from.
 vec3 sampleAvg(Layer L, sampler3D vt, sampler3D st, vec3 off)
 {
     int ns = clamp(int(depth.z + 0.5), 1, MAX_SAMPLES);
-    float v = 0.0, s = 0.0;
+    int how = int(extra.z + 0.5);
+    float vs[MAX_SAMPLES];
+    float ss[MAX_SAMPLES];
     bool ok = true;
     for (int i = 0; i < MAX_SAMPLES; ++i) {
         if (i >= ns) break;
@@ -135,10 +140,48 @@ vec3 sampleAvg(Layer L, sampler3D vt, sampler3D st, vec3 off)
         vec4 p = vec4(mix(vWhite, vPial, depthAt(d)) + off, 1.0);
         vec3 t = (L.texFromMm * p).xyz;
         ok = ok && inside(t);
-        v += texture(vt, t).r;
-        s += texture(st, (L.statFromMm * p).xyz).r;
+        vs[i] = texture(vt, t).r;
+        ss[i] = texture(st, (L.statFromMm * p).xyz).r;
     }
-    return vec3(v / float(ns), s / float(ns), ok ? 1.0 : 0.0);
+    float okf = ok ? 1.0 : 0.0;
+    if (how == 0 || how == 5) {
+        float v = 0.0, s = 0.0, n = 0.0;
+        for (int i = 0; i < MAX_SAMPLES; ++i) {
+            if (i >= ns) break;
+            if (how == 5 && vs[i] == 0.0) continue;
+            v += vs[i];
+            s += ss[i];
+            n += 1.0;
+        }
+        return n > 0.0 ? vec3(v / n, s / n, okf) : vec3(0.0, 0.0, okf);
+    }
+    if (how == 1) {
+        // Stable insertion sort, carrying each statistic with its value.
+        for (int i = 1; i < MAX_SAMPLES; ++i) {
+            if (i >= ns) break;
+            float kv = vs[i], ks = ss[i];
+            int j = i - 1;
+            while (j >= 0 && vs[j] > kv) {
+                vs[j + 1] = vs[j];
+                ss[j + 1] = ss[j];
+                --j;
+            }
+            vs[j + 1] = kv;
+            ss[j + 1] = ks;
+        }
+        int m = ns / 2;
+        return vec3(vs[m], ss[m], okf);
+    }
+    // max, min, max_abs: the first sample that wins, as numpy's argmax.
+    int best = 0;
+    for (int i = 1; i < MAX_SAMPLES; ++i) {
+        if (i >= ns) break;
+        bool better = how == 2 ? vs[i] > vs[best]
+                    : how == 3 ? vs[i] < vs[best]
+                    : abs(vs[i]) > abs(vs[best]);
+        if (better) best = i;
+    }
+    return vec3(vs[best], ss[best], okf);
 }
 
 // One layer over ``col``. Borders are found by sampling one pixel's footprint
