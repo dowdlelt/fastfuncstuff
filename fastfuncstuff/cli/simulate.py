@@ -137,6 +137,7 @@ figures (-no_plots skips them):
     _liu.png       Liu's estimation-vs-detection plane, with the theoretical bound
     _tsnr.png      the effect needed against tSNR: what tSNR an effect needs
     _matrix.png    the design matrix, SPM-style
+    _isi.png       the gaps each condition actually got, by run, and what follows what
 With -responses (each condition's actual response; the outputs above assume
 every condition responds as -pattern says): the summary adds each contrast's
 power at those values, plus _robust_responses.png and _tent_responses.png;
@@ -2935,8 +2936,9 @@ def main(argv: list[str] | None = None) -> int:
                 for c in live
             }
             plot_tsnr(curves, grid, points, target=args.target, path=f"{prefix}_tsnr.png")
-        from fastfuncstuff.simulation.plots import plot_design_matrix
+        from fastfuncstuff.simulation.plots import plot_design_matrix, plot_isi
 
+        plot_isi(reals, path=f"{prefix}_isi.png")
         d0 = res["designs"][0]
         plot_design_matrix(
             d0["X"].numpy(), reals[0].conditions, d0["run_lengths"], d0["poly_degree"], args.tr,

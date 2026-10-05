@@ -1635,6 +1635,95 @@ def plot_design_matrix(
     return _finish(fig, path)
 
 
+def plot_isi(
+    realizations: list[Any],
+    path: str | Path | None = None,
+    title: str | None = None,
+):
+    """The gaps each condition was actually given, read back from the onsets.
+
+    One panel per condition: the gap after each of its trials (offset to the
+    next onset of anything) in the first realization -- the one written as
+    timing files -- stacked by run, so an ``even:`` list should give flat
+    columns with equal run slices. Dots: the same across every realization,
+    scaled to the first one's count -- what the generator does on average. A
+    list of at most 12 distinct gaps is drawn value by value, anything else
+    as a histogram. Last panel: which condition follows which, in the first
+    realization -- an ``-order random`` design should have no structure.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    from .experiment import realized_gaps
+
+    real = realizations[0]
+    names = real.conditions
+    first, transitions = realized_gaps(real)
+    every = [realized_gaps(r)[0] for r in realizations]
+    pooled = [np.concatenate([g for gaps in every for g in gaps[i]] or [np.zeros(0)])
+              for i in range(len(names))]  # fmt: skip
+    values = np.unique(np.round(np.concatenate(pooled), 3))
+    discrete = 0 < len(values) <= 12
+    if discrete:
+        # Bin edges between the distinct values: bars sit on the values themselves.
+        edges = np.concatenate([[-np.inf], (values[1:] + values[:-1]) / 2, [np.inf]])
+        x = np.arange(len(values))
+    else:
+        edges = np.histogram_bin_edges(np.concatenate(pooled) if values.size else [0, 1], 20)
+        x = (edges[1:] + edges[:-1]) / 2
+    width = 0.7 if discrete else 0.9 * (edges[1] - edges[0])
+
+    n_runs = len(first[0]) if names else 0
+    n_panels = len(names) + (len(names) > 1)
+    ncol = min(4, n_panels)
+    nrow = int(np.ceil(n_panels / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.0 * ncol + 0.4, 3.4 * nrow + 0.6),
+                             squeeze=False, layout="constrained")  # fmt: skip
+    fig.patch.set_facecolor(SURFACE)
+    run_cols = ramp(n_runs)
+    for i, cond in enumerate(names):
+        ax = axes.flat[i]
+        _style(ax)
+        bottom = np.zeros(len(x))
+        for r in range(n_runs):
+            h = np.histogram(first[i][r], edges)[0]
+            ax.bar(x, h, width, bottom=bottom, color=run_cols[r], label=f"run {r + 1}")
+            bottom += h
+        n = int(bottom.sum())
+        if discrete:  # counts under the ticks: above the bars, the dots sat on them
+            ax.set_xticks(x, [f"{v:g}\nn={int(c)}" for v, c in zip(values, bottom, strict=True)])
+        if len(realizations) > 1 and pooled[i].size:
+            share = np.histogram(pooled[i], edges)[0] / pooled[i].size * n
+            ax.plot(x, share, "o", color=INK, markersize=4, label="all realizations")
+        mean = float(np.mean(np.concatenate(first[i]))) if n else float("nan")
+        ax.set_title(f"{cond}: {n} gaps, mean {mean:.2f} s", color=INK, fontsize=10, loc="left")
+        ax.set_xlabel("gap after the trial, offset to next onset (s)", color=INK2, fontsize=8.5)
+        ax.set_ylabel("trials", color=INK2, fontsize=8.5)
+    if len(names) > 1:
+        ax = axes.flat[len(names)]
+        seq = LinearSegmentedColormap.from_list("seq", ["#f0efec", BLUES[-1]])
+        # +-50% around the mean cell: from 0, every cell was equally dark; to its own
+        # range, 69 against 74 looked like structure. Alternation (0 vs 2x) saturates.
+        mean = float(transitions.mean())
+        _matrix(ax, transitions.astype(float), names, seq, 0.5 * mean,
+                1.5 * mean, "{:.0f}",
+                "Transitions: row, then column")  # fmt: skip
+        ax.set_xlabel("next trial", color=INK2, fontsize=8.5)
+        ax.set_ylabel("this trial", color=INK2, fontsize=8.5)
+    for ax in axes.flat[n_panels:]:
+        ax.set_visible(False)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
+                   loc="outside lower center", ncol=min(len(labels), 8))  # fmt: skip
+    fig.suptitle(
+        title or "Gaps as realized: first realization (the timing files), stacked by run; a "
+        "run's last trial has no gap (-post_fix follows)",
+        color=INK, fontsize=10,
+    )  # fmt: skip
+    return _finish(fig, path)
+
+
 def plot_hrf_recovery(
     result: dict[str, Any],
     tr: float,

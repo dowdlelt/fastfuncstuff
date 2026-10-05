@@ -256,3 +256,41 @@ def test_power_line_survives_nan_realizations():
     fig = plot_power({"table": rows}, ["tSNR 60"], {"A": [1]}, [1])
     line = next(ln for ln in fig.axes[0].get_lines() if ln.get_label() == "tSNR 60")
     np.testing.assert_allclose(line.get_ydata(), [0.0, 0.5, 1.0, 1.0])
+
+
+def test_isi_figure_reads_the_gaps_back_from_the_onsets(tmp_path):
+    from fastfuncstuff.simulation.experiment import realized_gaps
+    from fastfuncstuff.simulation.plots import plot_isi
+
+    spec = ExperimentSpec(
+        tr=2.4,
+        units=[Unit.parse("A", "A:0.5", 1), Unit.parse("B", "B:0.5", 1)],
+        n_runs=4,
+        isi=Interval.parse("even:(9.6,7.2,12.0)"),
+        initial_fix=12,
+        post_fix=12,
+        order="random",
+        scan_time=744,
+    )
+    reals = [realize(spec, s) for s in range(3)]
+    gaps, transitions = realized_gaps(reals[0])
+    every = np.concatenate([g for per in gaps for g in per])
+    # Only the listed gaps, in near-equal shares, and one gap per event but each run's last.
+    np.testing.assert_allclose(np.unique(every.round(6)), [7.2, 9.6, 12.0])
+    counts = np.unique(every.round(6), return_counts=True)[1]
+    assert counts.max() - counts.min() <= 4
+    n_events = sum(len(o) for per in reals[0].onsets for o in per)
+    assert every.size == transitions.sum() == n_events - spec.n_runs
+    plot_isi(reals, path=tmp_path / "isi.png")
+    assert (tmp_path / "isi.png").stat().st_size > 10_000
+
+
+def test_realized_gaps_measure_offset_to_next_onset_of_any_condition():
+    from fastfuncstuff.simulation.experiment import Realization, realized_gaps
+
+    real = Realization(0, ["A", "B"], [1.0, 2.0],
+                       [[np.array([0.0, 10.0])], [np.array([4.0])]], [10], [20.0])  # fmt: skip
+    gaps, transitions = realized_gaps(real)
+    np.testing.assert_allclose(gaps[0][0], [3.0])  # A at 0, ends 1, B at 4
+    np.testing.assert_allclose(gaps[1][0], [4.0])  # B at 4, ends 6, A at 10
+    np.testing.assert_array_equal(transitions, [[0, 1], [1, 0]])

@@ -573,6 +573,30 @@ class Realization:
     n_dropped: int = 0  # events of units that did not end -post_fix before a fixed scan's end
 
 
+def realized_gaps(real: Realization) -> tuple[list[list[np.ndarray]], np.ndarray]:
+    """The gaps a realization actually has, read back from its onsets.
+
+    Returns ``gaps[condition][run]`` -- for every event but a run's last, the
+    time from its offset to the next onset of any condition (the -isi sense of
+    a gap; a null shows as a longer one) -- and ``transitions[i, j]``, how often
+    condition ``j`` follows ``i``, summed over runs.
+    """
+    n_cond = len(real.conditions)
+    n_runs = len(real.onsets[0]) if n_cond else 0
+    gaps: list[list[np.ndarray]] = [[] for _ in range(n_cond)]
+    transitions = np.zeros((n_cond, n_cond), dtype=int)
+    for r in range(n_runs):
+        on = np.concatenate([np.asarray(real.onsets[i][r], dtype=float) for i in range(n_cond)])
+        cond = np.concatenate([np.full(len(real.onsets[i][r]), i) for i in range(n_cond)])
+        order = np.argsort(on, kind="stable")
+        on, cond = on[order], cond[order].astype(int)
+        gap = on[1:] - (on[:-1] + np.asarray(real.durations, dtype=float)[cond[:-1]])
+        np.add.at(transitions, (cond[:-1], cond[1:]), 1)
+        for i in range(n_cond):
+            gaps[i].append(gap[cond[:-1] == i])
+    return gaps, transitions
+
+
 @dataclass
 class RunPlan:
     """One run before it becomes a timeline: its units in order, each with the gap
