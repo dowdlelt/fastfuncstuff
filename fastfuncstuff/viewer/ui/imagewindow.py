@@ -350,27 +350,36 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("shift+v", "clear the mark", self._clear_highlight, group="surface"),
                 Binding(
+                    "{",
+                    "smaller nudge / move step",
+                    lambda: self._step_by(1 / 1.5),
+                    group="surface",
+                ),
+                Binding(
+                    "}", "larger nudge / move step", lambda: self._step_by(1.5), group="surface"
+                ),
+                Binding(
                     "ctrl+Up",
-                    "move marked pial out 0.25 mm",
-                    lambda: self._move_highlight("pial", 0.25),
+                    "move marked pial out one step",
+                    lambda: self._move_highlight("pial", 1.0),
                     group="surface",
                 ),
                 Binding(
                     "ctrl+Down",
-                    "move marked pial in 0.25 mm",
-                    lambda: self._move_highlight("pial", -0.25),
+                    "move marked pial in one step",
+                    lambda: self._move_highlight("pial", -1.0),
                     group="surface",
                 ),
                 Binding(
                     "ctrl+shift+Up",
-                    "move marked white out 0.25 mm",
-                    lambda: self._move_highlight("white", 0.25),
+                    "move marked white out one step",
+                    lambda: self._move_highlight("white", 1.0),
                     group="surface",
                 ),
                 Binding(
                     "ctrl+shift+Down",
-                    "move marked white in 0.25 mm",
-                    lambda: self._move_highlight("white", -0.25),
+                    "move marked white in one step",
+                    lambda: self._move_highlight("white", -1.0),
                     group="surface",
                 ),
                 Binding(
@@ -859,6 +868,8 @@ class ImageWindow(QtWidgets.QWidget):
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
         if snap <= 0 and state.surface_free:
             mode = "hand free"
+        if state.surface_tool in ("nudge", "mark"):
+            mode += f"  step {state.surface_step:g} mm"
         if snap > 0 and not state.surface_snap_gate:
             mode = mode.replace("snap", "edge")
         tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE", "mark": "MARK"}.get(
@@ -893,6 +904,13 @@ class ImageWindow(QtWidgets.QWidget):
 
         move_highlight(self.session, self._dispatch, surface, shift, self.pane.show_toast)
 
+    def _step_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetSurfaceStep
+
+        step = float(np.clip(self.session.state.surface_step * factor, 0.05, 5.0))
+        self._dispatch(SetSurfaceStep(round(step, 3)))
+        self._sync_brush()
+
     def _mark(self, row: float, col: float) -> None:
         """Mark (or with ctrl, unmark) the vertices under the brush on the nearest outline."""
         from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
@@ -926,8 +944,7 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetSurfaceTool("nudge" if on else "grab"))
         self._dispatch(SetSurfaceEditing(on))
 
-    #: How far one nudge pushes, mm, and how often a held press repeats it.
-    NUDGE_MM = 0.25
+    #: How often a held nudge repeats (its step is ``state.surface_step``).
     NUDGE_REPEAT_MS = 120
 
     def _nudge(self, row: float, col: float) -> bool:
@@ -955,7 +972,7 @@ class ImageWindow(QtWidgets.QWidget):
         if abs(away) < 0.1:
             self.pane.show_toast("nudge from beside the outline, on the side to push from")
             return False
-        drag = self.NUDGE_MM * np.sign(away) * n
+        drag = state.surface_step * np.sign(away) * n
         r, _, smooth, search, sign = state.surface_brush
         try:
             self._dispatch(

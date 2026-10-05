@@ -765,8 +765,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         return hemi, (float(mm[0]), float(mm[1]), float(mm[2]))
 
 
-def move_highlight(session, dispatch, surface: str, shift: float, say=None) -> None:
-    """Move every hemisphere's highlight on ``surface`` by ``shift`` mm; shared by 2-D and 3-D."""
+def move_highlight(session, dispatch, surface: str, direction: float, say=None) -> None:
+    """Move every hemisphere's highlight on ``surface`` one step out (+1) or in (-1).
+
+    The step is ``state.surface_step``; shared by the 2-D and 3-D windows.
+    """
+    shift = float(np.sign(direction)) * session.state.surface_step
     from fastfuncstuff.surface.edit import explain
     from fastfuncstuff.viewer.vocab import MoveSurfaceHighlight
 
@@ -983,11 +987,13 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("shift+p", "clear the highlight", self._clear_highlight, group="highlight"),
                 Key("(", "smaller paint brush", lambda: self._brush_by(1 / 1.25), group="highlight"),
                 Key(")", "larger paint brush", lambda: self._brush_by(1.25), group="highlight"),
-                Key("ctrl+Up", "move the highlighted pial out 0.25 mm", lambda: self._move_highlight("pial", 0.25), group="highlight"),
-                Key("ctrl+Down", "move the highlighted pial in 0.25 mm", lambda: self._move_highlight("pial", -0.25), group="highlight"),
-                Key("ctrl+shift+Up", "move the highlighted white out 0.25 mm", lambda: self._move_highlight("white", 0.25), group="highlight"),
-                Key("ctrl+shift+Down", "move the highlighted white in 0.25 mm", lambda: self._move_highlight("white", -0.25), group="highlight"),
+                Key("ctrl+Up", "move the highlighted pial out one step", lambda: self._move_highlight("pial", 1.0), group="highlight"),
+                Key("ctrl+Down", "move the highlighted pial in one step", lambda: self._move_highlight("pial", -1.0), group="highlight"),
+                Key("ctrl+shift+Up", "move the highlighted white out one step", lambda: self._move_highlight("white", 1.0), group="highlight"),
+                Key("ctrl+shift+Down", "move the highlighted white in one step", lambda: self._move_highlight("white", -1.0), group="highlight"),
                 Key("r", "the highlighted cortex as an ROI layer, white to pial", self._highlight_roi, group="highlight"),
+                Key("-", "smaller move step", lambda: self._step_by(1 / 1.5), group="highlight"),
+                Key("=", "larger move step", lambda: self._step_by(1.5), group="highlight"),
                 Key("right-drag", "zoom (up = in)", None, group="view"),
                 Key("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
@@ -1071,6 +1077,13 @@ class SurfaceWindow(QtWidgets.QWidget):
 
     def _move_highlight(self, surface: str, shift: float) -> None:
         move_highlight(self.session, self._dispatch, surface, shift, self.depth_label.setText)
+
+    def _step_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetSurfaceStep
+
+        step = float(np.clip(self.session.state.surface_step * factor, 0.05, 5.0))
+        self._dispatch(SetSurfaceStep(round(step, 3)))
+        self.depth_label.setText(f"move step {step:g} mm")
 
     def _highlight_roi(self) -> None:
         from fastfuncstuff.viewer.vocab import HighlightToRoi

@@ -117,6 +117,8 @@ class ViewerState:
     surface_snap_gate: bool = True
     #: Hand moves follow the drag, not the normals (``SnapParams.free``).
     surface_free: bool = False
+    #: How far one nudge, or one press moving the marked cortex, goes, mm.
+    surface_step: float = 0.25
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.
     surface_snap_key: str | None = None

@@ -491,6 +491,16 @@ class SetSurfaceSnapGate(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceStep(Command):
+    """How far one nudge or one move of the marked cortex goes, mm."""
+
+    name = "SET_SURFACE_STEP"
+    aspects = Aspect.NOTHING
+    mm: float = 0.25
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceFree(Command):
     """Hand edits follow the drag (on) or each vertex's normal (off)."""
 
@@ -1449,6 +1459,14 @@ def install(
         assert isinstance(cmd, SetSurfaceSnapGate)
         st.surface_snap_gate = bool(cmd.on)
         return SetSurfaceSnapGate.aspects
+
+    @bus.handle(SetSurfaceStep.name)
+    def _set_surface_step(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceStep)
+        if not 0.0 < cmd.mm <= 5.0:
+            raise ValueError("a surface step is between 0 and 5 mm")
+        st.surface_step = float(cmd.mm)
+        return SetSurfaceStep.aspects
 
     @bus.handle(SetSurfaceFree.name)
     def _set_surface_free(cmd: Command, st: ViewerState) -> Aspect:

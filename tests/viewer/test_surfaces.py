@@ -926,3 +926,59 @@ def test_a_free_stroke_moves_the_outline_within_the_slice_and_replays(session, t
         np.testing.assert_allclose(fresh.surfaces.hemis["lh"].states["white"], after, atol=1e-6)
     finally:
         fresh.close()
+
+
+def test_the_step_sets_how_far_a_nudge_and_a_marked_move_go(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import (
+        HighlightSurface,
+        OpenView,
+        SetSurfaceStep,
+        SetXYZ,
+        encode_ids,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image._step_by(1.5)
+        image._step_by(1.5)
+        assert session.state.surface_step == pytest.approx(0.5625, abs=1e-3)  # rounded to 0.001
+        session.do(SetSurfaceStep(0.6))
+        image.nudge_button.click()
+        assert "step 0.6 mm" in image.pane._brush_label
+        h = session.surfaces.hemis["lh"]
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        k = int(np.argmin(np.linalg.norm(h.states["pial"] - [24.0, 0, 0], axis=1)))
+        before = float(np.linalg.norm(h.states["pial"][k]))
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([25.5, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        image._edit_release()
+        assert before - np.linalg.norm(h.states["pial"][k]) == pytest.approx(0.6, abs=0.05)
+        top = int(np.argmax(h.states["pial"][:, 2]))
+        session.do(HighlightSurface("lh", encode_ids(session.surfaces.disc("lh", top, 3.0)), "set"))
+        z = float(h.states["pial"][top, 2])
+        image._move_highlight("pial", +1)
+        assert h.states["pial"][top, 2] - z == pytest.approx(0.6, abs=0.02)
+        with pytest.raises(ValueError):
+            session.do(SetSurfaceStep(0.0))
+    finally:
+        win.close()
+        session.close()
