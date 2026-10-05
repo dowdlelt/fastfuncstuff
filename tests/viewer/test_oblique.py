@@ -187,3 +187,25 @@ def test_a_stroke_drawn_in_a_tilted_slice_replays_from_its_command(tmp_path):
         np.testing.assert_allclose(cmd.grid_affine(), grid.affine, atol=1e-6)
     finally:
         session.close()
+
+
+def test_alt_arrows_tilt_by_hand_and_compose(tmp_path, session):
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import tilt_matrix
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session.do(OpenView("A1", "image", "axial"))
+    win = ImageWindow("A1", session, session.do)
+    try:
+        for _ in range(3):
+            win._tilt_by(0, 5.0)
+        r = tilt_matrix(session.state.viewports.get("A1"))
+        assert np.degrees(np.arccos((np.trace(r) - 1) / 2)) == pytest.approx(15.0)
+        win._tilt_by(1, 5.0)
+        win._untilt()
+        np.testing.assert_allclose(tilt_matrix(session.state.viewports.get("A1")), np.eye(3))
+    finally:
+        win.close()
+        app.processEvents()

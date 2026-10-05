@@ -241,6 +241,30 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("shift+t", "untilt the slice", self._untilt, group="view"),
                 Binding(
+                    "alt+Up",
+                    "tilt the slice 5 deg (top away)",
+                    lambda: self._tilt_by(0, 5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Down",
+                    "tilt the slice 5 deg (top toward)",
+                    lambda: self._tilt_by(0, -5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Left",
+                    "tilt the slice 5 deg (left away)",
+                    lambda: self._tilt_by(1, -5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Right",
+                    "tilt the slice 5 deg (right away)",
+                    lambda: self._tilt_by(1, 5.0),
+                    group="view",
+                ),
+                Binding(
                     "shift+o",
                     "surface outlines: both, white, pial, off",
                     self._cycle_outlines,
@@ -604,6 +628,23 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
         angle = np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))
         self.pane.show_toast(f"tilted {angle:.0f} deg to cut the cortex square-on (T: untilt)")
+
+    def _tilt_by(self, about: int, degrees: float) -> None:
+        """Tilt the slice about the pane's horizontal (0) or vertical (1) axis, by hand."""
+        from fastfuncstuff.viewer.align import axis_rotation
+        from fastfuncstuff.viewer.compose import tilt_matrix
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        state = self.session.state
+        vp = self._viewport()
+        grid = self._grid()
+        if vp is None or grid is None or state.grid is None:
+            return
+        layout = plane_layout(state.grid.affine, vp.plane)
+        # The pane's horizontal runs along its columns, its vertical along rows.
+        axis = grid.affine[:3, layout.col if about == 0 else layout.row]
+        r = axis_rotation(axis, degrees) @ tilt_matrix(vp)
+        self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
 
     def _untilt(self) -> None:
         from fastfuncstuff.viewer.vocab import SetViewTilt
