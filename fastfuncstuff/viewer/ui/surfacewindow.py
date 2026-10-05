@@ -1168,7 +1168,17 @@ class SurfaceWindow(QtWidgets.QWidget):
         for layer in self._overlay_layers()[-s3.MAX_LAYERS :]:
             idx = int(st.time_index if layer.time_linked else layer.volume_index)
             thr = layer.threshold_index
-            key = (layer.key, idx, thr if thr != idx else None, np.asarray(layer.affine).tobytes())
+            try:
+                generation = self.session.store.get(layer.key).generation
+            except KeyError:
+                continue
+            key = (
+                layer.key,
+                generation,
+                idx,
+                thr if thr != idx else None,
+                np.asarray(layer.affine).tobytes(),
+            )
             data = self._slot_cache.get(key)
             if data is None:
                 try:

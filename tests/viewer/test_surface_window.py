@@ -133,3 +133,26 @@ def test_a_turned_hemisphere_pivots_on_its_centre_and_still_picks_true_mm(window
     assert mm is not None and mm[2] == pytest.approx(1.5, abs=1e-4)
     win._reset_camera()
     assert c.hemi_rotation == {}
+
+
+def test_a_recomputed_mode_overlay_reaches_the_surface(window):
+    """The bug: instacorr re-adopts its map under the same key on every seed
+    click, and the texture cache keyed on the layer alone kept drawing the first
+    map while the slices moved on."""
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.modes.base import ComputedOverlay
+
+    session, win = window
+    source = session.state.layers.base.key
+    aff = session.state.layers.base.affine
+
+    def install(fill: float) -> np.ndarray:
+        values = np.full((30, 30, 10), fill, np.float32)
+        session.install_computed_overlay(source, ComputedOverlay(values, aff, "icorr"))
+        win.refresh(Aspect.LAYERS)
+        return win.canvas.overlays[-1].value
+
+    first = install(0.2)
+    second = install(0.7)
+    assert not np.array_equal(first, second), "the surface still draws the first map"
+    assert np.allclose(second, 0.7)

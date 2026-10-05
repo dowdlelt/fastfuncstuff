@@ -41,6 +41,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
+from itertools import count
 from pathlib import Path
 
 import numpy as np
@@ -81,6 +82,10 @@ class Resident:
     #: for a memory-backed dataset; a file-backed one already has its file.
     spill: Path | None = None
     _future: Future[np.ndarray] | None = field(default=None, repr=False)
+    #: Unique per record. A mode re-adopts new values under the same key on
+    #: every click, so a consumer caching by key alone draws the first map
+    #: forever; keyed on this, it sees each adopt as new data.
+    generation: int = field(default_factory=count().__next__)
 
     @property
     def memory_backed(self) -> bool:
