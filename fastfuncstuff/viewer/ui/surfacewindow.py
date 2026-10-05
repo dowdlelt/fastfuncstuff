@@ -131,6 +131,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     hinged = QtCore.Signal(float)
     #: Ctrl+shift+drag sideways: push the hemispheres apart by this many mm.
     spread = QtCore.Signal(float)
+    #: Paint mode: a drag over (hemi, vertex); the bool is "erase" (ctrl held).
+    painted = QtCore.Signal(str, int, bool)
 
     #: Radians turned by a drag the height of the window. pi read as sluggish:
     #: a half turn to see the other side took two strokes.
@@ -141,6 +143,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.setSampleCount(4)
         self.camera = s3.Camera()
         self.morph = 1.0
+        #: Left-drag paints the highlight instead of turning the view.
+        self.paint_mode = False
         self.depth: tuple[float, float] = (0.5, 0.5)
         self.samples = 1
         #: Folding shade strength under the overlays.
@@ -614,6 +618,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._press = self._last = event.position()
         self._moved = False
         self._grabbed = None
+        if self.paint_mode and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._paint(event)
+            return
         if event.modifiers() & QtCore.Qt.KeyboardModifier.AltModifier:
             hit = self._hit(event.position())
             self._grabbed = None if hit is None else hit[0]
@@ -623,6 +630,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             return
         d = event.position() - self._last
         self._last = event.position()
+        if self.paint_mode and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
+            self._moved = True
+            self._paint(event)
+            return
         if self._press is not None and (event.position() - self._press).manhattanLength() > 3:
             self._moved = True
         h = max(self.height(), 1)
@@ -690,13 +701,33 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.camera.zoom(0.9**steps)
         self.update()
 
+    def _paint(self, event: QtGui.QMouseEvent) -> None:
+        hit = self.pick_vertex(event.position())
+        if hit is not None:
+            erase = bool(
+                event.modifiers()
+                & (
+                    QtCore.Qt.KeyboardModifier.ControlModifier
+                    | QtCore.Qt.KeyboardModifier.MetaModifier
+                )
+            )
+            self.painted.emit(hit[0], hit[1], erase)
+
+    def pick_vertex(self, pos: QtCore.QPointF) -> tuple[str, int] | None:
+        """The hemisphere and nearest corner vertex of the face under a widget point."""
+        found = self._hit_face(pos)
+        if found is None:
+            return None
+        hemi, corners, bary = found
+        return hemi, int(corners[int(np.argmax(bary))])
+
     def pick_mm(self, pos: QtCore.QPointF) -> tuple[float, float, float] | None:
         """Scanner mm under a widget point, at the sampled mid-depth."""
         hit = self._hit(pos)
         return None if hit is None else hit[1]
 
-    def _hit(self, pos: QtCore.QPointF) -> tuple[str, tuple[float, float, float]] | None:
-        """Which hemisphere is under a widget point, and the scanner mm there."""
+    def _hit_face(self, pos: QtCore.QPointF):
+        """(hemi, the face's three vertex ids, barycentric) under a widget point."""
         w, h = max(self.width(), 1), max(self.height(), 1)
         x = 2.0 * pos.x() / w - 1.0
         y = 1.0 - 2.0 * pos.y() / h
@@ -714,6 +745,14 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             return None
         _, hemi, face, bary = best
         corners = self._faces[hemi]["flat" if self._flat.get(hemi) else "full"].reshape(-1, 3)[face]
+        return hemi, corners, bary
+
+    def _hit(self, pos: QtCore.QPointF) -> tuple[str, tuple[float, float, float]] | None:
+        """Which hemisphere is under a widget point, and the scanner mm there."""
+        found = self._hit_face(pos)
+        if found is None:
+            return None
+        hemi, corners, bary = found
         cpu = self._cpu[hemi]
         d = np.full(3, 0.5 * (self.depth[0] + self.depth[1]))
         if self.equivolume and "areas" in cpu:
@@ -724,6 +763,30 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         point = (1 - d) * cpu["white"][corners] + d * cpu["pial"][corners]
         mm = bary @ point
         return hemi, (float(mm[0]), float(mm[1]), float(mm[2]))
+
+
+def move_highlight(session, dispatch, surface: str, shift: float, say=None) -> None:
+    """Move every hemisphere's highlight on ``surface`` by ``shift`` mm; shared by 2-D and 3-D."""
+    from fastfuncstuff.surface.edit import explain
+    from fastfuncstuff.viewer.vocab import MoveSurfaceHighlight
+
+    hemis = [h for h in session.surfaces.hemis if session.surfaces.highlighted(h).size]
+    if not hemis:
+        if say is not None:
+            say("nothing is highlighted: paint some first (p in 3-D, v in a slice)")
+        return
+    r = session.state.surface_brush[0]
+    for hemi in hemis:
+        try:
+            dispatch(MoveSurfaceHighlight(hemi, surface, float(shift), float(r)))
+        except ValueError as exc:
+            if say is not None:
+                say(str(exc))
+            return
+    res = session.surfaces.last_result
+    note = explain(res) if res is not None else ""
+    if say is not None:
+        say(note or f"highlighted {surface} moved {'out' if shift > 0 else 'in'} {abs(shift):g} mm")
 
 
 class MapLegend(QtWidgets.QWidget):
@@ -872,6 +935,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.seeded.connect(self.seeded)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self.canvas.hinged.connect(self._hinge_by)
+        self.canvas.painted.connect(self._paint_highlight)
         self.canvas.spread.connect(self._spread_by)
         self._built_map: tuple | None = None
         self._built_topology: int | None = None
@@ -915,6 +979,15 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("ctrl+drag", "swing open: right nose to nose, left occipital to occipital", None, group="hemispheres"),
                 Key("ctrl+shift+drag", "push the hemispheres apart / together", None, group="hemispheres"),
                 Key("o", "open: closed, nose to nose, occipital to occipital", self._cycle_hinge, group="hemispheres"),
+                Key("p", "paint mode: drag highlights cortex (ctrl+drag erases)", self._toggle_paint, group="highlight"),
+                Key("shift+p", "clear the highlight", self._clear_highlight, group="highlight"),
+                Key("(", "smaller paint brush", lambda: self._brush_by(1 / 1.25), group="highlight"),
+                Key(")", "larger paint brush", lambda: self._brush_by(1.25), group="highlight"),
+                Key("ctrl+Up", "move the highlighted pial out 0.25 mm", lambda: self._move_highlight("pial", 0.25), group="highlight"),
+                Key("ctrl+Down", "move the highlighted pial in 0.25 mm", lambda: self._move_highlight("pial", -0.25), group="highlight"),
+                Key("ctrl+shift+Up", "move the highlighted white out 0.25 mm", lambda: self._move_highlight("white", 0.25), group="highlight"),
+                Key("ctrl+shift+Down", "move the highlighted white in 0.25 mm", lambda: self._move_highlight("white", -0.25), group="highlight"),
+                Key("r", "the highlighted cortex as an ROI layer, white to pial", self._highlight_roi, group="highlight"),
                 Key("right-drag", "zoom (up = in)", None, group="view"),
                 Key("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
@@ -968,6 +1041,44 @@ class SurfaceWindow(QtWidgets.QWidget):
         vp = self._viewport()
         if vp is not None:
             self._dispatch(SetSurfaceHemis(self.vid, vp.hemis, max(0.0, vp.split + delta)))
+
+    def _toggle_paint(self) -> None:
+        self.canvas.paint_mode = not self.canvas.paint_mode
+        r = self.session.state.surface_brush[0]
+        self.depth_label.setText(
+            f"paint r={r:g} mm (ctrl erases)" if self.canvas.paint_mode else "paint off"
+        )
+
+    def _brush_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetSurfaceBrush
+
+        r, snap, smooth, search, sign = self.session.state.surface_brush
+        r = float(np.clip(r * factor, 0.5, 30.0))
+        self._dispatch(SetSurfaceBrush(round(r, 2), snap, smooth, search, sign))
+        self.depth_label.setText(f"paint r={r:g} mm")
+
+    def _paint_highlight(self, hemi: str, vertex: int, erase: bool) -> None:
+        from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
+
+        r = self.session.state.surface_brush[0]
+        ids = self.session.surfaces.disc(hemi, vertex, r)
+        self._dispatch(HighlightSurface(hemi, encode_ids(ids), "remove" if erase else "add"))
+
+    def _clear_highlight(self) -> None:
+        from fastfuncstuff.viewer.vocab import HighlightSurface
+
+        self._dispatch(HighlightSurface(mode="clear"))
+
+    def _move_highlight(self, surface: str, shift: float) -> None:
+        move_highlight(self.session, self._dispatch, surface, shift, self.depth_label.setText)
+
+    def _highlight_roi(self) -> None:
+        from fastfuncstuff.viewer.vocab import HighlightToRoi
+
+        try:
+            self._dispatch(HighlightToRoi())
+        except ValueError as exc:
+            self.depth_label.setText(str(exc))
 
     def _hinge_by(self, degrees: float) -> None:
         vp = self._viewport()
@@ -1256,6 +1367,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             annot if vp.vertex_map == "annot" else "",
             surfaces.flags_version if vp.vertex_map == "flags" else 0,
             surfaces.depth_roi_version,
+            surfaces.highlight_version,
             surfaces.subject,
         )
         fresh = {h for h in surfaces.hemis if h not in self._map_hemis}
@@ -1277,6 +1389,13 @@ class SurfaceWindow(QtWidgets.QWidget):
                     np.uint8
                 )
                 colours[roi, 3] = np.maximum(colours[roi, 3], 170)
+            lit = surfaces.highlight.get(h)
+            if lit is not None and lit.any():
+                # The highlight, solid in the warn colour: it is a selection
+                # being acted on, and must read over any map.
+                warn = QtGui.QColor(theme.palette().warn)
+                colours[lit, :3] = (warn.red(), warn.green(), warn.blue())
+                colours[lit, 3] = 255
             self.canvas.set_hemisphere(
                 h, pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=colours
             )

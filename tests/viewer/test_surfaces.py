@@ -789,3 +789,72 @@ def test_highlight_moves_as_a_plateau_undoes_and_fills_the_ribbon(session, tmp_p
     assert np.all(mm[:, 2] > 15.0)  # only under the top patch
     session.do(HighlightSurface(mode="clear"))
     assert surfaces.highlighted("lh").size == 0
+
+
+def test_mark_in_a_slice_paint_in_3d_move_and_make_an_roi(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetXYZ
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(OpenView("S1", "surface", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        surf = next(w for w in win.manager.windows.values() if isinstance(w, SurfaceWindow))
+        surfaces = session.surfaces
+        h = surfaces.hemis["lh"]
+
+        # 2-D: mark along the pial outline at +x.
+        image.highlight_button.click()
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([24.0, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        image._edit_release()
+        marked = surfaces.highlighted("lh")
+        assert marked.size > 0
+        assert np.all(h.states["pial"][marked, 0] > 20.0)
+        image.redraw()
+        assert image.pane._highlight.shape[0] > 0  # dots on this slice
+
+        # 3-D: the paint signal adds a disc elsewhere; ctrl erases it again.
+        top = int(np.argmax(h.states["white"][:, 2]))
+        surf._paint_highlight("lh", top, False)
+        assert surfaces.highlight["lh"][top]
+        from fastfuncstuff.viewer.commands import Aspect
+
+        surf.refresh(Aspect.ALL)
+        assert surf.canvas._cpu["lh"]["vcolor"][top, 3] == 255
+        surf._paint_highlight("lh", top, True)
+        assert not surfaces.highlight["lh"][top]
+
+        # Move the marked pial in, then the ROI.
+        before = h.states["pial"][marked].copy()
+        image._move_highlight("pial", -0.25)
+        moved = np.linalg.norm(before - h.states["pial"][marked], axis=1)
+        np.testing.assert_allclose(moved, 0.25, atol=0.02)
+        surf._highlight_roi()
+        roi = session.state.layers.find_by_source("surface-highlight")
+        assert roi is not None and "surface ROI" in roi.name
+        image._clear_highlight()
+        assert surfaces.highlighted("lh").size == 0
+    finally:
+        win.close()
+        session.close()

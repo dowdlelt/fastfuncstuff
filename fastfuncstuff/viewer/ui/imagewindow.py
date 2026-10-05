@@ -161,6 +161,18 @@ class ImageWindow(QtWidgets.QWidget):
         )
         self.nudge_button.clicked.connect(self._toggle_nudge)
         bar.addWidget(self.nudge_button)
+
+        self.highlight_button = self._button(
+            "MARK",
+            "v",
+            "Highlight cortex: drag along a white or pial outline to mark the\n"
+            "vertices under the brush (ctrl+drag unmarks; shift+V clears). The\n"
+            "mark shows on the 3-D surface too. ctrl+Up/Down moves the marked\n"
+            "pial out/in as one piece (add shift for white); r in the 3-D window\n"
+            "turns it into an ROI.",
+        )
+        self.highlight_button.clicked.connect(self._toggle_highlight_tool)
+        bar.addWidget(self.highlight_button)
         #: While a nudge is held: repeats it, from wherever the cursor now is.
         self._nudge_timer = QtCore.QTimer(self)
         self._nudge_timer.setInterval(self.NUDGE_REPEAT_MS)
@@ -328,6 +340,37 @@ class ImageWindow(QtWidgets.QWidget):
                     "b",
                     "edit surfaces: nudge away from the cursor",
                     self.nudge_button.click,
+                    group="surface",
+                ),
+                Binding(
+                    "v",
+                    "mark cortex to move or make an ROI",
+                    self.highlight_button.click,
+                    group="surface",
+                ),
+                Binding("shift+v", "clear the mark", self._clear_highlight, group="surface"),
+                Binding(
+                    "ctrl+Up",
+                    "move marked pial out 0.25 mm",
+                    lambda: self._move_highlight("pial", 0.25),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+Down",
+                    "move marked pial in 0.25 mm",
+                    lambda: self._move_highlight("pial", -0.25),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+shift+Up",
+                    "move marked white out 0.25 mm",
+                    lambda: self._move_highlight("white", 0.25),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+shift+Down",
+                    "move marked white in 0.25 mm",
+                    lambda: self._move_highlight("white", -0.25),
                     group="surface",
                 ),
                 Binding(
@@ -733,7 +776,9 @@ class ImageWindow(QtWidgets.QWidget):
         self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
         self.point_button.setChecked(state.surface_editing and state.surface_tool == "point")
         self.nudge_button.setChecked(state.surface_editing and state.surface_tool == "nudge")
+        self.highlight_button.setChecked(state.surface_editing and state.surface_tool == "mark")
         self.pane.set_marks(self._selected_marks())
+        self.pane.set_highlight(self._highlight_points())
         self._sync_brush()
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
@@ -792,7 +837,9 @@ class ImageWindow(QtWidgets.QWidget):
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
         if snap > 0 and not state.surface_snap_gate:
             mode = mode.replace("snap", "edge")
-        tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE"}.get(state.surface_tool, "EDIT")
+        tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE", "mark": "MARK"}.get(
+            state.surface_tool, "EDIT"
+        )
         if state.surface_tool == "point" and state.surface_selected is not None:
             hemi, v = state.surface_selected
             tool += f" {hemi} #{v}"
@@ -805,6 +852,49 @@ class ImageWindow(QtWidgets.QWidget):
         on = not (state.surface_editing and state.surface_tool == "grab")
         self._dispatch(SetSurfaceTool("grab"))
         self._dispatch(SetSurfaceEditing(on))
+
+    def _toggle_highlight_tool(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "mark")
+        self._dispatch(SetSurfaceTool("mark" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    def _clear_highlight(self) -> None:
+        from fastfuncstuff.viewer.vocab import HighlightSurface
+
+        self._dispatch(HighlightSurface(mode="clear"))
+
+    def _move_highlight(self, surface: str, shift: float) -> None:
+        from fastfuncstuff.viewer.ui.surfacewindow import move_highlight
+
+        move_highlight(self.session, self._dispatch, surface, shift, self.pane.show_toast)
+
+    def _mark(self, row: float, col: float) -> None:
+        """Mark (or with ctrl, unmark) the vertices under the brush on the nearest outline."""
+        from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
+
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if view is None or pos is None or grid is None:
+            return
+        reach = max(8.0 / self.pane._image_scale(), self._brush_px() or 0.0)
+        grab = self.session.surfaces.grab(
+            grid.affine, view, pos, state.surfaces_shown, row, col, reach
+        )
+        if grab is None:
+            return
+        ids = self.session.surfaces.disc(
+            grab.hemi, grab.vertex, state.surface_brush[0] / 2, grab.surface
+        )
+        erase = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier)
+        )
+        self._dispatch(HighlightSurface(grab.hemi, encode_ids(ids), "remove" if erase else "add"))
+        self._marking = True
 
     def _toggle_nudge(self) -> None:
         state = self.session.state
@@ -917,6 +1007,32 @@ class ImageWindow(QtWidgets.QWidget):
         p = 0.5 * (h.states["white"][sel[1]] + h.states["pial"][sel[1]])
         self._dispatch(SetXYZ(float(p[0]), float(p[1]), float(p[2])))
 
+    def _highlight_points(self) -> np.ndarray:
+        """Highlighted vertices of the shown surfaces within half a voxel of this slice."""
+        state = self.session.state
+        surfaces = self.session.surfaces
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if not surfaces.highlight or view is None or pos is None or grid is None:
+            return np.zeros((0, 2))
+        inv = np.linalg.inv(grid.affine)
+        out = []
+        for hemi in surfaces.hemis:
+            ids = surfaces.highlighted(hemi)
+            if not ids.size:
+                continue
+            for surface in state.surfaces_shown:
+                verts = surfaces.hemis[hemi].states.get(surface)
+                if verts is None:
+                    continue
+                ijk = verts[ids] @ inv[:3, :3].T + inv[:3, 3]
+                near = np.abs(ijk[:, view.layout.fixed] - pos) <= 0.5
+                if near.any():
+                    out.append(np.asarray(view.points_to_image(ijk[near])).reshape(-1, 2))
+        return np.concatenate(out) if out else np.zeros((0, 2))
+
     def _selected_marks(self) -> list[tuple[float, float, str]]:
         """Where the selected vertex sits on this slice, per surface, if it is close."""
         state = self.session.state
@@ -967,6 +1083,9 @@ class ImageWindow(QtWidgets.QWidget):
         pos = self.pane.position
         if view is None or pos is None or state.grid is None:
             return
+        if state.surface_tool == "mark":
+            self._mark(row, col)
+            return
         if state.surface_tool == "nudge":
             if self._nudge(row, col):
                 self._nudge_at = (row, col)
@@ -1012,6 +1131,9 @@ class ImageWindow(QtWidgets.QWidget):
         self._edit_drag_mm = np.zeros(3)
 
     def _edit_drag(self, row: float, col: float) -> None:
+        if getattr(self, "_marking", False):
+            self._mark(row, col)
+            return
         if self._nudge_timer.isActive():
             self._nudge_at = (row, col)
             return
@@ -1040,6 +1162,9 @@ class ImageWindow(QtWidgets.QWidget):
                 self.pane.show_toast(note)
 
     def _edit_release(self) -> None:
+        if getattr(self, "_marking", False):
+            self._marking = False
+            return
         if self._nudge_timer.isActive() or self._nudge_at is not None:
             self._nudge_timer.stop()
             self._nudge_at = None

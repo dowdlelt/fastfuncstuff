@@ -125,6 +125,7 @@ class ImagePane(QtWidgets.QWidget):
         self._stroke_pts: list[tuple[float, float]] = []
         #: The selected vertex on this slice, per surface: (row, col, surface).
         self._marks: list[tuple[float, float, str]] = []
+        self._highlight = np.zeros((0, 2))
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -210,6 +211,13 @@ class ImagePane(QtWidgets.QWidget):
             self._outlines.update(built)
             changed = True
         if changed:
+            self.update()
+
+    def set_highlight(self, points: np.ndarray) -> None:
+        """Highlighted vertices near this slice, ``(N, 2)`` fractional (row, col) pixels."""
+        points = np.asarray(points, np.float64).reshape(-1, 2)
+        if points.shape != self._highlight.shape or not np.array_equal(points, self._highlight):
+            self._highlight = points
             self.update()
 
     def set_marks(self, marks: list[tuple[float, float, str]]) -> None:
@@ -324,6 +332,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_brush(p)
         if len(self._stroke_pts) > 1:
             self._paint_stroke(p, rect)
+        if self._highlight.size:
+            self._paint_highlight(p, rect)
         if self._marks:
             self._paint_marks(p, rect)
         if self._handle is not None:
@@ -426,6 +436,22 @@ class ImagePane(QtWidgets.QWidget):
             pen.setWidthF(self._outline_width)
             p.setPen(pen)
             p.drawPath(path)
+        p.restore()
+
+    def _paint_highlight(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        """Highlighted vertices: small dots in the warn colour, as on the 3-D surface."""
+        assert self._image is not None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        p.save()
+        p.setClipRect(rect)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(theme.palette().warn))
+        for row, col in self._highlight:
+            p.drawEllipse(
+                QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy), 2.2, 2.2
+            )
         p.restore()
 
     def _paint_marks(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:

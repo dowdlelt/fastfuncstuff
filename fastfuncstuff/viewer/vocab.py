@@ -673,6 +673,15 @@ class MoveSurfaceHighlight(Command):
 
 @command
 @dataclass(frozen=True)
+class HighlightToRoi(Command):
+    """The cortex under the highlight, white to pial, as a mask layer on the anatomy's grid."""
+
+    name = "HIGHLIGHT_TO_ROI"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+
+
+@command
+@dataclass(frozen=True)
 class UndoSurfaceEdit(Command):
     """Put the last committed surface edit back."""
 
@@ -1518,8 +1527,8 @@ def install(
     @bus.handle(SetSurfaceTool.name)
     def _set_surface_tool(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceTool)
-        if cmd.tool not in ("grab", "draw", "point", "nudge"):
-            raise ValueError("surface tool is grab, draw, point or nudge")
+        if cmd.tool not in ("grab", "draw", "point", "nudge", "mark"):
+            raise ValueError("surface tool is grab, draw, point, nudge or mark")
         st.surface_tool = cmd.tool
         return SetSurfaceTool.aspects
 
@@ -1548,6 +1557,21 @@ def install(
             cmd.hemi, cmd.surface, float(cmd.shift), session.surface_sampler(None), params
         )
         return MoveSurfaceHighlight.aspects
+
+    @bus.handle(HighlightToRoi.name)
+    def _highlight_to_roi(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, HighlightToRoi)
+        if session is None:
+            raise RuntimeError("HIGHLIGHT_TO_ROI needs a session")
+        base = st.layers.base
+        if base is None:
+            raise ValueError("load the anatomy first: the ROI is drawn on its grid")
+        mask = session.surfaces.highlight_mask(base.affine, base.shape)
+        if not mask.any():
+            raise ValueError("nothing is highlighted")
+        name = f"surface ROI ·{int(mask.sum()):,} vox"
+        _key, dirty = session.install_selection("surface-highlight", mask, like=base, name=name)
+        return dirty
 
     @bus.handle(UndoSurfaceEdit.name)
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:

@@ -343,3 +343,36 @@ def test_ctrl_drag_swings_the_hemispheres_open_and_o_cycles_the_presets(window):
     assert session.state.viewports.get("S1").hinge == -180.0
     win._cycle_hinge()
     assert session.state.viewports.get("S1").hinge == 0.0
+
+
+def test_paint_mode_paints_the_vertex_under_the_cursor_instead_of_turning(window):
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    win._reset_camera()
+    got = []
+    c.painted.connect(lambda h, v, e: got.append((h, v, e)))
+    win._toggle_paint()
+    turned = c.camera.rotation.copy()
+    pos = QtCore.QPointF(160.0, 160.0)
+    B = QtCore.Qt.MouseButton
+    for kind, buttons in (
+        (QtCore.QEvent.Type.MouseButtonPress, B.LeftButton),
+        (QtCore.QEvent.Type.MouseMove, B.LeftButton),
+    ):
+        QtWidgets.QApplication.sendEvent(
+            c,
+            QtGui.QMouseEvent(
+                kind, pos, pos, B.LeftButton, buttons, QtCore.Qt.KeyboardModifier.NoModifier
+            ),
+        )
+    assert got and got[0][0] == "lh" and got[0][2] is False
+    np.testing.assert_allclose(c.camera.rotation, turned)
+    assert session.surfaces.highlight["lh"].sum() > 0
