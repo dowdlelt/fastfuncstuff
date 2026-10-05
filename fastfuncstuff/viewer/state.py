@@ -103,6 +103,9 @@ class ViewerState:
     #: Topology edits act on it and leave it on the vertex they produce.
     surface_selected: tuple[str, int] | None = None
     surface_brush: tuple[float, float, float, float, int] = (4.0, 1.0, 0.2, 1.5, -1)
+    #: Snap only to edges at the boundary's expected intensity (see
+    #: ``surface.edit.SnapParams.gate``); off snaps to the strongest edge.
+    surface_snap_gate: bool = True
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.
     surface_snap_key: str | None = None

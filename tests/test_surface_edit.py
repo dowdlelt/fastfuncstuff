@@ -159,6 +159,16 @@ def test_pial_dragged_inward_does_not_snap_onto_the_white_boundary(phantom):
     res = edit.update(np.array([0.0, 0.0, -1.5]))
     core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
     assert np.all(np.abs(core - WHITE_TRUE) > 0.5)
+    # Ungated ("edge" mode), the strongest edge wins -- here the wrong one,
+    # which is why the gate is the default and "edge" a deliberate choice.
+    ungated = SurfaceEdit(
+        pial, topo, _top(u), sampler, SnapParams(radius=4.0, gate=False), role="pial", partner=white
+    )
+    assert ungated.levels is None
+    core = np.linalg.norm(
+        ungated.update(np.array([0.0, 0.0, -1.5])).positions[ungated.weight > 0.8], axis=1
+    )
+    assert np.median(np.abs(core - WHITE_TRUE)) < 0.5
 
 
 def test_pial_dragged_out_finds_the_csf_boundary(phantom):

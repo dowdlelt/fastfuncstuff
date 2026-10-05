@@ -470,6 +470,16 @@ class SetSurfaceBrush(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceSnapGate(Command):
+    """Snap to edges at the boundary's expected intensity (on) or the strongest edge (off)."""
+
+    name = "SET_SURFACE_SNAP_GATE"
+    aspects = Aspect.NOTHING
+    on: bool = True
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceSnap(Command):
     """Which layer edits snap to; empty means the bottom of the stack."""
 
@@ -503,6 +513,7 @@ class EditSurface(Command):
     search: float
     edge_sign: int
     snap_key: str = ""
+    gate: bool = True
 
 
 @command
@@ -529,6 +540,7 @@ class EditSurfaceStroke(Command):
     search: float
     edge_sign: int
     snap_key: str = ""
+    gate: bool = True
 
     @staticmethod
     def encode(points) -> str:
@@ -1339,6 +1351,12 @@ def install(
         st.surface_brush = (cmd.radius, cmd.snap, cmd.smooth, cmd.search, cmd.edge_sign)
         return SetSurfaceBrush.aspects
 
+    @bus.handle(SetSurfaceSnapGate.name)
+    def _set_surface_snap_gate(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceSnapGate)
+        st.surface_snap_gate = bool(cmd.on)
+        return SetSurfaceSnapGate.aspects
+
     @bus.handle(SetSurfaceSnap.name)
     def _set_surface_snap(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceSnap)
@@ -1362,6 +1380,7 @@ def install(
             smooth=cmd.smooth,
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
+            gate=bool(cmd.gate),
         )
         sampler = session.surface_sampler(cmd.snap_key or None)
         session.surfaces.apply(grab, tuple(cmd.drag), sampler, params)
@@ -1380,6 +1399,7 @@ def install(
             smooth=cmd.smooth,
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
+            gate=bool(cmd.gate),
         )
         session.surfaces.apply_stroke(
             cmd.hemi,

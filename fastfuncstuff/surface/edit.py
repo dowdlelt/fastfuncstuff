@@ -66,6 +66,12 @@ class SnapParams:
     #: Penalty, at the edge of the search band, for picking an edge far from
     #: the dragged position, relative to the strongest edge in the patch.
     distance_penalty: float = 0.5
+    #: Keep only edges that cross the intensity this boundary should sit at
+    #: (read off the surfaces themselves, see ``_tissue_levels``). Off, the
+    #: strongest edge of the right sign wins: for a boundary the surfaces'
+    #: own tissue estimate gets wrong -- pial lying in dura reads "CSF" from
+    #: dura, and the gate then rejects the GM/dura edge the eye can see.
+    gate: bool = True
 
 
 @dataclass
@@ -195,7 +201,7 @@ class SurfaceEdit:
         self.area = area[self._fold_slot]
         n = int(round(2 * params.search / (0.1 * sampler.voxel_mm))) + 1
         self._offsets = np.linspace(-params.search, params.search, max(n, 3))
-        self.levels = self._tissue_levels()
+        self.levels = self._tissue_levels() if params.gate else None
 
     def _laplacian(self) -> sp.csr_matrix:
         """Graph Laplacian over the patch's own edges (free at its rim).

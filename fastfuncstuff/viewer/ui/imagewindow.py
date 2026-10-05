@@ -299,7 +299,12 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
                 Binding(")", "larger brush", lambda: self._scale_brush(1.25), group="surface"),
-                Binding("m", "snap to the image edge on / off", self._toggle_snap, group="surface"),
+                Binding(
+                    "m",
+                    "snap -> edge (strongest, ungated) -> hand",
+                    self._toggle_snap,
+                    group="surface",
+                ),
                 Binding("ctrl+z", "undo the last surface edit", self._undo_edit, group="surface"),
                 Binding("Escape", "cancel the drag", self._cancel_edit, group="surface"),
                 Binding("drag the ring", "turn the moving image", None, group="align mode"),
@@ -625,20 +630,34 @@ class ImageWindow(QtWidgets.QWidget):
         self._sync_brush()
 
     def _toggle_snap(self) -> None:
-        """Snap fully to the found edge, or follow the hand exactly.
+        """Cycle snap -> edge -> hand.
 
-        A toggle rather than a slider because the two uses are distinct: snap
-        when the image shows the boundary, hand when it does not (a vessel, a
-        dura fold) and the eye knows better than the gradient.
+        Steps rather than a slider because the uses are distinct: snap when
+        the image shows the boundary at the intensity it should be; edge when
+        it shows a boundary the tissue estimate misjudges (pial lying in
+        dura, a stripped brain's outer edge) -- the strongest edge wins; hand
+        when it does not show one (a vessel, a dura fold) and the eye knows
+        better than the gradient.
         """
-        r, snap, smooth, search, sign = self.session.state.surface_brush
-        self._dispatch(SetSurfaceBrush(r, 0.0 if snap > 0 else 1.0, smooth, search, sign))
+        from fastfuncstuff.viewer.vocab import SetSurfaceSnapGate
+
+        state = self.session.state
+        r, snap, smooth, search, sign = state.surface_brush
+        if snap > 0 and state.surface_snap_gate:
+            self._dispatch(SetSurfaceSnapGate(False))
+        elif snap > 0:
+            self._dispatch(SetSurfaceBrush(r, 0.0, smooth, search, sign))
+        else:
+            self._dispatch(SetSurfaceBrush(r, 1.0, smooth, search, sign))
+            self._dispatch(SetSurfaceSnapGate(True))
         self._sync_brush()
 
     def _sync_brush(self, note: str = "") -> None:
         state = self.session.state
         r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
+        if snap > 0 and not state.surface_snap_gate:
+            mode = mode.replace("snap", "edge")
         tool = {"draw": "DRAW", "point": "POINT"}.get(state.surface_tool, "EDIT")
         if state.surface_tool == "point" and state.surface_selected is not None:
             hemi, v = state.surface_selected
@@ -764,7 +783,14 @@ class ImageWindow(QtWidgets.QWidget):
             self._sync_brush()
             return
         r, snap, smooth, search, sign = state.surface_brush
-        params = SnapParams(radius=r, snap=snap, smooth=smooth, search=search, edge_sign=sign)
+        params = SnapParams(
+            radius=r,
+            snap=snap,
+            smooth=smooth,
+            search=search,
+            edge_sign=sign,
+            gate=state.surface_snap_gate,
+        )
         try:
             sampler = self.session.surface_sampler(state.surface_snap_key)
         except (ValueError, KeyError) as exc:
@@ -826,6 +852,7 @@ class ImageWindow(QtWidgets.QWidget):
                 search,
                 sign,
                 self.session.state.surface_snap_key or "",
+                self.session.state.surface_snap_gate,
             )
         )
 
@@ -872,6 +899,7 @@ class ImageWindow(QtWidgets.QWidget):
                     search,
                     sign,
                     state.surface_snap_key or "",
+                    state.surface_snap_gate,
                 )
             )
         except ValueError as exc:

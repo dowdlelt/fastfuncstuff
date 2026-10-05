@@ -628,3 +628,53 @@ def test_point_tool_selects_marks_deletes_and_splits(tmp_path):
         assert hemi.n_vertices == n0 + valence and st.surface_selected == ("lh", v)
     finally:
         win.close()
+
+
+def test_m_cycles_snap_edge_hand_and_edits_record_the_gate(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import EditSurface, OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        st = session.state
+        seen = []
+        for _ in range(3):
+            image._toggle_snap()
+            seen.append((st.surface_brush[1] > 0, st.surface_snap_gate))
+        # snap (gated) -> edge -> hand (the gate is moot) -> snap again.
+        assert [seen[0], seen[1][0], seen[2]] == [(True, False), False, (True, True)]
+        session.do(
+            EditSurface(
+                "lh",
+                "white",
+                0,
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.3),
+                4.0,
+                1.0,
+                0.2,
+                1.5,
+                -1,
+                "",
+                False,
+            )
+        )
+        assert "SET_SURFACE_SNAP_GATE" in session.to_script()
+        assert any(isinstance(c, EditSurface) and c.gate is False for c in session.bus.log)
+    finally:
+        win.close()
+        session.close()
