@@ -748,9 +748,12 @@ class SurfaceWindow(QtWidgets.QWidget):
         bar = QtWidgets.QHBoxLayout()
         bar.setContentsMargins(6, 4, 6, 4)
         bar.setSpacing(4)
+        # Two short rows rather than one long one, keys in the tooltips, and a
+        # readout that elides: the single row held the window at ~800 px wide.
         self._shape_buttons: dict[str, QtWidgets.QPushButton] = {}
         for shape in s3.SHAPES:
-            b = QtWidgets.QPushButton(f"{shape.upper()[:4]} {self._SHAPE_KEYS[shape]}")
+            b = QtWidgets.QPushButton(shape.upper()[:4])
+            b.setToolTip(f"{shape} ({self._SHAPE_KEYS[shape]})")
             b.setCheckable(True)
             b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, s=shape: self._set_shape(s))
@@ -759,13 +762,18 @@ class SurfaceWindow(QtWidgets.QWidget):
         bar.addSpacing(8)
         self._hemi_buttons: dict[str, QtWidgets.QPushButton] = {}
         for hemi, key in (("lh", "L"), ("rh", "R")):
-            b = QtWidgets.QPushButton(f"{hemi.upper()} {key}")
+            b = QtWidgets.QPushButton(hemi.upper())
+            b.setToolTip(f"show / hide {hemi} (shift+{key.lower()})")
             b.setCheckable(True)
             b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, h=hemi: self._toggle_hemi(h))
             bar.addWidget(b)
             self._hemi_buttons[hemi] = b
-        bar.addSpacing(8)
+        bar.addStretch(1)
+        v.addLayout(bar)
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(6, 0, 6, 4)
+        bar.setSpacing(4)
         self.map_box = self._combo("Per-vertex map painted under the overlay (m cycles)")
         self.map_box.activated.connect(self._pick_map)
         bar.addWidget(self.map_box)
@@ -780,11 +788,16 @@ class SurfaceWindow(QtWidgets.QWidget):
         bar.addStretch(1)
         self.depth_label = QtWidgets.QLabel("")
         self.depth_label.setObjectName("value")
+        self.depth_label.setMinimumWidth(0)
         bar.addWidget(self.depth_label)
         v.addLayout(bar)
         self.region_label = QtWidgets.QLabel("")
         self.region_label.setObjectName("value")
         self.region_label.setContentsMargins(8, 0, 8, 2)
+        # Ignored: a long region name must not set the window's minimum width.
+        self.region_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred
+        )
         v.addWidget(self.region_label)
 
         self.canvas = SurfaceCanvas(self)
@@ -844,7 +857,10 @@ class SurfaceWindow(QtWidgets.QWidget):
         box = QtWidgets.QComboBox()
         box.setToolTip(tip)
         box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        box.setMinimumContentsLength(6)
         return box
 
     # -- viewport plumbing --------------------------------------------------
