@@ -65,6 +65,7 @@ from fastfuncstuff.viewer.vocab import (
     SetSurfaceEquivolume,
     SetSurfaceFolding,
     SetSurfaceHemis,
+    SetSurfaceHinge,
     SetSurfaceMap,
     SetSurfaceShape,
 )
@@ -126,6 +127,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     seeded = QtCore.Signal(float, float, float)
     #: Shift+wheel: move the sampled depth by this fraction.
     depth_scrolled = QtCore.Signal(float)
+    #: Ctrl+drag sideways: open the hinge by this many degrees.
+    hinged = QtCore.Signal(float)
+    #: Ctrl+shift+drag sideways: push the hemispheres apart by this many mm.
+    spread = QtCore.Signal(float)
 
     #: Radians turned by a drag the height of the window. pi read as sluggish:
     #: a half turn to see the other side took two strokes.
@@ -622,7 +627,25 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             self._moved = True
         h = max(self.height(), 1)
         buttons = event.buttons()
-        shift = event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier
+        mods = event.modifiers()
+        shift = mods & QtCore.Qt.KeyboardModifier.ShiftModifier
+        ctrl = mods & (
+            QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier
+        )
+        if ctrl and buttons & QtCore.Qt.MouseButton.LeftButton:
+            if not self._moved:
+                return  # a ctrl+click that jittered is still a seed, not a hinge
+            if shift:
+                # Split is the whole gap and each side takes half: each
+                # hemisphere follows the cursor.
+                mm_per_px = (
+                    2 * self.camera.distance * np.tan(np.radians(self.camera.fov_deg) / 2) / h
+                )
+                self.spread.emit(2.0 * d.x() * mm_per_px)
+            else:
+                # Right swings them nose to nose; a window's width is 360.
+                self.hinged.emit(360.0 * d.x() / max(self.width(), 1))
+            return
         if buttons & QtCore.Qt.MouseButton.RightButton:
             # Up zooms in, as in the slice windows.
             self.camera.zoom(float(np.exp(d.y() / 150.0)))
@@ -848,6 +871,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.located.connect(self.located)
         self.canvas.seeded.connect(self.seeded)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
+        self.canvas.hinged.connect(self._hinge_by)
+        self.canvas.spread.connect(self._spread_by)
         self._built_map: tuple | None = None
         self._built_topology: int | None = None
         self._built_fold: tuple | None = None
@@ -887,6 +912,9 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("0", "reset the camera", self._reset_camera, group="view"),
                 Key("drag", "rotate", None, group="view"),
                 Key("alt+drag", "turn one hemisphere about its centre", None, group="hemispheres"),
+                Key("ctrl+drag", "swing open: right nose to nose, left occipital to occipital", None, group="hemispheres"),
+                Key("ctrl+shift+drag", "push the hemispheres apart / together", None, group="hemispheres"),
+                Key("o", "open: closed, nose to nose, occipital to occipital", self._cycle_hinge, group="hemispheres"),
                 Key("right-drag", "zoom (up = in)", None, group="view"),
                 Key("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
@@ -940,6 +968,25 @@ class SurfaceWindow(QtWidgets.QWidget):
         vp = self._viewport()
         if vp is not None:
             self._dispatch(SetSurfaceHemis(self.vid, vp.hemis, max(0.0, vp.split + delta)))
+
+    def _hinge_by(self, degrees: float) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetSurfaceHinge(self.vid, float(np.clip(vp.hinge + degrees, -180, 180))))
+
+    def _spread_by(self, mm: float) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetSurfaceHemis(self.vid, vp.hemis, max(0.0, vp.split + mm)))
+
+    def _cycle_hinge(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        presets = [0.0, 180.0, -180.0]
+        # From anywhere in between, the next preset past the nearest one.
+        near = min(range(3), key=lambda k: abs(presets[k] - vp.hinge))
+        self._dispatch(SetSurfaceHinge(self.vid, presets[(near + 1) % 3]))
 
     def _shift_depth(self, delta: float) -> None:
         vp = self._viewport()
@@ -1320,12 +1367,15 @@ class SurfaceWindow(QtWidgets.QWidget):
 
     def _apply_layout(self, vp: Viewport) -> None:
         shown = {h for h in vp.hemis.split(",") if h}
-        models: dict[str, np.ndarray] = {}
-        for h in self.session.surfaces.hemis:
-            m = np.eye(4)
-            side = -1.0 if h == "lh" else 1.0
-            m[0, 3] = side * vp.split / 2.0
-            models[h] = m
+        # Pivots from the shape being morphed *to*, so the hinge does not
+        # wander during the morph. A flat patch lies in the axial plane, where
+        # a hinge about the vertical would only spin it.
+        hinge = 0.0 if vp.shape == "flat" else vp.hinge
+        positions = {
+            h: self.canvas._cpu.get(h, {}).get("posB", np.zeros((0, 3)))
+            for h in self.session.surfaces.hemis
+        }
+        models = s3.hemisphere_models(positions, vp.split, hinge)
         flat = {h: vp.shape == "flat" for h in self.session.surfaces.hemis}
         self.canvas.set_layout(shown, models, flat)
 

@@ -297,3 +297,49 @@ def test_d_cycles_the_depth_statistic_and_it_reaches_the_canvas(window):
     assert "SET_SURFACE_DEPTH_STAT" in session.to_script()
     with pytest.raises(ValueError, match="unknown depth statistic"):
         session.do(SetSurfaceDepthStat("S1", "mode"))
+
+
+def test_ctrl_drag_swings_the_hemispheres_open_and_o_cycles_the_presets(window):
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    session, win = window
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    B, M = QtCore.Qt.MouseButton, QtCore.Qt.KeyboardModifier
+
+    def send(kind, x, buttons, mods):
+        pos = QtCore.QPointF(x, 160.0)
+        QtWidgets.QApplication.sendEvent(
+            c, QtGui.QMouseEvent(kind, pos, pos, B.LeftButton, buttons, mods)
+        )
+
+    E = QtCore.QEvent.Type
+    send(E.MouseButtonPress, 100.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseMove, 110.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseMove, 180.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseButtonRelease, 180.0, B.NoButton, M.ControlModifier)
+    vp = session.state.viewports.get("S1")
+    assert vp.hinge > 0
+    win.refresh(Aspect.ALL)  # the manager does this after every command
+    # Turned about the vertical: z is untouched, x/y rotated.
+    m = c._model["lh"]
+    assert m[2, 2] == pytest.approx(1.0) and m[0, 0] < 1.0
+    assert session.state.seed is None  # a drag, not a ctrl+click
+
+    send(E.MouseButtonPress, 100.0, B.LeftButton, M.ControlModifier | M.ShiftModifier)
+    send(E.MouseMove, 140.0, B.LeftButton, M.ControlModifier | M.ShiftModifier)
+    assert session.state.viewports.get("S1").split > 0
+    send(E.MouseButtonRelease, 140.0, B.NoButton, M.NoModifier)
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceHinge
+
+    session.do(SetSurfaceHinge("S1", 0.0))
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == 180.0
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == -180.0
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == 0.0

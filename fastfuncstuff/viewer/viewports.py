@@ -159,6 +159,11 @@ class Viewport:
     #: beyond their layout (mm) -- splitting is how the medial wall is seen.
     hemis: str = "lh,rh"
     split: float = 0.0
+    #: The hemispheres swung open like a hot-dog bun, total degrees: positive
+    #: hinges on the front (nose to nose), negative on the back (occipital to
+    #: occipital); +-180 lays both flat, showing both lateral surfaces from
+    #: one side and both medial from the other.
+    hinge: float = 0.0
     #: Depth as equal *volume* fractions (Waehnert 2014) rather than equal
     #: distances -- the default, because a laminar question is about layers,
     #: and layers keep their volume, not their distance, through a fold.

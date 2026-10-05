@@ -681,6 +681,17 @@ class SetSurfaceHemis(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceHinge(Command):
+    """Swing a surface window's hemispheres open: + nose to nose, - occipital to occipital."""
+
+    name = "SET_SURFACE_HINGE"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    degrees: float = 0.0
+
+
+@command
+@dataclass(frozen=True)
 class SetDepthView(Command):
     """A depth window's region: source (disc / annot / layer), disc radius (mm),
     the layer profiled ("" = auto) and the ROI layer a ``layer`` region uses."""
@@ -1710,6 +1721,12 @@ def install(
         return _set_view(
             st, cmd.view, SetSurfaceHemis.aspects, hemis=cmd.hemis, split=float(cmd.split)
         )
+
+    @bus.handle(SetSurfaceHinge.name)
+    def _set_surface_hinge(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceHinge)
+        degrees = float(min(max(cmd.degrees, -180.0), 180.0))
+        return _set_view(st, cmd.view, SetSurfaceHinge.aspects, hinge=degrees)
 
     @bus.handle(SetViewSolo.name)
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:

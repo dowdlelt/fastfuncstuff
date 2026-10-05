@@ -106,6 +106,41 @@ def layout_offsets(
     return out
 
 
+def hemisphere_models(
+    positions: dict[str, np.ndarray], split: float = 0.0, hinge: float = 0.0
+) -> dict[str, np.ndarray]:
+    """Per-hemisphere 4x4 placing ``positions`` (as drawn, before this) in the window.
+
+    ``split`` pushes the hemispheres apart along x, mm in total. ``hinge``
+    swings them open about a vertical axis, total degrees split evenly between
+    the two: positive pivots each on its front medial edge (nose to nose),
+    negative on its back medial edge (occipital to occipital). Each pivots on
+    its *own* edge, so the hinge is where the two hemispheres touch, the way
+    a hot-dog bun opens; the split then moves them apart along x, which at
+    180 degrees is straight away from each other.
+    """
+    out: dict[str, np.ndarray] = {}
+    a = np.radians(float(hinge))
+    for h, pos in positions.items():
+        side = -1.0 if h == "lh" else 1.0
+        m = np.eye(4)
+        if a != 0.0 and pos.size:
+            lo, hi = pos.min(axis=0), pos.max(axis=0)
+            # The medial edge faces the other hemisphere: lh's largest x.
+            px = float(hi[0] if side < 0 else lo[0])
+            py = float(hi[1] if a > 0 else lo[1])
+            # The end away from the hinge swings out to the hemisphere's own
+            # side: lh's back end to -x for a front hinge (clockwise from
+            # above), its front end to -x for a back hinge (counter-clockwise).
+            r = _rotation([0, 0, 1], side * a / 2.0)
+            pivot = np.array([px, py, 0.0])
+            m[:3, :3] = r
+            m[:3, 3] = pivot - r @ pivot
+        m[0, 3] += side * split / 2.0
+        out[h] = m
+    return out
+
+
 def texture_from_mm(shape: tuple[int, int, int], affine: np.ndarray) -> np.ndarray:
     """4x4 from scanner mm to normalised 3-D texture coordinates.
 
@@ -605,6 +640,7 @@ __all__ = [
     "flag_ramp",
     "flat_patch",
     "layout_offsets",
+    "hemisphere_models",
     "pack_uniforms",
     "pick",
     "shade_reference",
