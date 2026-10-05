@@ -294,3 +294,33 @@ def test_realized_gaps_measure_offset_to_next_onset_of_any_condition():
     np.testing.assert_allclose(gaps[0][0], [3.0])  # A at 0, ends 1, B at 4
     np.testing.assert_allclose(gaps[1][0], [4.0])  # B at 4, ends 6, A at 10
     np.testing.assert_array_equal(transitions, [[0, 1], [1, 0]])
+
+
+def test_isi_balance_condition_makes_an_even_list_even_per_condition():
+    from fastfuncstuff.simulation.experiment import realized_gaps
+
+    def counts(balance):
+        spec = ExperimentSpec(
+            tr=2.4,
+            units=[Unit.parse("A", "A:0.5", 1), Unit.parse("B", "B:0.5", 1)],
+            n_runs=4,
+            isi=Interval.parse("even:(9.6,7.2,12.0)"),
+            initial_fix=12,
+            post_fix=12,
+            scan_time=744,
+            isi_balance=balance,
+        )
+        real = realize(spec, 0)
+        assert all(min(o[r].min() for o in real.onsets) == 12 for r in range(4))
+        gaps = realized_gaps(real)[0]
+        per_run = [[np.unique(g.round(6), return_counts=True)[1] for g in c] for c in gaps]
+        total = [np.unique(np.concatenate(c).round(6), return_counts=True)[1] for c in gaps]
+        return per_run, total
+
+    per_run, total = counts("condition")
+    # Each condition, each run: within one of even; over the experiment, leftovers rotate.
+    assert all(c.max() - c.min() <= 1 for cond in per_run for c in cond)
+    assert all(t.max() - t.min() <= 1 for t in total)
+    # The run-wide default is what let seed 0 hand one condition 16/9/10 in a run.
+    per_run, _ = counts("run")
+    assert max(c.max() - c.min() for cond in per_run for c in cond) > 1

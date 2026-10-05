@@ -1716,9 +1716,14 @@ def plot_isi(
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK2,
                    loc="outside lower center", ncol=min(len(labels), 8))  # fmt: skip
+    # The lead-in is not a gap, but it is the other half of "did the timing behave".
+    starts = [min((float(np.min(real.onsets[i][r])) for i in range(len(names))
+                   if len(real.onsets[i][r])), default=float("nan")) for r in range(n_runs)]  # fmt: skip
+    lead = (f"{starts[0]:g} s" if len(set(np.round(starts, 3))) == 1
+            else ", ".join(f"{v:g}" for v in starts) + " s")  # fmt: skip
     fig.suptitle(
         title or "Gaps as realized: first realization (the timing files), stacked by run; a "
-        "run's last trial has no gap (-post_fix follows)",
+        f"run's last trial has no gap (-post_fix follows). First onset of each run: {lead}",
         color=INK, fontsize=10,
     )  # fmt: skip
     return _finish(fig, path)

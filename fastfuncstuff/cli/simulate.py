@@ -306,6 +306,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t.add_argument("-isi", default="0", metavar="SPEC", help="Gap between units (default 0).")
     t.add_argument("-within_isi", default="0", metavar="SPEC", help="Gap inside a miniblock.")
+    t.add_argument(
+        "-isi_balance",
+        default="run",
+        choices=["run", "condition"],
+        help="What -isi is drawn over. run: every gap in a run together, so an even: list "
+        "is even in sum but one condition can get more of the short gaps. condition: each "
+        "unit's gaps on their own -- an even: list is even for every condition (leftovers "
+        "rotated across runs), and exp/poisson/uniform are mean-matched per condition.",
+    )
     t.add_argument("-initial_fix", type=float, default=0.0, help="Fixation before (s).")
     t.add_argument("-post_fix", type=float, default=16.0, help="Fixation after (s, default 16).")
     t.add_argument(
@@ -732,6 +741,7 @@ def _spec_from_args(args):
         num_events=args.num_events,
         num_blocks=args.num_blocks,
         tr_lock=args.tr_lock,
+        isi_balance=args.isi_balance,
     )
 
 
@@ -1577,7 +1587,7 @@ EXPLORE_ONLY = (
 )  # fmt: skip
 TIMING_FLAGS = (
     "trial", "block", "miniblock", "shuffle_items", "null", "isi_list", "isi", "within_isi",
-    "initial_fix",
+    "isi_balance", "initial_fix",
     "post_fix",
     "order", "nruns", "scan_time", "num_events", "num_blocks", "ndesigns", "scan_times",
     "events", "labels", "durations", "nt",

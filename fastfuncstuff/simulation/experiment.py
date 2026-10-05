@@ -313,6 +313,9 @@ class ExperimentSpec:
     num_events: int | None = None  # per-run total of non-null event units
     num_blocks: int | None = None  # per-run total of block units
     tr_lock: bool = False  # every onset on a TR boundary (gaps snapped to TR steps)
+    # "run": one -isi family per run, shared by every unit; "condition": one per
+    # unit, so an even list is even within each condition, not only in sum.
+    isi_balance: Literal["run", "condition"] = "run"
 
     @property
     def conditions(self) -> list[str]:
@@ -505,7 +508,9 @@ class ExperimentSpec:
         lines = [
             f"TR {self.tr:g} s, {self.n_runs} run(s), fixation {self.initial_fix:g} s before / "
             f"{self.post_fix:g} s after, order {self.order}",
-            f"between units: {self.isi}   within units: {self.within_isi}"
+            f"between units: {self.isi}"
+            + (" (balanced per condition)" if self.isi_balance == "condition" else "")
+            + f"   within units: {self.within_isi}"
             + ("   onsets locked to the TR grid" if self.tr_lock else ""),
         ]
         if self.scan_time is not None:
@@ -644,6 +649,8 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
                     off = item.off
                 else:
                     key = "isi" if last else "within"
+                    if last and spec.isi_balance == "condition":
+                        key = ("isi", ui)
                     off = spec.isi if last else spec.within_isi
                 if last and k == len(order) - 1:
                     spare = (off, (k, j))
@@ -662,6 +669,12 @@ def draw_plans(spec: ExperimentSpec, seed: int) -> tuple[list[int], list[RunPlan
                 vals = specs[key].values
                 drawn = _deal(len(vals), len(where), decks.setdefault(key, []), rng)
                 values = np.asarray(vals)[drawn] + [shift[pos] for pos in where]
+            elif isinstance(key, tuple) and key[0] == "isi" and specs[key].kind == "even":
+                # A condition's share of the run rarely divides by the list: its
+                # leftovers rotate across runs, so the whole experiment is even too.
+                vals = specs[key].values
+                drawn = _deal(len(vals), len(where), decks.setdefault(key, []), rng)
+                values = np.asarray(vals)[drawn] + specs[key].shift
             else:
                 values = specs[key].sample(len(where), rng, spec.tr)
             for pos, value in zip(where, values, strict=True):
