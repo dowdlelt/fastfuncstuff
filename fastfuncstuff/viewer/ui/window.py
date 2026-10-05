@@ -306,7 +306,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if self.linked and source.state.crosshair_mm is not None:
             self._follow(ctl, source.state.crosshair_mm, source.state.time_index)
         self.refresh(Aspect.ALL)
-        self._tile()
+        self._row()
         return ctl
 
     def close_controller(self, ctl: Controller) -> bool:
@@ -1144,6 +1144,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _tile(self) -> None:
         """Tile every controller's windows together, so A and B sit side by side."""
         self.manager.tile(self, peers=self._peers())
+
+    def _row(self) -> None:
+        """Every controller's windows at their own size, in a row at the top right."""
+        self.manager.row(self, peers=self._peers())
 
     def _cascade(self) -> None:
         self.manager.cascade(self, peers=self._peers())
@@ -2377,7 +2381,7 @@ def launch(
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
     win.show()
-    win._tile()
+    win._row()
     return app.exec()
 
 

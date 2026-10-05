@@ -335,6 +335,50 @@ class WindowManager(QtCore.QObject):
         finally:
             self._placing = False
 
+    def row(
+        self, anchor: QtWidgets.QWidget | None = None, peers: Sequence[WindowManager] = ()
+    ) -> None:
+        """Line the windows up along the top right, each at its own size.
+
+        How the viewer opens. Tiling at start-up blew three 280-pixel image
+        windows up to fill the screen a moment after they appeared; the size
+        a window chose for itself is the one it should keep, and a row at the
+        top right leaves the rest of the screen for the graphs and panels that
+        come next. Rows wrap downward when the screen runs out of width, each
+        right-aligned and in opening order.
+        """
+        windows = self._placeable(peers)
+        if not windows:
+            return
+        area = self._work_area(anchor)
+        rows: list[list[tuple[WindowManager, Companion, int, int]]] = [[]]
+        width = TILE_GAP
+        for mgr, win in windows:
+            frame = win.frameGeometry()
+            # The frame (title bar, borders) is what takes room on screen.
+            fw = frame.width() if frame.width() > 1 else win.width()
+            fh = frame.height() if frame.height() > 1 else win.height()
+            fw, fh = min(fw, area.width() - 2 * TILE_GAP), min(fh, area.height() - 2 * TILE_GAP)
+            if rows[-1] and width + fw + TILE_GAP > area.width():
+                rows.append([])
+                width = TILE_GAP
+            rows[-1].append((mgr, win, fw, fh))
+            width += fw + TILE_GAP
+        self._placing = True
+        try:
+            y = area.y() + TILE_GAP
+            for line in rows:
+                total = sum(fw for *_, fw, _ in line) + TILE_GAP * (len(line) - 1)
+                x = area.x() + area.width() - TILE_GAP - total
+                for mgr, win, fw, fh in line:
+                    win.move(x, y)
+                    g = win.geometry()
+                    mgr.record_geometry(win.vid, g.x(), g.y(), g.width(), g.height())
+                    x += fw + TILE_GAP
+                y += max(fh for *_, fh in line) + TILE_GAP
+        finally:
+            self._placing = False
+
     def cascade(
         self, anchor: QtWidgets.QWidget | None = None, peers: Sequence[WindowManager] = ()
     ) -> None:

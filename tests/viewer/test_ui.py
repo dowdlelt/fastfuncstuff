@@ -188,6 +188,24 @@ def test_tiling_gives_every_window_a_rectangle(win, qapp):
     assert len(lines) - before == len(rects)
 
 
+def test_opening_lines_windows_up_top_right_at_their_own_size(win, qapp):
+    """Start-up used to tile, which grew 280-pixel image windows to fill the
+    screen a moment after they appeared."""
+    win.show()
+    qapp.processEvents()
+    sizes = {vid: (w.width(), w.height()) for vid, w in win.manager.windows.items()}
+    win._row()
+    qapp.processEvents()
+    rects = [w.frameGeometry() for w in win.manager.windows.values() if w.isVisible()]
+    assert len(rects) >= 3
+    assert {vid: (w.width(), w.height()) for vid, w in win.manager.windows.items()} == sizes
+    controller = win.frameGeometry()
+    for i, a in enumerate(rects):
+        assert not controller.intersects(a)
+        for b in rects[i + 1 :]:
+            assert not a.intersects(b)
+
+
 def test_tiling_does_not_cover_the_controller(win, qapp):
     """Tiling over the controller hides the panel the windows are driven from."""
     win.show()
