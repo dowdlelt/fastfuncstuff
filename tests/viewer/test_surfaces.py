@@ -890,7 +890,5 @@ def test_free_hand_edits_follow_the_drag_and_are_recorded(session, tmp_path):
         )
     )
     np.testing.assert_allclose(white[top] - start, [0.8, 0.0, 0.0], atol=1e-5)
-    assert (
-        "free=True" in session.to_script()
-        or "True" in session.to_script().split("EDIT_SURFACE")[-1]
-    )
+    # The script line ends with gate and free, both on.
+    assert session.to_script().strip().splitlines()[-1].endswith("'' 1 1")
