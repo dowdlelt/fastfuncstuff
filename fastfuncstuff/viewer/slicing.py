@@ -287,7 +287,7 @@ def plane_indices(
     ``view`` crops and magnifies; without one the whole plane is covered. Built
     on-device so a redraw never round-trips index arithmetic through the host.
     """
-    layout = plane_layout(grid.affine, plane)
+    layout = plane_layout(grid.frame, plane)
     if view is None:
         view = PlaneView(layout=layout, shape=grid.shape)
     full_h, full_w = view.extent

@@ -161,6 +161,12 @@ class ImagePane(QtWidgets.QWidget):
         self._labels = layout.labels
         self.update()
 
+    def set_tilt(self, degrees: float) -> None:
+        """How far an oblique window's slice is tilted, for the caption; 0 = not."""
+        if degrees != getattr(self, "_tilt", 0.0):
+            self._tilt = float(degrees)
+            self.update()
+
     def set_zoomed(self, on: bool) -> None:
         """Whether the pane is showing a crop, for the corner readout."""
         if on != self._zoomed:
@@ -331,7 +337,10 @@ class ImagePane(QtWidgets.QWidget):
         # Saying so on the image, because a cropped brain still looks like a
         # brain -- the same reason the edge labels are written on.
         zoom = "  zoom" if self._zoomed else ""
-        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}")
+        tilt = getattr(self, "_tilt", 0.0)
+        # Said on the image: a tilted slice still looks like a slice.
+        tilted = f"  tilt {tilt:.0f}°" if tilt >= 0.5 else ""
+        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}{tilted}")
         if self._brush is not None and self._brush_label:
             p.drawText(6, 30, self._brush_label)
 

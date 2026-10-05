@@ -37,7 +37,7 @@ from fastfuncstuff.viewer.slicing import (
     plane_layout,
     plane_shape,
 )
-from fastfuncstuff.viewer.state import Plane, ViewerState
+from fastfuncstuff.viewer.state import DisplayGrid, Plane, ViewerState
 
 #: Colour drawn around suprathreshold voxels in boxed mode. Near-white reads
 #: against every scale in the palette, warm or cool.
@@ -144,6 +144,7 @@ def render_plane(
     position: int | None = None,
     solo_key: str | None = None,
     view: PlaneView | None = None,
+    grid: DisplayGrid | None = None,
 ) -> PaneImage | None:
     """Composite every visible layer for one display plane.
 
@@ -155,7 +156,7 @@ def render_plane(
     an empty session from a black image.
     """
     state: ViewerState = session.state
-    grid = state.grid
+    grid = grid or state.grid
     if grid is None:
         return None
     if solo_key is not None:
@@ -166,7 +167,7 @@ def render_plane(
     if not visible:
         return None
 
-    layout = plane_layout(grid.affine, plane)
+    layout = plane_layout(grid.frame, plane)
     pos = plane_position(state, plane) if position is None else position
     pos = max(0, min(pos, grid.shape[layout.fixed] - 1))
 
@@ -258,6 +259,62 @@ def render_plane(
     return PaneImage(rgba=to_rgba8(rgb), plane=plane, position=pos)
 
 
+def tilt_matrix(viewport) -> np.ndarray:
+    return np.asarray(getattr(viewport, "tilt", None) or np.eye(3).ravel(), float).reshape(3, 3)
+
+
+def section_tilt(
+    tilt: np.ndarray, plane_normal: np.ndarray, sheet_normal: np.ndarray
+) -> np.ndarray:
+    """The tilt, composed onto ``tilt``, that makes a slice cut the cortex square-on.
+
+    ``plane_normal`` is the slice's normal before any tilt, ``sheet_normal``
+    the cortex's. A square cut is a plane that *contains* the sheet normal --
+    then the ribbon shows its true thickness instead of a smear, and an edit
+    moves the outline the way the surface moves. Of all such planes, the one
+    nearest the slice already shown: its normal is the current one with the
+    sheet-normal part taken out, so the picture turns as little as possible.
+    Returns ``tilt`` unchanged when the slice already lies in the sheet (no
+    single nearest plane) or already cuts it square-on.
+    """
+    r = np.asarray(tilt, float).reshape(3, 3)
+    a = r @ (np.asarray(plane_normal, float) / np.linalg.norm(plane_normal))
+    n = np.asarray(sheet_normal, float) / np.linalg.norm(sheet_normal)
+    target = a - (a @ n) * n
+    if np.linalg.norm(target) < 0.05:
+        return r
+    target /= np.linalg.norm(target)
+    axis = np.cross(a, target)
+    s, c = float(np.linalg.norm(axis)), float(a @ target)
+    if s < 1e-9:
+        return r
+    k = axis / s
+    kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    turn = np.eye(3) + s * kx + (1 - c) * kx @ kx
+    return turn @ r
+
+
+def view_grid(state: ViewerState, viewport) -> DisplayGrid | None:
+    """The grid a window samples through: the display grid, tilted for an oblique window.
+
+    The tilt turns the grid about the crosshair, which therefore keeps its
+    voxel index in both -- so slice position, the crosshair's place in the
+    pane, and every caller of ``plane_view`` agree without knowing about the
+    tilt. Layout (which axis, which way) stays the untilted grid's.
+    """
+    grid = state.grid
+    if grid is None or viewport is None:
+        return grid
+    r = tilt_matrix(viewport)
+    if np.allclose(r, np.eye(3)):
+        return grid
+    c = np.asarray(grid.ijk_to_mm(tuple(float(v) for v in state.crosshair)))
+    turn = np.eye(4)
+    turn[:3, :3] = r
+    turn[:3, 3] = c - r @ c
+    return DisplayGrid(grid.shape, turn @ grid.affine, layout_affine=grid.affine)
+
+
 def plane_view(state: ViewerState, viewport) -> PlaneView | None:
     """The crop-and-magnify a viewport asks for, or ``None`` for the whole plane.
 
@@ -297,6 +354,7 @@ def render_viewport(session, viewport) -> PaneImage | None:
         position=position,
         solo_key=solo,
         view=plane_view(session.state, viewport),
+        grid=view_grid(session.state, viewport),
     )
 
 
@@ -331,6 +389,9 @@ __all__ = [
     "empty_pane",
     "plane_position",
     "plane_view",
+    "section_tilt",
+    "tilt_matrix",
+    "view_grid",
     "render_all",
     "render_plane",
     "render_viewport",

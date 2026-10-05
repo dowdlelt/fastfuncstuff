@@ -234,6 +234,13 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
                 Binding("c", "centre the view on the crosshair", self._centre_view, group="view"),
                 Binding(
+                    "t",
+                    "tilt the slice to cut the cortex square-on here",
+                    self._tilt_to_cortex,
+                    group="view",
+                ),
+                Binding("shift+t", "untilt the slice", self._untilt, group="view"),
+                Binding(
                     "shift+o",
                     "surface outlines: both, white, pial, off",
                     self._cycle_outlines,
@@ -468,6 +475,16 @@ class ImageWindow(QtWidgets.QWidget):
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
 
+    def _grid(self):
+        """The grid this window samples through -- tilted when the window is oblique."""
+        from fastfuncstuff.viewer.compose import view_grid
+
+        return view_grid(self.session.state, self._viewport())
+
+    def _tilted(self) -> bool:
+        grid = self._grid()
+        return grid is not None and grid.layout_affine is not None
+
     def _pick(self, row: int, col: int, *, seed: bool) -> None:
         state = self.session.state
         vp = self._viewport()
@@ -478,6 +495,14 @@ class ImageWindow(QtWidgets.QWidget):
         # image pixel (0, 0) is not grid voxel 0 and a click would land
         # wherever the offset happened not to be applied.
         ijk = view.to_ijk(row, col, state.crosshair)
+        grid = self._grid()
+        if grid is not None and grid.layout_affine is not None:
+            # Oblique: the tilted voxel is somewhere in the shared grid, not at
+            # these indices; go through mm and take the voxel it lands in.
+            self._dispatch(SetXYZ(*grid.ijk_to_mm(tuple(float(v) for v in ijk))))
+            if seed:
+                self._dispatch(SetSeed(*self.session.state.crosshair))
+            return
         # A click in an unlocked window still reports where it was clicked --
         # it just does not take its own slice from the crosshair afterwards.
         self._dispatch(SetIJK(*ijk))
@@ -545,6 +570,46 @@ class ImageWindow(QtWidgets.QWidget):
 
         self._dispatch(SetOutlineWidth(self.session.state.surface_outline_width * factor))
 
+    def _tilt_to_cortex(self) -> None:
+        """Oblique window: turn the slice to contain the cortex's normal at the crosshair.
+
+        Through a sulcal wall that runs at a slant to the slice, the ribbon is
+        a smear and dragging an outline moves the surface mostly out of the
+        slice. Cut square-on, the boundary is sharp and the drag means what it
+        shows. Pressed again after moving, it re-aims for the new spot.
+        """
+        from fastfuncstuff.viewer.compose import section_tilt, tilt_matrix
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        state = self.session.state
+        vp = self._viewport()
+        mm = state.crosshair_mm
+        if vp is None or state.grid is None or mm is None:
+            return
+        n = self.session.surfaces.cortex_normal(mm)
+        if n is None:
+            self.pane.show_toast("no cortex within 6 mm of the crosshair to tilt to")
+            return
+        fixed = plane_layout(state.grid.affine, vp.plane).fixed
+        plane_normal = np.linalg.inv(state.grid.affine)[fixed, :3]
+        now = tilt_matrix(vp)
+        a = now @ (plane_normal / np.linalg.norm(plane_normal))
+        if abs(float(a @ n)) < 0.05:
+            self.pane.show_toast("this slice already cuts the cortex square-on here")
+            return
+        r = section_tilt(now, plane_normal, n)
+        if np.allclose(r, now):
+            self.pane.show_toast("the cortex lies in this slice here: try another plane")
+            return
+        self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
+        angle = np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))
+        self.pane.show_toast(f"tilted {angle:.0f} deg to cut the cortex square-on (T: untilt)")
+
+    def _untilt(self) -> None:
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        self._dispatch(SetViewTilt(self.vid))
+
     def _centre_view(self) -> None:
         state = self.session.state
         vp = self._viewport()
@@ -563,6 +628,12 @@ class ImageWindow(QtWidgets.QWidget):
         if state.grid is None or vp is None:
             return
         axis = plane_layout(state.grid.affine, vp.plane).fixed
+        grid = self._grid()
+        if grid is not None and grid.layout_affine is not None:
+            # Oblique: step along the tilted slice's own normal.
+            mm = np.asarray(state.crosshair_mm) + delta * grid.affine[:3, axis]
+            self._dispatch(SetXYZ(float(mm[0]), float(mm[1]), float(mm[2])))
+            return
         if vp.locked:
             ijk = list(state.crosshair)
             ijk[axis] += delta
@@ -726,7 +797,9 @@ class ImageWindow(QtWidgets.QWidget):
         h = self.session.surfaces.hemis.get(sel[0])
         if h is None or sel[1] >= h.n_vertices:
             return []
-        inv = np.linalg.inv(state.grid.affine)
+        grid = self._grid()
+        assert grid is not None
+        inv = np.linalg.inv(grid.affine)
         marks = []
         for surface in ("white", "pial"):
             ijk = inv[:3, :3] @ h.states[surface][sel[1]] + inv[:3, 3]
@@ -749,7 +822,8 @@ class ImageWindow(QtWidgets.QWidget):
         if view is None or pos is None or state.grid is None:
             return None
         ijk = view.image_to_points(row, col, pos)
-        return state.grid.affine[:3, :3] @ ijk + state.grid.affine[:3, 3]
+        affine = self._grid().affine
+        return affine[:3, :3] @ ijk + affine[:3, 3]
 
     def _edit_press(self, row: float, col: float) -> None:
         from fastfuncstuff.surface.edit import SnapParams
@@ -765,7 +839,7 @@ class ImageWindow(QtWidgets.QWidget):
         # the same at every zoom.
         tolerance = 8.0 / self.pane._image_scale()
         grab = surfaces.grab(
-            state.grid.affine, view, pos, state.surfaces_shown, row, col, tolerance
+            self._grid().affine, view, pos, state.surfaces_shown, row, col, tolerance
         )
         if grab is None:
             # Not near an outline: the press still means "look here".
@@ -870,7 +944,7 @@ class ImageWindow(QtWidgets.QWidget):
             return
         row, col = pixels[-1]
         end = self.session.surfaces.grab(
-            state.grid.affine,
+            self._grid().affine,
             view,
             pos,
             state.surfaces_shown,
@@ -900,6 +974,7 @@ class ImageWindow(QtWidgets.QWidget):
                     sign,
                     state.surface_snap_key or "",
                     state.surface_snap_gate,
+                    EditSurfaceStroke.encode_grid(self._grid().affine) if self._tilted() else "",
                 )
             )
         except ValueError as exc:
@@ -940,7 +1015,7 @@ class ImageWindow(QtWidgets.QWidget):
             return
         assert state.grid is not None
         self.pane.set_outlines(
-            surfaces.outlines(state.grid.affine, view, pos, state.surfaces_shown, only=only),
+            surfaces.outlines(self._grid().affine, view, pos, state.surfaces_shown, only=only),
             only=only,
         )
 
@@ -957,6 +1032,10 @@ class ImageWindow(QtWidgets.QWidget):
         row, col = view.to_image(state.crosshair)
         self.pane.set_crosshair(row, col)
         self.pane.set_zoomed(not view.is_identity)
+        from fastfuncstuff.viewer.compose import tilt_matrix
+
+        r = tilt_matrix(vp)
+        self.pane.set_tilt(float(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))))
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
         self.pane.set_readout(self.session.overlay_readout())
         self.pane.set_handle(self._handle_position())

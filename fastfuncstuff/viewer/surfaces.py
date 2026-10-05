@@ -29,7 +29,7 @@ from fastfuncstuff.io.freesurfer import (
 )
 from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
-from fastfuncstuff.surface.mesh import MeshTopology
+from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball, vertex_normals
 from fastfuncstuff.surface.sampling import VolumeSampler
 from fastfuncstuff.viewer.slicing import PlaneView
 
@@ -108,12 +108,17 @@ class EditLog:
 class SurfaceStore:
     """The loaded hemispheres, slice indices cached per display grid, and edits."""
 
+    #: Display grids whose slice indices are kept (see ``_grids``).
+    MAX_GRIDS = 4
+
     def __init__(self) -> None:
         self.subject: Path | None = None
         self.hemis: dict[str, Hemisphere] = {}
-        self._grid_key: bytes | None = None
-        self._grid_inverse: np.ndarray | None = None
-        self._index: dict[tuple[str, str], SliceIndex] = {}
+        #: Slice indices per display grid, most recently used last: the shared
+        #: grid plus any oblique windows' tilted ones. One grid used to be
+        #: kept, which an oblique window beside a straight one would rebuild
+        #: on every redraw of either.
+        self._grids: dict[bytes, tuple[np.ndarray, dict[tuple[str, str], SliceIndex]]] = {}
         self._topo: dict[str, MeshTopology] = {}
         self._active: tuple[Grab, SurfaceEdit, np.ndarray] | None = None
         #: The last previewed edit, by the parameters that produced it, so the
@@ -177,7 +182,7 @@ class SurfaceStore:
         self._annots.clear()
         self._atlases.clear()
         self._trees.clear()
-        self._index.clear()
+        self._grids.clear()
         self._topo.clear()
         self._active = None
         self._pending = None
@@ -194,19 +199,23 @@ class SurfaceStore:
 
     def _slice_index(self, hemi: str, surface: str, grid_affine: np.ndarray) -> SliceIndex | None:
         key = np.asarray(grid_affine, np.float64).tobytes()
-        if key != self._grid_key:
-            # A new display grid re-expresses every vertex; indices built in
-            # the old one would cut the wrong slice.
-            self._index.clear()
-            self._grid_key = key
-            self._grid_inverse = np.linalg.inv(grid_affine)
-        found = self._index.get((hemi, surface))
+        entry = self._grids.pop(key, None)
+        if entry is None:
+            # Each grid re-expresses every vertex in its own voxels; an index
+            # built in another would cut the wrong slice.
+            entry = (np.linalg.inv(grid_affine), {})
+            while len(self._grids) >= self.MAX_GRIDS:
+                self._grids.pop(next(iter(self._grids)))
+        self._grids[key] = entry
+        inverse, index = entry
+        found = index.get((hemi, surface))
         if found is None:
             h = self.hemis[hemi]
             if surface not in h.states:
                 return None
-            ijk = apply_affine(np.linalg.inv(grid_affine), h.states[surface])
-            found = self._index[(hemi, surface)] = SliceIndex(ijk, h.faces)
+            found = index[(hemi, surface)] = SliceIndex(
+                apply_affine(inverse, h.states[surface]), h.faces
+            )
         return found
 
     def _move(
@@ -217,9 +226,10 @@ class SurfaceStore:
             return
         self.hemis[hemi].states[surface][ids] = positions
         self.version[hemi] = self.version.get(hemi, 0) + 1
-        index = self._index.get((hemi, surface))
-        if index is not None and self._grid_inverse is not None:
-            index.move(ids, apply_affine(self._grid_inverse, positions), faces)
+        for inverse, index in self._grids.values():
+            found = index.get((hemi, surface))
+            if found is not None:
+                found.move(ids, apply_affine(inverse, positions), faces)
 
     def outlines(
         self,
@@ -320,6 +330,27 @@ class SurfaceStore:
             if d <= max_mm and (best is None or d < best[2]):
                 best = (hemi, int(ids[k]), float(d))
         return best
+
+    def cortex_normal(
+        self, mm: tuple[float, float, float], radius: float = 3.0, max_mm: float = 6.0
+    ) -> np.ndarray | None:
+        """The cortical sheet's outward normal near ``mm``, averaged over ``radius`` mm.
+
+        From the mid-thickness surface, over a geodesic disc rather than one
+        vertex: a single vertex normal tilts with every wrinkle, and the plane
+        built from it would wobble from one press to the next.
+        """
+        found = self.nearest_vertex(mm, max_mm)
+        if found is None:
+            return None
+        hemi, v, _ = found
+        h = self.hemis[hemi]
+        topo = self.topology(hemi)
+        mid = 0.5 * (h.states["white"] + h.states["pial"]).astype(np.float64)
+        ids, _ = geodesic_ball(mid, topo, v, radius)
+        n = vertex_normals(mid, topo)[ids].sum(axis=0)
+        norm = float(np.linalg.norm(n))
+        return None if norm < 1e-9 else n / norm
 
     def region_lines(
         self, mm: tuple[float, float, float] | None, annot: str, atlas: str
@@ -489,8 +520,9 @@ class SurfaceStore:
                 )
         if "label:cortex" in bundle.masks:
             h.cortex = bundle.masks["label:cortex"]
-        for key in [k for k in self._index if k[0] == hemi]:
-            del self._index[key]
+        for _, index in self._grids.values():
+            for key in [k for k in index if k[0] == hemi]:
+                del index[key]
         self._topo.pop(hemi, None)
         self._trees.pop(hemi, None)
         self._areas.pop(hemi, None)

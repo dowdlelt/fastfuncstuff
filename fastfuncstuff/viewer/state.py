@@ -31,6 +31,15 @@ class DisplayGrid:
 
     shape: tuple[int, int, int]
     affine: np.ndarray
+    #: For a window's tilted copy of the grid (see ``compose.view_grid``): the
+    #: untilted affine, which decides which voxel axis a pane shows and which
+    #: way it runs. Without it a 50-degree tilt could swap a pane's axes.
+    layout_affine: np.ndarray | None = None
+
+    @property
+    def frame(self) -> np.ndarray:
+        """The affine plane layouts are read from."""
+        return self.affine if self.layout_affine is None else self.layout_affine
 
     @classmethod
     def from_layer(cls, shape: tuple[int, int, int], affine: np.ndarray) -> DisplayGrid:

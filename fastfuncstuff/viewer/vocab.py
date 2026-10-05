@@ -359,6 +359,17 @@ class SetZoom(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewTilt(Command):
+    """Tilt one image window's slice about the crosshair: a 3x3 rotation, row-major, in mm."""
+
+    name = "SET_VIEW_TILT"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    tilt: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+
+@command
+@dataclass(frozen=True)
 class SetPan(Command):
     name = "SET_PAN"
     aspects = Aspect.VIEWPORTS | Aspect.SLICES
@@ -541,10 +552,24 @@ class EditSurfaceStroke(Command):
     edge_sign: int
     snap_key: str = ""
     gate: bool = True
+    #: The display grid the slice was cut in, when an oblique window tilted
+    #: it -- 12 numbers, the affine's top three rows; empty is the shared grid.
+    grid: str = ""
 
     @staticmethod
     def encode(points) -> str:
         return ";".join(",".join(f"{v:.4f}" for v in p) for p in np.asarray(points))
+
+    @staticmethod
+    def encode_grid(affine) -> str:
+        return ",".join(f"{v:.9g}" for v in np.asarray(affine, float)[:3].ravel())
+
+    def grid_affine(self) -> np.ndarray | None:
+        if not self.grid:
+            return None
+        m = np.eye(4)
+        m[:3] = np.array([float(v) for v in self.grid.split(",")]).reshape(3, 4)
+        return m
 
     def points(self) -> np.ndarray:
         return np.array([[float(v) for v in p.split(",")] for p in self.stroke.split(";") if p])
@@ -1401,10 +1426,11 @@ def install(
             edge_sign=int(cmd.edge_sign),
             gate=bool(cmd.gate),
         )
+        tilted = cmd.grid_affine()
         session.surfaces.apply_stroke(
             cmd.hemi,
             cmd.surface,
-            st.grid.affine,
+            st.grid.affine if tilted is None else tilted,
             int(cmd.axis),
             float(cmd.position),
             cmd.points(),
@@ -1763,6 +1789,17 @@ def install(
         assert isinstance(cmd, SetSurfaceHinge)
         degrees = float(min(max(cmd.degrees, -180.0), 180.0))
         return _set_view(st, cmd.view, SetSurfaceHinge.aspects, hinge=degrees)
+
+    @bus.handle(SetViewTilt.name)
+    def _set_view_tilt(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewTilt)
+        r = np.asarray(cmd.tilt, float)
+        if r.size != 9:
+            raise ValueError("a tilt is 9 numbers: a 3x3 rotation, row-major")
+        r = r.reshape(3, 3)
+        if not np.allclose(r @ r.T, np.eye(3), atol=1e-4) or np.linalg.det(r) <= 0:
+            raise ValueError("a tilt must be a rotation")
+        return _set_view(st, cmd.view, SetViewTilt.aspects, tilt=tuple(float(x) for x in r.ravel()))
 
     @bus.handle(SetViewSolo.name)
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:

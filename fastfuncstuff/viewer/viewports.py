@@ -90,6 +90,9 @@ class Viewport:
     # -- image ---------------------------------------------------------
     zoom: float = 1.0
     pan: tuple[float, float] = (0.0, 0.0)
+    #: A tilt of the slice, row-major 3x3 rotation in scanner mm, about the
+    #: crosshair -- the oblique window. Identity is the grid's own plane.
+    tilt: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     #: Draw only the selected layer instead of compositing the stack. The
     #: point is flipping: with an EPI and an anat aligned in one stack, `[`
     #: and `]` alternate between them in place, which is the way to see what
