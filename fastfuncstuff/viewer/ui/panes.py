@@ -112,6 +112,14 @@ class ImagePane(QtWidgets.QWidget):
         self._hover: QtCore.QPointF | None = None
         self._editing_drag = False
         self._brush_label = ""
+        self._toast = ""
+        self._toast_alpha = 0.0
+        self._toast_anim = QtCore.QVariantAnimation(self)
+        self._toast_anim.setStartValue(1.0)
+        self._toast_anim.setKeyValueAt(self.TOAST_HOLD / (self.TOAST_HOLD + self.TOAST_FADE), 1.0)
+        self._toast_anim.setEndValue(0.0)
+        self._toast_anim.setDuration(self.TOAST_HOLD + self.TOAST_FADE)
+        self._toast_anim.valueChanged.connect(self._on_toast)
         #: A stroke being drawn, as fractional (row, col) image pixels.
         self._stroke_pts: list[tuple[float, float]] = []
         #: The selected vertex on this slice, per surface: (row, col, surface).
@@ -286,6 +294,8 @@ class ImagePane(QtWidgets.QWidget):
                 QtCore.Qt.AlignmentFlag.AlignCenter,
                 f"{self.plane.value.upper()}\nno data",
             )
+            if self._toast and self._toast_alpha > 0:
+                self._paint_toast(p)
             p.end()
             return
 
@@ -333,7 +343,57 @@ class ImagePane(QtWidgets.QWidget):
             p.drawText(r.adjusted(4, 0, 0, 0), flags.AlignLeft | flags.AlignVCenter, left)
         if self._readout:
             self._paint_readout(p)
+        if self._toast and self._toast_alpha > 0:
+            self._paint_toast(p)
         p.end()
+
+    #: How long a toast stays fully visible, then how long it fades, ms.
+    TOAST_HOLD = 3000
+    TOAST_FADE = 900
+
+    def show_toast(self, text: str) -> None:
+        """A message in a solid box over the image, fading after a few seconds.
+
+        For what an edit refused and why. Written into the caption line it was
+        small, unboxed text over a brain and went unread.
+        """
+        self._toast = text
+        self._toast_alpha = 1.0
+        self._toast_anim.stop()
+        self._toast_anim.start()
+        self.update()
+
+    def _on_toast(self, value) -> None:
+        self._toast_alpha = float(value)
+        if self._toast_alpha <= 0:
+            self._toast = ""
+        self.update()
+
+    def _paint_toast(self, p: QtGui.QPainter) -> None:
+        c = theme.palette()
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setOpacity(self._toast_alpha)
+        font = p.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        p.setFont(font)
+        pad = 8
+        width = max(self.width() - 4 * pad, 40)
+        flags = QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap
+        text = p.fontMetrics().boundingRect(QtCore.QRect(0, 0, width, 1000), flags, self._toast)
+        box = QtCore.QRectF(
+            (self.width() - text.width()) / 2 - pad,
+            self.height() - text.height() - 3 * pad,
+            text.width() + 2 * pad,
+            text.height() + 2 * pad,
+        )
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(c.warn))
+        p.drawRoundedRect(box, 6, 6)
+        p.setPen(QtGui.QColor(c.bg))
+        p.drawText(box, flags, self._toast)
+        p.restore()
 
     def _paint_outlines(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
         assert self._image is not None

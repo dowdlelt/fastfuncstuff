@@ -612,8 +612,9 @@ class ImageWindow(QtWidgets.QWidget):
         if state.surface_tool == "point" and state.surface_selected is not None:
             hemi, v = state.surface_selected
             tool += f" {hemi} #{v}"
-        label = f"{tool}  r={r:g} mm  {mode}" + (f"   {note}" if note else "")
-        self.pane.set_brush(self._brush_px(), label)
+        self.pane.set_brush(self._brush_px(), f"{tool}  r={r:g} mm  {mode}")
+        if note:
+            self.pane.show_toast(note)
 
     def _toggle_grab(self) -> None:
         state = self.session.state
@@ -736,7 +737,7 @@ class ImageWindow(QtWidgets.QWidget):
         try:
             sampler = self.session.surface_sampler(state.surface_snap_key)
         except (ValueError, KeyError) as exc:
-            self.setToolTip(str(exc))
+            self.pane.show_toast(str(exc))
             return
         surfaces.begin(grab, sampler, params)
         self._edit = (grab, np.asarray(grab.at_mm))

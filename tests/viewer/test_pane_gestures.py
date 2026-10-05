@@ -62,3 +62,17 @@ def test_middle_or_shift_drag_pans_and_does_not_move_the_crosshair(pane, button,
     assert got["panned"]
     assert not got["zoomed"]
     assert not got["picked"]
+
+
+def test_a_toast_paints_a_solid_box_and_fades_away(pane):
+    from fastfuncstuff.viewer.ui import theme
+
+    p, _ = pane
+    p.show_toast("end the stroke on the white outline it began on")
+    img = p.grab().toImage()
+    warn = QtGui.QColor(theme.palette().warn)
+    # Somewhere along the bottom band is the toast's fill.
+    row = p.height() - 14
+    assert any(img.pixelColor(x, row) == warn for x in range(p.width()))
+    p._on_toast(0.0)
+    assert p._toast == ""

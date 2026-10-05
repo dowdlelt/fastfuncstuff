@@ -532,7 +532,7 @@ def test_draw_gesture_through_the_window(tmp_path):
         image.pane.edit_dragged.emit(*map(float, to_image([0.0, 0.0, z])))
         image.pane.edit_released.emit()
         assert len(session.to_script().splitlines()) == n_before
-        assert "end the stroke" in image.pane._brush_label
+        assert "end the stroke" in image.pane._toast
     finally:
         win.close()
 
