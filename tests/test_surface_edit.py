@@ -350,3 +350,23 @@ def test_an_edit_says_why_it_did_not_do_what_was_asked(phantom):
         white, topo, c, sampler, SnapParams(radius=5.0, snap=0.0), role="white", partner=pial
     )
     assert explain(edit.update(np.array([0.0, 0.0, 0.5]))) == ""
+
+
+def test_stroke_targets_cast_along_the_outline_not_to_the_nearest_point():
+    """A stroke that starts on the outline and swerves 1.5 mm out: a vertex
+    1 mm along is nearer the stroke's start than the swerve, and the nearest
+    point gave it no shift. Cast along its normal, it reaches the swerve."""
+    from fastfuncstuff.surface.edit import closest_on_polyline, stroke_targets
+
+    # Surface: the plane x = 0 seen in the slice z = 0, normal +x. The vertex
+    # sits 0.5 mm above the slice, so its own outline point is (0, 1, 0).
+    vertex = np.array([[0.0, 1.0, 0.5]])
+    normal = np.array([[1.0, 0.0, 0.0]])
+    stroke = np.array([[0.0, 0.0, 0.0], [1.5, 0.3, 0.0], [1.5, 4.0, 0.0]])
+    near = closest_on_polyline(vertex, stroke)
+    cast = stroke_targets(vertex, normal, stroke, np.array([0.0, 0.0, 1.0]))
+    assert near[0, 0] < 1.0  # the trap: pulled toward the start
+    np.testing.assert_allclose(cast[0], [1.5, 1.0, 0.0], atol=1e-9)
+    # Lying in the slice (normal along z) there is no outline point to cast.
+    flat = stroke_targets(vertex, np.array([[0.0, 0.0, 1.0]]), stroke, np.array([0.0, 0.0, 1.0]))
+    np.testing.assert_allclose(flat, near)

@@ -779,6 +779,8 @@ class SurfaceStore:
             params,
             role=surface,
             partner=h.states.get(PARTNER[surface]),
+            # The slice: grid voxels with this axis fixed, as a normal in mm.
+            plane_normal=np.linalg.inv(grid_affine)[axis, :3],
         )
         res = edit.result()
         self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)

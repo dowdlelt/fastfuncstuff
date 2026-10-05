@@ -398,8 +398,10 @@ class StrokeEdit(SurfaceEdit):
 
     ``seeds`` are the vertices of the faces the slice cut between the two
     ends of the stroke -- the stretch that was redrawn -- and ``stroke`` the
-    drawn line, ``(M, 3)`` scanner mm. Each seed moves along its normal to the
-    stroke's nearest point; everything within ``params.radius`` mm *along the
+    drawn line, ``(M, 3)`` scanner mm. Each seed moves along its normal until
+    its tangent plane passes through the stroke where the seed's own outline
+    point, cast along the outline's normal, meets it (:func:`stroke_targets`);
+    everything within ``params.radius`` mm *along the
     surface* of any seed follows by harmonic interpolation, pinned to the
     seeds and to zero just past the rim, so the change carries into the
     slices above and below without a kink. With ``snap`` on, the result is
@@ -418,6 +420,7 @@ class StrokeEdit(SurfaceEdit):
         *,
         role: str = "white",
         partner: np.ndarray | None = None,
+        plane_normal: np.ndarray | None = None,
     ) -> None:
         from scipy.sparse.csgraph import dijkstra
 
@@ -434,10 +437,12 @@ class StrokeEdit(SurfaceEdit):
         self.centre = int(seeds[0])
         self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
-        targets = closest_on_polyline(self.start[self.seed], stroke)
-        self.seed_shift = np.einsum(
-            "ij,ij->i", targets - self.start[self.seed], self.normals[self.seed]
-        )
+        start, normals = self.start[self.seed], self.normals[self.seed]
+        if plane_normal is None:
+            targets = closest_on_polyline(start, stroke)
+        else:
+            targets = stroke_targets(start, normals, stroke, plane_normal)
+        self.seed_shift = np.einsum("ij,ij->i", targets - start, normals)
         self.along = self._interpolate()
 
     def _interpolate(self) -> np.ndarray:
@@ -474,6 +479,69 @@ class StrokeEdit(SurfaceEdit):
         return self._finish(self.along, limit)
 
 
+def stroke_targets(
+    points: np.ndarray, normals: np.ndarray, stroke: np.ndarray, plane_normal: np.ndarray
+) -> np.ndarray:
+    """Where each vertex's outline must pass through the stroke, ``(N, 3)`` mm.
+
+    The nearest stroke point is the wrong partner near a stroke's ends: a
+    stroke starts on the old outline and swerves out, so a vertex a millimetre
+    along from the start is nearer the start than the swerve, and was given
+    almost no shift -- on a real subject the first ~2 mm of every redrawn
+    stretch did not move. Instead each vertex's *own* point on the outline
+    (where its tangent plane meets the slice, straight across the surface) is
+    cast along the outline's in-slice normal, both ways, to the first stroke
+    crossing. A vertex whose surface lies nearly in the slice has no stable
+    outline point, and one whose cast misses the stroke has no crossing; both
+    keep the nearest point.
+    """
+    pts = np.asarray(points, np.float64)
+    nrm = np.asarray(normals, np.float64)
+    line = np.asarray(stroke, np.float64)
+    out = closest_on_polyline(pts, line)
+    a = np.asarray(plane_normal, np.float64)
+    a = a / np.linalg.norm(a)
+    origin = line[0]
+    # Within the tangent plane, the direction that reaches the slice fastest.
+    an = nrm @ a
+    w = a[None, :] - an[:, None] * nrm
+    wa = np.einsum("ij,j->i", w, a)
+    m = nrm - an[:, None] * a[None, :]  # the outline's in-slice normal
+    mlen = np.linalg.norm(m, axis=1)
+    ok = (mlen > 0.2) & (np.abs(wa) > 1e-6)
+    if not ok.any() or line.shape[0] < 2:
+        return out
+    foot = pts - (((pts - origin) @ a) / np.where(ok, wa, 1.0))[:, None] * w
+    m = m / np.maximum(mlen, 1e-12)[:, None]
+    # 2-D in the slice: e1, e2 span it.
+    e1 = line[-1] - line[0]
+    e1 = e1 - (e1 @ a) * a
+    if np.linalg.norm(e1) < 1e-9:
+        e1 = np.cross(a, [1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.cross(a, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(a, e1)
+    basis = np.stack([e1, e2], 1)
+    f2, m2 = (foot - origin) @ basis, m @ basis
+    p0 = (line[:-1] - origin) @ basis
+    seg = (line[1:] - line[:-1]) @ basis
+    # foot + delta * m = p0 + u * seg, per (vertex, segment): Cramer's rule.
+    det = m2[:, None, 0] * (-seg[None, :, 1]) - m2[:, None, 1] * (-seg[None, :, 0])
+    rhs = p0[None] - f2[:, None]
+    delta = (rhs[..., 0] * (-seg[None, :, 1]) - rhs[..., 1] * (-seg[None, :, 0])) / np.where(
+        np.abs(det) > 1e-12, det, np.inf
+    )
+    u = (m2[:, None, 0] * rhs[..., 1] - m2[:, None, 1] * rhs[..., 0]) / np.where(
+        np.abs(det) > 1e-12, det, np.inf
+    )
+    hit = (u >= 0) & (u <= 1) & np.isfinite(delta)
+    reach = np.where(hit, np.abs(delta), np.inf)
+    k = np.argmin(reach, axis=1)
+    rows = np.arange(pts.shape[0])
+    use = ok & np.isfinite(reach[rows, k])
+    out[use] = foot[use] + delta[rows, k][use, None] * m[use]
+    return out
+
+
 def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
     """For each point, the nearest point on the polyline ``line`` (both in mm)."""
     a, b = line[:-1], line[1:]
@@ -494,4 +562,5 @@ __all__ = [
     "SurfaceEdit",
     "closest_on_polyline",
     "explain",
+    "stroke_targets",
 ]
