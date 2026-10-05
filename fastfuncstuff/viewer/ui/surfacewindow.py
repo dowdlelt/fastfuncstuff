@@ -700,6 +700,45 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         return hemi, (float(mm[0]), float(mm[1]), float(mm[2]))
 
 
+class MapLegend(QtWidgets.QWidget):
+    """The per-vertex map's colour scale, end values written on it."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scale: tuple[float, float, str] | None = None
+        self._unit = ""
+        self._lut: np.ndarray | None = None
+        self.setFixedSize(120, 22)
+        self.hide()
+
+    def set_scale(self, scale: tuple[float, float, str] | None, unit: str = "") -> None:
+        if scale == self._scale and unit == self._unit:
+            return
+        self._scale, self._unit = scale, unit
+        self._lut = None if scale is None else s3.map_lut(scale[2])
+        self.setVisible(scale is not None)
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
+        if self._scale is None or self._lut is None:
+            return
+        lo, hi, _ = self._scale
+        p = QtGui.QPainter(self)
+        bar = self.rect().adjusted(0, 0, 0, -11)
+        rgb = np.ascontiguousarray(self._lut[None, :, :3].repeat(1, axis=0))
+        img = QtGui.QImage(rgb.data, 256, 1, 3 * 256, QtGui.QImage.Format.Format_RGB888)
+        p.drawImage(bar, img)
+        font = p.font()
+        font.setPointSize(7)
+        p.setFont(font)
+        p.setPen(QtGui.QColor(theme.palette().dim))
+        flags = QtCore.Qt.AlignmentFlag
+        r = self.rect()
+        p.drawText(r, flags.AlignLeft | flags.AlignBottom, f"{lo:.3g}{self._unit}")
+        p.drawText(r, flags.AlignRight | flags.AlignBottom, f"{hi:.3g}{self._unit}")
+        p.end()
+
+
 class SurfaceWindow(QtWidgets.QWidget):
     """A surface viewport as a top-level window."""
 
@@ -777,6 +816,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.map_box = self._combo("Per-vertex map painted under the overlay (m cycles)")
         self.map_box.activated.connect(self._pick_map)
         bar.addWidget(self.map_box)
+        self.legend = MapLegend()
+        bar.addWidget(self.legend)
         self.annot_box = self._combo(
             "Surface parcellation: the map's colours and the region readout"
         )
@@ -1189,6 +1230,21 @@ class SurfaceWindow(QtWidgets.QWidget):
             )
         self._built_map = key
         self._map_hemis = set(surfaces.hemis)
+        self._refresh_legend(vp)
+
+    def _refresh_legend(self, vp: Viewport) -> None:
+        scales = [
+            sc
+            for hemi in self.session.surfaces.hemis.values()
+            if (sc := s3.vertex_map_scale(hemi, vp.vertex_map)) is not None
+        ]
+        if not scales:
+            self.legend.set_scale(None)
+            return
+        # Hemispheres share the fixed thickness scale; sulc/curv take the wider.
+        lo, hi, name = max(scales, key=lambda sc: abs(sc[0]))
+        unit = " mm" if vp.vertex_map == "thickness" else ""
+        self.legend.set_scale((lo, hi, name), unit)
 
     def _sync_header(self, vp: Viewport) -> None:
         lo, hi = vp.depth

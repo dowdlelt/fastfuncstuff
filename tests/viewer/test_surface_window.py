@@ -265,3 +265,19 @@ def test_a_shape_change_keeps_the_zoom_relative_to_the_brain(window):
     c._on_morph(1.0)
     # The pial sheet is twice the white's width (its diagonal near twice too).
     assert 1.8 < c.camera.distance / before < 2.1
+
+
+def test_a_continuous_map_shows_its_scale_and_a_parcellation_does_not(window):
+    from fastfuncstuff.viewer.vocab import SetSurfaceMap
+
+    session, win = window
+    session.surfaces.hemis["lh"].morph["curv"] = np.linspace(-1, 1, 41 * 41).astype(np.float32)
+    session.do(SetSurfaceMap("S1", "curv"))
+    win.apply(session.state.viewports.get("S1"))
+    assert not win.legend.isHidden()
+    lo, hi, name = win.legend._scale
+    assert lo == pytest.approx(-hi) and lo > 0 and name == "RdBu"
+    win.legend.grab()  # paints
+    session.do(SetSurfaceMap("S1", ""))
+    win.apply(session.state.viewports.get("S1"))
+    assert win.legend.isHidden()

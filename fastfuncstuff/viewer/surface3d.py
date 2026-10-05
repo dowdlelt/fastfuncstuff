@@ -410,20 +410,46 @@ def flag_ramp() -> np.ndarray:
     return (rgb * 255).astype(np.uint8)
 
 
+def vertex_map_scale(hemi: Hemisphere, kind: str) -> tuple[float, float, str] | None:
+    """(value at the LUT's start, value at its end, LUT name) of a continuous map.
+
+    ``None`` for maps that are not a scale (parcellation, flags) or absent.
+    Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
+    same; sulc and curv red-blue, symmetric at their 98th percentile, with
+    FreeSurfer's sign (positive is sulcal, deep) toward blue.
+    """
+    if kind not in ("thickness", "sulc", "curv"):
+        return None
+    values = hemi.morph.get(kind)
+    if values is None:
+        return None
+    if kind == "thickness":
+        return 1.0, 4.5, "viridis"
+    cortex = hemi.cortex if hemi.cortex is not None else np.ones(hemi.n_vertices, bool)
+    top = float(np.percentile(np.abs(values[cortex]), 98)) or 1.0
+    return top, -top, "RdBu"
+
+
+def map_lut(name: str) -> np.ndarray:
+    """``(256, 4)`` uint8 entries of a named colormap."""
+    import torch
+
+    from fastfuncstuff.viewer.colormap import build_lut
+
+    return (np.clip(build_lut(name, 256, device=torch.device("cpu")).numpy(), 0, 1) * 255).astype(
+        np.uint8
+    )
+
+
 def vertex_colors(
     hemi: Hemisphere, kind: str, annotation=None, flags: np.ndarray | None = None
 ) -> np.ndarray | None:
     """``(V, 4)`` uint8 colours of a per-vertex map, or ``None`` for no map.
 
-    Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
-    same; sulc and curv on a symmetric red-blue scale at their 98th
-    percentile; ``annot`` in the parcellation's own colours. The medial wall
-    is left transparent: it has no thickness and no region.
+    Scales as :func:`vertex_map_scale`; ``annot`` in the parcellation's own
+    colours. The medial wall is left transparent: it has no thickness and no
+    region.
     """
-    import torch
-
-    from fastfuncstuff.viewer.colormap import build_lut
-
     if not kind:
         return None
     n = hemi.n_vertices
@@ -446,17 +472,11 @@ def vertex_colors(
         out[~cortex, 3] = 0
         return out
     values = hemi.morph.get(kind)
-    if values is None:
+    scale = vertex_map_scale(hemi, kind)
+    if values is None or scale is None:
         return None
-    if kind == "thickness":
-        lo, hi, name = 1.0, 4.5, "viridis"
-    else:
-        top = float(np.percentile(np.abs(values[cortex]), 98)) or 1.0
-        # FreeSurfer's sign: positive sulc/curv is sulcal (deep); show it blue.
-        lo, hi, name = top, -top, "RdBu"
-    lut = (np.clip(build_lut(name, 256, device=torch.device("cpu")).numpy(), 0, 1) * 255).astype(
-        np.uint8
-    )
+    lo, hi, name = scale
+    lut = map_lut(name)
     unit = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
     out = np.zeros((n, 4), np.uint8)
     out[:, :3] = lut[np.round(unit * 255).astype(int)][:, :3]
@@ -531,6 +551,8 @@ __all__ = [
     "depth_fractions",
     "equivolume_fraction",
     "vertex_colors",
+    "vertex_map_scale",
+    "map_lut",
     "flag_ramp",
     "flat_patch",
     "layout_offsets",
