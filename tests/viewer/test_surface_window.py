@@ -240,3 +240,28 @@ def test_the_crosshair_marks_its_nearest_vertex_and_c_aims_the_camera_there(wind
 
     win._toggle_cross()
     assert c.cross[3] == 0.0
+
+
+def test_a_shape_change_keeps_the_zoom_relative_to_the_brain(window):
+    """Pial to inflated filled the window: the camera stayed put while the
+    shape grew. It now backs off in step with the morph."""
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.surfaces.hemis = {"lh": _sheet(pial_scale=2.0)}
+    session.surfaces.version = {"lh": 2}
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c._on_morph(1.0)
+    win._reset_camera()
+    before = c.camera.distance
+    session.do(SetSurfaceShape("S1", "pial"))
+    win.apply(session.state.viewports.get("S1"))
+    c._anim.stop()
+    c._on_morph(0.0)
+    assert c.camera.distance == pytest.approx(before)
+    c._on_morph(1.0)
+    # The pial sheet is twice the white's width (its diagonal near twice too).
+    assert 1.8 < c.camera.distance / before < 2.1

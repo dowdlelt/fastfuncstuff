@@ -258,9 +258,16 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     def _drawn(self) -> list[OverlaySlot]:
         return self.overlays[-s3.MAX_LAYERS :]
 
-    def animate_to(self) -> None:
-        """Run the morph from shape A (0) to shape B (1)."""
+    def animate_to(self, camera: tuple[float, np.ndarray] | None = None) -> None:
+        """Run the morph from shape A (0) to shape B (1).
+
+        ``camera`` is the (distance, target) to arrive at, moved in step with
+        the morph so a shape that grows is not suddenly filling the window.
+        """
         self._anim.stop()
+        self._cam_path = (
+            None if camera is None else (self.camera.distance, self.camera.target.copy(), *camera)
+        )
         self.morph = 0.0
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
@@ -268,6 +275,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
 
     def _on_morph(self, value) -> None:
         self.morph = float(value)
+        path = getattr(self, "_cam_path", None)
+        if path is not None:
+            d0, t0, d1, t1 = path
+            # Geometric in distance, like the wheel, so the zoom reads evenly.
+            self.camera.distance = float(d0 * (d1 / d0) ** self.morph)
+            self.camera.target = (1 - self.morph) * t0 + self.morph * t1
         self.update()
 
     def current(self, hemi: str) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1021,6 +1034,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             moved = set()
         if shape_changed or moved:
             new = self._shape_arrays(vp.shape)
+            camera = self._camera_for(new) if shape_changed else None
             first = self._built_shape is None or bool(moved - set(self._built_versions))
             for h, (pos, nrm) in new.items():
                 hemi = surfaces.hemis[h]
@@ -1049,7 +1063,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                     flat_faces=flat_faces if h not in self._built_versions else None,
                 )
             if shape_changed and self._built_shape is not None:
-                c.animate_to()
+                c.animate_to(camera)
             else:
                 c.morph = 1.0
             if self._built_shape is None:
@@ -1067,6 +1081,33 @@ class SurfaceWindow(QtWidgets.QWidget):
         self._refresh_cross()
         self._sync_header(vp)
         c.update()
+
+    def _camera_for(
+        self, new: dict[str, tuple[np.ndarray, np.ndarray]]
+    ) -> tuple[float, np.ndarray] | None:
+        """Camera (distance, target) that frames ``new`` as the old shape was framed.
+
+        The view keeps its zoom *relative to the brain*: an inflated surface is
+        larger than the pial, so the camera backs off by the ratio of their
+        sizes, and a target off-centre stays as far off-centre in proportion.
+        """
+        old_pts = [p for h in new if (p := self.canvas.current(h)) is not None]
+        if not old_pts or not new:
+            return None
+        old = np.concatenate([p[0] for p in old_pts]).astype(np.float64)
+        now = np.concatenate([p for p, _ in new.values()]).astype(np.float64)
+
+        def centre_size(p):
+            lo, hi = p.min(axis=0), p.max(axis=0)
+            return 0.5 * (lo + hi), float(np.linalg.norm(hi - lo))
+
+        c0, s0 = centre_size(old)
+        c1, s1 = centre_size(now)
+        if s0 <= 0 or s1 <= 0:
+            return None
+        ratio = s1 / s0
+        cam = self.canvas.camera
+        return cam.distance * ratio, c1 + (cam.target - c0) * ratio
 
     def _areas(self, hemi: str) -> np.ndarray:
         """``(V, 2)`` white and pial vertex areas, for equivolume depth (cached per edit)."""
