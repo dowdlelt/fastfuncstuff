@@ -846,7 +846,16 @@ def win4d(win, qapp, tmp_path):
 
     rng = np.random.default_rng(61)
     aff = np.diag([3.0, 3.0, 3.0, 1.0])
-    img = nib.Nifti1Image(rng.normal(size=(10, 12, 8, 25)).astype(np.float32), aff)
+    # A head to find: zero-mean noise has a temporal mean of ~0 everywhere,
+    # and the AFNI-exact automask (rightly) finds no brain in it -- which
+    # emptied every carpet and matrix mask built from this fixture.
+    shape = (10, 12, 8)
+    ijk = np.stack(np.meshgrid(*[np.arange(n) for n in shape], indexing="ij"), -1)
+    centre, radii = (np.array(shape) - 1) / 2, np.array(shape) * 0.42
+    head = (((ijk - centre) / radii) ** 2).sum(-1) <= 1.0
+    noise = rng.normal(size=(*shape, 25))
+    data = (np.where(head, 100.0, 0.0)[..., None] + noise).astype(np.float32)
+    img = nib.Nifti1Image(data, aff)
     img.header["pixdim"][4] = 2.0
     img.header.set_xyzt_units("mm", "sec")
     nib.save(img, str(tmp_path / "bold.nii.gz"))
