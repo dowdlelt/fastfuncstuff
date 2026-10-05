@@ -315,3 +315,28 @@ def test_a_fold_is_damped_where_it_happens_not_across_the_whole_brush(phantom):
     moved[res.ids] = res.positions
     before, after = face_normals(white, f), face_normals(moved, f)
     assert np.all(np.einsum("ij,ij->i", before, after) > 0)
+
+
+def test_an_edit_says_why_it_did_not_do_what_was_asked(phantom):
+    from fastfuncstuff.surface.edit import explain
+
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    c = _top(u)
+    # Pial dragged 5 mm in, through white 3 mm below it: held.
+    edit = SurfaceEdit(
+        pial, topo, c, sampler, SnapParams(radius=4.0, snap=0.0), role="pial", partner=white
+    )
+    res = edit.update(np.array([0.0, 0.0, -5.0]))
+    assert res.held > 0
+    assert "held at white" in explain(res)
+    # Snap: a rough 0.6 mm drag the edge finishes to 1 mm, outward.
+    edit = SurfaceEdit(white, topo, c, sampler, SnapParams(radius=5.0), role="white", partner=pial)
+    res = edit.update(np.array([0.0, 0.0, 0.6]))
+    assert res.snap_offset == pytest.approx(0.4, abs=0.15)
+    assert "snap moved it" in explain(res) and "out" in explain(res)
+    # A plain hand drag that nothing holds back says nothing.
+    edit = SurfaceEdit(
+        white, topo, c, sampler, SnapParams(radius=5.0, snap=0.0), role="white", partner=pial
+    )
+    assert explain(edit.update(np.array([0.0, 0.0, 0.5]))) == ""

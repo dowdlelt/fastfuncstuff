@@ -788,8 +788,16 @@ class ImageWindow(QtWidgets.QWidget):
         if here is None:
             return
         self._edit_drag_mm = here - self._edit[1]
-        self.session.surfaces.preview(self._edit_drag_mm)
+        res = self.session.surfaces.preview(self._edit_drag_mm)
         self.surfaces_previewed.emit()
+        if res is not None:
+            from fastfuncstuff.surface.edit import explain
+
+            # Said while dragging, so the hand can respond: let go and
+            # switch mode, or move the other surface first.
+            note = explain(res)
+            if note:
+                self.pane.show_toast(note)
 
     def _edit_release(self) -> None:
         if self._stroke is not None:
@@ -869,7 +877,10 @@ class ImageWindow(QtWidgets.QWidget):
         except ValueError as exc:
             self._sync_brush(str(exc))
             return
-        self._sync_brush()
+        from fastfuncstuff.surface.edit import explain
+
+        res = getattr(self.session.surfaces, "last_result", None)
+        self._sync_brush(explain(res) if res is not None else "")
 
     def _cancel_edit(self) -> None:
         if self._stroke is not None:

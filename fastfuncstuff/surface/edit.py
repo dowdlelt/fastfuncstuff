@@ -78,6 +78,29 @@ class EditResult:
     displacement: np.ndarray
     #: Per-vertex edge confidence in [0, 1].
     confidence: np.ndarray
+    #: Why the result is not simply the drag -- for telling the person
+    #: dragging, while they drag. Vertices the fold guard damped; pial
+    #: vertices held at white (``min_thickness``) when dragged through it;
+    #: and, with snap on, how far the image's edge moved the brush's core
+    #: from where the hand put it (mm along the normal, + outward).
+    fold_damped: int = 0
+    held: int = 0
+    snap_offset: float = 0.0
+
+
+def explain(res: EditResult) -> str:
+    """One line on what held an edit back, or ``""`` when it did what was asked."""
+    parts = []
+    if res.snap_offset and abs(res.snap_offset) >= 0.25:
+        way = "out" if res.snap_offset > 0 else "in"
+        parts.append(
+            f"snap moved it {abs(res.snap_offset):.1f} mm {way} to the image edge (m: hand)"
+        )
+    if res.held:
+        parts.append(f"pial held at white on {res.held} vertices -- move white first")
+    if res.fold_damped:
+        parts.append(f"damped on {res.fold_damped} vertices so the mesh does not fold")
+    return "; ".join(parts)
 
 
 def _brush_weight(dist: np.ndarray, radius: float) -> np.ndarray:
@@ -280,15 +303,20 @@ class SurfaceEdit:
         reach = p.search if limit is None else limit
         edge = np.clip(edge, along - reach, along + reach)
         d = along + p.snap * np.sqrt(self.weight) * (edge - along)
+        core = self.weight > 0.5
+        snap_offset = float(np.median((d - along)[core])) if p.snap > 0 and core.any() else 0.0
 
         gap = None
+        held = 0
         if self.partner_start is not None:
             gap = np.einsum("ij,ij->i", self.partner_start - self.start, self.normals)
             if self.role == "pial":
                 # Pial may not pass inward through white. ``gap`` is white
                 # relative to pial along the normal, so negative: pial may move
                 # in by at most -(gap) - min_thickness.
-                d = np.maximum(d, gap + p.min_thickness)
+                floor = gap + p.min_thickness
+                held = int(np.count_nonzero((d < floor) & (self.weight > 0.1)))
+                d = np.maximum(d, floor)
         d = self._unfold(d)
         positions = self.start + d[:, None] * self.normals
 
@@ -300,7 +328,17 @@ class SurfaceEdit:
             pushed = push > 0
             partner_ids = self.ids[pushed]
             partner_pos = self.partner_start[pushed] + push[pushed, None] * self.normals[pushed]
-        return EditResult(self.ids, positions, partner_ids, partner_pos, d, confidence)
+        return EditResult(
+            self.ids,
+            positions,
+            partner_ids,
+            partner_pos,
+            d,
+            confidence,
+            fold_damped=self.fold_damped,
+            held=held,
+            snap_offset=snap_offset,
+        )
 
     def _flipped(self, d: np.ndarray) -> np.ndarray:
         """Faces (of those touching the patch) that ``d`` turns over."""
@@ -443,4 +481,11 @@ def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
     return near[np.arange(points.shape[0]), k]
 
 
-__all__ = ["EditResult", "SnapParams", "StrokeEdit", "SurfaceEdit", "closest_on_polyline"]
+__all__ = [
+    "EditResult",
+    "SnapParams",
+    "StrokeEdit",
+    "SurfaceEdit",
+    "closest_on_polyline",
+    "explain",
+]

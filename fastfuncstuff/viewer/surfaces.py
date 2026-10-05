@@ -120,6 +120,8 @@ class SurfaceStore:
         #: committing command does not recompute what is already on screen.
         self._pending: tuple[tuple, EditResult] | None = None
         self._undo: list[_Undo] = []
+        #: The last committed edit, so the window can say what held it back.
+        self.last_result: EditResult | None = None
         self.edited: set[tuple[str, str]] = set()
         self.log = EditLog()
         #: Bumped whenever any vertex moves or surfaces are (re)loaded, per
@@ -713,6 +715,7 @@ class SurfaceStore:
                 "pushed_partner": int(res.partner_ids.size),
             }
         )
+        self.last_result = res
         self._active = None
         self._pending = None
 
