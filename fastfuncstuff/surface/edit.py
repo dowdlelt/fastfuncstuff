@@ -72,6 +72,11 @@ class SnapParams:
     #: own tissue estimate gets wrong -- pial lying in dura reads "CSF" from
     #: dura, and the gate then rejects the GM/dura edge the eye can see.
     gate: bool = True
+    #: Hand moves follow the drag itself rather than each vertex's normal:
+    #: the direction the eye sees in the slice. Ignored while snapping (the
+    #: edge search runs along normals). The rule that pial stays outside
+    #: white still holds, along the normal.
+    free: bool = False
 
 
 @dataclass
@@ -291,7 +296,51 @@ class SurfaceEdit:
     def update(self, drag: np.ndarray) -> EditResult:
         """Positions for a cumulative drag vector ``drag`` (mm) from the press."""
         drag = np.asarray(drag, np.float64)
+        if self.params.free and self.params.snap <= 0:
+            return self._finish_free(self.weight[:, None] * drag[None, :])
         return self._finish(self.weight * (self.normals @ drag))
+
+    def _finish_free(self, disp: np.ndarray) -> EditResult:
+        """A hand move along ``(n, 3)`` vectors, not normals: what the slice shows.
+
+        Normal-only motion keeps the mesh regular, but it is not what a hand
+        dragging an outline across a slice asks for: the outline moves only
+        by the drag's component along each vertex's normal, so a stretch
+        whose normals tilt through the slice barely follows. Here the patch
+        goes where it is dragged. The fold guard still damps where it would
+        turn faces over, and the partner rule still holds along the normal.
+        """
+        p = self.params
+        n = self.normals
+        held = 0
+        if self.partner_start is not None and self.role == "pial":
+            gap = np.einsum("ij,ij->i", self.partner_start - self.start, n)
+            along = np.einsum("ij,ij->i", disp, n)
+            short = gap + p.min_thickness - along
+            inside = short > 0
+            held = int(np.count_nonzero(inside & (self.weight > 0.1)))
+            disp = disp + np.where(inside, short, 0.0)[:, None] * n
+        disp = self._unfold(disp)
+        positions = self.start + disp
+        along = np.einsum("ij,ij->i", disp, n)
+        partner_ids = np.zeros(0, np.int64)
+        partner_pos = np.zeros((0, 3))
+        if self.partner_start is not None and self.role == "white":
+            gap = np.einsum("ij,ij->i", self.partner_start - self.start, n)
+            push = along + p.min_thickness - gap
+            pushed = push > 0
+            partner_ids = self.ids[pushed]
+            partner_pos = self.partner_start[pushed] + push[pushed, None] * n[pushed]
+        return EditResult(
+            self.ids,
+            positions,
+            partner_ids,
+            partner_pos,
+            np.linalg.norm(disp, axis=1),
+            np.ones(self.ids.size),
+            fold_damped=self.fold_damped,
+            held=held,
+        )
 
     def _finish(self, along: np.ndarray, limit: np.ndarray | None = None) -> EditResult:
         """From a rough along-normal displacement to the placed, guarded result."""
@@ -347,9 +396,13 @@ class SurfaceEdit:
         )
 
     def _flipped(self, d: np.ndarray) -> np.ndarray:
-        """Faces (of those touching the patch) that ``d`` turns over."""
+        """Faces (of those touching the patch) that ``d`` turns over.
+
+        ``d`` is a distance along each normal, or ``(n, 3)`` vectors (free moves).
+        """
         moved = self._fold_verts.copy()
-        moved[self._fold_slot] = self.start + d[:, None] * self.normals
+        disp = d[:, None] * self.normals if d.ndim == 1 else d
+        moved[self._fold_slot] = self.start + disp
         after = face_normals(moved, self._fold_faces)
         return np.einsum("ij,ij->i", self._fold_before, after) <= 0
 
@@ -368,7 +421,11 @@ class SurfaceEdit:
         bad = self._flipped(d)
         if not bad.any():
             return d
-        keep = np.ones_like(d)
+        keep = np.ones(d.shape[0])
+
+        def scaled(k: np.ndarray) -> np.ndarray:
+            return d * k if d.ndim == 1 else d * k[:, None]
+
         for _ in range(12):
             hit = np.zeros(self._fold_verts.shape[0], bool)
             hit[self._fold_faces[bad].ravel()] = True
@@ -379,17 +436,17 @@ class SurfaceEdit:
             loss = 1.0 - keep
             loss = np.maximum(loss, 0.5 * (self._adjacency @ loss) / self._degree)
             keep = 1.0 - loss
-            bad = self._flipped(d * keep)
+            bad = self._flipped(scaled(keep))
             if not bad.any():
                 self.fold_damped = int(np.count_nonzero(keep < 0.999))
-                return d * keep
-        d = d * keep
+                return scaled(keep)
+        d = scaled(keep)
         for _ in range(8):
             d = 0.5 * d
             if not self._flipped(d).any():
-                self.fold_damped = d.size
+                self.fold_damped = d.shape[0]
                 return d
-        self.fold_damped = d.size
+        self.fold_damped = d.shape[0]
         return np.zeros_like(d)
 
 

@@ -491,6 +491,16 @@ class SetSurfaceSnapGate(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceFree(Command):
+    """Hand edits follow the drag (on) or each vertex's normal (off)."""
+
+    name = "SET_SURFACE_FREE"
+    aspects = Aspect.NOTHING
+    on: bool = False
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceSnap(Command):
     """Which layer edits snap to; empty means the bottom of the stack."""
 
@@ -525,6 +535,7 @@ class EditSurface(Command):
     edge_sign: int
     snap_key: str = ""
     gate: bool = True
+    free: bool = False
 
 
 @command
@@ -1436,6 +1447,12 @@ def install(
         st.surface_snap_gate = bool(cmd.on)
         return SetSurfaceSnapGate.aspects
 
+    @bus.handle(SetSurfaceFree.name)
+    def _set_surface_free(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceFree)
+        st.surface_free = bool(cmd.on)
+        return SetSurfaceFree.aspects
+
     @bus.handle(SetSurfaceSnap.name)
     def _set_surface_snap(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceSnap)
@@ -1460,6 +1477,7 @@ def install(
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
             gate=bool(cmd.gate),
+            free=bool(cmd.free),
         )
         sampler = session.surface_sampler(cmd.snap_key or None)
         session.surfaces.apply(grab, tuple(cmd.drag), sampler, params)

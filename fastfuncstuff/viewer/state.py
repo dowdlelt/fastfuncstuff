@@ -115,6 +115,8 @@ class ViewerState:
     #: Snap only to edges at the boundary's expected intensity (see
     #: ``surface.edit.SnapParams.gate``); off snaps to the strongest edge.
     surface_snap_gate: bool = True
+    #: Hand moves follow the drag, not the normals (``SnapParams.free``).
+    surface_free: bool = False
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.
     surface_snap_key: str | None = None

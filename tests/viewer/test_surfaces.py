@@ -858,3 +858,39 @@ def test_mark_in_a_slice_paint_in_3d_move_and_make_an_roi(tmp_path):
     finally:
         win.close()
         session.close()
+
+
+def test_free_hand_edits_follow_the_drag_and_are_recorded(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import EditSurface, LoadSurfaces, SetSurfaceFree
+
+    session.load(str(_shell_anat(tmp_path)))
+    session.do(LoadSurfaces(str(_subject(tmp_path))))
+    session.do(SetSurfaceFree(True))
+    assert session.state.surface_free
+    white = session.surfaces.hemis["lh"].states["white"]
+    top = int(np.argmax(white[:, 2]))
+    start = white[top].copy()
+    r, _, m, q, e = session.state.surface_brush
+    # Sideways at the top, where the normal is +z: only a free move goes.
+    session.do(
+        EditSurface(
+            "lh",
+            "white",
+            top,
+            tuple(start.tolist()),
+            (0.8, 0.0, 0.0),
+            r,
+            0.0,
+            m,
+            q,
+            e,
+            "",
+            True,
+            True,
+        )
+    )
+    np.testing.assert_allclose(white[top] - start, [0.8, 0.0, 0.0], atol=1e-5)
+    assert (
+        "free=True" in session.to_script()
+        or "True" in session.to_script().split("EDIT_SURFACE")[-1]
+    )

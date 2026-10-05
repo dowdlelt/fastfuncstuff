@@ -370,3 +370,46 @@ def test_stroke_targets_cast_along_the_outline_not_to_the_nearest_point():
     # Lying in the slice (normal along z) there is no outline point to cast.
     flat = stroke_targets(vertex, np.array([[0.0, 0.0, 1.0]]), stroke, np.array([0.0, 0.0, 1.0]))
     np.testing.assert_allclose(flat, near)
+
+
+def test_a_free_hand_drag_goes_where_it_is_dragged_not_along_the_normal(phantom):
+    """At the sphere's top the normal is +z: a sideways drag along normals
+    moves nothing, which is the "it will not go where I drag" report."""
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    c = _top(u)
+    drag = np.array([1.0, 0.0, 0.0])
+    normal = SurfaceEdit(
+        white, topo, c, sampler, SnapParams(radius=4.0, snap=0.0), role="white", partner=pial
+    )
+    free = SurfaceEdit(
+        white,
+        topo,
+        c,
+        sampler,
+        SnapParams(radius=4.0, snap=0.0, free=True),
+        role="white",
+        partner=pial,
+    )
+    k = int(np.flatnonzero(normal.ids == c)[0])
+    assert np.linalg.norm(normal.update(drag).positions[k] - white[c]) < 0.05
+    res = free.update(drag)
+    np.testing.assert_allclose(res.positions[k] - white[c], drag, atol=1e-6)
+    moved = white.copy()
+    moved[res.ids] = res.positions
+    before, after = face_normals(white, f), face_normals(moved, f)
+    assert np.all(np.einsum("ij,ij->i", before, after) > 0)
+    # Pial dragged freely down into white is still held outside it.
+    edit = SurfaceEdit(
+        pial,
+        topo,
+        c,
+        sampler,
+        SnapParams(radius=4.0, snap=0.0, free=True),
+        role="pial",
+        partner=white,
+    )
+    res = edit.update(np.array([0.0, 0.0, -5.0]))
+    assert res.held > 0
+    # Along the (smoothed) normal, so within a hair of the 0.1 mm floor radially.
+    assert np.linalg.norm(res.positions[k]) >= 20.0 + 0.09

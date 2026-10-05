@@ -395,6 +395,12 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
                 Binding(")", "larger brush", lambda: self._scale_brush(1.25), group="surface"),
                 Binding(
+                    "f",
+                    "hand moves: follow the drag / follow the normals",
+                    self._toggle_free,
+                    group="surface",
+                ),
+                Binding(
                     "m",
                     "snap -> edge (strongest, ungated) -> hand",
                     self._toggle_snap,
@@ -831,10 +837,28 @@ class ImageWindow(QtWidgets.QWidget):
             self._dispatch(SetSurfaceSnapGate(True))
         self._sync_brush()
 
+    def _toggle_free(self) -> None:
+        """Hand moves along the drag as seen in the slice, or along each vertex's normal.
+
+        Turning free on also turns snap off: the edge search runs along
+        normals, so a free move only means something by hand.
+        """
+        from fastfuncstuff.viewer.vocab import SetSurfaceFree
+
+        state = self.session.state
+        on = not state.surface_free
+        self._dispatch(SetSurfaceFree(on))
+        r, snap, smooth, search, sign = state.surface_brush
+        if on and snap > 0:
+            self._dispatch(SetSurfaceBrush(r, 0.0, smooth, search, sign))
+        self._sync_brush()
+
     def _sync_brush(self, note: str = "") -> None:
         state = self.session.state
         r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
+        if snap <= 0 and state.surface_free:
+            mode = "hand free"
         if snap > 0 and not state.surface_snap_gate:
             mode = mode.replace("snap", "edge")
         tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE", "mark": "MARK"}.get(
@@ -1120,6 +1144,7 @@ class ImageWindow(QtWidgets.QWidget):
             search=search,
             edge_sign=sign,
             gate=state.surface_snap_gate,
+            free=state.surface_free,
         )
         try:
             sampler = self.session.surface_sampler(state.surface_snap_key)
@@ -1196,6 +1221,7 @@ class ImageWindow(QtWidgets.QWidget):
                 sign,
                 self.session.state.surface_snap_key or "",
                 self.session.state.surface_snap_gate,
+                self.session.state.surface_free,
             )
         )
 
