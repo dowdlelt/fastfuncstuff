@@ -678,3 +678,70 @@ def test_m_cycles_snap_edge_hand_and_edits_record_the_gate(tmp_path):
     finally:
         win.close()
         session.close()
+
+
+def test_nudge_pushes_the_surface_away_from_the_cursor_and_undoes(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import EditSurface, OpenView, SetXYZ, UndoSurfaceEdit
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image.nudge_button.click()
+        assert session.state.surface_tool == "nudge"
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        h = session.surfaces.hemis["lh"]
+
+        def press_at(mm):
+            row, col = view.points_to_image(inv[:3, :3] @ np.asarray(mm) + inv[:3, 3])
+            image._edit_press(float(row), float(col))
+            image._edit_release()
+
+        def radius(surface, near):
+            k = np.argmin(np.linalg.norm(h.states[surface] - near, axis=1))
+            return float(np.linalg.norm(h.states[surface][k]))
+
+        # Outside pial (r = 24): pial moves in, a step at a time.
+        before = radius("pial", [24.0, 0, 0])
+        press_at([25.5, 0.0, 0.0])
+        assert radius("pial", [24.0, 0, 0]) == pytest.approx(before - 0.25, abs=0.03)
+        # Inside white (r = 20): white moves out.
+        before = radius("white", [20.0, 0, 0])
+        press_at([0.0, 18.5, 0.0])
+        assert radius("white", [0, 20.0, 0]) == pytest.approx(before + 0.25, abs=0.03)
+        nudges = [c for c in session.bus.log if isinstance(c, EditSurface)]
+        assert len(nudges) == 2 and all(c.snap == 0.0 for c in nudges)
+        session.do(UndoSurfaceEdit())
+        session.do(UndoSurfaceEdit())
+        assert radius("pial", [24.0, 0, 0]) == pytest.approx(24.0, abs=0.01)
+        # Held: the timer repeats the push until release.
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([25.5, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        assert image._nudge_timer.isActive()
+        image._nudge_again()
+        image._nudge_again()
+        image._edit_release()
+        assert not image._nudge_timer.isActive()
+        # Three pushes; each re-finds the nearest vertex as the outline moves
+        # away, so the one measured gets most but not all of each.
+        assert 0.45 < 24.0 - radius("pial", [24.0, 0, 0]) <= 0.76
+    finally:
+        win.close()
+        session.close()

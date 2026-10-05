@@ -619,7 +619,7 @@ class SplitSurfaceEdge(Command):
 @command
 @dataclass(frozen=True)
 class SetSurfaceTool(Command):
-    """What a press near an outline does while editing: grab (drag) or draw (redraw)."""
+    """What a press near an outline does while editing: grab, draw, point or nudge."""
 
     name = "SET_SURFACE_TOOL"
     aspects = Aspect.SLICES
@@ -1473,8 +1473,8 @@ def install(
     @bus.handle(SetSurfaceTool.name)
     def _set_surface_tool(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceTool)
-        if cmd.tool not in ("grab", "draw", "point"):
-            raise ValueError("surface tool is grab, draw or point")
+        if cmd.tool not in ("grab", "draw", "point", "nudge"):
+            raise ValueError("surface tool is grab, draw, point or nudge")
         st.surface_tool = cmd.tool
         return SetSurfaceTool.aspects
 

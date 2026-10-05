@@ -152,6 +152,21 @@ class ImageWindow(QtWidgets.QWidget):
         self.point_button.clicked.connect(self._toggle_point)
         bar.addWidget(self.point_button)
 
+        self.nudge_button = self._button(
+            "NUDGE",
+            "b",
+            "Push a surface away from the cursor: press beside a white or pial\n"
+            "outline and it moves back a quarter millimetre, over the brush;\n"
+            "hold to keep pushing. Always by hand (no snap). ( ) brush radius.",
+        )
+        self.nudge_button.clicked.connect(self._toggle_nudge)
+        bar.addWidget(self.nudge_button)
+        #: While a nudge is held: repeats it, from wherever the cursor now is.
+        self._nudge_timer = QtCore.QTimer(self)
+        self._nudge_timer.setInterval(self.NUDGE_REPEAT_MS)
+        self._nudge_timer.timeout.connect(self._nudge_again)
+        self._nudge_at: tuple[float, float] | None = None
+
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
         self.slice_label.setObjectName("value")
@@ -308,6 +323,12 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding(
                     "p", "edit surfaces: select a vertex", self.point_button.click, group="surface"
+                ),
+                Binding(
+                    "b",
+                    "edit surfaces: nudge away from the cursor",
+                    self.nudge_button.click,
+                    group="surface",
                 ),
                 Binding(
                     "Delete",
@@ -711,6 +732,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.edit_button.setChecked(state.surface_editing and state.surface_tool == "grab")
         self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
         self.point_button.setChecked(state.surface_editing and state.surface_tool == "point")
+        self.nudge_button.setChecked(state.surface_editing and state.surface_tool == "nudge")
         self.pane.set_marks(self._selected_marks())
         self._sync_brush()
         if state.grid is not None:
@@ -770,7 +792,7 @@ class ImageWindow(QtWidgets.QWidget):
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
         if snap > 0 and not state.surface_snap_gate:
             mode = mode.replace("snap", "edge")
-        tool = {"draw": "DRAW", "point": "POINT"}.get(state.surface_tool, "EDIT")
+        tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE"}.get(state.surface_tool, "EDIT")
         if state.surface_tool == "point" and state.surface_selected is not None:
             hemi, v = state.surface_selected
             tool += f" {hemi} #{v}"
@@ -783,6 +805,75 @@ class ImageWindow(QtWidgets.QWidget):
         on = not (state.surface_editing and state.surface_tool == "grab")
         self._dispatch(SetSurfaceTool("grab"))
         self._dispatch(SetSurfaceEditing(on))
+
+    def _toggle_nudge(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "nudge")
+        self._dispatch(SetSurfaceTool("nudge" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    #: How far one nudge pushes, mm, and how often a held press repeats it.
+    NUDGE_MM = 0.25
+    NUDGE_REPEAT_MS = 120
+
+    def _nudge(self, row: float, col: float) -> bool:
+        """Push the outline nearest (row, col) one step away from it. False if none is in reach.
+
+        A hand-mode EDIT_SURFACE whose drag is one step along the surface's
+        normal, away from the cursor -- so it replays, undoes, keeps pial
+        outside white and never folds, exactly as a drag does.
+        """
+        state = self.session.state
+        surfaces = self.session.surfaces
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if view is None or pos is None or grid is None:
+            return False
+        reach = max(8.0 / self.pane._image_scale(), self._brush_px() or 0.0)
+        grab = surfaces.grab(grid.affine, view, pos, state.surfaces_shown, row, col, reach)
+        if grab is None:
+            return False
+        h = surfaces.hemis[grab.hemi]
+        n = surfaces.surface_normal(grab.hemi, grab.surface, grab.vertex)
+        away = float(n @ (h.states[grab.surface][grab.vertex] - np.asarray(grab.at_mm)))
+        if abs(away) < 0.1:
+            self.pane.show_toast("nudge from beside the outline, on the side to push from")
+            return False
+        drag = self.NUDGE_MM * np.sign(away) * n
+        r, _, smooth, search, sign = state.surface_brush
+        try:
+            self._dispatch(
+                EditSurface(
+                    grab.hemi,
+                    grab.surface,
+                    grab.vertex,
+                    grab.at_mm,
+                    (float(drag[0]), float(drag[1]), float(drag[2])),
+                    r,
+                    0.0,
+                    smooth,
+                    search,
+                    sign,
+                    state.surface_snap_key or "",
+                    state.surface_snap_gate,
+                )
+            )
+        except ValueError as exc:
+            self.pane.show_toast(str(exc))
+            return False
+        from fastfuncstuff.surface.edit import explain
+
+        res = surfaces.last_result
+        note = explain(res) if res is not None else ""
+        if note:
+            self.pane.show_toast(note)
+        return True
+
+    def _nudge_again(self) -> None:
+        if self._nudge_at is None or not self._nudge(*self._nudge_at):
+            self._nudge_timer.stop()
 
     def _toggle_point(self) -> None:
         state = self.session.state
@@ -876,6 +967,11 @@ class ImageWindow(QtWidgets.QWidget):
         pos = self.pane.position
         if view is None or pos is None or state.grid is None:
             return
+        if state.surface_tool == "nudge":
+            if self._nudge(row, col):
+                self._nudge_at = (row, col)
+                self._nudge_timer.start()
+            return
         # Tolerance in image pixels from a screen distance, so grabbing feels
         # the same at every zoom.
         tolerance = 8.0 / self.pane._image_scale()
@@ -916,6 +1012,9 @@ class ImageWindow(QtWidgets.QWidget):
         self._edit_drag_mm = np.zeros(3)
 
     def _edit_drag(self, row: float, col: float) -> None:
+        if self._nudge_timer.isActive():
+            self._nudge_at = (row, col)
+            return
         if self._stroke is not None:
             here = self._press_point_mm(row, col)
             if here is not None:
@@ -941,6 +1040,10 @@ class ImageWindow(QtWidgets.QWidget):
                 self.pane.show_toast(note)
 
     def _edit_release(self) -> None:
+        if self._nudge_timer.isActive() or self._nudge_at is not None:
+            self._nudge_timer.stop()
+            self._nudge_at = None
+            return
         if self._stroke is not None:
             self._finish_stroke()
             return

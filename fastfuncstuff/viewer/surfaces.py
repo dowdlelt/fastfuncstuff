@@ -331,6 +331,16 @@ class SurfaceStore:
                 best = (hemi, int(ids[k]), float(d))
         return best
 
+    def surface_normal(
+        self, hemi: str, surface: str, vertex: int, radius: float = 1.5
+    ) -> np.ndarray:
+        """One surface's outward normal at ``vertex``, averaged over a small disc."""
+        verts = self.hemis[hemi].states[surface].astype(np.float64)
+        topo = self.topology(hemi)
+        ids, _ = geodesic_ball(verts, topo, int(vertex), radius)
+        n = vertex_normals(verts, topo)[ids].sum(axis=0)
+        return n / max(float(np.linalg.norm(n)), 1e-12)
+
     def cortex_normal(
         self, mm: tuple[float, float, float], radius: float = 3.0, max_mm: float = 6.0
     ) -> np.ndarray | None:
