@@ -745,3 +745,47 @@ def test_nudge_pushes_the_surface_away_from_the_cursor_and_undoes(tmp_path):
     finally:
         win.close()
         session.close()
+
+
+def test_highlight_moves_as_a_plateau_undoes_and_fills_the_ribbon(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import (
+        HighlightSurface,
+        LoadSurfaces,
+        MoveSurfaceHighlight,
+        UndoSurfaceEdit,
+        decode_ids,
+        encode_ids,
+    )
+
+    assert encode_ids([5, 3, 4, 9, 11, 12]) == "3-5,9,11-12"
+    np.testing.assert_array_equal(decode_ids("3-5,9,11-12"), [3, 4, 5, 9, 11, 12])
+
+    session.load(str(_shell_anat(tmp_path)))
+    session.do(LoadSurfaces(str(_subject(tmp_path))))
+    surfaces = session.surfaces
+    h = surfaces.hemis["lh"]
+    top = int(np.argmax(h.states["pial"][:, 2]))
+    patch = surfaces.disc("lh", top, 4.0)
+    session.do(HighlightSurface("lh", encode_ids(patch), "add"))
+    assert surfaces.highlighted("lh").size == patch.size
+    before = h.states["pial"].copy()
+    session.do(MoveSurfaceHighlight("lh", "pial", -0.8))
+    moved = np.linalg.norm(before - h.states["pial"], axis=1)
+    # A plateau: every highlighted vertex moves the full 0.8 mm...
+    np.testing.assert_allclose(moved[patch], 0.8, atol=0.02)
+    # ...with a shoulder outside it, and nothing far away.
+    assert 0 < moved.max() <= 0.81 and moved[np.argmin(h.states["pial"][:, 2])] == 0
+    session.do(UndoSurfaceEdit())
+    np.testing.assert_allclose(h.states["pial"], before)
+
+    # The ribbon under the highlight, voxelised white to pial.
+    base = session.state.layers.base
+    mask = surfaces.highlight_mask(base.affine, base.shape)
+    ijk = np.argwhere(mask)
+    mm = ijk @ base.affine[:3, :3].T + base.affine[:3, 3]
+    r = np.linalg.norm(mm, axis=1)
+    assert mask.sum() > 50
+    assert r.min() > 20.0 - 0.6 and r.max() < 24.0 + 0.6  # white 20, pial 24 (= 1.2 x 20)
+    assert np.all(mm[:, 2] > 15.0)  # only under the top patch
+    session.do(HighlightSurface(mode="clear"))
+    assert surfaces.highlighted("lh").size == 0

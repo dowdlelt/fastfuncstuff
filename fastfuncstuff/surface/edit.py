@@ -479,6 +479,47 @@ class StrokeEdit(SurfaceEdit):
         return self._finish(self.along, limit)
 
 
+class HighlightEdit(StrokeEdit):
+    """A chosen set of vertices moved together along their normals by ``shift`` mm.
+
+    The highlighted vertices are the seeds, all pinned to the same shift;
+    the surface within ``params.radius`` mm of them follows by the same
+    harmonic fill a stroke uses, so the group moves as a plateau with a
+    smooth shoulder instead of a brush's peak. Always by hand: a highlight
+    says "these, this far", which a snap would second-guess.
+    """
+
+    def __init__(
+        self,
+        vertices: np.ndarray,
+        topo: MeshTopology,
+        seeds: np.ndarray,
+        shift: float,
+        sampler: VolumeSampler,
+        params: SnapParams = SnapParams(),
+        *,
+        role: str = "white",
+        partner: np.ndarray | None = None,
+    ) -> None:
+        from scipy.sparse.csgraph import dijkstra
+
+        vertices = np.asarray(vertices, np.float64)
+        seeds = np.unique(np.asarray(seeds, np.int64))
+        if seeds.size == 0:
+            raise ValueError("nothing is highlighted")
+        graph = topo.edge_graph(vertices)
+        dist = dijkstra(graph, indices=seeds, limit=float(params.radius), min_only=True)
+        ids = np.flatnonzero(np.isfinite(dist))
+        self.centre = int(seeds[0])
+        self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
+        self.seed = np.isin(self.ids, seeds)
+        self.seed_shift = np.full(int(self.seed.sum()), float(shift))
+        self.along = self._interpolate()
+
+    def result(self) -> EditResult:
+        return self._finish(self.along, np.zeros(self.ids.size))
+
+
 def stroke_targets(
     points: np.ndarray, normals: np.ndarray, stroke: np.ndarray, plane_normal: np.ndarray
 ) -> np.ndarray:
@@ -557,6 +598,7 @@ def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "EditResult",
+    "HighlightEdit",
     "SnapParams",
     "StrokeEdit",
     "SurfaceEdit",

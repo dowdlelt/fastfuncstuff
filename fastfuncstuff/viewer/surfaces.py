@@ -145,6 +145,11 @@ class SurfaceStore:
         #: window can show which cortex the profile is from.
         self.depth_roi_vertices: dict[str, np.ndarray] = {}
         self.depth_roi_version = 0
+        #: Highlighted vertices per hemisphere (bool masks): a hand-picked
+        #: stretch of cortex to move together or turn into an ROI. Vertex
+        #: ids, so the same columns on white and pial.
+        self.highlight: dict[str, np.ndarray] = {}
+        self.highlight_version = 0
         self._areas: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
         #: Per hemisphere, once its topology has been edited: every surface and
         #: per-vertex file of its mesh (MeshBundle, BundleSources). Saving or
@@ -178,6 +183,8 @@ class SurfaceStore:
         self.topology_changed.clear()
         self.flags = {}
         self.depth_roi_vertices = {}
+        self.highlight = {}
+        self.highlight_version += 1
         self._areas.clear()
         self._annots.clear()
         self._atlases.clear()
@@ -330,6 +337,106 @@ class SurfaceStore:
             if d <= max_mm and (best is None or d < best[2]):
                 best = (hemi, int(ids[k]), float(d))
         return best
+
+    def set_highlight(self, hemi: str, ids: np.ndarray, mode: str = "add") -> None:
+        """Add, remove or set highlighted vertices; ``mode="clear"`` empties every hemisphere."""
+        if mode == "clear":
+            self.highlight = {}
+            self.highlight_version += 1
+            return
+        if mode not in ("add", "remove", "set"):
+            raise ValueError("highlight mode is add, remove, set or clear")
+        h = self.hemis.get(hemi)
+        if h is None:
+            raise ValueError(f"no {hemi} hemisphere loaded")
+        ids = np.asarray(ids, np.int64)
+        if ids.size and (ids.min() < 0 or ids.max() >= h.n_vertices):
+            raise ValueError("highlighted vertex out of range")
+        mask = self.highlight.get(hemi)
+        if mask is None or mode == "set":
+            mask = np.zeros(h.n_vertices, bool)
+        mask[ids] = mode != "remove"
+        self.highlight[hemi] = mask
+        self.highlight_version += 1
+
+    def highlighted(self, hemi: str) -> np.ndarray:
+        """Highlighted vertex ids of ``hemi`` (empty when none)."""
+        mask = self.highlight.get(hemi)
+        return np.zeros(0, np.int64) if mask is None else np.flatnonzero(mask)
+
+    def disc(self, hemi: str, vertex: int, radius: float, surface: str = "white") -> np.ndarray:
+        """Vertices within ``radius`` mm of ``vertex`` along ``surface``."""
+        verts = self.hemis[hemi].states[surface].astype(np.float64)
+        ids, _ = geodesic_ball(verts, self.topology(hemi), int(vertex), float(radius))
+        return ids
+
+    def move_highlight(
+        self, hemi: str, surface: str, shift: float, sampler: VolumeSampler, params: SnapParams
+    ) -> EditResult:
+        """Move ``hemi``'s highlighted vertices on ``surface`` by ``shift`` mm along their normals."""
+        from fastfuncstuff.surface.edit import HighlightEdit
+
+        self.cancel()
+        seeds = self.highlighted(hemi)
+        h = self.hemis[hemi]
+        topo = self.topology(hemi)
+        edit = HighlightEdit(
+            h.states[surface],
+            topo,
+            seeds,
+            shift,
+            sampler,
+            params,
+            role=surface,
+            partner=h.states.get(PARTNER[surface]),
+        )
+        res = edit.result()
+        self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)
+        self._commit(
+            hemi,
+            surface,
+            edit,
+            res,
+            {"tool": "highlight", "seeds": int(seeds.size), "shift": shift},
+        )
+        return res
+
+    def highlight_mask(self, affine: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+        """Voxels of a grid that the highlighted cortex fills, white to pial.
+
+        Points are laid over every face whose corners are all highlighted (a
+        few per face, so no voxel between vertices is missed) and up the
+        column from white to pial, half a voxel apart in depth.
+        """
+        out = np.zeros(shape, bool)
+        inv = np.linalg.inv(np.asarray(affine, np.float64))
+        vox = float(abs(np.linalg.det(np.asarray(affine)[:3, :3])) ** (1 / 3))
+        # Barycentric weights on a 4-step triangular grid: 15 points per face.
+        steps = 4
+        bary = (
+            np.array(
+                [(i, j, steps - i - j) for i in range(steps + 1) for j in range(steps + 1 - i)],
+                np.float64,
+            )
+            / steps
+        )
+        for hemi, mask in self.highlight.items():
+            h = self.hemis.get(hemi)
+            if h is None or not mask.any():
+                continue
+            faces = h.faces[mask[h.faces].all(axis=1)]
+            if not faces.size:
+                continue
+            white = h.states["white"].astype(np.float64)
+            pial = h.states["pial"].astype(np.float64)
+            w = np.einsum("pk,fkd->fpd", bary, white[faces]).reshape(-1, 3)
+            p = np.einsum("pk,fkd->fpd", bary, pial[faces]).reshape(-1, 3)
+            thick = float(np.max(np.linalg.norm(p - w, axis=1)))
+            for t in np.linspace(0.0, 1.0, max(2, int(np.ceil(2 * thick / vox)) + 1)):
+                ijk = np.rint(((1 - t) * w + t * p) @ inv[:3, :3].T + inv[:3, 3]).astype(int)
+                ok = np.all((ijk >= 0) & (ijk < np.asarray(shape)), axis=1)
+                out[tuple(ijk[ok].T)] = True
+        return out
 
     def surface_normal(
         self, hemi: str, surface: str, vertex: int, radius: float = 1.5
@@ -539,6 +646,9 @@ class SurfaceStore:
         self._annots = {k: v for k, v in self._annots.items() if k[0] != hemi}
         self.flags.pop(hemi, None)
         self.depth_roi_vertices.pop(hemi, None)
+        # Vertex ids change with the topology: a highlight would name others.
+        if self.highlight.pop(hemi, None) is not None:
+            self.highlight_version += 1
         self._active = None
         self._pending = None
         self.version[hemi] = self.version.get(hemi, 0) + 1

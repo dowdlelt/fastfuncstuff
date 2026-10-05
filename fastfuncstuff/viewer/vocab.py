@@ -626,6 +626,51 @@ class SetSurfaceTool(Command):
     tool: str = "grab"
 
 
+def encode_ids(ids) -> str:
+    """Vertex ids as ranges, ``"3-9,12,40-41"``: a painted patch is mostly runs."""
+    ids = np.unique(np.asarray(ids, np.int64))
+    if not ids.size:
+        return ""
+    breaks = np.flatnonzero(np.diff(ids) != 1)
+    starts = np.r_[ids[0], ids[breaks + 1]]
+    ends = np.r_[ids[breaks], ids[-1]]
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in zip(starts, ends, strict=True))
+
+
+def decode_ids(text: str) -> np.ndarray:
+    out: list[np.ndarray] = []
+    for part in filter(None, text.split(",")):
+        a, _, b = part.partition("-")
+        out.append(np.arange(int(a), int(b or a) + 1))
+    return np.concatenate(out) if out else np.zeros(0, np.int64)
+
+
+@command
+@dataclass(frozen=True)
+class HighlightSurface(Command):
+    """Add, remove or set highlighted vertices of a hemisphere (``ids`` as ranges); clear all."""
+
+    name = "HIGHLIGHT_SURFACE"
+    aspects = Aspect.SLICES | Aspect.VIEWPORTS
+    hemi: str = ""
+    ids: str = ""
+    mode: str = "add"
+
+
+@command
+@dataclass(frozen=True)
+class MoveSurfaceHighlight(Command):
+    """Move the highlighted vertices of one surface by ``shift`` mm along their normals."""
+
+    name = "MOVE_SURFACE_HIGHLIGHT"
+    aspects = Aspect.SLICES
+    major = True
+    hemi: str
+    surface: str
+    shift: float
+    radius: float = 4.0
+
+
 @command
 @dataclass(frozen=True)
 class UndoSurfaceEdit(Command):
@@ -1477,6 +1522,32 @@ def install(
             raise ValueError("surface tool is grab, draw, point or nudge")
         st.surface_tool = cmd.tool
         return SetSurfaceTool.aspects
+
+    @bus.handle(HighlightSurface.name)
+    def _highlight_surface(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, HighlightSurface)
+        if session is None:
+            raise RuntimeError("HIGHLIGHT_SURFACE needs a session")
+        session.surfaces.set_highlight(cmd.hemi, decode_ids(cmd.ids), cmd.mode)
+        return HighlightSurface.aspects
+
+    @bus.handle(MoveSurfaceHighlight.name)
+    def _move_surface_highlight(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, MoveSurfaceHighlight)
+        if session is None:
+            raise RuntimeError("MOVE_SURFACE_HIGHLIGHT needs a session")
+        from fastfuncstuff.surface.edit import SnapParams
+
+        if cmd.surface not in ("white", "pial"):
+            raise ValueError("move white or pial")
+        _, _, smooth, search, sign = st.surface_brush
+        params = SnapParams(
+            radius=cmd.radius, snap=0.0, smooth=smooth, search=search, edge_sign=sign
+        )
+        session.surfaces.move_highlight(
+            cmd.hemi, cmd.surface, float(cmd.shift), session.surface_sampler(None), params
+        )
+        return MoveSurfaceHighlight.aspects
 
     @bus.handle(UndoSurfaceEdit.name)
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:
