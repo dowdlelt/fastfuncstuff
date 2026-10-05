@@ -94,6 +94,9 @@ class SurfaceEdit:
     are scanner-RAS mm, the same frame as ``sampler``.
     """
 
+    #: Neighbour-averaging passes over the vertex normals a drag moves along.
+    NORMAL_SMOOTHING = 3
+
     def __init__(
         self,
         vertices: np.ndarray,
@@ -147,7 +150,21 @@ class SurfaceEdit:
         self._fold_faces = local.reshape(faces.shape)
         self._fold_verts = vertices[used]
         self._fold_slot = np.searchsorted(used, self.ids)
+        self._fold_before = face_normals(self._fold_verts, self._fold_faces)
+        self.fold_damped = 0
         self._system = self._laplacian()
+        self._degree = np.maximum(self._system.diagonal(), 1.0)
+        self._adjacency = (sp.diags(self._system.diagonal()) - self._system).tocsr()
+        # The direction each vertex moves: its normal, averaged over a couple
+        # of rings. Raw vertex normals jitter from vertex to vertex on a fine
+        # mesh, and a drag projected onto them pushed neighbours by different
+        # amounts -- on a real subject a third of 2 mm white drags folded the
+        # mesh; with these, a quarter (and the fold guard then damps less).
+        n = self.normals
+        for _ in range(self.NORMAL_SMOOTHING):
+            n = n + self._adjacency @ n
+            n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+        self.normals = n
         # Barycentric vertex area (a third of each incident face), mm^2.
         area = np.zeros(used.size)
         face_area = 0.5 * np.linalg.norm(face_normals(self._fold_verts, self._fold_faces), axis=1)
@@ -285,16 +302,50 @@ class SurfaceEdit:
             partner_pos = self.partner_start[pushed] + push[pushed, None] * self.normals[pushed]
         return EditResult(self.ids, positions, partner_ids, partner_pos, d, confidence)
 
-    def _unfold(self, d: np.ndarray) -> np.ndarray:
-        """Scale the displacement back until no face in the patch flips."""
-        before = face_normals(self._fold_verts, self._fold_faces)
+    def _flipped(self, d: np.ndarray) -> np.ndarray:
+        """Faces (of those touching the patch) that ``d`` turns over."""
         moved = self._fold_verts.copy()
+        moved[self._fold_slot] = self.start + d[:, None] * self.normals
+        after = face_normals(moved, self._fold_faces)
+        return np.einsum("ij,ij->i", self._fold_before, after) <= 0
+
+    def _unfold(self, d: np.ndarray) -> np.ndarray:
+        """Damp the displacement where it folds the mesh, and only there.
+
+        Halving the whole patch whenever any face flipped cost the median
+        2 mm pial drag half its movement on a real subject (the guard fired on
+        more than half of them): one tight fundus at the brush's edge held back
+        the vertex under the cursor. The damping now starts at the vertices of
+        the flipped faces and fades over their neighbours, so the rest of the
+        patch keeps what it was asked for. The global halving stays as the
+        last resort, and zero after that, so a flip can never be committed.
+        """
+        self.fold_damped = 0
+        bad = self._flipped(d)
+        if not bad.any():
+            return d
+        keep = np.ones_like(d)
+        for _ in range(12):
+            hit = np.zeros(self._fold_verts.shape[0], bool)
+            hit[self._fold_faces[bad].ravel()] = True
+            hit = hit[self._fold_slot]
+            keep[hit] *= 0.5
+            # Spread the damping one ring outward at half strength, so the
+            # damped spot does not become a step in the surface.
+            loss = 1.0 - keep
+            loss = np.maximum(loss, 0.5 * (self._adjacency @ loss) / self._degree)
+            keep = 1.0 - loss
+            bad = self._flipped(d * keep)
+            if not bad.any():
+                self.fold_damped = int(np.count_nonzero(keep < 0.999))
+                return d * keep
+        d = d * keep
         for _ in range(8):
-            moved[self._fold_slot] = self.start + d[:, None] * self.normals
-            after = face_normals(moved, self._fold_faces)
-            if np.all(np.einsum("ij,ij->i", before, after) > 0):
-                return d
             d = 0.5 * d
+            if not self._flipped(d).any():
+                self.fold_damped = d.size
+                return d
+        self.fold_damped = d.size
         return np.zeros_like(d)
 
 

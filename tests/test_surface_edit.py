@@ -63,7 +63,9 @@ def test_drag_out_snaps_white_to_the_true_boundary_and_leaves_the_rest(phantom):
     full = np.zeros(len(u))
     full[res.ids] = res.displacement
     jump = np.abs(full[topo.edges[:, 0]] - full[topo.edges[:, 1]])
-    assert jump.max() < 0.5
+    # The rim's sqrt fade puts the largest step there: 0.49 mm with raw
+    # vertex normals, 0.50 with the smoothed ones a drag now moves along.
+    assert jump.max() < 0.55
     # Nothing outside the brush is in the result.
     inside, _ = geodesic_ball(white, topo, c, 5.0)
     assert set(res.ids.tolist()) == set(inside.tolist())
@@ -288,3 +290,28 @@ def test_contour_path_takes_the_short_way_and_refuses_separate_pieces():
     np.testing.assert_array_equal(contour_path(ring, 1, 9), [1, 0, 9])
     two = np.concatenate([ring, ring + 1000])
     assert contour_path(two, 1, 12) is None
+
+
+def test_a_fold_is_damped_where_it_happens_not_across_the_whole_brush(phantom):
+    """The global halving cost the vertex under the cursor half its move
+    whenever any face in the brush flipped -- on a real subject, the median
+    2 mm pial drag. A fold at one spot must leave the centre its full move."""
+    sampler, u, f, topo = phantom
+    white = 20.0 * u
+    c = _top(u)
+    edit = SurfaceEdit(white, topo, c, sampler, SnapParams(radius=6.0, snap=0.0, smooth=0.0))
+    # A hand-made fold near the rim: a vertex and its ring pushed inward
+    # through the sphere's centre, while the rest move a gentle 0.5 mm.
+    ids = edit.ids
+    k = int(np.argmin(np.abs(edit.weight - 0.15)))
+    ring = np.r_[k, edit._adjacency[k].indices]
+    along = 0.5 * edit.weight
+    along[ring] -= 45.0
+    res = edit._finish(along)
+    centre = int(np.flatnonzero(ids == c)[0])
+    assert edit.fold_damped > 0
+    assert res.displacement[centre] == pytest.approx(along[centre], rel=0.05)
+    moved = white.copy()
+    moved[res.ids] = res.positions
+    before, after = face_normals(white, f), face_normals(moved, f)
+    assert np.all(np.einsum("ij,ij->i", before, after) > 0)
