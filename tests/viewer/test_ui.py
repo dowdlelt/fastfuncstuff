@@ -2642,3 +2642,21 @@ def test_the_debug_report_covers_every_controller(win, qapp):
     qapp.processEvents()
     text = win.debug_report()
     assert text.count("# ffs viewer session report") == len(win.controllers)
+
+
+def test_image_windows_thin_thicken_and_cycle_the_surface_outlines(win, qapp):
+    """Outlines are a fixed screen width, so in a small window they cover the
+    activation; [ ] and shift+O are on the image window, not just the controller."""
+    image = image_of(win, Plane.AXIAL)
+    before = win.session.state.surface_outline_width
+    image._outline_width_by(1 / 1.4)
+    qapp.processEvents()
+    assert win.session.state.surface_outline_width == pytest.approx(before / 1.4)
+    assert image.pane._outline_width == pytest.approx(before / 1.4)
+    for _ in range(20):
+        image._outline_width_by(1 / 1.4)
+    assert win.session.state.surface_outline_width == pytest.approx(0.25)
+    shown = win.session.state.surfaces_shown
+    image._cycle_outlines()
+    assert win.session.state.surfaces_shown != shown
+    assert "SET_OUTLINE_WIDTH" in win.session.to_script()

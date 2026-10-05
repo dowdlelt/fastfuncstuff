@@ -90,6 +90,9 @@ class ViewerState:
     #: on the session), and which of them are drawn as slice outlines.
     surface_subject: str | None = None
     surfaces_shown: tuple[str, ...] = ("white", "pial")
+    #: Outline width in screen pixels. Fixed on screen, so a small window
+    #: (few pixels per voxel) wants it thinner than a large one.
+    surface_outline_width: float = 1.25
     #: Whether a press near an outline grabs it (instead of moving the
     #: crosshair), and the brush it is dragged with: radius mm, snap 0-1,
     #: smoothing, search mm either side, and the outward edge sign (-1 = T1).

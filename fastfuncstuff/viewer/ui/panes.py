@@ -112,6 +112,7 @@ class ImagePane(QtWidgets.QWidget):
         self._hover: QtCore.QPointF | None = None
         self._editing_drag = False
         self._brush_label = ""
+        self._outline_width = 1.25
         self._toast = ""
         self._toast_alpha = 0.0
         self._toast_anim = QtCore.QVariantAnimation(self)
@@ -175,6 +176,11 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_outline_width(self, width: float) -> None:
+        if width != self._outline_width:
+            self._outline_width = float(width)
+            self.update()
 
     def set_outlines(self, outlines, only: set[tuple[str, str]] | None = None) -> None:
         """Surface/slice crossings, as :class:`viewer.surfaces.Outline` records.
@@ -408,7 +414,7 @@ class ImagePane(QtWidgets.QWidget):
             # magnified, so zooming in to judge a boundary makes the line
             # relatively thinner rather than hiding the edge under it.
             pen.setCosmetic(True)
-            pen.setWidthF(1.25)
+            pen.setWidthF(self._outline_width)
             p.setPen(pen)
             p.drawPath(path)
         p.restore()

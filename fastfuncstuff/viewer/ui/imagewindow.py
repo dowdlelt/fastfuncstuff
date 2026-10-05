@@ -233,6 +233,24 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
                 Binding("c", "centre the view on the crosshair", self._centre_view, group="view"),
+                Binding(
+                    "shift+o",
+                    "surface outlines: both, white, pial, off",
+                    self._cycle_outlines,
+                    group="surface",
+                ),
+                Binding(
+                    "[",
+                    "thinner surface outlines",
+                    lambda: self._outline_width_by(1 / 1.4),
+                    group="surface",
+                ),
+                Binding(
+                    "]",
+                    "thicker surface outlines",
+                    lambda: self._outline_width_by(1.4),
+                    group="surface",
+                ),
                 Binding("right-drag", "zoom (up = in)", None, group="view"),
                 Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
@@ -508,6 +526,19 @@ class ImageWindow(QtWidgets.QWidget):
         if self._viewport() is not None:
             self._dispatch(SetZoom(self.vid, 1.0))
             self._dispatch(SetPan(self.vid, 0.0, 0.0))
+
+    def _cycle_outlines(self) -> None:
+        from fastfuncstuff.viewer.surfaces import next_outlines
+        from fastfuncstuff.viewer.vocab import ShowSurfaces
+
+        nxt = next_outlines(self.session.state.surfaces_shown)
+        self._dispatch(ShowSurfaces(nxt))
+        self.pane.show_toast(f"outlines: {nxt or 'off'}")
+
+    def _outline_width_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetOutlineWidth
+
+        self._dispatch(SetOutlineWidth(self.session.state.surface_outline_width * factor))
 
     def _centre_view(self) -> None:
         state = self.session.state
@@ -864,6 +895,7 @@ class ImageWindow(QtWidgets.QWidget):
         surfaces = self.session.surfaces
         view = plane_view(state, vp)
         pos = self.pane.position
+        self.pane.set_outline_width(state.surface_outline_width)
         if not surfaces.hemis or not state.surfaces_shown or view is None or pos is None:
             self.pane.set_outlines([])
             return

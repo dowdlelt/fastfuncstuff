@@ -53,6 +53,7 @@ from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.surfaces import next_outlines
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar, colormap_icon, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
@@ -783,14 +784,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"surfaces: installed {len(plan.files)} files (backups *.pre-ffsedit-*)", 8000
         )
 
-    #: What shift+O steps through. Both first, because judging one boundary
-    #: needs the other in view to see the cortex between them.
-    _OUTLINE_CYCLE = ("white,pial", "white", "pial", "")
-
     def _cycle_outlines(self) -> None:
-        now = ",".join(self.session.state.surfaces_shown)
-        cycle = self._OUTLINE_CYCLE
-        nxt = cycle[(cycle.index(now) + 1) % len(cycle)] if now in cycle else cycle[0]
+        nxt = next_outlines(self.session.state.surfaces_shown)
         self._dispatch(ShowSurfaces(nxt))
         self.statusBar().showMessage(f"outlines: {nxt or 'off'}", 2000)
 

@@ -60,6 +60,18 @@ class Outline:
 PARTNER = {"white": "pial", "pial": "white"}
 
 
+#: What shift+O steps through. Both first, because judging one boundary
+#: needs the other in view to see the cortex between them.
+OUTLINE_CYCLE = ("white,pial", "white", "pial", "")
+
+
+def next_outlines(shown: tuple[str, ...]) -> str:
+    """The outline set after ``shown`` in :data:`OUTLINE_CYCLE`."""
+    now = ",".join(shown)
+    cycle = OUTLINE_CYCLE
+    return cycle[(cycle.index(now) + 1) % len(cycle)] if now in cycle else cycle[0]
+
+
 @dataclass(frozen=True)
 class Grab:
     """What a press near an outline took hold of."""

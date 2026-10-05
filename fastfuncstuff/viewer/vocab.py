@@ -436,6 +436,16 @@ class ShowSurfaces(Command):
 
 @command
 @dataclass(frozen=True)
+class SetOutlineWidth(Command):
+    """Width of the surface outlines on the slices, in screen pixels."""
+
+    name = "SET_OUTLINE_WIDTH"
+    aspects = Aspect.SLICES
+    width: float = 1.25
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceEditing(Command):
     """Presses near a white/pial outline grab it rather than move the crosshair."""
 
@@ -1297,6 +1307,12 @@ def install(
         assert isinstance(cmd, ShowSurfaces)
         st.surfaces_shown = tuple(n for n in cmd.names.split(",") if n)
         return ShowSurfaces.aspects
+
+    @bus.handle(SetOutlineWidth.name)
+    def _set_outline_width(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetOutlineWidth)
+        st.surface_outline_width = float(min(max(cmd.width, 0.25), 6.0))
+        return SetOutlineWidth.aspects
 
     @bus.handle(SetAtlas.name)
     def _set_atlas(cmd: Command, st: ViewerState) -> Aspect:
