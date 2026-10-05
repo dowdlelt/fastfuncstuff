@@ -370,7 +370,7 @@ class WindowManager(QtCore.QObject):
             for line in rows:
                 total = sum(fw for *_, fw, _ in line) + TILE_GAP * (len(line) - 1)
                 x = area.x() + area.width() - TILE_GAP - total
-                for mgr, win, fw, fh in line:
+                for mgr, win, fw, _fh in line:
                     win.move(x, y)
                     g = win.geometry()
                     mgr.record_geometry(win.vid, g.x(), g.y(), g.width(), g.height())
