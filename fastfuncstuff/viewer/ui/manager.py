@@ -122,6 +122,7 @@ class WindowManager(QtCore.QObject):
         elif viewport.is_surface:
             win = SurfaceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
+            win.seeded.connect(self._on_seeded)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
@@ -171,6 +172,18 @@ class WindowManager(QtCore.QObject):
         from fastfuncstuff.viewer.vocab import SetXYZ
 
         self._dispatch(SetXYZ(float(x), float(y), float(z)))
+
+    def _on_seeded(self, x: float, y: float, z: float) -> None:
+        """A window set the seed at a place in millimetres.
+
+        The seed is a display-grid voxel, so the crosshair moves first and the
+        seed takes the voxel it landed on -- the same pair an image window's
+        ctrl+click dispatches.
+        """
+        from fastfuncstuff.viewer.vocab import SetSeed
+
+        self._on_located(x, y, z)
+        self._dispatch(SetSeed(*self.session.state.crosshair))
 
     # -- drawing ---------------------------------------------------------
     def redraw(self, dirty: Aspect) -> None:

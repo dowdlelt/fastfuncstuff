@@ -121,6 +121,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
 
     #: A click on the surface, in scanner mm.
     located = QtCore.Signal(float, float, float)
+    #: Ctrl+click on the surface, in scanner mm: the InstaCorr seed.
+    seeded = QtCore.Signal(float, float, float)
     #: Shift+wheel: move the sampled depth by this fraction.
     depth_scrolled = QtCore.Signal(float)
 
@@ -607,7 +609,11 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         ):
             hit = self.pick_mm(event.position())
             if hit is not None:
-                self.located.emit(*hit)
+                seed = (
+                    QtCore.Qt.KeyboardModifier.ControlModifier
+                    | QtCore.Qt.KeyboardModifier.MetaModifier
+                )
+                (self.seeded if event.modifiers() & seed else self.located).emit(*hit)
         self._press = self._last = None
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 (Qt)
@@ -662,6 +668,8 @@ class SurfaceWindow(QtWidgets.QWidget):
     closed = QtCore.Signal(str)
     #: A click on the surface, scanner mm -- the manager turns it into SET_XYZ.
     located = QtCore.Signal(float, float, float)
+    #: Ctrl+click, scanner mm -- SET_XYZ there, then SET_SEED on that voxel.
+    seeded = QtCore.Signal(float, float, float)
 
     _SHAPE_KEYS = {
         "mid": "1",
@@ -739,6 +747,7 @@ class SurfaceWindow(QtWidgets.QWidget):
 
         self.canvas = SurfaceCanvas(self)
         self.canvas.located.connect(self.located)
+        self.canvas.seeded.connect(self.seeded)
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self._built_map: tuple | None = None
         self._built_topology: int | None = None
@@ -779,6 +788,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("right-drag", "pan", None, group="view"),
                 Key("scroll", "zoom", None, group="view"),
                 Key("click", "move the crosshair there", None, group="view"),
+                Key("ctrl+click", "set the InstaCorr seed there", None, group="view"),
                 Key("h", "this list", self.help.toggle, group="window"),
                 Key("w", "close this window", self.close, group="window"),
             ]

@@ -156,3 +156,60 @@ def test_a_recomputed_mode_overlay_reaches_the_surface(window):
     second = install(0.7)
     assert not np.array_equal(first, second), "the surface still draws the first map"
     assert np.allclose(second, 0.7)
+
+
+def test_ctrl_click_on_the_surface_seeds_and_a_plain_click_only_locates(window):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    win._reset_camera()
+    located, seeded = [], []
+    win.located.connect(lambda *mm: located.append(mm))
+    win.seeded.connect(lambda *mm: seeded.append(mm))
+
+    def click(mods: Qt.KeyboardModifier) -> None:
+        at = QPointF(160.0, 160.0)
+        for kind in (QMouseEvent.Type.MouseButtonPress, QMouseEvent.Type.MouseButtonRelease):
+            buttons = (
+                Qt.MouseButton.LeftButton
+                if kind == QMouseEvent.Type.MouseButtonPress
+                else Qt.MouseButton.NoButton
+            )
+            ev = QMouseEvent(kind, at, at, Qt.MouseButton.LeftButton, buttons, mods)
+            (
+                c.mousePressEvent
+                if kind == QMouseEvent.Type.MouseButtonPress
+                else c.mouseReleaseEvent
+            )(ev)
+
+    click(Qt.KeyboardModifier.ControlModifier)
+    assert len(seeded) == 1 and not located
+    assert seeded[0] == pytest.approx(c.pick_mm(QPointF(160.0, 160.0)))
+    click(Qt.KeyboardModifier.NoModifier)
+    assert len(seeded) == 1 and len(located) == 1
+
+
+def test_a_surface_seed_lands_on_the_voxel_the_crosshair_moved_to(window):
+    from fastfuncstuff.viewer.ui.manager import WindowManager
+    from fastfuncstuff.viewer.vocab import SetSeed, SetXYZ
+
+    session, _ = window
+    sent = []
+
+    def dispatch(cmd):
+        sent.append(cmd)
+        session.do(cmd)
+
+    WindowManager(session, dispatch)._on_seeded(-9.0, -19.0, 1.0)
+    assert [type(c) for c in sent] == [SetXYZ, SetSeed]
+    # The fixture's grid: origin (-29, -29, -9) mm, 2 mm voxels.
+    assert session.state.crosshair == (10, 5, 5)
+    assert session.state.seed == (10, 5, 5)
