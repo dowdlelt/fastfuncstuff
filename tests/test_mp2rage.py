@@ -53,3 +53,22 @@ def test_noise_sigma_survives_correlated_noise_along_one_axis():
     mask = torch.ones(n, n, n, dtype=torch.bool)
     est = M.estimate_noise_sigma(x, mask)
     assert abs(est - sigma) / sigma < 0.06
+
+
+def test_regularised_uni_darkens_air_and_spares_tissue():
+    tissue = M.uni_from_inversions(torch.tensor([70.0]), torch.tensor([200.0]))
+    tissue_reg = M.uni_from_inversions(torch.tensor([70.0]), torch.tensor([200.0]), reg=175.0)
+    air_reg = M.uni_from_inversions(torch.tensor([3.0]), torch.tensor([-2.0]), reg=175.0)
+    assert abs(float(tissue_reg - tissue)) < 30  # a few counts out of 4095
+    assert float(air_reg) < 100  # air goes to black instead of a random +-0.5
+
+
+def test_denoise_mp2rage_on_phantom():
+    raw, (a, b), r = _phantom(n=40)
+    uni = M.uni_from_inversions(a, b)  # noiseless scanner UNI: supplies the polarity
+    out = M.denoise_mp2rage(raw[0].abs(), raw[1], uni, tissue_mask=r < 18)
+    assert abs(out["k"] - 1.0) < 0.05
+    assert abs(float(out["sigma"][0]) - 6.0) < 1.0
+    err_raw = (M.uni_from_inversions(raw[0], raw[1]) - uni)[r > 16].std()
+    err_den = (out["uni"] - uni)[r > 16].std()
+    assert err_den < 0.6 * err_raw
