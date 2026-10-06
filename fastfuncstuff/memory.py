@@ -470,6 +470,18 @@ def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
     return 28 * n_timepoints * 8
 
 
+def bytes_per_point_closest_triangle(n_candidates: int) -> int:
+    """
+    Estimate memory per query point for the candidate-face closest-point search.
+
+    Per candidate: three gathered (3,) float32 vertices, the (3,) closest point,
+    and ~12 float32 Voronoi scalars and masks, plus its int64 face index twice
+    (the table and the gather). 40 x 4 bytes covers the float work with the
+    temporaries torch.where leaves alive.
+    """
+    return n_candidates * (40 * 4 + 2 * 8 * 3)
+
+
 def bytes_per_voxel_ridge(
     n_timepoints: int,
     n_regressors: int,
