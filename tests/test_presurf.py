@@ -108,3 +108,47 @@ def test_util_presurf_cli_end_to_end(tmp_path):
     assert rc == 0
     for name in ("MPRAGEised_stripped", "stripmask", "stripmask_raw", "brainmask", "WMmask"):
         assert (tmp_path / "out" / f"sub_{name}.nii.gz").exists(), name
+
+
+def test_util_presurf_cli_denoise_reg(tmp_path):
+    """-denoise reg: joint INV1/INV2 denoising feeds both segmentations."""
+    import nibabel as nib
+    import numpy as np
+
+    from fastfuncstuff.cli.util_presurf import main
+    from fastfuncstuff.processing.mp2rage import uni_from_inversions
+
+    n = 24
+    g = torch.Generator().manual_seed(0)
+    r = (
+        torch.stack(torch.meshgrid(*[torch.arange(n, dtype=torch.float32)] * 3, indexing="ij"))
+        .sub(n / 2)
+        .norm(dim=0)
+    )
+    tissue = torch.stack([(r < 5), (r >= 5) & (r < 8), (r >= 8) & (r < 11)]).float()
+    tpm = (tissue + 0.01) / (tissue + 0.01).sum(0, keepdim=True)
+    inv1s = (tissue * torch.tensor([70.0, -30.0, -120.0])[:, None, None, None]).sum(0)
+    inv2 = (tissue * torch.tensor([200.0, 175.0, 110.0])[:, None, None, None]).sum(0) + 2
+    uni = uni_from_inversions(inv1s, inv2)
+    inv1 = (inv1s + 3 * torch.randn(n, n, n, generator=g)).abs()
+    inv2 = (inv2 + 3 * torch.randn(n, n, n, generator=g)).abs()
+
+    def write(path, arr):
+        a = arr.numpy()
+        a = a.transpose(2, 1, 0) if a.ndim == 3 else a.transpose(3, 2, 1, 0)
+        nib.save(nib.Nifti1Image(np.ascontiguousarray(a), np.eye(4)), str(path))
+
+    for name, arr in (("uni", uni), ("inv1", inv1), ("inv2", inv2), ("tpm", tpm)):
+        write(tmp_path / f"{name}.nii.gz", arr)
+    rc = main(
+        [
+            "-uni", str(tmp_path / "uni.nii.gz"), "-inv2", str(tmp_path / "inv2.nii.gz"),
+            "-inv1", str(tmp_path / "inv1.nii.gz"), "-denoise", "reg",
+            "-tpm", str(tmp_path / "tpm.nii.gz"), "-prefix", str(tmp_path / "o" / "s"),
+            "-ngaus", "1", "1", "1", "-samp", "1", "-affreg", "off",
+            "-device", "cpu", "-quiet",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    for name in ("UNIreg", "UNIreg_stripped", "inv2_denoised", "stripmask", "brainmask"):
+        assert (tmp_path / "o" / f"s_{name}.nii.gz").exists(), name

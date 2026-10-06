@@ -39,18 +39,29 @@ def uni_polarity(uni: Tensor, offset: float = UNI_OFFSET) -> Tensor:
 
 
 def uni_from_inversions(
-    inv1_signed: Tensor, inv2: Tensor, scale_k: float = 1.0, *, eps: float = 1e-6
+    inv1_signed: Tensor,
+    inv2: Tensor,
+    scale_k: float = 1.0,
+    *,
+    reg: float = 0.0,
+    eps: float = 1e-6,
 ) -> Tensor:
-    """Magnitude-domain UNI ``k·s1·s2 / ((k·s1)² + s2²)`` in scanner units (0..4095).
+    """Magnitude-domain UNI ``(k·s1·s2 − β) / ((k·s1)² + s2² + 2β)`` in scanner units.
 
     ``scale_k`` is the relative scaling of the stored INV1 vs INV2 (scanners scale each
     series independently); :func:`fit_inversion_scale` estimates it. Differs from the
     scanner's complex UNI by the ``cos Δφ`` phase-noise factor, which pulls the scanner's
     values toward the midpoint — compare denoised against this, not against scanner UNI.
+
+    ``reg = β > 0`` is O'Brien et al. (2014)'s robust combination: unchanged where the
+    signal product dwarfs β (tissue), driven to −½ (black) where both inversions are
+    small (air, where the ratio would otherwise amplify noise to full brightness). It
+    biases dark tissue slightly darker, so keep β small — after denoising, ``(2σ_INV2)²``
+    cleans the background for a ~14-count GM shift on 7 T test data.
     """
     a = scale_k * inv1_signed
-    den = a * a + inv2 * inv2
-    r = torch.where(den > eps, a * inv2 / den.clamp_min(eps), torch.zeros_like(den))
+    den = a * a + inv2 * inv2 + 2.0 * reg
+    r = torch.where(den > eps, (a * inv2 - reg) / den.clamp_min(eps), torch.zeros_like(den))
     return r * UNI_SCALE + UNI_OFFSET
 
 
@@ -197,3 +208,95 @@ def residual_cross_correlation(
     v1 = (box(r1 * r1 * m) / n - m1 * m1).clamp_min(1e-12)
     v2 = (box(r2 * r2 * m) / n - m2 * m2).clamp_min(1e-12)
     return torch.where(mask, c12 / (v1 * v2).sqrt(), torch.zeros_like(c12))
+
+
+def head_bbox(inv2: Tensor, margin: int, *, thresh_frac: float = 0.1) -> tuple[slice, ...]:
+    """Bounding box of everything brighter than ``thresh_frac`` of INV2's 99th percentile,
+    padded by ``margin`` — non-local means wraps offsets at the edges, so the crop needs a
+    margin of air at least the search+patch radius wide."""
+    v = inv2.flatten()
+    top = torch.quantile(v[:: max(1, v.numel() // 2_000_000)].float(), 0.99)
+    nz = torch.nonzero(inv2 > thresh_frac * top)
+    if nz.numel() == 0:
+        return tuple(slice(None) for _ in range(inv2.ndim))
+    lo = (nz.min(0).values - margin).clamp_min(0)
+    hi = nz.max(0).values + margin + 1
+    return tuple(slice(int(a), int(b)) for a, b in zip(lo, hi, strict=True))
+
+
+def interior_mask(inv2: Tensor, *, erode_mm: float = 14.0, vox_mm: float = 0.7) -> Tensor:
+    """The head's interior — essentially brain — without a segmentation.
+
+    INV2 > 10% of its 99th percentile (below CSF, so ventricles are not holes the
+    erosion eats outward from), then eroded ~``erode_mm``. The erosion matters: scalp,
+    muscle and fat have real texture that lag-1 differences read as noise (INV1 σ came out
+    8.8 over the whole head vs 7.5 over the brain on 7 T test data), and an inflated σ
+    over-smooths everything.
+    """
+    v = inv2.flatten()
+    top = torch.quantile(v[:: max(1, v.numel() // 2_000_000)].float(), 0.99)
+    m = (inv2 > 0.1 * top).float()[None, None]
+    for _ in range(max(1, round(erode_mm / vox_mm))):
+        m = -F.max_pool3d(-m, 3, stride=1, padding=1)  # 6-ish erosion by one voxel
+    out = m[0, 0] > 0.5
+    return out if bool(out.any()) else inv2 > 0.1 * top
+
+
+def denoise_mp2rage(
+    inv1: Tensor,
+    inv2: Tensor,
+    uni: Tensor,
+    *,
+    beta: float = 0.35,
+    search_radius: int = 2,
+    patch_radius: int = 1,
+    keep: float = 0.25,
+    reg_mult: float = 2.0,
+    tissue_mask: Tensor | None = None,
+) -> dict:
+    """Jointly denoise an MP2RAGE INV1/INV2 pair and rebuild UNI.
+
+    Polarity comes from the scanner ``uni``; the relative INV1/INV2 scale ``k`` is fitted to
+    it. ``keep`` blends that fraction of the original back in after denoising — full
+    non-local means flattens tissue texture into a plastic look, and a quarter of the
+    original restores natural grain at little noise cost. ``tissue_mask`` (default:
+    :func:`interior_mask`) is where σ and ``k`` are estimated.
+
+    Returns a dict: ``inv1_signed``, ``inv2`` (denoised+blended), ``uni`` (plain),
+    ``uni_reg`` (O'Brien with β = (``reg_mult``·σ_INV2)²), ``sigma`` (2,), ``k``, ``neff``.
+    """
+    inv1 = inv1.float()
+    inv2 = inv2.float()
+    if tissue_mask is None:
+        tissue_mask = interior_mask(inv2)
+    k = fit_inversion_scale(inv1, inv2, uni, tissue_mask)
+    x1 = uni_polarity(uni.float()) * inv1
+    raw = torch.stack([x1, inv2])
+    sigma = torch.tensor(
+        [estimate_noise_sigma(inv1, tissue_mask), estimate_noise_sigma(inv2, tissue_mask)]
+    )
+    box = head_bbox(inv2, search_radius + patch_radius + 2)
+    out, wsum = joint_nlm(
+        raw[(slice(None), *box)],
+        sigma,
+        rician=(False, True),
+        search_radius=search_radius,
+        patch_radius=patch_radius,
+        beta=beta,
+    )
+    den = raw.clone()
+    den[(slice(None), *box)] = out
+    den = (1.0 - keep) * den + keep * raw
+    neff = torch.ones_like(inv2)
+    neff[box] = wsum
+    reg = (reg_mult * float(sigma[1])) ** 2
+    return {
+        "inv1_signed": den[0],
+        "inv2": den[1].clamp_min(0.0),
+        "uni": uni_from_inversions(den[0], den[1], k),
+        "uni_reg": uni_from_inversions(den[0], den[1], k, reg=reg),
+        "sigma": sigma,
+        "k": k,
+        "neff": neff,
+        "reg": reg,
+    }
