@@ -28,7 +28,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 # rather than enforced, since resolve_pe_axis is case- and sign-tolerant.
 PE_AXIS_WORDS = ("x", "y", "z", "i", "j", "k", "AP", "PA", "LR", "RL", "IS", "SI")
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
-from fastfuncstuff.processing.affine import load_matrix_chain
+from fastfuncstuff.processing.affine import load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
 from fastfuncstuff.processing.rbr import invert_displacement_field
@@ -45,6 +45,7 @@ from fastfuncstuff.processing.segment import (
     segment_apply,
     undistort_input,
 )
+from fastfuncstuff.processing.segment_affine import AFFINE_REG_TYPES, affine_to_tpm
 
 _IMG_EXTS = (".nii.gz", ".nii.zst", ".nii", ".HEAD", ".BRIK.gz", ".BRIK")
 
@@ -236,7 +237,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="AFF",
         help="The .aff12.1D aligning input->template (as written by ffs_allineate "
         "-base template -source input); pass as-is, base-side->source-side. Omit to "
-        "assume the input is already roughly in template space.",
+        "register the input to the TPM itself (-affreg).",
+    )
+    aff.add_argument(
+        "-affreg",
+        default="mni",
+        choices=(*AFFINE_REG_TYPES, "off"),
+        help="When no -1Dmatrix is given, find the input->template affine the way SPM "
+        "Segment does (spm_maff8): register the image to the TPM itself by maximising the "
+        "mutual information between intensity and the tissue class the TPM expects, from "
+        "two starts (header origin, FoV centre). The value is the prior on zooms/shears: "
+        "'mni' (default, adult brains), 'eastern' (East Asian brains), 'subj' "
+        "(inter-subject), 'rigid' (almost rigid), 'none' (unregularised). 'off' skips it "
+        "and assumes the input already sits in template space. The result is written as "
+        "prefix_affine.aff12.1D, reusable as -1Dmatrix.",
     )
     suggest(
         aff.add_argument(
@@ -771,6 +785,38 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit("-pe_reverse must be on the same grid as -input")
     n_tissue = log_prior.shape[0]
 
+    # SPM registers the raw first channel (before any autobox masking), so do it here.
+    world_affine: torch.Tensor | None = None
+    if not args.matrix and args.affreg != "off":
+        with _step(f"Affine registration to the TPM ({args.affreg})", enabled=verbose):
+            aff_np = affine_to_tpm(
+                channels[0],
+                np.asarray(hdr["affine"], dtype=np.float64),
+                log_prior,
+                np.asarray(tpm_affine.cpu(), dtype=np.float64),
+                bg_low,
+                bg_high,
+                samp=args.samp,
+                fwhm=args.fwhm,
+                regtype=args.affreg,
+                dither=dither_steps[0],
+                verbose=verbose,
+            )
+        world_affine = torch.as_tensor(aff_np, dtype=torch.float64, device=device)
+        # in the -1Dmatrix convention (base=template -> source=input, voxel map inverted)
+        tpm_to_input = np.linalg.inv(
+            np.linalg.inv(np.asarray(tpm_affine.cpu(), dtype=np.float64))
+            @ aff_np
+            @ np.asarray(hdr["affine"], dtype=np.float64)
+        )
+        save_matrix_1D(
+            torch.as_tensor(tpm_to_input, dtype=torch.float32),
+            f"{_strip_ext(args.prefix)}_affine.aff12.1D",
+            base_affine=np.asarray(tpm_affine.cpu()),
+            source_affine=np.asarray(hdr["affine"]),
+            header="ffs_segment -affreg: template -> input (pass as -1Dmatrix)",
+        )
+
     # Autobox: automask the head, zero the background noise outside a padded mask, then
     # crop the now-empty margin — a speed step. Outputs are re-embedded at the ORIGINAL
     # dims/alignment (the box is remembered). `subj_affine` is shifted to the cropped grid
@@ -826,15 +872,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # Affine init: build the subject-voxel -> TPM-voxel map. A template->input
     # .aff12.1D chain gives template_vox -> input_vox (base=template); we want its
-    # inverse. Without a matrix, assume the input already sits in template space.
+    # inverse. Without one, -affreg already set world_affine (or "off": identity).
     vox2vox: torch.Tensor | None = None
-    world_affine: torch.Tensor | None = None
     if args.matrix:
         tpm_to_input = load_matrix_chain(
             args.matrix, base_affine=np.asarray(tpm_affine.cpu()), source_affine=fit_affine_np
         ).to(dtype=torch.float64, device=device)
         vox2vox = torch.linalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
-    else:
+    elif world_affine is None:
         world_affine = torch.eye(4, dtype=torch.float64, device=device)
 
     fit = fit_segment(
