@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.surface.voxelize import MeshDistance, _closest_on_triangles, winding_number
@@ -135,3 +136,38 @@ def test_mesh_distance_matches_brute_force():
     # The barycentrics reproduce the closest point.
     q = got.interpolate(f, v[:, 0]), got.interpolate(f, v[:, 1]), got.interpolate(f, v[:, 2])
     np.testing.assert_allclose(np.linalg.norm(np.stack(q, 1) - pts, axis=1), ref, atol=1e-4)
+
+
+@pytest.mark.gpu
+def test_brick_search_is_exact_on_cuda():
+    """The CUDA brick search against an all-faces scan, on a folded mesh.
+
+    Exact by its bound, so it must match brute force everywhere -- including
+    the points near the inside of a fold, where per-brick *candidates* without
+    a bound picked the wrong bank.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA")
+    from fastfuncstuff.surface import voxelize
+
+    if voxelize.brick_nearest is None:
+        pytest.skip("Triton")
+    dev = torch.device("cuda")
+    u, f = icosphere(4)
+    x, y, z = u.T
+    v = u * (6 + 0.8 * np.sin(5 * np.arctan2(y, x)) * np.sin(4 * np.arccos(z)))[:, None]
+    rng = np.random.default_rng(0)
+    g = np.stack(np.meshgrid(*[np.arange(-7.5, 7.5, 0.25)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    r = np.linalg.norm(g, axis=1)
+    pts = g[(r > 4.5) & (r < 7.5)] + rng.uniform(-0.01, 0.01, (1, 3))
+    got = MeshDistance(v, f)(pts, dev, brick_mm=1.0)
+    tri = torch.as_tensor(v, device=dev)[torch.as_tensor(f, device=dev)]
+    ref = []
+    for s in range(0, len(pts), 512):
+        q = torch.as_tensor(pts[s : s + 512], device=dev)[:, None]
+        d2, _ = _closest_on_triangles(q, tri[None, :, 0], tri[None, :, 1], tri[None, :, 2])
+        ref.append(d2.min(1).values.sqrt().cpu().numpy())
+    ref = np.concatenate(ref)
+    np.testing.assert_allclose(got.distance, ref, atol=2e-5)
+    q = np.stack([got.interpolate(f, v[:, k]) for k in range(3)], 1)
+    np.testing.assert_allclose(np.linalg.norm(q - pts, axis=1), ref, atol=1e-4)

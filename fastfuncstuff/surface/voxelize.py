@@ -20,6 +20,11 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
+try:
+    from fastfuncstuff.surface.distance_triton import BrickIndex, brick_nearest
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    BrickIndex = brick_nearest = None
+
 from fastfuncstuff.memory import (
     bytes_per_point_closest_triangle,
     get_available_memory,
@@ -223,11 +228,23 @@ class MeshDistance:
         self.tree = cKDTree(self.vertices[self.faces].mean(1))
 
     def __call__(
-        self, points: np.ndarray, device: torch.device | None = None, workers: int = -1
+        self,
+        points: np.ndarray,
+        device: torch.device | None = None,
+        workers: int = -1,
+        brick_mm: float | None = None,
     ) -> ClosestPoints:
+        """Closest points; ``brick_mm`` enables the exact brick search on CUDA.
+
+        Give ``brick_mm`` for dense point sets (a voxel ribbon: ~4 voxels, so a
+        brick holds a program's worth of points). Elsewhere, or without
+        Triton, the per-point KD search runs.
+        """
         device = device or torch.device("cpu")
         pts = np.asarray(points, np.float64)
         n = pts.shape[0]
+        if brick_mm is not None and device.type == "cuda" and brick_nearest is not None and n:
+            return self._bricks(pts, device, float(brick_mm))
         n_cand = self.k
         dist = np.empty(n, np.float32)
         face = np.empty(n, np.int64)
@@ -261,6 +278,57 @@ class MeshDistance:
             face[s:e] = cand_t[rows, best].cpu().numpy()
             bary[s:e] = w[rows, best].cpu().numpy()
         return ClosestPoints(dist, face, bary)
+
+    def _bricks(self, pts: np.ndarray, device: torch.device, brick_mm: float) -> ClosestPoints:
+        assert BrickIndex is not None and brick_nearest is not None
+        cache = getattr(self, "_brick_cache", None)
+        if cache is None or cache[0] != device:
+            cache = (
+                device,
+                BrickIndex(self.vertices, self.faces, device),
+                torch.as_tensor(self.vertices, device=device),
+                torch.as_tensor(self.faces, device=device),
+            )
+            self._brick_cache = cache
+        _, index, verts, faces = cache
+        # Bookkeeping on the device: in numpy the sort, gathers and scatter-back
+        # cost four times the search itself.
+        p = torch.as_tensor(pts, device=device)
+        key = torch.floor(p / brick_mm).long()
+        k0 = key.min(0).values
+        key -= k0
+        span = key.max(0).values + 1
+        flat = (key[:, 0] * span[1] + key[:, 1]) * span[2] + key[:, 2]
+        del key
+        flat, order = torch.sort(flat)
+        uniq, counts = torch.unique_consecutive(flat, return_counts=True)
+        del flat
+        cell = torch.stack(
+            [uniq // (span[1] * span[2]), (uniq // span[2]) % span[1], uniq % span[2]], 1
+        )
+        centres = (cell + k0 + 0.5) * brick_mm
+        # Any face's distance is an upper bound on the centre's; the nearest
+        # centroid's is a tight one.
+        _, near = self.tree.query(centres.cpu().numpy(), k=1, workers=-1)
+        tri = verts[faces[torch.as_tensor(near, device=device)]]
+        d2, _ = _closest_on_triangles(centres, tri[:, 0], tri[:, 1], tri[:, 2])
+        p = p[order]
+        dist, face = brick_nearest(index, p.float(), counts, centres, d2.sqrt() + 1e-4, brick_mm)
+        # Barycentrics for the winners only, with the tested torch geometry, in
+        # a frame at each point (float32 then keeps sub-micron precision).
+        bary = torch.empty((p.shape[0], 3), dtype=torch.float32, device=device)
+        step = max(1, get_available_memory(device, empty_cache=False) // 400)
+        for s in range(0, p.shape[0], step):
+            rel = (verts[faces[face[s : s + step]]] - p[s : s + step, None, :]).float()
+            _, bary[s : s + step] = _closest_on_triangles(
+                torch.zeros_like(rel[:, 0]), rel[:, 0], rel[:, 1], rel[:, 2]
+            )
+        del p
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.numel(), device=device)
+        return ClosestPoints(
+            dist[inv].cpu().numpy(), face[inv].cpu().numpy(), bary[inv].cpu().numpy()
+        )
 
 
 __all__ = ["ClosestPoints", "MeshDistance", "winding_number"]

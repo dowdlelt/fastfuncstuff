@@ -25,8 +25,9 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
+from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.surface.mesh import MeshTopology
-from fastfuncstuff.surface.voxelize import ClosestPoints, MeshDistance, winding_number
+from fastfuncstuff.surface.voxelize import MeshDistance, winding_number
 
 #: Rim labels, as LN2_LAYERS reads them.
 RIM_CSF, RIM_WM, RIM_GM = 1, 2, 3
@@ -189,13 +190,14 @@ def _smooth_on_mesh(values: np.ndarray, faces: np.ndarray, n_iter: int) -> np.nd
 
 
 def volume_quantile_depth(
-    rho: np.ndarray,
-    foot: ClosestPoints,
+    rho: torch.Tensor,
+    face: torch.Tensor,
+    bary: torch.Tensor,
     faces: np.ndarray,
     n_vertices: int,
     column_voxels: float = 64.0,
     bins: int = 64,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Equivolume depth as each voxel's volume quantile within its cortical column.
 
     Equivolume layers are the depths that split every column's volume into
@@ -214,38 +216,39 @@ def volume_quantile_depth(
     this was 0.007.
 
     Columns are white-foot patches (a voxel's weight split over its foot face's
-    vertices by barycentrics), depth histograms smoothed along the mesh until a
-    column holds ~``column_voxels`` voxels: the measured optimum at both 0.25
-    and 0.4 mm, where the rounds needed differed fourfold.
+    vertices by barycentrics: ``face``/``bary`` of its closest white point),
+    depth histograms smoothed along the mesh until a column holds
+    ~``column_voxels`` voxels: the measured optimum at both 0.25 and 0.4 mm,
+    where the rounds needed differed fourfold.
     """
-    f = np.asarray(faces)[foot.face]
-    b = np.minimum((rho * bins).astype(np.int64), bins - 1)
-    hist = np.zeros(n_vertices * bins)
+    device = rho.device
+    f = torch.as_tensor(faces, device=device)[face]  # (N, 3) vertex ids
+    b = torch.clamp((rho * bins).long(), max=bins - 1)
+    hist = torch.zeros(n_vertices * bins, dtype=torch.float64, device=device)
     for k in range(3):
-        hist += np.bincount(f[:, k] * bins + b, foot.bary[:, k], n_vertices * bins)
-    hist = hist.reshape(n_vertices, bins)
-    per_vertex = rho.size / max(np.count_nonzero(hist.sum(1)), 1)
+        hist.index_add_(0, f[:, k] * bins + b, bary[:, k].double())
+    hist = hist.view(n_vertices, bins)
+    per_vertex = rho.numel() / max(int((hist.sum(1) > 0).sum()), 1)
     n_iter = int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500))
-    hist = _smooth_on_mesh(hist, faces, n_iter)
-    total = hist.sum(1, keepdims=True)
-    cdf = np.concatenate([np.zeros((n_vertices, 1)), np.cumsum(hist, 1)], 1) / np.where(
-        total > 0, total, 1.0
-    )
+    # (V, bins) is small; the sparse smoothing stays with scipy.
+    smooth = _smooth_on_mesh(hist.cpu().numpy(), faces, n_iter)
+    total = smooth.sum(1, keepdims=True)
+    cdf = np.concatenate([np.zeros((n_vertices, 1)), np.cumsum(smooth, 1)], 1)
+    cdf = torch.as_tensor(cdf / np.where(total > 0, total, 1.0), dtype=torch.float32, device=device)
     frac = rho * bins - b
-    q = np.zeros(rho.size)
+    q = torch.zeros_like(rho)
     for k in range(3):
         v = f[:, k]
-        q += foot.bary[:, k] * (cdf[v, b] * (1 - frac) + cdf[v, b + 1] * frac)
-    return np.clip(q, 0.0, 1.0).astype(np.float32)
+        q += bary[:, k] * (cdf[v, b] * (1 - frac) + cdf[v, b + 1] * frac)
+    return q.clamp_(0.0, 1.0)
 
 
-def _neighbours(
-    idx: np.ndarray, shape: tuple[int, int, int]
-) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+def _neighbours(idx, shape: tuple[int, int, int]) -> Iterator[tuple]:
     """Six face neighbours of flat C-order indices: yields ``(in_grid, neighbour)``.
 
-    Flat-stride arithmetic, never an ``(N, 3)`` coordinate copy per direction:
-    at 0.2 mm the ribbon is 70M voxels and those copies were most of the time.
+    Flat-stride arithmetic on whatever array type comes in, never an ``(N, 3)``
+    coordinate copy per direction: at 0.2 mm the ribbon is 70M voxels and those
+    copies were most of the time.
     """
     strides = (shape[1] * shape[2], shape[2], 1)
     for axis in range(3):
@@ -255,22 +258,32 @@ def _neighbours(
             yield ok, idx + step * strides[axis]
 
 
-def _mid_sheet(metric: np.ndarray, gm_idx: np.ndarray, shape) -> np.ndarray:
+def _chunks(n: int, device: torch.device, bytes_per_item: int) -> Iterator[slice]:
+    step = max(1 << 16, get_available_memory(device, empty_cache=False) // bytes_per_item)
+    for s in range(0, n, step):
+        yield slice(s, min(n, s + step))
+
+
+def _mid_sheet(metric: torch.Tensor, gm_idx: torch.Tensor, shape) -> torch.Tensor:
     """Positions in ``gm_idx`` of the one-voxel sheet where ``metric`` crosses 0.5.
 
     As LN2_LAYERS marks it: of two GM face neighbours on either side of 0.5,
     the one nearer 0.5 (both on a tie); a voxel at exactly 0.5 always.
     """
+    size = int(np.prod(shape))
     # A dense lookup with NaN off GM answers "is the neighbour GM, and its
     # value" in one read.
-    grid = np.full(int(np.prod(shape)), np.nan, np.float32)
+    grid = torch.full((size,), float("nan"), dtype=torch.float32, device=metric.device)
     grid[gm_idx] = metric
-    s = metric - np.float32(0.5)
-    mark = s == 0
-    for ok, nb in _neighbours(gm_idx, shape):
-        t = np.where(ok, grid[np.where(ok, nb, 0)], np.nan) - np.float32(0.5)
-        mark |= ~np.isnan(t) & (np.signbit(s) != np.signbit(t)) & (np.abs(s) <= np.abs(t))
-    return np.flatnonzero(mark)
+    mark = torch.zeros(gm_idx.numel(), dtype=torch.bool, device=metric.device)
+    for sl in _chunks(gm_idx.numel(), metric.device, 96):
+        s = metric[sl] - 0.5
+        m = s == 0
+        for ok, nb in _neighbours(gm_idx[sl], shape):
+            t = torch.where(ok, grid[nb.clamp(0, size - 1)], float("nan")) - 0.5
+            m |= ~torch.isnan(t) & (torch.signbit(s) != torch.signbit(t)) & (s.abs() <= t.abs())
+        mark[sl] = m
+    return torch.nonzero(mark).squeeze(1)
 
 
 def cortical_depth_volumes(
@@ -294,7 +307,7 @@ def cortical_depth_volumes(
     n_layers : LN2_LAYERS ``-nr_layers``.
     column_voxels : voxels per smoothed column for equivolume (volume_quantile_depth).
     thick_limit : GM voxels thicker than this (mm) are counted and located.
-    k : candidate faces per voxel for the exact distance (see MeshDistance).
+    k : candidate faces per voxel for the CPU distance search (see MeshDistance).
     """
     device = device or torch.device("cpu")
     shape = tuple(int(s) for s in shape)
@@ -322,6 +335,8 @@ def cortical_depth_volumes(
     owner[wm] = 0  # Inside any white surface is WM.
 
     flat_owner = owner.reshape(-1)
+    # ~4 voxels a side: measured fastest at 0.35 mm (64 points fill a program).
+    brick_mm = 4.0 * float(np.abs(np.linalg.det(affine[:3, :3])) ** (1 / 3))
     per_hemi = []
     for h, s in enumerate(surfaces):
         idx = np.flatnonzero(flat_owner == h + 1)
@@ -330,63 +345,73 @@ def cortical_depth_volumes(
         ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
         pts = ijk @ affine[:3, :3].T + affine[:3, 3]
         del ijk
-        cw = MeshDistance(s.white, s.faces, k)(pts, device)
-        cp = MeshDistance(s.pial, s.faces, k)(pts, device)
+        cw = MeshDistance(s.white, s.faces, k)(pts, device, brick_mm=brick_mm)
+        cp = MeshDistance(s.pial, s.faces, k)(pts, device, brick_mm=brick_mm)
         del pts
         log(f"{s.name}: distances for {idx.size:,} GM voxels")
-        keep = np.ones(idx.size, bool)
+        face = torch.as_tensor(cw.face, device=device)
+        bary = torch.as_tensor(cw.bary, device=device)
+        dw = torch.as_tensor(cw.distance, device=device)
+        thick = dw + torch.as_tensor(cp.distance, device=device)
+        del cw, cp
+        rho = (dw / thick.clamp_min(1e-9)).clamp_(0.0, 1.0)
+        del dw
+        idx_t = torch.as_tensor(idx, device=device)
         if s.cortex is not None:
-            keep = cw.interpolate(s.faces, s.cortex.astype(np.float32)) >= 0.5
-            flat_owner[idx[~keep]] = -1
-        dw, dp = cw.distance, cp.distance
-        thick = dw + dp
-        rho = np.clip(dw / np.maximum(thick, 1e-9), 0.0, 1.0)
-        equivol = volume_quantile_depth(
-            rho[keep], cw.subset(keep), s.faces, len(s.white), column_voxels
-        )
-        per_hemi.append((idx[keep], rho[keep], equivol, thick[keep]))
-        del cw, cp, equivol
+            cortex = torch.as_tensor(s.cortex, dtype=torch.float32, device=device)
+            vf = torch.as_tensor(s.faces, device=device)[face]
+            keep = (cortex[vf] * bary).sum(1) >= 0.5
+            del vf
+            flat_owner[idx[~keep.cpu().numpy()]] = -1
+            idx_t, rho, thick, face, bary = (a[keep] for a in (idx_t, rho, thick, face, bary))
+        equivol = volume_quantile_depth(rho, face, bary, s.faces, len(s.white), column_voxels)
+        del face, bary
+        per_hemi.append((idx_t, rho, equivol, thick))
         log(f"{s.name}: depth metrics")
 
     if per_hemi:
-        gm_idx = np.concatenate([p[0] for p in per_hemi])
-        order = np.argsort(gm_idx, kind="stable")
-        gm_idx = gm_idx[order]
-        rho, equivol, thick = (
-            np.concatenate([p[i] for p in per_hemi]).astype(np.float32)[order] for i in (1, 2, 3)
-        )
+        gm_idx = torch.cat([p[0] for p in per_hemi])
+        gm_idx, order = torch.sort(gm_idx)
+        rho, equivol, thick = (torch.cat([p[i] for p in per_hemi])[order] for i in (1, 2, 3))
+        del order
     else:
-        gm_idx = np.zeros(0, np.int64)
-        rho = equivol = thick = np.zeros(0, np.float32)
+        gm_idx = torch.zeros(0, dtype=torch.long, device=device)
+        rho = equivol = thick = torch.zeros(0, dtype=torch.float32, device=device)
     del per_hemi
 
-    flat_wm = wm.reshape(-1)
+    owner_t = torch.as_tensor(flat_owner, device=device)
     borders = []
-    for ok, nb in _neighbours(gm_idx, shape):
-        nb = nb[ok]
-        borders.append(nb[flat_owner[nb] == 0])
-    border_idx = np.unique(np.concatenate(borders)) if borders else np.zeros(0, np.int64)
+    for sl in _chunks(gm_idx.numel(), device, 64):
+        for ok, nb in _neighbours(gm_idx[sl], shape):
+            nb = nb[ok]
+            borders.append(nb[owner_t[nb] == 0])
+    del owner_t
+    border_idx = torch.unique(torch.cat(borders)) if borders else gm_idx[:0]
     del borders
+    border_wm = torch.as_tensor(wm.reshape(-1), device=device)[border_idx]
     log("rim borders")
+    mid_ed, mid_ev = _mid_sheet(rho, gm_idx, shape), _mid_sheet(equivol, gm_idx, shape)
+    log("midGM sheets")
 
-    out = DepthVolumes(
+    def host(t: torch.Tensor) -> np.ndarray:
+        return t.cpu().numpy()
+
+    return DepthVolumes(
         shape=shape,
         n_layers=int(n_layers),
-        gm_idx=gm_idx,
-        rho=rho,
-        equivol=equivol,
-        thick=thick,
-        border_idx=border_idx,
-        border_wm=flat_wm[border_idx],
-        mid_equidist=_mid_sheet(rho, gm_idx, shape),
-        mid_equivol=_mid_sheet(equivol, gm_idx, shape),
+        gm_idx=host(gm_idx),
+        rho=host(rho),
+        equivol=host(equivol),
+        thick=host(thick),
+        border_idx=host(border_idx),
+        border_wm=host(border_wm),
+        mid_equidist=host(mid_ed),
+        mid_equivol=host(mid_ev),
         n_thick=int((thick > thick_limit).sum()),
         thick_limit=float(thick_limit),
         n_medial=int((flat_owner == -1).sum()),
         n_overlap=n_overlap,
     )
-    log("midGM sheets")
-    return out
 
 
 def regrid(
