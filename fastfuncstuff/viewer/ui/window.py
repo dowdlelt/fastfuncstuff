@@ -750,6 +750,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage(f"surfaces: wrote {names} .{suffix.strip()}", 6000)
 
+    def _layers_dialog(self) -> None:
+        from fastfuncstuff.viewer.layerexport import export_dialog
+
+        self._open_tool_dialog(export_dialog(self.session))
+
     def _install_surfaces_dialog(self) -> None:
         """Replace the subject's surface files with the edits, after asking.
 
@@ -1659,6 +1664,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     "ctrl+shift+s",
                     "save edited surfaces (as copies)",
                     self._save_surfaces_dialog,
+                    group="session",
+                ),
+                Binding(
+                    "ctrl+shift+l",
+                    "LayNii layers from the surfaces as shown (edits included)",
+                    self._layers_dialog,
                     group="session",
                 ),
                 Binding(

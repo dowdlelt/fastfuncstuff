@@ -256,8 +256,9 @@ class DialogSpec:
     blocked: str = ""
     #: What finishing did, for the status line. Empty says a layer was made,
     #: which is what a preproc tool does; a dialog that writes a file or moves
-    #: an existing layer says so instead.
-    done: str = ""
+    #: an existing layer says so instead. A callable is asked after the run,
+    #: for an outcome only the result knows (what was written, what to check).
+    done: str | Callable[[], str] = ""
 
 
 # ---------------------------------------------------------------------------
