@@ -20,7 +20,11 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-from fastfuncstuff.memory import bytes_per_point_closest_triangle, get_available_memory
+from fastfuncstuff.memory import (
+    bytes_per_point_closest_triangle,
+    get_available_memory,
+    saturating_point_count,
+)
 
 
 def _to_index(affine: np.ndarray, xyz: np.ndarray) -> np.ndarray:
@@ -228,7 +232,13 @@ class MeshDistance:
         if n == 0:
             return ClosestPoints(dist, face, bary)
         budget = get_available_memory(device, empty_cache=False)
-        step = int(max(1024, min(n, budget // bytes_per_point_closest_triangle(n_cand))))
+        # Free memory says what fits; past saturation a bigger chunk only costs
+        # RAM -- a whole-brain ribbon sized by memory alone peaked at 38 GB on CPU.
+        step = min(
+            budget // bytes_per_point_closest_triangle(n_cand),
+            saturating_point_count(device) // n_cand,
+        )
+        step = int(max(1024, min(n, step)))
         verts = torch.as_tensor(self.vertices, dtype=torch.float32, device=device)
         faces = torch.as_tensor(self.faces, device=device)
         for s in range(0, n, step):
