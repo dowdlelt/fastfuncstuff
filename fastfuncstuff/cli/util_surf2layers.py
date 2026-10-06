@@ -25,8 +25,8 @@ surfaces, on any grid -- no rim file, no MapIcosahedron/3dSurf2Vol, no flood fil
 
 GM is the solid between the two closed meshes (a winding-number fill: hole-free at
 any resolution); depth uses exact point-to-mesh distances; equivolume uses the
-meshes' own vertex areas (Waehnert's model) rather than curvature estimated from
-voxels. The medial wall (label/?h.cortex.label) is excluded.
+volume quantile of each voxel within its cortical column -- volume preserved by
+construction, as LN2_LAYERS aims for, with no reliance on white/pial vertex pairing. The medial wall (label/?h.cortex.label) is excluded.
 
 The grid is -master (default: the subject's mri/rawavg.mgz, i.e. the original
 anatomical) at voxel size -dxyz (default: the master's own), cropped to the cortex
@@ -77,11 +77,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     s.add_argument("-pial", default="pial", help="Pial surface name in surf/ (pial)")
     s.add_argument("-nr_layers", type=int, default=3, help="Number of layers (3)")
     s.add_argument(
-        "-area_smooth",
-        type=int,
-        default=10,
+        "-column_voxels",
+        type=float,
+        default=64.0,
         metavar="N",
-        help="1-ring smoothing rounds on the vertex areas behind equivolume (10)",
+        help="Equivolume: voxels per cortical column whose volume is split into equal "
+        "layers; columns are widened along the surface until they hold this many (64)",
     )
     s.add_argument(
         "-thick_warn", type=float, default=6.0, metavar="MM", help="Warn above this thickness (6)"
@@ -168,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             autobox=not args.no_autobox,
             pad_mm=args.autobox_pad,
             n_layers=args.nr_layers,
-            area_smooth=args.area_smooth,
+            column_voxels=args.column_voxels,
             thick_limit=args.thick_warn,
             device=device,
             verbose=verbose,

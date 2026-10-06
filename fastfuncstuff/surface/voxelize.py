@@ -196,6 +196,9 @@ class ClosestPoints:
     face: np.ndarray  # (N,) int64
     bary: np.ndarray  # (N, 3) weights of faces[face]
 
+    def subset(self, keep: np.ndarray) -> ClosestPoints:
+        return ClosestPoints(self.distance[keep], self.face[keep], self.bary[keep])
+
     def interpolate(self, faces: np.ndarray, values: np.ndarray) -> np.ndarray:
         """A per-vertex quantity at the closest points."""
         f = np.asarray(faces)[self.face]

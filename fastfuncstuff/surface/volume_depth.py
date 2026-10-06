@@ -5,7 +5,7 @@ rebuilds the geometry from it: distances to the borders by voxel propagation,
 equivolume factors from voxel-counted curvature, smoothed for hundreds of
 iterations. A FreeSurfer subject already *has* that geometry, exactly: GM is
 the solid between the white and pial meshes, the distances are point-to-mesh
-distances, and the column's area at each end is the mesh's vertex area. So
+distances, and a cortical column is the GM above a patch of white surface. So
 every output here is computed from the meshes and only written onto voxels at
 the end, at whatever grid is asked for.
 
@@ -25,9 +25,8 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas
-from fastfuncstuff.surface.profiles import volume_fraction
-from fastfuncstuff.surface.voxelize import MeshDistance, winding_number
+from fastfuncstuff.surface.mesh import MeshTopology
+from fastfuncstuff.surface.voxelize import ClosestPoints, MeshDistance, winding_number
 
 #: Rim labels, as LN2_LAYERS reads them.
 RIM_CSF, RIM_WM, RIM_GM = 1, 2, 3
@@ -171,27 +170,73 @@ class DepthVolumes:
         ]
 
 
-def _smooth_vertex_values(values: np.ndarray, faces: np.ndarray, n_iter: int) -> np.ndarray:
-    """``n_iter`` rounds of 1-ring averaging (self included).
-
-    Barycentric vertex areas are noisy triangle to triangle; the equivolume
-    correction depends on the white/pial ratio, which should vary on the scale
-    of folding, not of the mesh.
-    """
+def _smooth_on_mesh(values: np.ndarray, faces: np.ndarray, n_iter: int) -> np.ndarray:
+    """``n_iter`` rounds of 1-ring averaging (self included) of ``(V, ...)`` values."""
+    out = np.asarray(values, np.float64)
     if n_iter <= 0:
-        return np.asarray(values, np.float64)
-    topo = MeshTopology.from_faces(faces, values.shape[0])
+        return out
+    n = out.shape[0]
+    topo = MeshTopology.from_faces(faces, n)
     i, j = topo.edges[:, 0], topo.edges[:, 1]
-    n = values.shape[0]
     adj = sp.coo_matrix(
         (np.ones(2 * i.size + n), (np.r_[i, j, np.arange(n)], np.r_[j, i, np.arange(n)])),
         shape=(n, n),
     ).tocsr()
-    deg = np.asarray(adj.sum(1)).ravel()
-    out = np.asarray(values, np.float64)
+    inv_deg = (1.0 / np.asarray(adj.sum(1)).ravel()).reshape((n,) + (1,) * (out.ndim - 1))
     for _ in range(n_iter):
-        out = adj @ out / deg
+        out = adj @ out * inv_deg
     return out
+
+
+def volume_quantile_depth(
+    rho: np.ndarray,
+    foot: ClosestPoints,
+    faces: np.ndarray,
+    n_vertices: int,
+    column_voxels: float = 64.0,
+    bins: int = 64,
+) -> np.ndarray:
+    """Equivolume depth as each voxel's volume quantile within its cortical column.
+
+    Equivolume layers are the depths that split every column's volume into
+    equal parts. Rather than model a column's shape (Waehnert's linear area
+    between paired white and pial vertices), measure it: the voxels whose
+    nearest white point falls on a vertex's patch *are* that column, their
+    count is its volume, and the volume fraction below a voxel's equidistant
+    depth is its equivolume depth -- preserved by construction. LN2_LAYERS does
+    the same at one depth (the fraction of each anchor's voxels below
+    mid-depth); this does it at every depth, with sub-voxel columns.
+
+    Why not the paired areas: FreeSurfer's pial vertex sits a median 1 mm (p90
+    2.4 mm) sideways of its white partner, so "the column's pial area" is some
+    other column's. On a folded synthetic with Bok ground truth and that much
+    slide, paired areas did worse than equidistant (mean error 0.027 vs 0.022);
+    this was 0.007.
+
+    Columns are white-foot patches (a voxel's weight split over its foot face's
+    vertices by barycentrics), depth histograms smoothed along the mesh until a
+    column holds ~``column_voxels`` voxels: the measured optimum at both 0.25
+    and 0.4 mm, where the rounds needed differed fourfold.
+    """
+    f = np.asarray(faces)[foot.face]
+    b = np.minimum((rho * bins).astype(np.int64), bins - 1)
+    hist = np.zeros(n_vertices * bins)
+    for k in range(3):
+        hist += np.bincount(f[:, k] * bins + b, foot.bary[:, k], n_vertices * bins)
+    hist = hist.reshape(n_vertices, bins)
+    per_vertex = rho.size / max(np.count_nonzero(hist.sum(1)), 1)
+    n_iter = int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500))
+    hist = _smooth_on_mesh(hist, faces, n_iter)
+    total = hist.sum(1, keepdims=True)
+    cdf = np.concatenate([np.zeros((n_vertices, 1)), np.cumsum(hist, 1)], 1) / np.where(
+        total > 0, total, 1.0
+    )
+    frac = rho * bins - b
+    q = np.zeros(rho.size)
+    for k in range(3):
+        v = f[:, k]
+        q += foot.bary[:, k] * (cdf[v, b] * (1 - frac) + cdf[v, b + 1] * frac)
+    return np.clip(q, 0.0, 1.0).astype(np.float32)
 
 
 def _neighbours(
@@ -234,7 +279,7 @@ def cortical_depth_volumes(
     shape: tuple[int, int, int],
     n_layers: int = 3,
     *,
-    area_smooth: int = 10,
+    column_voxels: float = 64.0,
     thick_limit: float = 6.0,
     k: int = 24,
     device: torch.device | None = None,
@@ -247,7 +292,7 @@ def cortical_depth_volumes(
     surfaces : one entry per hemisphere.
     affine, shape : the output grid, voxel -> scanner RAS, ``(X, Y, Z)``.
     n_layers : LN2_LAYERS ``-nr_layers``.
-    area_smooth : 1-ring smoothing rounds on the vertex areas behind equivolume.
+    column_voxels : voxels per smoothed column for equivolume (volume_quantile_depth).
     thick_limit : GM voxels thicker than this (mm) are counted and located.
     k : candidate faces per voxel for the exact distance (see MeshDistance).
     """
@@ -296,17 +341,11 @@ def cortical_depth_volumes(
         dw, dp = cw.distance, cp.distance
         thick = dw + dp
         rho = np.clip(dw / np.maximum(thick, 1e-9), 0.0, 1.0)
-        aw = _smooth_vertex_values(
-            vertex_areas(s.white, s.faces, len(s.white)), s.faces, area_smooth
+        equivol = volume_quantile_depth(
+            rho[keep], cw.subset(keep), s.faces, len(s.white), column_voxels
         )
-        ap = _smooth_vertex_values(vertex_areas(s.pial, s.faces, len(s.pial)), s.faces, area_smooth)
-        # Each closest point names a column; trust the one on the nearer surface
-        # more, so the factor varies smoothly across the ribbon.
-        alpha_w = volume_fraction(rho, cw.interpolate(s.faces, aw), cw.interpolate(s.faces, ap))
-        alpha_p = volume_fraction(rho, cp.interpolate(s.faces, aw), cp.interpolate(s.faces, ap))
-        equivol = np.clip((1.0 - rho) * alpha_w + rho * alpha_p, 0.0, 1.0)
-        per_hemi.append((idx[keep], rho[keep], equivol[keep].astype(np.float32), thick[keep]))
-        del cw, cp, alpha_w, alpha_p, equivol
+        per_hemi.append((idx[keep], rho[keep], equivol, thick[keep]))
+        del cw, cp, equivol
         log(f"{s.name}: depth metrics")
 
     if per_hemi:
@@ -407,7 +446,7 @@ def export_depth_volumes(
     autobox: bool = True,
     pad_mm: float = 1.0,
     n_layers: int = 3,
-    area_smooth: int = 10,
+    column_voxels: float = 64.0,
     thick_limit: float = 6.0,
     device: torch.device | None = None,
     verbose: bool = False,
@@ -439,7 +478,7 @@ def export_depth_volumes(
         affine,
         shape,
         n_layers,
-        area_smooth=area_smooth,
+        column_voxels=column_voxels,
         thick_limit=thick_limit,
         device=device,
         verbose=verbose,
@@ -464,4 +503,5 @@ __all__ = [
     "export_depth_volumes",
     "regrid",
     "thick_report",
+    "volume_quantile_depth",
 ]
