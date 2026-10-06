@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -141,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     verbose = not args.quiet
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
+    Path(stem).parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
     uni, uni_hdr = load_image(args.uni, device=device)
