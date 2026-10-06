@@ -190,6 +190,18 @@ def equivolume_fraction(alpha, white_area, pial_area):
     return np.where(flat, a, (root - aw) / np.where(flat, 1.0, delta))
 
 
+def volume_fraction(rho, white_area, pial_area):
+    """Inverse of :func:`equivolume_fraction`: volume fraction below depth ``rho``.
+
+    With area linear in depth, the volume from white to ``rho`` is
+    ``aw*rho + (ap - aw)*rho^2/2``; normalised by the whole column's.
+    """
+    r = np.asarray(rho, np.float64)
+    aw = np.asarray(white_area, np.float64)
+    ap = np.asarray(pial_area, np.float64)
+    return (2.0 * aw * r + (ap - aw) * r * r) / np.maximum(aw + ap, 1e-12)
+
+
 def sample_depths(
     white: np.ndarray,
     pial: np.ndarray,
@@ -390,6 +402,7 @@ def slab_contour_order(
 __all__ = [
     "SCORES",
     "equivolume_fraction",
+    "volume_fraction",
     "sample_depths",
     "ProfileSpec",
     "Profiles",
