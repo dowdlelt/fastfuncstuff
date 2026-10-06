@@ -111,13 +111,11 @@ def master_grid(path: str | Path) -> tuple[np.ndarray, tuple[int, int, int]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.io.freesurfer import load_hemisphere
     from fastfuncstuff.surface.volume_depth import (
         RibbonSurfaces,
-        cortical_depth_volumes,
-        crop_to_points,
-        regrid,
+        export_depth_volumes,
+        thick_report,
     )
 
     args = parse_args(argv)
@@ -138,13 +136,14 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"no -master given and {subj}/mri has no rawavg.mgz or orig.mgz")
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
-    Path(stem).parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
     hemis = ("lh", "rh") if args.hemi == "both" else (args.hemi,)
     surfaces = []
     for hemi in hemis:
-        h = load_hemisphere(subj, hemi, states=(args.white, args.pial), morph=(), patches=False)
+        # load_hemisphere requires white and pial whichever pair is asked for.
+        states = tuple(dict.fromkeys(("white", "pial", args.white, args.pial)))
+        h = load_hemisphere(subj, hemi, states=states, morph=(), patches=False)
         if args.white not in h.states:
             raise SystemExit(f"{subj}/surf/{hemi}.{args.white} not found")
         if args.pial not in h.states:
@@ -153,52 +152,36 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {hemi}: no label/{hemi}.cortex.label -- medial wall kept")
         surfaces.append(RibbonSurfaces.from_hemisphere(h, args.white, args.pial))
 
-    affine, shape = master_grid(master)
-    if args.dxyz is not None:
-        if len(args.dxyz) not in (1, 3):
-            raise SystemExit("-dxyz takes 1 or 3 values")
-        affine, shape = regrid(affine, shape, args.dxyz)
-    if not args.no_autobox:
-        pial = np.concatenate([s.pial for s in surfaces])
-        try:
-            affine, shape, _ = crop_to_points(affine, shape, pial, args.autobox_pad)
-        except ValueError as err:
-            raise SystemExit(f"-master {master}: {err}") from err
-    vox = np.linalg.norm(affine[:3, :3], axis=0)
+    if args.dxyz is not None and len(args.dxyz) not in (1, 3):
+        raise SystemExit("-dxyz takes 1 or 3 values")
     if verbose:
-        print(
-            f"ffs_util_surf2layers: {', '.join(hemis)} onto {shape[0]}x{shape[1]}x{shape[2]} "
-            f"at {' x '.join(f'{v:.3g}' for v in vox)} mm (master {master})"
+        print(f"ffs_util_surf2layers: master {master}")
+    affine, shape = master_grid(master)
+    try:
+        out, affine, _ = export_depth_volumes(
+            surfaces,
+            affine,
+            shape,
+            stem,
+            ext,
+            dxyz=args.dxyz,
+            autobox=not args.no_autobox,
+            pad_mm=args.autobox_pad,
+            n_layers=args.nr_layers,
+            area_smooth=args.area_smooth,
+            thick_limit=args.thick_warn,
+            device=device,
+            verbose=verbose,
         )
-
-    out = cortical_depth_volumes(
-        surfaces,
-        affine,
-        shape,
-        args.nr_layers,
-        area_smooth=args.area_smooth,
-        thick_limit=args.thick_warn,
-        device=device,
-        verbose=verbose,
-    )
-    if out.n_gm == 0:
-        raise SystemExit("no GM voxel centres on this grid: is -master aligned to the anatomical?")
-    for tag, vol in out.outputs().items():
-        save_nifti(vol, f"{stem}_{tag}{ext}", affine=affine)
-
+    except ValueError as err:
+        raise SystemExit(f"ffs_util_surf2layers: {err}") from err
     if verbose:
         print(
             f"  GM voxels {out.n_gm:,}  medial wall dropped {out.n_medial:,}"
             + (f"  hemisphere overlap {out.n_overlap:,}" if out.n_overlap else "")
         )
-    if out.n_thick:
-        print(
-            f"WARNING: {out.n_thick:,} GM voxels ({100 * out.n_thick / out.n_gm:.2f}%) are "
-            f"thicker than {out.thick_limit:g} mm -- check the pial surface there. "
-            "Largest clusters (voxels @ scanner RAS mm):"
-        )
-        for n, c in out.thick_clusters(affine):
-            print(f"    {n:7,d} @ ({c[0]:7.1f}, {c[1]:7.1f}, {c[2]:7.1f})")
+    for line in thick_report(out, affine):
+        print(line)
     if verbose:
         print(f"ffs_util_surf2layers done in {time.time() - t0:.0f}s -> {stem}_*{ext}")
     return 0

@@ -320,11 +320,86 @@ def crop_to_points(
     return out, (nx, ny, nz), tuple(slice(a, b + 1) for a, b in zip(lo, hi, strict=True))
 
 
+def thick_report(out: DepthVolumes, affine: np.ndarray, top: int = 5) -> list[str]:
+    """The over-thick warning as printable lines; empty when there is none."""
+    if not out.n_thick:
+        return []
+    lines = [
+        f"WARNING: {out.n_thick:,} GM voxels ({100 * out.n_thick / max(out.n_gm, 1):.2f}%) are "
+        f"thicker than {out.thick_limit:g} mm -- check the pial surface there. "
+        "Largest clusters (voxels @ scanner RAS mm):"
+    ]
+    for n, c in out.thick_clusters(affine, top):
+        lines.append(f"    {n:7,d} @ ({c[0]:7.1f}, {c[1]:7.1f}, {c[2]:7.1f})")
+    return lines
+
+
+def export_depth_volumes(
+    surfaces: list[RibbonSurfaces],
+    master_affine: np.ndarray,
+    master_shape: tuple[int, int, int],
+    stem: str,
+    ext: str = ".nii.gz",
+    *,
+    dxyz=None,
+    autobox: bool = True,
+    pad_mm: float = 1.0,
+    n_layers: int = 3,
+    area_smooth: int = 10,
+    thick_limit: float = 6.0,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> tuple[DepthVolumes, np.ndarray, list[str]]:
+    """Grid from a master, compute, and write ``{stem}_{tag}{ext}`` for every output.
+
+    The whole of ffs_util_surf2layers below its argument parsing, shared with the
+    viewer's export so the two cannot drift. Returns ``(volumes, grid affine,
+    written paths)``.
+    """
+    from pathlib import Path
+
+    from fastfuncstuff.io.afni import save_nifti
+
+    affine, shape = np.asarray(master_affine, np.float64), tuple(master_shape)
+    if dxyz is not None:
+        affine, shape = regrid(affine, shape, dxyz)
+    if autobox:
+        pial = np.concatenate([s.pial for s in surfaces])
+        affine, shape, _ = crop_to_points(affine, shape, pial, pad_mm)
+    if verbose:
+        vox = np.linalg.norm(affine[:3, :3], axis=0)
+        print(
+            f"{', '.join(s.name for s in surfaces)} onto {shape[0]}x{shape[1]}x{shape[2]} "
+            f"at {' x '.join(f'{v:.3g}' for v in vox)} mm"
+        )
+    out = cortical_depth_volumes(
+        surfaces,
+        affine,
+        shape,
+        n_layers,
+        area_smooth=area_smooth,
+        thick_limit=thick_limit,
+        device=device,
+        verbose=verbose,
+    )
+    if out.n_gm == 0:
+        raise ValueError("no GM voxel centres on this grid: is the master aligned to the anat?")
+    Path(stem).parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for tag, vol in out.outputs().items():
+        path = f"{stem}_{tag}{ext}"
+        save_nifti(vol, path, affine=affine)
+        written.append(path)
+    return out, affine, written
+
+
 __all__ = [
     "OUTPUT_TAGS",
     "DepthVolumes",
     "RibbonSurfaces",
     "cortical_depth_volumes",
     "crop_to_points",
+    "export_depth_volumes",
     "regrid",
+    "thick_report",
 ]

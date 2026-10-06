@@ -59,3 +59,24 @@ def test_writes_laynii_set_on_upsampled_master(tmp_path, capsys):
     main([*args[:-2], "-prefix", str(tmp_path / "lh"), "-hemi", "lh", "-device", "cpu", "-quiet"])
     lh = np.asarray(nib.load(f"{tmp_path / 'lh'}_rim.nii.gz").dataobj)
     assert 0.4 < (lh == 3).sum() / (rim == 3).sum() < 0.6
+
+
+def test_alternative_surface_names(tmp_path):
+    subj, master = _subject(tmp_path)
+    for hemi in ("lh", "rh"):
+        (subj / "surf" / f"{hemi}.pial.ffsedit").write_bytes(
+            (subj / "surf" / f"{hemi}.pial").read_bytes()
+        )
+    prefix = tmp_path / "alt"
+    args = [
+        "-fs_subj",
+        str(subj),
+        "-master",
+        str(master),
+        "-pial",
+        "pial.ffsedit",
+        "-prefix",
+        str(prefix),
+    ]
+    assert main([*args, "-device", "cpu", "-quiet"]) == 0
+    assert (np.asarray(nib.load(f"{prefix}_rim.nii.gz").dataobj) == 3).any()
