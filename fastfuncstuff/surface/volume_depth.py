@@ -18,6 +18,7 @@ one-voxel sheet at the voxel nearest each 0.5 crossing.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -66,29 +67,86 @@ class RibbonSurfaces:
 
 @dataclass
 class DepthVolumes:
-    """LN2_LAYERS's outputs on one grid, ``(X, Y, Z)``."""
+    """LN2_LAYERS's outputs on one grid, ``(X, Y, Z)``, held sparse.
 
-    rim: np.ndarray
-    metric_equidist: np.ndarray
-    layers_equidist: np.ndarray
-    mid_gm_equidist: np.ndarray
-    metric_equivol: np.ndarray
-    layers_equivol: np.ndarray
-    mid_gm_equivol: np.ndarray
-    thickness: np.ndarray
+    Only the GM band is stored -- a few percent of a 0.2 mm grid -- and each
+    dense volume is built when asked for, so writing them holds one at a time
+    (whole-brain 0.2 mm peaked at 24.7 GB with all eight dense at once).
+    """
+
+    shape: tuple[int, int, int]
+    n_layers: int
+    #: Flat C-order indices of GM voxels (sorted), and the values there.
+    gm_idx: np.ndarray
+    rho: np.ndarray  # equidistant metric
+    equivol: np.ndarray
+    thick: np.ndarray
+    #: Border voxels and whether each is on the WM side.
+    border_idx: np.ndarray
+    border_wm: np.ndarray
+    #: Positions *within gm_idx* of the two midGM sheets.
+    mid_equidist: np.ndarray
+    mid_equivol: np.ndarray
     #: GM voxels thicker than ``thick_limit`` -- real cortex is not; these are
     #: surface errors (pial through a vessel or the dura, a bad edit).
     n_thick: int = 0
     thick_limit: float = 6.0
-    n_gm: int = 0
     #: GM-by-fill voxels dropped as medial wall.
     n_medial: int = 0
     #: GM voxels claimed by two hemispheres, or by one's GM and the other's WM.
     n_overlap: int = 0
 
-    def outputs(self) -> dict[str, np.ndarray]:
-        """LN2_LAYERS file tag -> volume."""
-        return {tag: getattr(self, tag.replace("midGM", "mid_gm")) for tag in OUTPUT_TAGS}
+    @property
+    def n_gm(self) -> int:
+        return int(self.gm_idx.size)
+
+    def _dense(self, values, idx=None, dtype=np.float32) -> np.ndarray:
+        out = np.zeros(int(np.prod(self.shape)), dtype)
+        out[self.gm_idx if idx is None else idx] = values
+        return out.reshape(self.shape)
+
+    def _layers(self, metric: np.ndarray) -> np.ndarray:
+        lay = np.clip(np.ceil(metric * self.n_layers), 1, self.n_layers)
+        return self._dense(lay, dtype=np.int16)
+
+    @property
+    def rim(self) -> np.ndarray:
+        out = self._dense(RIM_GM, dtype=np.int16).reshape(-1)
+        out[self.border_idx] = np.where(self.border_wm, RIM_WM, RIM_CSF)
+        return out.reshape(self.shape)
+
+    @property
+    def metric_equidist(self) -> np.ndarray:
+        return self._dense(self.rho)
+
+    @property
+    def metric_equivol(self) -> np.ndarray:
+        return self._dense(self.equivol)
+
+    @property
+    def layers_equidist(self) -> np.ndarray:
+        return self._layers(self.rho)
+
+    @property
+    def layers_equivol(self) -> np.ndarray:
+        return self._layers(self.equivol)
+
+    @property
+    def mid_gm_equidist(self) -> np.ndarray:
+        return self._dense(1, self.gm_idx[self.mid_equidist], np.int16)
+
+    @property
+    def mid_gm_equivol(self) -> np.ndarray:
+        return self._dense(1, self.gm_idx[self.mid_equivol], np.int16)
+
+    @property
+    def thickness(self) -> np.ndarray:
+        return self._dense(self.thick)
+
+    def outputs(self) -> Iterator[tuple[str, np.ndarray]]:
+        """``(LN2_LAYERS file tag, volume)``, built one at a time."""
+        for tag in OUTPUT_TAGS:
+            yield tag, getattr(self, tag.replace("midGM", "mid_gm"))
 
     def thick_clusters(
         self, affine: np.ndarray, top: int | None = 5
@@ -99,12 +157,13 @@ class DepthVolumes:
         """
         from scipy import ndimage
 
-        lab, n = ndimage.label(self.thickness > self.thick_limit)
+        over = self._dense(True, self.gm_idx[self.thick > self.thick_limit], bool)
+        lab, n = ndimage.label(over)
         if n == 0:
             return []
         sizes = np.bincount(lab.ravel())[1:]
         order = np.argsort(-sizes, kind="stable")[:top]
-        centres = ndimage.center_of_mass(lab > 0, lab, (order + 1).tolist())
+        centres = ndimage.center_of_mass(over, lab, (order + 1).tolist())
         a = np.asarray(affine, np.float64)
         return [
             (int(sizes[i]), a[:3, :3] @ np.asarray(c) + a[:3, 3])
@@ -135,37 +194,38 @@ def _smooth_vertex_values(values: np.ndarray, faces: np.ndarray, n_iter: int) ->
     return out
 
 
-def _neighbours(ijk: np.ndarray, shape: tuple[int, int, int]):
-    """The six face neighbours of each voxel: yields ``(valid, flat_index)``."""
-    for axis in range(3):
-        for step in (-1, 1):
-            nb = ijk.copy()
-            nb[:, axis] += step
-            valid = (nb[:, axis] >= 0) & (nb[:, axis] < shape[axis])
-            flat = np.zeros(ijk.shape[0], np.int64)
-            flat[valid] = np.ravel_multi_index(tuple(nb[valid].T), shape)
-            yield valid, flat
+def _neighbours(
+    idx: np.ndarray, shape: tuple[int, int, int]
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Six face neighbours of flat C-order indices: yields ``(in_grid, neighbour)``.
 
-
-def _mid_sheet(metric: np.ndarray, gm: np.ndarray, gm_idx: np.ndarray, shape) -> np.ndarray:
-    """One-voxel sheet where ``metric`` crosses 0.5, as LN2_LAYERS marks it.
-
-    Of two GM face neighbours on either side of 0.5, the one nearer 0.5 is
-    marked (both on a tie); a voxel at exactly 0.5 always is.
+    Flat-stride arithmetic, never an ``(N, 3)`` coordinate copy per direction:
+    at 0.2 mm the ribbon is 70M voxels and those copies were most of the time.
     """
-    flat_m = metric.reshape(-1)
-    flat_gm = gm.reshape(-1)
-    s = flat_m[gm_idx] - 0.5
+    strides = (shape[1] * shape[2], shape[2], 1)
+    for axis in range(3):
+        coord = (idx // strides[axis]) % shape[axis]
+        for step in (-1, 1):
+            ok = (coord > 0) if step < 0 else (coord < shape[axis] - 1)
+            yield ok, idx + step * strides[axis]
+
+
+def _mid_sheet(metric: np.ndarray, gm_idx: np.ndarray, shape) -> np.ndarray:
+    """Positions in ``gm_idx`` of the one-voxel sheet where ``metric`` crosses 0.5.
+
+    As LN2_LAYERS marks it: of two GM face neighbours on either side of 0.5,
+    the one nearer 0.5 (both on a tie); a voxel at exactly 0.5 always.
+    """
+    # A dense lookup with NaN off GM answers "is the neighbour GM, and its
+    # value" in one read.
+    grid = np.full(int(np.prod(shape)), np.nan, np.float32)
+    grid[gm_idx] = metric
+    s = metric - np.float32(0.5)
     mark = s == 0
-    ijk = np.stack(np.unravel_index(gm_idx, shape), 1)
-    for valid, nb in _neighbours(ijk, shape):
-        ok = valid.copy()
-        ok[valid] = flat_gm[nb[valid]]
-        t = flat_m[nb] - 0.5
-        mark |= ok & (np.signbit(s) != np.signbit(t)) & (np.abs(s) <= np.abs(t))
-    out = np.zeros(int(np.prod(shape)), np.int16)
-    out[gm_idx[mark]] = 1
-    return out.reshape(shape)
+    for ok, nb in _neighbours(gm_idx, shape):
+        t = np.where(ok, grid[np.where(ok, nb, 0)], np.nan) - np.float32(0.5)
+        mark |= ~np.isnan(t) & (np.signbit(s) != np.signbit(t)) & (np.abs(s) <= np.abs(t))
+    return np.flatnonzero(mark)
 
 
 def cortical_depth_volumes(
@@ -211,29 +271,29 @@ def cortical_depth_volumes(
         n_overlap += int((gm & (owner != 0)).sum())
         owner[gm & (owner == 0)] = h + 1
         wm |= in_white
+        del in_white, gm
         log(f"{s.name}: filled white + pial")
     n_overlap += int((wm & (owner != 0)).sum())
     owner[wm] = 0  # Inside any white surface is WM.
 
-    size = int(np.prod(shape))
-    metric_ed = np.zeros(size, np.float32)
-    metric_ev = np.zeros(size, np.float32)
-    thickness = np.zeros(size, np.float32)
     flat_owner = owner.reshape(-1)
+    per_hemi = []
     for h, s in enumerate(surfaces):
         idx = np.flatnonzero(flat_owner == h + 1)
         if idx.size == 0:
             continue
         ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
         pts = ijk @ affine[:3, :3].T + affine[:3, 3]
+        del ijk
         cw = MeshDistance(s.white, s.faces, k)(pts, device)
         cp = MeshDistance(s.pial, s.faces, k)(pts, device)
+        del pts
         log(f"{s.name}: distances for {idx.size:,} GM voxels")
         keep = np.ones(idx.size, bool)
         if s.cortex is not None:
-            keep = cw.interpolate(s.faces, s.cortex.astype(np.float64)) >= 0.5
+            keep = cw.interpolate(s.faces, s.cortex.astype(np.float32)) >= 0.5
             flat_owner[idx[~keep]] = -1
-        dw, dp = cw.distance.astype(np.float64), cp.distance.astype(np.float64)
+        dw, dp = cw.distance, cp.distance
         thick = dw + dp
         rho = np.clip(dw / np.maximum(thick, 1e-9), 0.0, 1.0)
         aw = _smooth_vertex_values(
@@ -245,46 +305,48 @@ def cortical_depth_volumes(
         alpha_w = volume_fraction(rho, cw.interpolate(s.faces, aw), cw.interpolate(s.faces, ap))
         alpha_p = volume_fraction(rho, cp.interpolate(s.faces, aw), cp.interpolate(s.faces, ap))
         equivol = np.clip((1.0 - rho) * alpha_w + rho * alpha_p, 0.0, 1.0)
-        sel = idx[keep]
-        metric_ed[sel] = rho[keep]
-        metric_ev[sel] = equivol[keep]
-        thickness[sel] = thick[keep]
+        per_hemi.append((idx[keep], rho[keep], equivol[keep].astype(np.float32), thick[keep]))
+        del cw, cp, alpha_w, alpha_p, equivol
+        log(f"{s.name}: depth metrics")
 
-    gm_idx = np.flatnonzero(flat_owner > 0)
-    gm_mask = flat_owner.reshape(shape) > 0
+    if per_hemi:
+        gm_idx = np.concatenate([p[0] for p in per_hemi])
+        order = np.argsort(gm_idx, kind="stable")
+        gm_idx = gm_idx[order]
+        rho, equivol, thick = (
+            np.concatenate([p[i] for p in per_hemi]).astype(np.float32)[order] for i in (1, 2, 3)
+        )
+    else:
+        gm_idx = np.zeros(0, np.int64)
+        rho = equivol = thick = np.zeros(0, np.float32)
+    del per_hemi
 
-    rim = np.zeros(size, np.int16)
-    rim[gm_idx] = RIM_GM
-    ijk = np.stack(np.unravel_index(gm_idx, shape), 1)
     flat_wm = wm.reshape(-1)
-    for valid, nb in _neighbours(ijk, shape):
-        nb = nb[valid]
-        border = nb[flat_owner[nb] == 0]
-        rim[border] = np.where(flat_wm[border], RIM_WM, RIM_CSF)
+    borders = []
+    for ok, nb in _neighbours(gm_idx, shape):
+        nb = nb[ok]
+        borders.append(nb[flat_owner[nb] == 0])
+    border_idx = np.unique(np.concatenate(borders)) if borders else np.zeros(0, np.int64)
+    del borders
+    log("rim borders")
 
-    def layers(metric: np.ndarray) -> np.ndarray:
-        out = np.zeros(size, np.int16)
-        out[gm_idx] = np.clip(np.ceil(metric[gm_idx] * n_layers), 1, n_layers)
-        return out.reshape(shape)
-
-    metric_ed = metric_ed.reshape(shape)
-    metric_ev = metric_ev.reshape(shape)
     out = DepthVolumes(
-        rim=rim.reshape(shape),
-        metric_equidist=metric_ed,
-        layers_equidist=layers(metric_ed.reshape(-1)),
-        mid_gm_equidist=_mid_sheet(metric_ed, gm_mask, gm_idx, shape),
-        metric_equivol=metric_ev,
-        layers_equivol=layers(metric_ev.reshape(-1)),
-        mid_gm_equivol=_mid_sheet(metric_ev, gm_mask, gm_idx, shape),
-        thickness=thickness.reshape(shape),
-        n_thick=int((thickness[gm_idx] > thick_limit).sum()),
+        shape=shape,
+        n_layers=int(n_layers),
+        gm_idx=gm_idx,
+        rho=rho,
+        equivol=equivol,
+        thick=thick,
+        border_idx=border_idx,
+        border_wm=flat_wm[border_idx],
+        mid_equidist=_mid_sheet(rho, gm_idx, shape),
+        mid_equivol=_mid_sheet(equivol, gm_idx, shape),
+        n_thick=int((thick > thick_limit).sum()),
         thick_limit=float(thick_limit),
-        n_gm=int(gm_idx.size),
         n_medial=int((flat_owner == -1).sum()),
         n_overlap=n_overlap,
     )
-    log("rim, layers, midGM")
+    log("midGM sheets")
     return out
 
 
@@ -386,7 +448,7 @@ def export_depth_volumes(
         raise ValueError("no GM voxel centres on this grid: is the master aligned to the anat?")
     Path(stem).parent.mkdir(parents=True, exist_ok=True)
     written = []
-    for tag, vol in out.outputs().items():
+    for tag, vol in out.outputs():
         path = f"{stem}_{tag}{ext}"
         save_nifti(vol, path, affine=affine)
         written.append(path)
