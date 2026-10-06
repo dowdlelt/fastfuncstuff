@@ -68,3 +68,43 @@ def test_clean_mask_opening_cuts_bridge_without_prior():
     bridge[19:21, 19:21, 30:42] = True
     cleaned, _ = clean_mask(brain | eye | bridge, open_radius=2)
     assert not cleaned[eye].any() and cleaned[brain].all()
+
+
+def test_util_presurf_cli_end_to_end(tmp_path):
+    """Smoke: the whole CLI on a phantom, into a not-yet-existing prefix directory."""
+    import nibabel as nib
+    import numpy as np
+
+    from fastfuncstuff.cli.util_presurf import main
+
+    n = 24
+    r = (
+        torch.stack(torch.meshgrid(*[torch.arange(n, dtype=torch.float32)] * 3, indexing="ij"))
+        .sub(n / 2)
+        .norm(dim=0)
+    )
+    tissue = torch.stack([(r < 5), (r >= 5) & (r < 8), (r >= 8) & (r < 11)]).float()
+    tpm = (tissue + 0.01) / (tissue + 0.01).sum(0, keepdim=True)
+    uni = (tissue * torch.tensor([2500.0, 3500.0, 1000.0])[:, None, None, None]).sum(0) + 2000
+    inv2 = (tissue * torch.tensor([400.0, 300.0, 600.0])[:, None, None, None]).sum(0) + 5
+
+    def write(path, arr):
+        a = arr.numpy()
+        a = a.transpose(2, 1, 0) if a.ndim == 3 else a.transpose(3, 2, 1, 0)
+        nib.save(nib.Nifti1Image(np.ascontiguousarray(a), np.eye(4)), str(path))
+
+    write(tmp_path / "uni.nii.gz", uni)
+    write(tmp_path / "inv2.nii.gz", inv2)
+    write(tmp_path / "tpm.nii.gz", tpm.permute(0, 1, 2, 3))
+    prefix = tmp_path / "out" / "sub"
+    rc = main(
+        [
+            "-uni", str(tmp_path / "uni.nii.gz"), "-inv2", str(tmp_path / "inv2.nii.gz"),
+            "-tpm", str(tmp_path / "tpm.nii.gz"), "-prefix", str(prefix),
+            "-ngaus", "1", "1", "1", "-samp", "1", "-affreg", "off",
+            "-device", "cpu", "-quiet",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    for name in ("MPRAGEised_stripped", "stripmask", "stripmask_raw", "brainmask", "WMmask"):
+        assert (tmp_path / "out" / f"sub_{name}.nii.gz").exists(), name

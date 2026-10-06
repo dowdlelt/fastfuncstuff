@@ -54,8 +54,12 @@ def scale_unit(image: Tensor, mode: str = "minmax", *, robust_pct: float = 99.9)
 
 
 def mprageise(uni: Tensor, inv2_corrected: Tensor, mode: str = "minmax") -> Tensor:
-    """``UNI · scale01(INV2)`` — suppress UNI's amplified background noise."""
-    return uni.to(torch.float32) * scale_unit(inv2_corrected, mode)
+    """``UNI · scale01(INV2)`` — suppress UNI's amplified background noise.
+
+    Computed on ``uni``'s device: segmentation outputs come back on the CPU
+    (``segment_apply`` stores full-resolution maps there) while the input may be on GPU.
+    """
+    return uni.to(torch.float32) * scale_unit(inv2_corrected.to(uni.device), mode)
 
 
 def class_sum_mask(posteriors: Tensor, classes: tuple[int, ...], thresh: float) -> Tensor:

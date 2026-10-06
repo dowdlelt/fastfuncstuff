@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     save(brain_removed, "brainmask_removed")
     save(class_sum_mask(post, (1,), args.wm_thresh), "WMmask")
 
-    stripped = image * strip.to(image.dtype)
+    stripped = image * strip.to(device=image.device, dtype=image.dtype)
     save(stripped, "MPRAGEised_stripped" if not args.no_mprageise else "UNI_stripped")
 
     if verbose:
