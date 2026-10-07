@@ -383,6 +383,7 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         - .nii (uncompressed)
         - .nii.gz (gzip compressed)
         - .nii.zst (zstandard compressed)
+        - .mgz / .mgh (FreeSurfer; converted to NIfTI in memory)
 
     Returns
     -------
@@ -416,6 +417,10 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         except Exception:
             img_out = _load_zst_via_tempfile(filepath, zstd_threads)
 
+    elif str(filepath).lower().endswith((".mgz", ".mgh")):
+        # FreeSurfer volumes: same voxels and scanner affine, as a NIfTI, so
+        # everything downstream of this function is unchanged.
+        img_out = nib.Nifti1Image.from_image(nib.load(str(filepath)))
     else:
         # Standard nibabel loading for .nii and .nii.gz
         img_out = nib.load(str(filepath))

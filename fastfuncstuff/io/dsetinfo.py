@@ -348,7 +348,8 @@ def sample_time_offset(info: DatasetInfo) -> float | None:
 def read_info(path: str | Path) -> DatasetInfo:
     """Describe a dataset from its header alone (no image payload is read).
 
-    Accepts ``.nii`` / ``.nii.gz`` / ``.nii.zst`` and AFNI ``.HEAD`` / ``.BRIK``,
+    Accepts ``.nii`` / ``.nii.gz`` / ``.nii.zst``, AFNI ``.HEAD`` / ``.BRIK`` and
+    FreeSurfer ``.mgz`` / ``.mgh``,
     with an optional AFNI ``[selector]`` suffix — the selector adjusts the
     reported volume count exactly as it would on a real load.
     """
@@ -360,6 +361,8 @@ def read_info(path: str | Path) -> DatasetInfo:
 
     if p.suffix in (".HEAD", ".BRIK") or p.name.endswith(".BRIK.gz"):
         return _read_afni_info(p, raw_arg, indices)
+    if p.name.lower().endswith((".mgz", ".mgh")):
+        return _read_mgh_info(p, raw_arg, indices)
     return _read_nifti_info(p, raw_arg, indices)
 
 
@@ -445,6 +448,35 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     slope = float(hdr["scl_slope"]) if np.isfinite(hdr["scl_slope"]) else 1.0
     info.scl_slope = slope or 1.0
     info.scl_inter = float(hdr["scl_inter"]) if np.isfinite(hdr["scl_inter"]) else 0.0
+    return info
+
+
+def _read_mgh_info(p: Path, iname: str, indices: list[int] | None) -> DatasetInfo:
+    """FreeSurfer MGH/MGZ via nibabel. A .mgz is gzipped, so this reads its
+    (small) header from the front of the stream, not the voxels."""
+    img: Any = nib.load(str(p))
+    hdr: Any = img.header
+    dims = tuple(int(d) for d in img.shape)
+    shape3 = (dims + (1, 1, 1))[:3]
+    n_vol = _apply_selector(dims[3] if len(dims) > 3 else 1, indices)
+    dtype = np.dtype(hdr.get_data_dtype())
+    info = DatasetInfo(
+        path=p,
+        iname=iname,
+        exists=True,
+        selector=indices,
+        storage="MGH",
+        compression="gzip" if p.name.lower().endswith(".mgz") else None,
+        file_bytes=p.stat().st_size,
+        datum=_DATUM_NAMES.get(dtype.name, str(dtype)),
+        itemsize=int(dtype.itemsize),
+        shape=(shape3[0], shape3[1], shape3[2], n_vol),
+    )
+    zooms = tuple(float(z) for z in hdr.get_zooms()[:3])
+    _common(info, np.asarray(img.affine, dtype=np.float64), shape3, zooms)
+    # MGH stores the acquisition TR (ms) even on a 3-D T1, where it is not a
+    # volume spacing; it only means one for a series.
+    info.tr = float(hdr["tr"]) / 1000.0 if n_vol > 1 else 0.0
     return info
 
 

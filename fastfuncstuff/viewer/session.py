@@ -159,7 +159,7 @@ def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
 
 
 def _short(name: str, limit: int = 24) -> str:
-    for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
+    for ext in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD"):
         name = name.removesuffix(ext)
     return name if len(name) <= limit else "…" + name[-(limit - 1) :]
 

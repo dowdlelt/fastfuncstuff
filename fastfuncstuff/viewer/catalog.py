@@ -25,7 +25,7 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info
 
 #: Extensions the viewer can open. Ordered longest-first so ``.nii.gz`` is
 #: matched before ``.gz``.
-SUFFIXES = (".nii.gz", ".nii.zst", ".nii", ".HEAD", ".BRIK.gz", ".BRIK")
+SUFFIXES = (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD", ".BRIK.gz", ".BRIK")
 
 
 class Kind(StrEnum):
@@ -114,7 +114,7 @@ def _walk_fd(directory: Path, recursive: bool) -> list[Path] | None:
     cmd = [exe, "--type", "f", "--absolute-path"]
     if not recursive:
         cmd += ["--max-depth", "1"]
-    for suffix in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
+    for suffix in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD"):
         cmd += ["-e", suffix.lstrip(".")]
     cmd += [".", str(directory)]
     try:
