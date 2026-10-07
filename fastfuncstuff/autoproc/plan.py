@@ -232,7 +232,7 @@ class Options:
     suma_dir: str | None = None  # FreeSurfer SUMA dir (aseg.auto + SurfVol for the TPM)
     # -surface_target: also sample every run onto this cortical mesh (ffs_nwarp -surf),
     # same chain minus the MNI links, master = the anat. fs_subject holds surf/.
-    surface_target: str | None = None
+    surface_target: list[str] | None = None
     fs_subject: str | None = None
     events: list[str] | None = None  # events TSV(s) passed directly (bids format)
     # Explicit reference override (alternative to -grand_reference DIR): an EPI

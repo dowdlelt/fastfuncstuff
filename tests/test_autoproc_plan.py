@@ -2156,7 +2156,7 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     s = _skull_script(
         do_mni=True,
         mni_template="/t/MNI.nii.gz",
-        surface_target="onavg-ico64",
+        surface_target=["native", "onavg-ico64"],
         fs_subject="/fs/sub-X",
     )
     surf = [line for line in s.splitlines() if line.startswith("SURFCHAIN[")]
@@ -2168,7 +2168,7 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     assert "stage10s" in s and "skip_surface=1" in s
     line = next(x for x in s.splitlines() if "SURFCHAIN[$k]" in x and "printf" in x)
     assert '-master \\"$ANAT\\"' in line
-    assert "-surf /fs/sub-X -surf_mesh onavg-ico64" in line
+    assert "-surf /fs/sub-X -surf_mesh native onavg-ico64" in line
     assert "-dxyz" not in line and "-save_mean" not in line
     # one interpolation per run from the raw series, never from stage10's output
     assert "stage10.final" not in line

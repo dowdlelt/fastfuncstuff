@@ -3156,13 +3156,14 @@ def _stage_surface(plan: Plan, script_stem: str) -> str:
     st = _final_st_line(plan)
     nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
     batchfile = f"{script_stem}_surfbatch.txt"
-    surf = f"-surf {shlex.quote(opt.fs_subject)} -surf_mesh {shlex.quote(opt.surface_target)}"
+    meshes = " ".join(shlex.quote(m) for m in opt.surface_target)
+    surf = f"-surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
     return f"""
 # ============================ stage10s: onto the cortical surface ==========
 # The same single interpolation as stage10, read at cortical surface points instead
 # of the warpmaster grid: footprint reads on the equivolume mid-surface of
-# {opt.surface_target}, placed in this subject through ?h.sphere.reg when it is a
-# template. SURFCHAIN is CHAIN without the MNI links; the master is $ANAT, whose
+# {" + ".join(opt.surface_target)}, templates placed in this subject through
+# ?h.sphere.reg. SURFCHAIN is CHAIN without the MNI links; the master is $ANAT, whose
 # scanner space the FreeSurfer surfaces share. skip_surface=1 -> -batch_skip.
 echo '== stage10s: surface sampling =='
 surfbatch="{batchfile}"
@@ -3174,7 +3175,7 @@ for k in "${{RUN_KEYS[@]}}"; do
 done
 batch_skip=(); [ "$skip_surface" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$surfbatch" "${{batch_skip[@]}}" -device "$DEVICE"
-echo 'done -> stage10s.surf.*.?h.func.gii'
+echo 'done -> stage10s.surf.*.?h.*.gii'
 """
 
 

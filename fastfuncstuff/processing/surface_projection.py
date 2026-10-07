@@ -27,7 +27,14 @@ from fastfuncstuff.surface.projection import SurfaceSampling, build_sampling
 from fastfuncstuff.surface.remesh import remesh_via_sphere
 from fastfuncstuff.surface.topology import MeshBundle
 
-__all__ = ["HemiTarget", "project_to_surface", "resolve_mesh", "surface_targets"]
+__all__ = [
+    "HemiTarget",
+    "output_paths",
+    "project_to_surface",
+    "resolve_mesh",
+    "space_name",
+    "surface_targets",
+]
 
 
 @dataclass
@@ -37,6 +44,8 @@ class HemiTarget:
     hemi: str
     mesh: str  # "native" or the template's folder name
     faces: np.ndarray
+    white: np.ndarray  # (V, 3) the target's vertices placed in the subject, scanner mm
+    pial: np.ndarray
     sampling: SurfaceSampling
     cortex: np.ndarray | None  # target-mesh cortex mask, when the mesh has one
     meta: dict[str, str] = field(default_factory=dict)
@@ -54,6 +63,11 @@ def resolve_mesh(mesh: str, subject_dir: str | os.PathLike) -> Path | None:
     if sib.is_dir():
         return sib
     raise FileNotFoundError(f"-surf_mesh {mesh!r}: not a folder, and not beside {subject_dir}")
+
+
+def space_name(mesh: str) -> str:
+    """The name a target goes by in file names: ``native`` or the template folder's."""
+    return "native" if mesh == "native" else Path(mesh).name
 
 
 def _cortex(folder: Path, hemi: str, n: int) -> np.ndarray | None:
@@ -97,7 +111,7 @@ def surface_targets(
             "subject": str(subject_dir),
             "white_sha1": _sha(w),
             "pial_sha1": _sha(p),
-            "mesh": mesh,
+            "mesh": space_name(mesh),
         }
         if folder is None:
             tw, tp, tf = w, p, faces
@@ -119,7 +133,7 @@ def surface_targets(
             cortex = _cortex(folder, hemi, len(tw))
         smp = build_sampling(tw, tp, tf, fractions, voxel_face)
         meta["mesh_fingerprint"] = mesh_fingerprint(tf, len(tw))
-        out.append(HemiTarget(hemi, mesh, np.asarray(tf), smp, cortex, meta))
+        out.append(HemiTarget(hemi, space_name(mesh), np.asarray(tf), tw, tp, smp, cortex, meta))
     return out
 
 
@@ -131,13 +145,28 @@ def _voxel_face(source_path: str) -> float:
     return float(np.prod(zooms) ** (2.0 / 3.0))
 
 
+def output_paths(prefix: str, meshes, hemis, fractions, depth_mean: bool = False) -> list[str]:
+    """Every file :func:`project_to_surface` writes, in order (for -batch_skip)."""
+    out = []
+    for mesh in meshes:
+        for hemi in hemis:
+            stem = f"{prefix}.{space_name(mesh)}.{hemi}"
+            if depth_mean or len(fractions) == 1:
+                out.append(f"{stem}.func.gii")
+            else:
+                out += [f"{stem}.depth-{float(f):.2f}.func.gii" for f in fractions]
+            out += [f"{stem}.coverage.shape.gii", f"{stem}.mask.shape.gii"]
+            out += [f"{stem}.{s}.surf.gii" for s in ("white", "pial", "midthickness")]
+    return out
+
+
 def project_to_surface(
     source_path: str,
     nwarp_specs: list[str],
     master_path: str,
     subject_dir: str | os.PathLike,
     prefix: str,
-    mesh: str = "native",
+    meshes=("native",),
     hemis=("lh", "rh"),
     fractions=(0.5,),
     depth_mean: bool = False,
@@ -145,26 +174,41 @@ def project_to_surface(
     verb: int = 1,
     **nwarp_kwargs,
 ) -> list[Path]:
-    """Sample ``source`` onto the surface through the chain and write GIfTI.
+    """Sample ``source`` onto every target mesh through the chain and write GIfTI.
 
-    Writes ``{prefix}.{hemi}.func.gii`` (vertices x time, depth-averaged when
-    ``depth_mean`` or with one depth) or one ``{prefix}.{hemi}.depth-{f}.func.gii`` per
-    depth, plus ``{prefix}.{hemi}.coverage.shape.gii``: the share of each vertex's
-    footprint read inside the EPI in every frame. Returns the paths written.
+    All targets and hemispheres share one nwarp call, so the chain is composed once
+    and native and template outputs come from the same reads of the same data. Per
+    target ``{prefix}.{space}.{hemi}`` (space = ``native`` or the template's folder
+    name) gets:
+
+    * ``.func.gii`` -- vertices x time (depth-averaged with ``depth_mean`` or one depth),
+      or one ``.depth-{f}.func.gii`` per depth;
+    * ``.coverage.shape.gii`` -- share of each footprint read inside the EPI in every
+      frame; ``.mask.shape.gii`` -- cortex label (when the mesh has one) AND full
+      coverage, the mask statistics should use;
+    * ``.white/.pial/.midthickness.surf.gii`` -- the target's vertices placed in THIS
+      subject (scanner mm): the geometry smoothing, cluster areas and display need.
     """
     from fastfuncstuff.io.afni import get_tr_from_file
+    from fastfuncstuff.io.gifti import save_gifti_surface
 
     from .nwarpforge import nwarpforge
 
     if sample not in ("footprint", "point"):
         raise ValueError(f"sample must be 'footprint' or 'point', got {sample!r}")
+    meshes = [meshes] if isinstance(meshes, str) else list(meshes)
+    names = [space_name(m) for m in meshes]
+    if len(set(names)) != len(names):
+        raise ValueError(f"target meshes must have distinct names, got {names}")
     vface = _voxel_face(source_path) if sample == "footprint" else None
-    targets = surface_targets(subject_dir, mesh, hemis, fractions, vface)
+    targets = [
+        t for mesh in meshes for t in surface_targets(subject_dir, mesh, hemis, fractions, vface)
+    ]
     counts = [t.sampling.points.shape[0] for t in targets]
     if verb >= 1:
         for t, n in zip(targets, counts, strict=True):
             print(
-                f"  {t.hemi}: {mesh} mesh, {t.sampling.n_vertices} vertices x "
+                f"  {t.mesh} {t.hemi}: {t.sampling.n_vertices} vertices x "
                 f"{t.sampling.n_depths} depth(s) -> {n} reads ({sample})"
             )
     reads = nwarpforge(
@@ -183,17 +227,27 @@ def project_to_surface(
     written: list[Path] = []
     for t, chunk in zip(targets, np.split(r, np.cumsum(counts)[:-1], axis=1), strict=True):
         folded = t.sampling.fold(chunk)  # (K, V, T)
-        cover = t.sampling.coverage(chunk)  # (K, V)
+        cover = t.sampling.coverage(chunk).min(axis=0)  # (V,)
+        stem = f"{prefix}.{t.mesh}.{t.hemi}"
+        geom = {
+            "white": t.white,
+            "pial": t.pial,
+            "midthickness": 0.5 * (t.white + t.pial),
+        }
+        for name, pos in geom.items():
+            path = Path(f"{stem}.{name}.surf.gii")
+            save_gifti_surface(path, pos, t.faces, {**t.meta, "surface": name})
         meta = dict(t.meta)
         meta.update(
             source=str(source_path),
             sampling=sample,
             depths=" ".join(f"{f:g}" for f in t.sampling.fractions),
             equivolume="1",
+            # Relative, so the outputs can move together.
+            geometry=Path(f"{stem}.midthickness.surf.gii").name,
         )
         if tr and tr > 0:
             meta["TR_seconds"] = f"{tr:g}"
-        stem = f"{prefix}.{t.hemi}"
         if depth_mean or t.sampling.n_depths == 1:
             path = Path(f"{stem}.func.gii")
             save_gifti_data(path, folded.mean(axis=0), {**meta, "depth_mean": "1"})
@@ -203,7 +257,12 @@ def project_to_surface(
                 path = Path(f"{stem}.depth-{f:.2f}.func.gii")
                 save_gifti_data(path, folded[k], {**meta, "depth": f"{f:g}"})
                 written.append(path)
-        cpath = Path(f"{stem}.coverage.shape.gii")
-        save_gifti_data(cpath, cover.min(axis=0), meta, time_series=False)
-        written.append(cpath)
+        mask = cover > 0.99
+        if t.cortex is not None:
+            mask &= t.cortex
+        for name, values in (("coverage", cover), ("mask", mask.astype(np.float32))):
+            path = Path(f"{stem}.{name}.shape.gii")
+            save_gifti_data(path, values, meta, time_series=False)
+            written.append(path)
+        written += [Path(f"{stem}.{name}.surf.gii") for name in geom]
     return written

@@ -154,14 +154,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-surface_target",
         "-surface-target",
+        nargs="+",
         default=None,
         metavar="MESH",
         help="also sample every run onto a cortical mesh in the SAME single interpolation "
         "(ffs_nwarp -surf): 'native' for the subject's own vertices, or a FreeSurfer-format "
         "template on fsaverage's sphere by path or by name beside the subject (e.g. "
-        "onavg-ico64) for group-ready output. The chain is each run's own up to the anat "
-        "(never the MNI links), read at footprint points on the equivolume mid-surface. "
-        "Writes stage10s.surf.<run>.?h.func.gii. Needs the FreeSurfer subject: -fs_subject, "
+        "onavg-ico64) for group-ready output; several (native onavg-ico64) share one pass. "
+        "The chain is each run's own up to the anat (never the MNI links), read at "
+        "footprint points on the equivolume mid-surface. Writes "
+        "stage10s.surf.<run>.<SPACE>.?h.func.gii with its mask and placed geometry. "
+        "Needs the FreeSurfer subject: -fs_subject, "
         "or the folder above -suma.",
     )
     g.add_argument(
@@ -1059,13 +1062,14 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             errors.append("-surface_target needs the FreeSurfer subject: -fs_subject DIR or -suma.")
         elif not (Path(opt.fs_subject) / "surf").is_dir():
             errors.append(f"-fs_subject has no surf/ folder: {opt.fs_subject}")
-        elif opt.surface_target != "native":
+        else:
             from fastfuncstuff.processing.surface_projection import resolve_mesh
 
-            try:
-                resolve_mesh(opt.surface_target, opt.fs_subject)
-            except FileNotFoundError as exc:
-                errors.append(str(exc).replace("-surf_mesh", "-surface_target"))
+            for mesh in opt.surface_target:
+                try:
+                    resolve_mesh(mesh, opt.fs_subject)
+                except FileNotFoundError as exc:
+                    errors.append(str(exc).replace("-surf_mesh", "-surface_target"))
     if opt.slicetiming_method != "none" and opt.tr is None:
         # Slice timing needs a TR per run; the sidecar is the only source here.
         no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]

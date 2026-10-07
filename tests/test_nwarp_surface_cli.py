@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from fastfuncstuff.cli.nwarp import main
-from fastfuncstuff.io.gifti import load_gifti_data, mesh_fingerprint
+from fastfuncstuff.io.gifti import load_gifti_data, load_gifti_surface, mesh_fingerprint
 
 CRAS = np.array([3.0, -2.0, 5.0])
 CENTRE = np.array([1.0, 2.0, -1.0])  # scanner mm
@@ -133,7 +133,7 @@ def _run(world, tmp_path, *extra):
 
 def test_template_vertices_read_the_epi_where_the_sphere_puts_them(world, tmp_path):
     prefix = _run(world, tmp_path, "-surf_mesh", "tpl-test", "-surf_sample", "point")
-    data, meta = load_gifti_data(f"{prefix}.lh.func.gii")
+    data, meta = load_gifti_data(f"{prefix}.tpl-test.lh.func.gii")
     n = len(world["expect_dir"])
     assert data.shape == (n, 2)
     assert meta["mesh"] == "tpl-test" and meta["TR_seconds"] == "1.5"
@@ -144,14 +144,14 @@ def test_template_vertices_read_the_epi_where_the_sphere_puts_them(world, tmp_pa
     # Flat subject triangles sit inside the sphere by the chord sag (< 0.3 mm here).
     np.testing.assert_allclose(data[:, 0], want, atol=0.5)
     np.testing.assert_allclose(data[:, 1], 2 * data[:, 0], rtol=1e-5)
-    cover, _ = load_gifti_data(f"{prefix}.lh.coverage.shape.gii")
+    cover, _ = load_gifti_data(f"{prefix}.tpl-test.lh.coverage.shape.gii")
     np.testing.assert_array_equal(cover, 1.0)
 
 
 def test_footprint_and_depths_write_one_file_per_depth(world, tmp_path):
     prefix = _run(world, tmp_path, "-surf_depths", "0.2", "0.8")
-    lo, meta = load_gifti_data(f"{prefix}.lh.depth-0.20.func.gii")
-    hi, _ = load_gifti_data(f"{prefix}.lh.depth-0.80.func.gii")
+    lo, meta = load_gifti_data(f"{prefix}.native.lh.depth-0.20.func.gii")
+    hi, _ = load_gifti_data(f"{prefix}.native.lh.depth-0.80.func.gii")
     assert meta["mesh"] == "native" and meta["sampling"] == "footprint"
     d, _ = _icosphere(3)
     # The footprint mean of a linear field is the field at the patch centroid, which on
@@ -165,3 +165,22 @@ def test_footprint_and_depths_write_one_file_per_depth(world, tmp_path):
 def test_surf_refuses_volume_only_flags(world, tmp_path):
     with pytest.raises(SystemExit, match="-dxyz"):
         _run(world, tmp_path, "-dxyz", "2")
+
+
+def test_several_targets_in_one_pass_ship_their_geometry_and_mask(world, tmp_path):
+    prefix = _run(
+        world, tmp_path, "-surf_mesh", "native", str(world["tpl"]), "-surf_sample", "point"
+    )
+    nat, _ = load_gifti_data(f"{prefix}.native.lh.func.gii")
+    tpl, meta = load_gifti_data(f"{prefix}.tpl-test.lh.func.gii")
+    assert nat.shape[0] == 642 and tpl.shape[0] == len(world["expect_dir"])
+    # the template's placed midthickness is where its vertices are in the subject
+    v, f, smeta = load_gifti_surface(f"{prefix}.tpl-test.lh.midthickness.surf.gii")
+    assert np.array_equal(f, world["tf"]) and smeta["mesh_fingerprint"] == meta["mesh_fingerprint"]
+    want = CENTRE + 21.5 * world["expect_dir"]
+    assert np.abs(v - want).max() < 0.5  # chord sag of the subject mesh
+    assert meta["geometry"] == Path(f"{prefix}.tpl-test.lh.midthickness.surf.gii").name
+    mask, _ = load_gifti_data(f"{prefix}.tpl-test.lh.mask.shape.gii")
+    keep = np.zeros(len(mask), bool)
+    keep[world["keep"]] = True
+    np.testing.assert_array_equal(mask > 0, keep)  # cortex label AND (full) coverage

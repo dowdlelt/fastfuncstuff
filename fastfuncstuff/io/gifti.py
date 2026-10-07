@@ -14,7 +14,13 @@ import os
 
 import numpy as np
 
-__all__ = ["load_gifti_data", "mesh_fingerprint", "save_gifti_data"]
+__all__ = [
+    "load_gifti_data",
+    "load_gifti_surface",
+    "mesh_fingerprint",
+    "save_gifti_data",
+    "save_gifti_surface",
+]
 
 
 def mesh_fingerprint(faces: np.ndarray, n_vertices: int | None = None) -> str:
@@ -62,3 +68,40 @@ def load_gifti_data(path: str | os.PathLike) -> tuple[np.ndarray, dict[str, str]
     cols = [np.asarray(a.data, np.float32) for a in img.darrays]
     data = cols[0] if len(cols) == 1 else np.stack(cols, axis=1)
     return data, dict(img.meta)
+
+
+def save_gifti_surface(
+    path: str | os.PathLike,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    meta: dict[str, str] | None = None,
+) -> None:
+    """A ``.surf.gii`` in scanner mm (NIFTI_XFORM_SCANNER_ANAT), as SUMA and Workbench read."""
+    import nibabel as nib
+
+    xform = nib.gifti.GiftiCoordSystem(dataspace=1, xformspace=1, xform=np.eye(4))
+    pts = nib.gifti.GiftiDataArray(
+        np.asarray(vertices, np.float32),
+        intent="NIFTI_INTENT_POINTSET",
+        datatype="NIFTI_TYPE_FLOAT32",
+        coordsys=xform,
+    )
+    tri = nib.gifti.GiftiDataArray(
+        np.asarray(faces, np.int32), intent="NIFTI_INTENT_TRIANGLE", datatype="NIFTI_TYPE_INT32"
+    )
+    m = {"mesh_fingerprint": mesh_fingerprint(faces, len(vertices)), **(meta or {})}
+    img = nib.gifti.GiftiImage(
+        darrays=[pts, tri], meta=nib.gifti.GiftiMetaData({k: str(v) for k, v in m.items()})
+    )
+    nib.save(img, os.fspath(path))
+
+
+def load_gifti_surface(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
+    """``(vertices, faces, metadata)`` of a ``.surf.gii``."""
+    import nibabel as nib
+
+    img = nib.load(os.fspath(path))
+    assert isinstance(img, nib.gifti.GiftiImage)
+    pts = img.agg_data("NIFTI_INTENT_POINTSET")
+    tri = img.agg_data("NIFTI_INTENT_TRIANGLE")
+    return np.asarray(pts, np.float64), np.asarray(tri, np.int64), dict(img.meta)

@@ -249,19 +249,23 @@ Examples:
         metavar="SUBJ_DIR",
         help="FreeSurfer subject folder. Instead of a volume, read the source at cortical "
         "surface points through the same chain, in the same single interpolation, and "
-        "write GIfTI: PREFIX.lh.func.gii / PREFIX.rh.func.gii (+ PREFIX.?h.coverage."
-        "shape.gii, the share of each vertex's footprint inside the EPI in every frame). "
+        "write GIfTI per target mesh and hemisphere: PREFIX.SPACE.?h.func.gii, plus "
+        "?h.coverage.shape.gii (share of each footprint inside the EPI in every frame), "
+        "?h.mask.shape.gii (cortex AND full coverage) and the target's white/pial/"
+        "midthickness placed in this subject (?h.*.surf.gii). "
         "-master must be the anatomy the surfaces were built on (SUMA/brain.nii.gz, or "
         "the T1w recon-all ran on), and the chain must end there -- no MNI link. "
         "-jac then needs the AXIS:FIELDMAP form.",
     )
     surf_group.add_argument(
         "-surf_mesh",
-        default="native",
-        help="Target mesh: 'native' (the subject's own vertices) or a FreeSurfer-format "
-        "template folder on fsaverage's sphere, by path or by name beside the subject "
-        "(e.g. onavg-ico64): placed in the subject through ?h.sphere.reg, so the output "
-        "is group-ready with no second resample.",
+        nargs="+",
+        default=["native"],
+        help="Target mesh(es), each its own SPACE in the output names: 'native' (the "
+        "subject's own vertices) and/or FreeSurfer-format template folders on fsaverage's "
+        "sphere, by path or by name beside the subject (onavg-ico64, fsaverage, ...): "
+        "placed in the subject through ?h.sphere.reg, so the output is group-ready with "
+        "no second resample. Several targets share one pass over the data.",
     )
     surf_group.add_argument(
         "-surf_hemi",
@@ -442,16 +446,12 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
 
 
 def _surface_outputs(args: argparse.Namespace) -> list[str]:
-    """The GIfTI files a -surf run writes (mirrors project_to_surface's naming)."""
-    outs = []
-    for hemi in args.surf_hemi:
-        stem = f"{args.prefix}.{hemi}"
-        if args.surf_depth_mean or len(args.surf_depths) == 1:
-            outs.append(f"{stem}.func.gii")
-        else:
-            outs += [f"{stem}.depth-{f:.2f}.func.gii" for f in args.surf_depths]
-        outs.append(f"{stem}.coverage.shape.gii")
-    return outs
+    """The GIfTI files a -surf run writes."""
+    from fastfuncstuff.processing.surface_projection import output_paths
+
+    return output_paths(
+        args.prefix, args.surf_mesh, args.surf_hemi, args.surf_depths, args.surf_depth_mean
+    )
 
 
 def _validate_batch_run(run_args: argparse.Namespace) -> None:
@@ -663,7 +663,7 @@ def _dispatch_surface(
         master_path=args.master,
         subject_dir=args.surf,
         prefix=args.prefix,
-        mesh=args.surf_mesh,
+        meshes=tuple(args.surf_mesh),
         hemis=tuple(args.surf_hemi),
         fractions=tuple(args.surf_depths),
         depth_mean=args.surf_depth_mean,
