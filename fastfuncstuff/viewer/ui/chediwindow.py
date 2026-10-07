@@ -67,7 +67,7 @@ SELECT_RGB = (1.0, 0.55, 0.1)
 class PatchCanvas(QtWidgets.QWidget):
     """The flat image, the mesh over it, and the centre mark."""
 
-    #: Double-click: fractional (row, col) in patch pixels.
+    #: Double-click or shift+click: fractional (row, col) in patch pixels.
     located = QtCore.Signal(float, float)
     #: Wheel: signed notches.
     wheeled = QtCore.Signal(int)
@@ -186,6 +186,10 @@ class PatchCanvas(QtWidgets.QWidget):
             & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier)
         )
         shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and shift and not ctrl:
+            # Shift+click is "look here", not a selection.
+            self.located.emit(*self._patch_point(event.position()))
+            return
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             kind = ("window+" if shift else "window") if ctrl else "add"
         elif event.button() == QtCore.Qt.MouseButton.RightButton:
@@ -221,6 +225,9 @@ class ChediWindow(QtWidgets.QWidget):
     """A CHEDI viewport as a top-level window."""
 
     closed = QtCore.Signal(str)
+    #: The crosshair was put somewhere from here: the other windows should
+    #: bring it into view, not only follow it.
+    centre_requested = QtCore.Signal()
 
     def __init__(
         self,
@@ -302,8 +309,12 @@ class ChediWindow(QtWidgets.QWidget):
                     "n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"
                 ),
                 Binding(
-                    "double-click", "move the crosshair there (and the patch)", None, group="view"
+                    "shift+click",
+                    "crosshair there; the other windows centre on it",
+                    None,
+                    group="view",
                 ),
+                Binding("double-click", "the same", None, group="view"),
                 Binding("drag", "select under the brush", None, group="select"),
                 Binding("right-drag", "unselect under the brush", None, group="select"),
                 Binding(
@@ -400,6 +411,7 @@ class ChediWindow(QtWidgets.QWidget):
         k = int(np.count_nonzero(self.patch.inside.ravel()[: r * self.patch.size + c]))
         x, y, z = (float(v) for v in points[k])
         self._dispatch(SetXYZ(x, y, z))
+        self.centre_requested.emit()
 
     # -- selection ---------------------------------------------------------
     def _selected(self) -> np.ndarray:

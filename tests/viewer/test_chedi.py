@@ -296,3 +296,53 @@ def test_brush_paint_morph_invert_and_escape(chedi):
     win._clear_selection()
     assert session.surfaces.highlighted("lh").size == 0
     assert "HIGHLIGHT_SURFACE" in session.to_script()
+
+
+def test_shift_click_moves_the_crosshair_and_centres_a_zoomed_slice(tmp_path, subject):
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.chediwindow import ChediWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetPan, SetXYZ, SetZoom
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(subject))
+        win._dispatch(OpenView("A1", "image", "coronal"))
+        win._dispatch(SetZoom("A1", 4.0))
+        win._dispatch(SetPan("A1", -40.0, -40.0))  # far off in a corner
+        win._dispatch(SetXYZ(0.0, 0.0, 22.0))
+        win._dispatch(OpenView("E1", "chedi", "axial"))
+        app.processEvents()
+        chedi = next(w for w in win.manager.windows.values() if isinstance(w, ChediWindow))
+        chedi.resize(300, 320)
+        chedi.show()
+        app.processEvents()
+        before = session.state.crosshair_mm
+        selected = session.surfaces.highlighted("lh").size
+        canvas = chedi.canvas
+        rect = canvas.target()
+        at = QtCore.QPoint(int(rect.center().x() + rect.width() / 4), int(rect.center().y()))
+        QTest.mouseClick(
+            canvas, QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.KeyboardModifier.ShiftModifier, at
+        )
+        app.processEvents()
+        after = session.state.crosshair_mm
+        assert np.linalg.norm(np.subtract(after, before)) > 2.0  # it moved...
+        assert 20.0 < np.linalg.norm(after) < 24.5  # ...onto the cortex clicked
+        assert session.surfaces.highlighted("lh").size == selected  # and selected nothing
+        vp = session.state.viewports.get("A1")
+        view = plane_view(session.state, vp)
+        row, col = view.to_image(session.state.crosshair)
+        h, w = view.span
+        assert abs(row - h / 2) <= 2 and abs(col - w / 2) <= 2
+    finally:
+        win.close()
+        session.close()

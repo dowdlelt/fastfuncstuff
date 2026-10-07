@@ -118,6 +118,7 @@ class WindowManager(QtCore.QObject):
             win.surfaces_previewed.connect(self._redraw_outlines)
         elif viewport.is_chedi:
             win = ChediWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.centre_requested.connect(self.centre_on_crosshair)
         elif viewport.is_depth:
             win = DepthWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.roi_changed.connect(self._refresh_surface_windows)
@@ -266,6 +267,21 @@ class WindowManager(QtCore.QObject):
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
+
+    def centre_on_crosshair(self) -> None:
+        """Bring the crosshair into the middle of every zoomed image and every 3-D view.
+
+        Following it is not enough when a window is zoomed: the slice changes
+        but the crosshair can land off-screen, which is no help in confirming
+        where something is. An unzoomed image shows the whole plane already.
+        """
+        for win in list(self.windows.values()):
+            if isinstance(win, ImageWindow):
+                vp = self.session.state.viewports.find(win.vid)
+                if vp is not None and vp.zoom > 1.0:
+                    win._centre_view()
+            elif isinstance(win, SurfaceWindow):
+                win._centre_view()
 
     def _image_inputs_changed(self) -> bool:
         """Whether the image and graph viewports differ from the last time this was asked."""
