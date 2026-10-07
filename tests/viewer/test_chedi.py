@@ -441,3 +441,38 @@ def test_digits_toggle_a_cluster_and_clusters_follow_the_folding(chedi):
     assert win.k == 10
     keys = {b.keys for b in win.help._bindings}
     assert {"1", "0", "ctrl+0", "ctrl+1", "c", "x"} <= keys
+
+
+def test_relax_flattens_a_spike_and_snap_mode_reaches_the_command(chedi):
+    session, win = chedi
+    h = session.surfaces.hemis["lh"]
+    win._press("window", 30.0, 30.0)
+    win._drag(30.0, 30.0, 10 * 300.0, 0.0)
+    win._release()
+    # Plant a spike in the middle of the selection.
+    spike = int(
+        win._vis[np.argmin(np.linalg.norm(win.patch.uv[np.isin(win.patch.ids, win._vis)], axis=1))]
+    )
+    pial = h.states["pial"]
+    out = pial[spike] / np.linalg.norm(pial[spike])
+    pial[spike] = pial[spike] + 1.0 * out
+    session.surfaces.version["lh"] += 1
+    before = pial.copy()
+    win._relax()
+    r = lambda k: float(np.linalg.norm(h.states["pial"][k]))  # noqa: E731
+    assert r(spike) < np.linalg.norm(before[spike]) - 0.3  # the spike came down...
+    others = win._vis[win._vis != spike][:20]
+    assert np.allclose(
+        [r(k) for k in others], np.linalg.norm(before[others], axis=1), atol=0.15
+    )  # ...the rest barely moved: no plateau shift
+    moves = [ln.split() for ln in session.to_script().splitlines() if ln.startswith("MOVE_SURFACE")]
+    # name hemi surface shift radius within flatten snap gate key
+    relax = moves[-1]
+    assert relax[3] == "0.0" and relax[6] == "0.3" and relax[7] == "0.0"
+    win._cycle_snap()
+    assert win.snap_mode == "snap"
+    win._push(-1.0)
+    moves = [ln.split() for ln in session.to_script().splitlines() if ln.startswith("MOVE_SURFACE")]
+    push = moves[-1]
+    assert float(push[3]) < 0 and push[7] == "1.0" and push[8] == "1"
+    assert push[9] == session.state.layers.base.key  # snaps to the layer shown

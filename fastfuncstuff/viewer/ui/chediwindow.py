@@ -325,6 +325,11 @@ class ChediWindow(QtWidgets.QWidget):
         self.surface = "pial"
         #: Show the gyri/sulci map instead of the data (o).
         self.show_folding = False
+        #: How a push is placed: by hand (the step), or snapped to the shown
+        #: image's edge (gated, or "edge": strongest, ungated) -- m, as in a slice.
+        self.snap_mode = "hand"
+        #: Fraction of each point's spike height a push also takes out (shift+R).
+        self.flatten = 0.3
         #: Clusters (c): shown or not, how many, how much position counts,
         #: and the last labels with what they were computed from.
         self.show_clusters = False
@@ -410,7 +415,7 @@ class ChediWindow(QtWidgets.QWidget):
                     aliases=("=",),
                 ),
                 Binding("-", "larger patch", lambda: self._size_by(1.25), group="view"),
-                Binding("m", "mesh over the image on / off", self._toggle_mesh, group="view"),
+                Binding("shift+m", "mesh over the image on / off", self._toggle_mesh, group="view"),
                 Binding(
                     "n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"
                 ),
@@ -461,6 +466,19 @@ class ChediWindow(QtWidgets.QWidget):
                 Binding("w", "push the selection in", lambda: self._push(-1.0), group="move"),
                 Binding("s", "pull the selection out", lambda: self._push(1.0), group="move"),
                 Binding("t", "move pial / white", self._toggle_surface, group="move"),
+                Binding(
+                    "m",
+                    "pushes: by hand -> snap to edge -> strongest edge",
+                    self._cycle_snap,
+                    group="move",
+                ),
+                Binding("r", "relax: smooth the spikes out, no push", self._relax, group="move"),
+                Binding(
+                    "shift+r",
+                    "flatten with each push: 0 / 0.3 / 0.6",
+                    self._cycle_flatten,
+                    group="move",
+                ),
                 Binding("{", "smaller step", lambda: self._step_by(1 / 1.5), group="move"),
                 Binding("}", "larger step", lambda: self._step_by(1.5), group="move"),
                 Binding("h", "this list", self.help.toggle, group="window"),
@@ -806,7 +824,32 @@ class ChediWindow(QtWidgets.QWidget):
         self._dispatch(SetSurfaceStep(round(step, 3)))
         self.status.setText(f"step {self.session.state.surface_step:g} mm")
 
-    def _push(self, sign: float) -> None:
+    def _cycle_snap(self) -> None:
+        modes = ("hand", "snap", "edge")
+        self.snap_mode = modes[(modes.index(self.snap_mode) + 1) % len(modes)]
+        self.status.setText(
+            {
+                "hand": "pushes by hand: exactly the step",
+                "snap": "pushes snap to the shown image's edge (gated by tissue level)",
+                "edge": "pushes snap to the strongest edge (ungated)",
+            }[self.snap_mode]
+        )
+        if self.patch is not None:
+            self._draw()
+
+    def _cycle_flatten(self) -> None:
+        steps = (0.0, 0.3, 0.6)
+        i = steps.index(self.flatten) if self.flatten in steps else 0
+        self.flatten = steps[(i + 1) % len(steps)]
+        self.status.setText(f"each push also flattens spikes by {self.flatten:g}")
+        if self.patch is not None:
+            self._draw()
+
+    def _relax(self) -> None:
+        """Take spikes out of the selection without pushing it in or out."""
+        self._push(0.0, flatten=self.flatten or 0.5)
+
+    def _push(self, sign: float, flatten: float | None = None) -> None:
         """Move the selected, visible vertices of one surface along their normals, as a unit."""
         if self.patch is None:
             return
@@ -817,6 +860,7 @@ class ChediWindow(QtWidgets.QWidget):
             self.status.setText("nothing selected on screen")
             return
         step = self.session.state.surface_step
+        layer = self.layer()
         try:
             self._dispatch(
                 MoveSurfaceHighlight(
@@ -827,12 +871,17 @@ class ChediWindow(QtWidgets.QWidget):
                     # The selection on screen: only these move, whatever else
                     # is selected off it.
                     encode_ids(seeds),
+                    flatten=self.flatten if flatten is None else flatten,
+                    snap=0.0 if self.snap_mode == "hand" else 1.0,
+                    gate=self.snap_mode == "snap",
+                    snap_key="" if layer is None else layer.key,
                 )
             )
         except ValueError as exc:
             self.status.setText(str(exc))
             return
-        self.status.setText(f"{self.surface} {'in' if sign < 0 else 'out'} {step:g} mm: {n} points")
+        what = "relaxed" if sign == 0 else f"{'in' if sign < 0 else 'out'} {step:g} mm"
+        self.status.setText(f"{self.surface} {what}: {n} points ({self.snap_mode})")
 
     def _adjacency(self):
         assert self.patch is not None
@@ -988,7 +1037,7 @@ class ChediWindow(QtWidgets.QWidget):
                 if fold is not None
                 else f"{layer.name if layer is not None else ''} · {mode}"
             )
-            + f"   moves {self.surface}"
+            + f"   moves {self.surface} · {self.snap_mode} · flatten {self.flatten:g}"
             + ("" if p.source == "sphere" else "   (no sphere: inflated)")
         )
         self.canvas.update()

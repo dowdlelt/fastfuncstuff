@@ -709,6 +709,14 @@ class MoveSurfaceHighlight(Command):
     #: Only highlighted vertices also in these (ranges, as ``ids``) move;
     #: empty moves every one. CHEDI passes what is on screen.
     within: str = ""
+    #: Fraction of each vertex's local height (spikes) taken out as well;
+    #: see surface.edit.HighlightEdit.
+    flatten: float = 0.0
+    #: Snap to the image's edge as well (0 = by hand), gated or not, in the
+    #: layer ``snap_key`` (empty: the base).
+    snap: float = 0.0
+    gate: bool = True
+    snap_key: str = ""
 
 
 @command
@@ -1756,15 +1764,21 @@ def install(
             raise ValueError("move white or pial")
         _, _, smooth, search, sign = st.surface_brush
         params = SnapParams(
-            radius=cmd.radius, snap=0.0, smooth=smooth, search=search, edge_sign=sign
+            radius=cmd.radius,
+            snap=float(cmd.snap),
+            smooth=smooth,
+            search=search,
+            edge_sign=sign,
+            gate=bool(cmd.gate),
         )
         session.surfaces.move_highlight(
             cmd.hemi,
             cmd.surface,
             float(cmd.shift),
-            session.surface_sampler(None),
+            session.surface_sampler(cmd.snap_key or None),
             params,
             within=decode_ids(cmd.within) if cmd.within else None,
+            flatten=float(np.clip(cmd.flatten, 0.0, 1.0)),
         )
         return MoveSurfaceHighlight.aspects
 

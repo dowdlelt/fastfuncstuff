@@ -413,6 +413,7 @@ class SurfaceStore:
         sampler: VolumeSampler,
         params: SnapParams,
         within: np.ndarray | None = None,
+        flatten: float = 0.0,
     ) -> EditResult:
         """Move ``hemi``'s highlighted vertices on ``surface`` by ``shift`` mm along their normals.
 
@@ -436,6 +437,7 @@ class SurfaceStore:
             params,
             role=surface,
             partner=h.states.get(PARTNER[surface]),
+            flatten=flatten,
         )
         res = edit.result()
         self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)
@@ -444,7 +446,7 @@ class SurfaceStore:
             surface,
             edit,
             res,
-            {"tool": "highlight", "seeds": int(seeds.size), "shift": shift},
+            {"tool": "highlight", "seeds": int(seeds.size), "shift": shift, "flatten": flatten},
         )
         return res
 
