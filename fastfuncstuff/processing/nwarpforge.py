@@ -225,10 +225,18 @@ Transform = AffineTransform | NonlinearWarp | TimeVaryingWarp
 
 @dataclass(frozen=True)
 class VoxelGridPlan:
-    """Reusable homogeneous coordinates for one output grid."""
+    """Reusable homogeneous coordinates for one output grid.
+
+    A *point plan* (:func:`make_point_plan`) is the same object for a scattered
+    point list: shape ``(1, 1, N)`` and fractional output-voxel coordinates. Every
+    composition step reads its output coordinates from here, so the chain runs
+    unchanged on surface vertices; only code that rebuilds an ``arange`` grid
+    itself has to ask :attr:`points` first.
+    """
 
     shape: tuple[int, int, int]
     coords: Tensor  # (4, N), x/y/z/1
+    points: bool = False
 
     @property
     def ii(self) -> Tensor:
@@ -271,6 +279,22 @@ def make_voxel_grid_plan(shape: tuple[int, int, int], device: torch.device) -> V
         (ii.reshape(-1), jj.reshape(-1), kk.reshape(-1), torch.ones_like(ii).reshape(-1))
     )
     return VoxelGridPlan(shape=shape, coords=coords)
+
+
+def make_point_plan(ijk: Tensor | np.ndarray, device: torch.device) -> VoxelGridPlan:
+    """Plan for scattered output points at fractional voxel indices ``ijk`` (N, 3).
+
+    The indices are in the output grid's voxel space (x, y, z order), the frame the
+    whole chain is composed in. Convert scanner-mm points with the grid's *real*
+    affine, not its cardinal one: the two differ by the dataset's obliquity, and the
+    chain's own voxel-to-mm conversions take care of the cardinal frame.
+    """
+    ijk_t = torch.as_tensor(np.asarray(ijk, dtype=np.float32), device=device)
+    if ijk_t.ndim != 2 or ijk_t.shape[1] != 3:
+        raise ValueError(f"point indices must be (N, 3), got {tuple(ijk_t.shape)}")
+    n = ijk_t.shape[0]
+    coords = torch.cat((ijk_t.T, torch.ones(1, n, dtype=torch.float32, device=device)))
+    return VoxelGridPlan(shape=(1, 1, n), coords=coords.contiguous(), points=True)
 
 
 @dataclass(frozen=True)
@@ -683,6 +707,7 @@ def fieldmap_jacobian_transported(
     output_affine: np.ndarray,
     device: torch.device,
     ainterp: str = "cubic",
+    grid_plan: VoxelGridPlan | None = None,
 ) -> Tensor:
     """Fieldmap Jacobian on its native grid, transported to the output grid.
 
@@ -726,14 +751,21 @@ def fieldmap_jacobian_transported(
         )
     if down:
         w_sub = compose_chain(
-            down, output_shape, output_affine, device, time_idx=0, interp=ainterp, verb=0
+            down,
+            output_shape,
+            output_affine,
+            device,
+            time_idx=0,
+            interp=ainterp,
+            verb=0,
+            grid_plan=grid_plan,
         )
     else:
         z = torch.zeros(output_shape, dtype=torch.float32, device=device)
         w_sub = NonlinearWarp(
             xd=z, yd=z.clone(), zd=z.clone(), header_info={"affine": output_affine.copy()}
         )
-    fx, fy, fz = _output_to_source_voxel_coords(w_sub, fmap_aff, output_affine)
+    fx, fy, fz = _output_to_source_voxel_coords(w_sub, fmap_aff, output_affine, grid_plan)
     jac = trilinear_interpolate(jac_native, fx.reshape(-1), fy.reshape(-1), fz.reshape(-1)).reshape(
         output_shape
     )
@@ -747,6 +779,7 @@ def prepare_warp_for_grid(
     device: torch.device,
     verb: int = 1,
     interp: str = "linear",
+    grid_plan: VoxelGridPlan | None = None,
 ) -> NonlinearWarp:
     """Resample a NIfTI-mm warp to the target grid and convert to voxel units.
 
@@ -782,8 +815,9 @@ def prepare_warp_for_grid(
 
     tgt_nz, tgt_ny, tgt_nx = target_shape
 
+    points = grid_plan is not None and grid_plan.points
     # Check if grids match — skip resampling if so
-    needs_resample = not (
+    needs_resample = points or not (
         src_shape == target_shape and np.allclose(src_cardinal, tgt_cardinal, atol=1e-4)
     )
 
@@ -795,26 +829,25 @@ def prepare_warp_for_grid(
         src_xyz2ijk = np.linalg.inv(src_cardinal)
         M = (src_xyz2ijk @ tgt_cardinal).astype(np.float32)
 
-        kk, jj, ii = torch.meshgrid(
-            torch.arange(tgt_nz, dtype=torch.float32, device=device),
-            torch.arange(tgt_ny, dtype=torch.float32, device=device),
-            torch.arange(tgt_nx, dtype=torch.float32, device=device),
-            indexing="ij",
-        )
-
-        coords = torch.stack(
-            [
-                ii.reshape(-1),
-                jj.reshape(-1),
-                kk.reshape(-1),
-                torch.ones(
-                    tgt_nz * tgt_ny * tgt_nx,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            ],
-            dim=0,
-        )
+        if points:
+            assert grid_plan is not None
+            coords = grid_plan.coords
+        else:
+            kk, jj, ii = torch.meshgrid(
+                torch.arange(tgt_nz, dtype=torch.float32, device=device),
+                torch.arange(tgt_ny, dtype=torch.float32, device=device),
+                torch.arange(tgt_nx, dtype=torch.float32, device=device),
+                indexing="ij",
+            )
+            coords = torch.stack(
+                [
+                    ii.reshape(-1),
+                    jj.reshape(-1),
+                    kk.reshape(-1),
+                    torch.ones(tgt_nz * tgt_ny * tgt_nx, dtype=torch.float32, device=device),
+                ],
+                dim=0,
+            )
 
         M_t = torch.from_numpy(M).float().to(device)
         src_coords = M_t @ coords
@@ -1060,7 +1093,13 @@ def compose_chain(
                 prepared = frame_warp
             else:
                 prepared = prepare_warp_for_grid(
-                    frame_warp, output_shape, output_affine, device, verb=verb, interp=interp
+                    frame_warp,
+                    output_shape,
+                    output_affine,
+                    device,
+                    verb=verb,
+                    interp=interp,
+                    grid_plan=grid_plan,
                 )
             if result_warp is None:
                 result_warp = prepared
@@ -1100,6 +1139,7 @@ def reduce_chain(
     device: torch.device,
     interp: str = "linear",
     verb: int = 1,
+    grid_plan: VoxelGridPlan | None = None,
 ) -> list[Transform]:
     """Collapse maximal runs of *static* transforms into single pre-prepared warps.
 
@@ -1122,7 +1162,14 @@ def reduce_chain(
             return
         reduced.append(
             compose_chain(
-                run, output_shape, output_affine, device, time_idx=0, interp=interp, verb=0
+                run,
+                output_shape,
+                output_affine,
+                device,
+                time_idx=0,
+                interp=interp,
+                verb=0,
+                grid_plan=grid_plan,
             )
         )
         run.clear()
@@ -1449,30 +1496,25 @@ def _pad_output_grid(
 
 
 def _output_to_source_voxel_coords(
-    warp: NonlinearWarp, source_affine: np.ndarray, output_affine: np.ndarray
+    warp: NonlinearWarp,
+    source_affine: np.ndarray,
+    output_affine: np.ndarray,
+    grid_plan: VoxelGridPlan | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Source-voxel coordinates each output voxel samples (the same map apply uses)."""
     nz, ny, nx = warp.shape
     device = warp.xd.device
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
+    grid_plan = grid_plan or make_voxel_grid_plan(warp.shape, device)
+    if grid_plan.shape != warp.shape:
+        raise ValueError("Grid plan shape does not match warp")
     M = np.linalg.inv(compute_cardinal_affine(source_affine)) @ compute_cardinal_affine(
         output_affine
     )
     M_t = torch.from_numpy(M.astype(np.float32)).to(device)
-    coords = torch.stack(
-        [
-            (ii + warp.xd).reshape(-1),
-            (jj + warp.yd).reshape(-1),
-            (kk + warp.zd).reshape(-1),
-            torch.ones(nz * ny * nx, dtype=torch.float32, device=device),
-        ],
-        dim=0,
-    )
+    coords = grid_plan.coords.clone()
+    coords[0].add_(warp.xd.reshape(-1))
+    coords[1].add_(warp.yd.reshape(-1))
+    coords[2].add_(warp.zd.reshape(-1))
     s = M_t @ coords
     return (
         s[0].reshape(nz, ny, nx),
@@ -1736,7 +1778,8 @@ def nwarpforge(
     jac_axis: int | None = None,
     jac_match: str | None = None,
     progress: Callable[[str], AbstractContextManager[None]] | None = None,
-) -> None:
+    points: np.ndarray | None = None,
+) -> Tensor | None:
     """Main pipeline: compose warps and apply to source.
 
     Args:
@@ -1830,11 +1873,35 @@ def nwarpforge(
             behaviour. See processing/spacetime.py:TissueFollowingSampler.
         progress: Optional context-manager factory for opaque loads and writes. The CLI
             supplies its shared spinner; library callers remain silent by default.
+        points: Optional (N, 3) scanner-RAS mm points (surface vertices x depths) to
+            sample INSTEAD of an output grid. The chain ends in the master's space
+            (the anatomy the surfaces were built on), the points enter it through the
+            master's real affine, and nothing is written: the ``(T, N)`` samples are
+            returned (``(N,)`` for a 3-D source). Same kernels, motion, slice timing
+            and transported ``-jac`` as the volume path, in one interpolation.
+
+    Returns:
+        The sampled points when ``points`` is given, else None (the volume is saved).
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     interp = normalize_interp_mode(interp)
+    if points is not None:
+        if dxyz is not None:
+            raise ValueError("-dxyz regrids a volume; it has no meaning for surface points")
+        if master_path is not None and master_path.upper() in ("WARP", "NWARP"):
+            raise ValueError(
+                "surface points need -master to be the anatomy the surfaces were built on, "
+                "not WARP: the chain has to end in that anatomy's space"
+            )
+        if phase_path is not None:
+            raise ValueError("phase is not supported when sampling surface points")
+        if jac_axis is not None and jac_match is None:
+            raise ValueError(
+                "-jac on surface points needs the fieldmap named (AXIS:FIELDMAP): the "
+                "auto mode differentiates along grid axes, and points have none"
+            )
     if ainterp not in WARP_COMPOSE_INTERP:
         raise ValueError(f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}")
 
@@ -1968,12 +2035,14 @@ def nwarpforge(
         if master.ndim == 4:
             master = master[0]
         output_shape = tuple(master.shape)
+        output_real_affine = np.asarray(master_header["affine"], dtype=np.float64)
         output_affine = compute_cardinal_affine(master_header["affine"])
         master_space_info = get_afni_space_info(master_header.get("header"))
         master_hdr_obj = master_header.get("header")
         del master
     else:
         output_shape = tuple(source.shape[-3:]) if is_4d else tuple(source.shape)
+        output_real_affine = np.asarray(source_header["affine"], dtype=np.float64)
         output_affine = compute_cardinal_affine(source_header["affine"])
         master_space_info = get_afni_space_info(source_header.get("header"))
 
@@ -1987,6 +2056,21 @@ def nwarpforge(
             print(f"nwarpforge: -master WARP grid = {output_shape}")
 
     assert output_shape is not None and output_affine is not None
+
+    # Surface points: the "grid" becomes (1, 1, N) at fractional master-voxel indices.
+    # Matrices still convert through the master's (cardinal) affine below, exactly as
+    # for a volume, so the chain itself is untouched.
+    point_plan: VoxelGridPlan | None = None
+    if points is not None:
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError(f"points must be (N, 3) scanner mm, got {pts.shape}")
+        ijk = (np.linalg.inv(output_real_affine) @ np.c_[pts, np.ones(len(pts))].T)[:3].T
+        point_plan = make_point_plan(ijk, device)
+        output_shape = point_plan.shape
+        auto_pad, expad = False, 0
+        if verb >= 1:
+            print(f"nwarpforge: sampling {len(pts)} surface points (no output grid)")
 
     # Apply -dxyz: recompute grid for isotropic voxel size
     if dxyz is not None:
@@ -2180,7 +2264,8 @@ def nwarpforge(
         jac_axis = None
 
     affine_only = (
-        phase_data is None
+        point_plan is None
+        and phase_data is None
         and slice_times_t is None
         and interp not in ("NN", "nearest")
         and all(isinstance(x, AffineTransform) for x in transforms)
@@ -2204,7 +2289,7 @@ def nwarpforge(
 
     # Geometry is invariant across a 4-D series. Keep one compact homogeneous
     # grid instead of rebuilding arange/meshgrid/ones for every frame and slot.
-    grid_plan = None if affine_only else make_voxel_grid_plan(output_shape, device)
+    grid_plan = None if affine_only else (point_plan or make_voxel_grid_plan(output_shape, device))
     apply_plan = (
         make_warp_apply_plan(
             output_shape, source_header["affine"], output_affine, device, grid_plan=grid_plan
@@ -2221,7 +2306,13 @@ def nwarpforge(
         None
         if affine_only
         else reduce_chain(
-            transforms, output_shape, output_affine, device, interp=ainterp, verb=verb
+            transforms,
+            output_shape,
+            output_affine,
+            device,
+            interp=ainterp,
+            verb=verb,
+            grid_plan=grid_plan,
         )
     )
     static_composed: NonlinearWarp | None = None
@@ -2260,7 +2351,9 @@ def nwarpforge(
                     grid_plan=grid_plan,
                 )
             )
-            return _output_to_source_voxel_coords(comp_f, source_header["affine"], output_affine)
+            return _output_to_source_voxel_coords(
+                comp_f, source_header["affine"], output_affine, grid_plan
+            )
 
         follow_sampler = TissueFollowingSampler(
             st_channels if st_channels is not None else source,
@@ -2307,6 +2400,7 @@ def nwarpforge(
             output_affine,
             device,
             ainterp=ainterp,
+            grid_plan=grid_plan,
         )
         if verb >= 1:
             print(f"nwarpforge: -jac using fieldmap '{jac_match}', transported to the output grid")
@@ -2431,7 +2525,7 @@ def nwarpforge(
             # letting the temporal coordinate vary per voxel by the scanner slice
             # each output voxel lands in. sz is that scanner slice index.
             sx, sy, sz = _output_to_source_voxel_coords(
-                composed, source_header["affine"], output_affine
+                composed, source_header["affine"], output_affine, grid_plan
             )
             assert tr is not None and tzero is not None
             warped = apply_spacetime_sample(
@@ -2548,6 +2642,10 @@ def nwarpforge(
         output = torch.stack(output_volumes)
     else:
         output = output_volumes[0]
+
+    if point_plan is not None:
+        n_pts = point_plan.shape[2]
+        return output.reshape(-1, n_pts) if output.ndim == 4 else output.reshape(n_pts)
 
     # Build output header: use output_affine (cardinal), don't inherit
     # source's qform/sform which would conflict with the output grid.
