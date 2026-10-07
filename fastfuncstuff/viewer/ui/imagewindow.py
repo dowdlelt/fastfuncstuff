@@ -254,7 +254,7 @@ class ImageWindow(QtWidgets.QWidget):
                     "Down", "crosshair down", lambda: self._nudge_in_plane(1, 0), group="navigate"
                 ),
                 Binding("PgUp", "next slice", lambda: self._step(1), group="navigate"),
-                Binding("PgDn", "previous slice", lambda: self._step(-1), group="navigate"),
+                Binding("PgDown", "previous slice", lambda: self._step(-1), group="navigate"),
                 Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),

@@ -1593,7 +1593,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("Right", "crosshair +x", lambda: self._nudge(0, 1), group="navigate"),
                 Binding("Down", "crosshair -y", lambda: self._nudge(1, -1), group="navigate"),
                 Binding("Up", "crosshair +y", lambda: self._nudge(1, 1), group="navigate"),
-                Binding("PgDn", "crosshair -z", lambda: self._nudge(2, -1), group="navigate"),
+                Binding("PgDown", "crosshair -z", lambda: self._nudge(2, -1), group="navigate"),
                 Binding("PgUp", "crosshair +z", lambda: self._nudge(2, 1), group="navigate"),
                 Binding("n", "open an image window", self._new_image, group="windows"),
                 Binding("shift+n", "open a graph window", self._new_graph, group="windows"),

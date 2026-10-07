@@ -45,6 +45,10 @@ def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
             if binding.action is None:
                 continue
             key = QtGui.QKeySequence(spelling).toString()
+            # An unknown name parses to an empty sequence, which binds nothing
+            # and says nothing: "PgDn" (Qt spells it PgDown) sat dead that way.
+            if not key:
+                raise ValueError(f"{spelling!r} is not a key Qt knows ({binding.description!r})")
             if key in seen:
                 raise ValueError(
                     f"two shortcuts on {key!r}: {seen[key]!r} and {binding.description!r}. "

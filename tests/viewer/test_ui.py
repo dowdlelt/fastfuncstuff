@@ -2334,7 +2334,7 @@ def test_an_image_window_declares_its_arrows_so_h_can_list_them(flipped):
     """The table is both what is installed and what the help shows."""
     image = _image_window(flipped)
     keys = {b.keys for b in image.help._bindings}
-    assert {"Left", "Right", "Up", "Down", "PgUp", "PgDn"} <= keys
+    assert {"Left", "Right", "Up", "Down", "PgUp", "PgDown"} <= keys
 
 
 # ---------------------------------------------------------------------------
@@ -2689,3 +2689,15 @@ def test_image_windows_thin_thicken_and_cycle_the_surface_outlines(win, qapp):
     image._cycle_outlines()
     assert win.session.state.surfaces_shown != shown
     assert "SET_OUTLINE_WIDTH" in win.session.to_script()
+
+
+def test_a_key_name_qt_does_not_know_is_refused(qapp):
+    """`PgDn` parses to an empty sequence: bound to nothing, silently, for months."""
+    from fastfuncstuff.viewer.ui.shortcuts import Binding, install
+
+    widget = QtWidgets.QWidget()
+    try:
+        with pytest.raises(ValueError, match="not a key Qt knows"):
+            install(widget, [Binding("PgDn", "previous slice", lambda: None)])
+    finally:
+        widget.deleteLater()
