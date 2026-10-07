@@ -85,6 +85,8 @@ class WindowManager(QtCore.QObject):
         #: Set while the manager is placing windows, so the geometry it writes
         #: back does not read as the user having dragged them.
         self._placing = False
+        #: The image and graph viewports as last drawn; see _image_inputs_changed.
+        self._image_inputs: tuple = ()
 
     # -- reconciliation -------------------------------------------------
     def sync(self) -> None:
@@ -197,6 +199,10 @@ class WindowManager(QtCore.QObject):
         # or stepping its grid changes what an image has to show. This is the
         # same hazard as the crosshair redraw that did not listen for
         # CROSSHAIR -- a consumer whose input is wider than it looks.
+        #
+        # But only when an image or graph viewport is what changed. A depth
+        # step in a 3-D or CHEDI window is VIEWPORTS too, and redrawing every
+        # slice for it made a 7 ms depth step cost 65.
         images = dirty & (
             Aspect.SLICES
             | Aspect.COLORMAP
@@ -205,8 +211,7 @@ class WindowManager(QtCore.QObject):
             | Aspect.GRID
             | Aspect.CROSSHAIR
             | Aspect.LAYERS
-            | Aspect.VIEWPORTS
-        )
+        ) or bool(dirty & Aspect.VIEWPORTS and self._image_inputs_changed())
         # THRESHOLD and COLORMAP too: a graph tinted by the overlay changes
         # colour when its cut or its scale does.
         graphs = dirty & (
@@ -261,6 +266,13 @@ class WindowManager(QtCore.QObject):
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
+
+    def _image_inputs_changed(self) -> bool:
+        """Whether the image and graph viewports differ from the last time this was asked."""
+        now = tuple(v for v in self.session.state.viewports if v.is_image or v.is_graph)
+        changed = now != self._image_inputs
+        self._image_inputs = now
+        return changed
 
     def _redraw_outlines(self) -> None:
         """A surface drag in one window moves the outlines in all of them."""

@@ -157,3 +157,31 @@ def test_window_follows_the_crosshair_samples_the_overlay_and_steps_depth(tmp_pa
         win.close()
         session.close()
 
+
+def test_a_depth_step_redraws_no_slice_but_an_image_setting_does(tmp_path, subject):
+    """VIEWPORTS used to redraw every image window, so a 7 ms depth step cost 65."""
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetSurfaceDepth, SetZoom
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(subject))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(OpenView("E1", "chedi", "axial"))
+        app.processEvents()
+        image = next(w for w in win.manager.windows.values() if isinstance(w, ImageWindow))
+        calls = []
+        image.redraw = lambda: calls.append(1)  # type: ignore[method-assign]
+        win._dispatch(SetSurfaceDepth("E1", 0.8, 0.8))
+        assert calls == []
+        win._dispatch(SetZoom("A1", 2.0))
+        assert calls == [1]
+    finally:
+        win.close()
+        session.close()
