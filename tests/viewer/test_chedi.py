@@ -185,3 +185,114 @@ def test_a_depth_step_redraws_no_slice_but_an_image_setting_does(tmp_path, subje
     finally:
         win.close()
         session.close()
+
+
+def test_selection_morphology_on_a_mesh(subject):
+    from fastfuncstuff.viewer.chedi import adjacency, dilate, drop_isolated, erode, window_select
+
+    h = _hemi(subject)
+    adj = adjacency(h.faces, h.n_vertices)
+    everywhere = np.ones(h.n_vertices, bool)
+    one = np.zeros(h.n_vertices, bool)
+    one[0] = True
+    ring = dilate(one, adj, everywhere)
+    neighbours = set(np.flatnonzero(ring)) - {0}
+    assert 4 <= len(neighbours) <= 8 and ring[0]
+    # Eroding the 1-ring gives back its centre; a lone point is a speck.
+    np.testing.assert_array_equal(erode(ring, adj, everywhere), one)
+    assert not drop_isolated(one, adj).any()
+    assert drop_isolated(ring, adj).sum() == ring.sum()
+    # Dilation never reaches past what is visible, and the screen's edge is not
+    # a selection edge for erosion.
+    visible = ring.copy()
+    assert dilate(ring, adj, visible).sum() == ring.sum()
+    assert erode(ring, adj, visible).sum() == ring.sum()
+    np.testing.assert_array_equal(
+        window_select(np.array([1.0, 5.0, 9.0]), 5.0, 8.0), [True, True, True]
+    )
+    np.testing.assert_array_equal(
+        window_select(np.array([1.0, 5.0, 9.0]), 5.0, 2.0), [False, True, False]
+    )
+
+
+@pytest.fixture
+def chedi(tmp_path, subject):
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.chediwindow import ChediWindow
+    from fastfuncstuff.viewer.vocab import LoadSurfaces, OpenView, SetPatchSize, SetXYZ
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    session.load(str(_shell_anat(tmp_path)))
+    session.do(LoadSurfaces(str(subject), "lh"))
+    session.do(OpenView("E1", "chedi", "axial"))
+    session.do(SetPatchSize("E1", 6.0))
+    win = ChediWindow("E1", session, session.do)
+
+    def dispatch(cmd):
+        session.do(cmd)
+        win.refresh()
+
+    win._dispatch = dispatch
+    dispatch(SetXYZ(0.0, 0.0, 22.0))
+    yield session, win
+    win.close()
+    session.close()
+
+
+def test_push_moves_only_the_selected_vertices_on_screen(chedi):
+    """Logan's rule: what is selected but scrolled off the patch stays put."""
+    from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
+
+    session, win = chedi
+    h = session.surfaces.hemis["lh"]
+    assert win._vis.size > 10
+    # Select everything on screen with a wide value window...
+    win._press("window", 30.0, 30.0)
+    win._drag(30.0, 30.0, 10 * 300.0, 0.0)
+    win._release()
+    on_screen = session.surfaces.highlighted("lh")
+    assert set(on_screen) == set(win._vis)
+    # ...and some cortex on the far side of the sphere too.
+    far = np.flatnonzero(h.states["white"][:, 2] < -15.0)[:20]
+    session.do(HighlightSurface("lh", encode_ids(far), "add"))
+    before = h.states["pial"].copy()
+    step = session.state.surface_step
+    win._push(-1.0)  # W: pial in
+    moved = np.linalg.norm(h.states["pial"] - before, axis=1)
+    assert np.all(moved[far] == 0.0)
+    r_before = np.linalg.norm(before[win._vis], axis=1)
+    r_after = np.linalg.norm(h.states["pial"][win._vis], axis=1)
+    assert np.median(r_before - r_after) == pytest.approx(step, rel=0.05)
+    # White never moved: one surface at a time.
+    assert "MOVE_SURFACE_HIGHLIGHT lh pial" in session.to_script()
+    win._toggle_surface()
+    assert win.surface == "white"
+
+
+def test_brush_paint_morph_invert_and_escape(chedi):
+    session, win = chedi
+    centre = win.patch.size / 2.0
+    win._press("add", centre, centre)
+    win._drag(centre, centre + 4.0, 0.0, 0.0)
+    win._release()
+    painted = session.surfaces.highlighted("lh")
+    assert 0 < painted.size < win._vis.size
+    assert set(painted) <= set(win._vis)
+    on = lambda: int(session.surfaces.highlight["lh"][win._vis].sum())  # noqa: E731
+    n0 = on()
+    win._morph("dilate")
+    assert on() > n0
+    win._morph("erode")
+    assert on() <= n0 + 2
+    before = on()
+    win._morph("invert")
+    assert on() == win._vis.size - before
+    win._morph("invert")
+    assert on() == before
+    win._press("remove", centre, centre)
+    win._release()
+    win._clear_selection()
+    assert session.surfaces.highlighted("lh").size == 0
+    assert "HIGHLIGHT_SURFACE" in session.to_script()

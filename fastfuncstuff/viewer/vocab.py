@@ -706,6 +706,9 @@ class MoveSurfaceHighlight(Command):
     surface: str
     shift: float
     radius: float = 4.0
+    #: Only highlighted vertices also in these (ranges, as ``ids``) move;
+    #: empty moves every one. CHEDI passes what is on screen.
+    within: str = ""
 
 
 @command
@@ -1745,7 +1748,12 @@ def install(
             radius=cmd.radius, snap=0.0, smooth=smooth, search=search, edge_sign=sign
         )
         session.surfaces.move_highlight(
-            cmd.hemi, cmd.surface, float(cmd.shift), session.surface_sampler(None), params
+            cmd.hemi,
+            cmd.surface,
+            float(cmd.shift),
+            session.surface_sampler(None),
+            params,
+            within=decode_ids(cmd.within) if cmd.within else None,
         )
         return MoveSurfaceHighlight.aspects
 

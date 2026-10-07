@@ -211,4 +211,67 @@ class PatchSampler:
         return out
 
 
-__all__ = ["Patch", "PatchSampler", "build_patch"]
+def visible_vertices(patch: Patch) -> np.ndarray:
+    """Patch vertices inside the drawn square: the only ones a CHEDI edit may move.
+
+    The patch reaches past the square's edge (so its corners are covered);
+    those extra vertices are not on screen, and moving what cannot be seen is
+    the one thing an editor must not do.
+    """
+    inside = np.all(np.abs(patch.uv) <= patch.half_mm, axis=1)
+    return patch.ids[inside]
+
+
+def adjacency(faces: np.ndarray, n_vertices: int):
+    """Vertex-to-vertex adjacency of a mesh, as a boolean CSR matrix."""
+    import scipy.sparse as sp
+
+    f = np.asarray(faces, np.int64)
+    rows = np.concatenate([f[:, 0], f[:, 1], f[:, 2], f[:, 1], f[:, 2], f[:, 0]])
+    cols = np.concatenate([f[:, 1], f[:, 2], f[:, 0], f[:, 0], f[:, 1], f[:, 2]])
+    adj = sp.csr_matrix((np.ones(rows.size, bool), (rows, cols)), shape=(n_vertices, n_vertices))
+    adj.sum_duplicates()
+    return adj
+
+
+def _neighbour_count(adj, mask: np.ndarray) -> np.ndarray:
+    return np.asarray(adj @ mask.astype(np.int32)).ravel()
+
+
+def window_select(values: np.ndarray, level: float, width: float) -> np.ndarray:
+    """Which values lie in the window ``level +- width / 2``: the ctrl+drag selection."""
+    half = 0.5 * abs(float(width))
+    return np.abs(np.asarray(values, np.float64) - float(level)) <= half
+
+
+def erode(selected: np.ndarray, adj, within: np.ndarray) -> np.ndarray:
+    """Drop selected vertices with any unselected visible neighbour.
+
+    Only neighbours in ``within`` (the visible vertices, as a mask) count: the
+    edge of the screen is not the edge of the selection.
+    """
+    outside = within & ~selected
+    return selected & (_neighbour_count(adj, outside) == 0)
+
+
+def dilate(selected: np.ndarray, adj, within: np.ndarray) -> np.ndarray:
+    """Add every visible neighbour of a selected vertex."""
+    return selected | (within & (_neighbour_count(adj, selected) > 0))
+
+
+def drop_isolated(selected: np.ndarray, adj) -> np.ndarray:
+    """Drop selected vertices with no selected neighbour: specks a threshold left behind."""
+    return selected & (_neighbour_count(adj, selected) > 0)
+
+
+__all__ = [
+    "Patch",
+    "PatchSampler",
+    "adjacency",
+    "build_patch",
+    "dilate",
+    "drop_isolated",
+    "erode",
+    "visible_vertices",
+    "window_select",
+]

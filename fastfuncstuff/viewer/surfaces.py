@@ -406,13 +406,25 @@ class SurfaceStore:
         return ids
 
     def move_highlight(
-        self, hemi: str, surface: str, shift: float, sampler: VolumeSampler, params: SnapParams
+        self,
+        hemi: str,
+        surface: str,
+        shift: float,
+        sampler: VolumeSampler,
+        params: SnapParams,
+        within: np.ndarray | None = None,
     ) -> EditResult:
-        """Move ``hemi``'s highlighted vertices on ``surface`` by ``shift`` mm along their normals."""
+        """Move ``hemi``'s highlighted vertices on ``surface`` by ``shift`` mm along their normals.
+
+        ``within`` limits it to those highlighted vertices that are also in
+        that set -- what a CHEDI window can see.
+        """
         from fastfuncstuff.surface.edit import HighlightEdit
 
         self.cancel()
         seeds = self.highlighted(hemi)
+        if within is not None:
+            seeds = np.intersect1d(seeds, np.asarray(within, np.int64))
         h = self.hemis[hemi]
         topo = self.topology(hemi)
         edit = HighlightEdit(
