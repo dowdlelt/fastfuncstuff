@@ -387,7 +387,7 @@ def estimate_fwhmx_run(
     mag = (s_acc / denom).cpu()
     bin_r, bin_y = _collapse_radius_bins(radii_off, mag)
 
-    a, b, c, fwhm = _fit_model(bin_r, bin_y, device)
+    a, b, c, fwhm = fit_acf_curve(bin_r, bin_y, device)
     axes_fwhm = _per_axis_acf_fwhm(offsets.cpu(), radii_off, mag, device)
     return FWHMxResult(
         a=a,
@@ -509,7 +509,7 @@ def _half_max_crossing(rs: list[float], ys: list[float]) -> float:
     return -1.0
 
 
-def _fit_model(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, float, float]:
+def fit_acf_curve(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, float, float]:
     """Fit ACF(r)=a e^{-r²/2b²}+(1-a)e^{-r/c} and return (a, b, c, FWHM)."""
     if bin_r.numel() < 5:
         return -1.0, -1.0, -1.0, -1.0

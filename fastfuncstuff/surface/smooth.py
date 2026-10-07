@@ -111,6 +111,13 @@ class HeatSmoother:
     ``vertices`` should be the **midthickness** of the brain the data came from (white
     is too wrinkled, inflated distorts distances, and a template's average surface is
     not this brain). Vertices outside ``mask`` are left untouched.
+
+    Two solvers, one operator. With ``device=None`` each step is a sparse direct solve
+    (one factorisation on the CPU, exact). With a torch ``device`` each step is a
+    Jacobi-preconditioned conjugate-gradient solve over every column at once: the
+    system ``M + dt L`` is mass-dominated and well conditioned (a few to a few tens of
+    iterations), so on a GPU thousands of columns -- time points, or ClustSim noise
+    realisations -- go through as one sparse-times-dense product per iteration.
     """
 
     def __init__(
@@ -120,6 +127,8 @@ class HeatSmoother:
         fwhm: float,
         mask: np.ndarray | None = None,
         n_steps: int = 16,
+        device=None,
+        tol: float = 1e-6,
     ):
         n = np.asarray(vertices).shape[0]
         self.mask = np.ones(n, bool) if mask is None else np.asarray(mask, bool)
@@ -134,11 +143,37 @@ class HeatSmoother:
         # A masked vertex with no area left (every neighbour outside) keeps its value.
         self._mass = np.maximum(mass, 1e-12)
         dt = self.t / max(self.n_steps, 1)
-        a = (sparse.diags(self._mass) + dt * lap).tocsc()
-        self._solve = spla.factorized(a) if self.fwhm > 0 else None
+        a = (sparse.diags(self._mass) + dt * lap).tocsr()
+        self.device = device
+        self.tol = float(tol)
+        self._solve = None
+        if self.fwhm > 0 and device is None:
+            self._solve = spla.factorized(a.tocsc())
+        elif self.fwhm > 0:
+            import warnings
 
-    def __call__(self, data: np.ndarray) -> np.ndarray:
-        """``(V,)`` or ``(V, T)`` -> the same, smoothed inside the mask."""
+            import torch
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta")
+                self._a = torch.sparse_csr_tensor(
+                    torch.as_tensor(a.indptr, dtype=torch.int64),
+                    torch.as_tensor(a.indices, dtype=torch.int64),
+                    torch.as_tensor(a.data, dtype=torch.float32),
+                    size=a.shape,
+                    check_invariants=False,
+                ).to(device)
+            self._m_t = torch.as_tensor(self._mass, dtype=torch.float32, device=device)
+            self._dinv = 1.0 / torch.as_tensor(a.diagonal(), dtype=torch.float32, device=device)
+
+    def __call__(self, data):
+        """``(V,)`` or ``(V, T)`` -> the same, smoothed inside the mask.
+
+        numpy in, numpy out; a torch tensor in (with a ``device`` smoother), a tensor
+        out on that device.
+        """
+        if self.device is not None:
+            return self._call_torch(data)
         x = np.asarray(data)
         out = np.array(x, dtype=np.float64 if x.dtype == np.float64 else np.float32, copy=True)
         if self._solve is None:
@@ -149,6 +184,48 @@ class HeatSmoother:
             u = self._solve(m * u)
         out[self._idx] = u
         return out
+
+    def _call_torch(self, data):
+        import torch
+
+        was_numpy = not isinstance(data, torch.Tensor)
+        x = torch.as_tensor(np.asarray(data) if was_numpy else data, dtype=torch.float32)
+        x = x.to(self.device)
+        out = x.clone()
+        if self.fwhm <= 0:
+            return out.cpu().numpy() if was_numpy else out
+        idx = torch.as_tensor(self._idx, device=self.device)
+        u = x[idx]
+        vec = u.ndim == 1
+        if vec:
+            u = u[:, None]
+        for _ in range(self.n_steps):
+            u = self._cg(self._m_t[:, None] * u, u)
+        out[idx] = u[:, 0] if vec else u
+        return out.cpu().numpy() if was_numpy else out
+
+    def _cg(self, b, x0):
+        """Solve ``A X = B`` column-wise by Jacobi-preconditioned CG, from ``x0``."""
+        import torch
+
+        x = x0.clone()
+        r = b - self._a @ x
+        z = self._dinv[:, None] * r
+        p = z.clone()
+        rz = (r * z).sum(0)
+        bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(1e-30)
+        for _ in range(500):
+            ap = self._a @ p
+            alpha = rz / (p * ap).sum(0).clamp_min(1e-30)
+            x += alpha * p
+            r -= alpha * ap
+            if bool((torch.linalg.vector_norm(r, dim=0) / bnorm).max() < self.tol):
+                break
+            z = self._dinv[:, None] * r
+            rz_new = (r * z).sum(0)
+            p = z + (rz_new / rz.clamp_min(1e-30)) * p
+            rz = rz_new
+        return x
 
 
 def surface_fwhm(
