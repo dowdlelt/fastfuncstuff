@@ -252,6 +252,8 @@ class DatasetDiagnostics:
     # Cached between hooks.
     _scaled_mean: Tensor | None = None
     _mask: Tensor | None = None
+    #: Surface input: the residuals' mixed ACF and its mesh (ffs_reml -save_acf/-clustsim).
+    surface_acf: dict | None = None
 
     def _to_vol(self, flat: Tensor) -> np.ndarray:
         return flat.detach().cpu().float().numpy().reshape(self.volume_shape)

@@ -856,6 +856,16 @@ Examples:
         "(its edge is a wall), to the same FWHM.",
     )
     proc_opts.add_argument(
+        "-blur_to_fwhm",
+        type=float,
+        metavar="FWHM",
+        default=None,
+        help="Surface (.gii) input: blur TO this smoothness instead of BY it (SurfSmooth "
+        "-target_fwhm / 3dBlurToFWHM): the heat kernel is chosen so the first run, "
+        "detrended, measures FWHM mm (1-difference estimate), then every run is smoothed "
+        "with it. Data already that smooth are left alone. Exclusive with -do_blur.",
+    )
+    proc_opts.add_argument(
         "-surf_geom",
         metavar="SURF.gii",
         default=None,
@@ -1241,11 +1251,10 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
         print(f"  • xval_r2: {path}")
 
 
-def _surface_smoother(args, input_file, header, n_vertices: int):
-    """The HeatSmoother for -do_blur on surface input: the data's own mesh, the mask."""
-    from fastfuncstuff.io.afni import load_afni_mask
+def _surface_geometry(args, input_file, header, n_vertices: int):
+    """(vertices, faces) of the mesh surface data live on: -surf_geom, or the input's
+    'geometry' metadata, checked against the data's mesh fingerprint."""
     from fastfuncstuff.io.gifti import load_gifti_surface, mesh_fingerprint, surface_meta
-    from fastfuncstuff.surface.smooth import HeatSmoother
 
     meta = surface_meta(header) or {}
     geom = args.surf_geom
@@ -1253,8 +1262,8 @@ def _surface_smoother(args, input_file, header, n_vertices: int):
         geom = str(Path(str(input_file).split("[")[0]).parent / meta["geometry"])
     if geom is None or not Path(geom).exists():
         raise SystemExit(
-            "ffs_reml: -do_blur on surface input needs the mesh the data live on: pass "
-            f"-surf_geom (the ?h.midthickness.surf.gii); looked for {geom!r}"
+            "ffs_reml: this needs the mesh the surface data live on: pass -surf_geom "
+            f"(the ?h.midthickness.surf.gii); looked for {geom!r}"
         )
     vertices, faces, _ = load_gifti_surface(geom)
     if len(vertices) != n_vertices:
@@ -1262,8 +1271,143 @@ def _surface_smoother(args, input_file, header, n_vertices: int):
     want = meta.get("mesh_fingerprint")
     if want and want != mesh_fingerprint(faces, len(vertices)):
         raise SystemExit(f"ffs_reml: {geom} is not the mesh the data were sampled on")
-    mask = load_afni_mask(args.mask).reshape(-1) if args.mask else None
-    return HeatSmoother(vertices, faces, args.do_blur, mask=mask)
+    return vertices, faces
+
+
+def _surface_mask(args) -> np.ndarray | None:
+    from fastfuncstuff.io.afni import load_afni_mask
+
+    return load_afni_mask(args.mask).reshape(-1) if args.mask else None
+
+
+def _surface_device(device):
+    """The torch device for surface solves: the GPU when there is one in use, else
+    None (the exact CPU direct solve, which beats CG on the CPU)."""
+    return device if device is not None and device.type == "cuda" else None
+
+
+def _surface_smoother(args, input_file, header, n_vertices: int):
+    """The HeatSmoother for -do_blur on surface input: the data's own mesh, the mask."""
+    from fastfuncstuff.surface.smooth import HeatSmoother
+
+    vertices, faces = _surface_geometry(args, input_file, header, n_vertices)
+    return HeatSmoother(vertices, faces, args.do_blur, mask=_surface_mask(args))
+
+
+def _surface_blur_to(args, input_file, header, n_vertices: int, device):
+    """-blur_to_fwhm: the kernel that brings the first run (detrended) to the target."""
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.surface.acf import blur_to_fwhm, detrend
+
+    vertices, faces = _surface_geometry(args, input_file, header, n_vertices)
+    mask = _surface_mask(args)
+    first = np.asarray(load_nifti(input_file).dataobj, np.float64).reshape(n_vertices, -1)
+    master = detrend(first, degree=max(int(args.polort or 3), 1) if args.polort else 3)
+    hs, kernel, achieved = blur_to_fwhm(
+        master, vertices, faces, args.blur_to_fwhm, mask, device=None
+    )
+    if hs is None:
+        print(
+            f"  Surface data already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
+            "no blur applied"
+        )
+        return None
+    print(
+        f"  Blurring TO {args.blur_to_fwhm} mm: heat kernel {kernel:.2f} mm "
+        f"(first run reaches {achieved:.2f} mm)"
+    )
+    return hs
+
+
+def _observe_surface_acf(args, input_file, residuals, mask, label, device):
+    """The mixed ACF and per-vertex FWHM of surface residuals: ``{label: (acf, fwhm, per)}``."""
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.surface.acf import surface_acf
+    from fastfuncstuff.surface.smooth import surface_fwhm
+
+    header = load_nifti(input_file).header
+    vertices, faces = _surface_geometry(args, input_file, header, residuals.shape[0])
+    acf = surface_acf(residuals, vertices, faces, mask, device=_surface_device(device))
+    fwhm, per = surface_fwhm(residuals, vertices, faces, mask)
+    print(
+        f"  • surface ACF ({label}): a={acf.a:.4f} b={acf.b:.3f} c={acf.c:.3f} "
+        f"-> ACF FWHM {acf.fwhm:.2f} mm; classic FWHM {fwhm:.2f} mm"
+    )
+    return {"label": label, "acf": acf, "fwhm": fwhm, "per_vertex": per,
+            "vertices": vertices, "faces": faces, "mask": mask, "header": header}  # fmt: skip
+
+
+def _save_surface_acf(prefix, info) -> None:
+    """-save_acf on surface input: the fit, the curve, and a per-vertex FWHM map."""
+    from fastfuncstuff.io.afni import save_nifti
+
+    if not info:
+        print("  ⚠️  -save_acf: no surface ACF was estimated (needs residuals)")
+        return
+    acf, label = info["acf"], info["label"]
+    lines = [
+        f"# surface ACF of the {label} residuals: a b c ACF-FWHM classic-FWHM (mm)",
+        f"{acf.a:.5f} {acf.b:.4f} {acf.c:.4f} {acf.fwhm:.4f} {info['fwhm']:.4f}",
+        "# r(mm) mean-correlation",
+        *(f"{r:.3f} {c:.5f}" for r, c in zip(acf.r, acf.curve, strict=True) if np.isfinite(c)),
+    ]
+    stem = str(prefix).removesuffix(".gii").removesuffix(".shape")
+    Path(f"{stem}.acf_{label}.txt").write_text("\n".join(lines) + "\n")
+    per = np.nan_to_num(info["per_vertex"], nan=0.0).astype(np.float32)[:, None, None]
+    save_nifti(per, f"{stem}.fwhm_{label}.shape.gii", header=info["header"])
+    print(f"  • surface ACF: {stem}.acf_{label}.txt, {stem}.fwhm_{label}.shape.gii")
+
+
+def _run_surface_clustsim(args, diag, device) -> None:
+    """-clustsim on surface input: SurfClustSim with this fit's residual ACF.
+
+    Tables (cluster AREA in mm^2) go into the bucket's GIfTI metadata as JSON, keyed
+    by sidedness, and beside it as 3dClustSim-style text. The null depends only on
+    (geometry, mask, ACF), so a repeat with the same ones comes from the cache.
+    """
+    import json
+
+    import nibabel as nib
+
+    from fastfuncstuff.stats.clustsim import ACF, DEFAULT_CS_ATHR
+    from fastfuncstuff.stats.surface_clustsim import surface_clustsim, table_text
+
+    print()
+    print("=" * 70)
+    print("🎲 SurfClustSim: Monte-Carlo cluster-AREA thresholds on the surface (-clustsim)")
+    print("=" * 70)
+    info = getattr(diag, "surface_acf", None) if diag is not None else None
+    if not info:
+        print("  ⚠️  skipped: no surface ACF was estimated (needs residuals and -mask).")
+        return
+    buck = _resolve_written_bucket(args.Rbuck if info["label"] == "reml" else args.Obuck)
+    if buck is None:
+        print("  ⚠️  skipped: no bucket to attach the tables to.")
+        return
+    a = info["acf"]
+    try:
+        res = surface_clustsim(
+            info["vertices"], info["faces"], ACF(a.a, a.b, max(a.c, 1e-3)), info["mask"],
+            niter=args.clustsim_niter, device=_surface_device(device), verb=1,
+        )  # fmt: skip
+        stem = str(buck).removesuffix(".gii").removesuffix(".func").removesuffix(".shape")
+        out_dir = Path(args.clustsim_prefix or f"{stem}_clustsim")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        img = nib.load(buck)
+        assert isinstance(img, nib.gifti.GiftiImage)
+        for sided in res.max_areas:
+            (out_dir / f"surfclustsim.{sided}.1D").write_text(table_text(res, sided))
+            img.meta[f"ClustSim_{sided}"] = json.dumps({
+                "pthr": list(res.pthr), "athr": list(DEFAULT_CS_ATHR),
+                "area_mm2": res.table(sided).round(2).tolist(),
+                "acf": [a.a, a.b, a.c], "niter": res.niter,
+            })  # fmt: skip
+        nib.save(img, buck)
+        print(f"  • tables ({'cached' if res.cached else f'{res.niter} iterations'}): "
+              f"{out_dir}/ and the metadata of {buck}")  # fmt: skip
+        print(table_text(res, "bi-sided"))
+    except Exception as e:  # never lose a finished GLM to a table
+        print(f"    ⚠️  SurfClustSim failed (the bucket is still valid): {e}")
 
 
 def _derive_rvar_path(rbuck_path: str) -> str:
@@ -1827,18 +1971,17 @@ def main():
     from fastfuncstuff.io.gifti import is_gifti
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    if args.blur_to_fwhm is not None and (not surface_input or args.do_blur is not None):
+        print(
+            "❌ ERROR: -blur_to_fwhm is for surface (.gii) input, and replaces -do_blur.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if surface_input:
         # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
         # not care, but anything spatial assumes a voxel grid and has no surface
         # twin yet (Surfaces as an analysis space, S3-S5).
-        grid_only = [
-            flag
-            for flag, on in (
-                ("-save_acf", bool(args.save_acf)),
-                ("-clustsim", bool(args.clustsim)),
-            )
-            if on
-        ]
+        grid_only = [flag for flag, on in () if on]
         if grid_only:
             print(
                 f"❌ ERROR: {', '.join(grid_only)} need a voxel grid; surface (.gii) input "
@@ -1847,7 +1990,13 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-        needs_mask = args.save_tsnr or args.save_grandmean or args.save_mask
+        needs_mask = (
+            args.save_tsnr
+            or args.save_grandmean
+            or args.save_mask
+            or args.save_acf
+            or args.clustsim
+        )
         if needs_mask and not args.mask:
             print(
                 "❌ ERROR: the diagnostics need -mask on surface input (an automask has no "
@@ -2993,7 +3142,13 @@ def main():
     # path (the same one -save_* diagnostics use). -no_guard restores the old
     # behaviour, including the -cache fast path.
     guard_enabled = not args.no_guard
-    preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag or guard_enabled
+    preprocessing_applied = (
+        args.do_blur is not None
+        or args.blur_to_fwhm is not None
+        or args.do_scale
+        or want_diag
+        or guard_enabled
+    )
     # Set by the guard block below, then handed to analyze_from_design_matrix so
     # -handle_missing can partition the salvageable voxels into families.
     guard_validity = None
@@ -3065,6 +3220,10 @@ def main():
                 f"  Applying surface heat smoothing (FWHM = {args.do_blur} mm along the "
                 f"cortex, {int(surface_smoother.mask.sum()):,} vertices)..."
             )
+        elif args.blur_to_fwhm is not None:
+            surface_smoother = _surface_blur_to(
+                args, input_files[0], nifti_header, n_voxels, device
+            )
         elif args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
@@ -3097,7 +3256,7 @@ def main():
             # signature that a mid-run dropout is detected by.
             if guard_acc is not None:
                 guard_acc.observe_run(run_data, run_idx)
-            if args.do_blur is not None:
+            if args.do_blur is not None or surface_smoother is not None:
                 return _blur_run(run_data, run_idx)
             return run_data
 
@@ -3111,7 +3270,9 @@ def main():
             total_timepoints=total_tps,
             drop_first=trim.drop_first,
             drop_last=trim.drop_last,
-            per_run_fn=_per_run if (guard_acc is not None or args.do_blur is not None) else None,
+            per_run_fn=_per_run
+            if (guard_acc is not None or (args.do_blur is not None or surface_smoother is not None))
+            else None,
         )
         fmri_data_preprocessed = data_tensor.numpy()
         del data_tensor
@@ -3614,8 +3775,12 @@ def main():
                         {_label: _full[_dmf]},
                         _dmask,
                         want_tsnr=bool(args.save_tsnr),
-                        want_fwhmx=want_acf,
+                        want_fwhmx=want_acf and not surface_input,
                     )
+                    if surface_input and want_acf:
+                        diag.surface_acf = _observe_surface_acf(
+                            args, input_files[0], _full.numpy(), _dmf.numpy(), _label, device
+                        )
 
             # Surface input writes its diagnostics as GIfTI maps on the same mesh.
             _dext = ".shape.gii" if surface_input else ".nii.gz"
@@ -3643,7 +3808,9 @@ def main():
                     _diag_affine,
                     _diag_header,
                 )
-            if args.save_acf:
+            if args.save_acf and surface_input:
+                _save_surface_acf(args.save_acf, getattr(diag, "surface_acf", None))
+            elif args.save_acf:
                 diag.save_table(f"fwhmx_{_label}", f"{args.save_acf}.fwhmx_{_label}.txt")
                 diag.save_table(f"blur_est_{_label}", f"{args.save_acf}.blur_est_{_label}.1D")
         except Exception as _diag_err:  # diagnostics must never break the fit output
@@ -4445,7 +4612,9 @@ def main():
                 # Most likely: no AFNI stat metadata (needs 3drefit at write time).
                 print(f"  ⚠️  skipped {actual}: {e}")
 
-    if args.clustsim:
+    if args.clustsim and surface_input:
+        _run_surface_clustsim(args, diag, device)
+    elif args.clustsim:
         _run_clustsim(args, diag, device)
 
     print()
