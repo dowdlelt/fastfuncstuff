@@ -66,6 +66,17 @@ class SnapParams:
     #: Penalty, at the edge of the search band, for picking an edge far from
     #: the dragged position, relative to the strongest edge in the patch.
     distance_penalty: float = 0.5
+    #: Keep only edges that cross the intensity this boundary should sit at
+    #: (read off the surfaces themselves, see ``_tissue_levels``). Off, the
+    #: strongest edge of the right sign wins: for a boundary the surfaces'
+    #: own tissue estimate gets wrong -- pial lying in dura reads "CSF" from
+    #: dura, and the gate then rejects the GM/dura edge the eye can see.
+    gate: bool = True
+    #: Hand moves follow the drag itself rather than each vertex's normal:
+    #: the direction the eye sees in the slice. Ignored while snapping (the
+    #: edge search runs along normals). The rule that pial stays outside
+    #: white still holds, along the normal.
+    free: bool = False
 
 
 @dataclass
@@ -78,6 +89,29 @@ class EditResult:
     displacement: np.ndarray
     #: Per-vertex edge confidence in [0, 1].
     confidence: np.ndarray
+    #: Why the result is not simply the drag -- for telling the person
+    #: dragging, while they drag. Vertices the fold guard damped; pial
+    #: vertices held at white (``min_thickness``) when dragged through it;
+    #: and, with snap on, how far the image's edge moved the brush's core
+    #: from where the hand put it (mm along the normal, + outward).
+    fold_damped: int = 0
+    held: int = 0
+    snap_offset: float = 0.0
+
+
+def explain(res: EditResult) -> str:
+    """One line on what held an edit back, or ``""`` when it did what was asked."""
+    parts = []
+    if res.snap_offset and abs(res.snap_offset) >= 0.25:
+        way = "out" if res.snap_offset > 0 else "in"
+        parts.append(
+            f"snap moved it {abs(res.snap_offset):.1f} mm {way} to the image edge (m: hand)"
+        )
+    if res.held:
+        parts.append(f"pial held at white on {res.held} vertices -- move white first")
+    if res.fold_damped:
+        parts.append(f"damped on {res.fold_damped} vertices so the mesh does not fold")
+    return "; ".join(parts)
 
 
 def _brush_weight(dist: np.ndarray, radius: float) -> np.ndarray:
@@ -93,6 +127,9 @@ class SurfaceEdit:
     positions (same vertex order), used to keep pial outside white. Positions
     are scanner-RAS mm, the same frame as ``sampler``.
     """
+
+    #: Neighbour-averaging passes over the vertex normals a drag moves along.
+    NORMAL_SMOOTHING = 3
 
     def __init__(
         self,
@@ -147,7 +184,21 @@ class SurfaceEdit:
         self._fold_faces = local.reshape(faces.shape)
         self._fold_verts = vertices[used]
         self._fold_slot = np.searchsorted(used, self.ids)
+        self._fold_before = face_normals(self._fold_verts, self._fold_faces)
+        self.fold_damped = 0
         self._system = self._laplacian()
+        self._degree = np.maximum(self._system.diagonal(), 1.0)
+        self._adjacency = (sp.diags(self._system.diagonal()) - self._system).tocsr()
+        # The direction each vertex moves: its normal, averaged over a couple
+        # of rings. Raw vertex normals jitter from vertex to vertex on a fine
+        # mesh, and a drag projected onto them pushed neighbours by different
+        # amounts -- on a real subject a third of 2 mm white drags folded the
+        # mesh; with these, a quarter (and the fold guard then damps less).
+        n = self.normals
+        for _ in range(self.NORMAL_SMOOTHING):
+            n = n + self._adjacency @ n
+            n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+        self.normals = n
         # Barycentric vertex area (a third of each incident face), mm^2.
         area = np.zeros(used.size)
         face_area = 0.5 * np.linalg.norm(face_normals(self._fold_verts, self._fold_faces), axis=1)
@@ -155,7 +206,7 @@ class SurfaceEdit:
         self.area = area[self._fold_slot]
         n = int(round(2 * params.search / (0.1 * sampler.voxel_mm))) + 1
         self._offsets = np.linspace(-params.search, params.search, max(n, 3))
-        self.levels = self._tissue_levels()
+        self.levels = self._tissue_levels() if params.gate else None
 
     def _laplacian(self) -> sp.csr_matrix:
         """Graph Laplacian over the patch's own edges (free at its rim).
@@ -245,7 +296,51 @@ class SurfaceEdit:
     def update(self, drag: np.ndarray) -> EditResult:
         """Positions for a cumulative drag vector ``drag`` (mm) from the press."""
         drag = np.asarray(drag, np.float64)
+        if self.params.free and self.params.snap <= 0:
+            return self._finish_free(self.weight[:, None] * drag[None, :])
         return self._finish(self.weight * (self.normals @ drag))
+
+    def _finish_free(self, disp: np.ndarray) -> EditResult:
+        """A hand move along ``(n, 3)`` vectors, not normals: what the slice shows.
+
+        Normal-only motion keeps the mesh regular, but it is not what a hand
+        dragging an outline across a slice asks for: the outline moves only
+        by the drag's component along each vertex's normal, so a stretch
+        whose normals tilt through the slice barely follows. Here the patch
+        goes where it is dragged. The fold guard still damps where it would
+        turn faces over, and the partner rule still holds along the normal.
+        """
+        p = self.params
+        n = self.normals
+        held = 0
+        if self.partner_start is not None and self.role == "pial":
+            gap = np.einsum("ij,ij->i", self.partner_start - self.start, n)
+            along = np.einsum("ij,ij->i", disp, n)
+            short = gap + p.min_thickness - along
+            inside = short > 0
+            held = int(np.count_nonzero(inside & (self.weight > 0.1)))
+            disp = disp + np.where(inside, short, 0.0)[:, None] * n
+        disp = self._unfold(disp)
+        positions = self.start + disp
+        along = np.einsum("ij,ij->i", disp, n)
+        partner_ids = np.zeros(0, np.int64)
+        partner_pos = np.zeros((0, 3))
+        if self.partner_start is not None and self.role == "white":
+            gap = np.einsum("ij,ij->i", self.partner_start - self.start, n)
+            push = along + p.min_thickness - gap
+            pushed = push > 0
+            partner_ids = self.ids[pushed]
+            partner_pos = self.partner_start[pushed] + push[pushed, None] * n[pushed]
+        return EditResult(
+            self.ids,
+            positions,
+            partner_ids,
+            partner_pos,
+            np.linalg.norm(disp, axis=1),
+            np.ones(self.ids.size),
+            fold_damped=self.fold_damped,
+            held=held,
+        )
 
     def _finish(self, along: np.ndarray, limit: np.ndarray | None = None) -> EditResult:
         """From a rough along-normal displacement to the placed, guarded result."""
@@ -263,15 +358,20 @@ class SurfaceEdit:
         reach = p.search if limit is None else limit
         edge = np.clip(edge, along - reach, along + reach)
         d = along + p.snap * np.sqrt(self.weight) * (edge - along)
+        core = self.weight > 0.5
+        snap_offset = float(np.median((d - along)[core])) if p.snap > 0 and core.any() else 0.0
 
         gap = None
+        held = 0
         if self.partner_start is not None:
             gap = np.einsum("ij,ij->i", self.partner_start - self.start, self.normals)
             if self.role == "pial":
                 # Pial may not pass inward through white. ``gap`` is white
                 # relative to pial along the normal, so negative: pial may move
                 # in by at most -(gap) - min_thickness.
-                d = np.maximum(d, gap + p.min_thickness)
+                floor = gap + p.min_thickness
+                held = int(np.count_nonzero((d < floor) & (self.weight > 0.1)))
+                d = np.maximum(d, floor)
         d = self._unfold(d)
         positions = self.start + d[:, None] * self.normals
 
@@ -283,18 +383,70 @@ class SurfaceEdit:
             pushed = push > 0
             partner_ids = self.ids[pushed]
             partner_pos = self.partner_start[pushed] + push[pushed, None] * self.normals[pushed]
-        return EditResult(self.ids, positions, partner_ids, partner_pos, d, confidence)
+        return EditResult(
+            self.ids,
+            positions,
+            partner_ids,
+            partner_pos,
+            d,
+            confidence,
+            fold_damped=self.fold_damped,
+            held=held,
+            snap_offset=snap_offset,
+        )
+
+    def _flipped(self, d: np.ndarray) -> np.ndarray:
+        """Faces (of those touching the patch) that ``d`` turns over.
+
+        ``d`` is a distance along each normal, or ``(n, 3)`` vectors (free moves).
+        """
+        moved = self._fold_verts.copy()
+        disp = d[:, None] * self.normals if d.ndim == 1 else d
+        moved[self._fold_slot] = self.start + disp
+        after = face_normals(moved, self._fold_faces)
+        return np.einsum("ij,ij->i", self._fold_before, after) <= 0
 
     def _unfold(self, d: np.ndarray) -> np.ndarray:
-        """Scale the displacement back until no face in the patch flips."""
-        before = face_normals(self._fold_verts, self._fold_faces)
-        moved = self._fold_verts.copy()
+        """Damp the displacement where it folds the mesh, and only there.
+
+        Halving the whole patch whenever any face flipped cost the median
+        2 mm pial drag half its movement on a real subject (the guard fired on
+        more than half of them): one tight fundus at the brush's edge held back
+        the vertex under the cursor. The damping now starts at the vertices of
+        the flipped faces and fades over their neighbours, so the rest of the
+        patch keeps what it was asked for. The global halving stays as the
+        last resort, and zero after that, so a flip can never be committed.
+        """
+        self.fold_damped = 0
+        bad = self._flipped(d)
+        if not bad.any():
+            return d
+        keep = np.ones(d.shape[0])
+
+        def scaled(k: np.ndarray) -> np.ndarray:
+            return d * k if d.ndim == 1 else d * k[:, None]
+
+        for _ in range(12):
+            hit = np.zeros(self._fold_verts.shape[0], bool)
+            hit[self._fold_faces[bad].ravel()] = True
+            hit = hit[self._fold_slot]
+            keep[hit] *= 0.5
+            # Spread the damping one ring outward at half strength, so the
+            # damped spot does not become a step in the surface.
+            loss = 1.0 - keep
+            loss = np.maximum(loss, 0.5 * (self._adjacency @ loss) / self._degree)
+            keep = 1.0 - loss
+            bad = self._flipped(scaled(keep))
+            if not bad.any():
+                self.fold_damped = int(np.count_nonzero(keep < 0.999))
+                return scaled(keep)
+        d = scaled(keep)
         for _ in range(8):
-            moved[self._fold_slot] = self.start + d[:, None] * self.normals
-            after = face_normals(moved, self._fold_faces)
-            if np.all(np.einsum("ij,ij->i", before, after) > 0):
-                return d
             d = 0.5 * d
+            if not self._flipped(d).any():
+                self.fold_damped = d.shape[0]
+                return d
+        self.fold_damped = d.shape[0]
         return np.zeros_like(d)
 
 
@@ -303,8 +455,10 @@ class StrokeEdit(SurfaceEdit):
 
     ``seeds`` are the vertices of the faces the slice cut between the two
     ends of the stroke -- the stretch that was redrawn -- and ``stroke`` the
-    drawn line, ``(M, 3)`` scanner mm. Each seed moves along its normal to the
-    stroke's nearest point; everything within ``params.radius`` mm *along the
+    drawn line, ``(M, 3)`` scanner mm. Each seed moves along its normal until
+    its tangent plane passes through the stroke where the seed's own outline
+    point, cast along the outline's normal, meets it (:func:`stroke_targets`);
+    everything within ``params.radius`` mm *along the
     surface* of any seed follows by harmonic interpolation, pinned to the
     seeds and to zero just past the rim, so the change carries into the
     slices above and below without a kink. With ``snap`` on, the result is
@@ -323,6 +477,7 @@ class StrokeEdit(SurfaceEdit):
         *,
         role: str = "white",
         partner: np.ndarray | None = None,
+        plane_normal: np.ndarray | None = None,
     ) -> None:
         from scipy.sparse.csgraph import dijkstra
 
@@ -339,14 +494,26 @@ class StrokeEdit(SurfaceEdit):
         self.centre = int(seeds[0])
         self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
-        targets = closest_on_polyline(self.start[self.seed], stroke)
-        self.seed_shift = np.einsum(
-            "ij,ij->i", targets - self.start[self.seed], self.normals[self.seed]
-        )
+        start, normals = self.start[self.seed], self.normals[self.seed]
+        self.disp: np.ndarray | None = None
+        if plane_normal is None:
+            targets = closest_on_polyline(start, stroke)
+        else:
+            targets, feet = stroke_targets(start, normals, stroke, plane_normal, feet=True)
+            if params.free and params.snap <= 0:
+                # Free: each seed carries its outline point onto the stroke --
+                # in the slice, square to the outline, as the eye reads it --
+                # and the fill spreads that vector rather than a distance.
+                a = np.asarray(plane_normal, np.float64)
+                a = a / np.linalg.norm(a)
+                vec = targets - feet
+                vec -= np.outer(vec @ a, a)
+                self.disp = self._interpolate(vec)
+        self.seed_shift = np.einsum("ij,ij->i", targets - start, normals)
         self.along = self._interpolate()
 
-    def _interpolate(self) -> np.ndarray:
-        """Harmonic fill: seeds fixed to their shift, zero just past the rim."""
+    def _interpolate(self, values: np.ndarray | None = None) -> np.ndarray:
+        """Harmonic fill: seeds fixed to their shift (or ``values``), zero just past the rim."""
         edges = self.topo.edges
         n = self.ids.size
         lookup = np.full(self.topo.n_vertices, -1, np.int64)
@@ -365,18 +532,138 @@ class StrokeEdit(SurfaceEdit):
         )
         pin = np.zeros(n)
         pin[self.seed] = 1e6
-        rhs = np.zeros(n)
-        rhs[self.seed] = 1e6 * self.seed_shift
-        return np.asarray(spsolve((lap + sp.diags(pin)).tocsc(), rhs), np.float64)
+        seed_values = self.seed_shift if values is None else np.asarray(values, np.float64)
+        rhs = np.zeros((n, *seed_values.shape[1:]))
+        rhs[self.seed] = 1e6 * seed_values
+        out = spsolve((lap + sp.diags(pin)).tocsc(), rhs)
+        return np.asarray(out.toarray() if sp.issparse(out) else out, np.float64).reshape(rhs.shape)
 
     def result(self) -> EditResult:
         """The redrawn surface. Computed from the start, like every update."""
         p = self.params
+        if self.disp is not None:
+            return self._finish_free(self.disp)
         if p.snap <= 0:
             limit = np.zeros(self.ids.size)
         else:
             limit = np.where(self.seed, 0.5 * p.search, p.search)
         return self._finish(self.along, limit)
+
+
+class HighlightEdit(StrokeEdit):
+    """A chosen set of vertices moved together along their normals by ``shift`` mm.
+
+    The highlighted vertices are the seeds, all pinned to the same shift;
+    the surface within ``params.radius`` mm of them follows by the same
+    harmonic fill a stroke uses, so the group moves as a plateau with a
+    smooth shoulder instead of a brush's peak. Always by hand: a highlight
+    says "these, this far", which a snap would second-guess.
+    """
+
+    def __init__(
+        self,
+        vertices: np.ndarray,
+        topo: MeshTopology,
+        seeds: np.ndarray,
+        shift: float,
+        sampler: VolumeSampler,
+        params: SnapParams = SnapParams(),
+        *,
+        role: str = "white",
+        partner: np.ndarray | None = None,
+    ) -> None:
+        from scipy.sparse.csgraph import dijkstra
+
+        vertices = np.asarray(vertices, np.float64)
+        seeds = np.unique(np.asarray(seeds, np.int64))
+        if seeds.size == 0:
+            raise ValueError("nothing is highlighted")
+        graph = topo.edge_graph(vertices)
+        dist = dijkstra(graph, indices=seeds, limit=float(params.radius), min_only=True)
+        ids = np.flatnonzero(np.isfinite(dist))
+        self.centre = int(seeds[0])
+        self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
+        self.seed = np.isin(self.ids, seeds)
+        self.seed_shift = np.full(int(self.seed.sum()), float(shift))
+        self.along = self._interpolate()
+
+    def result(self) -> EditResult:
+        return self._finish(self.along, np.zeros(self.ids.size))
+
+
+def stroke_targets(
+    points: np.ndarray,
+    normals: np.ndarray,
+    stroke: np.ndarray,
+    plane_normal: np.ndarray,
+    *,
+    feet: bool = False,
+):
+    """Where each vertex's outline must pass through the stroke, ``(N, 3)`` mm.
+
+    The nearest stroke point is the wrong partner near a stroke's ends: a
+    stroke starts on the old outline and swerves out, so a vertex a millimetre
+    along from the start is nearer the start than the swerve, and was given
+    almost no shift -- on a real subject the first ~2 mm of every redrawn
+    stretch did not move. Instead each vertex's *own* point on the outline
+    (where its tangent plane meets the slice, straight across the surface) is
+    cast along the outline's in-slice normal, both ways, to the first stroke
+    crossing. A vertex whose surface lies nearly in the slice has no stable
+    outline point, and one whose cast misses the stroke has no crossing; both
+    keep the nearest point.
+
+    With ``feet``, also returns each vertex's outline point (the vertex itself
+    where it has none), so ``target - foot`` is the move the outline makes.
+    """
+    pts = np.asarray(points, np.float64)
+    nrm = np.asarray(normals, np.float64)
+    line = np.asarray(stroke, np.float64)
+    out = closest_on_polyline(pts, line)
+    a = np.asarray(plane_normal, np.float64)
+    a = a / np.linalg.norm(a)
+    origin = line[0]
+    # Within the tangent plane, the direction that reaches the slice fastest.
+    an = nrm @ a
+    w = a[None, :] - an[:, None] * nrm
+    wa = np.einsum("ij,j->i", w, a)
+    m = nrm - an[:, None] * a[None, :]  # the outline's in-slice normal
+    mlen = np.linalg.norm(m, axis=1)
+    ok = (mlen > 0.2) & (np.abs(wa) > 1e-6)
+    if not ok.any() or line.shape[0] < 2:
+        return (out, pts.copy()) if feet else out
+    foot = pts - (((pts - origin) @ a) / np.where(ok, wa, 1.0))[:, None] * w
+    m = m / np.maximum(mlen, 1e-12)[:, None]
+    # 2-D in the slice: e1, e2 span it.
+    e1 = line[-1] - line[0]
+    e1 = e1 - (e1 @ a) * a
+    if np.linalg.norm(e1) < 1e-9:
+        e1 = np.cross(a, [1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.cross(a, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(a, e1)
+    basis = np.stack([e1, e2], 1)
+    f2, m2 = (foot - origin) @ basis, m @ basis
+    p0 = (line[:-1] - origin) @ basis
+    seg = (line[1:] - line[:-1]) @ basis
+    # foot + delta * m = p0 + u * seg, per (vertex, segment): Cramer's rule.
+    det = m2[:, None, 0] * (-seg[None, :, 1]) - m2[:, None, 1] * (-seg[None, :, 0])
+    rhs = p0[None] - f2[:, None]
+    delta = (rhs[..., 0] * (-seg[None, :, 1]) - rhs[..., 1] * (-seg[None, :, 0])) / np.where(
+        np.abs(det) > 1e-12, det, np.inf
+    )
+    u = (m2[:, None, 0] * rhs[..., 1] - m2[:, None, 1] * rhs[..., 0]) / np.where(
+        np.abs(det) > 1e-12, det, np.inf
+    )
+    hit = (u >= 0) & (u <= 1) & np.isfinite(delta)
+    reach = np.where(hit, np.abs(delta), np.inf)
+    k = np.argmin(reach, axis=1)
+    rows = np.arange(pts.shape[0])
+    use = ok & np.isfinite(reach[rows, k])
+    out[use] = foot[use] + delta[rows, k][use, None] * m[use]
+    if feet:
+        where = pts.copy()
+        where[use] = foot[use]
+        return out, where
+    return out
 
 
 def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
@@ -392,4 +679,13 @@ def closest_on_polyline(points: np.ndarray, line: np.ndarray) -> np.ndarray:
     return near[np.arange(points.shape[0]), k]
 
 
-__all__ = ["EditResult", "SnapParams", "StrokeEdit", "SurfaceEdit", "closest_on_polyline"]
+__all__ = [
+    "EditResult",
+    "HighlightEdit",
+    "SnapParams",
+    "StrokeEdit",
+    "SurfaceEdit",
+    "closest_on_polyline",
+    "explain",
+    "stroke_targets",
+]

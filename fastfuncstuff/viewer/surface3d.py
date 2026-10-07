@@ -106,6 +106,41 @@ def layout_offsets(
     return out
 
 
+def hemisphere_models(
+    positions: dict[str, np.ndarray], split: float = 0.0, hinge: float = 0.0
+) -> dict[str, np.ndarray]:
+    """Per-hemisphere 4x4 placing ``positions`` (as drawn, before this) in the window.
+
+    ``split`` pushes the hemispheres apart along x, mm in total. ``hinge``
+    swings them open about a vertical axis, total degrees split evenly between
+    the two: positive pivots each on its front medial edge (nose to nose),
+    negative on its back medial edge (occipital to occipital). Each pivots on
+    its *own* edge, so the hinge is where the two hemispheres touch, the way
+    a hot-dog bun opens; the split then moves them apart along x, which at
+    180 degrees is straight away from each other.
+    """
+    out: dict[str, np.ndarray] = {}
+    a = np.radians(float(hinge))
+    for h, pos in positions.items():
+        side = -1.0 if h == "lh" else 1.0
+        m = np.eye(4)
+        if a != 0.0 and pos.size:
+            lo, hi = pos.min(axis=0), pos.max(axis=0)
+            # The medial edge faces the other hemisphere: lh's largest x.
+            px = float(hi[0] if side < 0 else lo[0])
+            py = float(hi[1] if a > 0 else lo[1])
+            # The end away from the hinge swings out to the hemisphere's own
+            # side: lh's back end to -x for a front hinge (clockwise from
+            # above), its front end to -x for a back hinge (counter-clockwise).
+            r = _rotation([0, 0, 1], side * a / 2.0)
+            pivot = np.array([px, py, 0.0])
+            m[:3, :3] = r
+            m[:3, 3] = pivot - r @ pivot
+        m[0, 3] += side * split / 2.0
+        out[h] = m
+    return out
+
+
 def texture_from_mm(shape: tuple[int, int, int], affine: np.ndarray) -> np.ndarray:
     """4x4 from scanner mm to normalised 3-D texture coordinates.
 
@@ -329,6 +364,7 @@ def pack_uniforms(
     cross_rgb: tuple[float, float, float],
     equivolume: bool = False,
     map_opacity: float = 1.0,
+    depth_stat: str = "mean",
 ) -> bytes:
     """The uniform block as bytes. Matrices go column-major, as GLSL reads them.
 
@@ -342,7 +378,7 @@ def pack_uniforms(
         _vec(depth[0], depth[1], float(samples), fold_contrast),
         _vec(*cross),
         _vec(*cross_rgb, 0.0),
-        _vec(1.0 if equivolume else 0.0, map_opacity, 0.0, 0.0),
+        _vec(1.0 if equivolume else 0.0, map_opacity, float(DEPTH_STATS.index(depth_stat)), 0.0),
     ]
     shown = layers[-MAX_LAYERS:]
     for k in range(MAX_LAYERS):
@@ -410,20 +446,46 @@ def flag_ramp() -> np.ndarray:
     return (rgb * 255).astype(np.uint8)
 
 
+def vertex_map_scale(hemi: Hemisphere, kind: str) -> tuple[float, float, str] | None:
+    """(value at the LUT's start, value at its end, LUT name) of a continuous map.
+
+    ``None`` for maps that are not a scale (parcellation, flags) or absent.
+    Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
+    same; sulc and curv red-blue, symmetric at their 98th percentile, with
+    FreeSurfer's sign (positive is sulcal, deep) toward blue.
+    """
+    if kind not in ("thickness", "sulc", "curv"):
+        return None
+    values = hemi.morph.get(kind)
+    if values is None:
+        return None
+    if kind == "thickness":
+        return 1.0, 4.5, "viridis"
+    cortex = hemi.cortex if hemi.cortex is not None else np.ones(hemi.n_vertices, bool)
+    top = float(np.percentile(np.abs(values[cortex]), 98)) or 1.0
+    return top, -top, "RdBu"
+
+
+def map_lut(name: str) -> np.ndarray:
+    """``(256, 4)`` uint8 entries of a named colormap."""
+    import torch
+
+    from fastfuncstuff.viewer.colormap import build_lut
+
+    return (np.clip(build_lut(name, 256, device=torch.device("cpu")).numpy(), 0, 1) * 255).astype(
+        np.uint8
+    )
+
+
 def vertex_colors(
     hemi: Hemisphere, kind: str, annotation=None, flags: np.ndarray | None = None
 ) -> np.ndarray | None:
     """``(V, 4)`` uint8 colours of a per-vertex map, or ``None`` for no map.
 
-    Thickness on a fixed 1-4.5 mm viridis scale, so two subjects read the
-    same; sulc and curv on a symmetric red-blue scale at their 98th
-    percentile; ``annot`` in the parcellation's own colours. The medial wall
-    is left transparent: it has no thickness and no region.
+    Scales as :func:`vertex_map_scale`; ``annot`` in the parcellation's own
+    colours. The medial wall is left transparent: it has no thickness and no
+    region.
     """
-    import torch
-
-    from fastfuncstuff.viewer.colormap import build_lut
-
     if not kind:
         return None
     n = hemi.n_vertices
@@ -446,17 +508,11 @@ def vertex_colors(
         out[~cortex, 3] = 0
         return out
     values = hemi.morph.get(kind)
-    if values is None:
+    scale = vertex_map_scale(hemi, kind)
+    if values is None or scale is None:
         return None
-    if kind == "thickness":
-        lo, hi, name = 1.0, 4.5, "viridis"
-    else:
-        top = float(np.percentile(np.abs(values[cortex]), 98)) or 1.0
-        # FreeSurfer's sign: positive sulc/curv is sulcal (deep); show it blue.
-        lo, hi, name = top, -top, "RdBu"
-    lut = (np.clip(build_lut(name, 256, device=torch.device("cpu")).numpy(), 0, 1) * 255).astype(
-        np.uint8
-    )
+    lo, hi, name = scale
+    lut = map_lut(name)
     unit = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
     out = np.zeros((n, 4), np.uint8)
     out[:, :3] = lut[np.round(unit * 255).astype(int)][:, :3]
@@ -483,6 +539,52 @@ def depth_fractions(depth: tuple[float, float], samples: int) -> np.ndarray:
     if samples <= 1:
         return np.array([depth[0]])
     return np.linspace(depth[0], depth[1], samples)
+
+
+#: How the depth samples between white and pial become one value, in the
+#: order ``d`` cycles them; the index is what the shader receives. Names are
+#: 3dVol2Surf's map functions. Selections (median, max, min, max_abs) take
+#: the threshold statistic from the *same* depth as the value, so a colour
+#: and its threshold always describe one point; means average both over the
+#: same samples. No ``mode``: of continuous samples every value is unique,
+#: and label layers already vote across depth.
+DEPTH_STATS = ("mean", "median", "max", "min", "max_abs", "nzmean")
+
+
+def reduce_depth(values: np.ndarray, stats: np.ndarray, how: str) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce ``(..., S)`` depth samples to one value and threshold statistic.
+
+    CPU twin of the fragment shader's ``reduceDepth``. For an even sample
+    count ``median`` is the upper middle, as in the shader -- a sample that
+    exists, so its statistic is that sample's too.
+    """
+    v = np.asarray(values, np.float64)
+    s = np.asarray(stats, np.float64)
+    if how == "mean":
+        return v.mean(axis=-1), s.mean(axis=-1)
+    if how == "nzmean":
+        nz = v != 0
+        n = nz.sum(axis=-1)
+        safe = np.maximum(n, 1)
+        return (
+            np.where(n > 0, (v * nz).sum(axis=-1) / safe, 0.0),
+            np.where(n > 0, (s * nz).sum(axis=-1) / safe, 0.0),
+        )
+    if how == "median":
+        order = np.argsort(v, axis=-1, kind="stable")
+        pick = np.take(order, [v.shape[-1] // 2], axis=-1)
+    elif how == "max":
+        pick = np.argmax(v, axis=-1)[..., None]
+    elif how == "min":
+        pick = np.argmin(v, axis=-1)[..., None]
+    elif how == "max_abs":
+        pick = np.argmax(np.abs(v), axis=-1)[..., None]
+    else:
+        raise ValueError(f"unknown depth statistic {how!r}; one of {', '.join(DEPTH_STATS)}")
+    return (
+        np.take_along_axis(v, pick, axis=-1)[..., 0],
+        np.take_along_axis(s, pick, axis=-1)[..., 0],
+    )
 
 
 def shade_reference(values: np.ndarray, stat: np.ndarray, shade: ShadeParams, lut: np.ndarray):
@@ -529,11 +631,16 @@ __all__ = [
     "VERTEX_MAPS",
     "palette_texture",
     "depth_fractions",
+    "DEPTH_STATS",
+    "reduce_depth",
     "equivolume_fraction",
     "vertex_colors",
+    "vertex_map_scale",
+    "map_lut",
     "flag_ramp",
     "flat_patch",
     "layout_offsets",
+    "hemisphere_models",
     "pack_uniforms",
     "pick",
     "shade_reference",

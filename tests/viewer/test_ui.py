@@ -188,6 +188,24 @@ def test_tiling_gives_every_window_a_rectangle(win, qapp):
     assert len(lines) - before == len(rects)
 
 
+def test_opening_lines_windows_up_top_right_at_their_own_size(win, qapp):
+    """Start-up used to tile, which grew 280-pixel image windows to fill the
+    screen a moment after they appeared."""
+    win.show()
+    qapp.processEvents()
+    sizes = {vid: (w.width(), w.height()) for vid, w in win.manager.windows.items()}
+    win._row()
+    qapp.processEvents()
+    rects = [w.frameGeometry() for w in win.manager.windows.values() if w.isVisible()]
+    assert len(rects) >= 3
+    assert {vid: (w.width(), w.height()) for vid, w in win.manager.windows.items()} == sizes
+    controller = win.frameGeometry()
+    for i, a in enumerate(rects):
+        assert not controller.intersects(a)
+        for b in rects[i + 1 :]:
+            assert not a.intersects(b)
+
+
 def test_tiling_does_not_cover_the_controller(win, qapp):
     """Tiling over the controller hides the panel the windows are driven from."""
     win.show()
@@ -828,7 +846,16 @@ def win4d(win, qapp, tmp_path):
 
     rng = np.random.default_rng(61)
     aff = np.diag([3.0, 3.0, 3.0, 1.0])
-    img = nib.Nifti1Image(rng.normal(size=(10, 12, 8, 25)).astype(np.float32), aff)
+    # A head to find: zero-mean noise has a temporal mean of ~0 everywhere,
+    # and the AFNI-exact automask (rightly) finds no brain in it -- which
+    # emptied every carpet and matrix mask built from this fixture.
+    shape = (10, 12, 8)
+    ijk = np.stack(np.meshgrid(*[np.arange(n) for n in shape], indexing="ij"), -1)
+    centre, radii = (np.array(shape) - 1) / 2, np.array(shape) * 0.42
+    head = (((ijk - centre) / radii) ** 2).sum(-1) <= 1.0
+    noise = rng.normal(size=(*shape, 25))
+    data = (np.where(head, 100.0, 0.0)[..., None] + noise).astype(np.float32)
+    img = nib.Nifti1Image(data, aff)
     img.header["pixdim"][4] = 2.0
     img.header.set_xyzt_units("mm", "sec")
     nib.save(img, str(tmp_path / "bold.nii.gz"))
@@ -2624,3 +2651,21 @@ def test_the_debug_report_covers_every_controller(win, qapp):
     qapp.processEvents()
     text = win.debug_report()
     assert text.count("# ffs viewer session report") == len(win.controllers)
+
+
+def test_image_windows_thin_thicken_and_cycle_the_surface_outlines(win, qapp):
+    """Outlines are a fixed screen width, so in a small window they cover the
+    activation; [ ] and shift+O are on the image window, not just the controller."""
+    image = image_of(win, Plane.AXIAL)
+    before = win.session.state.surface_outline_width
+    image._outline_width_by(1 / 1.4)
+    qapp.processEvents()
+    assert win.session.state.surface_outline_width == pytest.approx(before / 1.4)
+    assert image.pane._outline_width == pytest.approx(before / 1.4)
+    for _ in range(20):
+        image._outline_width_by(1 / 1.4)
+    assert win.session.state.surface_outline_width == pytest.approx(0.25)
+    shown = win.session.state.surfaces_shown
+    image._cycle_outlines()
+    assert win.session.state.surfaces_shown != shown
+    assert "SET_OUTLINE_WIDTH" in win.session.to_script()

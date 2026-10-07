@@ -29,7 +29,7 @@ from fastfuncstuff.io.freesurfer import (
 )
 from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
-from fastfuncstuff.surface.mesh import MeshTopology
+from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball, vertex_normals
 from fastfuncstuff.surface.sampling import VolumeSampler
 from fastfuncstuff.viewer.slicing import PlaneView
 
@@ -58,6 +58,18 @@ class Outline:
 
 #: The surfaces an edit can grab, and the one each keeps outside/inside.
 PARTNER = {"white": "pial", "pial": "white"}
+
+
+#: What shift+O steps through. Both first, because judging one boundary
+#: needs the other in view to see the cortex between them.
+OUTLINE_CYCLE = ("white,pial", "white", "pial", "")
+
+
+def next_outlines(shown: tuple[str, ...]) -> str:
+    """The outline set after ``shown`` in :data:`OUTLINE_CYCLE`."""
+    now = ",".join(shown)
+    cycle = OUTLINE_CYCLE
+    return cycle[(cycle.index(now) + 1) % len(cycle)] if now in cycle else cycle[0]
 
 
 @dataclass(frozen=True)
@@ -96,18 +108,25 @@ class EditLog:
 class SurfaceStore:
     """The loaded hemispheres, slice indices cached per display grid, and edits."""
 
+    #: Display grids whose slice indices are kept (see ``_grids``).
+    MAX_GRIDS = 4
+
     def __init__(self) -> None:
         self.subject: Path | None = None
         self.hemis: dict[str, Hemisphere] = {}
-        self._grid_key: bytes | None = None
-        self._grid_inverse: np.ndarray | None = None
-        self._index: dict[tuple[str, str], SliceIndex] = {}
+        #: Slice indices per display grid, most recently used last: the shared
+        #: grid plus any oblique windows' tilted ones. One grid used to be
+        #: kept, which an oblique window beside a straight one would rebuild
+        #: on every redraw of either.
+        self._grids: dict[bytes, tuple[np.ndarray, dict[tuple[str, str], SliceIndex]]] = {}
         self._topo: dict[str, MeshTopology] = {}
         self._active: tuple[Grab, SurfaceEdit, np.ndarray] | None = None
         #: The last previewed edit, by the parameters that produced it, so the
         #: committing command does not recompute what is already on screen.
         self._pending: tuple[tuple, EditResult] | None = None
         self._undo: list[_Undo] = []
+        #: The last committed edit, so the window can say what held it back.
+        self.last_result: EditResult | None = None
         self.edited: set[tuple[str, str]] = set()
         self.log = EditLog()
         #: Bumped whenever any vertex moves or surfaces are (re)loaded, per
@@ -126,6 +145,11 @@ class SurfaceStore:
         #: window can show which cortex the profile is from.
         self.depth_roi_vertices: dict[str, np.ndarray] = {}
         self.depth_roi_version = 0
+        #: Highlighted vertices per hemisphere (bool masks): a hand-picked
+        #: stretch of cortex to move together or turn into an ROI. Vertex
+        #: ids, so the same columns on white and pial.
+        self.highlight: dict[str, np.ndarray] = {}
+        self.highlight_version = 0
         self._areas: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
         #: Per hemisphere, once its topology has been edited: every surface and
         #: per-vertex file of its mesh (MeshBundle, BundleSources). Saving or
@@ -159,11 +183,13 @@ class SurfaceStore:
         self.topology_changed.clear()
         self.flags = {}
         self.depth_roi_vertices = {}
+        self.highlight = {}
+        self.highlight_version += 1
         self._areas.clear()
         self._annots.clear()
         self._atlases.clear()
         self._trees.clear()
-        self._index.clear()
+        self._grids.clear()
         self._topo.clear()
         self._active = None
         self._pending = None
@@ -180,19 +206,23 @@ class SurfaceStore:
 
     def _slice_index(self, hemi: str, surface: str, grid_affine: np.ndarray) -> SliceIndex | None:
         key = np.asarray(grid_affine, np.float64).tobytes()
-        if key != self._grid_key:
-            # A new display grid re-expresses every vertex; indices built in
-            # the old one would cut the wrong slice.
-            self._index.clear()
-            self._grid_key = key
-            self._grid_inverse = np.linalg.inv(grid_affine)
-        found = self._index.get((hemi, surface))
+        entry = self._grids.pop(key, None)
+        if entry is None:
+            # Each grid re-expresses every vertex in its own voxels; an index
+            # built in another would cut the wrong slice.
+            entry = (np.linalg.inv(grid_affine), {})
+            while len(self._grids) >= self.MAX_GRIDS:
+                self._grids.pop(next(iter(self._grids)))
+        self._grids[key] = entry
+        inverse, index = entry
+        found = index.get((hemi, surface))
         if found is None:
             h = self.hemis[hemi]
             if surface not in h.states:
                 return None
-            ijk = apply_affine(np.linalg.inv(grid_affine), h.states[surface])
-            found = self._index[(hemi, surface)] = SliceIndex(ijk, h.faces)
+            found = index[(hemi, surface)] = SliceIndex(
+                apply_affine(inverse, h.states[surface]), h.faces
+            )
         return found
 
     def _move(
@@ -203,9 +233,10 @@ class SurfaceStore:
             return
         self.hemis[hemi].states[surface][ids] = positions
         self.version[hemi] = self.version.get(hemi, 0) + 1
-        index = self._index.get((hemi, surface))
-        if index is not None and self._grid_inverse is not None:
-            index.move(ids, apply_affine(self._grid_inverse, positions), faces)
+        for inverse, index in self._grids.values():
+            found = index.get((hemi, surface))
+            if found is not None:
+                found.move(ids, apply_affine(inverse, positions), faces)
 
     def outlines(
         self,
@@ -306,6 +337,137 @@ class SurfaceStore:
             if d <= max_mm and (best is None or d < best[2]):
                 best = (hemi, int(ids[k]), float(d))
         return best
+
+    def set_highlight(self, hemi: str, ids: np.ndarray, mode: str = "add") -> None:
+        """Add, remove or set highlighted vertices; ``mode="clear"`` empties every hemisphere."""
+        if mode == "clear":
+            self.highlight = {}
+            self.highlight_version += 1
+            return
+        if mode not in ("add", "remove", "set"):
+            raise ValueError("highlight mode is add, remove, set or clear")
+        h = self.hemis.get(hemi)
+        if h is None:
+            raise ValueError(f"no {hemi} hemisphere loaded")
+        ids = np.asarray(ids, np.int64)
+        if ids.size and (ids.min() < 0 or ids.max() >= h.n_vertices):
+            raise ValueError("highlighted vertex out of range")
+        mask = self.highlight.get(hemi)
+        if mask is None or mode == "set":
+            mask = np.zeros(h.n_vertices, bool)
+        mask[ids] = mode != "remove"
+        self.highlight[hemi] = mask
+        self.highlight_version += 1
+
+    def highlighted(self, hemi: str) -> np.ndarray:
+        """Highlighted vertex ids of ``hemi`` (empty when none)."""
+        mask = self.highlight.get(hemi)
+        return np.zeros(0, np.int64) if mask is None else np.flatnonzero(mask)
+
+    def disc(self, hemi: str, vertex: int, radius: float, surface: str = "white") -> np.ndarray:
+        """Vertices within ``radius`` mm of ``vertex`` along ``surface``."""
+        verts = self.hemis[hemi].states[surface].astype(np.float64)
+        ids, _ = geodesic_ball(verts, self.topology(hemi), int(vertex), float(radius))
+        return ids
+
+    def move_highlight(
+        self, hemi: str, surface: str, shift: float, sampler: VolumeSampler, params: SnapParams
+    ) -> EditResult:
+        """Move ``hemi``'s highlighted vertices on ``surface`` by ``shift`` mm along their normals."""
+        from fastfuncstuff.surface.edit import HighlightEdit
+
+        self.cancel()
+        seeds = self.highlighted(hemi)
+        h = self.hemis[hemi]
+        topo = self.topology(hemi)
+        edit = HighlightEdit(
+            h.states[surface],
+            topo,
+            seeds,
+            shift,
+            sampler,
+            params,
+            role=surface,
+            partner=h.states.get(PARTNER[surface]),
+        )
+        res = edit.result()
+        self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)
+        self._commit(
+            hemi,
+            surface,
+            edit,
+            res,
+            {"tool": "highlight", "seeds": int(seeds.size), "shift": shift},
+        )
+        return res
+
+    def highlight_mask(self, affine: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+        """Voxels of a grid that the highlighted cortex fills, white to pial.
+
+        Points are laid over every face whose corners are all highlighted (a
+        few per face, so no voxel between vertices is missed) and up the
+        column from white to pial, half a voxel apart in depth.
+        """
+        out = np.zeros(shape, bool)
+        inv = np.linalg.inv(np.asarray(affine, np.float64))
+        vox = float(abs(np.linalg.det(np.asarray(affine)[:3, :3])) ** (1 / 3))
+        # Barycentric weights on a 4-step triangular grid: 15 points per face.
+        steps = 4
+        bary = (
+            np.array(
+                [(i, j, steps - i - j) for i in range(steps + 1) for j in range(steps + 1 - i)],
+                np.float64,
+            )
+            / steps
+        )
+        for hemi, mask in self.highlight.items():
+            h = self.hemis.get(hemi)
+            if h is None or not mask.any():
+                continue
+            faces = h.faces[mask[h.faces].all(axis=1)]
+            if not faces.size:
+                continue
+            white = h.states["white"].astype(np.float64)
+            pial = h.states["pial"].astype(np.float64)
+            w = np.einsum("pk,fkd->fpd", bary, white[faces]).reshape(-1, 3)
+            p = np.einsum("pk,fkd->fpd", bary, pial[faces]).reshape(-1, 3)
+            thick = float(np.max(np.linalg.norm(p - w, axis=1)))
+            for t in np.linspace(0.0, 1.0, max(2, int(np.ceil(2 * thick / vox)) + 1)):
+                ijk = np.rint(((1 - t) * w + t * p) @ inv[:3, :3].T + inv[:3, 3]).astype(int)
+                ok = np.all((ijk >= 0) & (ijk < np.asarray(shape)), axis=1)
+                out[tuple(ijk[ok].T)] = True
+        return out
+
+    def surface_normal(
+        self, hemi: str, surface: str, vertex: int, radius: float = 1.5
+    ) -> np.ndarray:
+        """One surface's outward normal at ``vertex``, averaged over a small disc."""
+        verts = self.hemis[hemi].states[surface].astype(np.float64)
+        topo = self.topology(hemi)
+        ids, _ = geodesic_ball(verts, topo, int(vertex), radius)
+        n = vertex_normals(verts, topo)[ids].sum(axis=0)
+        return n / max(float(np.linalg.norm(n)), 1e-12)
+
+    def cortex_normal(
+        self, mm: tuple[float, float, float], radius: float = 3.0, max_mm: float = 6.0
+    ) -> np.ndarray | None:
+        """The cortical sheet's outward normal near ``mm``, averaged over ``radius`` mm.
+
+        From the mid-thickness surface, over a geodesic disc rather than one
+        vertex: a single vertex normal tilts with every wrinkle, and the plane
+        built from it would wobble from one press to the next.
+        """
+        found = self.nearest_vertex(mm, max_mm)
+        if found is None:
+            return None
+        hemi, v, _ = found
+        h = self.hemis[hemi]
+        topo = self.topology(hemi)
+        mid = 0.5 * (h.states["white"] + h.states["pial"]).astype(np.float64)
+        ids, _ = geodesic_ball(mid, topo, v, radius)
+        n = vertex_normals(mid, topo)[ids].sum(axis=0)
+        norm = float(np.linalg.norm(n))
+        return None if norm < 1e-9 else n / norm
 
     def region_lines(
         self, mm: tuple[float, float, float] | None, annot: str, atlas: str
@@ -475,14 +637,18 @@ class SurfaceStore:
                 )
         if "label:cortex" in bundle.masks:
             h.cortex = bundle.masks["label:cortex"]
-        for key in [k for k in self._index if k[0] == hemi]:
-            del self._index[key]
+        for _, index in self._grids.values():
+            for key in [k for k in index if k[0] == hemi]:
+                del index[key]
         self._topo.pop(hemi, None)
         self._trees.pop(hemi, None)
         self._areas.pop(hemi, None)
         self._annots = {k: v for k, v in self._annots.items() if k[0] != hemi}
         self.flags.pop(hemi, None)
         self.depth_roi_vertices.pop(hemi, None)
+        # Vertex ids change with the topology: a highlight would name others.
+        if self.highlight.pop(hemi, None) is not None:
+            self.highlight_version += 1
         self._active = None
         self._pending = None
         self.version[hemi] = self.version.get(hemi, 0) + 1
@@ -701,6 +867,7 @@ class SurfaceStore:
                 "pushed_partner": int(res.partner_ids.size),
             }
         )
+        self.last_result = res
         self._active = None
         self._pending = None
 
@@ -764,6 +931,8 @@ class SurfaceStore:
             params,
             role=surface,
             partner=h.states.get(PARTNER[surface]),
+            # The slice: grid voxels with this axis fixed, as a normal in mm.
+            plane_normal=np.linalg.inv(grid_affine)[axis, :3],
         )
         res = edit.result()
         self._show(hemi, surface, edit, topo.faces_of(edit.ids), res)

@@ -359,6 +359,17 @@ class SetZoom(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewTilt(Command):
+    """Tilt one image window's slice about the crosshair: a 3x3 rotation, row-major, in mm."""
+
+    name = "SET_VIEW_TILT"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    tilt: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+
+@command
+@dataclass(frozen=True)
 class SetPan(Command):
     name = "SET_PAN"
     aspects = Aspect.VIEWPORTS | Aspect.SLICES
@@ -436,6 +447,16 @@ class ShowSurfaces(Command):
 
 @command
 @dataclass(frozen=True)
+class SetOutlineWidth(Command):
+    """Width of the surface outlines on the slices, in screen pixels."""
+
+    name = "SET_OUTLINE_WIDTH"
+    aspects = Aspect.SLICES
+    width: float = 1.25
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceEditing(Command):
     """Presses near a white/pial outline grab it rather than move the crosshair."""
 
@@ -456,6 +477,36 @@ class SetSurfaceBrush(Command):
     smooth: float = 0.2
     search: float = 1.5
     edge_sign: int = -1
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceSnapGate(Command):
+    """Snap to edges at the boundary's expected intensity (on) or the strongest edge (off)."""
+
+    name = "SET_SURFACE_SNAP_GATE"
+    aspects = Aspect.NOTHING
+    on: bool = True
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceStep(Command):
+    """How far one nudge or one move of the marked cortex goes, mm."""
+
+    name = "SET_SURFACE_STEP"
+    aspects = Aspect.NOTHING
+    mm: float = 0.25
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceFree(Command):
+    """Hand edits follow the drag (on) or each vertex's normal (off)."""
+
+    name = "SET_SURFACE_FREE"
+    aspects = Aspect.NOTHING
+    on: bool = False
 
 
 @command
@@ -493,6 +544,8 @@ class EditSurface(Command):
     search: float
     edge_sign: int
     snap_key: str = ""
+    gate: bool = True
+    free: bool = False
 
 
 @command
@@ -519,10 +572,28 @@ class EditSurfaceStroke(Command):
     search: float
     edge_sign: int
     snap_key: str = ""
+    gate: bool = True
+    #: The display grid the slice was cut in, when an oblique window tilted
+    #: it -- 12 numbers, the affine's top three rows; empty is the shared grid.
+    grid: str = ""
+    #: Hand redraws move the outline square to itself in the slice, not along
+    #: the surface normals (``SnapParams.free``).
+    free: bool = False
 
     @staticmethod
     def encode(points) -> str:
         return ";".join(",".join(f"{v:.4f}" for v in p) for p in np.asarray(points))
+
+    @staticmethod
+    def encode_grid(affine) -> str:
+        return ",".join(f"{v:.9g}" for v in np.asarray(affine, float)[:3].ravel())
+
+    def grid_affine(self) -> np.ndarray | None:
+        if not self.grid:
+            return None
+        m = np.eye(4)
+        m[:3] = np.array([float(v) for v in self.grid.split(",")]).reshape(3, 4)
+        return m
 
     def points(self) -> np.ndarray:
         return np.array([[float(v) for v in p.split(",")] for p in self.stroke.split(";") if p])
@@ -572,11 +643,65 @@ class SplitSurfaceEdge(Command):
 @command
 @dataclass(frozen=True)
 class SetSurfaceTool(Command):
-    """What a press near an outline does while editing: grab (drag) or draw (redraw)."""
+    """What a press near an outline does while editing: grab, draw, point or nudge."""
 
     name = "SET_SURFACE_TOOL"
     aspects = Aspect.SLICES
     tool: str = "grab"
+
+
+def encode_ids(ids) -> str:
+    """Vertex ids as ranges, ``"3-9,12,40-41"``: a painted patch is mostly runs."""
+    ids = np.unique(np.asarray(ids, np.int64))
+    if not ids.size:
+        return ""
+    breaks = np.flatnonzero(np.diff(ids) != 1)
+    starts = np.r_[ids[0], ids[breaks + 1]]
+    ends = np.r_[ids[breaks], ids[-1]]
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in zip(starts, ends, strict=True))
+
+
+def decode_ids(text: str) -> np.ndarray:
+    out: list[np.ndarray] = []
+    for part in filter(None, text.split(",")):
+        a, _, b = part.partition("-")
+        out.append(np.arange(int(a), int(b or a) + 1))
+    return np.concatenate(out) if out else np.zeros(0, np.int64)
+
+
+@command
+@dataclass(frozen=True)
+class HighlightSurface(Command):
+    """Add, remove or set highlighted vertices of a hemisphere (``ids`` as ranges); clear all."""
+
+    name = "HIGHLIGHT_SURFACE"
+    aspects = Aspect.SLICES | Aspect.VIEWPORTS
+    hemi: str = ""
+    ids: str = ""
+    mode: str = "add"
+
+
+@command
+@dataclass(frozen=True)
+class MoveSurfaceHighlight(Command):
+    """Move the highlighted vertices of one surface by ``shift`` mm along their normals."""
+
+    name = "MOVE_SURFACE_HIGHLIGHT"
+    aspects = Aspect.SLICES
+    major = True
+    hemi: str
+    surface: str
+    shift: float
+    radius: float = 4.0
+
+
+@command
+@dataclass(frozen=True)
+class HighlightToRoi(Command):
+    """The cortex under the highlight, white to pial, as a mask layer on the anatomy's grid."""
+
+    name = "HIGHLIGHT_TO_ROI"
+    aspects = Aspect.LAYERS | Aspect.SLICES
 
 
 @command
@@ -636,6 +761,17 @@ class SetSurfaceEquivolume(Command):
 
 @command
 @dataclass(frozen=True)
+class SetSurfaceDepthStat(Command):
+    """How a surface window reduces its depth samples: mean, median, max, min, max_abs, nzmean."""
+
+    name = "SET_SURFACE_DEPTH_STAT"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    stat: str = "mean"
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceMap(Command):
     """Paint a per-vertex map under the overlay: thickness, sulc, curv, annot, or none."""
 
@@ -666,6 +802,17 @@ class SetSurfaceHemis(Command):
     view: str
     hemis: str = "lh,rh"
     split: float = 0.0
+
+
+@command
+@dataclass(frozen=True)
+class SetSurfaceHinge(Command):
+    """Swing a surface window's hemispheres open: + nose to nose, - occipital to occipital."""
+
+    name = "SET_SURFACE_HINGE"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    degrees: float = 0.0
 
 
 @command
@@ -1276,6 +1423,12 @@ def install(
         st.surfaces_shown = tuple(n for n in cmd.names.split(",") if n)
         return ShowSurfaces.aspects
 
+    @bus.handle(SetOutlineWidth.name)
+    def _set_outline_width(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetOutlineWidth)
+        st.surface_outline_width = float(min(max(cmd.width, 0.25), 6.0))
+        return SetOutlineWidth.aspects
+
     @bus.handle(SetAtlas.name)
     def _set_atlas(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetAtlas)
@@ -1301,6 +1454,26 @@ def install(
         st.surface_brush = (cmd.radius, cmd.snap, cmd.smooth, cmd.search, cmd.edge_sign)
         return SetSurfaceBrush.aspects
 
+    @bus.handle(SetSurfaceSnapGate.name)
+    def _set_surface_snap_gate(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceSnapGate)
+        st.surface_snap_gate = bool(cmd.on)
+        return SetSurfaceSnapGate.aspects
+
+    @bus.handle(SetSurfaceStep.name)
+    def _set_surface_step(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceStep)
+        if not 0.0 < cmd.mm <= 5.0:
+            raise ValueError("a surface step is between 0 and 5 mm")
+        st.surface_step = float(cmd.mm)
+        return SetSurfaceStep.aspects
+
+    @bus.handle(SetSurfaceFree.name)
+    def _set_surface_free(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceFree)
+        st.surface_free = bool(cmd.on)
+        return SetSurfaceFree.aspects
+
     @bus.handle(SetSurfaceSnap.name)
     def _set_surface_snap(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceSnap)
@@ -1324,6 +1497,8 @@ def install(
             smooth=cmd.smooth,
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
+            gate=bool(cmd.gate),
+            free=bool(cmd.free),
         )
         sampler = session.surface_sampler(cmd.snap_key or None)
         session.surfaces.apply(grab, tuple(cmd.drag), sampler, params)
@@ -1342,11 +1517,14 @@ def install(
             smooth=cmd.smooth,
             search=cmd.search,
             edge_sign=int(cmd.edge_sign),
+            gate=bool(cmd.gate),
+            free=bool(cmd.free),
         )
+        tilted = cmd.grid_affine()
         session.surfaces.apply_stroke(
             cmd.hemi,
             cmd.surface,
-            st.grid.affine,
+            st.grid.affine if tilted is None else tilted,
             int(cmd.axis),
             float(cmd.position),
             cmd.points(),
@@ -1389,10 +1567,51 @@ def install(
     @bus.handle(SetSurfaceTool.name)
     def _set_surface_tool(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceTool)
-        if cmd.tool not in ("grab", "draw", "point"):
-            raise ValueError("surface tool is grab, draw or point")
+        if cmd.tool not in ("grab", "draw", "point", "nudge", "mark"):
+            raise ValueError("surface tool is grab, draw, point, nudge or mark")
         st.surface_tool = cmd.tool
         return SetSurfaceTool.aspects
+
+    @bus.handle(HighlightSurface.name)
+    def _highlight_surface(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, HighlightSurface)
+        if session is None:
+            raise RuntimeError("HIGHLIGHT_SURFACE needs a session")
+        session.surfaces.set_highlight(cmd.hemi, decode_ids(cmd.ids), cmd.mode)
+        return HighlightSurface.aspects
+
+    @bus.handle(MoveSurfaceHighlight.name)
+    def _move_surface_highlight(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, MoveSurfaceHighlight)
+        if session is None:
+            raise RuntimeError("MOVE_SURFACE_HIGHLIGHT needs a session")
+        from fastfuncstuff.surface.edit import SnapParams
+
+        if cmd.surface not in ("white", "pial"):
+            raise ValueError("move white or pial")
+        _, _, smooth, search, sign = st.surface_brush
+        params = SnapParams(
+            radius=cmd.radius, snap=0.0, smooth=smooth, search=search, edge_sign=sign
+        )
+        session.surfaces.move_highlight(
+            cmd.hemi, cmd.surface, float(cmd.shift), session.surface_sampler(None), params
+        )
+        return MoveSurfaceHighlight.aspects
+
+    @bus.handle(HighlightToRoi.name)
+    def _highlight_to_roi(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, HighlightToRoi)
+        if session is None:
+            raise RuntimeError("HIGHLIGHT_TO_ROI needs a session")
+        base = st.layers.base
+        if base is None:
+            raise ValueError("load the anatomy first: the ROI is drawn on its grid")
+        mask = session.surfaces.highlight_mask(base.affine, base.shape)
+        if not mask.any():
+            raise ValueError("nothing is highlighted")
+        name = f"surface ROI ·{int(mask.sum()):,} vox"
+        _key, dirty = session.install_selection("surface-highlight", mask, like=base, name=name)
+        return dirty
 
     @bus.handle(UndoSurfaceEdit.name)
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:
@@ -1662,6 +1881,17 @@ def install(
         assert isinstance(cmd, SetSurfaceEquivolume)
         return _set_view(st, cmd.view, SetSurfaceEquivolume.aspects, equivolume=bool(cmd.on))
 
+    @bus.handle(SetSurfaceDepthStat.name)
+    def _set_surface_depth_stat(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceDepthStat)
+        from fastfuncstuff.viewer.surface3d import DEPTH_STATS
+
+        if cmd.stat not in DEPTH_STATS:
+            raise ValueError(
+                f"unknown depth statistic {cmd.stat!r}; one of {', '.join(DEPTH_STATS)}"
+            )
+        return _set_view(st, cmd.view, SetSurfaceDepthStat.aspects, depth_stat=cmd.stat)
+
     @bus.handle(SetSurfaceMap.name)
     def _set_surface_map(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetSurfaceMap)
@@ -1688,6 +1918,23 @@ def install(
         return _set_view(
             st, cmd.view, SetSurfaceHemis.aspects, hemis=cmd.hemis, split=float(cmd.split)
         )
+
+    @bus.handle(SetSurfaceHinge.name)
+    def _set_surface_hinge(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetSurfaceHinge)
+        degrees = float(min(max(cmd.degrees, -180.0), 180.0))
+        return _set_view(st, cmd.view, SetSurfaceHinge.aspects, hinge=degrees)
+
+    @bus.handle(SetViewTilt.name)
+    def _set_view_tilt(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewTilt)
+        r = np.asarray(cmd.tilt, float)
+        if r.size != 9:
+            raise ValueError("a tilt is 9 numbers: a 3x3 rotation, row-major")
+        r = r.reshape(3, 3)
+        if not np.allclose(r @ r.T, np.eye(3), atol=1e-4) or np.linalg.det(r) <= 0:
+            raise ValueError("a tilt must be a rotation")
+        return _set_view(st, cmd.view, SetViewTilt.aspects, tilt=tuple(float(x) for x in r.ravel()))
 
     @bus.handle(SetViewSolo.name)
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:

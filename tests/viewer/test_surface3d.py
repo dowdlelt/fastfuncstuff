@@ -186,3 +186,89 @@ def test_vertex_maps_leave_the_medial_wall_transparent():
     assert tuple(rgba[1, :3]) == (200, 0, 0) and rgba[1, 3] == 255
     assert rgba[4, 3] == 0  # medial wall
     assert ann.name_at(3) == "insula" and ann.name_at(0) is None and ann.name_at(5) is None
+
+
+def test_depth_reductions_pick_the_statistic_from_the_same_depth():
+    from fastfuncstuff.viewer.surface3d import DEPTH_STATS, reduce_depth
+
+    v = np.array([[0.0, 3.0, -5.0, 1.0, 0.0]])
+    s = np.array([[10.0, 11.0, 12.0, 13.0, 14.0]])
+    want = {
+        "mean": (-0.2, 12.0),
+        "max": (3.0, 11.0),
+        "min": (-5.0, 12.0),
+        "max_abs": (-5.0, 12.0),
+        "nzmean": (-1 / 3, 12.0),
+    }
+    # Stable sort: -5(12) 0(10) 0(14) 1(13) 3(11); the middle is 0 from depth 4.
+    want["median"] = (0.0, 14.0)
+    for how in DEPTH_STATS:
+        got = reduce_depth(v, s, how)
+        assert got[0][0] == pytest.approx(want[how][0]), how
+        assert got[1][0] == pytest.approx(want[how][1]), how
+    zeros = reduce_depth(np.zeros((1, 3)), np.ones((1, 3)), "nzmean")
+    assert zeros[0][0] == 0.0 and zeros[1][0] == 0.0
+    with pytest.raises(ValueError, match="unknown depth statistic"):
+        reduce_depth(v, s, "mode")
+
+
+def test_the_depth_statistic_reaches_the_uniform_block_by_index():
+    from fastfuncstuff.viewer.surface3d import DEPTH_STATS, pack_uniforms
+
+    for k, how in enumerate(DEPTH_STATS):
+        raw = pack_uniforms(
+            np.eye(4), np.eye(4), morph=1.0, depth=(0.0, 1.0), samples=4, fold_contrast=0.0,
+            layers=[], cross=(0, 0, 0, 0), cross_rgb=(1, 1, 1), depth_stat=how,
+        )  # fmt: skip
+        extra = np.frombuffer(raw[2 * 64 + 4 * 16 : 2 * 64 + 5 * 16], np.float32)
+        assert extra[2] == k
+
+
+def _box(x0, x1):
+    """Corners of a hemisphere-ish box: x in [x0, x1], y (A-P) in [-80, 60]."""
+    import itertools
+
+    return np.array(list(itertools.product([x0, x1], [-80.0, 60.0], [-30.0, 50.0])))
+
+
+def _apply(m, p):
+    return p @ m[:3, :3].T + m[:3, 3]
+
+
+def test_closed_hemispheres_only_split_along_x():
+    from fastfuncstuff.viewer.surface3d import hemisphere_models
+
+    pos = {"lh": _box(-70.0, -2.0), "rh": _box(2.0, 70.0)}
+    m = hemisphere_models(pos, split=10.0)
+    assert np.allclose(_apply(m["lh"], pos["lh"]), pos["lh"] - [5.0, 0, 0])
+    assert np.allclose(_apply(m["rh"], pos["rh"]), pos["rh"] + [5.0, 0, 0])
+
+
+@pytest.mark.parametrize("hinge", [180.0, -180.0])
+def test_a_full_hinge_lays_the_hemispheres_end_to_end(hinge):
+    """+180: noses meet at the front hinge, occipital poles out at the sides;
+    -180: the reverse. Either way the medial walls end up facing one way and
+    the lateral surfaces the other, and the hinge edge does not move."""
+    from fastfuncstuff.viewer.surface3d import hemisphere_models
+
+    pos = {"lh": _box(-70.0, -2.0), "rh": _box(2.0, 70.0)}
+    m = hemisphere_models(pos, hinge=hinge)
+    hinge_y = 60.0 if hinge > 0 else -80.0
+    for h, medial_x, out in (("lh", -2.0, -1.0), ("rh", 2.0, 1.0)):
+        moved = _apply(m[h], pos[h])
+        # The pivot edge (medial, at the hinge end) stays put.
+        edge = (pos[h][:, 0] == medial_x) & (pos[h][:, 1] == hinge_y)
+        assert np.allclose(moved[edge], pos[h][edge])
+        # The far end has swung out to the hemisphere's own side; the far end
+        # of the medial wall lies in line with the hinge.
+        far = pos[h][:, 1] != hinge_y
+        assert np.all(np.sign(moved[far, 0] - medial_x) == out)
+        far_medial = far & (pos[h][:, 0] == medial_x)
+        assert np.allclose(moved[far_medial, 1], hinge_y)
+        # The medial wall's normal (+x for lh) now points along y, the same
+        # way for both hemispheres.
+        n = m[h][:3, :3] @ np.array([-out, 0.0, 0.0])
+        assert abs(n[1]) == pytest.approx(1.0)
+    n_l = m["lh"][:3, :3] @ np.array([1.0, 0, 0])
+    n_r = m["rh"][:3, :3] @ np.array([-1.0, 0, 0])
+    assert np.allclose(n_l, n_r)

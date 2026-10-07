@@ -63,7 +63,9 @@ def test_drag_out_snaps_white_to_the_true_boundary_and_leaves_the_rest(phantom):
     full = np.zeros(len(u))
     full[res.ids] = res.displacement
     jump = np.abs(full[topo.edges[:, 0]] - full[topo.edges[:, 1]])
-    assert jump.max() < 0.5
+    # The rim's sqrt fade puts the largest step there: 0.49 mm with raw
+    # vertex normals, 0.50 with the smoothed ones a drag now moves along.
+    assert jump.max() < 0.55
     # Nothing outside the brush is in the result.
     inside, _ = geodesic_ball(white, topo, c, 5.0)
     assert set(res.ids.tolist()) == set(inside.tolist())
@@ -157,6 +159,16 @@ def test_pial_dragged_inward_does_not_snap_onto_the_white_boundary(phantom):
     res = edit.update(np.array([0.0, 0.0, -1.5]))
     core = np.linalg.norm(res.positions[edit.weight > 0.8], axis=1)
     assert np.all(np.abs(core - WHITE_TRUE) > 0.5)
+    # Ungated ("edge" mode), the strongest edge wins -- here the wrong one,
+    # which is why the gate is the default and "edge" a deliberate choice.
+    ungated = SurfaceEdit(
+        pial, topo, _top(u), sampler, SnapParams(radius=4.0, gate=False), role="pial", partner=white
+    )
+    assert ungated.levels is None
+    core = np.linalg.norm(
+        ungated.update(np.array([0.0, 0.0, -1.5])).positions[ungated.weight > 0.8], axis=1
+    )
+    assert np.median(np.abs(core - WHITE_TRUE)) < 0.5
 
 
 def test_pial_dragged_out_finds_the_csf_boundary(phantom):
@@ -288,3 +300,116 @@ def test_contour_path_takes_the_short_way_and_refuses_separate_pieces():
     np.testing.assert_array_equal(contour_path(ring, 1, 9), [1, 0, 9])
     two = np.concatenate([ring, ring + 1000])
     assert contour_path(two, 1, 12) is None
+
+
+def test_a_fold_is_damped_where_it_happens_not_across_the_whole_brush(phantom):
+    """The global halving cost the vertex under the cursor half its move
+    whenever any face in the brush flipped -- on a real subject, the median
+    2 mm pial drag. A fold at one spot must leave the centre its full move."""
+    sampler, u, f, topo = phantom
+    white = 20.0 * u
+    c = _top(u)
+    edit = SurfaceEdit(white, topo, c, sampler, SnapParams(radius=6.0, snap=0.0, smooth=0.0))
+    # A hand-made fold near the rim: a vertex and its ring pushed inward
+    # through the sphere's centre, while the rest move a gentle 0.5 mm.
+    ids = edit.ids
+    k = int(np.argmin(np.abs(edit.weight - 0.15)))
+    ring = np.r_[k, edit._adjacency[k].indices]
+    along = 0.5 * edit.weight
+    along[ring] -= 45.0
+    res = edit._finish(along)
+    centre = int(np.flatnonzero(ids == c)[0])
+    assert edit.fold_damped > 0
+    assert res.displacement[centre] == pytest.approx(along[centre], rel=0.05)
+    moved = white.copy()
+    moved[res.ids] = res.positions
+    before, after = face_normals(white, f), face_normals(moved, f)
+    assert np.all(np.einsum("ij,ij->i", before, after) > 0)
+
+
+def test_an_edit_says_why_it_did_not_do_what_was_asked(phantom):
+    from fastfuncstuff.surface.edit import explain
+
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    c = _top(u)
+    # Pial dragged 5 mm in, through white 3 mm below it: held.
+    edit = SurfaceEdit(
+        pial, topo, c, sampler, SnapParams(radius=4.0, snap=0.0), role="pial", partner=white
+    )
+    res = edit.update(np.array([0.0, 0.0, -5.0]))
+    assert res.held > 0
+    assert "held at white" in explain(res)
+    # Snap: a rough 0.6 mm drag the edge finishes to 1 mm, outward.
+    edit = SurfaceEdit(white, topo, c, sampler, SnapParams(radius=5.0), role="white", partner=pial)
+    res = edit.update(np.array([0.0, 0.0, 0.6]))
+    assert res.snap_offset == pytest.approx(0.4, abs=0.15)
+    assert "snap moved it" in explain(res) and "out" in explain(res)
+    # A plain hand drag that nothing holds back says nothing.
+    edit = SurfaceEdit(
+        white, topo, c, sampler, SnapParams(radius=5.0, snap=0.0), role="white", partner=pial
+    )
+    assert explain(edit.update(np.array([0.0, 0.0, 0.5]))) == ""
+
+
+def test_stroke_targets_cast_along_the_outline_not_to_the_nearest_point():
+    """A stroke that starts on the outline and swerves 1.5 mm out: a vertex
+    1 mm along is nearer the stroke's start than the swerve, and the nearest
+    point gave it no shift. Cast along its normal, it reaches the swerve."""
+    from fastfuncstuff.surface.edit import closest_on_polyline, stroke_targets
+
+    # Surface: the plane x = 0 seen in the slice z = 0, normal +x. The vertex
+    # sits 0.5 mm above the slice, so its own outline point is (0, 1, 0).
+    vertex = np.array([[0.0, 1.0, 0.5]])
+    normal = np.array([[1.0, 0.0, 0.0]])
+    stroke = np.array([[0.0, 0.0, 0.0], [1.5, 0.3, 0.0], [1.5, 4.0, 0.0]])
+    near = closest_on_polyline(vertex, stroke)
+    cast = stroke_targets(vertex, normal, stroke, np.array([0.0, 0.0, 1.0]))
+    assert near[0, 0] < 1.0  # the trap: pulled toward the start
+    np.testing.assert_allclose(cast[0], [1.5, 1.0, 0.0], atol=1e-9)
+    # Lying in the slice (normal along z) there is no outline point to cast.
+    flat = stroke_targets(vertex, np.array([[0.0, 0.0, 1.0]]), stroke, np.array([0.0, 0.0, 1.0]))
+    np.testing.assert_allclose(flat, near)
+
+
+def test_a_free_hand_drag_goes_where_it_is_dragged_not_along_the_normal(phantom):
+    """At the sphere's top the normal is +z: a sideways drag along normals
+    moves nothing, which is the "it will not go where I drag" report."""
+    sampler, u, f, topo = phantom
+    white, pial = 20.0 * u, 23.0 * u
+    c = _top(u)
+    drag = np.array([1.0, 0.0, 0.0])
+    normal = SurfaceEdit(
+        white, topo, c, sampler, SnapParams(radius=4.0, snap=0.0), role="white", partner=pial
+    )
+    free = SurfaceEdit(
+        white,
+        topo,
+        c,
+        sampler,
+        SnapParams(radius=4.0, snap=0.0, free=True),
+        role="white",
+        partner=pial,
+    )
+    k = int(np.flatnonzero(normal.ids == c)[0])
+    assert np.linalg.norm(normal.update(drag).positions[k] - white[c]) < 0.05
+    res = free.update(drag)
+    np.testing.assert_allclose(res.positions[k] - white[c], drag, atol=1e-6)
+    moved = white.copy()
+    moved[res.ids] = res.positions
+    before, after = face_normals(white, f), face_normals(moved, f)
+    assert np.all(np.einsum("ij,ij->i", before, after) > 0)
+    # Pial dragged freely down into white is still held outside it.
+    edit = SurfaceEdit(
+        pial,
+        topo,
+        c,
+        sampler,
+        SnapParams(radius=4.0, snap=0.0, free=True),
+        role="pial",
+        partner=white,
+    )
+    res = edit.update(np.array([0.0, 0.0, -5.0]))
+    assert res.held > 0
+    # Along the (smoothed) normal, so within a hair of the 0.1 mm floor radially.
+    assert np.linalg.norm(res.positions[k]) >= 20.0 + 0.09

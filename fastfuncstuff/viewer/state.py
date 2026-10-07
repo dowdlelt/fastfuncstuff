@@ -31,6 +31,15 @@ class DisplayGrid:
 
     shape: tuple[int, int, int]
     affine: np.ndarray
+    #: For a window's tilted copy of the grid (see ``compose.view_grid``): the
+    #: untilted affine, which decides which voxel axis a pane shows and which
+    #: way it runs. Without it a 50-degree tilt could swap a pane's axes.
+    layout_affine: np.ndarray | None = None
+
+    @property
+    def frame(self) -> np.ndarray:
+        """The affine plane layouts are read from."""
+        return self.affine if self.layout_affine is None else self.layout_affine
 
     @classmethod
     def from_layer(cls, shape: tuple[int, int, int], affine: np.ndarray) -> DisplayGrid:
@@ -90,6 +99,9 @@ class ViewerState:
     #: on the session), and which of them are drawn as slice outlines.
     surface_subject: str | None = None
     surfaces_shown: tuple[str, ...] = ("white", "pial")
+    #: Outline width in screen pixels. Fixed on screen, so a small window
+    #: (few pixels per voxel) wants it thinner than a large one.
+    surface_outline_width: float = 1.25
     #: Whether a press near an outline grabs it (instead of moving the
     #: crosshair), and the brush it is dragged with: radius mm, snap 0-1,
     #: smoothing, search mm either side, and the outward edge sign (-1 = T1).
@@ -100,6 +112,13 @@ class ViewerState:
     #: Topology edits act on it and leave it on the vertex they produce.
     surface_selected: tuple[str, int] | None = None
     surface_brush: tuple[float, float, float, float, int] = (4.0, 1.0, 0.2, 1.5, -1)
+    #: Snap only to edges at the boundary's expected intensity (see
+    #: ``surface.edit.SnapParams.gate``); off snaps to the strongest edge.
+    surface_snap_gate: bool = True
+    #: Hand moves follow the drag, not the normals (``SnapParams.free``).
+    surface_free: bool = False
+    #: How far one nudge, or one press moving the marked cortex, goes, mm.
+    surface_step: float = 0.25
     #: Layer an edit snaps to; ``None`` means the bottom of the stack, which is
     #: the anatomy the surfaces are being checked against.
     surface_snap_key: str | None = None

@@ -1447,9 +1447,7 @@ def build_glm_design(
                 )
 
             else:
-                raise ValueError(
-                    f"Unknown mode: {mode}. Valid modes: assumed, fir, onoff"
-                )
+                raise ValueError(f"Unknown mode: {mode}. Valid modes: assumed, fir, onoff")
 
         designs.append(design)
 
@@ -1793,4 +1791,3 @@ def make_penalty_matrix(n_basis: int, order: int = 2) -> np.ndarray:
         D = np.diff(D, axis=0)
 
     return D
-

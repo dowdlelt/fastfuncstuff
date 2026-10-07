@@ -147,6 +147,17 @@ class PlaneView:
     def is_identity(self) -> bool:
         return self.span == self.extent and self.origin == (0, 0)
 
+    def pan_centring(self, ijk: tuple[int, int, int]) -> tuple[float, float]:
+        """The pan that puts voxel ``ijk`` at the middle of the drawn window.
+
+        Still clamped by :attr:`origin`, so near an edge the voxel lands as
+        close to the middle as the data allows.
+        """
+        row, col = self.layout.to_image(ijk, self.shape)
+        h, w = self.extent
+        # origin = (extent - span) / 2 + pan, and the middle is origin + span / 2.
+        return (row + 0.5 - h / 2.0, col + 0.5 - w / 2.0)
+
     def to_image(self, ijk: tuple[int, int, int]) -> tuple[int, int]:
         """Display-grid indices to (row, col) in the drawn image.
 
@@ -276,7 +287,7 @@ def plane_indices(
     ``view`` crops and magnifies; without one the whole plane is covered. Built
     on-device so a redraw never round-trips index arithmetic through the host.
     """
-    layout = plane_layout(grid.affine, plane)
+    layout = plane_layout(grid.frame, plane)
     if view is None:
         view = PlaneView(layout=layout, shape=grid.shape)
     full_h, full_w = view.extent

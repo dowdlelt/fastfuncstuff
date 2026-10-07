@@ -532,7 +532,7 @@ def test_draw_gesture_through_the_window(tmp_path):
         image.pane.edit_dragged.emit(*map(float, to_image([0.0, 0.0, z])))
         image.pane.edit_released.emit()
         assert len(session.to_script().splitlines()) == n_before
-        assert "end the stroke" in image.pane._brush_label
+        assert "end the stroke" in image.pane._toast
     finally:
         win.close()
 
@@ -628,3 +628,357 @@ def test_point_tool_selects_marks_deletes_and_splits(tmp_path):
         assert hemi.n_vertices == n0 + valence and st.surface_selected == ("lh", v)
     finally:
         win.close()
+
+
+def test_m_cycles_snap_edge_hand_and_edits_record_the_gate(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import EditSurface, OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        st = session.state
+        seen = []
+        for _ in range(3):
+            image._toggle_snap()
+            seen.append((st.surface_brush[1] > 0, st.surface_snap_gate))
+        # snap (gated) -> edge -> hand (the gate is moot) -> snap again.
+        assert [seen[0], seen[1][0], seen[2]] == [(True, False), False, (True, True)]
+        session.do(
+            EditSurface(
+                "lh",
+                "white",
+                0,
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.3),
+                4.0,
+                1.0,
+                0.2,
+                1.5,
+                -1,
+                "",
+                False,
+            )
+        )
+        assert "SET_SURFACE_SNAP_GATE" in session.to_script()
+        assert any(isinstance(c, EditSurface) and c.gate is False for c in session.bus.log)
+    finally:
+        win.close()
+        session.close()
+
+
+def test_nudge_pushes_the_surface_away_from_the_cursor_and_undoes(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import EditSurface, OpenView, SetXYZ, UndoSurfaceEdit
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image.nudge_button.click()
+        assert session.state.surface_tool == "nudge"
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        h = session.surfaces.hemis["lh"]
+
+        def press_at(mm):
+            row, col = view.points_to_image(inv[:3, :3] @ np.asarray(mm) + inv[:3, 3])
+            image._edit_press(float(row), float(col))
+            image._edit_release()
+
+        def radius(surface, near):
+            k = np.argmin(np.linalg.norm(h.states[surface] - near, axis=1))
+            return float(np.linalg.norm(h.states[surface][k]))
+
+        # Outside pial (r = 24): pial moves in, a step at a time.
+        before = radius("pial", [24.0, 0, 0])
+        press_at([25.5, 0.0, 0.0])
+        assert radius("pial", [24.0, 0, 0]) == pytest.approx(before - 0.25, abs=0.03)
+        # Inside white (r = 20): white moves out.
+        before = radius("white", [20.0, 0, 0])
+        press_at([0.0, 18.5, 0.0])
+        assert radius("white", [0, 20.0, 0]) == pytest.approx(before + 0.25, abs=0.03)
+        nudges = [c for c in session.bus.log if isinstance(c, EditSurface)]
+        assert len(nudges) == 2 and all(c.snap == 0.0 for c in nudges)
+        session.do(UndoSurfaceEdit())
+        session.do(UndoSurfaceEdit())
+        assert radius("pial", [24.0, 0, 0]) == pytest.approx(24.0, abs=0.01)
+        # Held: the timer repeats the push until release.
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([25.5, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        assert image._nudge_timer.isActive()
+        image._nudge_again()
+        image._nudge_again()
+        image._edit_release()
+        assert not image._nudge_timer.isActive()
+        # Three pushes; each re-finds the nearest vertex as the outline moves
+        # away, so the one measured gets most but not all of each.
+        assert 0.45 < 24.0 - radius("pial", [24.0, 0, 0]) <= 0.76
+    finally:
+        win.close()
+        session.close()
+
+
+def test_highlight_moves_as_a_plateau_undoes_and_fills_the_ribbon(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import (
+        HighlightSurface,
+        LoadSurfaces,
+        MoveSurfaceHighlight,
+        UndoSurfaceEdit,
+        decode_ids,
+        encode_ids,
+    )
+
+    assert encode_ids([5, 3, 4, 9, 11, 12]) == "3-5,9,11-12"
+    np.testing.assert_array_equal(decode_ids("3-5,9,11-12"), [3, 4, 5, 9, 11, 12])
+
+    session.load(str(_shell_anat(tmp_path)))
+    session.do(LoadSurfaces(str(_subject(tmp_path))))
+    surfaces = session.surfaces
+    h = surfaces.hemis["lh"]
+    top = int(np.argmax(h.states["pial"][:, 2]))
+    patch = surfaces.disc("lh", top, 4.0)
+    session.do(HighlightSurface("lh", encode_ids(patch), "add"))
+    assert surfaces.highlighted("lh").size == patch.size
+    before = h.states["pial"].copy()
+    session.do(MoveSurfaceHighlight("lh", "pial", -0.8))
+    moved = np.linalg.norm(before - h.states["pial"], axis=1)
+    # A plateau: every highlighted vertex moves the full 0.8 mm...
+    np.testing.assert_allclose(moved[patch], 0.8, atol=0.02)
+    # ...with a shoulder outside it, and nothing far away.
+    assert 0 < moved.max() <= 0.81 and moved[np.argmin(h.states["pial"][:, 2])] == 0
+    session.do(UndoSurfaceEdit())
+    np.testing.assert_allclose(h.states["pial"], before)
+
+    # The ribbon under the highlight, voxelised white to pial.
+    base = session.state.layers.base
+    mask = surfaces.highlight_mask(base.affine, base.shape)
+    ijk = np.argwhere(mask)
+    mm = ijk @ base.affine[:3, :3].T + base.affine[:3, 3]
+    r = np.linalg.norm(mm, axis=1)
+    assert mask.sum() > 50
+    assert r.min() > 20.0 - 0.6 and r.max() < 24.0 + 0.6  # white 20, pial 24 (= 1.2 x 20)
+    assert np.all(mm[:, 2] > 15.0)  # only under the top patch
+    session.do(HighlightSurface(mode="clear"))
+    assert surfaces.highlighted("lh").size == 0
+
+
+def test_mark_in_a_slice_paint_in_3d_move_and_make_an_roi(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetXYZ
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(OpenView("S1", "surface", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        surf = next(w for w in win.manager.windows.values() if isinstance(w, SurfaceWindow))
+        surfaces = session.surfaces
+        h = surfaces.hemis["lh"]
+
+        # 2-D: mark along the pial outline at +x.
+        image.highlight_button.click()
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([24.0, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        image._edit_release()
+        marked = surfaces.highlighted("lh")
+        assert marked.size > 0
+        assert np.all(h.states["pial"][marked, 0] > 20.0)
+        image.redraw()
+        assert image.pane._highlight.shape[0] > 0  # dots on this slice
+
+        # 3-D: the paint signal adds a disc elsewhere; ctrl erases it again.
+        top = int(np.argmax(h.states["white"][:, 2]))
+        surf._paint_highlight("lh", top, False)
+        assert surfaces.highlight["lh"][top]
+        from fastfuncstuff.viewer.commands import Aspect
+
+        surf.refresh(Aspect.ALL)
+        assert surf.canvas._cpu["lh"]["vcolor"][top, 3] == 255
+        surf._paint_highlight("lh", top, True)
+        assert not surfaces.highlight["lh"][top]
+
+        # Move the marked pial in, then the ROI.
+        before = h.states["pial"][marked].copy()
+        image._move_highlight("pial", -0.25)
+        moved = np.linalg.norm(before - h.states["pial"][marked], axis=1)
+        np.testing.assert_allclose(moved, 0.25, atol=0.02)
+        surf._highlight_roi()
+        roi = session.state.layers.find_by_source("surface-highlight")
+        assert roi is not None and "surface ROI" in roi.name
+        image._clear_highlight()
+        assert surfaces.highlighted("lh").size == 0
+    finally:
+        win.close()
+        session.close()
+
+
+def test_free_hand_edits_follow_the_drag_and_are_recorded(session, tmp_path):
+    from fastfuncstuff.viewer.vocab import EditSurface, LoadSurfaces, SetSurfaceFree
+
+    session.load(str(_shell_anat(tmp_path)))
+    session.do(LoadSurfaces(str(_subject(tmp_path))))
+    session.do(SetSurfaceFree(True))
+    assert session.state.surface_free
+    white = session.surfaces.hemis["lh"].states["white"]
+    top = int(np.argmax(white[:, 2]))
+    start = white[top].copy()
+    r, _, m, q, e = session.state.surface_brush
+    # Sideways at the top, where the normal is +z: only a free move goes.
+    session.do(
+        EditSurface(
+            "lh",
+            "white",
+            top,
+            tuple(start.tolist()),
+            (0.8, 0.0, 0.0),
+            r,
+            0.0,
+            m,
+            q,
+            e,
+            "",
+            True,
+            True,
+        )
+    )
+    np.testing.assert_allclose(white[top] - start, [0.8, 0.0, 0.0], atol=1e-5)
+    # The script line ends with gate and free, both on.
+    assert session.to_script().strip().splitlines()[-1].endswith("'' 1 1")
+
+
+def test_a_free_stroke_moves_the_outline_within_the_slice_and_replays(session, tmp_path):
+    """Free: the redrawn stretch moves square to the outline *in the slice*,
+    so its vertices keep their height and the outline lands on the line."""
+    import dataclasses
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceTool
+
+    session.load(_shell_anat(tmp_path))
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    session.do(SetSurfaceTool("draw"))
+    hemi = session.surfaces.hemis["lh"]
+    before = hemi.states["white"].copy()
+    cmd = dataclasses.replace(_stroke_command(session), free=True)
+    session.do(cmd)
+    after = hemi.states["white"]
+    moved = np.flatnonzero(np.any(after != before, axis=1))
+    on_slice = moved[np.abs(before[moved, 2] - 15.0) < 0.8]
+    angle = np.abs(np.arctan2(before[on_slice, 1], before[on_slice, 0]))
+    mid = on_slice[angle < 0.3]
+    assert mid.size > 0
+    # In-plane: no vertical motion; and the outline's in-slice radius moves
+    # from sqrt(20^2 - z^2) toward the stroke's sqrt(21^2 - 15^2).
+    np.testing.assert_allclose(after[moved, 2], before[moved, 2], atol=1e-9)
+    gain = np.linalg.norm(after[mid, :2], axis=1) - np.linalg.norm(before[mid, :2], axis=1)
+    want = np.sqrt(21.0**2 - 15.0**2) - np.sqrt(20.0**2 - 15.0**2)
+    assert np.median(gain) == pytest.approx(want, abs=0.25)
+    fresh = ViewerSession(device=CPU)
+    try:
+        fresh.run_script(session.to_script())
+        np.testing.assert_allclose(fresh.surfaces.hemis["lh"].states["white"], after, atol=1e-6)
+    finally:
+        fresh.close()
+
+
+def test_the_step_sets_how_far_a_nudge_and_a_marked_move_go(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import (
+        HighlightSurface,
+        OpenView,
+        SetSurfaceStep,
+        SetXYZ,
+        encode_ids,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win.load_surfaces(str(_subject(tmp_path)))
+        win._dispatch(OpenView("A1", "image", "axial"))
+        win._dispatch(SetXYZ(0.0, 0.0, 0.0))
+        app.processEvents()
+        image = next(
+            w for w in win.manager.windows.values() if isinstance(w, ImageWindow) and w.vid == "A1"
+        )
+        image._step_by(1.5)
+        image._step_by(1.5)
+        assert session.state.surface_step == pytest.approx(0.5625, abs=1e-3)  # rounded to 0.001
+        session.do(SetSurfaceStep(0.6))
+        image.nudge_button.click()
+        assert "step 0.6 mm" in image.pane._brush_label
+        h = session.surfaces.hemis["lh"]
+        st = session.state
+        view = plane_view(st, image._viewport())
+        inv = np.linalg.inv(st.grid.affine)
+        k = int(np.argmin(np.linalg.norm(h.states["pial"] - [24.0, 0, 0], axis=1)))
+        before = float(np.linalg.norm(h.states["pial"][k]))
+        row, col = view.points_to_image(inv[:3, :3] @ np.array([25.5, 0, 0]) + inv[:3, 3])
+        image._edit_press(float(row), float(col))
+        image._edit_release()
+        assert before - np.linalg.norm(h.states["pial"][k]) == pytest.approx(0.6, abs=0.05)
+        top = int(np.argmax(h.states["pial"][:, 2]))
+        session.do(HighlightSurface("lh", encode_ids(session.surfaces.disc("lh", top, 3.0)), "set"))
+        z = float(h.states["pial"][top, 2])
+        image._move_highlight("pial", +1)
+        assert h.states["pial"][top, 2] - z == pytest.approx(0.6, abs=0.02)
+        with pytest.raises(ValueError):
+            session.do(SetSurfaceStep(0.0))
+    finally:
+        win.close()
+        session.close()

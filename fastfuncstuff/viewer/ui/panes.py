@@ -55,9 +55,13 @@ class ImagePane(QtWidgets.QWidget):
     stepped = QtCore.Signal(int)
     #: Seed request (ctrl/cmd-click), same coordinates as ``picked``.
     seeded = QtCore.Signal(int, int)
-    #: Right-button drag, in image pixels. Left stays the crosshair, because
-    #: moving where you are looking is the gesture you make most.
+    #: Middle-button (or shift+left) drag, in image pixels. Left stays the
+    #: crosshair, because moving where you are looking is the gesture you
+    #: make most.
     panned = QtCore.Signal(float, float)
+    #: Right-button drag: multiply the zoom by this factor (up zooms in), the
+    #: same gesture as in the surface window.
+    zoomed = QtCore.Signal(float)
     #: Align-mode drags. ``slid`` is in image pixels (row, col); ``turned`` in
     #: degrees, positive clockwise on screen. ``released`` ends a drag.
     slid = QtCore.Signal(float, float)
@@ -82,6 +86,8 @@ class ImagePane(QtWidgets.QWidget):
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
         self._drag_from: QtCore.QPointF | None = None
+        #: What the drag from ``_drag_from`` does: "pan" or "zoom".
+        self._drag_kind = ""
         #: Voxel footprints of the open graphs, as (row, col, n_rows, n_cols)
         #: in image indices. The crosshair opens up around them.
         self._coverage: list[tuple[int, int, int, int]] = []
@@ -106,10 +112,20 @@ class ImagePane(QtWidgets.QWidget):
         self._hover: QtCore.QPointF | None = None
         self._editing_drag = False
         self._brush_label = ""
+        self._outline_width = 1.25
+        self._toast = ""
+        self._toast_alpha = 0.0
+        self._toast_anim = QtCore.QVariantAnimation(self)
+        self._toast_anim.setStartValue(1.0)
+        self._toast_anim.setKeyValueAt(self.TOAST_HOLD / (self.TOAST_HOLD + self.TOAST_FADE), 1.0)
+        self._toast_anim.setEndValue(0.0)
+        self._toast_anim.setDuration(self.TOAST_HOLD + self.TOAST_FADE)
+        self._toast_anim.valueChanged.connect(self._on_toast)
         #: A stroke being drawn, as fractional (row, col) image pixels.
         self._stroke_pts: list[tuple[float, float]] = []
         #: The selected vertex on this slice, per surface: (row, col, surface).
         self._marks: list[tuple[float, float, str]] = []
+        self._highlight = np.zeros((0, 2))
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -146,6 +162,12 @@ class ImagePane(QtWidgets.QWidget):
         self._labels = layout.labels
         self.update()
 
+    def set_tilt(self, degrees: float) -> None:
+        """How far an oblique window's slice is tilted, for the caption; 0 = not."""
+        if degrees != getattr(self, "_tilt", 0.0):
+            self._tilt = float(degrees)
+            self.update()
+
     def set_zoomed(self, on: bool) -> None:
         """Whether the pane is showing a crop, for the corner readout."""
         if on != self._zoomed:
@@ -161,6 +183,11 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_outline_width(self, width: float) -> None:
+        if width != self._outline_width:
+            self._outline_width = float(width)
+            self.update()
 
     def set_outlines(self, outlines, only: set[tuple[str, str]] | None = None) -> None:
         """Surface/slice crossings, as :class:`viewer.surfaces.Outline` records.
@@ -184,6 +211,13 @@ class ImagePane(QtWidgets.QWidget):
             self._outlines.update(built)
             changed = True
         if changed:
+            self.update()
+
+    def set_highlight(self, points: np.ndarray) -> None:
+        """Highlighted vertices near this slice, ``(N, 2)`` fractional (row, col) pixels."""
+        points = np.asarray(points, np.float64).reshape(-1, 2)
+        if points.shape != self._highlight.shape or not np.array_equal(points, self._highlight):
+            self._highlight = points
             self.update()
 
     def set_marks(self, marks: list[tuple[float, float, str]]) -> None:
@@ -280,6 +314,8 @@ class ImagePane(QtWidgets.QWidget):
                 QtCore.Qt.AlignmentFlag.AlignCenter,
                 f"{self.plane.value.upper()}\nno data",
             )
+            if self._toast and self._toast_alpha > 0:
+                self._paint_toast(p)
             p.end()
             return
 
@@ -296,6 +332,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_brush(p)
         if len(self._stroke_pts) > 1:
             self._paint_stroke(p, rect)
+        if self._highlight.size:
+            self._paint_highlight(p, rect)
         if self._marks:
             self._paint_marks(p, rect)
         if self._handle is not None:
@@ -309,7 +347,10 @@ class ImagePane(QtWidgets.QWidget):
         # Saying so on the image, because a cropped brain still looks like a
         # brain -- the same reason the edge labels are written on.
         zoom = "  zoom" if self._zoomed else ""
-        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}")
+        tilt = getattr(self, "_tilt", 0.0)
+        # Said on the image: a tilted slice still looks like a slice.
+        tilted = f"  tilt {tilt:.0f}°" if tilt >= 0.5 else ""
+        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}{tilted}")
         if self._brush is not None and self._brush_label:
             p.drawText(6, 30, self._brush_label)
 
@@ -327,7 +368,57 @@ class ImagePane(QtWidgets.QWidget):
             p.drawText(r.adjusted(4, 0, 0, 0), flags.AlignLeft | flags.AlignVCenter, left)
         if self._readout:
             self._paint_readout(p)
+        if self._toast and self._toast_alpha > 0:
+            self._paint_toast(p)
         p.end()
+
+    #: How long a toast stays fully visible, then how long it fades, ms.
+    TOAST_HOLD = 3000
+    TOAST_FADE = 900
+
+    def show_toast(self, text: str) -> None:
+        """A message in a solid box over the image, fading after a few seconds.
+
+        For what an edit refused and why. Written into the caption line it was
+        small, unboxed text over a brain and went unread.
+        """
+        self._toast = text
+        self._toast_alpha = 1.0
+        self._toast_anim.stop()
+        self._toast_anim.start()
+        self.update()
+
+    def _on_toast(self, value) -> None:
+        self._toast_alpha = float(value)
+        if self._toast_alpha <= 0:
+            self._toast = ""
+        self.update()
+
+    def _paint_toast(self, p: QtGui.QPainter) -> None:
+        c = theme.palette()
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setOpacity(self._toast_alpha)
+        font = p.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        p.setFont(font)
+        pad = 8
+        width = max(self.width() - 4 * pad, 40)
+        flags = QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap
+        text = p.fontMetrics().boundingRect(QtCore.QRect(0, 0, width, 1000), flags, self._toast)
+        box = QtCore.QRectF(
+            (self.width() - text.width()) / 2 - pad,
+            self.height() - text.height() - 3 * pad,
+            text.width() + 2 * pad,
+            text.height() + 2 * pad,
+        )
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(c.warn))
+        p.drawRoundedRect(box, 6, 6)
+        p.setPen(QtGui.QColor(c.bg))
+        p.drawText(box, flags, self._toast)
+        p.restore()
 
     def _paint_outlines(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
         assert self._image is not None
@@ -342,9 +433,25 @@ class ImagePane(QtWidgets.QWidget):
             # magnified, so zooming in to judge a boundary makes the line
             # relatively thinner rather than hiding the edge under it.
             pen.setCosmetic(True)
-            pen.setWidthF(1.25)
+            pen.setWidthF(self._outline_width)
             p.setPen(pen)
             p.drawPath(path)
+        p.restore()
+
+    def _paint_highlight(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        """Highlighted vertices: small dots in the warn colour, as on the 3-D surface."""
+        assert self._image is not None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        p.save()
+        p.setClipRect(rect)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QColor(theme.palette().warn))
+        for row, col in self._highlight:
+            p.drawEllipse(
+                QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy), 2.2, 2.2
+            )
         p.restore()
 
     def _paint_marks(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
@@ -527,16 +634,25 @@ class ImagePane(QtWidgets.QWidget):
                     self.seeded.emit(*idx)
                 return
             self._drag_from = event.position()
+            self._drag_kind = "zoom"
             return
         mods = event.modifiers()
+        shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        left = event.button() == QtCore.Qt.MouseButton.LeftButton
+        if event.button() == QtCore.Qt.MouseButton.MiddleButton or (
+            # Shift+drag pans, except on the align handle, where shift slides.
+            left and shift and self._grab_kind(event.position(), True) is None
+        ):
+            self._drag_from = event.position()
+            self._drag_kind = "pan"
+            return
         if self._brush is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
             frac = self._to_fraction(event.position())
             if frac is not None:
                 self._editing_drag = True
                 self.edit_pressed.emit(*frac)
             return
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        if left:
             kind = self._grab_kind(event.position(), shift)
             if kind is not None:
                 self._grab = kind
@@ -555,11 +671,13 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
-        if event.buttons() & QtCore.Qt.MouseButton.RightButton:
-            if self._drag_from is not None:
+        if self._drag_from is not None:
+            delta = event.position() - self._drag_from
+            self._drag_from = event.position()
+            if self._drag_kind == "zoom":
+                self.zoomed.emit(float(np.exp(-delta.y() / 150.0)))
+            else:
                 scale = self._image_scale()
-                delta = event.position() - self._drag_from
-                self._drag_from = event.position()
                 # Negated: dragging the image right should bring what is on the
                 # left into view, the way dragging a map works.
                 self.panned.emit(-delta.y() / scale, -delta.x() / scale)
@@ -592,6 +710,10 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._drag_from is not None:
+            self._drag_from = None
+            self._drag_kind = ""
+            return
         if self._editing_drag and event.button() == QtCore.Qt.MouseButton.LeftButton:
             self._editing_drag = False
             self.edit_released.emit()

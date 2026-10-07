@@ -13,6 +13,7 @@ import torch
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
 nib = pytest.importorskip("nibabel")
 
+from fastfuncstuff.viewer.commands import Aspect  # noqa: E402
 from tests.viewer.test_surface_render import _sheet  # noqa: E402
 
 
@@ -213,3 +214,165 @@ def test_a_surface_seed_lands_on_the_voxel_the_crosshair_moved_to(window):
     # The fixture's grid: origin (-29, -29, -9) mm, 2 mm voxels.
     assert session.state.crosshair == (10, 5, 5)
     assert session.state.seed == (10, 5, 5)
+
+
+def test_the_crosshair_marks_its_nearest_vertex_and_c_aims_the_camera_there(window):
+    """The crosshair is rarely at mid-depth; a mark only within 2 mm of it drew
+    nothing. And on an inflated surface its mm is not where it is drawn."""
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape, SetXYZ
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "flat"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    # 9 mm above the sheet (mid-depth is z = 1.5): far off the surface.
+    session.do(SetXYZ(5.0, -7.0, 9.0))
+    win.refresh(Aspect.ALL)
+    cx, cy, cz, r = c.cross
+    assert r > 0 and cz == pytest.approx(1.5, abs=1e-4)
+    assert abs(cx - 5.0) < 1.5 and abs(cy + 7.0) < 1.5
+
+    hemi, k = c.nearest_vertex((5.0, -7.0, 9.0))
+    win._centre_view()
+    assert np.allclose(c.camera.target, c.drawn_positions(hemi)[k], atol=1e-4)
+
+    win._toggle_cross()
+    assert c.cross[3] == 0.0
+
+
+def test_a_shape_change_keeps_the_zoom_relative_to_the_brain(window):
+    """Pial to inflated filled the window: the camera stayed put while the
+    shape grew. It now backs off in step with the morph."""
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.surfaces.hemis = {"lh": _sheet(pial_scale=2.0)}
+    session.surfaces.version = {"lh": 2}
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c._on_morph(1.0)
+    win._reset_camera()
+    before = c.camera.distance
+    session.do(SetSurfaceShape("S1", "pial"))
+    win.apply(session.state.viewports.get("S1"))
+    c._anim.stop()
+    c._on_morph(0.0)
+    assert c.camera.distance == pytest.approx(before)
+    c._on_morph(1.0)
+    # The pial sheet is twice the white's width (its diagonal near twice too).
+    assert 1.8 < c.camera.distance / before < 2.1
+
+
+def test_a_continuous_map_shows_its_scale_and_a_parcellation_does_not(window):
+    from fastfuncstuff.viewer.vocab import SetSurfaceMap
+
+    session, win = window
+    session.surfaces.hemis["lh"].morph["curv"] = np.linspace(-1, 1, 41 * 41).astype(np.float32)
+    session.do(SetSurfaceMap("S1", "curv"))
+    win.apply(session.state.viewports.get("S1"))
+    assert not win.legend.isHidden()
+    lo, hi, name = win.legend._scale
+    assert lo == pytest.approx(-hi) and lo > 0 and name == "RdBu"
+    win.legend.grab()  # paints
+    session.do(SetSurfaceMap("S1", ""))
+    win.apply(session.state.viewports.get("S1"))
+    assert win.legend.isHidden()
+
+
+def test_d_cycles_the_depth_statistic_and_it_reaches_the_canvas(window):
+    from fastfuncstuff.viewer.vocab import SetSurfaceDepth, SetSurfaceDepthStat
+
+    session, win = window
+    session.do(SetSurfaceDepth("S1", 0.0, 1.0, 6))
+    win._cycle_depth_stat()
+    vp = session.state.viewports.get("S1")
+    assert vp.depth_stat == "median"
+    win.refresh(Aspect.ALL)
+    assert win.canvas.depth_stat == "median"
+    assert "median" in win.depth_label.text()
+    assert "SET_SURFACE_DEPTH_STAT" in session.to_script()
+    with pytest.raises(ValueError, match="unknown depth statistic"):
+        session.do(SetSurfaceDepthStat("S1", "mode"))
+
+
+def test_ctrl_drag_swings_the_hemispheres_open_and_o_cycles_the_presets(window):
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    session, win = window
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    B, M = QtCore.Qt.MouseButton, QtCore.Qt.KeyboardModifier
+
+    def send(kind, x, buttons, mods):
+        pos = QtCore.QPointF(x, 160.0)
+        QtWidgets.QApplication.sendEvent(
+            c, QtGui.QMouseEvent(kind, pos, pos, B.LeftButton, buttons, mods)
+        )
+
+    E = QtCore.QEvent.Type
+    send(E.MouseButtonPress, 100.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseMove, 110.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseMove, 180.0, B.LeftButton, M.ControlModifier)
+    send(E.MouseButtonRelease, 180.0, B.NoButton, M.ControlModifier)
+    vp = session.state.viewports.get("S1")
+    assert vp.hinge > 0
+    win.refresh(Aspect.ALL)  # the manager does this after every command
+    # Turned about the vertical: z is untouched, x/y rotated.
+    m = c._model["lh"]
+    assert m[2, 2] == pytest.approx(1.0) and m[0, 0] < 1.0
+    assert session.state.seed is None  # a drag, not a ctrl+click
+
+    send(E.MouseButtonPress, 100.0, B.LeftButton, M.ControlModifier | M.ShiftModifier)
+    send(E.MouseMove, 140.0, B.LeftButton, M.ControlModifier | M.ShiftModifier)
+    assert session.state.viewports.get("S1").split > 0
+    send(E.MouseButtonRelease, 140.0, B.NoButton, M.NoModifier)
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceHinge
+
+    session.do(SetSurfaceHinge("S1", 0.0))
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == 180.0
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == -180.0
+    win._cycle_hinge()
+    assert session.state.viewports.get("S1").hinge == 0.0
+
+
+def test_paint_mode_paints_the_vertex_under_the_cursor_instead_of_turning(window):
+    from PySide6 import QtCore, QtGui, QtWidgets
+
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    win._reset_camera()
+    got = []
+    c.painted.connect(lambda h, v, e: got.append((h, v, e)))
+    win._toggle_paint()
+    turned = c.camera.rotation.copy()
+    pos = QtCore.QPointF(160.0, 160.0)
+    B = QtCore.Qt.MouseButton
+    for kind, buttons in (
+        (QtCore.QEvent.Type.MouseButtonPress, B.LeftButton),
+        (QtCore.QEvent.Type.MouseMove, B.LeftButton),
+    ):
+        QtWidgets.QApplication.sendEvent(
+            c,
+            QtGui.QMouseEvent(
+                kind, pos, pos, B.LeftButton, buttons, QtCore.Qt.KeyboardModifier.NoModifier
+            ),
+        )
+    assert got and got[0][0] == "lh" and got[0][2] is False
+    np.testing.assert_allclose(c.camera.rotation, turned)
+    assert session.surfaces.highlight["lh"].sum() > 0

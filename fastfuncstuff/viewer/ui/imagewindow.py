@@ -152,6 +152,33 @@ class ImageWindow(QtWidgets.QWidget):
         self.point_button.clicked.connect(self._toggle_point)
         bar.addWidget(self.point_button)
 
+        self.nudge_button = self._button(
+            "NUDGE",
+            "b",
+            "Push a surface away from the cursor: press beside a white or pial\n"
+            "outline and it moves back a quarter millimetre, over the brush;\n"
+            "hold to keep pushing. Always by hand (no snap). ( ) brush radius.",
+        )
+        self.nudge_button.clicked.connect(self._toggle_nudge)
+        bar.addWidget(self.nudge_button)
+
+        self.highlight_button = self._button(
+            "MARK",
+            "v",
+            "Highlight cortex: drag along a white or pial outline to mark the\n"
+            "vertices under the brush (ctrl+drag unmarks; shift+V clears). The\n"
+            "mark shows on the 3-D surface too. ctrl+Up/Down moves the marked\n"
+            "pial out/in as one piece (add shift for white); r in the 3-D window\n"
+            "turns it into an ROI.",
+        )
+        self.highlight_button.clicked.connect(self._toggle_highlight_tool)
+        bar.addWidget(self.highlight_button)
+        #: While a nudge is held: repeats it, from wherever the cursor now is.
+        self._nudge_timer = QtCore.QTimer(self)
+        self._nudge_timer.setInterval(self.NUDGE_REPEAT_MS)
+        self._nudge_timer.timeout.connect(self._nudge_again)
+        self._nudge_at: tuple[float, float] | None = None
+
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
         self.slice_label.setObjectName("value")
@@ -184,6 +211,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         self.pane.stepped.connect(self._step)
         self.pane.panned.connect(self._pan_by)
+        self.pane.zoomed.connect(self._zoom_by)
         self.pane.slid.connect(self._slide)
         self.pane.turned.connect(self._turn)
         self.pane.edit_pressed.connect(self._edit_press)
@@ -231,7 +259,58 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
-                Binding("right-drag", "pan", None, group="view"),
+                Binding("c", "centre the view on the crosshair", self._centre_view, group="view"),
+                Binding(
+                    "t",
+                    "tilt the slice to cut the cortex square-on here",
+                    self._tilt_to_cortex,
+                    group="view",
+                ),
+                Binding("shift+t", "untilt the slice", self._untilt, group="view"),
+                Binding(
+                    "alt+Up",
+                    "tilt the slice 5 deg (top away)",
+                    lambda: self._tilt_by(0, 5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Down",
+                    "tilt the slice 5 deg (top toward)",
+                    lambda: self._tilt_by(0, -5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Left",
+                    "tilt the slice 5 deg (left away)",
+                    lambda: self._tilt_by(1, -5.0),
+                    group="view",
+                ),
+                Binding(
+                    "alt+Right",
+                    "tilt the slice 5 deg (right away)",
+                    lambda: self._tilt_by(1, 5.0),
+                    group="view",
+                ),
+                Binding(
+                    "shift+o",
+                    "surface outlines: both, white, pial, off",
+                    self._cycle_outlines,
+                    group="surface",
+                ),
+                Binding(
+                    "[",
+                    "thinner surface outlines",
+                    lambda: self._outline_width_by(1 / 1.4),
+                    group="surface",
+                ),
+                Binding(
+                    "]",
+                    "thicker surface outlines",
+                    lambda: self._outline_width_by(1.4),
+                    group="surface",
+                ),
+                Binding("right-drag", "zoom (up = in)", None, group="view"),
+                Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
@@ -258,6 +337,52 @@ class ImageWindow(QtWidgets.QWidget):
                     "p", "edit surfaces: select a vertex", self.point_button.click, group="surface"
                 ),
                 Binding(
+                    "b",
+                    "edit surfaces: nudge away from the cursor",
+                    self.nudge_button.click,
+                    group="surface",
+                ),
+                Binding(
+                    "v",
+                    "mark cortex to move or make an ROI",
+                    self.highlight_button.click,
+                    group="surface",
+                ),
+                Binding("shift+v", "clear the mark", self._clear_highlight, group="surface"),
+                Binding(
+                    "{",
+                    "smaller nudge / move step",
+                    lambda: self._step_by(1 / 1.5),
+                    group="surface",
+                ),
+                Binding(
+                    "}", "larger nudge / move step", lambda: self._step_by(1.5), group="surface"
+                ),
+                Binding(
+                    "ctrl+Up",
+                    "move marked pial out one step",
+                    lambda: self._move_highlight("pial", 1.0),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+Down",
+                    "move marked pial in one step",
+                    lambda: self._move_highlight("pial", -1.0),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+shift+Up",
+                    "move marked white out one step",
+                    lambda: self._move_highlight("white", 1.0),
+                    group="surface",
+                ),
+                Binding(
+                    "ctrl+shift+Down",
+                    "move marked white in one step",
+                    lambda: self._move_highlight("white", -1.0),
+                    group="surface",
+                ),
+                Binding(
                     "Delete",
                     "delete the selected vertex",
                     self._delete_selected,
@@ -278,7 +403,18 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("(", "smaller brush", lambda: self._scale_brush(1 / 1.25), group="surface"),
                 Binding(")", "larger brush", lambda: self._scale_brush(1.25), group="surface"),
-                Binding("m", "snap to the image edge on / off", self._toggle_snap, group="surface"),
+                Binding(
+                    "f",
+                    "hand moves: follow the drag / follow the normals",
+                    self._toggle_free,
+                    group="surface",
+                ),
+                Binding(
+                    "m",
+                    "snap -> edge (strongest, ungated) -> hand",
+                    self._toggle_snap,
+                    group="surface",
+                ),
                 Binding("ctrl+z", "undo the last surface edit", self._undo_edit, group="surface"),
                 Binding("Escape", "cancel the drag", self._cancel_edit, group="surface"),
                 Binding("drag the ring", "turn the moving image", None, group="align mode"),
@@ -442,6 +578,16 @@ class ImageWindow(QtWidgets.QWidget):
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
 
+    def _grid(self):
+        """The grid this window samples through -- tilted when the window is oblique."""
+        from fastfuncstuff.viewer.compose import view_grid
+
+        return view_grid(self.session.state, self._viewport())
+
+    def _tilted(self) -> bool:
+        grid = self._grid()
+        return grid is not None and grid.layout_affine is not None
+
     def _pick(self, row: int, col: int, *, seed: bool) -> None:
         state = self.session.state
         vp = self._viewport()
@@ -452,6 +598,14 @@ class ImageWindow(QtWidgets.QWidget):
         # image pixel (0, 0) is not grid voxel 0 and a click would land
         # wherever the offset happened not to be applied.
         ijk = view.to_ijk(row, col, state.crosshair)
+        grid = self._grid()
+        if grid is not None and grid.layout_affine is not None:
+            # Oblique: the tilted voxel is somewhere in the shared grid, not at
+            # these indices; go through mm and take the voxel it lands in.
+            self._dispatch(SetXYZ(*grid.ijk_to_mm(tuple(float(v) for v in ijk))))
+            if seed:
+                self._dispatch(SetSeed(*self.session.state.crosshair))
+            return
         # A click in an unlocked window still reports where it was clicked --
         # it just does not take its own slice from the crosshair afterwards.
         self._dispatch(SetIJK(*ijk))
@@ -506,6 +660,83 @@ class ImageWindow(QtWidgets.QWidget):
             self._dispatch(SetZoom(self.vid, 1.0))
             self._dispatch(SetPan(self.vid, 0.0, 0.0))
 
+    def _cycle_outlines(self) -> None:
+        from fastfuncstuff.viewer.surfaces import next_outlines
+        from fastfuncstuff.viewer.vocab import ShowSurfaces
+
+        nxt = next_outlines(self.session.state.surfaces_shown)
+        self._dispatch(ShowSurfaces(nxt))
+        self.pane.show_toast(f"outlines: {nxt or 'off'}")
+
+    def _outline_width_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetOutlineWidth
+
+        self._dispatch(SetOutlineWidth(self.session.state.surface_outline_width * factor))
+
+    def _tilt_to_cortex(self) -> None:
+        """Oblique window: turn the slice to contain the cortex's normal at the crosshair.
+
+        Through a sulcal wall that runs at a slant to the slice, the ribbon is
+        a smear and dragging an outline moves the surface mostly out of the
+        slice. Cut square-on, the boundary is sharp and the drag means what it
+        shows. Pressed again after moving, it re-aims for the new spot.
+        """
+        from fastfuncstuff.viewer.compose import section_tilt, tilt_matrix
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        state = self.session.state
+        vp = self._viewport()
+        mm = state.crosshair_mm
+        if vp is None or state.grid is None or mm is None:
+            return
+        n = self.session.surfaces.cortex_normal(mm)
+        if n is None:
+            self.pane.show_toast("no cortex within 6 mm of the crosshair to tilt to")
+            return
+        fixed = plane_layout(state.grid.affine, vp.plane).fixed
+        plane_normal = np.linalg.inv(state.grid.affine)[fixed, :3]
+        now = tilt_matrix(vp)
+        a = now @ (plane_normal / np.linalg.norm(plane_normal))
+        if abs(float(a @ n)) < 0.05:
+            self.pane.show_toast("this slice already cuts the cortex square-on here")
+            return
+        r = section_tilt(now, plane_normal, n)
+        if np.allclose(r, now):
+            self.pane.show_toast("the cortex lies in this slice here: try another plane")
+            return
+        self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
+        angle = np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))
+        self.pane.show_toast(f"tilted {angle:.0f} deg to cut the cortex square-on (T: untilt)")
+
+    def _tilt_by(self, about: int, degrees: float) -> None:
+        """Tilt the slice about the pane's horizontal (0) or vertical (1) axis, by hand."""
+        from fastfuncstuff.viewer.align import axis_rotation
+        from fastfuncstuff.viewer.compose import tilt_matrix
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        state = self.session.state
+        vp = self._viewport()
+        grid = self._grid()
+        if vp is None or grid is None or state.grid is None:
+            return
+        layout = plane_layout(state.grid.affine, vp.plane)
+        # The pane's horizontal runs along its columns, its vertical along rows.
+        axis = grid.affine[:3, layout.col if about == 0 else layout.row]
+        r = axis_rotation(axis, degrees) @ tilt_matrix(vp)
+        self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
+
+    def _untilt(self) -> None:
+        from fastfuncstuff.viewer.vocab import SetViewTilt
+
+        self._dispatch(SetViewTilt(self.vid))
+
+    def _centre_view(self) -> None:
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        if view is not None:
+            self._dispatch(SetPan(self.vid, *view.pan_centring(state.crosshair)))
+
     def _pan_by(self, d_row: float, d_col: float) -> None:
         vp = self._viewport()
         if vp is not None:
@@ -517,6 +748,12 @@ class ImageWindow(QtWidgets.QWidget):
         if state.grid is None or vp is None:
             return
         axis = plane_layout(state.grid.affine, vp.plane).fixed
+        grid = self._grid()
+        if grid is not None and grid.layout_affine is not None:
+            # Oblique: step along the tilted slice's own normal.
+            mm = np.asarray(state.crosshair_mm) + delta * grid.affine[:3, axis]
+            self._dispatch(SetXYZ(float(mm[0]), float(mm[1]), float(mm[2])))
+            return
         if vp.locked:
             ijk = list(state.crosshair)
             ijk[axis] += delta
@@ -553,7 +790,10 @@ class ImageWindow(QtWidgets.QWidget):
         self.edit_button.setChecked(state.surface_editing and state.surface_tool == "grab")
         self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
         self.point_button.setChecked(state.surface_editing and state.surface_tool == "point")
+        self.nudge_button.setChecked(state.surface_editing and state.surface_tool == "nudge")
+        self.highlight_button.setChecked(state.surface_editing and state.surface_tool == "mark")
         self.pane.set_marks(self._selected_marks())
+        self.pane.set_highlight(self._highlight_points())
         self._sync_brush()
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
@@ -584,32 +824,187 @@ class ImageWindow(QtWidgets.QWidget):
         self._sync_brush()
 
     def _toggle_snap(self) -> None:
-        """Snap fully to the found edge, or follow the hand exactly.
+        """Cycle snap -> edge -> hand.
 
-        A toggle rather than a slider because the two uses are distinct: snap
-        when the image shows the boundary, hand when it does not (a vessel, a
-        dura fold) and the eye knows better than the gradient.
+        Steps rather than a slider because the uses are distinct: snap when
+        the image shows the boundary at the intensity it should be; edge when
+        it shows a boundary the tissue estimate misjudges (pial lying in
+        dura, a stripped brain's outer edge) -- the strongest edge wins; hand
+        when it does not show one (a vessel, a dura fold) and the eye knows
+        better than the gradient.
         """
-        r, snap, smooth, search, sign = self.session.state.surface_brush
-        self._dispatch(SetSurfaceBrush(r, 0.0 if snap > 0 else 1.0, smooth, search, sign))
+        from fastfuncstuff.viewer.vocab import SetSurfaceSnapGate
+
+        state = self.session.state
+        r, snap, smooth, search, sign = state.surface_brush
+        if snap > 0 and state.surface_snap_gate:
+            self._dispatch(SetSurfaceSnapGate(False))
+        elif snap > 0:
+            self._dispatch(SetSurfaceBrush(r, 0.0, smooth, search, sign))
+        else:
+            self._dispatch(SetSurfaceBrush(r, 1.0, smooth, search, sign))
+            self._dispatch(SetSurfaceSnapGate(True))
+        self._sync_brush()
+
+    def _toggle_free(self) -> None:
+        """Hand moves along the drag as seen in the slice, or along each vertex's normal.
+
+        Turning free on also turns snap off: the edge search runs along
+        normals, so a free move only means something by hand.
+        """
+        from fastfuncstuff.viewer.vocab import SetSurfaceFree
+
+        state = self.session.state
+        on = not state.surface_free
+        self._dispatch(SetSurfaceFree(on))
+        r, snap, smooth, search, sign = state.surface_brush
+        if on and snap > 0:
+            self._dispatch(SetSurfaceBrush(r, 0.0, smooth, search, sign))
         self._sync_brush()
 
     def _sync_brush(self, note: str = "") -> None:
         state = self.session.state
         r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
-        tool = {"draw": "DRAW", "point": "POINT"}.get(state.surface_tool, "EDIT")
+        if snap <= 0 and state.surface_free:
+            mode = "hand free"
+        if state.surface_tool in ("nudge", "mark"):
+            mode += f"  step {state.surface_step:g} mm"
+        if snap > 0 and not state.surface_snap_gate:
+            mode = mode.replace("snap", "edge")
+        tool = {"draw": "DRAW", "point": "POINT", "nudge": "NUDGE", "mark": "MARK"}.get(
+            state.surface_tool, "EDIT"
+        )
         if state.surface_tool == "point" and state.surface_selected is not None:
             hemi, v = state.surface_selected
             tool += f" {hemi} #{v}"
-        label = f"{tool}  r={r:g} mm  {mode}" + (f"   {note}" if note else "")
-        self.pane.set_brush(self._brush_px(), label)
+        self.pane.set_brush(self._brush_px(), f"{tool}  r={r:g} mm  {mode}")
+        if note:
+            self.pane.show_toast(note)
 
     def _toggle_grab(self) -> None:
         state = self.session.state
         on = not (state.surface_editing and state.surface_tool == "grab")
         self._dispatch(SetSurfaceTool("grab"))
         self._dispatch(SetSurfaceEditing(on))
+
+    def _toggle_highlight_tool(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "mark")
+        self._dispatch(SetSurfaceTool("mark" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    def _clear_highlight(self) -> None:
+        from fastfuncstuff.viewer.vocab import HighlightSurface
+
+        self._dispatch(HighlightSurface(mode="clear"))
+
+    def _move_highlight(self, surface: str, shift: float) -> None:
+        from fastfuncstuff.viewer.ui.surfacewindow import move_highlight
+
+        move_highlight(self.session, self._dispatch, surface, shift, self.pane.show_toast)
+
+    def _step_by(self, factor: float) -> None:
+        from fastfuncstuff.viewer.vocab import SetSurfaceStep
+
+        step = float(np.clip(self.session.state.surface_step * factor, 0.05, 5.0))
+        self._dispatch(SetSurfaceStep(round(step, 3)))
+        self._sync_brush()
+
+    def _mark(self, row: float, col: float) -> None:
+        """Mark (or with ctrl, unmark) the vertices under the brush on the nearest outline."""
+        from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
+
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if view is None or pos is None or grid is None:
+            return
+        reach = max(8.0 / self.pane._image_scale(), self._brush_px() or 0.0)
+        grab = self.session.surfaces.grab(
+            grid.affine, view, pos, state.surfaces_shown, row, col, reach
+        )
+        if grab is None:
+            return
+        ids = self.session.surfaces.disc(
+            grab.hemi, grab.vertex, state.surface_brush[0] / 2, grab.surface
+        )
+        erase = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & (QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier)
+        )
+        self._dispatch(HighlightSurface(grab.hemi, encode_ids(ids), "remove" if erase else "add"))
+        self._marking = True
+
+    def _toggle_nudge(self) -> None:
+        state = self.session.state
+        on = not (state.surface_editing and state.surface_tool == "nudge")
+        self._dispatch(SetSurfaceTool("nudge" if on else "grab"))
+        self._dispatch(SetSurfaceEditing(on))
+
+    #: How often a held nudge repeats (its step is ``state.surface_step``).
+    NUDGE_REPEAT_MS = 120
+
+    def _nudge(self, row: float, col: float) -> bool:
+        """Push the outline nearest (row, col) one step away from it. False if none is in reach.
+
+        A hand-mode EDIT_SURFACE whose drag is one step along the surface's
+        normal, away from the cursor -- so it replays, undoes, keeps pial
+        outside white and never folds, exactly as a drag does.
+        """
+        state = self.session.state
+        surfaces = self.session.surfaces
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if view is None or pos is None or grid is None:
+            return False
+        reach = max(8.0 / self.pane._image_scale(), self._brush_px() or 0.0)
+        grab = surfaces.grab(grid.affine, view, pos, state.surfaces_shown, row, col, reach)
+        if grab is None:
+            return False
+        h = surfaces.hemis[grab.hemi]
+        n = surfaces.surface_normal(grab.hemi, grab.surface, grab.vertex)
+        away = float(n @ (h.states[grab.surface][grab.vertex] - np.asarray(grab.at_mm)))
+        if abs(away) < 0.1:
+            self.pane.show_toast("nudge from beside the outline, on the side to push from")
+            return False
+        drag = state.surface_step * np.sign(away) * n
+        r, _, smooth, search, sign = state.surface_brush
+        try:
+            self._dispatch(
+                EditSurface(
+                    grab.hemi,
+                    grab.surface,
+                    grab.vertex,
+                    grab.at_mm,
+                    (float(drag[0]), float(drag[1]), float(drag[2])),
+                    r,
+                    0.0,
+                    smooth,
+                    search,
+                    sign,
+                    state.surface_snap_key or "",
+                    state.surface_snap_gate,
+                )
+            )
+        except ValueError as exc:
+            self.pane.show_toast(str(exc))
+            return False
+        from fastfuncstuff.surface.edit import explain
+
+        res = surfaces.last_result
+        note = explain(res) if res is not None else ""
+        if note:
+            self.pane.show_toast(note)
+        return True
+
+    def _nudge_again(self) -> None:
+        if self._nudge_at is None or not self._nudge(*self._nudge_at):
+            self._nudge_timer.stop()
 
     def _toggle_point(self) -> None:
         state = self.session.state
@@ -653,6 +1048,32 @@ class ImageWindow(QtWidgets.QWidget):
         p = 0.5 * (h.states["white"][sel[1]] + h.states["pial"][sel[1]])
         self._dispatch(SetXYZ(float(p[0]), float(p[1]), float(p[2])))
 
+    def _highlight_points(self) -> np.ndarray:
+        """Highlighted vertices of the shown surfaces within half a voxel of this slice."""
+        state = self.session.state
+        surfaces = self.session.surfaces
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        grid = self._grid()
+        if not surfaces.highlight or view is None or pos is None or grid is None:
+            return np.zeros((0, 2))
+        inv = np.linalg.inv(grid.affine)
+        out = []
+        for hemi in surfaces.hemis:
+            ids = surfaces.highlighted(hemi)
+            if not ids.size:
+                continue
+            for surface in state.surfaces_shown:
+                verts = surfaces.hemis[hemi].states.get(surface)
+                if verts is None:
+                    continue
+                ijk = verts[ids] @ inv[:3, :3].T + inv[:3, 3]
+                near = np.abs(ijk[:, view.layout.fixed] - pos) <= 0.5
+                if near.any():
+                    out.append(np.asarray(view.points_to_image(ijk[near])).reshape(-1, 2))
+        return np.concatenate(out) if out else np.zeros((0, 2))
+
     def _selected_marks(self) -> list[tuple[float, float, str]]:
         """Where the selected vertex sits on this slice, per surface, if it is close."""
         state = self.session.state
@@ -665,7 +1086,9 @@ class ImageWindow(QtWidgets.QWidget):
         h = self.session.surfaces.hemis.get(sel[0])
         if h is None or sel[1] >= h.n_vertices:
             return []
-        inv = np.linalg.inv(state.grid.affine)
+        grid = self._grid()
+        assert grid is not None
+        inv = np.linalg.inv(grid.affine)
         marks = []
         for surface in ("white", "pial"):
             ijk = inv[:3, :3] @ h.states[surface][sel[1]] + inv[:3, 3]
@@ -688,7 +1111,8 @@ class ImageWindow(QtWidgets.QWidget):
         if view is None or pos is None or state.grid is None:
             return None
         ijk = view.image_to_points(row, col, pos)
-        return state.grid.affine[:3, :3] @ ijk + state.grid.affine[:3, 3]
+        affine = self._grid().affine
+        return affine[:3, :3] @ ijk + affine[:3, 3]
 
     def _edit_press(self, row: float, col: float) -> None:
         from fastfuncstuff.surface.edit import SnapParams
@@ -700,11 +1124,19 @@ class ImageWindow(QtWidgets.QWidget):
         pos = self.pane.position
         if view is None or pos is None or state.grid is None:
             return
+        if state.surface_tool == "mark":
+            self._mark(row, col)
+            return
+        if state.surface_tool == "nudge":
+            if self._nudge(row, col):
+                self._nudge_at = (row, col)
+                self._nudge_timer.start()
+            return
         # Tolerance in image pixels from a screen distance, so grabbing feels
         # the same at every zoom.
         tolerance = 8.0 / self.pane._image_scale()
         grab = surfaces.grab(
-            state.grid.affine, view, pos, state.surfaces_shown, row, col, tolerance
+            self._grid().affine, view, pos, state.surfaces_shown, row, col, tolerance
         )
         if grab is None:
             # Not near an outline: the press still means "look here".
@@ -722,17 +1154,31 @@ class ImageWindow(QtWidgets.QWidget):
             self._sync_brush()
             return
         r, snap, smooth, search, sign = state.surface_brush
-        params = SnapParams(radius=r, snap=snap, smooth=smooth, search=search, edge_sign=sign)
+        params = SnapParams(
+            radius=r,
+            snap=snap,
+            smooth=smooth,
+            search=search,
+            edge_sign=sign,
+            gate=state.surface_snap_gate,
+            free=state.surface_free,
+        )
         try:
             sampler = self.session.surface_sampler(state.surface_snap_key)
         except (ValueError, KeyError) as exc:
-            self.setToolTip(str(exc))
+            self.pane.show_toast(str(exc))
             return
         surfaces.begin(grab, sampler, params)
         self._edit = (grab, np.asarray(grab.at_mm))
         self._edit_drag_mm = np.zeros(3)
 
     def _edit_drag(self, row: float, col: float) -> None:
+        if getattr(self, "_marking", False):
+            self._mark(row, col)
+            return
+        if self._nudge_timer.isActive():
+            self._nudge_at = (row, col)
+            return
         if self._stroke is not None:
             here = self._press_point_mm(row, col)
             if here is not None:
@@ -746,10 +1192,25 @@ class ImageWindow(QtWidgets.QWidget):
         if here is None:
             return
         self._edit_drag_mm = here - self._edit[1]
-        self.session.surfaces.preview(self._edit_drag_mm)
+        res = self.session.surfaces.preview(self._edit_drag_mm)
         self.surfaces_previewed.emit()
+        if res is not None:
+            from fastfuncstuff.surface.edit import explain
+
+            # Said while dragging, so the hand can respond: let go and
+            # switch mode, or move the other surface first.
+            note = explain(res)
+            if note:
+                self.pane.show_toast(note)
 
     def _edit_release(self) -> None:
+        if getattr(self, "_marking", False):
+            self._marking = False
+            return
+        if self._nudge_timer.isActive() or self._nudge_at is not None:
+            self._nudge_timer.stop()
+            self._nudge_at = None
+            return
         if self._stroke is not None:
             self._finish_stroke()
             return
@@ -776,6 +1237,8 @@ class ImageWindow(QtWidgets.QWidget):
                 search,
                 sign,
                 self.session.state.surface_snap_key or "",
+                self.session.state.surface_snap_gate,
+                self.session.state.surface_free,
             )
         )
 
@@ -793,7 +1256,7 @@ class ImageWindow(QtWidgets.QWidget):
             return
         row, col = pixels[-1]
         end = self.session.surfaces.grab(
-            state.grid.affine,
+            self._grid().affine,
             view,
             pos,
             state.surfaces_shown,
@@ -822,12 +1285,18 @@ class ImageWindow(QtWidgets.QWidget):
                     search,
                     sign,
                     state.surface_snap_key or "",
+                    state.surface_snap_gate,
+                    EditSurfaceStroke.encode_grid(self._grid().affine) if self._tilted() else "",
+                    state.surface_free,
                 )
             )
         except ValueError as exc:
             self._sync_brush(str(exc))
             return
-        self._sync_brush()
+        from fastfuncstuff.surface.edit import explain
+
+        res = getattr(self.session.surfaces, "last_result", None)
+        self._sync_brush(explain(res) if res is not None else "")
 
     def _cancel_edit(self) -> None:
         if self._stroke is not None:
@@ -853,12 +1322,13 @@ class ImageWindow(QtWidgets.QWidget):
         surfaces = self.session.surfaces
         view = plane_view(state, vp)
         pos = self.pane.position
+        self.pane.set_outline_width(state.surface_outline_width)
         if not surfaces.hemis or not state.surfaces_shown or view is None or pos is None:
             self.pane.set_outlines([])
             return
         assert state.grid is not None
         self.pane.set_outlines(
-            surfaces.outlines(state.grid.affine, view, pos, state.surfaces_shown, only=only),
+            surfaces.outlines(self._grid().affine, view, pos, state.surfaces_shown, only=only),
             only=only,
         )
 
@@ -875,6 +1345,10 @@ class ImageWindow(QtWidgets.QWidget):
         row, col = view.to_image(state.crosshair)
         self.pane.set_crosshair(row, col)
         self.pane.set_zoomed(not view.is_identity)
+        from fastfuncstuff.viewer.compose import tilt_matrix
+
+        r = tilt_matrix(vp)
+        self.pane.set_tilt(float(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))))
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
         self.pane.set_readout(self.session.overlay_readout())
         self.pane.set_handle(self._handle_position())

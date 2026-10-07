@@ -322,6 +322,14 @@ class TestPlaneView:
         base = self._view(zoom=2.0).origin
         assert view.origin == (base[0] + 5, base[1] - 3)
 
+    def test_pan_centring_puts_the_voxel_in_the_middle_of_the_window(self):
+        ijk = (12, 30, 5)
+        pan = self._view(zoom=4.0).pan_centring(ijk)
+        view = self._view(zoom=4.0, pan=pan)
+        row, col = view.to_image(ijk)
+        sh, sw = view.span
+        assert abs(row + 0.5 - sh / 2) <= 1 and abs(col + 0.5 - sw / 2) <= 1
+
     def test_pan_cannot_walk_the_view_off_the_data(self):
         """A blank pane with no indication of the way back is a dead end."""
         h, w = self._view().extent
