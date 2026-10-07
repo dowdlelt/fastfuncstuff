@@ -1288,7 +1288,7 @@ class SetEdges(Command):
 @command
 @dataclass(frozen=True)
 class SetResample(Command):
-    """How a layer is painted into the display grid: auto, nearest or linear.
+    """How a layer is painted into the display grid: auto, nearest, linear or cubic.
 
     Display only. Nothing about the layer's voxels, what a graph plots, what a
     mode reads or what a cluster table counts depends on it -- which is why it
@@ -1324,6 +1324,9 @@ class SetSeed(Command):
 # ---------------------------------------------------------------------------
 
 OpenLayer = Callable[[str, str], Layer]
+
+#: Values SET_RESAMPLE takes, in the order the DRAW key cycles them.
+RESAMPLE_MODES = ("auto", "nearest", "linear", "cubic")
 
 #: Values SET_THRESHOLD_FOLLOW takes.
 THRESHOLD_FOLLOW = ("same", "next", "fixed")
@@ -2304,8 +2307,8 @@ def install(
     def _set_resample(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetResample)
         how = str(cmd.how)
-        if how not in ("auto", "nearest", "linear"):
-            raise ValueError(f"resample must be auto, nearest or linear, not {how!r}")
+        if how not in RESAMPLE_MODES:
+            raise ValueError(f"resample must be one of {RESAMPLE_MODES}, not {how!r}")
         if st.layers.get(cmd.key).resample == how:
             return Aspect.NOTHING
         st.layers.update(cmd.key, resample=how)

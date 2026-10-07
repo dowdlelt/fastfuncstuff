@@ -207,6 +207,34 @@ def test_nearest_mode_returns_an_actual_voxel_value():
     assert float(got[0]) == 10203.0
 
 
+def test_cubic_on_exact_indices_returns_those_voxels():
+    """Interpolating, and not transposed: the same ramp check linear passes."""
+    vol = _ramp((6, 8, 10))
+    pts = torch.tensor([[0.0, 0.0, 0.0], [5.0, 7.0, 9.0], [2.0, 3.0, 4.0]])
+    got = sample_volume(vol, pts, mode="cubic")
+    assert torch.allclose(got, torch.tensor([0.0, 50709.0, 20304.0]), atol=1e-2)
+
+
+def test_cubic_reproduces_a_quadratic_that_linear_cannot():
+    """Catmull-Rom is exact on quadratics; a wrong tap weight or axis breaks that."""
+    x, y, z = torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float64) for n in (8, 9, 10)), indexing="ij"
+    )
+    vol = x**2 + 0.5 * y**2 - 0.25 * z**2 + x * y
+    pts = torch.tensor([[3.3, 4.6, 5.2], [2.5, 2.5, 6.75]], dtype=torch.float64)
+    px, py, pz = pts.unbind(-1)
+    want = px**2 + 0.5 * py**2 - 0.25 * pz**2 + px * py
+    assert torch.allclose(sample_volume(vol, pts, mode="cubic"), want, atol=1e-9)
+    assert not torch.allclose(sample_volume(vol, pts, mode="bilinear"), want, atol=1e-3)
+
+
+def test_cubic_does_not_darken_the_border_and_stops_half_a_voxel_out():
+    vol = torch.full((4, 4, 4), 7.0)
+    pts = torch.tensor([[0.0, 0.0, 0.0], [3.0, 1.5, 0.2], [-0.4, 1.0, 1.0], [3.6, 1.0, 1.0]])
+    got = sample_volume(vol, pts, mode="cubic")
+    assert torch.allclose(got, torch.tensor([7.0, 7.0, 7.0, 0.0]), atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # plane extraction
 # ---------------------------------------------------------------------------

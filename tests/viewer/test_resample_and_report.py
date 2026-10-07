@@ -106,7 +106,7 @@ def test_the_automatic_choice_can_be_overridden_both_ways(session):
 
 def test_an_unknown_resample_mode_is_an_error(session):
     with pytest.raises(ValueError):
-        session.do(SetResample(_layer(session, "bold").key, "cubic"))
+        session.do(SetResample(_layer(session, "bold").key, "bicubic"))
 
 
 def test_it_replays_through_a_script(session):

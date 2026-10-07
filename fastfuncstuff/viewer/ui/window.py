@@ -66,6 +66,7 @@ from fastfuncstuff.viewer.ui.widgets import RowSizedList, install_combo_pickers
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
+    RESAMPLE_MODES,
     Load,
     LoadSurfaces,
     ModeAction,
@@ -1342,10 +1343,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
             "auto: nearest when the layer is coarser than the grid, linear when\n"
             "finer. So a 3 mm run drawn on a 1 mm anatomy keeps its own voxels\n"
             "instead of being smoothed into a resolution it does not have.\n"
+            "cubic: sharper than linear, for an anatomy upsampled onto a finer\n"
+            "display grid.\n"
             "Press 'e' to cycle."
         )
-        for label, value in (("auto", "auto"), ("nearest", "nearest"), ("linear", "linear")):
-            self.resample_box.addItem(label, userData=value)
+        for value in RESAMPLE_MODES:
+            self.resample_box.addItem(value, userData=value)
         self.resample_box.activated.connect(
             lambda i: self._apply(SetResample, how=str(self.resample_box.itemData(i)))
         )
@@ -2144,15 +2147,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.mode_box.blockSignals(False)
 
     def _cycle_resample(self) -> None:
-        """auto -> nearest -> linear -> auto on the selected layer.
+        """auto -> nearest -> linear -> cubic -> auto on the selected layer.
 
         A cycle rather than a toggle because the useful gesture is comparing
-        the two against the automatic choice, and three states is one key.
+        them against the automatic choice, and every state is one key.
         """
         layer = self.session.state.selected_layer()
         if layer is None:
             return
-        order = ("auto", "nearest", "linear")
+        order = RESAMPLE_MODES
         nxt = (
             order[(order.index(layer.resample) + 1) % len(order)]
             if layer.resample in order

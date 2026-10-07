@@ -336,6 +336,8 @@ def sample_volume(
     """
     if volume.ndim != 3:
         raise ValueError(f"expected a 3-D volume, got shape {tuple(volume.shape)}")
+    if mode == "cubic":
+        return _sample_cubic(volume, layer_ijk, fill=fill)
     nx, ny, nz = volume.shape
     out_shape = layer_ijk.shape[:-1]
 
@@ -355,6 +357,46 @@ def sample_volume(
         inside = ((layer_ijk >= 0) & (layer_ijk <= (sizes - 1))).all(dim=-1)
         sampled = torch.where(inside, sampled, torch.full_like(sampled, fill))
     return sampled
+
+
+def _catmull_rom(t: Tensor) -> Tensor:
+    """Weights of the four taps at offsets -1, 0, 1, 2 for a fraction ``t``: ``(..., 4)``."""
+    t2, t3 = t * t, t * t * t
+    return 0.5 * torch.stack(
+        (-t3 + 2 * t2 - t, 3 * t3 - 5 * t2 + 2, -3 * t3 + 4 * t2 + t, t3 - t2), dim=-1
+    )
+
+
+def _sample_cubic(volume: Tensor, layer_ijk: Tensor, *, fill: float = 0.0) -> Tensor:
+    """Tricubic (Catmull-Rom) sampling; ``grid_sample`` has no cubic mode in 3-D.
+
+    Catmull-Rom rather than a cubic B-spline because it interpolates: a sample
+    on a voxel centre returns that voxel, as linear and nearest do, so
+    switching modes changes the edges and not the values. Taps past the border
+    repeat the edge voxel -- zero taps would darken the rim of every volume --
+    and points more than half a voxel outside come back as ``fill``, the same
+    extent nearest draws.
+
+    One x-offset at a time, so the gather never holds more than 16 taps per point.
+    """
+    shape = layer_ijk.shape[:-1]
+    sizes = volume.shape
+    pts = layer_ijk.reshape(-1, 3)
+    base = pts.floor()
+    weights = _catmull_rom(pts - base)  # (P, 3, 4)
+    offsets = torch.arange(-1, 3, device=pts.device)
+    taps = [(base[:, a].long().unsqueeze(1) + offsets).clamp(0, sizes[a] - 1) for a in range(3)]
+    flat = volume.reshape(-1).to(pts.dtype)
+    yz = taps[1].unsqueeze(2) * sizes[2] + taps[2].unsqueeze(1)  # (P, 4, 4)
+    wyz = weights[:, 1].unsqueeze(2) * weights[:, 2].unsqueeze(1)
+    out = torch.zeros(pts.shape[0], dtype=pts.dtype, device=pts.device)
+    for a in range(4):
+        vals = flat[taps[0][:, a, None, None] * (sizes[1] * sizes[2]) + yz]
+        out += weights[:, 0, a] * (vals * wyz).sum(dim=(1, 2))
+    upper = torch.tensor(sizes, dtype=pts.dtype, device=pts.device) - 0.5
+    inside = ((pts >= -0.5) & (pts <= upper)).all(dim=-1)
+    out = torch.where(inside, out, torch.full_like(out, fill))
+    return out.reshape(shape)
 
 
 def extract_plane(

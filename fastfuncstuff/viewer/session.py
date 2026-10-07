@@ -691,7 +691,7 @@ class ViewerSession:
     UPSAMPLE_RATIO = 1.2
 
     def resample_mode(self, layer: Layer) -> str:
-        """``"nearest"`` or ``"linear"`` for one layer. Display only.
+        """``"nearest"``, ``"linear"`` or ``"cubic"`` for one layer. Display only.
 
         This changes how the layer is *drawn* and nothing else. The voxels in
         the store are untouched, every readout, graph, carpet, cluster table
@@ -701,7 +701,7 @@ class ViewerSession:
         ``auto`` decides by direction; see :attr:`Layer.resample` for why that
         is the axis that matters.
         """
-        if layer.resample in ("nearest", "linear"):
+        if layer.resample in ("nearest", "linear", "cubic"):
             return layer.resample
         grid = self.state.grid
         if grid is None:

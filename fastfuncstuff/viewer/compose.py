@@ -134,7 +134,7 @@ def edge_colors(values: Tensor, inside: Tensor, sigma: float) -> tuple[Tensor, T
 #: The viewer's words for resampling, and what ``grid_sample`` calls them.
 #: "linear" rather than "bilinear" in the interface, because the sampling is
 #: three-dimensional and the ``bi`` is an artefact of torch's 2-D naming.
-_GRID_SAMPLE = {"nearest": "nearest", "linear": "bilinear"}
+_GRID_SAMPLE = {"nearest": "nearest", "linear": "bilinear", "cubic": "cubic"}
 
 
 def render_plane(

@@ -142,6 +142,8 @@ class Layer:
     #: voxels. A layer finer than the grid is being downsampled, where nearest
     #: aliases and linear is right. Override when the guess is wrong: a smooth
     #: coarse field -- a warp, a bias estimate -- reads better interpolated.
+    #: ``cubic`` is never chosen automatically; it is the sharper alternative
+    #: to linear for an anatomy upsampled onto a finer display grid.
     resample: str = "auto"
 
     def with_(self, **changes: object) -> Layer:

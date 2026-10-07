@@ -2627,7 +2627,7 @@ def test_e_cycles_how_the_layer_is_drawn(win, qapp):
 
     key = win.current_key()
     assert win.session.state.layers.get(key).resample == "auto"
-    for expected in ("nearest", "linear", "auto"):
+    for expected in ("nearest", "linear", "cubic", "auto"):
         win._cycle_resample()
         qapp.processEvents()
         assert win.session.state.layers.get(key).resample == expected
