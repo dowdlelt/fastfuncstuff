@@ -81,6 +81,11 @@ class Resident:
     #: Where this dataset's array was parked when RAM ran short. Only ever set
     #: for a memory-backed dataset; a file-backed one already has its file.
     spill: Path | None = None
+    #: A dataset painted on demand rather than held: volume ``i`` is
+    #: ``provider(i)``. A surface result is one -- its sub-bricks live on the
+    #: vertices and are painted into the ribbon only when drawn, so a 300-frame
+    #: series costs one painted volume, not a 4-D copy on the grid.
+    provider: Callable[[int], np.ndarray] | None = field(default=None, repr=False)
     _future: Future[np.ndarray] | None = field(default=None, repr=False)
     #: Unique per record. A mode re-adopts new values under the same key on
     #: every click, so a consumer caching by key alone draws the first map
@@ -236,6 +241,35 @@ class VolumeStore:
             self._touch(res)
         return res
 
+    def adopt_lazy(
+        self,
+        key: str,
+        shape: tuple[int, int, int],
+        n_volumes: int,
+        provider: Callable[[int], np.ndarray],
+        *,
+        name: str = "",
+    ) -> Resident:
+        """Register a dataset whose volumes are made on request (``provider(i)``).
+
+        Everything that reads through the store -- previews, slicing, readouts --
+        sees an ordinary dataset; a full 4-D array is only ever built if something
+        asks for all of it (:meth:`ensure_ram`).
+        """
+        nx, ny, nz = (int(v) for v in shape)
+        info = DatasetInfo(
+            path=Path(name or key),
+            iname=name or key,
+            exists=True,
+            storage="MEMORY",
+            shape=(nx, ny, nz, max(int(n_volumes), 1)),
+        )
+        res = Resident(key=key, path=Path(name or key), info=info, provider=provider)
+        with self._lock:
+            self._items[key] = res
+            self._touch(res)
+        return res
+
     # -- spill ---------------------------------------------------------
     def spill_dir(self) -> Path:
         """The directory parked arrays go to, made on demand."""
@@ -297,6 +331,12 @@ class VolumeStore:
         res = self.get(key)
         if index == 0 and res.preview is not None:
             return res.preview
+        if res.provider is not None:
+            vol = np.ascontiguousarray(res.provider(int(index)), dtype=np.float32)
+            if index == 0:
+                with self._lock:
+                    res.preview = vol
+            return vol
         if res.spill is not None:
             # Memory-mapped, so stepping through a spilled run touches one
             # volume's worth of pages rather than reading the whole array back
@@ -337,6 +377,15 @@ class VolumeStore:
     def _inflate(self, key: str) -> np.ndarray:
         res = self.get(key)
         try:
+            if res.provider is not None:
+                n = res.info.n_volumes
+                arr = np.stack([res.provider(i) for i in range(n)], axis=3).astype(np.float32)
+                with self._lock:
+                    res.array = arr
+                    res._future = None
+                    self._touch(res)
+                self._enforce_ram_budget(protect=key)
+                return arr
             if res.spill is not None:
                 arr = np.ascontiguousarray(np.load(res.spill, allow_pickle=False), dtype=np.float32)
                 with self._lock:
@@ -426,7 +475,9 @@ class VolumeStore:
             res = self._items.get(key)
             if res is None or res.array is None:
                 return
-            array = res.array if (res.memory_backed and res.spill is None) else None
+            # A painted-on-demand dataset is free to drop, like a file: it repaints.
+            keep = res.memory_backed and res.spill is None and res.provider is None
+            array = res.array if keep else None
         if array is not None:
             try:
                 spill = self._write_spill(key, array)

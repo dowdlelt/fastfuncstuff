@@ -378,12 +378,13 @@ def test_paint_mode_paints_the_vertex_under_the_cursor_instead_of_turning(window
     assert session.surfaces.highlight["lh"].sum() > 0
 
 
-def test_a_surface_stat_result_paints_as_the_data_map(window, tmp_path):
-    # A reml bucket on this mesh: loaded by command, thresholded at p, shown with a
-    # symmetric legend whose tooltip says what survived.
+def test_a_surface_layer_draws_on_its_vertices_with_the_layer_controls(window, tmp_path):
+    # A reml bucket on this mesh, loaded like any dataset: the surface window draws
+    # it on the vertices, over the anatomical map, and the layer's own threshold
+    # command decides which vertices show -- no surface-only controls.
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.io.gifti import mesh_fingerprint, set_surface_meta
-    from fastfuncstuff.viewer.vocab import LoadSurfaceData, SetSurfaceData, SetSurfaceMap
+    from fastfuncstuff.viewer.vocab import SetThreshold, SetThresholdIndex
 
     session, win = window
     h = session.surfaces.hemis["lh"]
@@ -392,16 +393,16 @@ def test_a_surface_stat_result_paints_as_the_data_map(window, tmp_path):
     xy = h.states["white"][:, :2]
     t = (8.0 * np.exp(-(xy**2).sum(1) / 40.0)).astype(np.float32)
     vals = np.stack([t, t], 1)[:, None, None, :]
-    path = tmp_path / "s.func.gii"
-    save_nifti(vals, path, header=hdr, brick_labels=["c#0_Coef", "c#0_Tstat"],
-               brick_stataux={1: (3, (60.0,))})  # fmt: skip
-    session.do(LoadSurfaceData(str(path), "lh"))
-    session.do(SetSurfaceData(p=0.001, alpha=0.0))
-    session.do(SetSurfaceMap("S1", "data"))
-    win.apply(session.state.viewports.get("S1"))
-    assert not win.legend.isHidden()
-    lo, hi, name = win.legend._scale
-    assert lo == pytest.approx(-hi) and lo > 0 and name == "RdBu"
-    assert "c#0_Tstat: p < 0.001" in win.legend.toolTip()
-    script = session.to_script()
-    assert "LOAD_SURFACE_DATA" in script and "SET_SURFACE_DATA" in script
+    save_nifti(vals, tmp_path / "s.lh.func.gii", header=hdr,
+               brick_labels=["c#0_Coef", "c#0_Tstat"], brick_stataux={1: (3, (60.0,))})  # fmt: skip
+    key = session.load(str(tmp_path / "s.lh.func.gii"))
+    session.do(SetThresholdIndex(key, 1))
+    session.do(SetThreshold(key, 3.5))
+    win.refresh(Aspect.ALL)
+    shown = win.canvas._cpu["lh"]["vcolor"][:, 3] > 0
+    np.testing.assert_array_equal(shown, t > 3.5)
+    session.do(SetThreshold(key, 6.0))
+    win.refresh(Aspect.ALL)
+    np.testing.assert_array_equal(win.canvas._cpu["lh"]["vcolor"][:, 3] > 0, t > 6.0)
+    # drawn per vertex, so never also sampled from the ribbon it is painted into
+    assert key not in [ly.key for ly in win._overlay_layers()]

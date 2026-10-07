@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
 import nibabel as nib
 import numpy as np
 import pytest
 from scipy import stats
 
-from fastfuncstuff.io.gifti import mesh_fingerprint, save_gifti_surface
+from fastfuncstuff.io.gifti import mesh_fingerprint
 from fastfuncstuff.surface.mesh import vertex_areas
 from fastfuncstuff.surface.statmap import (
     SurfaceData,
@@ -67,81 +65,18 @@ def test_only_clusters_as_large_as_the_table_survive_and_signs_stay_apart():
     assert set(merged[neg]) == set(merged[big])  # 2-sided lets them join
 
 
-def _store_with_sheet(tmp_path):
-    from fastfuncstuff.viewer.surfaces import SurfaceStore
-
-    v, f = _sheet(40)
-    save_gifti_surface(tmp_path / "lh.white.surf.gii", v, f)
-    save_gifti_surface(tmp_path / "lh.pial.surf.gii", v + [0, 0, 2.5], f)
-    store = SurfaceStore()
-    store.load_mesh(tmp_path / "lh.white.surf.gii", "lh", "white")
-    store.load_mesh(tmp_path / "lh.pial.surf.gii", "lh", "pial")
-    return store, v, f
-
-
-def _bucket(path, v, f, table=None):
-    blob = np.exp(-((v[:, 0] - 20) ** 2 + (v[:, 1] - 20) ** 2) / 30) * 8
-    arrays = [
-        nib.gifti.GiftiDataArray(blob.astype(np.float32), intent="NIFTI_INTENT_NONE",
-                                 meta=nib.gifti.GiftiMetaData({"Name": "task#0_Coef"})),
-        nib.gifti.GiftiDataArray(blob.astype(np.float32), intent="NIFTI_INTENT_TTEST",
-                                 meta=nib.gifti.GiftiMetaData({"Name": "task#0_Tstat",
-                                                               "StatCode": "3", "StatParams": "60"})),
-    ]  # fmt: skip
-    meta = {"mesh_fingerprint": mesh_fingerprint(f, len(v))}
-    if table:
-        meta["ClustSim_bi-sided"] = json.dumps(table)
-    nib.save(nib.gifti.GiftiImage(darrays=arrays, meta=nib.gifti.GiftiMetaData(meta)), str(path))
-
-
-def test_store_binds_data_to_its_mesh_and_thresholds_it(tmp_path):
-    store, v, f = _store_with_sheet(tmp_path)
-    table = {"pthr": [0.01, 0.001], "athr": [0.1, 0.05], "area_mm2": [[1e4, 2e4], [500.0, 900.0]]}
-    _bucket(tmp_path / "s.func.gii", v, f, table)
-    data = store.load_data(tmp_path / "s.func.gii", "lh")
-    assert data.default_sub_brick() == 1  # opens on the t, not the coefficient
-    store.set_data_view(p=0.001, alpha=0.0)
-    colours, scale, caption = store.data_display("lh")
-    shown = colours[:, 3] > 0
-    assert shown.any() and "task#0_Tstat" in caption
-    thr = stats.t.isf(0.0005, 60)
-    np.testing.assert_array_equal(shown, data.values[:, 1] > thr)
-    store.set_data_view(alpha=0.05)  # the blob is far smaller than 900 mm^2
-    colours, _, caption = store.data_display("lh")
-    assert not (colours[:, 3] > 0).any() and "900" in caption
-
-
-def test_store_refuses_data_from_another_mesh(tmp_path):
-    store, v, f = _store_with_sheet(tmp_path)
-    v2, f2 = _sheet(41)
-    _bucket(tmp_path / "other.func.gii", v2, f2)
-    with pytest.raises(ValueError, match="another mesh"):
-        store.load_data(tmp_path / "other.func.gii", "lh")
-    # same vertex count, different faces: the fingerprint catches it
-    f3 = f[:, [0, 2, 1]]
-    _bucket(tmp_path / "flipped.func.gii", v, f3)
-    with pytest.raises(ValueError, match="fingerprint"):
-        store.load_data(tmp_path / "flipped.func.gii", "lh")
-
-
-def test_a_reml_bucket_round_trips_into_the_store(tmp_path):
-    # What ffs_reml writes (StatCode/StatParams per array) is what the store reads.
+def test_a_reml_bucket_round_trips(tmp_path):
+    # What ffs_reml writes (StatCode/StatParams per array) is what the viewer reads.
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.io.gifti import set_surface_meta
 
-    store, v, f = _store_with_sheet(tmp_path)
+    v, f = _sheet(40)
     hdr = nib.Nifti2Header()
     set_surface_meta(hdr, {"mesh_fingerprint": mesh_fingerprint(f, len(v))})
     vals = np.random.default_rng(0).normal(size=(len(v), 1, 1, 2)).astype(np.float32)
     save_nifti(vals, tmp_path / "r.func.gii", header=hdr, brick_labels=["c#0_Coef", "c#0_Tstat"],
                brick_stataux={1: (3, (55.0,))})  # fmt: skip
-    data = store.load_data(tmp_path / "r.func.gii", "lh")
+    data = load_surface_data(tmp_path / "r.func.gii")
     assert data.stat == {1: (3, (55.0,))} and data.labels == ["c#0_Coef", "c#0_Tstat"]
-    assert load_surface_data(tmp_path / "r.func.gii").fingerprint == data.fingerprint
-
-
-def test_store_finds_the_hemisphere_by_fingerprint(tmp_path):
-    store, v, f = _store_with_sheet(tmp_path)
-    _bucket(tmp_path / "noname.func.gii", v, f)
-    store.load_data(tmp_path / "noname.func.gii")
-    assert "lh" in store.data
+    assert data.fingerprint == mesh_fingerprint(f, len(v))
+    assert data.default_sub_brick() == 1

@@ -58,6 +58,10 @@ class Cluster:
     #: Corrected alpha from an attached ClustSim table, or ``None`` when the
     #: dataset carries none.
     alpha: float | None = None
+    #: Cortical area (mm^2, on the midthickness) of a cluster found on a surface;
+    #: ``None`` for a volume cluster. A surface cluster's size is its area --
+    #: ``n_voxels`` is how many voxels of the grid its ribbon paints.
+    area_mm2: float | None = None
 
     @property
     def com_voxel(self) -> tuple[int, int, int]:

@@ -44,6 +44,11 @@ class SurfaceData:
     stat: dict[int, tuple[int, tuple[float, ...]]] = field(default_factory=dict)
     tables: dict[str, dict] = field(default_factory=dict)  # sided -> ClustSim JSON
     fingerprint: str = ""
+    #: Every array a time point (NIFTI_INTENT_TIME_SERIES): a series to scrub, not a
+    #: bucket of contrasts. Decided by the arrays' intents, not by a TR in the
+    #: metadata -- a stats bucket inherits its input's TR.
+    is_series: bool = False
+    tr: float | None = None
 
     @property
     def n_vertices(self) -> int:
@@ -64,6 +69,7 @@ def load_surface_data(path: str | os.PathLike) -> SurfaceData:
     img = nib.load(os.fspath(path))
     assert isinstance(img, nib.gifti.GiftiImage)
     cols, labels, stat = [], [], {}
+    series = bool(img.darrays) and all(a.intent == 2001 for a in img.darrays)
     for k, arr in enumerate(img.darrays):
         if arr.intent in (1008, 1009):  # POINTSET / TRIANGLE: geometry, not data
             raise ValueError(f"{path} is a surface geometry file, not per-vertex data")
@@ -79,6 +85,7 @@ def load_surface_data(path: str | os.PathLike) -> SurfaceData:
         for key, val in file_meta.items()
         if key.startswith("ClustSim_")
     }
+    tr = file_meta.get("TR_seconds")
     return SurfaceData(
         os.fspath(path),
         np.stack(cols, axis=1),
@@ -86,6 +93,8 @@ def load_surface_data(path: str | os.PathLike) -> SurfaceData:
         stat,
         tables,
         file_meta.get("mesh_fingerprint", ""),
+        is_series=series and len(cols) > 1,
+        tr=float(tr) if tr else None,
     )
 
 

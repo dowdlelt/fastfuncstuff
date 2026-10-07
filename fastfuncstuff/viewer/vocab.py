@@ -770,35 +770,6 @@ class LoadMesh(Command):
 
 @command
 @dataclass(frozen=True)
-class LoadSurfaceData(Command):
-    """Attach a per-vertex result (.func.gii / .shape.gii) to a hemisphere's mesh.
-
-    Bound by vertex index, never resampled: it must be the mesh it was made on
-    (vertex count and fingerprint). Shown as the surface windows' "data" map.
-    """
-
-    name = "LOAD_SURFACE_DATA"
-    aspects = Aspect.VIEWPORTS
-    path: str
-    hemi: str = ""  # empty: the loaded hemisphere whose mesh the data's fingerprint names
-
-
-@command
-@dataclass(frozen=True)
-class SetSurfaceData(Command):
-    """How surface results are thresholded: sub-brick (-1 = first t, -2 = keep),
-    voxel-wise p (<= 0 keeps), family-wise alpha for the SurfClustSim area cut
-    (0 = threshold only; < 0 keeps)."""
-
-    name = "SET_SURFACE_DATA"
-    aspects = Aspect.VIEWPORTS
-    sub_brick: int = -2
-    p: float = -1.0
-    alpha: float = -1.0
-
-
-@command
-@dataclass(frozen=True)
 class UseMesh(Command):
     """Put a listed mesh in use for its hemi and kind: edits and depth sampling act on it."""
 
@@ -1859,18 +1830,6 @@ def install(
         assert isinstance(cmd, LoadMesh)
         _surfaces_of(LoadMesh.name).load_mesh(cmd.path, cmd.hemi, cmd.kind)
         return LoadMesh.aspects
-
-    @bus.handle(LoadSurfaceData.name)
-    def _load_surface_data(cmd: Command, st: ViewerState) -> Aspect:
-        assert isinstance(cmd, LoadSurfaceData)
-        _surfaces_of(LoadSurfaceData.name).load_data(cmd.path, cmd.hemi)
-        return LoadSurfaceData.aspects
-
-    @bus.handle(SetSurfaceData.name)
-    def _set_surface_data(cmd: Command, st: ViewerState) -> Aspect:
-        assert isinstance(cmd, SetSurfaceData)
-        _surfaces_of(SetSurfaceData.name).set_data_view(cmd.sub_brick, cmd.p, cmd.alpha)
-        return SetSurfaceData.aspects
 
     @bus.handle(UseMesh.name)
     def _use_mesh(cmd: Command, st: ViewerState) -> Aspect:

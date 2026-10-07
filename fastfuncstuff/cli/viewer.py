@@ -148,27 +148,24 @@ def build_parser() -> FfsArgumentParser:
         metavar="FILE",
         action="append",
         default=[],
-        help="A per-vertex result (.func.gii from ffs_reml on a surface) to show as a "
-        "surface window's 'data' map, thresholded by p and, when it carries SurfClustSim "
-        "tables, by cluster area. Bound to its mesh by vertex index: load the meshes it "
-        "was made on first (-surfaces, or -mesh PREFIX.SPACE.lh.white.surf.gii and pial). "
-        "The hemisphere is read from the name (.lh. / .rh.), else matched by the data's "
-        "mesh fingerprint; repeat for more.",
+        help="A per-vertex result (.func.gii from ffs_reml on a surface) loaded as a "
+        "layer once the meshes are in: painted into the cortical ribbon on the slices, "
+        "drawn on its own vertices in a surface window, and set by the same controls as "
+        "any layer (threshold, p, sub-bricks, clusters). It must be on a loaded mesh "
+        "(-surfaces, or -mesh PREFIX.SPACE.lh.white.surf.gii and pial), matched by "
+        "fingerprint; the other hemisphere's file beside it (.lh. / .rh.) joins the "
+        "same layer. Repeat for more.",
     )
     add_device_arg(p, default="auto")
     return p
 
 
 def _surf_data_commands(paths: list[str]):
-    from fastfuncstuff.io.freesurfer import infer_label
-    from fastfuncstuff.viewer.vocab import LoadSurfaceData
+    """Plain LOADs, issued after the meshes: a surface result is a layer like any
+    other, it just needs the meshes it was made on to be there first."""
+    from fastfuncstuff.viewer.vocab import AddLayer
 
-    out = []
-    for path in paths:
-        hemi, _ = infer_label(path)
-        # No lh/rh in the name: the store matches the data's mesh fingerprint.
-        out.append(LoadSurfaceData(path, hemi or ""))
-    return out
+    return [AddLayer(path) for path in paths]
 
 
 def _mesh_commands(paths: list[str]):

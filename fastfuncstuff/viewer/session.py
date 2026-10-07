@@ -246,6 +246,9 @@ class ViewerSession:
         self._roi_sets: dict[str, RoiSet] = {}
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._clustsim: dict[str, dict] = {}
+        #: Surface layers' vertex values and ribbon maps, by layer key (see
+        #: viewer.surfacelayers). The layer itself is an ordinary Layer.
+        self.surface_layers: dict = {}
         #: Display-only masks, ``{owner: {layer key: keep}}`` on each layer's own
         #: grid. Keyed by owner so two windows masking one layer compose (AND)
         #: and closing one takes away only its own.
@@ -282,6 +285,10 @@ class ViewerSession:
         2.5 ms while a full dataset takes seconds, so the layer becomes visible
         immediately and becomes scrubbable when the worker finishes.
         """
+        from fastfuncstuff.viewer.surfacelayers import is_surface_path
+
+        if is_surface_path(path):
+            return self._open_surface(path, key)
         res = self.store.open(path, key=key)
         layer = layer_from_info(res.info, key, res.path)
         preview = self.store.preview(key)
@@ -297,6 +304,101 @@ class ViewerSession:
         if layer.n_volumes > 1:
             self.store.load_async(key, on_done=self._on_loaded)
         return layer
+
+    def _open_surface(self, path: str, key: str) -> Layer:
+        """A per-vertex result as a layer: painted into the ribbon on the display grid.
+
+        Needs the meshes it was made on (matched by fingerprint); the other
+        hemisphere's file joins the same layer when it sits beside it. The grid is
+        the display grid when there is one, else a 1 mm box around the meshes.
+        """
+        from fastfuncstuff.viewer.surfacelayers import SurfaceLayerData, open_surface_parts
+
+        parts = open_surface_parts(path, self.surfaces.match_hemi)
+        if self.state.grid is not None:
+            shape, affine = self.state.grid.shape, np.asarray(self.state.grid.affine)
+        else:
+            shape, affine = self.surfaces.mesh_grid(list(parts))
+        maps = {h: self.surfaces.ribbon_map(h, shape, affine) for h in parts}
+        sld = SurfaceLayerData(parts, maps)
+        self.surface_layers[key] = sld
+        first = next(iter(parts.values()))
+        name = Path(path).name + (" +" + "+".join(list(parts)[1:]) if len(parts) > 1 else "")
+        self.store.adopt_lazy(key, shape, sld.n_volumes, sld.paint, name=name)
+        stats = dict(first.stat)
+        values0 = np.concatenate([d.values[:, 0] for d in parts.values()])
+        lo, hi = derive_range(values0[values0 != 0] if np.any(values0 != 0) else values0)
+        return Layer(
+            key=key,
+            name=name,
+            path=str(path),
+            shape=tuple(int(s) for s in shape),
+            n_volumes=sld.n_volumes,
+            affine=np.asarray(affine, float),
+            labels=() if first.is_series else tuple(first.labels),
+            stataux=stats,
+            time_linked=first.is_series,
+            source="surface:" + ",".join(parts),
+            range_lo=lo,
+            range_hi=hi,
+        )
+
+    def surface_display_token(self, hemi: str) -> tuple:
+        """What :meth:`surface_vertex_rgba` depends on, hashable: a 3-D window
+        recolours only when it changes."""
+        layer = self._surface_choice(hemi)
+        if layer is None:
+            return ()
+        sld = self.surface_layers[layer.key]
+        masked = any(layer.key in m for m in self._display_masks.values())
+        cut = sld.clusters.get(hemi)
+        return (
+            layer.key, layer.volume_index, layer.threshold_index, layer.threshold,
+            layer.colormap, layer.colormap_reversed, layer.range_lo, layer.range_hi,
+            str(layer.sign_mode), str(layer.alpha_mode), layer.opacity, layer.n_panes,
+            self.state.time_index if layer.time_linked else -1,
+            masked, None if cut is None else int(cut[1].sum()),
+        )  # fmt: skip
+
+    def _surface_choice(self, hemi: str) -> Layer | None:
+        """The surface layer the 3-D window shows on ``hemi``: the selected one when it
+        is a surface layer there, else the top-most visible one."""
+        selected = self.state.selected_layer()
+        on_selected = self.surface_layers.get(selected.key) if selected is not None else None
+        if selected is not None and on_selected is not None and hemi in on_selected.parts:
+            return selected
+        for layer in reversed(list(self.state.layers)):
+            sld = self.surface_layers.get(layer.key)
+            if layer.visible and sld is not None and hemi in sld.parts:
+                return layer
+        return None
+
+    def surface_vertex_rgba(self, hemi: str):
+        """``(rgba (V, 4), layer)`` for ``hemi`` in the 3-D window, or None.
+
+        The selected layer when it is a surface layer on this hemisphere, else the
+        top-most visible one: the controls drive whichever surface result is in
+        front of you. Coloured by the layer's own display parameters (see
+        viewer.surfacelayers.vertex_rgba); a cluster table's cut applies when a
+        cluster window is masking this layer.
+        """
+        from fastfuncstuff.viewer.surfacelayers import vertex_rgba
+
+        chosen = self._surface_choice(hemi)
+        if chosen is None:
+            return None
+        sld = self.surface_layers[chosen.key]
+        data = sld.parts[hemi]
+        idx = self.state.time_index if chosen.time_linked else chosen.volume_index
+        idx = max(0, min(int(idx), data.values.shape[1] - 1))
+        values = data.values[:, idx]
+        stat = (
+            data.values[:, chosen.threshold_brick] if chosen.threshold_index is not None else values
+        )
+        keep = None
+        if any(chosen.key in m for m in self._display_masks.values()) and hemi in sld.clusters:
+            keep = ~sld.clusters[hemi][1]
+        return vertex_rgba(chosen, values, stat, keep), chosen
 
     def _on_loaded(self, key: str) -> None:
         self._notify_loaded(key)
@@ -1354,6 +1456,7 @@ class ViewerSession:
             del self._threshold_scales[stale]
         for stale in [k for k in self._source_masks if k[0] == key]:
             del self._source_masks[stale]
+        self.surface_layers.pop(key, None)
         self.store.close(key)
 
     def run_script(self, text: str) -> Aspect:
@@ -1597,6 +1700,30 @@ class ViewerSession:
             raise ValueError("no layer to clusterize")
         if layer.threshold <= 0:
             raise ValueError(f"{layer.name} has no threshold set; nothing to cluster")
+        sld = self.surface_layers.get(layer.key)
+        if sld is not None:
+            # On the mesh, not the painted voxels: areas, mesh adjacency and the
+            # bucket's own SurfClustSim table; painted back for every consumer.
+            from fastfuncstuff.stats.fdr import stat_value_to_pvalue
+            from fastfuncstuff.viewer.surfacelayers import surface_clusterize
+
+            spec = layer.stat_spec()
+            pthr = (
+                None
+                if spec is None
+                else stat_value_to_pvalue(float(layer.threshold), spec[0], spec[1])
+            )
+            geometry = {
+                h: (
+                    self.surfaces.hemis[h].states["white"],
+                    self.surfaces.hemis[h].states.get(
+                        "pial", self.surfaces.hemis[h].states["white"]
+                    ),
+                    self.surfaces.hemis[h].faces,
+                )
+                for h in sld.parts
+            }
+            return layer, surface_clusterize(layer, sld, geometry, min_voxels=min_voxels, pthr=pthr)
         values = self.volume(layer.key, layer.volume_index)
         stat = self.volume(layer.key, layer.threshold_brick)
 
