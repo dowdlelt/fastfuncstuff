@@ -734,6 +734,29 @@ class HighlightToRoi(Command):
 
 @command
 @dataclass(frozen=True)
+class SaveSurfaceRoi(Command):
+    """Write the highlight as an ROI: ``PATH.?h.label`` per hemisphere, and with
+    ``volume`` the cortex it spans, white to pial, as ``PATH.nii.gz`` on the base grid."""
+
+    name = "SAVE_SURFACE_ROI"
+    aspects = Aspect.NOTHING
+    path: str
+    volume: bool = True
+
+
+@command
+@dataclass(frozen=True)
+class LoadSurfaceRoi(Command):
+    """Highlight the vertices of a FreeSurfer ``.label`` (``mode`` add / set / remove)."""
+
+    name = "LOAD_SURFACE_ROI"
+    aspects = Aspect.SLICES | Aspect.VIEWPORTS
+    path: str
+    mode: str = "add"
+
+
+@command
+@dataclass(frozen=True)
 class UndoSurfaceEdit(Command):
     """Put the last committed surface edit back."""
 
@@ -1805,6 +1828,24 @@ def install(
         name = f"surface ROI ·{int(mask.sum()):,} vox"
         _key, dirty = session.install_selection("surface-highlight", mask, like=base, name=name)
         return dirty
+
+    @bus.handle(SaveSurfaceRoi.name)
+    def _save_surface_roi(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SaveSurfaceRoi)
+        if session is None:
+            raise RuntimeError("SAVE_SURFACE_ROI needs a session")
+        base = st.layers.base
+        grid = (base.affine, base.shape) if cmd.volume and base is not None else None
+        session.surfaces.save_roi(cmd.path, grid)
+        return SaveSurfaceRoi.aspects
+
+    @bus.handle(LoadSurfaceRoi.name)
+    def _load_surface_roi(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, LoadSurfaceRoi)
+        if session is None:
+            raise RuntimeError("LOAD_SURFACE_ROI needs a session")
+        session.surfaces.load_roi(cmd.path, cmd.mode)
+        return LoadSurfaceRoi.aspects
 
     @bus.handle(UndoSurfaceEdit.name)
     def _undo_surface_edit(cmd: Command, st: ViewerState) -> Aspect:

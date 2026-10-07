@@ -485,6 +485,65 @@ class SurfaceStore:
         self.highlight[hemi] = mask
         self.highlight_version += 1
 
+    def save_roi(self, stem: str | Path, grid=None) -> list[Path]:
+        """Write the highlight as an ROI: ``STEM.?h.label`` per hemisphere, plus
+        ``STEM.nii.gz`` -- the cortex it spans, white to pial -- when a ``(affine,
+        shape)`` grid is given.
+
+        FreeSurfer labels -- zero-based vertex ids, coordinates on white in
+        tkregister space, as ``mri_label2label`` writes them -- so FreeSurfer,
+        SUMA and nibabel all read them.
+        """
+        from fastfuncstuff.io.freesurfer import write_label
+
+        stem = str(stem)
+        for ext in (".nii.gz", ".nii", ".label"):
+            stem = stem.removesuffix(ext)
+        stem = stem.removesuffix(".lh").removesuffix(".rh")
+        written: list[Path] = []
+        for hemi, mask in sorted(self.highlight.items()):
+            h = self.hemis.get(hemi)
+            if h is None or not mask.any():
+                continue
+            ids = np.flatnonzero(mask)
+            to_tkr = np.linalg.inv(np.asarray(h.tkr_to_scanner, np.float64))
+            white = np.asarray(h.states["white"], np.float64)[ids]
+            coords = white @ to_tkr[:3, :3].T + to_tkr[:3, 3]
+            path = Path(f"{stem}.{hemi}.label")
+            subject = self.subject.name if self.subject is not None else ""
+            write_label(path, ids, coords, np.ones(ids.size), subject)
+            written.append(path)
+        if not written:
+            raise ValueError("nothing is highlighted")
+        if grid is not None:
+            from fastfuncstuff.io.afni import save_nifti
+
+            affine, shape = grid
+            vol = self.highlight_mask(affine, shape)
+            path = Path(f"{stem}.nii.gz")
+            save_nifti(vol.astype(np.int16), path, affine=np.asarray(affine, np.float64))
+            written.append(path)
+        return written
+
+    def load_roi(self, path: str | Path, mode: str = "add") -> str:
+        """Highlight the vertices of a FreeSurfer ``.label``; returns its hemisphere.
+
+        The hemisphere comes from the name (``lh.``, ``.lh.``); the label must fit
+        that hemisphere's mesh.
+        """
+        import nibabel.freesurfer as nfs
+
+        from fastfuncstuff.io.freesurfer import infer_label
+
+        hemi = infer_label(str(path))[0]
+        if hemi is None or hemi not in self.hemis:
+            raise ValueError(
+                f"{Path(path).name}: no loaded hemisphere for it (lh / rh in the name)"
+            )
+        ids = np.asarray(nfs.read_label(str(path)), np.int64)
+        self.set_highlight(hemi, ids, mode)
+        return hemi
+
     def highlighted(self, hemi: str) -> np.ndarray:
         """Highlighted vertex ids of ``hemi`` (empty when none)."""
         mask = self.highlight.get(hemi)
@@ -552,10 +611,32 @@ class SurfaceStore:
     def highlight_mask(self, affine: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
         """Voxels of a grid that the highlighted cortex fills, white to pial.
 
-        Points are laid over every face whose corners are all highlighted (a
-        few per face, so no voxel between vertices is missed) and up the
-        column from white to pial, half a voxel apart in depth.
+        On a closed mesh (any FreeSurfer surface) these are the ribbon voxels the
+        highlighted vertices *own* (surface.ribbon) -- the projection's own
+        vertex-to-voxel rule, so an ROI drawn on the surface covers exactly the
+        voxels a surface result would be read from, at every depth. An open mesh
+        (a test sheet, a cut patch) has no inside, so it falls back to sampling
+        points over the highlighted faces up the column.
         """
+        from fastfuncstuff.surface.outline import is_closed
+
+        out = np.zeros(shape, bool)
+        open_hemis = {}
+        for hemi, mask in self.highlight.items():
+            h = self.hemis.get(hemi)
+            if h is None or not mask.any():
+                continue
+            if "pial" in h.states and is_closed(h.faces):
+                rm = self.ribbon_map(hemi, shape, affine)
+                out.reshape(-1)[rm.voxels_of(mask)] = True
+            else:
+                open_hemis[hemi] = mask
+        if open_hemis:
+            out |= self._sampled_highlight_mask(affine, shape, open_hemis)
+        return out
+
+    def _sampled_highlight_mask(self, affine, shape, highlight) -> np.ndarray:
+        """Points over every fully highlighted face, up the column, half a voxel apart."""
         out = np.zeros(shape, bool)
         inv = np.linalg.inv(np.asarray(affine, np.float64))
         vox = float(abs(np.linalg.det(np.asarray(affine)[:3, :3])) ** (1 / 3))
@@ -568,7 +649,7 @@ class SurfaceStore:
             )
             / steps
         )
-        for hemi, mask in self.highlight.items():
+        for hemi, mask in highlight.items():
             h = self.hemis.get(hemi)
             if h is None or not mask.any():
                 continue

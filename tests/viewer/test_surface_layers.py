@@ -160,3 +160,60 @@ def test_the_cluster_window_sizes_surface_clusters_in_mm2(world):
     assert "mm² of cortex" in table.summary()
     win.close()
     app.processEvents()
+
+
+def test_an_roi_saves_as_labels_and_the_cortex_it_spans_and_loads_back(world, tmp_path):
+    from fastfuncstuff.viewer.vocab import (
+        HighlightSurface,
+        HighlightToRoi,
+        LoadSurfaceRoi,
+        SaveSurfaceRoi,
+        encode_ids,
+    )
+
+    s, tmp, d, f, t = world
+    north = np.flatnonzero(d[:, 2] > 0.8)
+    s.do(HighlightSurface("lh", encode_ids(north), "set"))
+    s.do(SaveSurfaceRoi(str(tmp_path / "roi")))
+    lab = nib.freesurfer.read_label(str(tmp_path / "roi.lh.label"))
+    np.testing.assert_array_equal(np.sort(lab), north)
+    vol = np.asarray(nib.load(str(tmp_path / "roi.nii.gz")).dataobj) > 0
+    # The volume is the ribbon voxels those vertices own, white to pial.
+    base = s.state.layers.base
+    rm = s.surfaces.ribbon_map("lh", base.shape, base.affine)
+    expect = np.zeros(base.shape, bool)
+    expect.reshape(-1)[rm.voxels_of(np.isin(np.arange(len(d)), north))] = True
+    np.testing.assert_array_equal(vol, expect)
+    depths = rm.depth[np.isin(rm.vertex, north)]
+    assert depths.min() < 0.15 and depths.max() > 0.85  # it spans the depth
+    # the same voxels as the ROI layer made from the highlight
+    s.do(HighlightToRoi())
+    top = s.state.layers[-1]
+    np.testing.assert_array_equal(np.asarray(s.volume(top.key, 0)) > 0, expect)
+    # and back
+    s.do(HighlightSurface(mode="clear"))
+    s.do(LoadSurfaceRoi(str(tmp_path / "roi.lh.label")))
+    np.testing.assert_array_equal(s.surfaces.highlighted("lh"), north)
+
+
+def test_a_shape_drawn_in_the_window_fills_as_one_recorded_highlight(world):
+    pytest.importorskip("PySide6.QtWidgets")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s, tmp, d, f, t = world
+    s.do(OpenView("S1", "surface", "axial"))
+    win = SurfaceWindow("S1", s, s.do)
+    ang = np.linspace(0, 2 * np.pi, 20, endpoint=False)
+    ring = [int(np.argmax(d @ np.r_[0.6 * np.cos(a), 0.6 * np.sin(a), 0.8])) for a in ang]
+    win._fill_outline("lh", ring, False)
+    shown = s.surfaces.highlight["lh"]
+    assert shown[d[:, 2] > 0.85].all() and not shown[d[:, 2] < 0.7].any()
+    assert "HIGHLIGHT_SURFACE lh" in s.to_script()
+    win._fill_outline("lh", ring, True)  # ctrl+shift: the same shape erases
+    assert not s.surfaces.highlight["lh"].any()
+    win.close()
+    app.processEvents()

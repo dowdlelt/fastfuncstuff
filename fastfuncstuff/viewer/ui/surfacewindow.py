@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import resources
+from pathlib import Path
 
 import numpy as np
 import shiboken6
@@ -133,6 +134,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     spread = QtCore.Signal(float)
     #: Paint mode: a drag over (hemi, vertex); the bool is "erase" (ctrl held).
     painted = QtCore.Signal(str, int, bool)
+    #: A vertex picked while tracing an outline (shown as it is drawn).
+    traced = QtCore.Signal(str, int)
+    #: A finished outline: hemisphere, picked vertex ids in order, erase.
+    outlined = QtCore.Signal(str, object, bool)
 
     #: Radians turned by a drag the height of the window. pi read as sluggish:
     #: a half turn to see the other side took two strokes.
@@ -168,6 +173,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         #: the layout. View state like the camera, so not recorded.
         self.hemi_rotation: dict[str, np.ndarray] = {}
         self._grabbed: str | None = None
+        #: An outline being traced in paint mode: (hemi, picks, erase).
+        self._outline: tuple[str | None, list[int], bool] | None = None
         #: CPU copies for picking: drawn positions A/B, white, pial, faces.
         self._cpu: dict[str, dict[str, np.ndarray]] = {}
         #: Per drawn slot: the key its textures hold, and those textures.
@@ -625,7 +632,20 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._press = self._last = event.position()
         self._moved = False
         self._grabbed = None
+        self._outline = None
         if self.paint_mode and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
+                # Shift: trace a shape whose inside fills on release.
+                erase = bool(
+                    event.modifiers()
+                    & (
+                        QtCore.Qt.KeyboardModifier.ControlModifier
+                        | QtCore.Qt.KeyboardModifier.MetaModifier
+                    )
+                )
+                self._outline = (None, [], erase)
+                self._trace(event)
+                return
             self._paint(event)
             return
         if event.modifiers() & QtCore.Qt.KeyboardModifier.AltModifier:
@@ -639,7 +659,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._last = event.position()
         if self.paint_mode and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
             self._moved = True
-            self._paint(event)
+            if self._outline is not None:
+                self._trace(event)
+            else:
+                self._paint(event)
             return
         if self._press is not None and (event.position() - self._press).manhattanLength() > 3:
             self._moved = True
@@ -684,6 +707,14 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.update()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        outline = self._outline
+        if outline is not None:
+            self._outline = None
+            hemi, picks, erase = outline
+            if hemi is not None and len(picks) > 2:
+                self.outlined.emit(hemi, list(picks), erase)
+            self._press = self._last = None
+            return
         if (
             event.button() == QtCore.Qt.MouseButton.LeftButton
             and not self._moved
@@ -719,6 +750,19 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 )
             )
             self.painted.emit(hit[0], hit[1], erase)
+
+    def _trace(self, event: QtGui.QMouseEvent) -> None:
+        """One more pick along an outline being drawn, on the hemisphere it began on."""
+        hit = self.pick_vertex(event.position())
+        if hit is None or self._outline is None:
+            return
+        hemi, picks, erase = self._outline
+        if hemi is not None and hit[0] != hemi:
+            return
+        if not picks or picks[-1] != hit[1]:
+            picks.append(hit[1])
+            self._outline = (hit[0], picks, erase)
+            self.traced.emit(hit[0], hit[1])
 
     def pick_vertex(self, pos: QtCore.QPointF) -> tuple[str, int] | None:
         """The hemisphere and nearest corner vertex of the face under a widget point."""
@@ -947,6 +991,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.depth_scrolled.connect(self._scroll_depth)
         self.canvas.hinged.connect(self._hinge_by)
         self.canvas.painted.connect(self._paint_highlight)
+        self.canvas.traced.connect(self._trace_vertex)
+        self.canvas.outlined.connect(self._fill_outline)
         self.canvas.spread.connect(self._spread_by)
         self._built_map: tuple | None = None
         self._built_topology: int | None = None
@@ -991,6 +1037,9 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("ctrl+shift+drag", "push the hemispheres apart / together", None, group="hemispheres"),
                 Key("o", "open: closed, nose to nose, occipital to occipital", self._cycle_hinge, group="hemispheres"),
                 Key("p", "paint mode: drag highlights cortex (ctrl+drag erases)", self._toggle_paint, group="highlight"),
+                Key("shift+drag", "in paint mode: draw a shape, its inside fills (ctrl+shift erases)", None, group="highlight"),
+                Key("s", "save the highlight as an ROI: ?h.label + the volume it spans", self._save_roi, group="highlight"),
+                Key("l", "load ROI labels into the highlight", self._load_roi, group="highlight"),
                 Key("shift+p", "clear the highlight", self._clear_highlight, group="highlight"),
                 Key("(", "smaller paint brush", lambda: self._brush_by(1 / 1.25), group="highlight"),
                 Key(")", "larger paint brush", lambda: self._brush_by(1.25), group="highlight"),
@@ -1076,6 +1125,61 @@ class SurfaceWindow(QtWidgets.QWidget):
         r = self.session.state.surface_brush[0]
         ids = self.session.surfaces.disc(hemi, vertex, r)
         self._dispatch(HighlightSurface(hemi, encode_ids(ids), "remove" if erase else "add"))
+
+    def _trace_vertex(self, hemi: str, vertex: int) -> None:
+        """Show the outline as it is drawn: each pick highlighted at once."""
+        self.session.surfaces.set_highlight(hemi, np.array([vertex]), "add")
+        self.refresh(Aspect.VIEWPORTS)
+
+    def _fill_outline(self, hemi: str, picks: list, erase: bool) -> None:
+        """The traced shape and its inside, as one recorded highlight command.
+
+        Joined and filled on the shape that is drawn, so the boundary follows what
+        was seen (on the inflated surface, the inflated distances).
+        """
+        from fastfuncstuff.surface.outline import fill_outline
+        from fastfuncstuff.viewer.vocab import HighlightSurface, encode_ids
+
+        drawn = self.canvas.drawn_positions(hemi)
+        h = self.session.surfaces.hemis[hemi]
+        positions = drawn if drawn is not None and len(drawn) == h.n_vertices else h.states["white"]
+        inside = fill_outline(np.asarray(positions, np.float64), h.faces, picks)
+        if erase:
+            # The live trace added the boundary; the erase takes it and the inside.
+            self._dispatch(HighlightSurface(hemi, encode_ids(np.flatnonzero(inside)), "remove"))
+        else:
+            self._dispatch(HighlightSurface(hemi, encode_ids(np.flatnonzero(inside)), "add"))
+        n = int(inside.sum())
+        area = float(self.session.surfaces.vertex_areas(hemi)[0][inside].sum())
+        self.depth_label.setText(
+            f"{'erased' if erase else 'drew'} {n:,} vertices, {area:,.0f} mm² of white"
+        )
+
+    def _save_roi(self) -> None:
+        """The highlight as ROI files: ?h.label per hemisphere and the volume it spans."""
+        from fastfuncstuff.viewer.vocab import SaveSurfaceRoi
+
+        if not any(m.any() for m in self.session.surfaces.highlight.values()):
+            self.depth_label.setText("nothing is highlighted")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save the highlight as an ROI (STEM.?h.label + STEM.nii.gz)", "roi"
+        )
+        if path:
+            self._dispatch(SaveSurfaceRoi(path))
+            self.depth_label.setText(f"saved {Path(path).name}.?h.label + .nii.gz")
+
+    def _load_roi(self) -> None:
+        from fastfuncstuff.viewer.vocab import LoadSurfaceRoi
+
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Load ROI labels into the highlight", "", "FreeSurfer labels (*.label)"
+        )
+        for path in paths:
+            try:
+                self._dispatch(LoadSurfaceRoi(path))
+            except ValueError as exc:
+                self.depth_label.setText(str(exc))
 
     def _clear_highlight(self) -> None:
         from fastfuncstuff.viewer.vocab import HighlightSurface
