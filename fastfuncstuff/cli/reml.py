@@ -851,7 +851,17 @@ Examples:
         default=None,
         help="Apply 3D Gaussian spatial smoothing with FWHM in mm. "
         "Smoothing is applied BEFORE masking to avoid edge effects. "
-        "Typical values: 4-8 mm.",
+        "Typical values: 4-8 mm. On surface (.gii) input: heat diffusion ALONG the "
+        "cortex on the data's own midthickness (never across a sulcus), inside -mask "
+        "(its edge is a wall), to the same FWHM.",
+    )
+    proc_opts.add_argument(
+        "-surf_geom",
+        metavar="SURF.gii",
+        default=None,
+        help="Surface input: the mesh the data live on, for -do_blur (the midthickness "
+        "in this subject). Default: the 'geometry' file named in the input's metadata "
+        "(ffs_nwarp -surf writes it beside the data). Its fingerprint must match.",
     )
     proc_opts.add_argument(
         "-cache",
@@ -1229,6 +1239,31 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
             header=header,
         )
         print(f"  • xval_r2: {path}")
+
+
+def _surface_smoother(args, input_file, header, n_vertices: int):
+    """The HeatSmoother for -do_blur on surface input: the data's own mesh, the mask."""
+    from fastfuncstuff.io.afni import load_afni_mask
+    from fastfuncstuff.io.gifti import load_gifti_surface, mesh_fingerprint, surface_meta
+    from fastfuncstuff.surface.smooth import HeatSmoother
+
+    meta = surface_meta(header) or {}
+    geom = args.surf_geom
+    if geom is None and meta.get("geometry"):
+        geom = str(Path(str(input_file).split("[")[0]).parent / meta["geometry"])
+    if geom is None or not Path(geom).exists():
+        raise SystemExit(
+            "ffs_reml: -do_blur on surface input needs the mesh the data live on: pass "
+            f"-surf_geom (the ?h.midthickness.surf.gii); looked for {geom!r}"
+        )
+    vertices, faces, _ = load_gifti_surface(geom)
+    if len(vertices) != n_vertices:
+        raise SystemExit(f"ffs_reml: {geom} has {len(vertices)} vertices, the data {n_vertices}")
+    want = meta.get("mesh_fingerprint")
+    if want and want != mesh_fingerprint(faces, len(vertices)):
+        raise SystemExit(f"ffs_reml: {geom} is not the mesh the data were sampled on")
+    mask = load_afni_mask(args.mask).reshape(-1) if args.mask else None
+    return HeatSmoother(vertices, faces, args.do_blur, mask=mask)
 
 
 def _derive_rvar_path(rbuck_path: str) -> str:
@@ -1799,7 +1834,6 @@ def main():
         grid_only = [
             flag
             for flag, on in (
-                ("-do_blur", args.do_blur is not None),
                 ("-save_acf", bool(args.save_acf)),
                 ("-clustsim", bool(args.clustsim)),
             )
@@ -3024,10 +3058,19 @@ def main():
         n_voxels = int(np.prod(volume_shape))
         total_tps = int(design_info["n_timepoints"])
 
-        if args.do_blur is not None:
+        surface_smoother = None
+        if args.do_blur is not None and surface_input:
+            surface_smoother = _surface_smoother(args, input_files[0], nifti_header, n_voxels)
+            print(
+                f"  Applying surface heat smoothing (FWHM = {args.do_blur} mm along the "
+                f"cortex, {int(surface_smoother.mask.sum()):,} vertices)..."
+            )
+        elif args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
         def _blur_run(run_data, run_idx):
+            if surface_smoother is not None:
+                return torch.from_numpy(surface_smoother(run_data.numpy()).astype(np.float32))
             # The loader hands us (n_voxels, n_tps) in C order, so the view back
             # to (x, y, z, t) is free. volume_shape is set once, above, before
             # this closure is ever invoked.
