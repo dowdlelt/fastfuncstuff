@@ -37,7 +37,13 @@ import scipy.sparse as sp
 from scipy.ndimage import gaussian_filter1d
 from scipy.sparse.linalg import spsolve
 
-from fastfuncstuff.surface.mesh import MeshTopology, face_normals, geodesic_ball, vertex_normals
+from fastfuncstuff.surface.mesh import (
+    MeshTopology,
+    face_normals,
+    geodesic_ball,
+    local_height,
+    vertex_normals,
+)
 from fastfuncstuff.surface.sampling import VolumeSampler
 
 
@@ -556,8 +562,15 @@ class HighlightEdit(StrokeEdit):
     The highlighted vertices are the seeds, all pinned to the same shift;
     the surface within ``params.radius`` mm of them follows by the same
     harmonic fill a stroke uses, so the group moves as a plateau with a
-    smooth shoulder instead of a brush's peak. Always by hand: a highlight
-    says "these, this far", which a snap would second-guess.
+    smooth shoulder instead of a brush's peak. By hand unless ``params.snap``
+    asks for the edge search too.
+
+    ``flatten`` (0-1) adds, to every vertex in reach, that fraction of its
+    height above its neighbours (along its normal, measured over
+    ``flatten_rings`` rings): a spike moves further in than the plateau, a pit
+    less. Seeds take it in full; the shoulder takes it faded by the brush
+    weight, so the selection blends into the cortex around it. A plateau
+    shift of 0 with ``flatten`` > 0 only relaxes.
     """
 
     def __init__(
@@ -571,6 +584,8 @@ class HighlightEdit(StrokeEdit):
         *,
         role: str = "white",
         partner: np.ndarray | None = None,
+        flatten: float = 0.0,
+        flatten_rings: int = 2,
     ) -> None:
         from scipy.sparse.csgraph import dijkstra
 
@@ -584,10 +599,17 @@ class HighlightEdit(StrokeEdit):
         self.centre = int(seeds[0])
         self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
-        self.seed_shift = np.full(int(self.seed.sum()), float(shift))
-        self.along = self._interpolate()
+        self.disp = None
+        self.flatten = np.zeros(self.ids.size)
+        if flatten > 0:
+            # Positive sticks out: it comes in further than the plateau.
+            self.flatten = -float(flatten) * local_height(vertices, topo, self.ids, flatten_rings)
+        self.seed_shift = float(shift) + self.flatten[self.seed]
+        self.along = self._interpolate() + np.where(self.seed, 0.0, self.weight * self.flatten)
 
     def result(self) -> EditResult:
+        if self.params.snap > 0:
+            return super().result()
         return self._finish(self.along, np.zeros(self.ids.size))
 
 

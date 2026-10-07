@@ -413,3 +413,71 @@ def test_a_free_hand_drag_goes_where_it_is_dragged_not_along_the_normal(phantom)
     assert res.held > 0
     # Along the (smoothed) normal, so within a hair of the 0.1 mm floor radially.
     assert np.linalg.norm(res.positions[k]) >= 20.0 + 0.09
+
+
+def _sheet(n=41, spacing=0.8):
+    xs = (np.arange(n) - n // 2) * spacing
+    gx, gy = np.meshgrid(xs, xs, indexing="ij")
+    v = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], 1)
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + n, a + 1], [a + 1, a + n, a + n + 1]]
+    f = np.asarray(faces, np.int64)
+    # Normals +z (outward) for this winding.
+    if face_normals(v, f)[:, 2].mean() < 0:
+        f = f[:, ::-1]
+    return v, f
+
+
+def _flat_sampler():
+    aff = np.diag([1.0, 1.0, 1.0, 1.0])
+    aff[:3, 3] = -40
+    return VolumeSampler(np.zeros((81, 81, 81), np.float32), aff)
+
+
+def test_flatten_brings_a_spike_down_further_than_the_plateau():
+    from fastfuncstuff.surface.edit import HighlightEdit
+
+    v, f = _sheet()
+    topo = MeshTopology.from_faces(f)
+    centre = len(v) // 2
+    v[centre, 2] = 1.0  # one vertex sticking out 1 mm
+    near = np.flatnonzero(np.linalg.norm(v[:, :2], axis=1) < 3.0)
+    params = SnapParams(radius=2.0, snap=0.0)
+    plain = HighlightEdit(v, topo, near, -0.25, _flat_sampler(), params, role="pial").result()
+    flat = HighlightEdit(
+        v, topo, near, -0.25, _flat_sampler(), params, role="pial", flatten=0.5
+    ).result()
+
+    def dz(res, k):
+        return res.positions[res.ids == k][0, 2] - v[k, 2]
+
+    other = int(near[near != centre][0])
+    assert dz(plain, centre) == pytest.approx(dz(plain, other), abs=1e-4)  # uniform today
+    # The spike comes down by the step plus half its height; the plateau by
+    # about the step (a little less beside the spike: it sits below its
+    # neighbourhood's mean now).
+    assert dz(flat, centre) == pytest.approx(-0.25 - 0.5 * 1.0, abs=0.05)
+    far = int(near[np.argmax(np.linalg.norm(v[near, :2], axis=1))])
+    assert dz(flat, far) == pytest.approx(-0.25, abs=0.02)
+    # Relax only: no plateau shift, the spike still comes down.
+    relax = HighlightEdit(v, topo, near, 0.0, _flat_sampler(), params, role="pial", flatten=0.5)
+    assert dz(relax.result(), centre) < -0.4
+    assert abs(dz(relax.result(), far)) < 0.02
+
+
+def test_flatten_leaves_uniform_curvature_nearly_alone(phantom):
+    """Measured over two rings, a smooth sphere is not a spike: real folding survives."""
+    from fastfuncstuff.surface.edit import HighlightEdit
+
+    sampler, u, f, topo = phantom
+    pial = u * 24.0
+    seeds = np.flatnonzero(u[:, 2] > 0.95)
+    params = SnapParams(radius=2.0, snap=0.0)
+    flat = HighlightEdit(pial, topo, seeds, -0.25, sampler, params, role="pial", flatten=0.6)
+    res = flat.result()
+    moved = np.linalg.norm(res.positions, axis=1) - 24.0
+    seed_moves = moved[np.isin(res.ids, seeds)]
+    assert np.all(np.abs(seed_moves + 0.25) < 0.05)

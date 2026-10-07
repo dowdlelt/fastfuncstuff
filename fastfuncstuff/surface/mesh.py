@@ -50,6 +50,19 @@ class MeshTopology:
         idx = np.concatenate([self.vf_index[a:b] for a, b in zip(starts, stops, strict=True)])
         return np.unique(idx)
 
+    def adjacency(self) -> sp.csr_matrix:
+        """Vertex-to-vertex adjacency, 0/1 CSR; built once, the connectivity never changes."""
+        found = getattr(self, "_adjacency", None)
+        if found is None:
+            e, n = self.edges, self.n_vertices
+            found = sp.csr_matrix(
+                (np.ones(2 * len(e)), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])),
+                shape=(n, n),
+            )
+            found.data[:] = 1.0
+            self._adjacency = found
+        return found
+
     def edge_graph(self, vertices: np.ndarray) -> sp.csr_matrix:
         """Symmetric edge-length graph for geodesic distances.
 
@@ -75,6 +88,51 @@ class MeshTopology:
         out = g.copy()
         out.data = w[slot]
         return out
+
+
+def _rings(topo: MeshTopology, ids: np.ndarray, rings: int):
+    """Rows ``ids`` of the ``rings``-ring neighbourhood (self excluded), 0/1 CSR."""
+    adj = topo.adjacency()
+    ids = np.asarray(ids, np.int64)
+    reach = adj[ids]
+    for _ in range(rings - 1):
+        reach = reach + reach @ adj
+    reach = reach.tocsr()
+    reach.data[:] = 1.0
+    reach[np.arange(ids.size), ids] = 0.0
+    reach.eliminate_zeros()
+    return reach
+
+
+def local_height(
+    vertices: np.ndarray, topo: MeshTopology, ids: np.ndarray, rings: int = 2
+) -> np.ndarray:
+    """How far each of ``ids`` sticks out of the surface around it, along its normal, mm.
+
+    The height above the ``rings``-ring mean, *minus* the neighbours' own
+    such heights. The second difference matters: a smoothly curved crown
+    sits above its ring mean too (by ~r^2/2R), and by the first difference
+    alone every press would round crowns off a little more. Under constant
+    (or linearly varying) curvature the two cancel; a spike, a pit or a
+    ledge one or two vertices wide does not.
+    """
+    v = np.asarray(vertices, np.float64)
+    ids = np.asarray(ids, np.int64)
+    reach = _rings(topo, ids, rings)
+    # The first difference is needed on the neighbours as well.
+    around = np.unique(np.r_[ids, reach.indices])
+    ring = _rings(topo, around, rings)
+    counts = np.maximum(np.asarray(ring.sum(axis=1)).ravel(), 1)
+    mean = np.asarray(ring @ v) / counts[:, None]
+    normals = vertex_normals(v, topo, around)
+    first = np.einsum("ij,ij->i", v[around] - mean, normals)
+    lookup = np.zeros(topo.n_vertices)
+    lookup[around] = first
+    own = lookup[ids]
+    neighbours = np.asarray(reach @ lookup).ravel() / np.maximum(
+        np.asarray(reach.sum(axis=1)).ravel(), 1
+    )
+    return own - neighbours
 
 
 def face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
