@@ -137,3 +137,26 @@ def test_a_bucket_is_not_a_series_even_with_a_tr_and_a_series_is(world, tmp_path
     )
     run = s.state.layers.get(s.load(str(tmp_path / "run.lh.func.gii")))
     assert run.time_linked and run.n_volumes == 5 and run.labels == ()
+
+
+def test_the_cluster_window_sizes_surface_clusters_in_mm2(world):
+    pytest.importorskip("PySide6.QtWidgets")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
+    from fastfuncstuff.viewer.vocab import SetThreshold, SetThresholdIndex
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s, tmp, d, f, t = world
+    key = s.load(str(tmp / "s.lh.func.gii"))
+    s.do(SetThresholdIndex(key, 1))
+    s.do(SetThreshold(key, float(stats.t.isf(0.0005, DOF))))
+    _, table = s.clusterize(key, min_voxels=1)
+    win = ClusterWindow("C1", s, s.do)
+    win.show_table(key, table)
+    assert win.table.horizontalHeaderItem(2).text() == "mm²"
+    area = float(win.table.item(0, 2).text().replace(",", ""))
+    assert area == pytest.approx(table.clusters[0].area_mm2, rel=0.01)
+    assert "mm² of cortex" in table.summary()
+    win.close()
+    app.processEvents()

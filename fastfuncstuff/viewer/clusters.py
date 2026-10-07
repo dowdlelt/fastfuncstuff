@@ -108,8 +108,16 @@ class ClusterTable:
     def find(self, index: int) -> Cluster | None:
         return next((c for c in self.clusters if c.index == index), None)
 
+    @property
+    def is_surface(self) -> bool:
+        """Found on a cortical surface: sized by area (mm^2), not volume."""
+        return any(c.area_mm2 is not None for c in self.clusters)
+
     def summary(self) -> str:
         text = f"{len(self.clusters)} clusters, {self.n_voxels:,} voxels"
+        if self.is_surface:
+            area = sum(c.area_mm2 or 0.0 for c in self.clusters)
+            text = f"{len(self.clusters)} clusters, {area:,.0f} mm² of cortex"
         text += f"   thr {self.threshold:.4g}"
         if self.pthr is not None:
             text += f" (p {self.pthr:.2g})"

@@ -309,11 +309,21 @@ class ClusterWindow(QtWidgets.QWidget):
             self.table.setUpdatesEnabled(True)
             self.info.setText(message or "nothing to cluster")
             return
+        # A cluster found on a surface is sized by its cortical area -- that is how
+        # it came about, and what its alpha was simulated in -- not by the volume
+        # its ribbon happens to paint on this grid.
+        surface = table.is_surface
+        self.table.setHorizontalHeaderItem(
+            2, QtWidgets.QTableWidgetItem("mm²" if surface else "mm³")
+        )
         for row, cluster in enumerate(table.clusters[:shown]):
+            size = (
+                cluster.area_mm2 if surface and cluster.area_mm2 is not None else cluster.volume_mm3
+            )
             cells = (
                 str(cluster.index),
                 f"{cluster.n_voxels:,}",
-                f"{cluster.volume_mm3:,.0f}",
+                f"{size:,.0f}" if size >= 100 else f"{size:,.1f}",
                 f"{cluster.peak:+.3g}",
                 f"{cluster.peak_xyz[0]:.1f}",
                 f"{cluster.peak_xyz[1]:.1f}",
