@@ -135,6 +135,43 @@ def local_height(
     return own - neighbours
 
 
+def even_spacing(
+    vertices: np.ndarray,
+    topo: MeshTopology,
+    ids: np.ndarray,
+    weight: np.ndarray,
+    normals: np.ndarray,
+    sweeps: int,
+    step: float = 0.5,
+) -> np.ndarray:
+    """Moves of ``ids`` within their tangent planes that even out the spacing, ``(n, 3)`` mm.
+
+    Each sweep moves every vertex toward the mean of its neighbours, keeps
+    only the part of that move in its tangent plane (``normals``, held fixed),
+    and scales it by ``weight`` (0-1): crowded vertices spread into sparser
+    ones around them, while the shape stays and the rim and everything beyond
+    it hold still. The plain neighbour mean, not cotangent weights, on
+    purpose: it pulls toward equal edge lengths, where cotangent weights would
+    keep the crowding as the mesh's parametrisation.
+    """
+    v = np.asarray(vertices, np.float64)
+    ids = np.asarray(ids, np.int64)
+    rows = topo.adjacency()[ids]
+    # Only the patch and its one-ring are read, reindexed locally.
+    used = np.union1d(ids, rows.indices)
+    rows = rows[:, used]
+    slot = np.searchsorted(used, ids)
+    local = v[used].copy()
+    degree = np.maximum(np.asarray(rows.sum(axis=1)).ravel(), 1.0)
+    n = np.asarray(normals, np.float64)
+    rate = step * np.clip(np.asarray(weight, np.float64), 0.0, 1.0)[:, None]
+    for _ in range(int(sweeps)):
+        d = (rows @ local) / degree[:, None] - local[slot]
+        d -= np.einsum("ij,ij->i", d, n)[:, None] * n
+        local[slot] += rate * d
+    return local[slot] - v[ids]
+
+
 def face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """Unnormalised face normals (length = 2 x area), FreeSurfer winding = outward."""
     v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
@@ -197,6 +234,7 @@ def geodesic_ball(
 
 __all__ = [
     "MeshTopology",
+    "even_spacing",
     "face_normals",
     "geodesic_ball",
     "vertex_areas",

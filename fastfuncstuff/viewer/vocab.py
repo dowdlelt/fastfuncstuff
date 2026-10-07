@@ -717,6 +717,10 @@ class MoveSurfaceHighlight(Command):
     snap: float = 0.0
     gate: bool = True
     snap_key: str = ""
+    #: Sweeps of sliding the vertices within the surface to even out their
+    #: spacing (0: none); see surface.edit.HighlightEdit. Last, so recorded
+    #: scripts from before it still parse.
+    even: int = 0
 
 
 @command
@@ -1783,6 +1787,7 @@ def install(
             params,
             within=decode_ids(cmd.within) if cmd.within else None,
             flatten=float(np.clip(cmd.flatten, 0.0, 1.0)),
+            even=max(int(cmd.even), 0),
         )
         return MoveSurfaceHighlight.aspects
 

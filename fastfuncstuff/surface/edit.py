@@ -15,7 +15,8 @@ Invariants an edit keeps:
 
 * **Vertices move along their normals only.** Tangential motion changes no
   boundary and only distorts the mesh that every derived surface (inflated,
-  sphere, flat) is indexed against.
+  sphere, flat) is indexed against. The exceptions ask for it: a free-hand
+  drag, and evening out a crowded patch (``HighlightEdit``'s ``even``).
 * **Topology never changes**, so vertex correspondence with every other
   surface of the hemisphere -- and between white and pial -- is preserved by
   construction.
@@ -39,6 +40,7 @@ from scipy.sparse.linalg import spsolve
 
 from fastfuncstuff.surface.mesh import (
     MeshTopology,
+    even_spacing,
     face_normals,
     geodesic_ball,
     local_height,
@@ -571,6 +573,13 @@ class HighlightEdit(StrokeEdit):
     less. Seeds take it in full; the shoulder takes it faded by the brush
     weight, so the selection blends into the cortex around it. A plateau
     shift of 0 with ``flatten`` > 0 only relaxes.
+
+    ``even`` (sweeps of :func:`even_spacing`) also slides the vertices within
+    the surface to even out their spacing -- the one move here that is not
+    along the normal, and so never snapped. A push into a protrusion crowds
+    its vertices together, and moving along normals can only crowd them
+    further; on pial nothing else is indexed against the positions, and on
+    white the slide is a fraction of an edge.
     """
 
     def __init__(
@@ -586,6 +595,7 @@ class HighlightEdit(StrokeEdit):
         partner: np.ndarray | None = None,
         flatten: float = 0.0,
         flatten_rings: int = 2,
+        even: int = 0,
     ) -> None:
         from scipy.sparse.csgraph import dijkstra
 
@@ -606,8 +616,15 @@ class HighlightEdit(StrokeEdit):
             self.flatten = -float(flatten) * local_height(vertices, topo, self.ids, flatten_rings)
         self.seed_shift = float(shift) + self.flatten[self.seed]
         self.along = self._interpolate() + np.where(self.seed, 0.0, self.weight * self.flatten)
+        self.tangent = (
+            even_spacing(vertices, topo, self.ids, self.weight, self.normals, even)
+            if even > 0
+            else None
+        )
 
     def result(self) -> EditResult:
+        if self.tangent is not None:
+            return self._finish_free(self.along[:, None] * self.normals + self.tangent)
         if self.params.snap > 0:
             return super().result()
         return self._finish(self.along, np.zeros(self.ids.size))

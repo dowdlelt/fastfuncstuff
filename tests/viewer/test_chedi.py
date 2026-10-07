@@ -351,15 +351,19 @@ def test_shift_click_moves_the_crosshair_and_centres_a_zoomed_slice(tmp_path, su
 def test_o_shows_gyri_and_sulci_and_f_g_unselect_them(chedi, subject):
     session, win = chedi
     h = session.surfaces.hemis["lh"]
-    # No ?h.curv yet: it says so rather than drawing nothing.
-    win._toggle_folding()
-    assert not win.show_folding and "curv" in win.status.text()
+    # No ?h.curv yet: it says so and goes on to the spacing map.
+    win._cycle_display()
+    assert win.display == "spacing" and "curv" in win.status.text()
+    win._cycle_display()
+    assert win.display == "data"
     # Half the cap a "sulcus" (+), half a "gyrus" (-), split along x.
     h.morph["curv"] = np.where(h.states["white"][:, 0] > 0, 0.2, -0.2).astype(np.float32)
-    win._toggle_folding()
-    assert win.show_folding and "gyri / sulci" in win.canvas.caption
-    win._toggle_folding()
-    assert not win.show_folding
+    win._cycle_display()
+    assert win.display == "folding" and "gyri / sulci" in win.canvas.caption
+    win._cycle_display()
+    assert win.display == "spacing" and "spacing" in win.canvas.caption
+    win._cycle_display()
+    assert win.display == "data"
 
     def select_all():
         win._press("window", 30.0, 30.0)
@@ -476,3 +480,45 @@ def test_relax_flattens_a_spike_and_snap_mode_reaches_the_command(chedi):
     push = moves[-1]
     assert float(push[3]) < 0 and push[7] == "1.0" and push[8] == "1"
     assert push[9] == session.state.layers.base.key  # snaps to the layer shown
+
+
+def test_u_evens_out_crowded_pial_and_the_spacing_map_shows_it(chedi):
+    session, win = chedi
+    h = session.surfaces.hemis["lh"]
+    # Crowd pial around the patch centre: pull the vertices near it halfway
+    # in toward it, along the sphere.
+    pial = h.states["pial"]
+    c = pial[win.patch.centre].astype(np.float64)
+    dist = np.linalg.norm(pial - c, axis=1)
+    reach = np.flatnonzero(dist < 6.0)
+    near = np.flatnonzero(dist < 3.0)  # the crowded core; the ring past it is stretched
+    radius = np.linalg.norm(pial[reach], axis=1, keepdims=True)
+    # r -> r^2/6 out to 6 mm: dense at the centre, continuous at the rim.
+    squeezed = c + (dist[reach] / 6.0)[:, None] * (pial[reach] - c)
+    pial[reach] = (squeezed / np.linalg.norm(squeezed, axis=1, keepdims=True) * radius).astype(
+        np.float32
+    )
+    radius = np.linalg.norm(pial[near], axis=1, keepdims=True)
+    session.surfaces.version["lh"] += 1
+    crowded = win._spacing()[near]
+    assert np.median(crowded) < -1.0  # a quarter of white's area, or less
+    # ctrl+drag on the spacing map selects by spacing: the crowded part.
+    win._cycle_display()  # no ?h.curv here: straight to the spacing map
+    assert win.display == "spacing"
+    lo = float(np.median(crowded))
+    win._gesture = None
+    win._press("window", 30.0, 30.0)
+    g = win._gesture
+    win._gesture = ("window", g[1], lo, 1.0, g[4], g[5])
+    win._update_preview(0.0, 0.0)
+    win._release()
+    picked = session.surfaces.highlighted("lh")
+    assert np.isin(picked, near).mean() > 0.9
+    win._even()
+    after = win._spacing()[near]
+    assert np.median(after) > np.median(crowded) + 0.5
+    # Within the surface: the radius of every vertex barely changed.
+    r_after = np.linalg.norm(h.states["pial"][near], axis=1)
+    assert np.allclose(r_after, radius[:, 0], atol=0.1)
+    moves = [ln.split() for ln in session.to_script().splitlines() if ln.startswith("MOVE_SURFACE")]
+    assert moves[-1][-1] == str(30)  # even, last on the line

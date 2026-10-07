@@ -64,6 +64,13 @@ DEPTH_RANGE = (-0.5, 1.5)
 #: How far past the selected vertices a push fades out, mm. Small: the
 #: shoulder is the one part of a push that can reach past the patch's edge.
 SHOULDER_MM = 2.0
+#: Sweeps of evening out the spacing one u takes (see surface.mesh.even_spacing).
+EVEN_SWEEPS = 30
+#: The spacing map's window: log2(pial / white vertex area) from a quarter
+#: (black, crowded) to four times (white, stretched); 1 is mid grey.
+SPACING_LOG2 = (-2.0, 2.0)
+#: What o steps through: the anatomy, gyri/sulci, how crowded pial is.
+DISPLAYS = ("data", "folding", "spacing")
 #: Widget pixels of ctrl+drag that move the window by its layer's full range.
 WINDOW_DRAG_PX = 300.0
 #: Selection dot colour.
@@ -323,8 +330,8 @@ class ChediWindow(QtWidgets.QWidget):
         self._centre: tuple[str, int] | None = None
         #: The one surface a push moves. Pial: what is usually wrong.
         self.surface = "pial"
-        #: Show the gyri/sulci map instead of the data (o).
-        self.show_folding = False
+        #: What is drawn (o): the data, the gyri/sulci map, or the spacing map.
+        self.display = "data"
         #: How a push is placed: by hand (the step), or snapped to the shown
         #: image's edge (gated, or "edge": strongest, ungated) -- m, as in a slice.
         self.snap_mode = "hand"
@@ -436,7 +443,8 @@ class ChediWindow(QtWidgets.QWidget):
                 Binding("right-drag", "unselect under the brush", None, group="select"),
                 Binding(
                     "ctrl+drag",
-                    "select by value: up/down the level, left/right the window (shift: add)",
+                    "select by value (or spacing, when shown): up/down the level, "
+                    "left/right the window (shift: add)",
                     None,
                     group="select",
                 ),
@@ -455,7 +463,10 @@ class ChediWindow(QtWidgets.QWidget):
                 Binding("(", "smaller brush", lambda: self._brush_by(1 / 1.25), group="select"),
                 Binding(")", "larger brush", lambda: self._brush_by(1.25), group="select"),
                 Binding(
-                    "o", "gyri / sulci map instead of the data", self._toggle_folding, group="view"
+                    "o",
+                    "show: data -> gyri / sulci -> spacing (dark = crowded)",
+                    self._cycle_display,
+                    group="view",
                 ),
                 Binding(
                     "f", "unselect sulci (on screen)", lambda: self._drop_fold(1), group="select"
@@ -473,6 +484,12 @@ class ChediWindow(QtWidgets.QWidget):
                     group="move",
                 ),
                 Binding("r", "relax: smooth the spikes out, no push", self._relax, group="move"),
+                Binding(
+                    "u",
+                    "uncrowd: even out the spacing, within the surface",
+                    self._even,
+                    group="move",
+                ),
                 Binding(
                     "shift+r",
                     "flatten with each push: 0 / 0.3 / 0.6",
@@ -614,9 +631,14 @@ class ChediWindow(QtWidgets.QWidget):
         if kind in ("add", "remove"):
             self._gesture = (kind, set(self._under_brush(row, col).tolist()))
         else:
-            values = self._vertex_values()
+            # By what is shown: on the spacing map, ctrl+drag selects the crowded.
+            if self.display == "spacing":
+                values = self._spacing()[self._vis]
+                lo, hi = SPACING_LOG2
+            else:
+                values = self._vertex_values()
+                lo, hi = self._window(values, self.layer())
             nearest = int(np.argmin(np.hypot(self._vis_px[:, 0] - row, self._vis_px[:, 1] - col)))
-            lo, hi = self._window(values, self.layer())
             span = max(hi - lo, 1e-6)
             base = self._selected() if kind == "window+" else self._selected() & ~self._vis_mask
             self._gesture = ("window", base, float(values[nearest]), 0.1 * span, values, span)
@@ -696,12 +718,33 @@ class ChediWindow(QtWidgets.QWidget):
             return None
         return folding_values(h, "binary")
 
-    def _toggle_folding(self) -> None:
-        if self.patch is not None and self._folding() is None:
-            self.status.setText("no ?h.curv: no gyri/sulci map")
-            return
-        self.show_folding = not self.show_folding
-        self.status.setText("gyri (light) / sulci (dark)" if self.show_folding else "data")
+    def _spacing(self) -> np.ndarray:
+        """Per vertex: log2 of its pial area over its white area -- below 0, pial is crowded.
+
+        Against the vertex's own white area, not a fixed density: vertex
+        spacing varies across a hemisphere anyway, and white is where each
+        vertex's share of cortex is set. Sulcal fundi sit a little below 0 by
+        nature; a protrusion pushed back in sits far below.
+        """
+        assert self.patch is not None
+        white, pial = self.session.surfaces.vertex_areas(self.patch.hemi)
+        return np.log2(np.maximum(pial, 1e-6) / np.maximum(white, 1e-6))
+
+    def _cycle_display(self) -> None:
+        nxt = DISPLAYS[(DISPLAYS.index(self.display) + 1) % len(DISPLAYS)]
+        skipped = ""
+        if nxt == "folding" and self.patch is not None and self._folding() is None:
+            skipped = "no ?h.curv, no gyri/sulci map -- "
+            nxt = "spacing"
+        self.display = nxt
+        self.status.setText(
+            skipped
+            + {
+                "data": "data",
+                "folding": "gyri (light) / sulci (dark)",
+                "spacing": "pial / white vertex area: dark = crowded, mid grey = even",
+            }[nxt]
+        )
         if self.patch is not None:
             self._draw()
 
@@ -845,11 +888,15 @@ class ChediWindow(QtWidgets.QWidget):
         if self.patch is not None:
             self._draw()
 
+    def _even(self) -> None:
+        """Slide the selection's vertices within the surface until their spacing evens out."""
+        self._push(0.0, flatten=0.0, even=EVEN_SWEEPS)
+
     def _relax(self) -> None:
         """Take spikes out of the selection without pushing it in or out."""
         self._push(0.0, flatten=self.flatten or 0.5)
 
-    def _push(self, sign: float, flatten: float | None = None) -> None:
+    def _push(self, sign: float, flatten: float | None = None, even: int = 0) -> None:
         """Move the selected, visible vertices of one surface along their normals, as a unit."""
         if self.patch is None:
             return
@@ -872,6 +919,7 @@ class ChediWindow(QtWidgets.QWidget):
                     # is selected off it.
                     encode_ids(seeds),
                     flatten=self.flatten if flatten is None else flatten,
+                    even=even,
                     snap=0.0 if self.snap_mode == "hand" else 1.0,
                     gate=self.snap_mode == "snap",
                     snap_key="" if layer is None else layer.key,
@@ -880,7 +928,13 @@ class ChediWindow(QtWidgets.QWidget):
         except ValueError as exc:
             self.status.setText(str(exc))
             return
-        what = "relaxed" if sign == 0 else f"{'in' if sign < 0 else 'out'} {step:g} mm"
+        what = (
+            "evened out"
+            if even
+            else "relaxed"
+            if sign == 0
+            else f"{'in' if sign < 0 else 'out'} {step:g} mm"
+        )
         self.status.setText(f"{self.surface} {what}: {n} points ({self.snap_mode})")
 
     def _adjacency(self):
@@ -1011,14 +1065,17 @@ class ChediWindow(QtWidgets.QWidget):
             return
         h = session.surfaces.hemis[p.hemi]
         depth = self.current_depth()
-        fold = self._folding() if self.show_folding else None
+        fold = self._folding() if self.display == "folding" else None
+        spacing = self._spacing() if self.display == "spacing" else None
         if fold is not None:
             # Interpolated through the same pixel weights, then two-toned:
             # gyri light, sulci dark, as FreeSurfer draws them.
-            shade = np.full(p.inside.shape, np.nan, np.float32)
-            shade[p.inside] = (fold[p.corners[p.inside]] * p.weights[p.inside]).sum(axis=1)
-            values = np.where(np.isfinite(shade), np.where(shade > 0, 0.3, 0.75), np.nan)
+            values = self._per_pixel(fold)
+            values = np.where(np.isfinite(values), np.where(values > 0, 0.3, 0.75), np.nan)
             lo, hi = 0.0, 1.0
+        elif spacing is not None:
+            values = self._per_pixel(spacing)
+            lo, hi = SPACING_LOG2
         else:
             values = sampler.sample(h, depth, volume, self._version())
             lo, hi = self._window(values, layer)
@@ -1035,12 +1092,22 @@ class ChediWindow(QtWidgets.QWidget):
             + (
                 "gyri / sulci"
                 if fold is not None
+                else "spacing (dark = crowded)"
+                if spacing is not None
                 else f"{layer.name if layer is not None else ''} · {mode}"
             )
             + f"   moves {self.surface} · {self.snap_mode} · flatten {self.flatten:g}"
             + ("" if p.source == "sphere" else "   (no sphere: inflated)")
         )
         self.canvas.update()
+
+    def _per_pixel(self, per_vertex: np.ndarray) -> np.ndarray:
+        """A per-vertex map through the patch's pixel weights; NaN outside the patch."""
+        p = self.patch
+        assert p is not None
+        out = np.full(p.inside.shape, np.nan, np.float32)
+        out[p.inside] = (per_vertex[p.corners[p.inside]] * p.weights[p.inside]).sum(axis=1)
+        return out
 
     def _window(self, values: np.ndarray, layer) -> tuple[float, float]:
         """The layer's own display range, so depths compare; else this patch's spread.

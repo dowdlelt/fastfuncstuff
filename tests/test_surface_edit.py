@@ -481,3 +481,53 @@ def test_flatten_leaves_uniform_curvature_nearly_alone(phantom):
     moved = np.linalg.norm(res.positions, axis=1) - 24.0
     seed_moves = moved[np.isin(res.ids, seeds)]
     assert np.all(np.abs(seed_moves + 0.25) < 0.05)
+
+
+def _crowded_sheet():
+    """The sheet with the vertices within 3 mm of the centre crowded toward it (r -> r^2/3)."""
+    v, f = _sheet()
+    r = np.linalg.norm(v[:, :2], axis=1)
+    inner = r < 3.0
+    v[inner, :2] *= (r[inner] / 3.0)[:, None]
+    return v, f, inner
+
+
+def test_even_spreads_a_crowded_patch_within_the_surface():
+    from fastfuncstuff.surface.edit import HighlightEdit
+    from fastfuncstuff.surface.mesh import vertex_areas
+
+    v, f, inner = _crowded_sheet()
+    topo = MeshTopology.from_faces(f)
+    seeds = np.flatnonzero(np.linalg.norm(v[:, :2], axis=1) < 4.0)
+    params = SnapParams(radius=2.0, snap=0.0)
+    res = HighlightEdit(v, topo, seeds, 0.0, _flat_sampler(), params, role="pial", even=40).result()
+    after = v.copy()
+    after[res.ids] = res.positions
+    # The centre vertex's area was a tenth of the 0.64 mm^2 every other has.
+    before_area = vertex_areas(v, f, len(v))[inner]
+    after_area = vertex_areas(after, f, len(v))[inner]
+    assert before_area.min() < 0.1
+    assert after_area.min() > 0.55
+    assert after_area.std() / after_area.mean() < 0.05
+    # Within the surface: the sheet stays flat, nothing outside the brush moves,
+    # and no triangle turned over.
+    assert np.abs(after[:, 2]).max() < 1e-9
+    far = np.linalg.norm(v[:, :2], axis=1) > 7.0
+    assert np.array_equal(after[far], v[far])
+    assert np.all(face_normals(after, f)[:, 2] > 0)
+
+
+def test_even_off_is_the_plain_push():
+    from fastfuncstuff.surface.edit import HighlightEdit
+
+    v, f, _ = _crowded_sheet()
+    topo = MeshTopology.from_faces(f)
+    seeds = np.flatnonzero(np.linalg.norm(v[:, :2], axis=1) < 4.0)
+    params = SnapParams(radius=2.0, snap=0.0)
+    plain = HighlightEdit(v, topo, seeds, -0.2, _flat_sampler(), params, role="pial").result()
+    both = HighlightEdit(
+        v, topo, seeds, -0.2, _flat_sampler(), params, role="pial", even=10
+    ).result()
+    # The push is the same along the normal; even only adds the slide.
+    assert np.allclose(both.positions[:, 2], plain.positions[:, 2], atol=1e-9)
+    assert np.abs(both.positions[:, :2] - plain.positions[:, :2]).max() > 0.01
