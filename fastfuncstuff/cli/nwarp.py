@@ -240,6 +240,58 @@ Examples:
         "estimate. Forces padding even with -no_autopad.",
     )
 
+    surf_group = parser.add_argument_group(
+        "Surface output (sample onto a cortical mesh instead of a grid)"
+    )
+    surf_group.add_argument(
+        "-surf",
+        default=None,
+        metavar="SUBJ_DIR",
+        help="FreeSurfer subject folder. Instead of a volume, read the source at cortical "
+        "surface points through the same chain, in the same single interpolation, and "
+        "write GIfTI: PREFIX.lh.func.gii / PREFIX.rh.func.gii (+ PREFIX.?h.coverage."
+        "shape.gii, the share of each vertex's footprint inside the EPI in every frame). "
+        "-master must be the anatomy the surfaces were built on (SUMA/brain.nii.gz, or "
+        "the T1w recon-all ran on), and the chain must end there -- no MNI link. "
+        "-jac then needs the AXIS:FIELDMAP form.",
+    )
+    surf_group.add_argument(
+        "-surf_mesh",
+        default="native",
+        help="Target mesh: 'native' (the subject's own vertices) or a FreeSurfer-format "
+        "template folder on fsaverage's sphere, by path or by name beside the subject "
+        "(e.g. onavg-ico64): placed in the subject through ?h.sphere.reg, so the output "
+        "is group-ready with no second resample.",
+    )
+    surf_group.add_argument(
+        "-surf_hemi",
+        nargs="+",
+        choices=["lh", "rh"],
+        default=["lh", "rh"],
+        help="Hemispheres to write.",
+    )
+    surf_group.add_argument(
+        "-surf_depths",
+        nargs="+",
+        type=float,
+        default=[0.5],
+        help="Equivolume depth fractions, white 0 .. pial 1 (outside [0, 1] extends "
+        "linearly). One file per depth unless -surf_depth_mean.",
+    )
+    surf_group.add_argument(
+        "-surf_depth_mean",
+        action="store_true",
+        help="Average the depths into one map per hemisphere (a ribbon mean).",
+    )
+    surf_group.add_argument(
+        "-surf_sample",
+        choices=["footprint", "point"],
+        default="footprint",
+        help="footprint: each vertex averages its own patch of cortex, read finer than one "
+        "voxel face, so a mesh coarser than the voxels still reads every voxel. point: "
+        "one read per vertex (aliases when vertices are sparser than voxels).",
+    )
+
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
@@ -375,6 +427,8 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     parse_prefix). The phase output, mean, and first/last files are listed on
     intent; a mean/first-last that a 3-D output skips just means the run isn't
     skipped next time (safe)."""
+    if getattr(args, "surf", None):
+        return [str(p) for p in _surface_outputs(args)]
     outs: list[str] = [args.prefix]
     if args.phase:
         outs.append(args.phase_prefix or derive_phase_output_path(args.prefix))
@@ -384,6 +438,19 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
             outs.append(path)
     if args.save_first_last:
         outs.append(derive_prefixed_output_path(args.prefix, "firstlast"))
+    return outs
+
+
+def _surface_outputs(args: argparse.Namespace) -> list[str]:
+    """The GIfTI files a -surf run writes (mirrors project_to_surface's naming)."""
+    outs = []
+    for hemi in args.surf_hemi:
+        stem = f"{args.prefix}.{hemi}"
+        if args.surf_depth_mean or len(args.surf_depths) == 1:
+            outs.append(f"{stem}.func.gii")
+        else:
+            outs += [f"{stem}.depth-{f:.2f}.func.gii" for f in args.surf_depths]
+        outs.append(f"{stem}.coverage.shape.gii")
     return outs
 
 
@@ -523,6 +590,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if verb >= 1:
         print_cli_section("Applying transforms")
 
+    if args.surf:
+        _dispatch_surface(
+            args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
+        )
+        if verb >= 1:
+            print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
+        return
+
     nwarpforge(
         source_path=args.source,
         nwarp_specs=nwarp_specs,
@@ -558,6 +633,60 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
 
     if verb >= 1:
         print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
+
+
+def _dispatch_surface(
+    args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
+) -> None:
+    """-surf: the same chain, read at surface points, written as GIfTI."""
+    from fastfuncstuff.processing.surface_projection import project_to_surface
+
+    wrong = [
+        flag
+        for flag, val in (
+            ("-phase", args.phase),
+            ("-dxyz", args.dxyz),
+            ("-save_mean", args.save_mean),
+            ("-save_max", args.save_max),
+            ("-save_min", args.save_min),
+            ("-save_first_last", args.save_first_last),
+        )
+        if val
+    ]
+    if wrong:
+        raise SystemExit(f"ffs_nwarp: {', '.join(wrong)} cannot be used with -surf")
+    if args.master is None:
+        raise SystemExit("ffs_nwarp: -surf needs -master, the anatomy the surfaces were built on")
+    written = project_to_surface(
+        source_path=args.source,
+        nwarp_specs=nwarp_specs,
+        master_path=args.master,
+        subject_dir=args.surf,
+        prefix=args.prefix,
+        mesh=args.surf_mesh,
+        hemis=tuple(args.surf_hemi),
+        fractions=tuple(args.surf_depths),
+        depth_mean=args.surf_depth_mean,
+        sample=args.surf_sample,
+        verb=args.verb,
+        interp=args.interp,
+        device=device,
+        time_range=time_range,
+        debug=args.debug,
+        no_neg=args.no_neg,
+        ainterp=ainterp,
+        slice_times=slice_times,
+        tr=tr,
+        tzero=args.tzero,
+        tinterp=args.tinterp,
+        follow_tissue=args.follow_tissue,
+        jac_axis=jac_axis,
+        jac_match=jac_match,
+        progress=lambda message: spinner(message, enabled=args.verb >= 1),
+    )
+    if args.verb >= 1:
+        for path in written:
+            print(f"  wrote {path}")
 
 
 if __name__ == "__main__":
