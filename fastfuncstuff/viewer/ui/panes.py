@@ -126,6 +126,12 @@ class ImagePane(QtWidgets.QWidget):
         #: The selected vertex on this slice, per surface: (row, col, surface).
         self._marks: list[tuple[float, float, str]] = []
         self._highlight = np.zeros((0, 2))
+        #: Replaces the plane/slice caption and drops the edge labels: for a
+        #: small cell (a neighbour-strip slice) where those would cover the image.
+        self.caption: str | None = None
+        #: Left-drag keeps picking. Off for a cell that re-centres on the
+        #: crosshair, where each pick would move the ground under the drag.
+        self.drag_picks = True
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -312,7 +318,7 @@ class ImagePane(QtWidgets.QWidget):
             p.drawText(
                 self.rect(),
                 QtCore.Qt.AlignmentFlag.AlignCenter,
-                f"{self.plane.value.upper()}\nno data",
+                f"{self.plane.value.upper()}\nno data" if self.caption is None else self.caption,
             )
             if self._toast and self._toast_alpha > 0:
                 self._paint_toast(p)
@@ -350,14 +356,19 @@ class ImagePane(QtWidgets.QWidget):
         tilt = getattr(self, "_tilt", 0.0)
         # Said on the image: a tilted slice still looks like a slice.
         tilted = f"  tilt {tilt:.0f}°" if tilt >= 0.5 else ""
-        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}{tilted}")
+        if self.caption is not None:
+            font.setPointSize(8)
+            p.setFont(font)
+            p.drawText(4, 12, self.caption)
+        else:
+            p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}{tilted}")
         if self._brush is not None and self._brush_label:
             p.drawText(6, 30, self._brush_label)
 
         # Anatomical edge labels. An upside-down or mirrored brain still looks
         # like a brain, so the only thing that says which way round it is, is
         # writing it on the edges.
-        if self._labels is not None:
+        if self._labels is not None and self.caption is None:
             p.setPen(QtGui.QColor(c.edge_label))
             top, right, bottom, left = self._labels
             r = self.rect()
@@ -706,7 +717,7 @@ class ImagePane(QtWidgets.QWidget):
                     self.turned.emit(step)
             return
         idx = self._to_indices(event.position())
-        if idx is not None:
+        if idx is not None and self.drag_picks:
             self.picked.emit(*idx)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)

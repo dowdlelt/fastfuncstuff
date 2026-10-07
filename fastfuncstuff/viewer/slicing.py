@@ -259,6 +259,12 @@ def plane_layout(affine: np.ndarray, plane: Plane) -> PlaneLayout:
     )
 
 
+def plane_normal(plane: Plane) -> tuple[str, str]:
+    """The plane's normal as anatomical letters: (positive side, negative side), e.g. S, I."""
+    normal = _PLANE_CONVENTION[plane][0]
+    return normal, _OPPOSITE[normal]
+
+
 def plane_axes(plane: Plane, affine: np.ndarray | None = None) -> tuple[int, int, int]:
     """``(fixed, row, col)`` display axes for a plane."""
     if affine is None:

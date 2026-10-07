@@ -22,7 +22,7 @@ from fastfuncstuff.viewer import align
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
 from fastfuncstuff.viewer.state import DisplayGrid, Plane, ViewerState
-from fastfuncstuff.viewer.viewports import ViewKind, clamp_grid
+from fastfuncstuff.viewer.viewports import MAX_STRIP, ViewKind, clamp_grid
 
 # ---------------------------------------------------------------------------
 # navigation
@@ -366,6 +366,19 @@ class SetViewTilt(Command):
     aspects = Aspect.VIEWPORTS | Aspect.SLICES
     view: str
     tilt: tuple[float, ...] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+
+@command
+@dataclass(frozen=True)
+class SetViewStrip(Command):
+    """An image window's neighbour strip: count (even, 0 = off), step in slices (0 = auto), zoom."""
+
+    name = "SET_VIEW_STRIP"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    count: int
+    step: int = 0
+    zoom: float = 4.0
 
 
 @command
@@ -1994,6 +2007,25 @@ def install(
         if not np.allclose(r @ r.T, np.eye(3), atol=1e-4) or np.linalg.det(r) <= 0:
             raise ValueError("a tilt must be a rotation")
         return _set_view(st, cmd.view, SetViewTilt.aspects, tilt=tuple(float(x) for x in r.ravel()))
+
+    @bus.handle(SetViewStrip.name)
+    def _set_view_strip(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewStrip)
+        count, step = int(cmd.count), int(cmd.step)
+        # Even, because the strip is symmetric about the main view: as many
+        # slices on one side as the other.
+        if count < 0 or count > MAX_STRIP or count % 2:
+            raise ValueError(f"a strip shows an even number of slices, 0 to {MAX_STRIP}")
+        if step < 0:
+            raise ValueError("strip step is in slices, 0 for auto")
+        return _set_view(
+            st,
+            cmd.view,
+            SetViewStrip.aspects,
+            strip=count,
+            strip_step=step,
+            strip_zoom=float(np.clip(cmd.zoom, 1.0, 32.0)),
+        )
 
     @bus.handle(SetViewSolo.name)
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:

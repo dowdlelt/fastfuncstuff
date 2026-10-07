@@ -26,6 +26,7 @@ from fastfuncstuff.viewer.surfaces import Grab
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.panes import ImagePane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.stripbar import StripBar
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     DeleteSurfaceVertex,
@@ -44,6 +45,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewPlane,
     SetViewPosition,
     SetViewSolo,
+    SetViewStrip,
     SetXYZ,
     SetZoom,
     SplitSurfaceEdge,
@@ -173,6 +175,18 @@ class ImageWindow(QtWidgets.QWidget):
         )
         self.highlight_button.clicked.connect(self._toggle_highlight_tool)
         bar.addWidget(self.highlight_button)
+        bar.addSpacing(6)
+
+        self.strip_button = self._button(
+            "STRIP",
+            "k",
+            "Neighbouring slices in a row under the image, cropped around the\n"
+            "crosshair: below on the left, above on the right. While editing a\n"
+            "surface they span the brush, so the edit can be seen fading out.\n"
+            "K count, alt+PgUp/PgDown spacing, alt+= / alt+- their zoom.",
+        )
+        self.strip_button.clicked.connect(self._toggle_strip)
+        bar.addWidget(self.strip_button)
         #: While a nudge is held: repeats it, from wherever the cursor now is.
         self._nudge_timer = QtCore.QTimer(self)
         self._nudge_timer.setInterval(self.NUDGE_REPEAT_MS)
@@ -223,7 +237,27 @@ class ImageWindow(QtWidgets.QWidget):
         #: (grab, press mm) of the drag in progress, if this window started one.
         self._edit: tuple[Grab, np.ndarray] | None = None
         self._edit_drag_mm: np.ndarray | None = None
-        v.addWidget(self.pane, 1)
+        self.strip = StripBar()
+        self.strip.picked.connect(self._strip_pick)
+        self.strip.zoomed.connect(self._strip_zoom_by)
+        self.strip.stepped.connect(self._step)
+        self.strip.setVisible(False)
+        #: The cells as last drawn, so a click or an outline refresh can find
+        #: which slice and crop each one shows.
+        self._strip_cells: list = []
+        #: The count ``k`` brings back after turning the strip off.
+        self._strip_last = 4
+        #: (grid ijk, crosshair then): where an edit grabbed, which the strip
+        #: centres on until the crosshair moves.
+        self._strip_focus: tuple[np.ndarray, tuple[int, int, int]] | None = None
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(3)
+        self.splitter.addWidget(self.pane)
+        self.splitter.addWidget(self.strip)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        v.addWidget(self.splitter, 1)
         # Two thirds of what it used to be. An EPI slice is 64 to 100 voxels
         # across, so a 420-pixel window was showing it at four times its own
         # resolution and spending most of the screen on interpolation -- and
@@ -432,6 +466,32 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("s", "label signal, then next", ask("signal"), group="review"),
                 Binding("n", "label noise, then next", ask("noise"), group="review"),
                 Binding("u", "clear the label", ask("unlabel"), group="review"),
+                Binding("k", "neighbour strip on / off", self.strip_button.click, group="strip"),
+                Binding("shift+k", "strip: 2 / 4 / 6 / 8 slices", self._cycle_strip, group="strip"),
+                Binding(
+                    "alt+PgUp",
+                    "strip: slices further apart",
+                    lambda: self._strip_step_by(1),
+                    group="strip",
+                ),
+                Binding(
+                    "alt+PgDown",
+                    "strip: closer (below 1: auto)",
+                    lambda: self._strip_step_by(-1),
+                    group="strip",
+                ),
+                Binding(
+                    "alt+=",
+                    "strip: zoom in",
+                    lambda: self._strip_zoom_by(1.25),
+                    group="strip",
+                    aliases=("alt++",),
+                ),
+                Binding(
+                    "alt+-", "strip: zoom out", lambda: self._strip_zoom_by(1 / 1.25), group="strip"
+                ),
+                Binding("click a cell", "go to that slice, there", None, group="strip"),
+                Binding("right-drag a cell", "strip zoom", None, group="strip"),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]
@@ -771,6 +831,7 @@ class ImageWindow(QtWidgets.QWidget):
             button.setChecked(plane is viewport.plane)
         self.solo_button.setChecked(viewport.solo)
         self.lock_button.setChecked(viewport.locked)
+        self.strip_button.setChecked(viewport.strip > 0)
         self.edit_button.setChecked(self.session.state.surface_editing)
         self.pane.plane = viewport.plane
 
@@ -795,6 +856,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_marks(self._selected_marks())
         self.pane.set_highlight(self._highlight_points())
         self._sync_brush()
+        self._redraw_strip(vp)
         if state.grid is not None:
             layout = plane_layout(state.grid.affine, vp.plane)
             extent = state.grid.shape[layout.fixed]
@@ -802,6 +864,156 @@ class ImageWindow(QtWidgets.QWidget):
             follow = "" if vp.locked else " parked"
             self.slice_label.setText(f"{'--' if pos is None else pos}/{extent - 1}{follow}")
         self.redraw_crosshair()
+
+    # -- neighbour strip ----------------------------------------------
+    def _set_strip(self, count: int | None = None, step: int | None = None, zoom=None) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        was = vp.strip
+        pane_h = self.pane.height()
+        count = vp.strip if count is None else count
+        self._dispatch(
+            SetViewStrip(
+                self.vid,
+                count,
+                vp.strip_step if step is None else step,
+                vp.strip_zoom if zoom is None else float(zoom),
+            )
+        )
+        if count and count != was:
+            self._fit_strip(pane_h, 0 if not was else self.strip.height())
+
+    def _fit_strip(self, pane_h: int, strip_h: int) -> None:
+        """Size the strip for square cells, growing or shrinking the window by
+        the difference so the main view keeps its size."""
+        h = self.strip.preferred_height(self.width())
+        self.resize(self.width(), self.height() + h - strip_h)
+        self.splitter.setSizes([pane_h, h])
+
+    def _focus_strip(self, at_mm) -> None:
+        """Centre the strip on an edit's grab point rather than the crosshair."""
+        grid = self._grid()
+        if grid is None:
+            return
+        inv = np.linalg.inv(grid.affine)
+        ijk = inv[:3, :3] @ np.asarray(at_mm, float) + inv[:3, 3]
+        self._strip_focus = (ijk, tuple(self.session.state.crosshair))
+        vp = self._viewport()
+        if vp is not None and vp.strip:
+            self._redraw_strip(vp)
+
+    def _strip_centre(self) -> np.ndarray | None:
+        if self._strip_focus is None:
+            return None
+        ijk, crosshair = self._strip_focus
+        if tuple(self.session.state.crosshair) != crosshair:
+            self._strip_focus = None  # the crosshair moved: back to following it
+            return None
+        return ijk
+
+    def _toggle_strip(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        if vp.strip:
+            self._strip_last = vp.strip
+            self._set_strip(0)
+        else:
+            self._set_strip(self._strip_last)
+
+    def _cycle_strip(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        n = 2 if vp.strip >= 8 or not vp.strip else vp.strip + 2
+        self._set_strip(n)
+        self.pane.show_toast(f"strip: {n} slices")
+
+    def _strip_step_by(self, delta: int) -> None:
+        from fastfuncstuff.viewer.strip import effective_step, slice_mm
+
+        vp = self._viewport()
+        state = self.session.state
+        if vp is None or state.grid is None:
+            return
+        if not vp.strip:
+            self._set_strip(self._strip_last)
+            vp = self._viewport()
+            assert vp is not None
+        step = max(0, effective_step(self.session, vp) + delta)
+        if vp.strip_step == 0 and delta < 0:
+            step = 0  # already at auto: nothing closer to go to
+        self._set_strip(step=step)
+        vp = self._viewport()
+        assert vp is not None
+        now = effective_step(self.session, vp)
+        mm = now * slice_mm(state.grid, plane_layout(state.grid.affine, vp.plane).fixed)
+        auto = "auto, " if not vp.strip_step else ""
+        self.pane.show_toast(f"strip step: {auto}{now} slice{'s' * (now != 1)} ({mm:.1f} mm)")
+
+    def _strip_zoom_by(self, factor: float) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._set_strip(zoom=max(1.0, min(vp.strip_zoom * factor, 32.0)))
+
+    def _redraw_strip(self, vp: Viewport) -> None:
+        from fastfuncstuff.viewer.strip import strip_cells
+
+        cells = strip_cells(self.session, vp, centre=self._strip_centre()) if vp.strip else []
+        self._strip_cells = cells
+        self.strip.setVisible(bool(cells))
+        if not cells:
+            return
+        state = self.session.state
+        self.strip.set_count(len(cells), vp.plane)
+        for pane, cell in zip(self.strip.cells, cells, strict=True):
+            pane.caption = cell.label
+            pane.set_pane(cell.image)
+            row, col = cell.view.to_image(state.crosshair)
+            pane.set_crosshair(row, col)
+        self._strip_outlines(None)
+
+    def _strip_outlines(self, only: set[tuple[str, str]] | None) -> None:
+        """Surface outlines in every cell -- live during a drag, which is the point."""
+        state = self.session.state
+        surfaces = self.session.surfaces
+        grid = self._grid()
+        for pane, cell in zip(self.strip.cells, self._strip_cells, strict=False):
+            pane.set_outline_width(state.surface_outline_width)
+            if (
+                not surfaces.hemis
+                or not state.surfaces_shown
+                or grid is None
+                or cell.position is None
+            ):
+                pane.set_outlines([])
+                continue
+            pane.set_outlines(
+                surfaces.outlines(
+                    grid.affine, cell.view, cell.position, state.surfaces_shown, only
+                ),
+                only=only,
+            )
+
+    def _strip_pick(self, index: int, row: int, col: int) -> None:
+        """A click in a cell: the crosshair to that point, in that slice."""
+        if index >= len(self._strip_cells):
+            return
+        cell = self._strip_cells[index]
+        state = self.session.state
+        vp = self._viewport()
+        grid = self._grid()
+        if cell.position is None or vp is None or grid is None:
+            return
+        ijk = list(cell.view.to_ijk(row, col, state.crosshair))
+        ijk[cell.view.layout.fixed] = cell.position
+        if not vp.locked:
+            self._dispatch(SetViewPosition(self.vid, int(cell.position)))
+        if grid.layout_affine is not None:
+            self._dispatch(SetXYZ(*grid.ijk_to_mm(tuple(float(v) for v in ijk))))
+        else:
+            self._dispatch(SetIJK(*ijk))
 
     # -- surface editing ----------------------------------------------
     def _brush_px(self) -> float | None:
@@ -822,6 +1034,10 @@ class ImageWindow(QtWidgets.QWidget):
         r = float(np.clip(r * factor, 0.5, 30.0))
         self._dispatch(SetSurfaceBrush(round(r, 2), snap, smooth, search, sign))
         self._sync_brush()
+        # The brush sets the auto spacing, and a brush change redraws nothing.
+        vp = self._viewport()
+        if vp is not None and vp.strip and not vp.strip_step:
+            self._redraw_strip(vp)
 
     def _toggle_snap(self) -> None:
         """Cycle snap -> edge -> hand.
@@ -966,6 +1182,8 @@ class ImageWindow(QtWidgets.QWidget):
         grab = surfaces.grab(grid.affine, view, pos, state.surfaces_shown, row, col, reach)
         if grab is None:
             return False
+        if self._nudge_at is None:
+            self._focus_strip(grab.at_mm)  # the press, not each repeat
         h = surfaces.hemis[grab.hemi]
         n = surfaces.surface_normal(grab.hemi, grab.surface, grab.vertex)
         away = float(n @ (h.states[grab.surface][grab.vertex] - np.asarray(grab.at_mm)))
@@ -1142,6 +1360,7 @@ class ImageWindow(QtWidgets.QWidget):
             # Not near an outline: the press still means "look here".
             self._pick(int(round(row)), int(round(col)), seed=False)
             return
+        self._focus_strip(grab.at_mm)
         if state.surface_tool == "point":
             self._dispatch(SelectSurfaceVertex(grab.hemi, grab.vertex))
             self._goto_selected()
@@ -1315,7 +1534,9 @@ class ImageWindow(QtWidgets.QWidget):
         """Only the outlines a drag can move -- the image is unchanged."""
         vp = self._viewport()
         if vp is not None:
-            self._redraw_outlines(vp, only=self.session.surfaces.editing_keys)
+            only = self.session.surfaces.editing_keys
+            self._redraw_outlines(vp, only=only)
+            self._strip_outlines(only)
 
     def _redraw_outlines(self, vp: Viewport, only: set[tuple[str, str]] | None = None) -> None:
         state = self.session.state

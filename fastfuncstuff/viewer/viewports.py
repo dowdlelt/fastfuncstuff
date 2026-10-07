@@ -66,6 +66,11 @@ class ViewKind(StrEnum):
     DEPTH = "depth"
 
 
+#: Most slices a neighbour strip shows. Past this each cell is too narrow to
+#: read a boundary in.
+MAX_STRIP = 12
+
+
 @dataclass(frozen=True)
 class Viewport:
     """One window: what it shows and how, but never any voxels.
@@ -99,6 +104,14 @@ class Viewport:
     #: registration actually did. Composite (the default) is the ordinary
     #: underlay/overlay behaviour.
     solo: bool = False
+    #: Neighbour strip under the image: how many cropped slices (0 = off,
+    #: half each side), how many slices apart (0 = auto: span the edit brush
+    #: while editing surfaces, else 1), and the crop's own zoom. Its own zoom
+    #: because the point is seeing the neighbourhood of the crosshair, which
+    #: the main view may be showing whole.
+    strip: int = 0
+    strip_step: int = 0
+    strip_zoom: float = 4.0
 
     # -- graph ---------------------------------------------------------
     grid_n: int = 2
@@ -383,6 +396,7 @@ def clamp_grid(n: int) -> int:
 
 __all__ = [
     "MAX_GRID",
+    "MAX_STRIP",
     "MIN_GRID",
     "Plane",
     "ViewKind",
