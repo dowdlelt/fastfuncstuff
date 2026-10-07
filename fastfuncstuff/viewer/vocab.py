@@ -834,6 +834,17 @@ class SetPatchSize(Command):
 
 @command
 @dataclass(frozen=True)
+class SetPatchLayer(Command):
+    """Which layer a CHEDI window samples, by key; empty follows the layer selection."""
+
+    name = "SET_PATCH_LAYER"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetViewSampling(Command):
     """How a window reads voxels onto what it draws: nearest, linear or cubic."""
 
@@ -2087,6 +2098,13 @@ def install(
         assert isinstance(cmd, SetPatchSize)
         mm = float(np.clip(cmd.mm, 3.0, 100.0))
         return _set_view(st, cmd.view, SetPatchSize.aspects, patch_mm=round(mm, 2))
+
+    @bus.handle(SetPatchLayer.name)
+    def _set_patch_layer(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetPatchLayer)
+        if cmd.key and st.layers.find(cmd.key) is None:
+            raise ValueError(f"no layer {cmd.key!r}")
+        return _set_view(st, cmd.view, SetPatchLayer.aspects, patch_layer=cmd.key)
 
     @bus.handle(SetViewSampling.name)
     def _set_view_sampling(cmd: Command, st: ViewerState) -> Aspect:

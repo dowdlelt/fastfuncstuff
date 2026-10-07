@@ -219,6 +219,9 @@ class Viewport:
     #: nearest (the voxels themselves), linear or cubic. Depth is ``depth[0]``.
     patch_mm: float = 25.0
     sampling: str = "nearest"
+    #: The layer it samples, by key; empty follows the selection (see
+    #: ``ChediWindow.layer``).
+    patch_layer: str = ""
 
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.

@@ -40,6 +40,7 @@ from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     HighlightSurface,
     MoveSurfaceHighlight,
+    SetPatchLayer,
     SetPatchSize,
     SetSurfaceDepth,
     SetSurfaceStep,
@@ -314,6 +315,12 @@ class ChediWindow(QtWidgets.QWidget):
                     "n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"
                 ),
                 Binding(
+                    "l",
+                    "sample: follow the selection / each layer in turn",
+                    self._cycle_layer,
+                    group="view",
+                ),
+                Binding(
                     "shift+click",
                     "crosshair there; the other windows centre on it",
                     None,
@@ -389,8 +396,22 @@ class ChediWindow(QtWidgets.QWidget):
             nxt = MODES[(MODES.index(vp.sampling) + 1) % len(MODES)]
             self._dispatch(SetViewSampling(self.vid, nxt))
 
+    def _cycle_layer(self) -> None:
+        """l: follow the selection -> each loaded layer, bottom to top -> follow again."""
+        vp = self._viewport()
+        if vp is None:
+            return
+        keys = ["", *(layer.key for layer in self.session.state.layers)]
+        now = vp.patch_layer if vp.patch_layer in keys else ""
+        nxt = keys[(keys.index(now) + 1) % len(keys)]
+        self._dispatch(SetPatchLayer(self.vid, nxt))
+        layer = self.layer()
+        name = layer.name if layer is not None else "nothing"
+        self.status.setText(f"samples {name}" + ("" if nxt else " (following the selection)"))
+
     def layer(self):
-        """What the wall shows: the selected layer, else the top visible overlay, else the base.
+        """What the wall shows: the layer ``l`` picked; else the selected layer, else
+        the top visible overlay, else the base.
 
         The overlay rather than the base because the base is usually what the
         slices are anchored to, and the image worth judging the mesh against
@@ -398,6 +419,11 @@ class ChediWindow(QtWidgets.QWidget):
         Selecting a layer is how to choose.
         """
         layers = self.session.state.layers
+        vp = self._viewport()
+        if vp is not None and vp.patch_layer:
+            picked = layers.find(vp.patch_layer)
+            if picked is not None:
+                return picked
         base = layers.base
         selected = self.session.state.selected_layer()
         if selected is not None and (base is None or selected.key != base.key):

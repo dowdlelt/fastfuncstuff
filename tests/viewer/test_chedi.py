@@ -376,3 +376,24 @@ def test_o_shows_gyri_and_sulci_and_f_g_unselect_them(chedi, subject):
     assert kept.size and np.all(h.states["white"][kept, 0] > 0)
     win._drop_fold(1)
     assert session.surfaces.highlighted("lh").size == 0
+
+
+def test_l_picks_the_sampled_layer_including_the_base_under_an_overlay(chedi, tmp_path):
+    import shutil
+
+    from fastfuncstuff.viewer.vocab import Load
+
+    session, win = chedi
+    base = session.state.layers.base
+    shutil.copy(session.store.get(base.key).path, tmp_path / "t2.nii.gz")
+    session.do(Load(str(tmp_path / "t2.nii.gz"), "T2"))
+    win.refresh()
+    assert win.layer().key == "T2"  # following: the overlay
+    win._cycle_layer()
+    assert win.layer().key == base.key  # the base, though an overlay is visible
+    assert base.name in win.canvas.caption
+    win._cycle_layer()
+    assert win.layer().key == "T2"
+    win._cycle_layer()
+    assert session.state.viewports.get("E1").patch_layer == ""
+    assert "SET_PATCH_LAYER E1" in session.to_script()
