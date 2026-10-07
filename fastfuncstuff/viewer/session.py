@@ -1399,8 +1399,11 @@ class ViewerSession:
             return res.array[..., idx]
         return self.store.preview(key, idx)
 
-    def surface_sampler(self, key: str | None = None):
+    def surface_sampler(self, key: str | None = None, mode: str = "linear"):
         """The image a surface edit snaps to: ``key``'s current volume, or the bottom layer's.
+
+        ``mode`` (nearest / linear / cubic) is how a view reads it; edits snap
+        with linear. Every mode shares the one cached copy of the voxels.
 
         Built on the CPU from the layer's own voxels and affine -- an edit
         reads a few thousand points, which a device round trip would only
@@ -1415,10 +1418,10 @@ class ViewerSession:
         cache = (layer.key, int(idx), np.asarray(layer.affine).tobytes())
         hit = getattr(self, "_surface_sampler", None)
         if hit is not None and hit[0] == cache:
-            return hit[1]
+            return hit[1].with_mode(mode)
         sampler = VolumeSampler(self.volume(layer.key, int(idx)), layer.affine)
         self._surface_sampler = (cache, sampler)
-        return sampler
+        return sampler.with_mode(mode)
 
     def display_volume(self, key: str, index: int | None = None) -> torch.Tensor | None:
         """The currently displayed sub-brick as a device tensor, cached.
