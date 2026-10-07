@@ -2149,6 +2149,37 @@ def test_do_mni_stays_out_of_the_grandmean_chain():
     assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D"' not in s
 
 
+def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
+    """-surface_target: the SAME one interpolation as stage10, read at surface points.
+    The surfaces live in the anat's scanner space, so the MNI links must not be in
+    the chain and the master is $ANAT, not the (MNI) warpmaster."""
+    s = _skull_script(
+        do_mni=True,
+        mni_template="/t/MNI.nii.gz",
+        surface_target="onavg-ico64",
+        fs_subject="/fs/sub-X",
+    )
+    surf = [line for line in s.splitlines() if line.startswith("SURFCHAIN[")]
+    chain = [line for line in s.splitlines() if line.startswith("CHAIN[")]
+    assert len(surf) == len(chain) == 2
+    for sc, c in zip(surf, chain, strict=True):
+        links = c.split('="')[1].rstrip('"').split()
+        assert sc.split('="')[1].rstrip('"').split() == [x for x in links if "mni" not in x]
+    assert "stage10s" in s and "skip_surface=1" in s
+    line = next(x for x in s.splitlines() if "SURFCHAIN[$k]" in x and "printf" in x)
+    assert '-master \\"$ANAT\\"' in line
+    assert "-surf /fs/sub-X -surf_mesh onavg-ico64" in line
+    assert "-dxyz" not in line and "-save_mean" not in line
+    # one interpolation per run from the raw series, never from stage10's output
+    assert "stage10.final" not in line
+    assert s.index("== stage10: final") < s.index("== stage10s: surface")
+
+
+def test_no_surface_target_emits_no_surface_stage():
+    s = _skull_script()
+    assert "SURFCHAIN" not in s and "stage10s" not in s and "skip_surface" not in s
+
+
 def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
     """-glm_blur smooths inside ffs_reml and labels the outputs, so a second FWHM
     is a stage12-only re-run that does not overwrite the first fit."""

@@ -230,6 +230,10 @@ class Options:
     tpm_source: str | None = None  # QC anat-in-EPI source for ffs_segment
     fs_tpm: bool = False  # build the TPM in-script from FreeSurfer (SUMA) outputs
     suma_dir: str | None = None  # FreeSurfer SUMA dir (aseg.auto + SurfVol for the TPM)
+    # -surface_target: also sample every run onto this cortical mesh (ffs_nwarp -surf),
+    # same chain minus the MNI links, master = the anat. fs_subject holds surf/.
+    surface_target: str | None = None
+    fs_subject: str | None = None
     events: list[str] | None = None  # events TSV(s) passed directly (bids format)
     # Explicit reference override (alternative to -grand_reference DIR): an EPI
     # contrast image to align to, the nwarp-order matrices mapping it to anat, and

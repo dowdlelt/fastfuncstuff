@@ -1180,12 +1180,18 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   recipe            : {opt.recipe or "(none)"}
 #   reference session : {plan.ref_session}
 #   sessions          : {"multi" if plan.multi_session else "single"}
-#   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {opt.distortion}   slice-timing : {opt.slicetiming_method}
+#   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {
+        opt.distortion
+    }   slice-timing : {opt.slicetiming_method}
 #   phase  : {_phase_on(plan)}{_timing_header_note(plan)}{_cut_header_note(plan)}
 #   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
 #   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
-#   ref image         : {opt.ref_image or "grandmean"} (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{_qc_header_note(plan)}
-# ============================================================================={_invocation_note(invocation)}
+#   ref image         : {
+        opt.ref_image or "grandmean"
+    } (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{_qc_header_note(plan)}
+# ============================================================================={
+        _invocation_note(invocation)
+    }
 set -euo pipefail
 
 OUT={shlex.quote(out_dir)}
@@ -1214,7 +1220,9 @@ trap _ffs_toc EXIT
 # The batched moco + final stages pass their toggle to the tool as -batch_skip.
 skip_nordic=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
 skip_xfmap=1  skip_xrun=1 skip_runmean=1 skip_xses=1 skip_anat=1
-skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
+skip_final={_skip_default(opt)} skip_stats=1{phase_skip}{
+        f" skip_surface={_skip_default(opt)}" if opt.surface_target else ""
+    }
 """
 
 
@@ -1298,6 +1306,15 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         lines.append(f'AVGCHAIN[{q(k)}]="{" ".join(avg)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
+        if plan.options.surface_target:
+            # The surfaces live in the anat's scanner space: the chain stops there.
+            surf = chain_files(
+                pr,
+                ".nii$FMT",
+                plan.options,
+                tokens=[t for t in pr.warp_chain if t not in _MNI_TOKENS],
+            )
+            lines.append(f'SURFCHAIN[{q(k)}]="{" ".join(surf)}"')
         # Jacobian modulation for the fieldmap link, wherever that chain is
         # applied to data (stage07, stage10). Empty for a run with no fmap.
         jac = _jac_spec(pr)
@@ -3055,17 +3072,22 @@ def _stage_warpmaster(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
-def _stage_final(plan: Plan, script_stem: str) -> str:
+def _final_st_line(plan: Plan) -> str:
+    """Bash setting ``st_str``: the -tpattern flags a final resample folds slice timing
+    in with (``-slicetiming_method integrate``), or nothing."""
     opt = plan.options
-    if opt.slicetiming_method == "integrate":
-        st = (
-            f"  tp={_tpattern(plan)}; " + 'tr="${TR[$k]}"\n'
-            '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" '
-            f'-tzero {opt.tzero:g}"; '
-            'else st_str=""; fi'
-        )
-    else:
-        st = '  st_str=""'
+    if opt.slicetiming_method != "integrate":
+        return '  st_str=""'
+    return (
+        f"  tp={_tpattern(plan)}; " + 'tr="${TR[$k]}"\n'
+        '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" '
+        f'-tzero {opt.tzero:g}"; '
+        'else st_str=""; fi'
+    )
+
+
+def _stage_final(plan: Plan, script_stem: str) -> str:
+    st = _final_st_line(plan)
     nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
     batchfile = f"{script_stem}_nwarpbatch.txt"
     # Phase rides the magnitude's chain in the same single interpolation.
@@ -3114,6 +3136,45 @@ done
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
 echo 'done → stage10.final.*'
 {_qc_final(plan)}
+"""
+
+
+_MNI_TOKENS = ("mni_nl", "mni_lin")
+
+
+def _stage_surface(plan: Plan, script_stem: str) -> str:
+    """stage10s: every run onto the cortical mesh, through the same chain (minus MNI).
+
+    One interpolation from the raw series, exactly like stage10 -- the surface points
+    replace the master grid. The master is the anat ($ANAT) because the FreeSurfer
+    surfaces share its scanner space; the chain ends there.
+    """
+    opt = plan.options
+    if not opt.surface_target:
+        return ""
+    assert opt.fs_subject is not None
+    st = _final_st_line(plan)
+    nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
+    batchfile = f"{script_stem}_surfbatch.txt"
+    surf = f"-surf {shlex.quote(opt.fs_subject)} -surf_mesh {shlex.quote(opt.surface_target)}"
+    return f"""
+# ============================ stage10s: onto the cortical surface ==========
+# The same single interpolation as stage10, read at cortical surface points instead
+# of the warpmaster grid: footprint reads on the equivolume mid-surface of
+# {opt.surface_target}, placed in this subject through ?h.sphere.reg when it is a
+# template. SURFCHAIN is CHAIN without the MNI links; the master is $ANAT, whose
+# scanner space the FreeSurfer surfaces share. skip_surface=1 -> -batch_skip.
+echo '== stage10s: surface sampling =='
+surfbatch="{batchfile}"
+: > "$surfbatch"
+for k in "${{RUN_KEYS[@]}}"; do
+{st}
+{_raw_source(plan)}
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{SURFCHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master \\"$ANAT\\" {nwarp_flags} $st_str {surf} -prefix \\"stage10s.surf.${{FRAG[$k]}}\\"" >> "$surfbatch"
+done
+batch_skip=(); [ "$skip_surface" -eq 1 ] && batch_skip=(-batch_skip)
+ffs_nwarp -batch "$surfbatch" "${{batch_skip[@]}}" -device "$DEVICE"
+echo 'done -> stage10s.surf.*.?h.func.gii'
 """
 
 
@@ -3761,6 +3822,7 @@ def write_script(
         _stage_anat(plan),
         _stage_warpmaster(plan),
         _stage_final(plan, script_stem),
+        _stage_surface(plan, script_stem),
         _stage_masks(plan),
         _stage_stats(plan, bids_root),
     ]

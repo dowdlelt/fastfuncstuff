@@ -152,6 +152,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
     )
     g.add_argument(
+        "-surface_target",
+        "-surface-target",
+        default=None,
+        metavar="MESH",
+        help="also sample every run onto a cortical mesh in the SAME single interpolation "
+        "(ffs_nwarp -surf): 'native' for the subject's own vertices, or a FreeSurfer-format "
+        "template on fsaverage's sphere by path or by name beside the subject (e.g. "
+        "onavg-ico64) for group-ready output. The chain is each run's own up to the anat "
+        "(never the MNI links), read at footprint points on the equivolume mid-surface. "
+        "Writes stage10s.surf.<run>.?h.func.gii. Needs the FreeSurfer subject: -fs_subject, "
+        "or the folder above -suma.",
+    )
+    g.add_argument(
+        "-fs_subject",
+        "-fs-subject",
+        default=None,
+        metavar="DIR",
+        help="FreeSurfer subject folder (with surf/) for -surface_target; defaults to the "
+        "parent of -suma. Its surfaces must share scanner space with the anat.",
+    )
+    g.add_argument(
         "-do_mni",
         "-do-mni",
         action="store_true",
@@ -1028,6 +1049,23 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     f"and it is not there: {', '.join(absent)}. Re-run the reference with "
                     "-do_mni first."
                 )
+    if opt.surface_target:
+        if not opt.go_to_anat or opt.grand_reference or opt.ref_file:
+            errors.append(
+                "-surface_target samples through the chain to THIS pipeline's own anat; it "
+                "needs an anat alignment here (not -no_anat, -grand_reference or -ref_file)."
+            )
+        if opt.fs_subject is None:
+            errors.append("-surface_target needs the FreeSurfer subject: -fs_subject DIR or -suma.")
+        elif not (Path(opt.fs_subject) / "surf").is_dir():
+            errors.append(f"-fs_subject has no surf/ folder: {opt.fs_subject}")
+        elif opt.surface_target != "native":
+            from fastfuncstuff.processing.surface_projection import resolve_mesh
+
+            try:
+                resolve_mesh(opt.surface_target, opt.fs_subject)
+            except FileNotFoundError as exc:
+                errors.append(str(exc).replace("-surf_mesh", "-surface_target"))
     if opt.slicetiming_method != "none" and opt.tr is None:
         # Slice timing needs a TR per run; the sidecar is the only source here.
         no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]
@@ -1814,6 +1852,8 @@ def main(argv: list[str] | None = None) -> int:
         tpm_source=tpm_source,
         fs_tpm=fs_tpm,
         suma_dir=args.suma,
+        surface_target=args.surface_target,
+        fs_subject=args.fs_subject or (str(Path(args.suma).parent) if args.suma else None),
         ref_file=args.ref_file,
         ref_transforms=args.ref_transforms,
         ref_anat=args.ref_anat,
