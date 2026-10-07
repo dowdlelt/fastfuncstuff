@@ -229,3 +229,137 @@ def test_the_window_lists_shows_uses_and_follows_edits(tmp_path):
     finally:
         win.close()
         session.close()
+
+
+@pytest.fixture
+def loose(tmp_path):
+    """A white and a pial file in a plain directory: no subject around them."""
+    import shutil
+
+    subj = _subject(tmp_path)
+    out = tmp_path / "loose"
+    out.mkdir()
+    for name in ("lh.white", "lh.pial"):
+        shutil.copy(subj / "surf" / name, out / name)
+    shutil.rmtree(subj)
+    from fastfuncstuff.viewer.session import ViewerSession
+
+    s = ViewerSession(device=CPU)
+    s.load(str(_shell_anat(tmp_path)))
+    yield s, out
+    s.close()
+
+
+def test_a_lone_mesh_loads_without_a_subject_and_samples_on_itself(loose):
+    from fastfuncstuff.viewer.surface3d import shape_positions
+    from fastfuncstuff.viewer.vocab import LoadMesh
+
+    session, out = loose
+    session.do(LoadMesh(str(out / "lh.pial"), "lh", "pial"))
+    surfaces = session.surfaces
+    h = surfaces.hemis["lh"]
+    assert surfaces.subject is None and surfaces.stand_ins == {"lh": "white"}
+    # The missing boundary is the surface itself, so the ribbon has no depth.
+    assert h.states["white"] is h.states["pial"]
+    assert np.allclose(shape_positions(h, "mid"), h.states["pial"])
+    assert [(r.name, surfaces.is_active(r)) for r in surfaces.meshes] == [("lh.pial", True)]
+    # Only the real surface is outlined: the stand-in would draw on top of it.
+    radii = _outline_radii(session)
+    assert set(radii) == {"pial"} and radii["pial"] == pytest.approx(RADIUS * 1.2, abs=1.0)
+    # And a script rebuilds it with no subject either.
+    from fastfuncstuff.viewer.session import ViewerSession
+
+    again = ViewerSession(device=CPU)
+    try:
+        again.run_script(session.to_script())
+        assert again.surfaces.stand_ins == {"lh": "white"}
+        assert np.array_equal(again.surfaces.hemis["lh"].states["pial"], h.states["pial"])
+    finally:
+        again.close()
+
+
+def test_the_partner_fills_the_gap_above_a_mesh_that_could_not(loose, tmp_path):
+    from fastfuncstuff.viewer.vocab import LoadMesh, UseMesh
+
+    session, out = loose
+    session.do(LoadMesh(str(out / "lh.pial"), "lh", "pial"))
+    surfaces = session.surfaces
+    # Another mesh, labelled white: it cannot fill the gap, so it is a comparison.
+    nfs.write_geometry(
+        str(out / "lh.white.other"),
+        *_sphere(RADIUS, 1000),
+        volume_info=nfs.read_geometry(str(out / "lh.pial"), read_metadata=True)[2],
+    )
+    session.do(LoadMesh(str(out / "lh.white.other"), "lh", "white"))
+    assert surfaces.stand_ins == {"lh": "white"}
+    other = surfaces.meshes[-1]
+    assert not surfaces.is_active(other)
+    with pytest.raises(ValueError, match="not the same mesh"):
+        session.do(UseMesh(other.key))
+    session.do(LoadMesh(str(out / "lh.white"), "lh", "white"))
+    h = surfaces.hemis["lh"]
+    assert surfaces.stand_ins == {}
+    assert h.states["white"] is not h.states["pial"]
+    white = surfaces.active_mesh("lh", "white")
+    assert white is not None and white.name == "lh.white"
+    assert [r.name for r in surfaces.meshes] == ["lh.pial", "lh.white", "lh.white.other"]
+    radii = _outline_radii(session)
+    assert radii.keys() == {"white", "pial", other.key}
+    assert radii["white"] == pytest.approx(RADIUS, abs=1.0)
+    assert radii["pial"] == pytest.approx(RADIUS * 1.2, abs=1.0)
+
+
+def test_a_lone_surface_edits_without_a_partner_but_not_its_topology(loose):
+    from fastfuncstuff.viewer.vocab import LoadMesh
+
+    session, out = loose
+    session.do(LoadMesh(str(out / "lh.white"), "lh", "white"))
+    h = session.surfaces.hemis["lh"]
+    before = h.states["white"].copy()
+    session.do(_edit(session))
+    moved = np.linalg.norm(h.states["white"] - before, axis=1)
+    assert moved.max() > 0.1
+    assert h.states["pial"] is h.states["white"]
+    with pytest.raises(ValueError, match="loose mesh files"):
+        session.surfaces.delete_vertex("lh", 0)
+
+
+def test_the_mesh_window_opens_and_loads_with_no_subject(tmp_path):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.meshwindow import NAME
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+
+    path = _subject(tmp_path) / "surf" / "lh.pial"
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=CPU)
+    win = ViewerWindow(session)
+    try:
+        win.open_path(str(_shell_anat(tmp_path)))
+        win._open_meshes()
+        meshes = win.mesh_window
+        assert meshes is not None and meshes.load_button.isEnabled()
+        meshes.load_path(str(path))
+        app.processEvents()
+        assert meshes.table.item(0, NAME).text() == "● lh.pial"
+        assert "depth sampling is on this surface" in meshes.status.text()
+    finally:
+        win.close()
+        session.close()
+
+
+def test_cli_mesh_flag_loads_headless_and_refuses_an_unnamed_file(tmp_path, capsys):
+    import shutil
+
+    from fastfuncstuff.cli.viewer import main
+
+    surf = _subject(tmp_path) / "surf"
+    anat = _shell_anat(tmp_path)
+    assert main(["-no_window", "-device", "cpu", "-mesh", str(surf / "lh.white"), str(anat)]) == 0
+    assert "LOAD_MESH" in capsys.readouterr().out
+    shutil.copy(surf / "lh.white", tmp_path / "mesh.surf")
+    with pytest.raises(SystemExit, match="hemisphere"):
+        main(["-no_window", "-device", "cpu", "-mesh", str(tmp_path / "mesh.surf")])

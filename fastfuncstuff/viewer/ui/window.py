@@ -510,7 +510,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ),
             (
                 "MESH",
-                "Mesh list: compare, load, use and back up white/pial meshes (ctrl+M)",
+                "Mesh list: load, compare, use and back up white/pial meshes -- no subject needed (ctrl+M)",
                 self._open_meshes,
             ),
         ):
@@ -956,14 +956,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _new_surface(self) -> None:
         if not self.session.surfaces.hemis:
-            self.statusBar().showMessage("surface window: load a subject first (SURF)", 5000)
+            self.statusBar().showMessage(
+                "surface window: load a subject (SURF) or a mesh (MESH) first", 5000
+            )
             return
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
     def _new_chedi(self) -> None:
         if not self.session.surfaces.hemis:
-            self.statusBar().showMessage("chedi: load a subject first (SURF)", 5000)
+            self.statusBar().showMessage(
+                "chedi: load a subject (SURF) or a mesh (MESH) first", 5000
+            )
             return
         self.manager.open(ViewKind.CHEDI, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
@@ -971,9 +975,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _open_meshes(self) -> None:
         from fastfuncstuff.viewer.ui.meshwindow import MeshWindow
 
-        if not self.session.surfaces.hemis:
-            self.statusBar().showMessage("meshes: load a subject first (SURF)", 5000)
-            return
         if self.mesh_window is None:
             self.mesh_window = MeshWindow(lambda: self.session, self._dispatch, self)
         self.mesh_window.refresh()
@@ -982,14 +983,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _new_depth(self) -> None:
         if not self.session.surfaces.hemis:
-            self.statusBar().showMessage("depth profiles: load a subject first (SURF)", 5000)
+            self.statusBar().showMessage(
+                "depth profiles: load a subject (SURF) or a mesh (MESH) first", 5000
+            )
             return
         self.manager.open(ViewKind.DEPTH, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
     def _new_profiles(self) -> None:
         if not self.session.surfaces.hemis:
-            self.statusBar().showMessage("profile column: load a subject first (SURF)", 5000)
+            self.statusBar().showMessage(
+                "profile column: load a subject (SURF) or a mesh (MESH) first", 5000
+            )
             return
         self.statusBar().showMessage("profile column: sampling every vertex...", 3000)
         self.manager.open(ViewKind.PROFILE, Plane.AXIAL)
@@ -2443,6 +2448,7 @@ def launch(
     script: str | None = None,
     directory: str | None = None,
     surfaces: str | None = None,
+    meshes: list[str] | None = None,
 ) -> int:
     """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
@@ -2465,6 +2471,12 @@ def launch(
         win.open_path(p)
     if surfaces:
         win.load_surfaces(surfaces)
+    if meshes:
+        win._open_meshes()
+        assert win.mesh_window is not None
+        for m in meshes:
+            # The mesh window's loader asks for whatever the name doesn't say.
+            win.mesh_window.load_path(m)
     if script:
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()

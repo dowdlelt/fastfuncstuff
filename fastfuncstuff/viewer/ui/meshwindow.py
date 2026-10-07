@@ -1,6 +1,7 @@
 """The mesh list window: which white/pial meshes are loaded, drawn, and in use.
 
-One row per mesh, top to bottom in list order; per hemisphere and type the
+No subject is needed: a file loaded for a hemisphere that is not loaded yet
+becomes that hemisphere. One row per mesh, top to bottom in list order; per hemisphere and type the
 top-most row is the one edits, depth sampling and depth maps act on, and is
 marked ``●``. Every change goes through a recorded command except Bak, which
 is a safety copy and not part of what a script rebuilds.
@@ -75,7 +76,9 @@ class MeshWindow(QtWidgets.QWidget):
         self.load_button = self._make_button(
             "LOAD…",
             "Add a white or pial surface file to the bottom of the list, shown\n"
-            "for comparison. Hemi and type are read from the filename.",
+            "for comparison. Hemi and type are read from the filename.\n"
+            "With no subject loaded, the first file of a hemisphere is used, and\n"
+            "its white/pial partner fills the gap when loaded.",
             self._load,
         )
         self.save_button = self._make_button(
@@ -198,7 +201,6 @@ class MeshWindow(QtWidgets.QWidget):
         self.use_button.setEnabled(row is not None and not active)
         self.remove_button.setEnabled(row is not None and not active)
         self.save_button.setEnabled(row is not None)
-        self.load_button.setEnabled(bool(surfaces.hemis))
         self.bak_button.setEnabled(bool(surfaces.hemis))
 
     # -- actions -----------------------------------------------------------
@@ -234,7 +236,8 @@ class MeshWindow(QtWidgets.QWidget):
         surfaces = self.surfaces
         if surfaces.subject is not None:
             return str(Path(surfaces.subject) / "surf")
-        return str(Path.cwd())
+        loaded = [row.path for row in surfaces.meshes if row.path is not None]
+        return str(loaded[-1].parent if loaded else Path.cwd())
 
     def _load(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -246,13 +249,19 @@ class MeshWindow(QtWidgets.QWidget):
     def load_path(self, path: str) -> None:
         """Load a file, asking only for what its name does not say."""
         hemi, kind = infer_label(path)
-        hemis = sorted(self.surfaces.hemis)
-        if hemi not in hemis:
-            if len(hemis) == 1:
-                hemi = hemis[0]
+        loaded = sorted(self.surfaces.hemis)
+        if hemi is None:
+            if len(loaded) == 1:
+                hemi = loaded[0]
             else:
+                # Either hemisphere, loaded or not: a new one is made from the file.
                 hemi, ok = QtWidgets.QInputDialog.getItem(
-                    self, "Hemisphere", f"Which hemisphere is {Path(path).name}?", hemis, 0, False
+                    self,
+                    "Hemisphere",
+                    f"Which hemisphere is {Path(path).name}?",
+                    ["lh", "rh"],
+                    0,
+                    False,
                 )
                 if not ok:
                     return
@@ -269,7 +278,13 @@ class MeshWindow(QtWidgets.QWidget):
                 return
             kind = "pial" if text == "pial" else "white"
         if self._do(LoadMesh(path, hemi, kind)):
-            self.status.setText(f"loaded {Path(path).name} as {hemi} {KIND_TEXT[kind]}")
+            missing = self.surfaces.stand_ins.get(hemi)
+            note = (
+                f" -- no {KIND_TEXT[missing]} yet, so depth sampling is on this surface"
+                if missing is not None
+                else ""
+            )
+            self.status.setText(f"loaded {Path(path).name} as {hemi} {KIND_TEXT[kind]}{note}")
 
     def _save(self) -> None:
         row = self._selected()

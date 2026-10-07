@@ -751,7 +751,11 @@ class SaveSurfaces(Command):
 @command
 @dataclass(frozen=True)
 class LoadMesh(Command):
-    """Add a white or pial surface file to the mesh list, last: shown for comparison, not in use."""
+    """Add a white or pial surface file to the mesh list, last: shown for comparison, not in use.
+
+    No subject needed: for a hemisphere not loaded yet the file *becomes* it,
+    in use, and the white/pial partner it lacks fills in when loaded.
+    """
 
     name = "LOAD_MESH"
     aspects = Aspect.SLICES

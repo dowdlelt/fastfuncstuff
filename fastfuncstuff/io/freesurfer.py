@@ -232,6 +232,24 @@ def read_scanner_surface(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarra
     return _apply(tkr_to_scanner(s.volume_info), s.vertices), s.faces
 
 
+def hemisphere_from_file(path: str | os.PathLike, hemi: str, state: str) -> Hemisphere:
+    """A hemisphere holding one surface file as ``state``, for a mesh without its subject.
+
+    No morph data, patches or cortex label: those live beside the surface in
+    a subject directory, and a lone file says nothing about where that is.
+    """
+    path = Path(path)
+    s = read_surface(path)
+    to_scanner = tkr_to_scanner(s.volume_info)
+    return Hemisphere(
+        name=hemi,
+        faces=s.faces,
+        states={state: _apply(to_scanner, s.vertices)},
+        tkr_to_scanner=to_scanner,
+        paths={state: path},
+    )
+
+
 def write_positions_like(
     path: str | os.PathLike,
     template: str | os.PathLike,

@@ -166,6 +166,14 @@ class SurfaceStore:
         self._loaded_count = 0
         #: Bumped when the list changes, so its window knows to rebuild.
         self.meshes_version = 0
+        #: Hemispheres built from loose mesh files rather than a subject:
+        #: no morph data, atlases or bundle to edit topology through.
+        self.bare: set[str] = set()
+        #: Per bare hemisphere missing white or pial, the kind it is missing.
+        #: Its state is the *same array* as the one present, so everything
+        #: that samples between white and pial samples on the surface itself,
+        #: and an edit of the one moves the other. Never drawn or grabbed.
+        self.stand_ins: dict[str, str] = {}
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -173,6 +181,8 @@ class SurfaceStore:
             raise FileNotFoundError(f"no ?h.white surfaces under {subject_dir}/surf")
         self.subject = Path(subject_dir)
         self.hemis = loaded
+        self.bare.clear()
+        self.stand_ins.clear()
         self._reset_edits()
         for h in loaded:
             self.version[h] = self.version.get(h, 0) + 1
@@ -181,6 +191,8 @@ class SurfaceStore:
     def clear(self) -> None:
         self.subject = None
         self.hemis = {}
+        self.bare.clear()
+        self.stand_ins.clear()
         self._reset_edits()
         self._init_meshes()
 
@@ -274,6 +286,8 @@ class SurfaceStore:
                 if surface not in ANATOMICAL:
                     continue
                 if only is not None and (hemi, surface) not in only:
+                    continue
+                if self.stand_ins.get(hemi) == surface:
                     continue
                 rgb = OUTLINE_RGB.get(surface, (1.0, 1.0, 1.0))
                 row = self.active_mesh(hemi, surface) if surface in KINDS else None
@@ -706,6 +720,11 @@ class SurfaceStore:
     def _topology_edit(self, hemi: str, change, entry: dict):
         from fastfuncstuff.surface.topology import MeshBundle
 
+        if hemi in self.bare:
+            raise ValueError(
+                f"{hemi} was loaded from loose mesh files: topology edits need its subject "
+                "(every surface and per-vertex file of the mesh changes together)"
+            )
         had = hemi in self._bundles
         bundle, src = self._bundle(hemi)
         assert isinstance(bundle, MeshBundle)
@@ -772,7 +791,7 @@ class SurfaceStore:
         best: tuple[float, str, str, int] | None = None
         for hemi in self.hemis:
             for surface in shown:
-                if surface not in PARTNER:
+                if surface not in PARTNER or self.stand_ins.get(hemi) == surface:
                     continue
                 index = self._slice_index(hemi, surface, grid_affine)
                 if index is None:
@@ -798,7 +817,10 @@ class SurfaceStore:
         """Start a drag: the brush is fixed here, every preview starts from here."""
         h = self.hemis[grab.hemi]
         topo = self.topology(grab.hemi)
-        partner = h.states.get(PARTNER[grab.surface])
+        # A lone surface has no partner to keep its side of: its stand-in is
+        # itself, and would pin every vertex in place.
+        lone = self.stand_ins.get(grab.hemi) == PARTNER[grab.surface]
+        partner = None if lone else h.states.get(PARTNER[grab.surface])
         edit = SurfaceEdit(
             h.states[grab.surface],
             topo,
@@ -1083,6 +1105,9 @@ class SurfaceStore:
             tmp.replace(original)
             if surface in self.hemis[hemi].states:
                 self.hemis[hemi].states[surface] = positions[(hemi, surface)].astype(np.float32)
+                missing = self.stand_ins.get(hemi)
+                if missing == PARTNER.get(surface):
+                    self.hemis[hemi].states[missing] = self.hemis[hemi].states[surface]
         # A hemisphere whose topology changed: every file of its mesh, the same way.
         by_original = dict(plan.files[len(geometric) :])
         for hemi in sorted(self.topology_changed):
@@ -1156,6 +1181,8 @@ class SurfaceStore:
         self._loaded_count = 0
         for hemi, h in self.hemis.items():
             for kind in KINDS:
+                if self.stand_ins.get(hemi) == kind:
+                    continue
                 path = h.paths.get(kind)
                 self.meshes.append(
                     MeshEntry(
@@ -1182,7 +1209,13 @@ class SurfaceStore:
         raise KeyError(f"no mesh {key!r}")
 
     def active_mesh(self, hemi: str, kind: str) -> MeshEntry | None:
-        """The row in use for ``hemi``'s ``kind``: the top-most of them."""
+        """The row in use for ``hemi``'s ``kind``: the top-most of them.
+
+        None while that kind is a stand-in: any row of it is then a mesh
+        that could not fill the gap, and only a comparison.
+        """
+        if self.stand_ins.get(hemi) == kind:
+            return None
         for row in self.meshes:
             if row.hemi == hemi and row.kind == kind:
                 return row
@@ -1231,16 +1264,21 @@ class SurfaceStore:
         self.meshes_version += 1
 
     def load_mesh(self, path: str | Path, hemi: str, kind: str) -> MeshEntry:
-        """Read a surface file into the list, last: shown, not in use."""
+        """Read a surface file into the list.
+
+        Normally last: shown, not in use. A hemisphere not loaded yet is made
+        from the file, which is then in use; and a file that is the kind a
+        loose hemisphere is missing (the same mesh) fills the gap, in use.
+        """
         from fastfuncstuff.io.freesurfer import read_scanner_surface
 
-        if hemi not in self.hemis:
-            raise ValueError(
-                f"no {hemi} hemisphere loaded (have {', '.join(self.hemis) or 'none'})"
-            )
         if kind not in KINDS:
             raise ValueError(f"a mesh is one of {', '.join(KINDS)}, not {kind!r}")
+        if hemi not in ("lh", "rh"):
+            raise ValueError(f"a hemisphere is lh or rh, not {hemi!r}")
         path = Path(path)
+        if hemi not in self.hemis:
+            return self._bare_hemisphere(path, hemi, kind)
         positions, faces = read_scanner_surface(path)
         row = MeshEntry(
             key=self._mint_mesh(),
@@ -1255,7 +1293,70 @@ class SurfaceStore:
         self._loaded_count += 1
         self.meshes.append(row)
         self.meshes_version += 1
+        if self.stand_ins.get(hemi) == kind:
+            self._fill(row, strict=False)
         return row
+
+    def _bare_hemisphere(self, path: Path, hemi: str, kind: str) -> MeshEntry:
+        from fastfuncstuff.io.freesurfer import hemisphere_from_file
+
+        h = hemisphere_from_file(path, hemi, kind)
+        missing = PARTNER[kind]
+        h.states[missing] = h.states[kind]
+        self.hemis[hemi] = h
+        self.bare.add(hemi)
+        self.stand_ins[hemi] = missing
+        self.version[hemi] = self.version.get(hemi, 0) + 1
+        row = MeshEntry(
+            key=self._mint_mesh(),
+            hemi=hemi,
+            kind=kind,
+            name=path.name,
+            path=path,
+            positions=None,
+            faces=h.faces,
+            rgb=OUTLINE_RGB[kind],
+        )
+        self.meshes.append(row)
+        self.meshes_version += 1
+        return row
+
+    def _fill(self, row: MeshEntry, strict: bool) -> bool:
+        """Put ``row`` in use as the kind its loose hemisphere stands in for.
+
+        Moved above any other row of its hemi and kind, or the top-most rule
+        would hand the slot to an earlier mesh that could not fill it.
+        ``strict`` raises when it is another mesh; otherwise it stays a
+        comparison.
+        """
+        h = self.hemis[row.hemi]
+        assert row.positions is not None
+        if row.positions.shape != (h.n_vertices, 3) or not np.array_equal(row.faces, h.faces):
+            if strict:
+                raise ValueError(
+                    f"{row.name} is not the same mesh as the {row.hemi} surface in use "
+                    f"({row.positions.shape[0]:,} vs {h.n_vertices:,} vertices): "
+                    "it can be shown, not used"
+                )
+            return False
+        self.cancel()
+        h.states[row.kind] = np.ascontiguousarray(row.positions, np.float32)
+        if row.path is not None:
+            h.paths[row.kind] = row.path
+        del self.stand_ins[row.hemi]
+        row.positions = None
+        row.faces = h.faces
+        self.meshes.remove(row)
+        first = next(
+            (i for i, r in enumerate(self.meshes) if r.hemi == row.hemi and r.kind == row.kind),
+            len(self.meshes),
+        )
+        self.meshes.insert(first, row)
+        self._drop_index(row.hemi, row.kind)
+        self._drop_index(row.hemi, f"mesh:{row.key}")
+        self.version[row.hemi] = self.version.get(row.hemi, 0) + 1
+        self.meshes_version += 1
+        return True
 
     def use_mesh(self, key: str) -> MeshEntry:
         """Put a row in use for its hemi and kind: it moves above the one that was.
@@ -1266,6 +1367,9 @@ class SurfaceStore:
         """
         row = self.mesh(key)
         current = self.active_mesh(row.hemi, row.kind)
+        if current is None and self.stand_ins.get(row.hemi) == row.kind:
+            self._fill(row, strict=True)
+            return row
         if current is row or current is None:
             return row
         h = self.hemis[row.hemi]
@@ -1279,6 +1383,9 @@ class SurfaceStore:
         self.cancel()
         current.positions, current.faces = h.states[row.kind], h.faces
         h.states[row.kind] = np.ascontiguousarray(row.positions, np.float32)
+        missing = self.stand_ins.get(row.hemi)
+        if missing is not None:
+            h.states[missing] = h.states[row.kind]
         row.positions = None
         self.meshes.remove(row)
         self.meshes.insert(self.meshes.index(current), row)

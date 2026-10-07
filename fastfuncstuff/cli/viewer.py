@@ -94,6 +94,7 @@ examples
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
   ffs_viewer -surfaces $SUBJECTS_DIR/subj subj/SUMA/brain.nii.gz stats.nii.gz
+  ffs_viewer -mesh lh.white -mesh lh.pial.ffsedit T1.nii.gz
 """
 
 
@@ -131,8 +132,36 @@ def build_parser() -> FfsArgumentParser:
         "the slices. Placed in scanner space from the surface files themselves, so "
         "they line up with orig.mgz, the SUMA SurfVol, or anything aligned to them.",
     )
+    p.add_argument(
+        "-mesh",
+        metavar="FILE",
+        action="append",
+        default=[],
+        help="A FreeSurfer surface file to outline, no subject directory needed; "
+        "repeat for more. Hemisphere and white/pial are read from the name "
+        "(lh.pial, rh.smoothwm...). With only one of white and pial, depth "
+        "sampling collapses onto that surface; load the other to get the ribbon "
+        "back. After -surfaces, files are added to the subject's mesh list.",
+    )
     add_device_arg(p, default="auto")
     return p
+
+
+def _mesh_commands(paths: list[str]):
+    from fastfuncstuff.viewer.meshlist import infer_label
+    from fastfuncstuff.viewer.vocab import LoadMesh
+
+    out = []
+    for path in paths:
+        hemi, kind = infer_label(path)
+        if hemi is None or kind is None:
+            raise SystemExit(
+                f"ffs_viewer: -mesh {path}: can't tell "
+                f"{'the hemisphere (lh/rh)' if hemi is None else 'white or pial'} from the "
+                "name; rename it, or load it from the MESH window, which asks"
+            )
+        out.append(LoadMesh(path, hemi, kind))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
 
                 session.do(LoadSurfaces(args.surfaces))
+            for cmd in _mesh_commands(args.mesh):
+                session.do(cmd)
             if args.script:
                 session.run_script(open(args.script).read())
             print(session.to_script(header="replayed"), end="")
@@ -176,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         script=args.script,
         directory=args.read,
         surfaces=args.surfaces,
+        meshes=args.mesh,
     )
 
 
