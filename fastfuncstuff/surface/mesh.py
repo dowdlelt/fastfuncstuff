@@ -83,12 +83,28 @@ def face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return np.cross(v1 - v0, v2 - v0)
 
 
-def vertex_normals(vertices: np.ndarray, topo: MeshTopology) -> np.ndarray:
-    """Area-weighted unit vertex normals."""
-    fn = face_normals(vertices, topo.faces)
-    n = np.zeros((topo.n_vertices, 3), np.float64)
-    for k in range(3):
-        np.add.at(n, topo.faces[:, k], fn)
+def vertex_normals(
+    vertices: np.ndarray, topo: MeshTopology, ids: np.ndarray | None = None
+) -> np.ndarray:
+    """Area-weighted unit vertex normals: of every vertex, or of ``ids`` only, in that order.
+
+    With ``ids``, only the faces touching them are visited -- a vertex normal
+    depends on nothing else, so the result is the same, and an edit of a few
+    hundred vertices no longer pays for the whole hemisphere's ~230k faces.
+    """
+    faces = topo.faces if ids is None else topo.faces[topo.faces_of(ids)]
+    fn = face_normals(vertices, faces)
+    flat = faces.ravel()
+    # bincount, not np.add.at: the same sums, several times faster.
+    n = np.stack(
+        [
+            np.bincount(flat, weights=np.repeat(fn[:, c], 3), minlength=topo.n_vertices)
+            for c in range(3)
+        ],
+        axis=1,
+    )
+    if ids is not None:
+        n = n[np.asarray(ids, np.int64)]
     norm = np.linalg.norm(n, axis=1, keepdims=True)
     return n / np.maximum(norm, 1e-12)
 

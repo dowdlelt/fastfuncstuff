@@ -480,7 +480,7 @@ class SurfaceStore:
         verts = self.hemis[hemi].states[surface].astype(np.float64)
         topo = self.topology(hemi)
         ids, _ = geodesic_ball(verts, topo, int(vertex), radius)
-        n = vertex_normals(verts, topo)[ids].sum(axis=0)
+        n = vertex_normals(verts, topo, ids).sum(axis=0)
         return n / max(float(np.linalg.norm(n)), 1e-12)
 
     def cortex_normal(
@@ -500,7 +500,7 @@ class SurfaceStore:
         topo = self.topology(hemi)
         mid = 0.5 * (h.states["white"] + h.states["pial"]).astype(np.float64)
         ids, _ = geodesic_ball(mid, topo, v, radius)
-        n = vertex_normals(mid, topo)[ids].sum(axis=0)
+        n = vertex_normals(mid, topo, ids).sum(axis=0)
         norm = float(np.linalg.norm(n))
         return None if norm < 1e-9 else n / norm
 

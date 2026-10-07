@@ -161,7 +161,7 @@ class SurfaceEdit:
         # Normals of the *whole* mesh evaluated at the start, then frozen for
         # the drag: recomputing them as the patch moves would let the search
         # direction chase its own displacement.
-        self.normals = vertex_normals(vertices, topo)[self.ids]
+        self.normals = vertex_normals(vertices, topo, self.ids)
         self.partner_start = (
             None if partner is None else np.asarray(partner, np.float64)[self.ids].copy()
         )
