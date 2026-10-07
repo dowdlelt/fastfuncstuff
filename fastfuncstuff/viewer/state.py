@@ -61,6 +61,83 @@ class DisplayGrid:
         return all(0 <= v < n for v, n in zip(ijk, self.shape, strict=True))
 
 
+#: Longest axis a resized display grid may have. A plane is drawn per
+#: frame, so this bounds pixels per pane, not memory: 2048 is already a
+#: 0.125 mm grid across a 256 mm head.
+MAX_GRID_AXIS = 2048
+
+
+def resize_grid(
+    shape: tuple[int, int, int], affine: np.ndarray, voxel_mm: float
+) -> tuple[tuple[int, int, int], np.ndarray]:
+    """The same field of view and orientation, with voxels of about ``voxel_mm``.
+
+    Either direction: finer to draw a high-resolution overlay on its own
+    voxels, coarser to see the anatomy the way a low-resolution run sees it.
+    ``voxel_mm <= 0`` returns the grid unchanged. Each axis gets a whole number
+    of voxels, so the size is matched to within one voxel's rounding, and the
+    outer *edges* stay put (not the outer centres): the new grid covers
+    exactly what the underlay covered and never straddles its border.
+    """
+    shape = tuple(int(n) for n in shape)
+    affine = np.asarray(affine, dtype=float)
+    if voxel_mm <= 0:
+        return (shape[0], shape[1], shape[2]), affine
+    spacing = np.linalg.norm(affine[:3, :3], axis=0)
+    out_shape = [
+        int(min(MAX_GRID_AXIS, max(1, round(n * s / voxel_mm))))
+        for n, s in zip(shape, spacing, strict=True)
+    ]
+    scale = np.asarray(shape, dtype=float) / np.asarray(out_shape, dtype=float)
+    out = affine.copy()
+    out[:3, :3] = affine[:3, :3] * scale
+    # Voxel centre 0 of the new grid sits half a new voxel inside the old edge.
+    out[:3, 3] = affine[:3, 3] + affine[:3, :3] @ (0.5 * scale - 0.5)
+    return (out_shape[0], out_shape[1], out_shape[2]), out
+
+
+#: Round display voxel sizes offered after "underlay" and the layers' own.
+GRID_SIZES = (3.0, 2.0, 1.5, 1.0, 0.8, 0.5, 0.4, 0.25)
+
+
+def voxel_mm(affine: np.ndarray) -> float:
+    """A grid's finest voxel edge, mm -- the size a slab's in-plane voxels are."""
+    return float(np.linalg.norm(np.asarray(affine, dtype=float)[:3, :3], axis=0).min())
+
+
+def grid_res_choices(state: ViewerState) -> list[tuple[str, float]]:
+    """``(label, mm)`` for the GRID picker; ``mm == 0`` is the underlay's own grid.
+
+    The underlay, then every other layer's own size by name (which of the
+    two is finer swaps from dataset to dataset), then round sizes. The
+    current setting is always present, so a replayed script's odd value is
+    shown rather than silently mislabelled.
+    """
+    items: list[tuple[str, float]] = []
+    seen: list[float] = []
+
+    def offer(label: str, mm: float) -> None:
+        if not any(abs(mm - have) <= 0.01 * max(mm, have) for have in seen):
+            seen.append(mm)
+            items.append((label, mm))
+
+    base = state.layers.base
+    if base is None:
+        items.append(("underlay", 0.0))
+    else:
+        under = voxel_mm(base.affine)
+        items.append((f"underlay ({under:.3g} mm)", 0.0))
+        seen.append(under)
+        for layer in list(state.layers)[1:]:
+            mm = round(voxel_mm(layer.affine), 4)
+            offer(f"match {layer.name} ({mm:.3g} mm)", mm)
+        for mm in GRID_SIZES:
+            offer(f"{mm:g} mm", mm)
+    if all(abs(mm - state.grid_mm) > 1e-6 for _, mm in items):
+        items.append((f"{state.grid_mm:g} mm", state.grid_mm))
+    return items
+
+
 @dataclass
 class ViewerState:
     """Everything the UI draws from.
@@ -89,6 +166,13 @@ class ViewerState:
     #: :meth:`ViewerSession.input_layer` and never written back, so the answer
     #: keeps following the stack until someone names one.
     input_key: str | None = None
+    #: Display voxel size, mm. 0 (the default) draws on the underlay's own
+    #: voxels. Anything else resizes that grid, keeping its field of view and
+    #: orientation: finer to show a high-resolution overlay on its own voxels
+    #: with the underlay interpolated, coarser to see the anatomy at a run's
+    #: resolution. Each layer's DRAW mode still decides how it is painted
+    #: into whatever grid this gives. See :func:`resize_grid`.
+    grid_mm: float = 0.0
     #: Seed voxel for InstaCorr, in display-grid indices. ``None`` until set.
     seed: tuple[int, int, int] | None = None
     #: Interface palette. State rather than a widget setting so a recorded
@@ -163,11 +247,12 @@ class ViewerState:
 
         Called when the first layer arrives. Later layers resample into this
         grid rather than replacing it, so loading a functional dataset over an
-        anatomical one does not throw away the anatomy's resolution.
+        anatomical one does not throw away the anatomy's resolution. The
+        layer's grid is resized to :attr:`grid_mm` when that is set.
         """
-        self.grid = DisplayGrid.from_layer(shape, affine)
+        self.grid = DisplayGrid.from_layer(*resize_grid(shape, affine, self.grid_mm))
         i, j, k = (s // 2 for s in self.grid.shape)
         self.crosshair = (i, j, k)
 
 
-__all__ = ["DisplayGrid", "Plane", "ViewerState"]
+__all__ = ["DisplayGrid", "Plane", "ViewerState", "grid_res_choices", "resize_grid", "voxel_mm"]

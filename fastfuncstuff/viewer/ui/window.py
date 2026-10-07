@@ -52,7 +52,7 @@ from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
-from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.state import Plane, grid_res_choices
 from fastfuncstuff.viewer.surfaces import next_outlines
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar, colormap_icon, thresholds_itself
@@ -81,6 +81,7 @@ from fastfuncstuff.viewer.vocab import (
     SetColormap,
     SetColormapReversed,
     SetEdges,
+    SetGridRes,
     SetIJK,
     SetIndex,
     SetInput,
@@ -597,6 +598,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.mode_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
         flow.addWidget(self.mode_box)
+
+        flow.addWidget(self._head("GRID"))
+        self.grid_box = QtWidgets.QComboBox()
+        self.grid_box.setToolTip(
+            "Display voxel size: the grid every layer is painted into.\n"
+            "'underlay' draws on the bottom layer's own voxels (the default).\n"
+            "'match <layer>' or a size keeps the underlay's field of view and\n"
+            "orientation with finer or coarser voxels -- finer shows a\n"
+            "high-resolution overlay on its own voxels; coarser shows the\n"
+            "anatomy the way a run sees it. Each layer's DRAW still decides\n"
+            "how it is painted (cubic sharpens an upsampled underlay).\n"
+            "Display only: no layer's data changes."
+        )
+        self.grid_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.grid_box.activated.connect(
+            lambda i: self._dispatch(SetGridRes(float(self.grid_box.itemData(i))))
+        )
+        flow.addWidget(self.grid_box)
 
         for text, key, tip, slot in (
             ("+IMAGE", "n", "Open another image window", self._new_image),
@@ -2061,8 +2080,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.refresh_clusters(ctl=ctl)
         ctl.manager.redraw(dirty)
 
+    def _sync_grid_box(self) -> None:
+        st = self.session.state
+        items = grid_res_choices(st)
+        self.grid_box.blockSignals(True)
+        self.grid_box.clear()
+        for label, mm in items:
+            self.grid_box.addItem(label, userData=mm)
+        current = next(i for i, (_, mm) in enumerate(items) if abs(mm - st.grid_mm) <= 1e-6)
+        self.grid_box.setCurrentIndex(current)
+        self.grid_box.setEnabled(st.layers.base is not None)
+        self.grid_box.blockSignals(False)
+
     def _sync_layer_list(self) -> None:
         self._watch()
+        self._sync_grid_box()
         selected = self.current_key()
         self.layer_list.blockSignals(True)
         self.layer_list.clear()

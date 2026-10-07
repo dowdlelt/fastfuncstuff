@@ -21,7 +21,7 @@ import numpy as np
 from fastfuncstuff.viewer import align
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
-from fastfuncstuff.viewer.state import Plane, ViewerState
+from fastfuncstuff.viewer.state import DisplayGrid, Plane, ViewerState
 from fastfuncstuff.viewer.viewports import ViewKind, clamp_grid
 
 # ---------------------------------------------------------------------------
@@ -1301,6 +1301,24 @@ class SetResample(Command):
     how: str = "auto"
 
 
+@command
+@dataclass(frozen=True)
+class SetGridRes(Command):
+    """Display voxel size in mm; 0 draws on the underlay's own voxels.
+
+    Resizes the underlay's grid -- same field of view, same orientation --
+    finer or coarser. Finer draws an overlay finer than the anatomy on its own
+    voxels, with the anatomy interpolated; coarser shows the anatomy at a
+    run's resolution. Display only, like SET_RESAMPLE, which still decides
+    how each layer is painted into the grid. The crosshair, seed, pan and
+    parked slices are carried across in millimetres.
+    """
+
+    name = "SET_GRID_RES"
+    aspects = Aspect.GRID | Aspect.CROSSHAIR | Aspect.SLICES
+    mm: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # instacorr
 # ---------------------------------------------------------------------------
@@ -1324,6 +1342,46 @@ class SetSeed(Command):
 # ---------------------------------------------------------------------------
 
 OpenLayer = Callable[[str, str], Layer]
+
+
+def _carry_to_grid(st: ViewerState, old: DisplayGrid | None, was: tuple[int, int, int]) -> None:
+    """Re-express everything held in display-grid indices after the grid changed.
+
+    The anatomical location is what the user is looking at, so each one goes
+    across in millimetres: the crosshair and seed, every parked slice, and
+    every pan (in grid voxels along a pane's rows and columns, so a finer grid
+    needs proportionally more of them to stay put).
+    """
+    from fastfuncstuff.viewer.slicing import plane_layout
+
+    new = st.grid
+    if old is None or new is None:
+        return
+
+    def carry(ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        v = new.mm_to_ijk(old.ijk_to_mm(ijk))
+        return new.clamp((round(v[0]), round(v[1]), round(v[2])))
+
+    st.crosshair = carry(was)
+    if st.seed is not None:
+        st.seed = carry(st.seed)
+    old_mm = np.linalg.norm(np.asarray(old.affine)[:3, :3], axis=0)
+    new_mm = np.linalg.norm(np.asarray(new.affine)[:3, :3], axis=0)
+    for vp in list(st.viewports):
+        before, after = plane_layout(old.affine, vp.plane), plane_layout(new.affine, vp.plane)
+        changes: dict[str, object] = {}
+        if vp.position is not None:
+            parked = list(was)
+            parked[before.fixed] = int(vp.position)
+            changes["position"] = carry((parked[0], parked[1], parked[2]))[after.fixed]
+        if vp.pan != (0.0, 0.0):
+            changes["pan"] = (
+                float(vp.pan[0]) * old_mm[before.row] / new_mm[after.row],
+                float(vp.pan[1]) * old_mm[before.col] / new_mm[after.col],
+            )
+        if changes:
+            st.viewports.update(vp.id, **changes)
+
 
 #: Values SET_RESAMPLE takes, in the order the DRAW key cycles them.
 RESAMPLE_MODES = ("auto", "nearest", "linear", "cubic")
@@ -1367,11 +1425,9 @@ def install(
         location is what the user is looking at, so it is carried across in
         millimetres and re-expressed in the new grid.
         """
-        mm = st.crosshair_mm
+        old, was = st.grid, st.crosshair
         st.adopt_grid(layer.shape, layer.affine)
-        if mm is not None and st.grid is not None:
-            ijk = st.grid.mm_to_ijk(mm)
-            st.crosshair = st.grid.clamp((round(ijk[0]), round(ijk[1]), round(ijk[2])))
+        _carry_to_grid(st, old, was)
         return Aspect.GRID | Aspect.CROSSHAIR
 
     @bus.handle(Read.name)
@@ -2313,6 +2369,18 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, resample=how)
         return SetResample.aspects
+
+    @bus.handle(SetGridRes.name)
+    def _set_grid_res(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetGridRes)
+        mm = max(0.0, float(cmd.mm))
+        if mm == st.grid_mm:
+            return Aspect.NOTHING
+        st.grid_mm = mm
+        base = st.layers.base
+        if base is None:
+            return Aspect.NOTHING
+        return SetGridRes.aspects | _adopt_grid_preserving_position(st, base)
 
     @bus.handle(SetTimeLinked.name)
     def _set_time_linked(cmd: Command, st: ViewerState) -> Aspect:

@@ -131,6 +131,8 @@ def describe(session: ViewerSession, *, script: bool = True) -> str:
         base = st.layers.base
         zx, zy, zz = _zooms(st.grid.affine)
         out.append(f"  from         {base.name if base else '(none)'}  [bottom of the stack]")
+        if st.grid_mm > 0:
+            out.append(f"  resized to   {st.grid_mm:g} mm  [SET_GRID_RES]")
         out.append(f"  shape        {st.grid.shape}")
         out.append(f"  voxel        {zx:.4f} x {zy:.4f} x {zz:.4f} mm")
         out.append("  affine")

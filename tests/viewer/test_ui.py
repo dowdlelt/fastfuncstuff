@@ -2622,6 +2622,26 @@ def test_the_draw_box_names_which_way_auto_went(win, qapp):
     assert win.resample_box.currentText().startswith("auto")
 
 
+def test_the_grid_box_resizes_the_display_grid_and_back(win, qapp):
+    st = win.session.state
+    shape = st.grid.shape
+    assert win.grid_box.itemData(0) == 0.0
+    finer = next(
+        i
+        for i in range(win.grid_box.count())
+        if 0
+        < win.grid_box.itemData(i)
+        < 0.9 * min(np.linalg.norm(np.asarray(st.layers.base.affine)[:3, :3], axis=0))
+    )
+    win.grid_box.activated.emit(finer)
+    qapp.processEvents()
+    assert all(a > b for a, b in zip(st.grid.shape, shape, strict=True))
+    assert win.grid_box.currentIndex() == finer
+    win.grid_box.activated.emit(0)
+    qapp.processEvents()
+    assert st.grid.shape == shape
+
+
 def test_e_cycles_how_the_layer_is_drawn(win, qapp):
     from fastfuncstuff.viewer.ui.shortcuts import Binding  # noqa: F401
 

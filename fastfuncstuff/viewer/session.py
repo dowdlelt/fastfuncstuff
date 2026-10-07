@@ -699,12 +699,18 @@ class ViewerSession:
         grid, and switching it does not invalidate a fit.
 
         ``auto`` decides by direction; see :attr:`Layer.resample` for why that
-        is the axis that matters.
+        is the axis that matters. The exception is the underlay on a resized
+        grid (:attr:`ViewerState.grid_mm`): a finer grid exists so that the
+        anatomy is the layer interpolated, and nearest would only redraw its
+        own voxels as blocks. Set its DRAW to nearest to see them anyway.
         """
         if layer.resample in ("nearest", "linear", "cubic"):
             return layer.resample
         grid = self.state.grid
         if grid is None:
+            return "linear"
+        base = self.state.layers.base
+        if base is not None and base.key == layer.key:
             return "linear"
         return (
             "nearest"
