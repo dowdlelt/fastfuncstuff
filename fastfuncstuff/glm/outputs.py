@@ -491,6 +491,9 @@ def _strip_imaging_extension(filepath: str) -> str:
         ".nii.zst",
         ".nii.gz",
         ".nii",
+        ".func.gii",
+        ".shape.gii",
+        ".gii",
     ]
 
     for ext in EXTENSIONS:
@@ -530,6 +533,8 @@ def _normalize_output_path(output_path: str | Path) -> tuple[Path, str]:
         return output_path, "nifti_gz"
     elif path_str.endswith((".nii", ".NII")):
         return output_path, "nifti"
+    elif path_str.lower().endswith(".gii"):
+        return output_path, "gifti"
     else:
         # Default to NIfTI compressed - ADD extension, don't replace
         return Path(path_str + ".nii.gz"), "nifti_gz"
@@ -1191,7 +1196,8 @@ def write_glm_bucket_as_nifti(
 
     bucket_data = np.asarray(bucket_img.dataobj)
     stataux_arg = brick_stataux or None
-    need_fdr = add_fdr and bool(fdr_specs)
+    # FDR curves live in the AFNI NIfTI extension; a GIfTI bucket has none (yet).
+    need_fdr = add_fdr and bool(fdr_specs) and detected_format != "gifti"
 
     # Final target honours the extension the caller asked for (via -prefix):
     # .nii, .nii.gz, or .nii.zst. We never force gzip — save_nifti picks the
@@ -1200,6 +1206,8 @@ def write_glm_bucket_as_nifti(
     base_name = _strip_imaging_extension(str(base_path))
     ext_by_format = {"nifti": ".nii", "nifti_gz": ".nii.gz", "nifti_zst": ".nii.zst"}
     final_ext = ext_by_format.get(detected_format, ".nii.gz") if compress_output else ".nii"
+    if detected_format == "gifti":
+        final_ext = str(base_path)[len(base_name) :]  # .func.gii / .shape.gii / .gii
     final_path = Path(base_name + final_ext)
 
     if need_fdr and final_ext != ".nii":

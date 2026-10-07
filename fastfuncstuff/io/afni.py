@@ -417,6 +417,12 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         except Exception:
             img_out = _load_zst_via_tempfile(filepath, zstd_threads)
 
+    elif str(filepath).lower().endswith(".gii"):
+        # Surface data: a (V, 1, 1, T) image, AFNI's 1-D-volume convention, so every
+        # reader downstream is unchanged. See io/gifti.py.
+        from fastfuncstuff.io.gifti import gifti_as_nifti
+
+        img_out = gifti_as_nifti(filepath)
     elif str(filepath).lower().endswith((".mgz", ".mgh")):
         # FreeSurfer volumes: same voxels and scanner affine, as a NIfTI, so
         # everything downstream of this function is unchanged.
@@ -1612,9 +1618,12 @@ def load_afni_mask(
     img = load_nifti(mask_path)
     data = img.get_fdata(dtype=np.float32)
 
-    # Squeeze out singleton dimensions (common in AFNI masks)
-    # e.g., (64, 64, 35, 1) → (64, 64, 35)
-    data = np.squeeze(data)
+    # Squeeze out trailing singleton dimensions (common in AFNI masks)
+    # e.g., (64, 64, 35, 1) → (64, 64, 35). Only past the third axis: a surface
+    # mask is (V, 1, 1), and squeezing it to 1-D would lose that it is a grid of
+    # one row of vertices like its data (io/gifti.py).
+    while data.ndim > 3 and data.shape[-1] == 1:
+        data = data[..., 0]
 
     if data.ndim != 3:
         raise ValueError(
@@ -3427,6 +3436,16 @@ def save_nifti(
         raise ImportError(
             "nibabel is required to save NIfTI files. Install with: pip install nibabel"
         ) from err
+
+    if str(output_path).lower().endswith(".gii"):
+        # Surface output: GIfTI, carrying the input's mesh fingerprint and geometry
+        # from the header (see io/gifti.py). There is no affine to keep.
+        from fastfuncstuff.io.gifti import save_nifti_data_as_gifti
+
+        if reference_img is not None:
+            _, header = _reference_geometry(reference_img)
+        save_nifti_data_as_gifti(output_path, data, header, brick_labels, brick_stataux, tr)
+        return
 
     # A caller who nominated a reference file has said which dataset's geometry
     # governs; anything else may be writing a map it computed rather than a

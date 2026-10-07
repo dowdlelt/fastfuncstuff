@@ -276,6 +276,11 @@ def read_nifti_header(filepath: str | Path) -> nib.Nifti1Header | nib.Nifti2Head
     filepath = Path(clean_path)
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
+    if filepath.name.lower().endswith(".gii"):
+        # GIfTI has no NIfTI header: build the in-memory one (XML, no payload to skip).
+        from fastfuncstuff.io.gifti import gifti_as_nifti
+
+        return gifti_as_nifti(filepath).header
 
     # NIfTI-1 header is 348 bytes, NIfTI-2 is 540; read enough for either.
     raw = _read_leading_bytes(filepath, 544)

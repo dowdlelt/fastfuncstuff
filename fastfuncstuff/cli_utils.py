@@ -37,7 +37,9 @@ from fastfuncstuff.cli_help import (  # noqa: F401
 from fastfuncstuff.design.trim import TrimSpec, TrimTimingReport, shift_onsets_for_trim
 from fastfuncstuff.utils import suppress_io_progress
 
-_NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
+# GIfTI counts: surface data go through the same writers (io/gifti.py), and the
+# .func/.shape qualifier stays with the extension so siblings keep it.
+_NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii", ".func.gii", ".shape.gii", ".gii")
 
 
 @contextlib.contextmanager
@@ -139,6 +141,11 @@ class PrefixInfo:
     def as_file(self) -> str:
         """Return ``{stem}{nifti_ext}`` — the prefix used as a single output file."""
         return f"{self.stem}{self.nifti_ext}"
+
+
+def has_imaging_ext(path: str | Path) -> bool:
+    """True when ``path`` already names an output format (NIfTI or GIfTI)."""
+    return str(path).endswith(_NIFTI_EXTENSIONS)
 
 
 def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:

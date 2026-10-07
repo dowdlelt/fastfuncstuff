@@ -57,6 +57,7 @@ try:
         collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
+        has_imaging_ext,
         microtime_offset_bins,
         parse_cv_strategy,
         parse_device_arg,
@@ -1243,7 +1244,7 @@ def _derive_rvar_path(rbuck_path: str) -> str:
     """
     p = Path(rbuck_path)
     name = p.name
-    for suffix in (".nii.gz", ".nii.zst", ".nii"):
+    for suffix in (".nii.gz", ".nii.zst", ".nii", ".func.gii", ".shape.gii", ".gii"):
         if name.endswith(suffix):
             return str(p.with_name(name[: -len(suffix)] + "_ffsremlvar" + suffix))
     # Unknown extension: drop the single suffix and re-add it.
@@ -1788,8 +1789,43 @@ def main():
         output_format = args.force_format  # Keep var name for compatibility
     else:
         output_format = detect_format(input_files[0])
-    print(f"📥 Input format detected: {output_format}")
-    print("📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI")
+    from fastfuncstuff.io.gifti import is_gifti
+
+    surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    if surface_input:
+        # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
+        # not care, but anything spatial assumes a voxel grid and has no surface
+        # twin yet (Surfaces as an analysis space, S3-S5).
+        grid_only = [
+            flag
+            for flag, on in (
+                ("-do_blur", args.do_blur is not None),
+                ("-save_acf", bool(args.save_acf)),
+                ("-clustsim", bool(args.clustsim)),
+            )
+            if on
+        ]
+        if grid_only:
+            print(
+                f"❌ ERROR: {', '.join(grid_only)} need a voxel grid; surface (.gii) input "
+                "has no surface version yet (planned: heat smoothing, surface FWHM, "
+                "surface ClustSim).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        needs_mask = args.save_tsnr or args.save_grandmean or args.save_mask
+        if needs_mask and not args.mask:
+            print(
+                "❌ ERROR: the diagnostics need -mask on surface input (an automask has no "
+                "meaning on vertices): pass the projection's ?h.mask.shape.gii.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("📥 Input: surface data (GIfTI, read as V x 1 x 1)")
+        print("📤 Output: name outputs .func.gii / .gii to write GIfTI (else NIfTI)")
+    else:
+        print(f"📥 Input format detected: {output_format}")
+        print("📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI")
     print()
 
     # Print summary of requested outputs
@@ -3538,20 +3574,29 @@ def main():
                         want_fwhmx=want_acf,
                     )
 
+            # Surface input writes its diagnostics as GIfTI maps on the same mesh.
+            _dext = ".shape.gii" if surface_input else ".nii.gz"
+            _tsnr_stem = (
+                str(args.save_tsnr).removesuffix(".shape.gii").removesuffix(".gii")
+                if args.save_tsnr
+                else ""
+            )
             if args.save_grandmean:
                 diag.save_map(
                     "grandmean",
-                    replace_afni_extension(args.save_grandmean, ".nii.gz"),
+                    args.save_grandmean
+                    if is_gifti(args.save_grandmean)
+                    else replace_afni_extension(args.save_grandmean, _dext),
                     _diag_affine,
                     _diag_header,
                 )
             if args.save_tsnr:
                 diag.save_map(
-                    "raw_tsnr", f"{args.save_tsnr}.raw_tsnr.nii.gz", _diag_affine, _diag_header
+                    "raw_tsnr", f"{_tsnr_stem}.raw_tsnr{_dext}", _diag_affine, _diag_header
                 )
                 diag.save_map(
                     f"resid_tsnr_{_label}",
-                    f"{args.save_tsnr}.resid_tsnr_{_label}.nii.gz",
+                    f"{_tsnr_stem}.resid_tsnr_{_label}{_dext}",
                     _diag_affine,
                     _diag_header,
                 )
@@ -3799,7 +3844,7 @@ def main():
         # Respect the extension the user gave (.nii/.nii.gz/.nii.zst); default
         # to compressed .nii.gz only when no NIfTI extension is present.
         rvar_output_path = Path(args.Rvar)
-        if not str(rvar_output_path).endswith((".nii.gz", ".nii", ".nii.zst")):
+        if not has_imaging_ext(rvar_output_path):
             rvar_output_path = Path(str(rvar_output_path) + ".nii.gz")
 
         print(f"  • Writing REML variance parameters: {rvar_output_path}")
@@ -3947,7 +3992,7 @@ def main():
         # Normalise output path, respecting the user's extension
         # (.nii/.nii.gz/.nii.zst); default to .nii.gz only when none is given.
         lklhd_out = _rlklhd
-        if not lklhd_out.endswith((".nii.gz", ".nii", ".nii.zst")):
+        if not has_imaging_ext(lklhd_out):
             lklhd_out = lklhd_out + ".nii.gz"
         lklhd_path = Path(lklhd_out)
 
