@@ -365,6 +365,7 @@ def pack_uniforms(
     equivolume: bool = False,
     map_opacity: float = 1.0,
     depth_stat: str = "mean",
+    cubic: bool = False,
 ) -> bytes:
     """The uniform block as bytes. Matrices go column-major, as GLSL reads them.
 
@@ -378,7 +379,12 @@ def pack_uniforms(
         _vec(depth[0], depth[1], float(samples), fold_contrast),
         _vec(*cross),
         _vec(*cross_rgb, 0.0),
-        _vec(1.0 if equivolume else 0.0, map_opacity, float(DEPTH_STATS.index(depth_stat)), 0.0),
+        _vec(
+            1.0 if equivolume else 0.0,
+            map_opacity,
+            float(DEPTH_STATS.index(depth_stat)),
+            1.0 if cubic else 0.0,
+        ),
     ]
     shown = layers[-MAX_LAYERS:]
     for k in range(MAX_LAYERS):

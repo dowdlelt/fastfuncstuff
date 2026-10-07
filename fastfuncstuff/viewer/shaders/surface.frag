@@ -34,7 +34,7 @@ layout(std140, binding = 0) uniform Block {
     vec4 depth;      // lo, hi, samples, folding contrast
     vec4 cross;      // crosshair mm, radius
     vec4 crossRgb;
-    vec4 extra;      // equivolume on, vertex-map opacity, depth statistic
+    vec4 extra;      // equivolume on, vertex-map opacity, depth statistic, cubic sampling
     Layer layers[MAX_LAYERS];
 };
 
@@ -68,6 +68,45 @@ float equivolume(float a)
 }
 
 float depthAt(float d) { return extra.x > 0.5 ? equivolume(d) : d; }
+
+// Catmull-Rom weights of the taps at -1, 0, 1, 2 for a fraction t. Twin of
+// slicing.py:_catmull_rom, the viewer's cubic: it interpolates, so a voxel
+// centre reads that voxel in every mode and only the edges change.
+vec4 catmullRom(float t)
+{
+    float t2 = t * t, t3 = t2 * t;
+    return 0.5 * vec4(-t3 + 2.0 * t2 - t, 3.0 * t3 - 5.0 * t2 + 2.0,
+                      -3.0 * t3 + 4.0 * t2 + t, t3 - t2);
+}
+
+// Tricubic from 64 fetches; the hardware has no cubic filter. Taps past the
+// border repeat the edge voxel, as _sample_cubic does.
+float cubicAt(sampler3D vt, vec3 t)
+{
+    ivec3 size = textureSize(vt, 0);
+    vec3 p = t * vec3(size) - 0.5;
+    vec3 b = floor(p);
+    vec3 f = p - b;
+    vec4 wx = catmullRom(f.x), wy = catmullRom(f.y), wz = catmullRom(f.z);
+    ivec3 base = ivec3(b) - 1;
+    ivec3 hi = size - 1;
+    float acc = 0.0;
+    for (int z = 0; z < 4; ++z) {
+        for (int y = 0; y < 4; ++y) {
+            float row = 0.0;
+            for (int x = 0; x < 4; ++x) {
+                row += wx[x] * texelFetch(vt, clamp(base + ivec3(x, y, z), ivec3(0), hi), 0).r;
+            }
+            acc += wz[z] * wy[y] * row;
+        }
+    }
+    return acc;
+}
+
+// A value or statistic texture, as the window's sampling asks. Nearest and
+// linear are the bound sampler's filter; cubic is computed. Labels never come
+// here: they are read nearest, always.
+float sampleAt(sampler3D vt, vec3 t) { return extra.w > 0.5 ? cubicAt(vt, t) : texture(vt, t).r; }
 
 float unitOf(float v, vec4 cmap, vec4 modes)
 {
@@ -140,8 +179,8 @@ vec3 sampleAvg(Layer L, sampler3D vt, sampler3D st, vec3 off)
         vec4 p = vec4(mix(vWhite, vPial, depthAt(d)) + off, 1.0);
         vec3 t = (L.texFromMm * p).xyz;
         ok = ok && inside(t);
-        vs[i] = texture(vt, t).r;
-        ss[i] = texture(st, (L.statFromMm * p).xyz).r;
+        vs[i] = sampleAt(vt, t);
+        ss[i] = sampleAt(st, (L.statFromMm * p).xyz);
     }
     float okf = ok ? 1.0 : 0.0;
     if (how == 0 || how == 5) {

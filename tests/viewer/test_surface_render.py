@@ -51,16 +51,19 @@ def _sheet(n: int = 41, size: float = 40.0, pial_scale: float = 1.0):
 
 
 @pytest.mark.parametrize(
-    ("pial_scale", "stat"),
+    ("pial_scale", "stat", "sampling"),
     [
-        (1.0, None),
-        (1.5, None),
-        *[(1.0, stat) for stat in ("mean", "median", "max", "min", "max_abs", "nzmean")],
+        (1.0, None, "nearest"),
+        (1.5, None, "nearest"),
+        (1.0, None, "cubic"),
+        *[(1.0, stat, "nearest") for stat in ("mean", "median", "max", "min", "max_abs", "nzmean")],
     ],
 )
-def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale, stat):
+def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale, stat, sampling):
     """``pial_scale`` 1.5 makes pial's area 2.25x white's, so equivolume depth
     is not the identity and the shader's has to agree with the CPU twin.
+
+    ``cubic``: the shader's Catmull-Rom against the CPU one (VolumeSampler).
 
     With ``stat``, five depths from 0.1 to 0.9 straddle two voxels in z (three
     in k=5, two in k=6), so every reduction picks something different."""
@@ -110,6 +113,7 @@ def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale, stat):
         win.apply(session.state.viewports.get("S1"))
         win.canvas._anim.stop()
         win.canvas.morph = 1.0
+        win.canvas.set_sampling(sampling)
         grabbed = win.canvas.grabFramebuffer()
         img = grabbed.convertToFormat(grabbed.Format.Format_RGBA8888)
         if img.isNull():
@@ -127,8 +131,12 @@ def test_rendered_pixels_match_the_cpu_colouring(tmp_path, pial_scale, stat):
                 mm = win.canvas.pick_mm(_pt(x, y))
                 if mm is None:
                     continue
+                if sampling == "cubic":
+                    from fastfuncstuff.surface.sampling import VolumeSampler
+
+                    v = VolumeSampler(data, aff, "cubic")(np.asarray(mm)[None])
                 # Nearest voxel, as the shader's nearest sampler reads it.
-                if stat is None:
+                elif stat is None:
                     i, j, k = np.floor(inv[:3, :3] @ mm + inv[:3, 3] + 0.5).astype(int)
                     v = data[i, j, k][None]
                 else:

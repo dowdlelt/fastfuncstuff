@@ -155,7 +155,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         #: Overlay layers, bottom to top (at most MAX_LAYERS are drawn).
         self.overlays: list[OverlaySlot] = []
         self.cross: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
-        self.linear = False
+        #: nearest / linear / cubic, as surface.sampling.MODES. Nearest by
+        #: default: the voxels themselves.
+        self.sampling = "nearest"
         #: Per hemisphere: arrays waiting to upload, and what is drawn.
         self._pending: dict[str, dict[str, np.ndarray]] = {}
         self._faces: dict[str, dict[str, np.ndarray]] = {}
@@ -437,7 +439,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             tex = self._slot_tex[k] or (self._empty, self._empty)
             labels = k < len(drawn) and drawn[k].shade.labels
             # Labels are never interpolated: a blend of 12 and 40 is not 26.
-            sampler = self._linear_s if self.linear and not labels else self._nearest
+            sampler = self._linear_s if self.sampling == "linear" and not labels else self._nearest
             bindings.append(Binding.sampledTexture(1 + k, frag, tex[0], sampler))
             bindings.append(Binding.sampledTexture(5 + k, frag, tex[1], sampler))
         bindings.append(Binding.sampledTexture(9, frag, self._lut_tex, self._nearest))
@@ -534,8 +536,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 self._bindings(gpu)
             self._rebind = False
 
-    def set_linear(self, on: bool) -> None:
-        self.linear = bool(on)
+    def set_sampling(self, mode: str) -> None:
+        from fastfuncstuff.surface.sampling import MODES
+
+        if mode not in MODES:
+            raise ValueError(f"sampling is one of {', '.join(MODES)}, not {mode!r}")
+        self.sampling = mode
         self._rebind = True
         self.update()
 
@@ -587,6 +593,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     equivolume=self.equivolume,
                     map_opacity=self.map_opacity,
                     depth_stat=self.depth_stat,
+                    cubic=self.sampling == "cubic",
                 ),
             )
             draws.append((gpu, index, count))
@@ -974,7 +981,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("c", "centre the view on the crosshair", self._centre_view, group="view"),
                 Key("x", "show / hide the crosshair", self._toggle_cross, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
-                Key("n", "nearest / linear voxel sampling", self._toggle_linear, group="view"),
+                Key("n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
                 Key("shift+v", "previous view", lambda: self._cycle_view(-1), group="view"),
                 Key("0", "reset the camera", self._reset_camera, group="view"),
@@ -1138,8 +1145,11 @@ class SurfaceWindow(QtWidgets.QWidget):
             lo = hi = 0.5 * (lo + hi)
         self._dispatch(SetSurfaceDepth(self.vid, lo, hi, n))
 
-    def _toggle_linear(self) -> None:
-        self.canvas.set_linear(not self.canvas.linear)
+    def _cycle_sampling(self) -> None:
+        from fastfuncstuff.surface.sampling import MODES
+
+        nxt = MODES[(MODES.index(self.canvas.sampling) + 1) % len(MODES)]
+        self.canvas.set_sampling(nxt)
 
     def _cycle_view(self, step: int) -> None:
         names = list(s3.VIEWS)
