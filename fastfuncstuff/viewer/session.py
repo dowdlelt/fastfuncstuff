@@ -343,6 +343,31 @@ class ViewerSession:
             range_hi=hi,
         )
 
+    def layer_sampler(self, key: str, index: int, mode: str = "linear"):
+        """A point sampler of one sub-brick of a layer (scanner mm in, values out).
+
+        :meth:`surface_sampler` follows a layer's *displayed* sub-brick; an overlay
+        also needs the one its threshold reads. Cached per (layer, sub-brick, grid),
+        a few at a time.
+        """
+        from fastfuncstuff.surface.sampling import VolumeSampler
+
+        layer = self.state.layers.get(key)
+        # The store record's generation too: a mode re-adopts new values under
+        # the same key, and a sampler of the old ones would draw them forever.
+        generation = self.store.get(key).generation
+        cache_key = (key, int(index), generation, np.asarray(layer.affine).tobytes())
+        cache = getattr(self, "_layer_samplers", None)
+        if cache is None:
+            cache = self._layer_samplers = {}
+        hit = cache.get(cache_key)
+        if hit is None:
+            hit = VolumeSampler(self.volume(key, int(index)), layer.affine)
+            if len(cache) > 8:
+                cache.pop(next(iter(cache)))
+            cache[cache_key] = hit
+        return hit.with_mode(mode)
+
     def surface_display_token(self, hemi: str) -> tuple:
         """What :meth:`surface_vertex_rgba` depends on, hashable: a 3-D window
         recolours only when it changes."""

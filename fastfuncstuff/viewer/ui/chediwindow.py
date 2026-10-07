@@ -56,6 +56,9 @@ from fastfuncstuff.viewer.vocab import (
 
 #: How far from the crosshair (mm) a vertex may be and still be followed.
 FOLLOW_MM = 10.0
+#: Colour overlays CHEDI draws over its wall (``i`` toggles them): enough for grey
+#: matter and a thresholded map at once without the patch turning to soup.
+MAX_OVERLAYS = 2
 #: Pixels across the sampled patch. The canvas scales it; more is slower to
 #: build and sample and shows nothing an anatomy at ~1 mm has to give.
 PATCH_PIXELS = 256
@@ -333,6 +336,7 @@ class ChediWindow(QtWidgets.QWidget):
         self.surface = "pial"
         #: What is drawn (o): the data, the gyri/sulci map, or the spacing map.
         self.display = "data"
+        self.show_overlays = True
         #: What the spacing map compares against: "file" or, after a
         #: topology edit, "white".
         self._spacing_vs = "file"
@@ -470,6 +474,12 @@ class ChediWindow(QtWidgets.QWidget):
                     "o",
                     "show: data -> gyri / sulci -> spacing (dark = crowded)",
                     self._cycle_display,
+                    group="view",
+                ),
+                Binding(
+                    "i",
+                    "colour overlays on / off: the top two visible layers over the wall",
+                    self._toggle_overlays,
                     group="view",
                 ),
                 Binding(
@@ -1099,6 +1109,17 @@ class ChediWindow(QtWidgets.QWidget):
         rgba = np.empty((*rgb.shape, 4), np.uint8)
         rgba[..., :3] = rgb[..., None]
         rgba[..., 3] = np.where(p.inside, 255, 0)
+        shown = []
+        if spacing is None:
+            for over in self.overlay_layers():
+                top = self._overlay_rgba(over, depth, mode)
+                if top is None:
+                    continue
+                a = top[..., 3:4].astype(np.float32) / 255.0
+                rgba[..., :3] = np.round(top[..., :3] * a + rgba[..., :3] * (1.0 - a)).astype(
+                    np.uint8
+                )
+                shown.append(over.name)
         self.canvas.image = QtGui.QImage(
             rgba.data, p.size, p.size, 4 * p.size, QtGui.QImage.Format.Format_RGBA8888
         ).copy()
@@ -1111,10 +1132,63 @@ class ChediWindow(QtWidgets.QWidget):
                 if spacing is not None
                 else f"{layer.name if layer is not None else ''} · {mode}"
             )
+            + (f"   + {', '.join(shown)}" if shown else "")
             + f"   moves {self.surface} · {self.snap_mode} · flatten {self.flatten:g}"
             + ("" if p.source == "sphere" else "   (no sphere: inflated)")
         )
         self.canvas.update()
+
+    def overlay_layers(self) -> list:
+        """The colour overlays over the wall: the top two visible layers above the
+        base, other than the one the wall shows -- grey matter and the thresholded
+        map, say. A surface layer is one too (on its own vertices, no depth)."""
+        if not self.show_overlays:
+            return []
+        wall = self.layer()
+        above = [
+            ly
+            for ly in list(self.session.state.layers)[1:]
+            if ly.visible and (wall is None or ly.key != wall.key)
+        ]
+        return above[-MAX_OVERLAYS:]
+
+    def _overlay_rgba(self, layer, depth: float, mode: str) -> np.ndarray | None:
+        """``(H, W, 4)`` uint8 of one overlay on the patch, coloured as on the slices."""
+        from fastfuncstuff.viewer.surfacelayers import layer_rgba
+
+        p, sampler = self.patch, self._sampler
+        assert p is not None and sampler is not None
+        session = self.session
+        idx = session.state.time_index if layer.time_linked else layer.volume_index
+        sld = session.surface_layers.get(layer.key)
+        if sld is not None:
+            data = sld.parts.get(p.hemi)
+            if data is None:
+                return None
+            values = self._per_pixel(data.values[:, min(idx, data.values.shape[1] - 1)])
+            stat = self._per_pixel(data.values[:, layer.threshold_brick])
+        else:
+            h = session.surfaces.hemis[p.hemi]
+            values = sampler.sample(
+                h, depth, session.layer_sampler(layer.key, idx, mode), self._version()
+            )
+            stat = (
+                values
+                if layer.threshold_index is None
+                else sampler.sample(
+                    h,
+                    depth,
+                    session.layer_sampler(layer.key, layer.threshold_brick, mode),
+                    self._version(),
+                )
+            )
+        return layer_rgba(layer, values, stat)
+
+    def _toggle_overlays(self) -> None:
+        self.show_overlays = not self.show_overlays
+        names = ", ".join(ly.name for ly in self.overlay_layers()) or "none visible"
+        self.status.setText(f"overlays {'on: ' + names if self.show_overlays else 'off'}")
+        self.refresh()
 
     def _per_pixel(self, per_vertex: np.ndarray) -> np.ndarray:
         """A per-vertex map through the patch's pixel weights; NaN outside the patch."""

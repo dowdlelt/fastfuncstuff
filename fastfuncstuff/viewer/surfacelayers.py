@@ -111,17 +111,29 @@ def open_surface_parts(path: str | Path, match) -> dict[str, SurfaceData]:
 
 
 def vertex_rgba(layer, values: np.ndarray, stat: np.ndarray, keep: np.ndarray | None, device=None):
-    """``(V, 4)`` uint8 colours of one hemisphere, as :func:`viewer.compose.render_plane`
-    would colour the same values: the layer's LUT, range, sign mode, threshold and
-    alpha ramp, then any cluster cut. Values off cortex (exactly 0) stay clear."""
+    """``(V, 4)`` uint8 colours of one hemisphere: :func:`layer_rgba` on its vertices."""
+    return layer_rgba(layer, values, stat, keep, device)
+
+
+def layer_rgba(
+    layer, values: np.ndarray, stat: np.ndarray, keep: np.ndarray | None = None, device=None
+):
+    """``(..., 4)`` uint8 colours of any array of a layer's values, as
+    :func:`viewer.compose.render_plane` colours a plane: the layer's LUT, range,
+    sign mode, threshold and alpha ramp, then any cut (``keep``). Values exactly 0
+    or NaN (off cortex, off a patch) stay clear. Shared by the surface window's
+    vertices and CHEDI's overlays, so a threshold reads the same everywhere."""
     import torch
 
     from fastfuncstuff.viewer.colormap import apply_colormap, threshold_alpha
     from fastfuncstuff.viewer.compose import cached_lut
 
     dev = device or torch.device("cpu")
-    v = torch.as_tensor(np.asarray(values, np.float32), device=dev)
-    s = torch.as_tensor(np.asarray(stat, np.float32), device=dev)
+    shape = np.shape(values)
+    raw = np.asarray(values, np.float32).reshape(-1)
+    finite = np.isfinite(raw)
+    v = torch.as_tensor(np.where(finite, raw, 0.0), device=dev)
+    s = torch.as_tensor(np.nan_to_num(np.asarray(stat, np.float32).reshape(-1)), device=dev)
     lo = layer.range_lo if layer.range_lo is not None else 0.0
     hi = layer.range_hi if layer.range_hi is not None else 1.0
     rgb = apply_colormap(
@@ -134,12 +146,14 @@ def vertex_rgba(layer, values: np.ndarray, stat: np.ndarray, keep: np.ndarray | 
     )
     alpha = threshold_alpha(s, layer.threshold, mode=layer.alpha_mode, sign_mode=layer.sign_mode)
     alpha = alpha * float(layer.opacity) * (v != 0).to(alpha.dtype)
+    alpha = alpha * torch.as_tensor(finite, device=dev).to(alpha.dtype)
     if keep is not None:
-        alpha = alpha * torch.as_tensor(np.asarray(keep, bool), device=dev).to(alpha.dtype)
+        cut = np.asarray(keep, bool).reshape(-1)
+        alpha = alpha * torch.as_tensor(cut, device=dev).to(alpha.dtype)
     out = np.zeros((v.shape[0], 4), np.uint8)
     out[:, :3] = np.clip(np.round(rgb.cpu().numpy() * 255), 0, 255).astype(np.uint8)
     out[:, 3] = np.clip(np.round(alpha.cpu().numpy() * 255), 0, 255).astype(np.uint8)
-    return out
+    return out.reshape(*shape, 4)
 
 
 def _cluster_alpha(table: dict, pthr: float | None, area: float) -> float | None:
