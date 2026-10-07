@@ -14,11 +14,12 @@ Nothing here imports Qt.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from fastfuncstuff.io.freesurfer import infer_label
 
 #: The two types a row can be. smoothwm is a white matter surface for this
 #: purpose: what matters is which side of the cortex it bounds.
@@ -34,8 +35,6 @@ COMPARE_RGB: tuple[tuple[float, float, float], ...] = (
     (0.75, 0.55, 1.0),
     (0.6, 1.0, 0.85),
 )
-
-_HEMI = re.compile(r"(?:^|[._\-])(lh|rh)(?:[._\-]|$)", re.IGNORECASE)
 
 
 @dataclass
@@ -62,24 +61,6 @@ class MeshEntry:
     @property
     def label(self) -> str:
         return f"{self.name}{' *' if self.edited else ''}"
-
-
-def infer_label(filename: str) -> tuple[str | None, str | None]:
-    """(hemi, kind) read off a surface filename, ``None`` for what it does not say.
-
-    ``lh.pial.ffs`` -> (lh, pial); ``rh.smoothwm`` -> (rh, white). The filename
-    is a hint, not a contract: the row's hemi and type can be set by hand.
-    """
-    name = Path(filename).name.lower()
-    m = _HEMI.search(name)
-    hemi = m.group(1) if m else None
-    if "pial" in name:
-        kind = "pial"
-    elif "white" in name or "smoothwm" in name or re.search(r"(?:^|[._\-])wm(?:[._\-]|$)", name):
-        kind = "white"
-    else:
-        kind = None
-    return hemi, kind
 
 
 __all__ = ["COMPARE_RGB", "KINDS", "MeshEntry", "infer_label"]

@@ -24,6 +24,7 @@ must not pay for a torch import to read a mesh.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -230,6 +231,27 @@ def read_scanner_surface(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarra
     """(vertices in scanner RAS, faces) of a surface file, placed by its own geometry."""
     s = read_surface(path)
     return _apply(tkr_to_scanner(s.volume_info), s.vertices), s.faces
+
+
+_HEMI = re.compile(r"(?:^|[._\-])(lh|rh)(?:[._\-]|$)", re.IGNORECASE)
+
+
+def infer_label(filename: str) -> tuple[str | None, str | None]:
+    """(hemi, kind) read off a surface filename, ``None`` for what it does not say.
+
+    ``lh.pial.ffs`` -> (lh, pial); ``rh.smoothwm`` -> (rh, white). The filename
+    is a hint, not a contract: the row's hemi and type can be set by hand.
+    """
+    name = Path(filename).name.lower()
+    m = _HEMI.search(name)
+    hemi = m.group(1) if m else None
+    if "pial" in name:
+        kind = "pial"
+    elif "white" in name or "smoothwm" in name or re.search(r"(?:^|[._\-])wm(?:[._\-]|$)", name):
+        kind = "white"
+    else:
+        kind = None
+    return hemi, kind
 
 
 def hemisphere_from_file(path: str | os.PathLike, hemi: str, state: str) -> Hemisphere:

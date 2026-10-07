@@ -80,3 +80,58 @@ def test_alternative_surface_names(tmp_path):
     ]
     assert main([*args, "-device", "cpu", "-quiet"]) == 0
     assert (np.asarray(nib.load(f"{prefix}_rim.nii.gz").dataobj) == 3).any()
+
+
+def _rim(prefix):
+    return np.asarray(nib.load(f"{prefix}_rim.nii.gz").dataobj)
+
+
+def test_meshes_without_a_subject_match_the_subject_and_take_edits(tmp_path):
+    import shutil
+
+    import pytest
+
+    from fastfuncstuff.io.freesurfer import write_label
+
+    subj, master = _subject(tmp_path)
+    run = ["-master", str(master), "-device", "cpu", "-quiet"]
+    assert main(["-fs_subj", str(subj), "-prefix", str(tmp_path / "subj_out"), *run]) == 0
+    # The same files, moved out of any subject: identical layers.
+    loose = tmp_path / "loose"
+    shutil.copytree(subj / "surf", loose)
+    shutil.rmtree(subj)
+    meshes = ["-white_mesh", str(loose / "lh.white"), str(loose / "rh.white")]
+    pial = ["-pial_mesh", str(loose / "rh.pial"), str(loose / "lh.pial")]  # paired by name
+    assert main([*meshes, *pial, "-prefix", str(tmp_path / "mesh_out"), *run]) == 0
+    np.testing.assert_array_equal(_rim(tmp_path / "subj_out"), _rim(tmp_path / "mesh_out"))
+
+    # An edited pial saved as a copy: thicker cortex, originals untouched.
+    v, f = nfs.read_geometry(str(loose / "lh.pial"))
+    c = np.array([-11.0, 0.0, 0.0])
+    edited = loose / "lh.pial.ffsedit"
+    nfs.write_geometry(str(edited), ((v - c) * 1.2 + c).astype(np.float32), f,
+                       volume_info=_volume_info())  # fmt: skip
+    lh = ["-white_mesh", str(loose / "lh.white"), "-pial_mesh", str(edited)]
+    assert main([*lh, "-prefix", str(tmp_path / "edit"), *run]) == 0
+    assert main([*lh[:2], "-pial_mesh", str(loose / "lh.pial"),
+                 "-prefix", str(tmp_path / "orig"), *run]) == 0  # fmt: skip
+    assert (_rim(tmp_path / "edit") == 3).sum() > 1.3 * (_rim(tmp_path / "orig") == 3).sum()
+
+    # A cortex label drops what it leaves out (here, the top half).
+    top = np.flatnonzero(nfs.read_geometry(str(loose / "lh.white"))[0][:, 2] < 0)
+    write_label(tmp_path / "lh.cortex.label", top, np.zeros((top.size, 3)), np.zeros(top.size))
+    lab = ["-cortex_label", str(tmp_path / "lh.cortex.label")]
+    assert main([*lh[:2], "-pial_mesh", str(loose / "lh.pial"), *lab,
+                 "-prefix", str(tmp_path / "lab"), *run]) == 0  # fmt: skip
+    assert (_rim(tmp_path / "lab") == 3).sum() < 0.7 * (_rim(tmp_path / "orig") == 3).sum()
+
+    with pytest.raises(SystemExit, match="-master is required"):
+        main([*lh, "-prefix", str(tmp_path / "x"), "-device", "cpu", "-quiet"])
+    with pytest.raises(SystemExit, match="covers"):
+        main([*lh[:2], "-pial_mesh", str(loose / "rh.pial"), "-prefix", str(tmp_path / "x"), *run])
+    other = loose / "lh.pial.other"
+    w, wf = icosphere(2)
+    nfs.write_geometry(str(other), (w * R2 + c).astype(np.float32), wf.astype(np.int32),
+                       volume_info=_volume_info())  # fmt: skip
+    with pytest.raises(SystemExit, match="not the same mesh"):
+        main([*lh[:2], "-pial_mesh", str(other), "-prefix", str(tmp_path / "x"), *run])
