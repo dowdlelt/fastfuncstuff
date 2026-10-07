@@ -268,7 +268,7 @@ class ProfileWindow(QtWidgets.QWidget):
                 Key("scroll", "move along (ctrl: zoom)", None, group="view"),
                 Key("click", "move the crosshair to that vertex", None, group="view"),
                 Key("h", "this list", self.help.toggle, group="window"),
-                Key("w", "close this window", self.close, group="window"),
+                Key("ctrl+w", "close this window", self.close, group="window"),
             ]
         )  # fmt: skip
         keep_keys_for_shortcuts(self)

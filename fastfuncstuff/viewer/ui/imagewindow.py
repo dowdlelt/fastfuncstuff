@@ -493,7 +493,7 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("click a cell", "go to that slice, there", None, group="strip"),
                 Binding("right-drag a cell", "strip zoom", None, group="strip"),
                 Binding("h", "this list", self.help.toggle, group="window"),
-                Binding("w", "close this window", self.close, group="window"),
+                Binding("ctrl+w", "close this window", self.close, group="window"),
             ]
         )
         keep_keys_for_shortcuts(self)

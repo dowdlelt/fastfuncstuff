@@ -2701,3 +2701,28 @@ def test_a_key_name_qt_does_not_know_is_refused(qapp):
             install(widget, [Binding("PgDn", "previous slice", lambda: None)])
     finally:
         widget.deleteLater()
+
+
+def test_long_key_tables_split_into_columns_of_whole_groups():
+    from fastfuncstuff.viewer.ui.shortcuts import split_columns
+
+    groups = [(f"g{n}", list(range(k))) for n, k in enumerate([3, 9, 4, 12, 6, 2])]
+    cols = split_columns(groups)
+    assert len(cols) == 2
+    # Every group, in order, none split.
+    assert [g for col in cols for g, _ in col] == [g for g, _ in groups]
+    heights = [sum(len(items) + 1 for _, items in col) for col in cols]
+    assert abs(heights[0] - heights[1]) <= 13  # within one group of even
+    assert len(split_columns(groups[:2])) == 1
+    assert len(split_columns(groups * 3)) == 3
+
+
+def test_w_alone_closes_nothing(win, qapp):
+    """Closing a window is ctrl+W: a bare w closed one by accident, twice."""
+    from PySide6 import QtGui
+
+    windows = [win, *win.manager.windows.values()]
+    for window in windows:
+        for binding in window.help._bindings:
+            if binding.description == "close this window":
+                assert QtGui.QKeySequence(binding.keys).toString() == "Ctrl+W", binding

@@ -96,6 +96,34 @@ def keep_keys_for_shortcuts(root: QtWidgets.QWidget) -> None:
             widget.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
 
 
+#: Rows (a key, or a group heading) a single column of the help holds before
+#: the table is split, and a second column before it takes a third.
+ONE_COLUMN_ROWS = 20
+TWO_COLUMN_ROWS = 60
+
+
+def split_columns(groups: list[tuple[str, list]]) -> list[list[tuple[str, list]]]:
+    """Whole groups, in order, into 1-3 columns of about equal height.
+
+    A group heading counts as a row, and a group is never split: a key cut off
+    from its heading reads as belonging to the group above it.
+    """
+    heights = [len(items) + 1 for _, items in groups]
+    total = sum(heights)
+    n = 1 if total <= ONE_COLUMN_ROWS else 2 if total <= TWO_COLUMN_ROWS else 3
+    out: list[list[tuple[str, list]]] = [[]]
+    filled = 0
+    for group, height in zip(groups, heights, strict=True):
+        # Start the next column when this group would carry the current one
+        # further past its share than stopping short of it would.
+        share = total * len(out) / n
+        if out[-1] and len(out) < n and filled + height - share > share - filled:
+            out.append([])
+        out[-1].append(group)
+        filled += height
+    return out
+
+
 class ShortcutsDialog(QtWidgets.QDialog):
     """The `h` panel: what this window's keys do."""
 
@@ -109,27 +137,39 @@ class ShortcutsDialog(QtWidgets.QDialog):
         outer.setContentsMargins(16, 14, 16, 14)
         outer.setSpacing(4)
 
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(3)
-        row = 0
-        last_group = None
+        # Whole groups per column, so a long table (CHEDI's, the image
+        # window's) fits on a screen instead of running off the bottom.
+        # A table may visit a group more than once (the image window's VIEW
+        # keys are in three places); each group is listed once, where it
+        # first appears.
+        by_name: dict[str, list[Binding]] = {}
         for binding in bindings:
-            if binding.group != last_group:
-                if last_group is not None:
+            by_name.setdefault(binding.group, []).append(binding)
+        groups = list(by_name.items())
+        columns = QtWidgets.QHBoxLayout()
+        columns.setSpacing(28)
+        for column in split_columns(groups):
+            grid = QtWidgets.QGridLayout()
+            grid.setHorizontalSpacing(18)
+            grid.setVerticalSpacing(3)
+            row = 0
+            for n, (group, items) in enumerate(column):
+                if n:
                     row += 1
-                head = QtWidgets.QLabel(binding.group.upper())
+                head = QtWidgets.QLabel(group.upper())
                 head.setObjectName("group")
                 grid.addWidget(head, row, 0, 1, 2)
                 row += 1
-                last_group = binding.group
-            key = QtWidgets.QLabel(binding.keys)
-            key.setObjectName("key")
-            key.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            grid.addWidget(key, row, 0)
-            grid.addWidget(QtWidgets.QLabel(binding.description), row, 1)
-            row += 1
-        outer.addLayout(grid)
+                for binding in items:
+                    key = QtWidgets.QLabel(binding.keys)
+                    key.setObjectName("key")
+                    key.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+                    grid.addWidget(key, row, 0)
+                    grid.addWidget(QtWidgets.QLabel(binding.description), row, 1)
+                    row += 1
+            grid.setRowStretch(row, 1)
+            columns.addLayout(grid)
+        outer.addLayout(columns)
 
         hint = QtWidgets.QLabel("esc or h to close")
         hint.setObjectName("group")

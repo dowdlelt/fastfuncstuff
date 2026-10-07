@@ -575,7 +575,7 @@ class GraphWindow(QtWidgets.QWidget):
                 ),
                 Binding("click", "jump to that volume", None, group="grid"),
                 Binding("h", "this list", self.help.toggle, group="window"),
-                Binding("w", "close this window", self.close, group="window"),
+                Binding("ctrl+w", "close this window", self.close, group="window"),
             ]
         )
         keep_keys_for_shortcuts(self)

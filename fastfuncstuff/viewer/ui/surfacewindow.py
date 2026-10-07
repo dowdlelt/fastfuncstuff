@@ -1007,7 +1007,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("click", "move the crosshair there", None, group="view"),
                 Key("ctrl+click", "set the InstaCorr seed there", None, group="view"),
                 Key("h", "this list", self.help.toggle, group="window"),
-                Key("w", "close this window", self.close, group="window"),
+                Key("ctrl+w", "close this window", self.close, group="window"),
             ]
         )  # fmt: skip
         keep_keys_for_shortcuts(self)

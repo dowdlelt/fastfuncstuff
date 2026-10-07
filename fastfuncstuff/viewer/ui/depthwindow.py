@@ -326,7 +326,7 @@ class DepthWindow(QtWidgets.QWidget):
                 Key("f", "follow the crosshair / pin the region", self._toggle_follow, group="depth"),
                 Key("click (heatmap)", "go to that volume", None, group="depth"),
                 Key("h", "this list", self.help.toggle, group="window"),
-                Key("w", "close this window", self.close, group="window"),
+                Key("ctrl+w", "close this window", self.close, group="window"),
             ]
         )  # fmt: skip
         keep_keys_for_shortcuts(self)
