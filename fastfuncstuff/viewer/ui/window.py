@@ -2449,6 +2449,7 @@ def launch(
     directory: str | None = None,
     surfaces: str | None = None,
     meshes: list[str] | None = None,
+    surf_data: list | None = None,
 ) -> int:
     """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
@@ -2477,6 +2478,8 @@ def launch(
         for m in meshes:
             # The mesh window's loader asks for whatever the name doesn't say.
             win.mesh_window.load_path(m)
+    for cmd in surf_data or []:
+        win.refresh(session.do(cmd))
     if script:
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()

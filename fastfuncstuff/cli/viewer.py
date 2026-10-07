@@ -143,8 +143,32 @@ def build_parser() -> FfsArgumentParser:
         "sampling collapses onto that surface; load the other to get the ribbon "
         "back. After -surfaces, files are added to the subject's mesh list.",
     )
+    p.add_argument(
+        "-surf_data",
+        metavar="FILE",
+        action="append",
+        default=[],
+        help="A per-vertex result (.func.gii from ffs_reml on a surface) to show as a "
+        "surface window's 'data' map, thresholded by p and, when it carries SurfClustSim "
+        "tables, by cluster area. Bound to its mesh by vertex index: load the meshes it "
+        "was made on first (-surfaces, or -mesh PREFIX.SPACE.lh.white.surf.gii and pial). "
+        "The hemisphere is read from the name (.lh. / .rh.), else matched by the data's "
+        "mesh fingerprint; repeat for more.",
+    )
     add_device_arg(p, default="auto")
     return p
+
+
+def _surf_data_commands(paths: list[str]):
+    from fastfuncstuff.io.freesurfer import infer_label
+    from fastfuncstuff.viewer.vocab import LoadSurfaceData
+
+    out = []
+    for path in paths:
+        hemi, _ = infer_label(path)
+        # No lh/rh in the name: the store matches the data's mesh fingerprint.
+        out.append(LoadSurfaceData(path, hemi or ""))
+    return out
 
 
 def _mesh_commands(paths: list[str]):
@@ -183,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
 
                 session.do(LoadSurfaces(args.surfaces))
-            for cmd in _mesh_commands(args.mesh):
+            for cmd in [*_mesh_commands(args.mesh), *_surf_data_commands(args.surf_data)]:
                 session.do(cmd)
             if args.script:
                 session.run_script(open(args.script).read())
@@ -208,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         directory=args.read,
         surfaces=args.surfaces,
         meshes=args.mesh,
+        surf_data=_surf_data_commands(args.surf_data),
     )
 
 

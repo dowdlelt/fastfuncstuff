@@ -1389,6 +1389,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             vp.vertex_map,
             annot if vp.vertex_map == "annot" else "",
             surfaces.flags_version if vp.vertex_map == "flags" else 0,
+            surfaces.data_version if vp.vertex_map == "data" else 0,
             surfaces.depth_roi_version,
             surfaces.highlight_version,
             surfaces.subject,
@@ -1398,7 +1399,11 @@ class SurfaceWindow(QtWidgets.QWidget):
             return
         for h, hemi in surfaces.hemis.items():
             ann = surfaces.annotation(h, annot) if vp.vertex_map == "annot" else None
-            colours = s3.vertex_colors(hemi, vp.vertex_map, ann, surfaces.flags.get(h))
+            if vp.vertex_map == "data":
+                shown = surfaces.data_display(h)
+                colours = None if shown is None else shown[0]
+            else:
+                colours = s3.vertex_colors(hemi, vp.vertex_map, ann, surfaces.flags.get(h))
             if colours is None:
                 colours = np.zeros((hemi.n_vertices, 4), np.uint8)
             roi = surfaces.depth_roi_vertices.get(h)
@@ -1427,6 +1432,20 @@ class SurfaceWindow(QtWidgets.QWidget):
         self._refresh_legend(vp)
 
     def _refresh_legend(self, vp: Viewport) -> None:
+        if vp.vertex_map == "data":
+            shown = [
+                d
+                for h in self.session.surfaces.data
+                if (d := self.session.surfaces.data_display(h))
+            ]
+            if not shown:
+                self.legend.set_scale(None)
+                return
+            top = max(d[1] for d in shown)
+            # RdBu runs red to blue; the data map is red for positive, as AFNI's.
+            self.legend.set_scale((top, -top, "RdBu"))
+            self.legend.setToolTip("\n".join(d[2] for d in shown))
+            return
         scales = [
             sc
             for hemi in self.session.surfaces.hemis.values()

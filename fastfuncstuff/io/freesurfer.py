@@ -228,7 +228,16 @@ class Hemisphere:
 
 
 def read_scanner_surface(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarray]:
-    """(vertices in scanner RAS, faces) of a surface file, placed by its own geometry."""
+    """(vertices in scanner RAS, faces) of a surface file, placed by its own geometry.
+
+    A ``.surf.gii`` (as ffs_nwarp -surf writes the target meshes it places in a subject)
+    is already in scanner mm.
+    """
+    if os.fspath(path).lower().endswith(".gii"):
+        from fastfuncstuff.io.gifti import load_gifti_surface
+
+        v, f, _ = load_gifti_surface(path)
+        return v.astype(np.float32), f.astype(np.int32)
     s = read_surface(path)
     return _apply(tkr_to_scanner(s.volume_info), s.vertices), s.faces
 
@@ -261,6 +270,16 @@ def hemisphere_from_file(path: str | os.PathLike, hemi: str, state: str) -> Hemi
     a subject directory, and a lone file says nothing about where that is.
     """
     path = Path(path)
+    if path.name.lower().endswith(".gii"):
+        # Scanner mm already: no tkregister frame to undo.
+        vertices, faces = read_scanner_surface(path)
+        return Hemisphere(
+            name=hemi,
+            faces=faces,
+            states={state: vertices},
+            tkr_to_scanner=np.eye(4),
+            paths={state: path},
+        )
     s = read_surface(path)
     to_scanner = tkr_to_scanner(s.volume_info)
     return Hemisphere(

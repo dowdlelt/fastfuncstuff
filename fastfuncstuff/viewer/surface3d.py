@@ -433,7 +433,9 @@ def folding_values(hemi: Hemisphere, mode: str) -> np.ndarray:
 
 
 #: Per-vertex maps a surface window can paint, in the order offered.
-VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot", "flags")
+#: "data" is a loaded per-vertex result (surface.statmap), thresholded by p and
+#: cluster area; the store colours it, since it lives on the store.
+VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot", "flags", "data")
 
 
 def flag_ramp() -> np.ndarray:

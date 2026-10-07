@@ -31,6 +31,7 @@ from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
 from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball, vertex_normals
 from fastfuncstuff.surface.sampling import VolumeSampler
+from fastfuncstuff.surface.statmap import SurfaceData
 from fastfuncstuff.viewer.meshlist import COMPARE_RGB, KINDS, MeshEntry
 from fastfuncstuff.viewer.slicing import PlaneView
 
@@ -177,6 +178,110 @@ class SurfaceStore:
         #: that samples between white and pial samples on the surface itself,
         #: and an edit of the one moves the other. Never drawn or grabbed.
         self.stand_ins: dict[str, str] = {}
+        #: Per-vertex results (a reml bucket on this mesh), by hemisphere: bound
+        #: to the mesh by vertex index, never resampled. See surface.statmap.
+        self.data: dict[str, SurfaceData] = {}
+        #: How they are shown: sub-brick (-1 = the bucket's first t), the
+        #: voxel-wise p, and the family-wise alpha for the cluster-area cut
+        #: (0 = no cluster cut, threshold only).
+        self.data_view: dict[str, float] = {"sub_brick": -1, "p": 0.001, "alpha": 0.05}
+        self.data_version = 0
+
+    def load_data(self, path: str | Path, hemi: str = "") -> SurfaceData:
+        """Attach a per-vertex result to ``hemi``; it must be this hemisphere's mesh.
+
+        ``hemi`` empty: the loaded hemisphere whose mesh the data's fingerprint names
+        (a reml bucket's name need not say lh or rh; its metadata says which mesh).
+        """
+        from fastfuncstuff.io.gifti import mesh_fingerprint
+        from fastfuncstuff.surface.statmap import load_surface_data
+
+        data = load_surface_data(path)
+        if not hemi:
+            matches = [
+                h
+                for h, hs in self.hemis.items()
+                if hs.n_vertices == data.n_vertices
+                and (
+                    not data.fingerprint
+                    or data.fingerprint == mesh_fingerprint(hs.faces, hs.n_vertices)
+                )
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"{Path(path).name}: {'no' if not matches else 'more than one'} loaded "
+                    "hemisphere is the mesh it was made on; name lh or rh"
+                )
+            hemi = matches[0]
+        if hemi not in self.hemis:
+            raise ValueError(f"load the {hemi} surface before data on it")
+        h = self.hemis[hemi]
+        if data.n_vertices != h.n_vertices:
+            raise ValueError(
+                f"{Path(path).name} has {data.n_vertices:,} vertices, the {hemi} mesh "
+                f"{h.n_vertices:,}: it belongs to another mesh"
+            )
+        if data.fingerprint and data.fingerprint != mesh_fingerprint(h.faces, h.n_vertices):
+            raise ValueError(
+                f"{Path(path).name} was made on another mesh (fingerprint "
+                f"{data.fingerprint}); load the surfaces it was sampled on"
+            )
+        self.data[hemi] = data
+        self.data_version += 1
+        return data
+
+    def set_data_view(self, sub_brick: int = -2, p: float = -1.0, alpha: float = -1.0) -> None:
+        """Change what is shown; a negative argument (other than sub_brick -1) keeps it."""
+        if sub_brick != -2:
+            self.data_view["sub_brick"] = sub_brick
+        if p > 0:
+            self.data_view["p"] = p
+        if alpha >= 0:
+            self.data_view["alpha"] = alpha
+        self.data_version += 1
+
+    def data_display(self, hemi: str):
+        """``(colours (V, 4) uint8, scale, caption)`` of ``hemi``'s result, or None.
+
+        The p-threshold comes from the sub-brick's stat code; with a SurfClustSim
+        table and alpha > 0, only clusters at least the table's area survive, measured
+        on the midthickness (the surface the table was simulated on).
+        """
+        from fastfuncstuff.surface.mesh import vertex_areas
+        from fastfuncstuff.surface.statmap import (
+            cluster_area_threshold,
+            data_colors,
+            stat_threshold,
+            surviving_clusters,
+        )
+        from fastfuncstuff.viewer.surface3d import map_lut
+
+        data = self.data.get(hemi)
+        h = self.hemis.get(hemi)
+        if data is None or h is None:
+            return None
+        k = int(self.data_view["sub_brick"])
+        k = data.default_sub_brick() if k < 0 or k >= data.values.shape[1] else k
+        vals = data.values[:, k]
+        code, params = data.stat.get(k, (None, ()))
+        p, alpha = float(self.data_view["p"]), float(self.data_view["alpha"])
+        thr = stat_threshold(code, params, p)
+        label = data.labels[k]
+        if thr is None:  # not a statistic: show it all, no cut
+            keep = np.isfinite(vals) & (vals != 0)
+            scale = float(np.percentile(np.abs(vals[keep]), 98)) if keep.any() else 1.0
+            return data_colors(vals, keep, scale, map_lut("RdBu")[::-1]), scale, label
+        white, pial = h.states["white"], h.states.get("pial", h.states["white"])
+        area = vertex_areas(0.5 * (np.asarray(white) + np.asarray(pial)), h.faces)
+        min_area = cluster_area_threshold(data, p, alpha) if alpha > 0 else None
+        keep, labels = surviving_clusters(
+            vals, thr, h.faces, area, min_area, one_sided_positive=code == 4
+        )
+        scale = max(float(np.percentile(np.abs(vals[keep]), 98)) if keep.any() else thr, thr)
+        cut = f", clusters >= {min_area:.0f} mm^2 (alpha {alpha:g})" if min_area else ""
+        n = int(labels.max())
+        caption = f"{label}: p < {p:g} (|stat| > {thr:.2f}){cut}; {n} cluster{'s' * (n != 1)}"
+        return data_colors(vals, keep, scale, map_lut("RdBu")[::-1]), scale, caption
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -204,6 +309,8 @@ class SurfaceStore:
         self.flags_version += 1
 
     def _reset_edits(self) -> None:
+        self.data = {}
+        self.data_version += 1
         self._bundles.clear()
         self.topology_changed.clear()
         self.flags = {}

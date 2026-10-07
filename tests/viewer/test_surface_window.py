@@ -376,3 +376,32 @@ def test_paint_mode_paints_the_vertex_under_the_cursor_instead_of_turning(window
     assert got and got[0][0] == "lh" and got[0][2] is False
     np.testing.assert_allclose(c.camera.rotation, turned)
     assert session.surfaces.highlight["lh"].sum() > 0
+
+
+def test_a_surface_stat_result_paints_as_the_data_map(window, tmp_path):
+    # A reml bucket on this mesh: loaded by command, thresholded at p, shown with a
+    # symmetric legend whose tooltip says what survived.
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.io.gifti import mesh_fingerprint, set_surface_meta
+    from fastfuncstuff.viewer.vocab import LoadSurfaceData, SetSurfaceData, SetSurfaceMap
+
+    session, win = window
+    h = session.surfaces.hemis["lh"]
+    hdr = nib.Nifti2Header()
+    set_surface_meta(hdr, {"mesh_fingerprint": mesh_fingerprint(h.faces, h.n_vertices)})
+    xy = h.states["white"][:, :2]
+    t = (8.0 * np.exp(-(xy**2).sum(1) / 40.0)).astype(np.float32)
+    vals = np.stack([t, t], 1)[:, None, None, :]
+    path = tmp_path / "s.func.gii"
+    save_nifti(vals, path, header=hdr, brick_labels=["c#0_Coef", "c#0_Tstat"],
+               brick_stataux={1: (3, (60.0,))})  # fmt: skip
+    session.do(LoadSurfaceData(str(path), "lh"))
+    session.do(SetSurfaceData(p=0.001, alpha=0.0))
+    session.do(SetSurfaceMap("S1", "data"))
+    win.apply(session.state.viewports.get("S1"))
+    assert not win.legend.isHidden()
+    lo, hi, name = win.legend._scale
+    assert lo == pytest.approx(-hi) and lo > 0 and name == "RdBu"
+    assert "c#0_Tstat: p < 0.001" in win.legend.toolTip()
+    script = session.to_script()
+    assert "LOAD_SURFACE_DATA" in script and "SET_SURFACE_DATA" in script
