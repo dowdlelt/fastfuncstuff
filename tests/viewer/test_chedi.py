@@ -346,3 +346,33 @@ def test_shift_click_moves_the_crosshair_and_centres_a_zoomed_slice(tmp_path, su
     finally:
         win.close()
         session.close()
+
+
+def test_o_shows_gyri_and_sulci_and_f_g_unselect_them(chedi, subject):
+    session, win = chedi
+    h = session.surfaces.hemis["lh"]
+    # No ?h.curv yet: it says so rather than drawing nothing.
+    win._toggle_folding()
+    assert not win.show_folding and "curv" in win.status.text()
+    # Half the cap a "sulcus" (+), half a "gyrus" (-), split along x.
+    h.morph["curv"] = np.where(h.states["white"][:, 0] > 0, 0.2, -0.2).astype(np.float32)
+    win._toggle_folding()
+    assert win.show_folding and "gyri / sulci" in win.canvas.caption
+    win._toggle_folding()
+    assert not win.show_folding
+
+    def select_all():
+        win._press("window", 30.0, 30.0)
+        win._drag(30.0, 30.0, 10 * 300.0, 0.0)
+        win._release()
+
+    select_all()
+    win._drop_fold(1)  # f: off the sulci
+    kept = session.surfaces.highlighted("lh")
+    assert kept.size and np.all(h.states["white"][kept, 0] <= 0)
+    select_all()
+    win._drop_fold(-1)  # g: off the gyri
+    kept = session.surfaces.highlighted("lh")
+    assert kept.size and np.all(h.states["white"][kept, 0] > 0)
+    win._drop_fold(1)
+    assert session.surfaces.highlighted("lh").size == 0

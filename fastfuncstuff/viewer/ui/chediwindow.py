@@ -251,6 +251,8 @@ class ChediWindow(QtWidgets.QWidget):
         self._centre: tuple[str, int] | None = None
         #: The one surface a push moves. Pial: what is usually wrong.
         self.surface = "pial"
+        #: Show the gyri/sulci map instead of the data (o).
+        self.show_folding = False
         #: Paint-select brush radius, flat mm.
         self.brush_mm = 1.5
         #: Visible vertex ids, their (row, col) pixels, and as a hemisphere mask.
@@ -337,6 +339,15 @@ class ChediWindow(QtWidgets.QWidget):
                 Binding("Escape", "clear the selection", self._clear_selection, group="select"),
                 Binding("(", "smaller brush", lambda: self._brush_by(1 / 1.25), group="select"),
                 Binding(")", "larger brush", lambda: self._brush_by(1.25), group="select"),
+                Binding(
+                    "o", "gyri / sulci map instead of the data", self._toggle_folding, group="view"
+                ),
+                Binding(
+                    "f", "unselect sulci (on screen)", lambda: self._drop_fold(1), group="select"
+                ),
+                Binding(
+                    "g", "unselect gyri (on screen)", lambda: self._drop_fold(-1), group="select"
+                ),
                 Binding("w", "push the selection in", lambda: self._push(-1.0), group="move"),
                 Binding("s", "pull the selection out", lambda: self._push(1.0), group="move"),
                 Binding("t", "move pial / white", self._toggle_surface, group="move"),
@@ -527,6 +538,43 @@ class ChediWindow(QtWidgets.QWidget):
         self._set_selected(new)
         self.status.setText(f"{how}: {before} -> {int(new[self._vis].sum())} points on screen")
 
+    def _folding(self) -> np.ndarray | None:
+        """Per vertex: +1 sulcus, -1 gyrus (0 flat), as the 3-D window's binary shade."""
+        from fastfuncstuff.viewer.surface3d import folding_values
+
+        assert self.patch is not None
+        h = self.session.surfaces.hemis[self.patch.hemi]
+        if "curv" not in h.morph:
+            return None
+        return folding_values(h, "binary")
+
+    def _toggle_folding(self) -> None:
+        if self.patch is not None and self._folding() is None:
+            self.status.setText("no ?h.curv: no gyri/sulci map")
+            return
+        self.show_folding = not self.show_folding
+        self.status.setText("gyri (light) / sulci (dark)" if self.show_folding else "data")
+        if self.patch is not None:
+            self._draw()
+
+    def _drop_fold(self, which: int) -> None:
+        """Unselect the on-screen points on sulci (``which`` 1) or gyri (-1)."""
+        if self.patch is None or not self._vis.size:
+            return
+        fold = self._folding()
+        if fold is None:
+            self.status.setText("no ?h.curv: cannot tell gyri from sulci")
+            return
+        mask = self._selected()
+        before = int(mask[self._vis].sum())
+        drop = self._vis[fold[self._vis] * which > 0]
+        mask[drop] = False
+        self._set_selected(mask)
+        name = "sulci" if which > 0 else "gyri"
+        self.status.setText(
+            f"off {name}: {before} -> {int(mask[self._vis].sum())} points on screen"
+        )
+
     def _clear_selection(self) -> None:
         self._gesture = None
         self._preview = None
@@ -692,8 +740,17 @@ class ChediWindow(QtWidgets.QWidget):
             return
         h = session.surfaces.hemis[p.hemi]
         depth = self.current_depth()
-        values = sampler.sample(h, depth, volume, self._version())
-        lo, hi = self._window(values, layer)
+        fold = self._folding() if self.show_folding else None
+        if fold is not None:
+            # Interpolated through the same pixel weights, then two-toned:
+            # gyri light, sulci dark, as FreeSurfer draws them.
+            shade = np.full(p.inside.shape, np.nan, np.float32)
+            shade[p.inside] = (fold[p.corners[p.inside]] * p.weights[p.inside]).sum(axis=1)
+            values = np.where(np.isfinite(shade), np.where(shade > 0, 0.3, 0.75), np.nan)
+            lo, hi = 0.0, 1.0
+        else:
+            values = sampler.sample(h, depth, volume, self._version())
+            lo, hi = self._window(values, layer)
         grey = np.clip((values - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
         rgb = np.where(np.isfinite(grey), grey * 255.0, 0.0).astype(np.uint8)
         rgba = np.empty((*rgb.shape, 4), np.uint8)
@@ -704,7 +761,12 @@ class ChediWindow(QtWidgets.QWidget):
         ).copy()
         self.canvas.caption = (
             f"{p.hemi} #{p.centre}   depth {depth:.2f}   ±{p.half_mm:.0f} mm   "
-            f"{layer.name if layer is not None else ''} · {mode}   moves {self.surface}"
+            + (
+                "gyri / sulci"
+                if fold is not None
+                else f"{layer.name if layer is not None else ''} · {mode}"
+            )
+            + f"   moves {self.surface}"
             + ("" if p.source == "sphere" else "   (no sphere: inflated)")
         )
         self.canvas.update()
