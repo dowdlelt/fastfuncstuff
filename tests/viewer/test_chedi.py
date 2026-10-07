@@ -397,3 +397,47 @@ def test_l_picks_the_sampled_layer_including_the_base_under_an_overlay(chedi, tm
     win._cycle_layer()
     assert session.state.viewports.get("E1").patch_layer == ""
     assert "SET_PATCH_LAYER E1" in session.to_script()
+
+
+def test_kmeans_finds_planted_groups_repeatably_and_orders_them_by_brightness():
+    from fastfuncstuff.viewer.chedi import cluster_features, kmeans, order_clusters
+
+    rng = np.random.default_rng(3)
+    means = (40.0, 10.0, 25.0)
+    profile = np.concatenate([rng.normal(m, 1.0, (300, 3)) for m in means])
+    truth = np.repeat([2, 0, 1], 300)  # rank of each group's brightness
+    fold = np.zeros(900)
+    x = cluster_features(profile, fold, np.zeros((900, 2)), 25.0, 0.0)
+    assert x.shape == (900, 4)  # 3 depths + folding; no position at weight 0
+    labels = order_clusters(kmeans(x, 3), profile[:, 1], 3)
+    np.testing.assert_array_equal(labels, truth)
+    np.testing.assert_array_equal(kmeans(x, 3), kmeans(x, 3))  # same press, same clusters
+    # The profile's shape survives standardising: one scale across depths.
+    rising = np.tile([0.0, 1.0, 2.0], (10, 1))
+    z = cluster_features(rising, np.zeros(10), np.zeros((10, 2)), 25.0, 0.0)
+    assert z[0, 0] < z[0, 1] < z[0, 2]
+    assert cluster_features(rising, np.zeros(10), np.ones((10, 2)), 25.0, 1.0).shape == (10, 6)
+
+
+def test_digits_toggle_a_cluster_and_clusters_follow_the_folding(chedi):
+    session, win = chedi
+    h = session.surfaces.hemis["lh"]
+    # Uniform anatomy at any one depth, so only the folding can split it.
+    h.morph["curv"] = np.where(h.states["white"][:, 0] > 0, 0.2, -0.2).astype(np.float32)
+    win.spatial = 0.0
+    win.k = 2
+    win._toggle_clusters()
+    assert win.show_clusters and len(win.canvas.legend) == 2
+    assert len(win.canvas.cluster_dots) == win._vis.size
+    win._pick_cluster(1)
+    picked = session.surfaces.highlighted("lh")
+    side = np.sign(h.states["white"][picked, 0])
+    assert picked.size and np.all(side == side[0])  # one side of the fold
+    win._pick_cluster(1)  # again: out
+    assert session.surfaces.highlighted("lh").size == 0
+    win._pick_cluster(5)
+    assert "only 2 clusters" in win.status.text()
+    win._k_by(20)
+    assert win.k == 10
+    keys = {b.keys for b in win.help._bindings}
+    assert {"1", "0", "ctrl+0", "ctrl+1", "c", "x"} <= keys

@@ -22,13 +22,18 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.chedi import (
+    MAX_CLUSTERS,
+    PROFILE_OFFSETS,
     Patch,
     PatchSampler,
     adjacency,
     build_patch,
+    cluster_features,
     dilate,
     drop_isolated,
     erode,
+    kmeans,
+    order_clusters,
     visible_vertices,
     window_select,
 )
@@ -66,6 +71,24 @@ SELECT_RGB = (1.0, 0.55, 0.1)
 #: Mesh wireframe: a bright blue that stays visible over dark CSF and bright
 #: white matter alike, and is nothing like the orange selection.
 MESH_RGB = (0.3, 0.7, 1.0)
+#: Cluster colours, dark to bright like the clusters themselves (cluster 1 is
+#: the darkest): viridis at ten steps, so the order reads off the colour.
+CLUSTER_RGB = np.array(
+    [
+        (0.267, 0.005, 0.329),
+        (0.283, 0.141, 0.458),
+        (0.254, 0.265, 0.530),
+        (0.207, 0.372, 0.553),
+        (0.164, 0.471, 0.558),
+        (0.128, 0.567, 0.551),
+        (0.135, 0.659, 0.518),
+        (0.267, 0.749, 0.441),
+        (0.478, 0.821, 0.318),
+        (0.993, 0.906, 0.144),
+    ]
+)
+#: Position weights ``x`` steps through (see chedi.cluster_features).
+SPATIAL_STEPS = (0.0, 0.5, 1.0)
 
 
 class PatchCanvas(QtWidgets.QWidget):
@@ -93,6 +116,11 @@ class PatchCanvas(QtWidgets.QWidget):
         self.caption = ""
         #: Selected vertices on screen, ``(N, 2)`` (row, col) patch pixels.
         self.dots = np.zeros((0, 2))
+        #: Every on-screen vertex coloured by its cluster, ``(N, 2)`` and
+        #: ``(N, 3)``, and the legend's (colour, text) lines; empty when off.
+        self.cluster_dots = np.zeros((0, 2))
+        self.cluster_rgb = np.zeros((0, 3))
+        self.legend: list[tuple[tuple[float, float, float], str]] = []
         #: Paint-brush radius in patch pixels, drawn at the cursor.
         self.brush_px = 4.0
         self._hover: QtCore.QPointF | None = None
@@ -129,19 +157,36 @@ class PatchCanvas(QtWidgets.QWidget):
             p.setPen(pen)
             p.drawPath(self.mesh)
             p.restore()
-        if len(self.dots):
+        radius = max(1.5, min(3.0, 0.35 * scale))
+        if len(self.cluster_dots):
             p.save()
             p.setClipRect(rect)
             p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.setBrush(QtGui.QColor.fromRgbF(*SELECT_RGB, 0.85))
-            radius = max(1.5, min(3.0, 0.35 * scale))
-            for r, cc in self.dots:
+            for (r, cc), rgb in zip(self.cluster_dots, self.cluster_rgb, strict=True):
+                p.setBrush(QtGui.QColor.fromRgbF(float(rgb[0]), float(rgb[1]), float(rgb[2]), 0.9))
                 p.drawEllipse(
-                    QtCore.QPointF(rect.x() + cc * scale, rect.y() + r * scale),
-                    radius,
-                    radius,
+                    QtCore.QPointF(rect.x() + cc * scale, rect.y() + r * scale), radius, radius
                 )
             p.restore()
+        if len(self.dots):
+            p.save()
+            p.setClipRect(rect)
+            if len(self.cluster_dots):
+                # Over cluster colours the selection is a ring, not a fill.
+                p.setPen(QtGui.QPen(QtGui.QColor.fromRgbF(1.0, 1.0, 1.0, 0.95), 1.2))
+                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                ring = radius + 1.5
+            else:
+                p.setPen(QtCore.Qt.PenStyle.NoPen)
+                p.setBrush(QtGui.QColor.fromRgbF(*SELECT_RGB, 0.85))
+                ring = radius
+            for r, cc in self.dots:
+                p.drawEllipse(
+                    QtCore.QPointF(rect.x() + cc * scale, rect.y() + r * scale), ring, ring
+                )
+            p.restore()
+        if self.legend:
+            self._paint_legend(p, rect)
         if self._hover is not None and rect.contains(self._hover):
             ring = QtGui.QPen(QtGui.QColor.fromRgbF(*SELECT_RGB, 0.7), 1.0)
             ring.setStyle(QtCore.Qt.PenStyle.DashLine)
@@ -175,6 +220,29 @@ class PatchCanvas(QtWidgets.QWidget):
         self.located.emit(
             (event.position().y() - rect.y()) / scale, (event.position().x() - rect.x()) / scale
         )
+
+    def _paint_legend(self, p: QtGui.QPainter, rect: QtCore.QRectF) -> None:
+        """Key, colour, size and mean value of each cluster, bottom right."""
+        c = theme.palette()
+        font = QtGui.QFont(p.font())
+        font.setFamily(theme.MONO)
+        font.setPointSize(8)
+        p.setFont(font)
+        metrics = QtGui.QFontMetrics(font)
+        line = metrics.height()
+        width = max(metrics.horizontalAdvance(t) for _, t in self.legend) + 26
+        height = line * len(self.legend) + 8
+        plate = QtCore.QRectF(rect.right() - width - 4, rect.bottom() - height - 4, width, height)
+        ground = QtGui.QColor(c.bg)
+        ground.setAlphaF(0.78)
+        p.fillRect(plate, ground)
+        for n, (rgb, text) in enumerate(self.legend):
+            y = plate.y() + 4 + n * line
+            p.fillRect(
+                QtCore.QRectF(plate.x() + 5, y + 2, 12, line - 4), QtGui.QColor.fromRgbF(*rgb)
+            )
+            p.setPen(QtGui.QColor(c.text))
+            p.drawText(QtCore.QPointF(plate.x() + 22, y + metrics.ascent()), text)
 
     def _patch_point(self, pos: QtCore.QPointF) -> tuple[float, float]:
         rect = self.target()
@@ -257,6 +325,14 @@ class ChediWindow(QtWidgets.QWidget):
         self.surface = "pial"
         #: Show the gyri/sulci map instead of the data (o).
         self.show_folding = False
+        #: Clusters (c): shown or not, how many, how much position counts,
+        #: and the last labels with what they were computed from.
+        self.show_clusters = False
+        self.k = 6
+        self.spatial = 0.5
+        self._labels: np.ndarray | None = None
+        self._labels_key: tuple | None = None
+        self._label_values = np.zeros(0)
         #: Paint-select brush radius, flat mm.
         self.brush_mm = 1.5
         #: Visible vertex ids, their (row, col) pixels, and as a hemisphere mask.
@@ -300,8 +376,32 @@ class ChediWindow(QtWidgets.QWidget):
                     group="depth",
                 ),
                 Binding("scroll", "depth in steps of 0.05", None, group="depth"),
-                Binding("0", "mid-depth (0.5)", lambda: self._set_depth(0.5), group="depth"),
-                Binding("1", "pial (1.0)", lambda: self._set_depth(1.0), group="depth"),
+                Binding("ctrl+0", "mid-depth (0.5)", lambda: self._set_depth(0.5), group="depth"),
+                Binding("ctrl+1", "pial (1.0)", lambda: self._set_depth(1.0), group="depth"),
+                Binding(
+                    "c",
+                    "clusters on / off (k-means of what is shown)",
+                    self._toggle_clusters,
+                    group="clusters",
+                ),
+                *[
+                    Binding(
+                        str(n % 10),
+                        f"select / unselect cluster {n}"
+                        + (" (darkest)" if n == 1 else " (if k = 10)" if n == MAX_CLUSTERS else ""),
+                        lambda n=n: self._pick_cluster(n),
+                        group="clusters",
+                    )
+                    for n in range(1, MAX_CLUSTERS + 1)
+                ],
+                Binding("k", "more clusters", lambda: self._k_by(1), group="clusters"),
+                Binding("shift+k", "fewer clusters", lambda: self._k_by(-1), group="clusters"),
+                Binding(
+                    "x",
+                    "where a point is counts: off / some / strongly",
+                    self._cycle_spatial,
+                    group="clusters",
+                ),
                 Binding(
                     "+",
                     "smaller patch (closer)",
@@ -476,8 +576,8 @@ class ChediWindow(QtWidgets.QWidget):
             hit = self._vis[[int(np.argmin(d))]]  # a click always takes the nearest point
         return hit
 
-    def _vertex_values(self) -> np.ndarray:
-        """The image at every visible vertex, at the depth shown and as sampled."""
+    def _vertex_values(self, depth: float | None = None) -> np.ndarray:
+        """The image at every visible vertex, at ``depth`` (the one shown) and as sampled."""
         assert self.patch is not None
         h = self.session.surfaces.hemis[self.patch.hemi]
         layer = self.layer()
@@ -487,7 +587,8 @@ class ChediWindow(QtWidgets.QWidget):
         )
         w = h.states["white"][self._vis].astype(np.float64)
         p = h.states["pial"][self._vis].astype(np.float64)
-        return sampler(w + self.current_depth() * (p - w))
+        d = self.current_depth() if depth is None else depth
+        return sampler(w + d * (p - w))
 
     def _press(self, kind: str, row: float, col: float) -> None:
         if self.patch is None or not self._vis.size:
@@ -604,6 +705,83 @@ class ChediWindow(QtWidgets.QWidget):
             f"off {name}: {before} -> {int(mask[self._vis].sum())} points on screen"
         )
 
+    # -- clusters ------------------------------------------------------------
+    def _cluster_labels(self) -> np.ndarray | None:
+        """Cluster of every visible vertex (0 darkest .. k-1 brightest), cached."""
+        if self.patch is None or not self._vis.size:
+            return None
+        layer = self.layer()
+        vp = self._viewport()
+        depth = self.current_depth()
+        key = (
+            self._built,
+            self._version(),
+            round(depth, 4),
+            None if layer is None else layer.key,
+            None if vp is None else vp.sampling,
+            self.k,
+            self.spatial,
+        )
+        if key == self._labels_key and self._labels is not None:
+            return self._labels
+        profile = np.stack([self._vertex_values(depth + o) for o in PROFILE_OFFSETS], axis=1)
+        fold = self._folding()
+        if fold is None:
+            fold = np.zeros(self.session.surfaces.hemis[self.patch.hemi].n_vertices)
+        h = self.session.surfaces.hemis[self.patch.hemi]
+        uv = self.patch.uv_of(h.n_vertices)[self._vis]
+        x = cluster_features(profile, fold[self._vis], uv, self.patch.half_mm, self.spatial)
+        labels = kmeans(x, self.k)
+        middle = PROFILE_OFFSETS.index(0.0)
+        self._labels = order_clusters(labels, profile[:, middle], self.k)
+        self._labels_key = key
+        self._label_values = profile[:, middle]
+        return self._labels
+
+    def _toggle_clusters(self) -> None:
+        self.show_clusters = not self.show_clusters
+        self.status.setText(
+            f"{self.k} clusters, 1 darkest .. {self.k} brightest: press a number to (un)select one"
+            if self.show_clusters
+            else "clusters off"
+        )
+        self._show_dots()
+
+    def _k_by(self, delta: int) -> None:
+        self.k = int(np.clip(self.k + delta, 2, MAX_CLUSTERS))
+        self.show_clusters = True
+        self.status.setText(f"{self.k} clusters")
+        self._show_dots()
+
+    def _cycle_spatial(self) -> None:
+        i = SPATIAL_STEPS.index(self.spatial) if self.spatial in SPATIAL_STEPS else 0
+        self.spatial = SPATIAL_STEPS[(i + 1) % len(SPATIAL_STEPS)]
+        self.show_clusters = True
+        words = {0.0: "off", 0.5: "some", 1.0: "strongly"}[self.spatial]
+        self.status.setText(f"position in the clustering: {words}")
+        self._show_dots()
+
+    def _pick_cluster(self, n: int) -> None:
+        """Toggle cluster ``n`` (1-based) in the selection: all in -> out, else in."""
+        if self.patch is None:
+            return
+        if n > self.k:
+            self.status.setText(f"only {self.k} clusters (k for more)")
+            return
+        labels = self._cluster_labels()
+        if labels is None:
+            return
+        self.show_clusters = True
+        ids = self._vis[labels == n - 1]
+        if not ids.size:
+            self.status.setText(f"cluster {n} is empty")
+            return
+        everything = bool(self._selected()[ids].all())
+        mode = "remove" if everything else "add"
+        self._dispatch(HighlightSurface(self.patch.hemi, encode_ids(ids), mode))
+        self.status.setText(f"cluster {n}: {ids.size} points {'out' if everything else 'in'}")
+        self._show_dots()
+
     def _clear_selection(self) -> None:
         self._gesture = None
         self._preview = None
@@ -666,12 +844,27 @@ class ChediWindow(QtWidgets.QWidget):
         return self._adj
 
     def _show_dots(self) -> None:
+        canvas = self.canvas
+        canvas.cluster_dots = np.zeros((0, 2))
+        canvas.cluster_rgb = np.zeros((0, 3))
+        canvas.legend = []
         if self.patch is None or not self._vis.size:
-            self.canvas.dots = np.zeros((0, 2))
-        else:
-            mask = self._preview if self._preview is not None else self._selected()
-            self.canvas.dots = self._vis_px[mask[self._vis]]
-        self.canvas.update()
+            canvas.dots = np.zeros((0, 2))
+            canvas.update()
+            return
+        mask = self._preview if self._preview is not None else self._selected()
+        canvas.dots = self._vis_px[mask[self._vis]]
+        labels = self._cluster_labels() if self.show_clusters else None
+        if labels is not None:
+            colours = CLUSTER_RGB[np.round(np.linspace(0, MAX_CLUSTERS - 1, self.k)).astype(int)]
+            canvas.cluster_dots = self._vis_px
+            canvas.cluster_rgb = colours[labels]
+            for j in range(self.k):
+                members = labels == j
+                mean = float(np.nanmean(self._label_values[members])) if members.any() else np.nan
+                text = f"{(j + 1) % 10}  {int(members.sum()):>5}  {mean:>7.4g}"
+                canvas.legend.append((tuple(colours[j]), text))
+        canvas.update()
 
     def _version(self) -> tuple:
         surfaces = self.session.surfaces

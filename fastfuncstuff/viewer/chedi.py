@@ -264,7 +264,98 @@ def drop_isolated(selected: np.ndarray, adj) -> np.ndarray:
     return selected & (_neighbour_count(adj, selected) > 0)
 
 
+#: Depths, relative to the one shown, a cluster feature reads: a short
+#: profile across the boundary, so "bright here and above" and "bright only
+#: here" are different patterns.
+PROFILE_OFFSETS = (-0.15, 0.0, 0.15)
+#: The most clusters: one key each, 1-9 then 0.
+MAX_CLUSTERS = 10
+
+
+def cluster_features(
+    profile: np.ndarray, fold: np.ndarray, uv: np.ndarray, half_mm: float, spatial: float
+) -> np.ndarray:
+    """``(N, F)`` features: the depth profile, gyrus/sulcus, and (weighted) flat position.
+
+    The profile is standardised with one mean and SD across all its depths,
+    so its *shape* survives -- per-depth scaling would make "brighter above"
+    look the same as flat. Folding is +-1, worth about one SD of contrast, so
+    it splits a cluster only when the contrast alone does not. Position is
+    scaled to +-``spatial`` across the patch: 0 ignores where a point is, 1
+    makes neighbours strongly prefer the same cluster.
+    """
+    v = np.asarray(profile, np.float64)
+    if v.ndim == 1:
+        v = v[:, None]
+    finite = v[np.isfinite(v)]
+    mu = float(finite.mean()) if finite.size else 0.0
+    sd = float(finite.std()) if finite.size else 1.0
+    z = np.nan_to_num((v - mu) / (sd or 1.0))
+    parts = [z, np.asarray(fold, np.float64)[:, None]]
+    if spatial > 0:
+        parts.append(np.asarray(uv, np.float64) / max(half_mm, 1e-6) * spatial)
+    return np.concatenate(parts, axis=1)
+
+
+def kmeans(x: np.ndarray, k: int, seed: int = 0, iters: int = 50) -> np.ndarray:
+    """Labels ``0..k-1`` from k-means++ seeding and Lloyd steps; deterministic for a seed.
+
+    Small and dependency-free: a patch has a few thousand points and a
+    handful of features, and the same press must give the same clusters.
+    """
+    x = np.asarray(x, np.float64)
+    n = x.shape[0]
+    k = int(max(1, min(k, n)))
+    rng = np.random.default_rng(seed)
+    centres = [x[rng.integers(n)]]
+    d2 = ((x - centres[0]) ** 2).sum(axis=1)
+    for _ in range(1, k):
+        total = d2.sum()
+        pick = rng.integers(n) if total <= 0 else rng.choice(n, p=d2 / total)
+        centres.append(x[pick])
+        d2 = np.minimum(d2, ((x - x[pick]) ** 2).sum(axis=1))
+    c = np.stack(centres)
+    labels = np.zeros(n, np.int64)
+    xx = (x * x).sum(axis=1)[:, None]
+    for step in range(iters):
+        # |x - c|^2 as one matrix product, not an (N, k, F) difference array.
+        dist = xx - 2.0 * x @ c.T + (c * c).sum(axis=1)[None, :]
+        new = dist.argmin(axis=1)
+        if step and np.array_equal(new, labels):
+            break
+        labels = new
+        for j in range(k):
+            members = labels == j
+            if members.any():
+                c[j] = x[members].mean(axis=0)
+            else:
+                # An emptied cluster takes the point worst served by the rest.
+                far = int(dist[np.arange(n), labels].argmax())
+                c[j] = x[far]
+                labels[far] = j
+    return labels
+
+
+def order_clusters(labels: np.ndarray, value: np.ndarray, k: int) -> np.ndarray:
+    """Relabel so cluster 0 has the lowest mean ``value`` and k-1 the highest.
+
+    Keys then mean the same thing after a re-run: the last one is always the
+    brightest -- the dura -- whatever order k-means happened to find them in.
+    """
+    means = np.array(
+        [np.nanmean(value[labels == j]) if np.any(labels == j) else np.inf for j in range(k)]
+    )
+    rank = np.empty(k, np.int64)
+    rank[np.argsort(means, kind="stable")] = np.arange(k)
+    return rank[labels]
+
+
 __all__ = [
+    "MAX_CLUSTERS",
+    "PROFILE_OFFSETS",
+    "cluster_features",
+    "kmeans",
+    "order_clusters",
     "Patch",
     "PatchSampler",
     "adjacency",
