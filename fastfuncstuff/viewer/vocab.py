@@ -739,6 +739,63 @@ class SaveSurfaces(Command):
 
 @command
 @dataclass(frozen=True)
+class LoadMesh(Command):
+    """Add a white or pial surface file to the mesh list, last: shown for comparison, not in use."""
+
+    name = "LOAD_MESH"
+    aspects = Aspect.SLICES
+    path: str
+    hemi: str
+    kind: str
+
+
+@command
+@dataclass(frozen=True)
+class UseMesh(Command):
+    """Put a listed mesh in use for its hemi and kind: edits and depth sampling act on it."""
+
+    name = "USE_MESH"
+    aspects = Aspect.SLICES
+    key: str
+
+
+@command
+@dataclass(frozen=True)
+class SetMesh(Command):
+    """Show/hide (``shown`` 1/0, -1 = unchanged), recolour (``rgb`` "r,g,b") or relabel a mesh."""
+
+    name = "SET_MESH"
+    aspects = Aspect.SLICES
+    key: str
+    shown: int = -1
+    rgb: str = ""
+    hemi: str = ""
+    kind: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class RemoveMesh(Command):
+    name = "REMOVE_MESH"
+    aspects = Aspect.SLICES
+    key: str
+
+
+@command
+@dataclass(frozen=True)
+class SaveMesh(Command):
+    """Write one listed mesh to ``path``, a copy of the file it came from."""
+
+    name = "SAVE_MESH"
+    aspects = Aspect.NOTHING
+    major = True
+    key: str
+    path: str
+    overwrite: bool = False
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceShape(Command):
     """Draw a surface window's hemispheres as another shape (mid, inflated, flat...)."""
 
@@ -1698,6 +1755,53 @@ def install(
         ):
             st.surface_selected = None
         return UndoSurfaceEdit.aspects | Aspect.LAYERS
+
+    def _surfaces_of(what: str):
+        if session is None:
+            raise RuntimeError(f"{what} needs a session")
+        return session.surfaces
+
+    @bus.handle(LoadMesh.name)
+    def _load_mesh(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, LoadMesh)
+        _surfaces_of(LoadMesh.name).load_mesh(cmd.path, cmd.hemi, cmd.kind)
+        return LoadMesh.aspects
+
+    @bus.handle(UseMesh.name)
+    def _use_mesh(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, UseMesh)
+        _surfaces_of(UseMesh.name).use_mesh(cmd.key)
+        return UseMesh.aspects
+
+    @bus.handle(SetMesh.name)
+    def _set_mesh(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetMesh)
+        rgb = None
+        if cmd.rgb:
+            parts = [float(x) for x in cmd.rgb.split(",")]
+            if len(parts) != 3:
+                raise ValueError("rgb is three numbers 0-1, comma-separated")
+            rgb = (parts[0], parts[1], parts[2])
+        _surfaces_of(SetMesh.name).set_mesh(
+            cmd.key,
+            shown=None if cmd.shown < 0 else bool(cmd.shown),
+            rgb=rgb,
+            hemi=cmd.hemi or None,
+            kind=cmd.kind or None,
+        )
+        return SetMesh.aspects
+
+    @bus.handle(RemoveMesh.name)
+    def _remove_mesh(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, RemoveMesh)
+        _surfaces_of(RemoveMesh.name).remove_mesh(cmd.key)
+        return RemoveMesh.aspects
+
+    @bus.handle(SaveMesh.name)
+    def _save_mesh(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SaveMesh)
+        _surfaces_of(SaveMesh.name).save_mesh(cmd.key, cmd.path, cmd.overwrite)
+        return SaveMesh.aspects
 
     @bus.handle(SaveSurfaces.name)
     def _save_surfaces(cmd: Command, st: ViewerState) -> Aspect:

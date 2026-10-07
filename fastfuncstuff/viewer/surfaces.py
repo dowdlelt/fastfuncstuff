@@ -31,6 +31,7 @@ from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
 from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball, vertex_normals
 from fastfuncstuff.surface.sampling import VolumeSampler
+from fastfuncstuff.viewer.meshlist import COMPARE_RGB, KINDS, MeshEntry
 from fastfuncstuff.viewer.slicing import PlaneView
 
 #: Outline colours (RGB, 0-1). Yellow white and red pial follow freeview, which
@@ -158,6 +159,13 @@ class SurfaceStore:
         self.topology_changed: set[str] = set()
         #: Bumped on every topology edit, so windows rebuild from scratch.
         self.topology_version = 0
+        #: Every white/pial mesh loaded, in order; per (hemi, kind) the
+        #: top-most is the one in use. See :mod:`viewer.meshlist`.
+        self.meshes: list[MeshEntry] = []
+        self._mesh_count = 0
+        self._loaded_count = 0
+        #: Bumped when the list changes, so its window knows to rebuild.
+        self.meshes_version = 0
 
     def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
         loaded = load_subject(subject_dir, hemis)
@@ -168,11 +176,13 @@ class SurfaceStore:
         self._reset_edits()
         for h in loaded:
             self.version[h] = self.version.get(h, 0) + 1
+        self._init_meshes()
 
     def clear(self) -> None:
         self.subject = None
         self.hemis = {}
         self._reset_edits()
+        self._init_meshes()
 
     def publish_flags(self, flags: dict[str, np.ndarray]) -> None:
         self.flags = flags
@@ -218,12 +228,19 @@ class SurfaceStore:
         found = index.get((hemi, surface))
         if found is None:
             h = self.hemis[hemi]
-            if surface not in h.states:
+            if surface.startswith("mesh:"):
+                row = self.mesh(surface[5:])
+                positions, faces = self.mesh_positions(row), self.mesh_faces(row)
+            elif surface in h.states:
+                positions, faces = h.states[surface], h.faces
+            else:
                 return None
-            found = index[(hemi, surface)] = SliceIndex(
-                apply_affine(inverse, h.states[surface]), h.faces
-            )
+            found = index[(hemi, surface)] = SliceIndex(apply_affine(inverse, positions), faces)
         return found
+
+    def _drop_index(self, hemi: str, surface: str) -> None:
+        for _, index in self._grids.values():
+            index.pop((hemi, surface), None)
 
     def _move(
         self, hemi: str, surface: str, ids: np.ndarray, positions: np.ndarray, faces: np.ndarray
@@ -258,14 +275,32 @@ class SurfaceStore:
                     continue
                 if only is not None and (hemi, surface) not in only:
                     continue
+                rgb = OUTLINE_RGB.get(surface, (1.0, 1.0, 1.0))
+                row = self.active_mesh(hemi, surface) if surface in KINDS else None
+                if row is not None:
+                    if not row.shown:
+                        continue
+                    rgb = row.rgb
                 index = self._slice_index(hemi, surface, grid_affine)
                 if index is None:
                     continue
                 seg = index.segments(axis, float(position))
                 if not len(seg):
                     continue
-                rgb = OUTLINE_RGB.get(surface, (1.0, 1.0, 1.0))
                 out.append(Outline(hemi, surface, rgb, view.points_to_image(seg)))
+        # Comparison meshes never move during a drag, so a drag's partial
+        # redraw (``only``) leaves them as they are. Hiding every outline
+        # (an empty ``shown``) hides them too.
+        if only is None and shown:
+            for row in self.meshes:
+                if not row.shown or self.is_active(row) or row.hemi not in self.hemis:
+                    continue
+                index = self._slice_index(row.hemi, f"mesh:{row.key}", grid_affine)
+                if index is None:
+                    continue
+                seg = index.segments(axis, float(position))
+                if len(seg):
+                    out.append(Outline(row.hemi, row.key, row.rgb, view.points_to_image(seg)))
         return out
 
     # -- atlases ---------------------------------------------------------------
@@ -853,6 +888,9 @@ class SurfaceStore:
         if edit.partner_start is not None:
             moves.append((PARTNER[surface], edit.ids.copy(), edit.partner_start.astype(np.float32)))
         self._undo.append(_Undo(hemi, moves))
+        for moved, ids, old in moves:
+            if moved == surface or res.partner_ids.size:
+                self._snapshot_before_first_edit(hemi, moved, ids, old)
         self.edited.add((hemi, surface))
         if res.partner_ids.size:
             self.edited.add((hemi, PARTNER[surface]))
@@ -1052,6 +1090,10 @@ class SurfaceStore:
         self.topology_changed.clear()
         self._undo.clear()
         self.log = EditLog()
+        for row in self.meshes:
+            if self.is_active(row):
+                row.edited = False
+        self.meshes_version += 1
         return plan
 
     def save(self, suffix: str = "ffsedit") -> list[Path]:
@@ -1089,6 +1131,244 @@ class SurfaceStore:
                 written.append(out)
         if written:
             log = written[0].with_name(f"surface_edits.{suffix}.json")
+            log.write_text(json.dumps(self.log.entries, indent=1))
+            written.append(log)
+        return written
+
+    # -- the mesh list ---------------------------------------------------------
+    def _init_meshes(self) -> None:
+        self.meshes = []
+        self._mesh_count = 0
+        self._loaded_count = 0
+        for hemi, h in self.hemis.items():
+            for kind in KINDS:
+                path = h.paths.get(kind)
+                self.meshes.append(
+                    MeshEntry(
+                        key=self._mint_mesh(),
+                        hemi=hemi,
+                        kind=kind,
+                        name=path.name if path else f"{hemi}.{kind}",
+                        path=path,
+                        positions=None,
+                        faces=h.faces,
+                        rgb=OUTLINE_RGB[kind],
+                    )
+                )
+        self.meshes_version += 1
+
+    def _mint_mesh(self) -> str:
+        self._mesh_count += 1
+        return f"m{self._mesh_count}"
+
+    def mesh(self, key: str) -> MeshEntry:
+        for row in self.meshes:
+            if row.key == key:
+                return row
+        raise KeyError(f"no mesh {key!r}")
+
+    def active_mesh(self, hemi: str, kind: str) -> MeshEntry | None:
+        """The row in use for ``hemi``'s ``kind``: the top-most of them."""
+        for row in self.meshes:
+            if row.hemi == hemi and row.kind == kind:
+                return row
+        return None
+
+    def is_active(self, row: MeshEntry) -> bool:
+        return self.active_mesh(row.hemi, row.kind) is row
+
+    def mesh_positions(self, row: MeshEntry) -> np.ndarray:
+        if self.is_active(row):
+            return self.hemis[row.hemi].states[row.kind]
+        assert row.positions is not None
+        return row.positions
+
+    def mesh_faces(self, row: MeshEntry) -> np.ndarray:
+        return self.hemis[row.hemi].faces if self.is_active(row) else row.faces
+
+    def _snapshot_before_first_edit(
+        self, hemi: str, surface: str, ids: np.ndarray, old: np.ndarray
+    ) -> None:
+        """On the first edit of a surface in use, keep it as it was, as a row below.
+
+        The edit has already moved the vertices (the preview did), so the
+        snapshot is the current array with the moved ones put back.
+        """
+        if surface not in KINDS or (hemi, surface) in self.edited:
+            return
+        current = self.active_mesh(hemi, surface)
+        if current is None:
+            return
+        before = self.hemis[hemi].states[surface].copy()
+        before[ids] = old
+        current.edited = True
+        row = MeshEntry(
+            key=self._mint_mesh(),
+            hemi=hemi,
+            kind=surface,
+            name=f"{current.name} (before edits)",
+            path=current.path,
+            positions=before,
+            faces=self.hemis[hemi].faces,
+            rgb=tuple(0.55 * c for c in current.rgb),  # type: ignore[arg-type]
+            shown=False,
+        )
+        self.meshes.insert(self.meshes.index(current) + 1, row)
+        self.meshes_version += 1
+
+    def load_mesh(self, path: str | Path, hemi: str, kind: str) -> MeshEntry:
+        """Read a surface file into the list, last: shown, not in use."""
+        from fastfuncstuff.io.freesurfer import read_scanner_surface
+
+        if hemi not in self.hemis:
+            raise ValueError(
+                f"no {hemi} hemisphere loaded (have {', '.join(self.hemis) or 'none'})"
+            )
+        if kind not in KINDS:
+            raise ValueError(f"a mesh is one of {', '.join(KINDS)}, not {kind!r}")
+        path = Path(path)
+        positions, faces = read_scanner_surface(path)
+        row = MeshEntry(
+            key=self._mint_mesh(),
+            hemi=hemi,
+            kind=kind,
+            name=path.name,
+            path=path,
+            positions=positions,
+            faces=faces,
+            rgb=COMPARE_RGB[self._loaded_count % len(COMPARE_RGB)],
+        )
+        self._loaded_count += 1
+        self.meshes.append(row)
+        self.meshes_version += 1
+        return row
+
+    def use_mesh(self, key: str) -> MeshEntry:
+        """Put a row in use for its hemi and kind: it moves above the one that was.
+
+        The arrays swap rather than copy -- the row that was in use keeps its
+        own vertices as a comparison. Undo for that hemisphere is cleared: its
+        records name vertices of the array that just stopped being in use.
+        """
+        row = self.mesh(key)
+        current = self.active_mesh(row.hemi, row.kind)
+        if current is row or current is None:
+            return row
+        h = self.hemis[row.hemi]
+        assert row.positions is not None
+        if row.positions.shape != (h.n_vertices, 3) or not np.array_equal(row.faces, h.faces):
+            raise ValueError(
+                f"{row.name} is not the same mesh as {current.name} "
+                f"({row.positions.shape[0]:,} vs {h.n_vertices:,} vertices): "
+                "it can be shown, not used"
+            )
+        self.cancel()
+        current.positions, current.faces = h.states[row.kind], h.faces
+        h.states[row.kind] = np.ascontiguousarray(row.positions, np.float32)
+        row.positions = None
+        self.meshes.remove(row)
+        self.meshes.insert(self.meshes.index(current), row)
+        for surface in (row.kind, f"mesh:{row.key}", f"mesh:{current.key}"):
+            self._drop_index(row.hemi, surface)
+        self.version[row.hemi] = self.version.get(row.hemi, 0) + 1
+        self._undo = [u for u in self._undo if u.hemi != row.hemi]
+        # "Edited" means "differs from the file a save or install replaces".
+        path = h.paths.get(row.kind)
+        same = path is not None and np.array_equal(h.states[row.kind], h.original(row.kind))
+        if same:
+            self.edited.discard((row.hemi, row.kind))
+        else:
+            self.edited.add((row.hemi, row.kind))
+        self.meshes_version += 1
+        return row
+
+    def remove_mesh(self, key: str) -> None:
+        row = self.mesh(key)
+        if self.is_active(row):
+            raise ValueError(f"{row.name} is in use: use another {row.hemi} {row.kind} first")
+        self.meshes.remove(row)
+        self._drop_index(row.hemi, f"mesh:{row.key}")
+        self.meshes_version += 1
+
+    def set_mesh(
+        self,
+        key: str,
+        *,
+        shown: bool | None = None,
+        rgb: tuple[float, float, float] | None = None,
+        hemi: str | None = None,
+        kind: str | None = None,
+    ) -> MeshEntry:
+        """Show/hide, recolour or relabel a row.
+
+        Relabelling is refused for a row in use (it would leave its hemi or
+        kind with none), and a relabelled row goes to the bottom: anywhere
+        else it could land above its new group's row and silently take over.
+        """
+        row = self.mesh(key)
+        if shown is not None:
+            row.shown = bool(shown)
+        if rgb is not None:
+            row.rgb = tuple(float(np.clip(c, 0.0, 1.0)) for c in rgb)  # type: ignore[assignment]
+        if (hemi is not None and hemi != row.hemi) or (kind is not None and kind != row.kind):
+            if self.is_active(row):
+                raise ValueError(f"{row.name} is in use: relabel a comparison mesh instead")
+            if hemi is not None and hemi not in self.hemis:
+                raise ValueError(f"no {hemi} hemisphere loaded")
+            if kind is not None and kind not in KINDS:
+                raise ValueError(f"a mesh is one of {', '.join(KINDS)}, not {kind!r}")
+            self._drop_index(row.hemi, f"mesh:{row.key}")
+            row.hemi = hemi or row.hemi
+            row.kind = kind or row.kind
+            self.meshes.remove(row)
+            self.meshes.append(row)
+        self.meshes_version += 1
+        return row
+
+    def _protected(self) -> set[Path]:
+        """The subject's own surface files: replaced only by install, never by a save."""
+        return {p.resolve() for h in self.hemis.values() for p in h.paths.values()}
+
+    def save_mesh(self, key: str, path: str | Path, overwrite: bool = False) -> Path:
+        """Write one row as a surface file, a copy of the file it came from."""
+        from fastfuncstuff.io.freesurfer import write_positions_like
+
+        row = self.mesh(key)
+        path = Path(path)
+        if path.resolve() in self._protected():
+            raise ValueError(
+                f"{path.name} is one of the subject's surfaces: install replaces those"
+            )
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"{path} exists")
+        positions = self.mesh_positions(row)
+        h = self.hemis[row.hemi]
+        template = row.path if row.path is not None else h.paths[row.kind]
+        write_positions_like(path, template, positions)
+        return path
+
+    def backup(self, stamp: str | None = None) -> list[Path]:
+        """Every mesh in use, as ``?h.<kind>.bak-<stamp>`` beside its file, plus the edit log.
+
+        Deliberately not a command: it is a safety net, and a replayed script
+        writing backups of its own would only be clutter.
+        """
+        import time
+
+        from fastfuncstuff.io.freesurfer import write_positions_like
+
+        stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+        written: list[Path] = []
+        for row in self.meshes:
+            if not self.is_active(row) or row.hemi in self.topology_changed:
+                continue
+            h = self.hemis[row.hemi]
+            template = h.paths[row.kind]
+            out = template.with_name(f"{row.hemi}.{row.kind}.bak-{stamp}")
+            write_positions_like(out, template, h.states[row.kind], h.tkr_to_scanner)
+            written.append(out)
+        if written:
+            log = written[0].with_name(f"surface_edits.bak-{stamp}.json")
             log.write_text(json.dumps(self.log.entries, indent=1))
             written.append(log)
         return written

@@ -223,14 +223,37 @@ class Hemisphere:
 
     def save_positions(self, state: str, path: str | os.PathLike, positions: np.ndarray) -> None:
         """Write ``positions`` (scanner RAS) as a copy of ``state``'s file; see :meth:`save_state`."""
-        template = self.paths[state]
-        tkr = read_surface(template).vertices
-        delta = (np.asarray(positions) - _apply(self.tkr_to_scanner, tkr)).astype(np.float64)
-        moved = np.any(delta != 0, axis=1)
-        rotation = np.linalg.inv(self.tkr_to_scanner)[:3, :3]
-        out = tkr.copy()
-        out[moved] = (tkr[moved] + delta[moved] @ rotation.T).astype(np.float32)
-        write_surface_like(path, template, out)
+        write_positions_like(path, self.paths[state], positions, self.tkr_to_scanner)
+
+
+def read_scanner_surface(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarray]:
+    """(vertices in scanner RAS, faces) of a surface file, placed by its own geometry."""
+    s = read_surface(path)
+    return _apply(tkr_to_scanner(s.volume_info), s.vertices), s.faces
+
+
+def write_positions_like(
+    path: str | os.PathLike,
+    template: str | os.PathLike,
+    positions: np.ndarray,
+    to_scanner: np.ndarray | None = None,
+) -> None:
+    """Write scanner-RAS ``positions`` as a copy of ``template``.
+
+    Applied as a displacement onto the template's own coordinates, so a
+    vertex nobody moved comes out bit-identical -- the float32 round trip
+    through scanner space would otherwise perturb every one in the last bit.
+    ``to_scanner`` defaults to the template's own volume geometry.
+    """
+    surf = read_surface(template)
+    to_scanner = tkr_to_scanner(surf.volume_info) if to_scanner is None else to_scanner
+    tkr = surf.vertices
+    delta = (np.asarray(positions) - _apply(to_scanner, tkr)).astype(np.float64)
+    moved = np.any(delta != 0, axis=1)
+    rotation = np.linalg.inv(to_scanner)[:3, :3]
+    out = tkr.copy()
+    out[moved] = (tkr[moved] + delta[moved] @ rotation.T).astype(np.float32)
+    write_surface_like(path, template, out)
 
 
 def load_hemisphere(

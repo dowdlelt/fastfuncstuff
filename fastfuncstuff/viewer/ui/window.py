@@ -476,6 +476,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rescan_button.clicked.connect(lambda: self._start_rescan(manual=True))
         bar.addWidget(self.rescan_button)
 
+        #: The mesh list, made on first use (ctrl+M / MESH).
+        self.mesh_window = None
         self.surf_button = QtWidgets.QPushButton("SURF")
         self.surf_button.setToolTip(
             "Load a FreeSurfer subject's surfaces and outline white/pial on the slices.\n"
@@ -500,6 +502,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 "QC",
                 "Ribbon profile column: surface QC, back to front (shift+P)",
                 self._new_profiles,
+            ),
+            (
+                "MESH",
+                "Mesh list: compare, load, use and back up white/pial meshes (ctrl+M)",
+                self._open_meshes,
             ),
         ):
             button = QtWidgets.QPushButton(text)
@@ -948,6 +955,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
+
+    def _open_meshes(self) -> None:
+        from fastfuncstuff.viewer.ui.meshwindow import MeshWindow
+
+        if not self.session.surfaces.hemis:
+            self.statusBar().showMessage("meshes: load a subject first (SURF)", 5000)
+            return
+        if self.mesh_window is None:
+            self.mesh_window = MeshWindow(lambda: self.session, self._dispatch, self)
+        self.mesh_window.refresh()
+        self.mesh_window.show()
+        self.mesh_window.raise_()
 
     def _new_depth(self) -> None:
         if not self.session.surfaces.hemis:
@@ -1664,6 +1683,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
                 Binding(
+                    "ctrl+m",
+                    "mesh list (compare / use / back up)",
+                    self._open_meshes,
+                    group="windows",
+                ),
+                Binding(
                     "shift+l",
                     "open depth profiles (laminar) of the overlay around the crosshair",
                     self._new_depth,
@@ -2061,6 +2086,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # window -- so they are re-read whenever the picture moves.
             self.mode_panel.sync_values(self.session.mode.params)
         self._refresh_windows(self._active, dirty)
+        if self.mesh_window is not None and dirty & (Aspect.SLICES | Aspect.THEME):
+            if dirty & Aspect.THEME:
+                self.mesh_window.restyle()
+            self.mesh_window.refresh()
         self._sync_readout()
 
     def _refresh_windows(self, ctl: Controller, dirty: Aspect) -> None:
