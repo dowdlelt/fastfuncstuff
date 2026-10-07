@@ -485,6 +485,8 @@ def test_relax_flattens_a_spike_and_snap_mode_reaches_the_command(chedi):
 def test_u_evens_out_crowded_pial_and_the_spacing_map_shows_it(chedi):
     session, win = chedi
     h = session.surfaces.hemis["lh"]
+    # As loaded, every vertex is mid grey: the map shows editing, not folding.
+    assert np.abs(win._spacing()).max() < 1e-4 and win._spacing_vs == "file"
     # Crowd pial around the patch centre: pull the vertices near it halfway
     # in toward it, along the sphere.
     pial = h.states["pial"]
@@ -522,3 +524,17 @@ def test_u_evens_out_crowded_pial_and_the_spacing_map_shows_it(chedi):
     assert np.allclose(r_after, radius[:, 0], atol=0.1)
     moves = [ln.split() for ln in session.to_script().splitlines() if ln.startswith("MOVE_SURFACE")]
     assert moves[-1][-1] == str(30)  # even, last on the line
+
+
+def test_spacing_map_falls_back_to_white_once_the_topology_changes(chedi):
+    session, win = chedi
+    surfaces = session.surfaces
+    assert surfaces.area_change("lh", "pial") is not None
+    win._cycle_display()
+    assert win.display == "spacing" and "vs file" in win.canvas.caption
+    centre = win.patch.centre
+    surfaces.delete_vertex("lh", int(surfaces.neighbours("lh", centre)[0]))
+    # The file has one vertex more than the mesh now: no per-vertex baseline.
+    assert surfaces.area_change("lh", "pial") is None
+    win.refresh()
+    assert win._spacing_vs == "white" and "vs white" in win.canvas.caption

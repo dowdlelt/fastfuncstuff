@@ -66,8 +66,9 @@ DEPTH_RANGE = (-0.5, 1.5)
 SHOULDER_MM = 2.0
 #: Sweeps of evening out the spacing one u takes (see surface.mesh.even_spacing).
 EVEN_SWEEPS = 30
-#: The spacing map's window: log2(pial / white vertex area) from a quarter
-#: (black, crowded) to four times (white, stretched); 1 is mid grey.
+#: The spacing map's window: log2 of the vertex area now over its area in the
+#: file, from a quarter (black, crowded) to four times (white, stretched);
+#: unedited is mid grey.
 SPACING_LOG2 = (-2.0, 2.0)
 #: What o steps through: the anatomy, gyri/sulci, how crowded pial is.
 DISPLAYS = ("data", "folding", "spacing")
@@ -332,6 +333,9 @@ class ChediWindow(QtWidgets.QWidget):
         self.surface = "pial"
         #: What is drawn (o): the data, the gyri/sulci map, or the spacing map.
         self.display = "data"
+        #: What the spacing map compares against: "file" or, after a
+        #: topology edit, "white".
+        self._spacing_vs = "file"
         #: How a push is placed: by hand (the step), or snapped to the shown
         #: image's edge (gated, or "edge": strongest, ungated) -- m, as in a slice.
         self.snap_mode = "hand"
@@ -719,15 +723,20 @@ class ChediWindow(QtWidgets.QWidget):
         return folding_values(h, "binary")
 
     def _spacing(self) -> np.ndarray:
-        """Per vertex: log2 of its pial area over its white area -- below 0, pial is crowded.
+        """Per vertex: log2 of its area on the moved surface now over its area in the file.
 
-        Against the vertex's own white area, not a fixed density: vertex
-        spacing varies across a hemisphere anyway, and white is where each
-        vertex's share of cortex is set. Sulcal fundi sit a little below 0 by
-        nature; a protrusion pushed back in sits far below.
+        Below 0, editing crowded it. After a delete or split the file is not
+        this mesh any more, and pial's area over white's stands in -- which
+        fundi darken by nature (see SurfaceStore.area_change).
         """
         assert self.patch is not None
-        white, pial = self.session.surfaces.vertex_areas(self.patch.hemi)
+        surfaces = self.session.surfaces
+        change = surfaces.area_change(self.patch.hemi, self.surface)
+        self._spacing_vs = "file"
+        if change is not None:
+            return change
+        self._spacing_vs = "white"
+        white, pial = surfaces.vertex_areas(self.patch.hemi)
         return np.log2(np.maximum(pial, 1e-6) / np.maximum(white, 1e-6))
 
     def _cycle_display(self) -> None:
@@ -742,9 +751,15 @@ class ChediWindow(QtWidgets.QWidget):
             + {
                 "data": "data",
                 "folding": "gyri (light) / sulci (dark)",
-                "spacing": "pial / white vertex area: dark = crowded, mid grey = even",
+                "spacing": "spacing: dark = crowded by editing, mid grey = as loaded",
             }[nxt]
         )
+        if nxt == "spacing" and self.patch is not None:
+            self._spacing()
+            if self._spacing_vs == "white":
+                self.status.setText(
+                    self.status.text() + " (mesh changed since loading: pial vs white instead)"
+                )
         if self.patch is not None:
             self._draw()
 
@@ -1092,7 +1107,7 @@ class ChediWindow(QtWidgets.QWidget):
             + (
                 "gyri / sulci"
                 if fold is not None
-                else "spacing (dark = crowded)"
+                else f"{self.surface} spacing vs {self._spacing_vs} (dark = crowded)"
                 if spacing is not None
                 else f"{layer.name if layer is not None else ''} · {mode}"
             )

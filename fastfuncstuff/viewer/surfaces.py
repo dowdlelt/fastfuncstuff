@@ -152,6 +152,9 @@ class SurfaceStore:
         self.highlight: dict[str, np.ndarray] = {}
         self.highlight_version = 0
         self._areas: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+        #: (hemi, surface) -> (file, vertex areas as that file has them, or
+        #: None when the file is not this mesh any more).
+        self._file_areas: dict[tuple[str, str], tuple[str, np.ndarray | None]] = {}
         #: Per hemisphere, once its topology has been edited: every surface and
         #: per-vertex file of its mesh (MeshBundle, BundleSources). Saving or
         #: installing such a hemisphere writes all of them.
@@ -208,6 +211,7 @@ class SurfaceStore:
         self.highlight = {}
         self.highlight_version += 1
         self._areas.clear()
+        self._file_areas.clear()
         self._annots.clear()
         self._atlases.clear()
         self._trees.clear()
@@ -655,6 +659,44 @@ class SurfaceStore:
             self._areas[hemi] = cached
         return cached[1], cached[2]
 
+    def area_change(self, hemi: str, surface: str = "pial") -> np.ndarray | None:
+        """log2 of each vertex's area on ``surface`` now over its area in the file: 0 unedited.
+
+        What editing did to the spacing, and nothing else. Against white
+        instead, natural folding dominates: on a real subject pial/white
+        spans -2.5..+1.8 (log2, 5-95%), and 9% of vertices -- sulcal fundi --
+        sit below -2, as dark as a crushed protrusion. None when there is no
+        file, or the mesh's topology has changed since it was read.
+        """
+        from fastfuncstuff.surface.mesh import vertex_areas
+
+        h = self.hemis[hemi]
+        path = h.paths.get(surface)
+        if path is None or surface not in h.states:
+            return None
+        faces = h.faces.astype(np.int64)
+        cached = self._file_areas.get((hemi, surface))
+        if cached is None or cached[0] != str(path):
+            try:
+                before = h.original(surface)
+            except (OSError, ValueError):
+                before = None
+            base = (
+                vertex_areas(before, faces, h.n_vertices)
+                if before is not None and before.shape == (h.n_vertices, 3)
+                else None
+            )
+            cached = (str(path), base)
+            self._file_areas[(hemi, surface)] = cached
+        base = cached[1]
+        if base is None:
+            return None
+        white, pial = self.vertex_areas(hemi)
+        now = {"white": white, "pial": pial}.get(surface)
+        if now is None:
+            now = vertex_areas(h.states[surface], faces, h.n_vertices)
+        return np.log2(np.maximum(now, 1e-6) / np.maximum(base, 1e-6))
+
     def publish_depth_roi(self, vertices: dict[str, np.ndarray]) -> None:
         self.depth_roi_vertices = vertices
         self.depth_roi_version += 1
@@ -714,6 +756,7 @@ class SurfaceStore:
         self._topo.pop(hemi, None)
         self._trees.pop(hemi, None)
         self._areas.pop(hemi, None)
+        self._file_areas = {k: v for k, v in self._file_areas.items() if k[0] != hemi}
         self._annots = {k: v for k, v in self._annots.items() if k[0] != hemi}
         self.flags.pop(hemi, None)
         self.depth_roi_vertices.pop(hemi, None)
