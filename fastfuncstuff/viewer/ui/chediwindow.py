@@ -62,6 +62,9 @@ SHOULDER_MM = 2.0
 WINDOW_DRAG_PX = 300.0
 #: Selection dot colour.
 SELECT_RGB = (1.0, 0.55, 0.1)
+#: Mesh wireframe: a bright blue that stays visible over dark CSF and bright
+#: white matter alike, and is nothing like the orange selection.
+MESH_RGB = (0.3, 0.7, 1.0)
 
 
 class PatchCanvas(QtWidgets.QWidget):
@@ -119,9 +122,9 @@ class PatchCanvas(QtWidgets.QWidget):
             p.setClipRect(rect)
             p.translate(rect.x(), rect.y())
             p.scale(scale, scale)
-            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*c.crosshair, 0.22))
+            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*MESH_RGB, 0.55))
             pen.setCosmetic(True)
-            pen.setWidthF(0.6)
+            pen.setWidthF(0.7)
             p.setPen(pen)
             p.drawPath(self.mesh)
             p.restore()
