@@ -504,6 +504,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 self._new_profiles,
             ),
             (
+                "CHEDI",
+                "Cortex laid flat around the crosshair, sampled at a depth (shift+E)",
+                self._new_chedi,
+            ),
+            (
                 "MESH",
                 "Mesh list: compare, load, use and back up white/pial meshes (ctrl+M)",
                 self._open_meshes,
@@ -954,6 +959,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("surface window: load a subject first (SURF)", 5000)
             return
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+
+    def _new_chedi(self) -> None:
+        if not self.session.surfaces.hemis:
+            self.statusBar().showMessage("chedi: load a subject first (SURF)", 5000)
+            return
+        self.manager.open(ViewKind.CHEDI, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
     def _open_meshes(self) -> None:
@@ -1686,6 +1698,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     "ctrl+m",
                     "mesh list (compare / use / back up)",
                     self._open_meshes,
+                    group="windows",
+                ),
+                Binding(
+                    "shift+e",
+                    "CHEDI: cortex laid flat at a depth",
+                    self._new_chedi,
                     group="windows",
                 ),
                 Binding(

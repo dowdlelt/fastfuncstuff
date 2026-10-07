@@ -64,6 +64,7 @@ class ViewKind(StrEnum):
     SURFACE = "surface"
     PROFILE = "profile"
     DEPTH = "depth"
+    CHEDI = "chedi"
 
 
 #: Most slices a neighbour strip shows. Past this each cell is too narrow to
@@ -213,6 +214,12 @@ class Viewport:
     depth_roi_layer: str = ""
     depth_bins: int = 31
 
+    # -- chedi (flattened patch) ------------------------------------------
+    #: Half the patch's width, flat mm, and how voxels are read onto it:
+    #: nearest (the voxels themselves), linear or cubic. Depth is ``depth[0]``.
+    patch_mm: float = 25.0
+    sampling: str = "nearest"
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -253,6 +260,10 @@ class Viewport:
         return self.kind is ViewKind.PROFILE
 
     @property
+    def is_chedi(self) -> bool:
+        return self.kind is ViewKind.CHEDI
+
+    @property
     def is_surface(self) -> bool:
         return self.kind is ViewKind.SURFACE
 
@@ -280,6 +291,8 @@ class Viewport:
             return f"surface · {self.shape}  [{self.id}]"
         if self.is_profile:
             return f"profiles · {self.profile_score}  [{self.id}]"
+        if self.is_chedi:
+            return f"chedi · {self.sampling}  [{self.id}]"
         if self.is_depth:
             return f"depth · {self.depth_source}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
@@ -318,6 +331,7 @@ class ViewportSet:
             ViewKind.SURFACE: "S",
             ViewKind.PROFILE: "P",
             ViewKind.DEPTH: "D",
+            ViewKind.CHEDI: "E",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:

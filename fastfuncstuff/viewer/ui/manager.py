@@ -20,6 +20,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+from fastfuncstuff.viewer.ui.chediwindow import ChediWindow
 from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
@@ -48,6 +49,7 @@ Companion = (
     | ClusterWindow
     | TraceWindow
     | SurfaceWindow
+    | ChediWindow
     | ProfileWindow
     | DepthWindow
 )
@@ -112,6 +114,8 @@ class WindowManager(QtCore.QObject):
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
             win.surfaces_previewed.connect(self._redraw_outlines)
+        elif viewport.is_chedi:
+            win = ChediWindow(viewport.id, self.session, self._dispatch, self._parent)
         elif viewport.is_depth:
             win = DepthWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.roi_changed.connect(self._refresh_surface_windows)
@@ -229,6 +233,19 @@ class WindowManager(QtCore.QObject):
                     win.redraw()
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
+                    win.refresh(dirty)
+            elif isinstance(win, ChediWindow):
+                # The crosshair (to follow), an edit or a USE (SLICES), what
+                # it samples (LAYERS, TIME, COLORMAP: the range), and its own
+                # settings (VIEWPORTS).
+                if dirty & (
+                    Aspect.CROSSHAIR
+                    | Aspect.SLICES
+                    | Aspect.LAYERS
+                    | Aspect.TIME
+                    | Aspect.COLORMAP
+                    | Aspect.VIEWPORTS
+                ):
                     win.refresh(dirty)
             elif isinstance(win, DepthWindow):
                 # The clicked spot (CROSSHAIR), the volume shown (TIME), what

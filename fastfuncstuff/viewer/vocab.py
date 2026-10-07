@@ -820,6 +820,28 @@ class SetSurfaceDepth(Command):
 
 @command
 @dataclass(frozen=True)
+class SetPatchSize(Command):
+    """Half-width of a CHEDI window's flattened patch, in mm."""
+
+    name = "SET_PATCH_SIZE"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    mm: float
+
+
+@command
+@dataclass(frozen=True)
+class SetViewSampling(Command):
+    """How a window reads voxels onto what it draws: nearest, linear or cubic."""
+
+    name = "SET_VIEW_SAMPLING"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    mode: str
+
+
+@command
+@dataclass(frozen=True)
 class SetSurfaceEquivolume(Command):
     """Sample depth by equal volume (on) or equal distance (off) between white and pial."""
 
@@ -2051,6 +2073,21 @@ def install(
             raise ValueError("surface depth is a fraction from white (0) to pial (1)")
         samples = int(min(max(cmd.samples, 1), 16))
         return _set_view(st, cmd.view, SetSurfaceDepth.aspects, depth=(lo, hi), samples=samples)
+
+    @bus.handle(SetPatchSize.name)
+    def _set_patch_size(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetPatchSize)
+        mm = float(np.clip(cmd.mm, 3.0, 100.0))
+        return _set_view(st, cmd.view, SetPatchSize.aspects, patch_mm=round(mm, 2))
+
+    @bus.handle(SetViewSampling.name)
+    def _set_view_sampling(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewSampling)
+        from fastfuncstuff.surface.sampling import MODES
+
+        if cmd.mode not in MODES:
+            raise ValueError(f"sampling is one of {', '.join(MODES)}, not {cmd.mode!r}")
+        return _set_view(st, cmd.view, SetViewSampling.aspects, sampling=cmd.mode)
 
     @bus.handle(SetSurfaceEquivolume.name)
     def _set_surface_equivolume(cmd: Command, st: ViewerState) -> Aspect:
