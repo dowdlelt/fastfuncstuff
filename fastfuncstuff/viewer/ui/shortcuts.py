@@ -29,6 +29,37 @@ class Binding:
     aliases: tuple[str, ...] = field(default=())
 
 
+def double_tap(
+    once: Callable[[], None], twice: Callable[[], None], clock: Callable[[], float] | None = None
+) -> Callable[[], None]:
+    """One action for a key, another when it is struck again within a double-click.
+
+    The first tap always runs ``once`` -- waiting to see whether a second is
+    coming would make the common single tap feel laggy -- so ``twice`` should
+    be a superset of it (centre this window, then centre every window).
+    """
+    if clock is None:
+        timer = QtCore.QElapsedTimer()
+        timer.start()
+
+        def clock() -> float:
+            return timer.elapsed() / 1000.0
+
+    last = [float("-inf")]
+
+    def fire() -> None:
+        now = clock()
+        window = QtWidgets.QApplication.doubleClickInterval() / 1000.0
+        if now - last[0] <= window:
+            last[0] = float("-inf")  # a third tap starts over rather than re-firing
+            twice()
+        else:
+            last[0] = now
+            once()
+
+    return fire
+
+
 def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
     """Register every binding on ``widget`` as a window-level shortcut.
 

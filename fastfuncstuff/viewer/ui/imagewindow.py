@@ -25,7 +25,12 @@ from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.surfaces import Grab
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.panes import ImagePane
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    double_tap,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.ui.stripbar import StripBar
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
@@ -72,6 +77,8 @@ class ImageWindow(QtWidgets.QWidget):
     #: A surface drag moved vertices without touching any image; every image
     #: window should redraw its outlines (and nothing else).
     surfaces_previewed = QtCore.Signal()
+    #: `c c`: centre every window on the crosshair, not just this one.
+    centre_all_requested = QtCore.Signal()
 
     def __init__(
         self,
@@ -293,7 +300,12 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
-                Binding("c", "centre the view on the crosshair", self._centre_view, group="view"),
+                Binding(
+                    "c",
+                    "centre the view on the crosshair (c c: every window)",
+                    double_tap(self._centre_view, self.centre_all_requested.emit),
+                    group="view",
+                ),
                 Binding(
                     "t",
                     "tilt the slice to cut the cortex square-on here",

@@ -57,7 +57,7 @@ from fastfuncstuff.viewer import surface3d as s3
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
-from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, double_tap, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetAtlas,
@@ -891,6 +891,8 @@ class SurfaceWindow(QtWidgets.QWidget):
     located = QtCore.Signal(float, float, float)
     #: Ctrl+click, scanner mm -- SET_XYZ there, then SET_SEED on that voxel.
     seeded = QtCore.Signal(float, float, float)
+    #: `c c`: centre every window on the crosshair, not just this one.
+    centre_all_requested = QtCore.Signal()
 
     #: Radius of the crosshair's mark on the surface, mm.
     CROSS_MM = 2.0
@@ -1024,7 +1026,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
                 Key("d", "depth statistic: mean, median, max, min, max_abs, nzmean", self._cycle_depth_stat, group="depth"),
                 Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
-                Key("c", "centre the view on the crosshair", self._centre_view, group="view"),
+                Key("c", "centre the view on the crosshair (c c: every window)", double_tap(self._centre_view, self.centre_all_requested.emit), group="view"),
                 Key("x", "show / hide the crosshair", self._toggle_cross, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"),

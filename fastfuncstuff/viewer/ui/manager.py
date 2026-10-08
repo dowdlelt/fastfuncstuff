@@ -139,6 +139,7 @@ class WindowManager(QtCore.QObject):
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
             win.surfaces_previewed.connect(self._redraw_outlines)
+            win.centre_all_requested.connect(self.centre_on_crosshair)
         elif viewport.is_chedi:
             win = ChediWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.centre_requested.connect(self.centre_on_crosshair)
@@ -153,6 +154,7 @@ class WindowManager(QtCore.QObject):
             win = SurfaceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
             win.seeded.connect(self._on_seeded)
+            win.centre_all_requested.connect(self.centre_on_crosshair)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)

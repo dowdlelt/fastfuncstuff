@@ -2884,3 +2884,42 @@ def test_a_scrolls_first_notch_does_not_draw_the_heavy_windows_inline(win, qapp)
         manager._settle.stop()
         manager._held.clear()
         stub.deleteLater()
+
+
+def test_c_twice_quickly_centres_the_other_windows_too(win, qapp):
+    """One `c` centres the focused window; a second within a double-click, all of them."""
+    from fastfuncstuff.viewer.ui.shortcuts import double_tap
+    from fastfuncstuff.viewer.vocab import SetPan, SetZoom
+
+    axial, coronal = image_of(win, Plane.AXIAL), image_of(win, Plane.CORONAL)
+    for w in (axial, coronal):
+        win.refresh(win.session.do(SetZoom(w.vid, 4.0)))
+        win.refresh(win.session.do(SetPan(w.vid, 0.0, 0.0)))
+    qapp.processEvents()
+
+    def pan(w):
+        return win.session.state.viewports.find(w.vid).pan
+
+    axial._centre_view()
+    centred = pan(axial)
+    win.refresh(win.session.do(SetPan(axial.vid, 0.0, 0.0)))
+    assert centred != (0.0, 0.0), "the crosshair should not already be centred at pan 0"
+
+    t = [0.0]
+    tap = double_tap(axial._centre_view, axial.centre_all_requested.emit, clock=lambda: t[0])
+    tap()
+    qapp.processEvents()
+    assert pan(axial) == centred and pan(coronal) == (0.0, 0.0)
+    t[0] += 0.1
+    tap()
+    qapp.processEvents()
+    assert pan(coronal) != (0.0, 0.0)
+
+    # Slower than a double-click: two single taps, nothing leaks out.
+    win.refresh(win.session.do(SetPan(coronal.vid, 0.0, 0.0)))
+    t[0] += 10.0
+    tap()
+    t[0] += 10.0
+    tap()
+    qapp.processEvents()
+    assert pan(coronal) == (0.0, 0.0)
