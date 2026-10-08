@@ -1070,8 +1070,12 @@ class ChediWindow(QtWidgets.QWidget):
         h = self.session.surfaces.hemis[p.hemi]
         uv = p.uv_of(h.n_vertices)
         f = p.faces
-        edges = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
-        edges = np.unique(np.sort(edges, axis=1), axis=0)
+        edges = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+        # One int64 key per edge: a row-wise unique sorts lexicographically,
+        # 5x slower, and this runs on every re-centre.
+        n = np.int64(h.n_vertices)
+        key = np.unique(edges[:, 0].astype(np.int64) * n + edges[:, 1])
+        edges = np.stack([key // n, key % n], axis=1)
         rc = p.to_pixels(uv[edges])  # (E, 2, 2) as (row, col)
         self.canvas.mesh = _segment_path(rc[..., ::-1])
         self.canvas.size_px = p.size
