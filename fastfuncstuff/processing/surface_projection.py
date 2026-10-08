@@ -32,6 +32,7 @@ __all__ = [
     "output_paths",
     "project_to_surface",
     "resolve_mesh",
+    "resolve_subject",
     "space_name",
     "surface_targets",
 ]
@@ -51,18 +52,40 @@ class HemiTarget:
     meta: dict[str, str] = field(default_factory=dict)
 
 
+def _freesurfer_dirs() -> list[Path]:
+    """Where FreeSurfer keeps subjects by name: ``$SUBJECTS_DIR``, then the copy of
+    fsaverage & co. that ships in ``$FREESURFER_HOME/subjects``."""
+    dirs = [os.environ.get("SUBJECTS_DIR")]
+    home = os.environ.get("FREESURFER_HOME")
+    dirs.append(str(Path(home) / "subjects") if home else None)
+    return [Path(d) for d in dirs if d]
+
+
+def resolve_subject(subject: str | os.PathLike) -> Path:
+    """A FreeSurfer subject as a path, or as a name in :func:`_freesurfer_dirs`."""
+    p = Path(subject)
+    if (p / "surf").is_dir():
+        return p
+    for d in _freesurfer_dirs():
+        if (d / p / "surf").is_dir():
+            return d / p
+    looked = ", ".join(str(d) for d in _freesurfer_dirs()) or "no $SUBJECTS_DIR set"
+    raise FileNotFoundError(f"FreeSurfer subject {str(subject)!r}: no surf/ there or in {looked}")
+
+
 def resolve_mesh(mesh: str, subject_dir: str | os.PathLike) -> Path | None:
-    """The template folder for ``mesh``: a path, or a sibling of the subject (the
-    usual SUBJECTS_DIR layout, e.g. ``onavg-ico64`` beside the subject). None = native."""
+    """The template folder for ``mesh``: a path, a sibling of the subject (the usual
+    SUBJECTS_DIR layout, e.g. ``onavg-ico64`` beside the subject), or a subject of that
+    name in ``$SUBJECTS_DIR`` / ``$FREESURFER_HOME/subjects``. None = native."""
     if mesh == "native":
         return None
-    p = Path(mesh)
-    if p.is_dir():
-        return p
-    sib = Path(subject_dir).parent / mesh
-    if sib.is_dir():
-        return sib
-    raise FileNotFoundError(f"-surf_mesh {mesh!r}: not a folder, and not beside {subject_dir}")
+    candidates = [Path(mesh), Path(subject_dir).parent / mesh]
+    candidates += [d / mesh for d in _freesurfer_dirs()]
+    for p in candidates:
+        if p.is_dir():
+            return p
+    looked = ", ".join(str(p.parent) for p in candidates[1:])
+    raise FileNotFoundError(f"-surf_mesh {mesh!r}: not a folder, and not in {looked}")
 
 
 def space_name(mesh: str) -> str:
@@ -96,7 +119,7 @@ def surface_targets(
     pial: str = "pial",
 ) -> list[HemiTarget]:
     """Each hemisphere's target mesh in the subject's scanner space, with its sampling."""
-    subject_dir = Path(subject_dir)
+    subject_dir = resolve_subject(subject_dir)
     folder = resolve_mesh(mesh, subject_dir)
     out = []
     for hemi in hemis:
@@ -200,6 +223,7 @@ def project_to_surface(
     names = [space_name(m) for m in meshes]
     if len(set(names)) != len(names):
         raise ValueError(f"target meshes must have distinct names, got {names}")
+    subject_dir = resolve_subject(subject_dir)
     vface = _voxel_face(source_path) if sample == "footprint" else None
     targets = [
         t for mesh in meshes for t in surface_targets(subject_dir, mesh, hemis, fractions, vface)

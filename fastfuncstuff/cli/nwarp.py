@@ -247,7 +247,7 @@ Examples:
         "-surf",
         default=None,
         metavar="SUBJ_DIR",
-        help="FreeSurfer subject folder. Instead of a volume, read the source at cortical "
+        help="FreeSurfer subject: a folder, or a subject name in $SUBJECTS_DIR. Instead of a volume, read the source at cortical "
         "surface points through the same chain, in the same single interpolation, and "
         "write GIfTI per target mesh and hemisphere: PREFIX.SPACE.?h.func.gii, plus "
         "?h.coverage.shape.gii (share of each footprint inside the EPI in every frame), "
@@ -263,7 +263,8 @@ Examples:
         default=["native"],
         help="Target mesh(es), each its own SPACE in the output names: 'native' (the "
         "subject's own vertices) and/or FreeSurfer-format template folders on fsaverage's "
-        "sphere, by path or by name beside the subject (onavg-ico64, fsaverage, ...): "
+        "sphere, by path or by name -- beside the subject, then in $SUBJECTS_DIR and "
+        "$FREESURFER_HOME/subjects (onavg-ico64, fsaverage, ...): "
         "placed in the subject through ?h.sphere.reg, so the output is group-ready with "
         "no second resample. Several targets share one pass over the data.",
     )

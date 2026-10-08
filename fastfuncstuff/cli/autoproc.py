@@ -159,7 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MESH",
         help="also sample every run onto a cortical mesh in the SAME single interpolation "
         "(ffs_nwarp -surf): 'native' for the subject's own vertices, or a FreeSurfer-format "
-        "template on fsaverage's sphere by path or by name beside the subject (e.g. "
+        "template on fsaverage's sphere by path or by name (beside the subject or in "
+        "$SUBJECTS_DIR, e.g. "
         "onavg-ico64) for group-ready output; several (native onavg-ico64) share one pass. "
         "The chain is each run's own up to the anat (never the MNI links), read at "
         "footprint points on the equivolume mid-surface. Writes "
@@ -172,8 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-fs-subject",
         default=None,
         metavar="DIR",
-        help="FreeSurfer subject folder (with surf/) for -surface_target; defaults to the "
-        "parent of -suma. Its surfaces must share scanner space with the anat.",
+        help="FreeSurfer subject (a folder with surf/, or a name in $SUBJECTS_DIR) for "
+        "-surface_target; defaults to the parent of -suma. Baked into the script as an "
+        "absolute path, as are the template meshes. Its surfaces must share scanner space with the anat.",
     )
     g.add_argument(
         "-do_mni",
@@ -1061,7 +1063,10 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         if opt.fs_subject is None:
             errors.append("-surface_target needs the FreeSurfer subject: -fs_subject DIR or -suma.")
         elif not (Path(opt.fs_subject) / "surf").is_dir():
-            errors.append(f"-fs_subject has no surf/ folder: {opt.fs_subject}")
+            errors.append(
+                f"-fs_subject has no surf/ folder (as a path, or a name in $SUBJECTS_DIR): "
+                f"{opt.fs_subject}"
+            )
         else:
             from fastfuncstuff.processing.surface_projection import resolve_mesh
 
@@ -1687,6 +1692,36 @@ def _opt_flag_spellings() -> set[str]:
     return {f"-{k}_opts" for k in keys} | {f"-{k.replace('_', '-')}-opts" for k in keys}
 
 
+def _baked_subject(subject: str | None) -> str | None:
+    """The FreeSurfer subject as an absolute path, resolved NOW: the script may run
+    where $SUBJECTS_DIR is not set. Unresolvable names pass through for validation."""
+    from fastfuncstuff.processing.surface_projection import resolve_subject
+
+    if subject is None:
+        return None
+    try:
+        return str(resolve_subject(subject).resolve())
+    except FileNotFoundError:
+        return subject
+
+
+def _baked_meshes(meshes: list[str] | None, subject: str | None) -> list[str] | None:
+    """Template meshes as absolute folders, for the same reason as the subject; the
+    output names (the folder's own name) do not change."""
+    from fastfuncstuff.processing.surface_projection import resolve_mesh
+
+    if not meshes or subject is None:
+        return meshes
+    out = []
+    for mesh in meshes:
+        try:
+            folder = resolve_mesh(mesh, subject)
+        except FileNotFoundError:
+            folder = None  # validation reports it
+        out.append(str(folder.resolve()) if folder is not None else mesh)
+    return out
+
+
 def _glue_opt_values(argv: list[str]) -> list[str]:
     """Rewrite ``-moco_opts <value>`` as ``-moco_opts=<value>``.
 
@@ -1760,6 +1795,9 @@ def main(argv: list[str] | None = None) -> int:
     _report_anat(anat_paths, from_bids=not (args.anat or args.suma), skipped=unused)
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
+    fs_subject = _baked_subject(
+        args.fs_subject or (str(Path(args.suma).parent) if args.suma else None)
+    )
     anat_nonlin = eff(args.anat_nonlin, "anat_nonlin")
     mni_backend, mni_template = _resolve_mni(args)
     if args.do_mni:
@@ -1856,8 +1894,8 @@ def main(argv: list[str] | None = None) -> int:
         tpm_source=tpm_source,
         fs_tpm=fs_tpm,
         suma_dir=args.suma,
-        surface_target=args.surface_target,
-        fs_subject=args.fs_subject or (str(Path(args.suma).parent) if args.suma else None),
+        surface_target=_baked_meshes(args.surface_target, fs_subject),
+        fs_subject=fs_subject,
         ref_file=args.ref_file,
         ref_transforms=args.ref_transforms,
         ref_anat=args.ref_anat,

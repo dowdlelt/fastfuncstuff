@@ -184,3 +184,24 @@ def test_several_targets_in_one_pass_ship_their_geometry_and_mask(world, tmp_pat
     keep = np.zeros(len(mask), bool)
     keep[world["keep"]] = True
     np.testing.assert_array_equal(mask > 0, keep)  # cortex label AND (full) coverage
+
+
+def test_subject_and_template_found_by_name_in_subjects_dir(world, tmp_path, monkeypatch):
+    """fsaverage, onavg & co. live in $SUBJECTS_DIR (or $FREESURFER_HOME/subjects), not
+    necessarily beside the subject; -surf takes a subject name there too."""
+    from fastfuncstuff.processing.surface_projection import resolve_mesh, resolve_subject
+
+    fsdir = tmp_path / "fs_subjects"
+    fsdir.mkdir()
+    world["tpl"].rename(fsdir / "tpl-test")
+    world["subj"].rename(fsdir / "subj")
+    monkeypatch.setenv("SUBJECTS_DIR", str(fsdir))
+    monkeypatch.delenv("FREESURFER_HOME", raising=False)
+    assert resolve_subject("subj") == fsdir / "subj"
+    elsewhere = tmp_path / "elsewhere" / "subj"
+    assert resolve_mesh("tpl-test", elsewhere) == fsdir / "tpl-test"
+    with pytest.raises(FileNotFoundError, match="no-such-mesh"):
+        resolve_mesh("no-such-mesh", elsewhere)
+    world["subj"] = "subj"
+    prefix = _run(world, tmp_path, "-surf_mesh", "tpl-test", "-surf_sample", "point")
+    assert Path(f"{prefix}.tpl-test.lh.func.gii").is_file()
