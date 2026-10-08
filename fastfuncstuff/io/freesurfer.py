@@ -70,8 +70,16 @@ def read_surface(path: str | os.PathLike) -> SurfaceFile:
     nv, nf, offset = _triangle_layout(raw)
     vertices = np.frombuffer(raw, ">f4", count=nv * 3, offset=offset).reshape(nv, 3)
     faces = np.frombuffer(raw, ">i4", count=nf * 3, offset=offset + nv * 12).reshape(nf, 3)
-    # nibabel already parses the trailer's volume-geometry tags; reuse it.
-    _, _, meta = nfs.read_geometry(str(path), read_metadata=True)
+    # nibabel already parses the trailer's volume-geometry tags; reuse it. Spheres and
+    # template meshes (onavg, sphere.reg) legitimately carry no volume geometry and
+    # sometimes tags nibabel does not know; the callers that need the geometry check
+    # volume_info themselves, so nibabel's per-file warnings are only noise.
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "No volume information contained in the file")
+        warnings.filterwarnings("ignore", "Unknown extension code")
+        _, _, meta = nfs.read_geometry(str(path), read_metadata=True)
     return SurfaceFile(
         vertices=vertices.astype(np.float32),
         faces=faces.astype(np.int32),
