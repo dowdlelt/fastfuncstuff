@@ -314,7 +314,7 @@ class ViewerSession:
         """
         from fastfuncstuff.viewer.surfacelayers import SurfaceLayerData, open_surface_parts
 
-        parts = open_surface_parts(path, self.surfaces.match_hemi)
+        parts = open_surface_parts(path, self.surfaces.place_data)
         if self.state.grid is not None:
             shape, affine = self.state.grid.shape, np.asarray(self.state.grid.affine)
         else:

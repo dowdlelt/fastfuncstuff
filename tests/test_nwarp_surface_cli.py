@@ -409,3 +409,36 @@ def test_geometry_written_once_under_its_own_stem(world, tmp_path):
     expected = {Path(p).resolve() for p in _expected_outputs(parse_args(argv))}
     written = {p.resolve() for p in [*out.iterdir(), *(tmp_path / "geom").iterdir()]}
     assert expected == written
+
+
+def test_template_results_map_onto_the_native_surfaces_of_their_own_subject(world, tmp_path):
+    """Native surfaces loaded (inflated, flat, edits, voxel sampling), a result made on
+    a template from the same subject: it is mapped back through the sphere.reg files,
+    where a native projection of the same EPI puts it. Another subject's is refused."""
+    import torch
+
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.vocab import Load, LoadSurfaces
+
+    prefix = _run(world, tmp_path, "-surf_mesh", "native", str(world["tpl"]),
+                  "-surf_sample", "point", "-surf_depths", "0.5")  # fmt: skip
+    native, _ = load_gifti_data(f"{prefix}.native.lh.func.gii")
+    s = ViewerSession(device=torch.device("cpu"))
+    try:
+        s.load(str(world["src"]))
+        s.do(LoadSurfaces(str(world["subj"]), hemis="lh"))
+        s.do(Load(f"{prefix}.tpl-test.lh.func.gii", "T"))
+        mapped = s.surface_layers["T"].parts["lh"]
+        assert mapped.n_vertices == native.shape[0] and mapped.meta["mapped_from"] == "tpl-test"
+        # a linear field, read on the template and carried back across a coarser mesh
+        np.testing.assert_allclose(mapped.values[:, 0], native[:, 0], atol=2.5)
+        assert np.corrcoef(mapped.values[:, 0], native[:, 0])[0, 1] > 0.99
+
+        other, meta = load_gifti_data(f"{prefix}.tpl-test.lh.func.gii")
+        from fastfuncstuff.io.gifti import save_gifti_data
+
+        save_gifti_data(tmp_path / "x.lh.func.gii", other, {**meta, "subject": "/elsewhere"})
+        with pytest.raises(ValueError, match="not on any loaded mesh"):
+            s.do(Load(str(tmp_path / "x.lh.func.gii"), "X"))
+    finally:
+        s.close()

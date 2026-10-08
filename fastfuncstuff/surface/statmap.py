@@ -49,6 +49,9 @@ class SurfaceData:
     #: metadata -- a stats bucket inherits its input's TR.
     is_series: bool = False
     tr: float | None = None
+    #: The file's own metadata (subject, mesh, depths ...): what a viewer needs to
+    #: place it on a mesh it was not made on.
+    meta: dict[str, str] = field(default_factory=dict)
 
     @property
     def n_vertices(self) -> int:
@@ -95,6 +98,7 @@ def load_surface_data(path: str | os.PathLike) -> SurfaceData:
         file_meta.get("mesh_fingerprint", ""),
         is_series=series and len(cols) > 1,
         tr=float(tr) if tr else None,
+        meta=file_meta,
     )
 
 

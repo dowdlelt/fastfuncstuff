@@ -87,22 +87,21 @@ def sibling_path(path: str | Path) -> Path | None:
     return p.with_name(p.name[: hit.start()] + other + p.name[hit.end() :])
 
 
-def open_surface_parts(path: str | Path, match) -> dict[str, SurfaceData]:
-    """The file and its sibling hemisphere, each matched to a loaded mesh.
+def open_surface_parts(path: str | Path, place) -> dict[str, SurfaceData]:
+    """The file and its sibling hemisphere, each on a loaded mesh.
 
-    ``match(data, hint) -> hemi`` is the surface store's fingerprint match; the
-    sibling is joined only if it matches the *other* loaded hemisphere.
+    ``place(data, hint) -> (hemi, data)`` is the surface store's: the fingerprint
+    match, or the data mapped onto the loaded mesh when it is this subject on a
+    template. The sibling is joined only if it lands on the *other* hemisphere.
     """
     from fastfuncstuff.io.freesurfer import infer_label
 
-    data = load_surface_data(path)
-    hemi = match(data, infer_label(str(path))[0] or "")
+    hemi, data = place(load_surface_data(path), infer_label(str(path))[0] or "")
     parts = {hemi: data}
     sib = sibling_path(path)
     if sib is not None and sib.exists():
         try:
-            other = load_surface_data(sib)
-            h2 = match(other, infer_label(str(sib))[0] or "")
+            h2, other = place(load_surface_data(sib), infer_label(str(sib))[0] or "")
         except (ValueError, OSError):
             h2 = None
         if h2 is not None and h2 not in parts and other.values.shape[1] == data.values.shape[1]:

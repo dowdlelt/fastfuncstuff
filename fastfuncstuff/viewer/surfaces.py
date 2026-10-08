@@ -115,6 +115,8 @@ class SurfaceStore:
         self.subject: Path | None = None
         #: "native", or the template mesh the subject is shown on (view-only).
         self.space = "native"
+        #: Template -> this subject's mesh, per (hemi, template): see place_data.
+        self._template_lookups: dict = {}
         self.hemis: dict[str, Hemisphere] = {}
         #: Slice indices per display grid, most recently used last: the shared
         #: grid plus any oblique windows' tilted ones. One grid used to be
@@ -182,6 +184,64 @@ class SurfaceStore:
         #: voxel of a grid. Built once per mesh and grid (seconds), reused by every
         #: surface layer on them; a mesh edit bumps the version and so retires it.
         self._ribbons: dict[tuple, object] = {}
+
+    def place_data(self, data, hint: str = ""):
+        """``(hemi, data)``: a per-vertex result on a loaded hemisphere.
+
+        On its own mesh it is matched as is (:meth:`match_hemi`). A result made on
+        a template from *this* subject (the projection records ``subject`` and
+        ``mesh``) is mapped onto the loaded mesh through the two ``sphere.reg``
+        files instead -- the projection's own correspondence, run backwards -- so
+        native surfaces (inflated, flat, edits, voxel sampling) and template-space
+        results share one view. Values are interpolated barycentrically; a 0/1 or
+        integer map takes the nearest corner.
+        """
+        try:
+            return self.match_hemi(data, hint), data
+        except ValueError as no_match:
+            mapped = self._map_from_template(data, hint)
+            if mapped is None:
+                raise no_match from None
+            return mapped
+
+    def _map_from_template(self, data, hint: str):
+        from dataclasses import replace
+
+        from fastfuncstuff.io.freesurfer import read_surface
+        from fastfuncstuff.io.gifti import mesh_fingerprint
+        from fastfuncstuff.processing.surface_projection import resolve_mesh
+        from fastfuncstuff.surface.remesh import sphere_lookup
+
+        meta = getattr(data, "meta", {}) or {}
+        mesh, subject = meta.get("mesh"), meta.get("subject")
+        if self.subject is None or self.space != "native" or not mesh or not subject:
+            return None
+        if Path(subject).resolve() != Path(self.subject).resolve():
+            return None
+        if hint not in self.hemis:
+            return None
+        key = (hint, mesh)
+        look = self._template_lookups.get(key)
+        if look is None:
+            folder = resolve_mesh(mesh, self.subject)
+            if folder is None:
+                return None
+            tgt = read_surface(folder / "surf" / f"{hint}.sphere.reg")
+            if len(tgt.vertices) != data.n_vertices:
+                return None
+            reg = read_surface(Path(self.subject) / "surf" / f"{hint}.sphere.reg")
+            look = sphere_lookup(tgt.vertices, tgt.faces, reg.vertices)
+            self._template_lookups[key] = look
+        v = data.values
+        integral = bool(np.all(np.isfinite(v)) and np.all(v == np.round(v)))
+        values = look.nearest(v) if integral else look.interpolate(v)
+        hs = self.hemis[hint]
+        return hint, replace(
+            data,
+            values=np.asarray(values, np.float32),
+            fingerprint=mesh_fingerprint(hs.faces, hs.n_vertices),
+            meta={**meta, "mapped_from": mesh},
+        )
 
     def match_hemi(self, data, hint: str = "") -> str:
         """The loaded hemisphere a per-vertex result belongs to, by its mesh.
@@ -266,6 +326,7 @@ class SurfaceStore:
         if not loaded:
             raise FileNotFoundError(f"no ?h.white surfaces under {subject_dir}/surf")
         self.space = space
+        self._template_lookups = {}
         self.subject = Path(subject_dir)
         self.hemis = loaded
         self.bare.clear()
