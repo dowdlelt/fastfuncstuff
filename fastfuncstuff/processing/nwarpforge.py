@@ -1779,6 +1779,7 @@ def nwarpforge(
     jac_match: str | None = None,
     progress: Callable[[str], AbstractContextManager[None]] | None = None,
     points: np.ndarray | None = None,
+    point_reducer: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor | None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1880,6 +1881,11 @@ def nwarpforge(
             returned (``(N,)`` for a 3-D source). Same kernels, motion, slice timing
             and transported ``-jac`` as the volume path, in one interpolation.
 
+        point_reducer: With ``points``: applied to every finished frame's ``(N,)`` reads
+            as it comes out, so the series is held as the reduced ``(M,)`` instead of
+            ``(N,)`` -- a surface fold of millions of footprint reads onto vertices.
+            The return is then ``(T, M)`` (``(M,)`` for a 3-D source).
+
     Returns:
         The sampled points when ``points`` is given, else None (the volume is saved).
     """
@@ -1902,6 +1908,8 @@ def nwarpforge(
                 "-jac on surface points needs the fieldmap named (AXIS:FIELDMAP): the "
                 "auto mode differentiates along grid axes, and points have none"
             )
+    elif point_reducer is not None:
+        raise ValueError("point_reducer needs points")
     if ainterp not in WARP_COMPOSE_INTERP:
         raise ValueError(f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}")
 
@@ -2247,6 +2255,8 @@ def nwarpforge(
     # tensors; on a CPU device this is a no-op. The affine-only fast path below keeps
     # its own (already bounded) batched output and is exempt.
     def _stash(vol: Tensor) -> Tensor:
+        if point_plan is not None and point_reducer is not None:
+            return point_reducer(vol.reshape(-1)).to("cpu")
         return vol.to("cpu")
 
     # Affine-only fast path: a chain with no nonlinear warp is a pure per-frame
@@ -2644,6 +2654,8 @@ def nwarpforge(
         output = output_volumes[0]
 
     if point_plan is not None:
+        if point_reducer is not None:
+            return output
         n_pts = point_plan.shape[2]
         return output.reshape(-1, n_pts) if output.ndim == 4 else output.reshape(n_pts)
 

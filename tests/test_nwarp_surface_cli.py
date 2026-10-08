@@ -149,7 +149,7 @@ def test_template_vertices_read_the_epi_where_the_sphere_puts_them(world, tmp_pa
 
 
 def test_footprint_and_depths_write_one_file_per_depth(world, tmp_path):
-    prefix = _run(world, tmp_path, "-surf_depths", "0.2", "0.8")
+    prefix = _run(world, tmp_path, "-surf_depths", "0.2", "0.8", "-surf_depth_combine", "none")
     lo, meta = load_gifti_data(f"{prefix}.native.lh.depth-0.20.func.gii")
     hi, _ = load_gifti_data(f"{prefix}.native.lh.depth-0.80.func.gii")
     assert meta["mesh"] == "native" and meta["sampling"] == "footprint"
@@ -205,3 +205,52 @@ def test_subject_and_template_found_by_name_in_subjects_dir(world, tmp_path, mon
     world["subj"] = "subj"
     prefix = _run(world, tmp_path, "-surf_mesh", "tpl-test", "-surf_sample", "point")
     assert Path(f"{prefix}.tpl-test.lh.func.gii").is_file()
+
+
+def _half_fov(world, tmp_path, value=100.0):
+    """A constant EPI on the same oblique grid, cut off part way up the sphere."""
+    img = nib.load(str(world["src"]))
+    data = np.full(img.shape[:3] + (2,), value, np.float32)[:, :, :34]
+    half = nib.Nifti1Image(data, img.affine)
+    half.header.set_xyzt_units("mm", "sec")
+    half.header["pixdim"][4] = 1.5
+    path = tmp_path / "half.nii.gz"
+    half.to_filename(str(path))
+    return path
+
+
+def test_partly_covered_vertices_keep_their_level_and_leave_the_mask(world, tmp_path):
+    """A footprint poking out of the slab is the mean of the reads INSIDE it, not that
+    mean diluted by the zeros nwarp returns outside; the mask still drops it."""
+    world["src"] = _half_fov(world, tmp_path)
+    prefix = _run(world, tmp_path)
+    data, _ = load_gifti_data(f"{prefix}.native.lh.func.gii")
+    cover, _ = load_gifti_data(f"{prefix}.native.lh.coverage.shape.gii")
+    mask, _ = load_gifti_data(f"{prefix}.native.lh.mask.shape.gii")
+    part = (cover > 0.05) & (cover < 0.95)
+    assert part.sum() > 10 and (cover == 0).sum() > 10 and (cover == 1).sum() > 10
+    # A diluted mean would sit at cover * 100, down to ~5 here.
+    assert np.abs(data[part] - 100.0).max() < 0.5
+    assert np.abs(data[cover == 1] - 100.0).max() < 1e-3
+    assert (cover[(data == 0).all(axis=1)] == 0).all()  # nothing read: 0, not a stray value
+    assert not mask[part].any() and mask[cover == 1].all()
+
+
+def test_default_output_is_the_equal_weight_mean_of_five_depths(world, tmp_path):
+    each = _run(world, tmp_path, "-surf_depth_combine", "none")
+    depths = [load_gifti_data(f"{each}.native.lh.depth-{f:.2f}.func.gii")[0] for f in
+              (0.1, 0.3, 0.5, 0.7, 0.9)]  # fmt: skip
+    assert not Path(f"{each}.native.lh.func.gii").exists()  # "none": the depths only
+    out = tmp_path / "mean"
+    out.mkdir()
+    prefix = _run(world, out)
+    mean, meta = load_gifti_data(f"{prefix}.native.lh.func.gii")
+    assert meta["depths"] == "0.1 0.3 0.5 0.7 0.9" and meta["depth_combine"] == "mean"
+    np.testing.assert_allclose(mean, np.mean(depths, axis=0), rtol=1e-5)
+    wtd = tmp_path / "wtd"
+    wtd.mkdir()
+    prefix = _run(world, wtd, "-surf_depth_weights", "1", "1", "1", "0", "0")
+    low, _ = load_gifti_data(f"{prefix}.native.lh.func.gii")
+    np.testing.assert_allclose(low, np.mean(depths[:3], axis=0), rtol=1e-5)
+    tmean, _ = load_gifti_data(f"{prefix}.native.lh.mean.shape.gii")
+    np.testing.assert_allclose(tmean, low.mean(axis=1), rtol=1e-5)

@@ -28,7 +28,11 @@ from fastfuncstuff.surface.remesh import remesh_via_sphere
 from fastfuncstuff.surface.topology import MeshBundle
 
 __all__ = [
+    "DEFAULT_DEPTHS",
     "HemiTarget",
+    "SurfaceFold",
+    "combine_depths",
+    "depth_weights",
     "output_paths",
     "project_to_surface",
     "resolve_mesh",
@@ -36,6 +40,13 @@ __all__ = [
     "space_name",
     "surface_targets",
 ]
+
+
+#: Default depths: the centres of five equivolume bins, combined with equal weights --
+#: the midpoint rule for the ribbon mean, so every cortical volume element counts the
+#: same and neither white matter (0) nor CSF (1) is read at the boundary itself.
+DEFAULT_DEPTHS = (0.1, 0.3, 0.5, 0.7, 0.9)
+DEPTH_COMBINE = ("mean", "none")
 
 
 @dataclass
@@ -113,7 +124,7 @@ def surface_targets(
     subject_dir: str | os.PathLike,
     mesh: str = "native",
     hemis=("lh", "rh"),
-    fractions=(0.5,),
+    fractions=DEFAULT_DEPTHS,
     voxel_face: float | None = None,
     white: str = "white",
     pial: str = "pial",
@@ -168,19 +179,82 @@ def _voxel_face(source_path: str) -> float:
     return float(np.prod(zooms) ** (2.0 / 3.0))
 
 
-def output_paths(prefix: str, meshes, hemis, fractions, depth_mean: bool = False) -> list[str]:
+def depth_weights(fractions, weights=None) -> np.ndarray:
+    """Normalised per-depth weights: equal by default, else ``weights`` (one per depth)."""
+    n = len(fractions)
+    w = np.ones(n) if weights is None else np.asarray(weights, np.float64)
+    if w.shape != (n,):
+        raise ValueError(f"{w.size} depth weights for {n} depths")
+    if (w < 0).any() or w.sum() <= 0:
+        raise ValueError(f"depth weights must be >= 0 and not all 0, got {list(w)}")
+    return w / w.sum()
+
+
+def output_paths(prefix: str, meshes, hemis, fractions, depth_combine: str = "mean") -> list[str]:
     """Every file :func:`project_to_surface` writes, in order (for -batch_skip)."""
     out = []
     for mesh in meshes:
         for hemi in hemis:
             stem = f"{prefix}.{space_name(mesh)}.{hemi}"
-            if depth_mean or len(fractions) == 1:
+            if depth_combine == "mean" or len(fractions) == 1:
                 out.append(f"{stem}.func.gii")
             else:
                 out += [f"{stem}.depth-{float(f):.2f}.func.gii" for f in fractions]
-            out += [f"{stem}.coverage.shape.gii", f"{stem}.mask.shape.gii"]
+            out += [f"{stem}.{n}.shape.gii" for n in ("coverage", "mask", "mean")]
             out += [f"{stem}.{s}.surf.gii" for s in ("white", "pial", "midthickness")]
     return out
+
+
+class SurfaceFold:
+    """Fold every frame's reads onto every target's ``(K, V)`` rows as nwarp emits it.
+
+    Per frame and row: the mean of the reads that landed inside the EPI (nwarp reads
+    exactly 0 outside), and the share of the footprint that did. Renormalising over
+    the reads inside keeps a vertex whose footprint pokes out of the slab at its true
+    level instead of averaging in zeros; the share is what the mask is built from.
+    The series is then held as ``2 * sum(K * V)`` per frame instead of every read.
+    """
+
+    def __init__(self, targets: list[HemiTarget]):
+        from scipy import sparse
+
+        self.targets = targets
+        self.rows = [t.sampling.operator.shape[0] for t in targets]
+        self.op = sparse.block_diag([t.sampling.operator for t in targets], format="csr")
+
+    def __call__(self, reads):
+        import torch
+
+        r = reads.detach().to("cpu", torch.float32).numpy()
+        num = self.op @ r
+        cov = self.op @ (r != 0).astype(np.float32)
+        val = np.divide(num, cov, out=np.zeros_like(num), where=cov > 0)
+        return torch.from_numpy(np.concatenate([val, cov]).astype(np.float32))
+
+    def split(self, out: np.ndarray):
+        """``(T, 2R)`` frames -> per target ``(values, coverage)``, each ``(K, V, T)``."""
+        out = out[None] if out.ndim == 1 else out
+        half = out.shape[1] // 2
+        edges = np.cumsum(self.rows)[:-1]
+        for t, val, cov in zip(
+            self.targets,
+            np.split(out[:, :half], edges, axis=1),
+            np.split(out[:, half:], edges, axis=1),
+            strict=True,
+        ):
+            k, v = t.sampling.n_depths, t.sampling.n_vertices
+            yield t, val.T.reshape(k, v, -1), cov.T.reshape(k, v, -1)
+
+
+def combine_depths(values: np.ndarray, cover: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """``(K, V, T)`` -> ``(V, T)``: weighted depth mean over the depths that read
+    anything at that vertex and frame (a depth wholly outside the EPI drops out)."""
+    w = weights[:, None, None] * (cover > 0)
+    total = w.sum(axis=0)
+    return np.divide(
+        (w * values).sum(axis=0), total, out=np.zeros(values.shape[1:], np.float32),
+        where=total > 0,
+    ).astype(np.float32)  # fmt: skip
 
 
 def project_to_surface(
@@ -191,8 +265,9 @@ def project_to_surface(
     prefix: str,
     meshes=("native",),
     hemis=("lh", "rh"),
-    fractions=(0.5,),
-    depth_mean: bool = False,
+    fractions=DEFAULT_DEPTHS,
+    depth_combine: str = "mean",
+    depth_weights_: list[float] | None = None,
     sample: str = "footprint",
     verb: int = 1,
     **nwarp_kwargs,
@@ -204,11 +279,13 @@ def project_to_surface(
     target ``{prefix}.{space}.{hemi}`` (space = ``native`` or the template's folder
     name) gets:
 
-    * ``.func.gii`` -- vertices x time (depth-averaged with ``depth_mean`` or one depth),
-      or one ``.depth-{f}.func.gii`` per depth;
-    * ``.coverage.shape.gii`` -- share of each footprint read inside the EPI in every
-      frame; ``.mask.shape.gii`` -- cortex label (when the mesh has one) AND full
-      coverage, the mask statistics should use;
+    * ``.func.gii`` -- vertices x time, the depths combined (``depth_combine="mean"``:
+      equal weights, or ``depth_weights_``), or one ``.depth-{f}.func.gii`` per depth
+      with ``"none"``;
+    * ``.coverage.shape.gii`` -- the smallest share of the footprint inside the EPI in
+      any frame and depth; ``.mask.shape.gii`` -- cortex label (when the mesh has one)
+      AND full coverage; ``.mean.shape.gii`` -- the temporal mean (what a cross-run
+      mask clips on);
     * ``.white/.pial/.midthickness.surf.gii`` -- the target's vertices placed in THIS
       subject (scanner mm): the geometry smoothing, cluster areas and display need.
     """
@@ -219,6 +296,9 @@ def project_to_surface(
 
     if sample not in ("footprint", "point"):
         raise ValueError(f"sample must be 'footprint' or 'point', got {sample!r}")
+    if depth_combine not in DEPTH_COMBINE:
+        raise ValueError(f"depth_combine must be one of {DEPTH_COMBINE}, got {depth_combine!r}")
+    weights = depth_weights(fractions, depth_weights_)
     meshes = [meshes] if isinstance(meshes, str) else list(meshes)
     names = [space_name(m) for m in meshes]
     if len(set(names)) != len(names):
@@ -228,30 +308,27 @@ def project_to_surface(
     targets = [
         t for mesh in meshes for t in surface_targets(subject_dir, mesh, hemis, fractions, vface)
     ]
-    counts = [t.sampling.points.shape[0] for t in targets]
     if verb >= 1:
-        for t, n in zip(targets, counts, strict=True):
+        for t in targets:
             print(
                 f"  {t.mesh} {t.hemi}: {t.sampling.n_vertices} vertices x "
-                f"{t.sampling.n_depths} depth(s) -> {n} reads ({sample})"
+                f"{t.sampling.n_depths} depth(s) -> {t.sampling.points.shape[0]} reads ({sample})"
             )
-    reads = nwarpforge(
+    fold = SurfaceFold(targets)
+    out = nwarpforge(
         source_path=source_path,
         nwarp_specs=nwarp_specs,
         prefix="",
         master_path=master_path,
         points=np.concatenate([t.sampling.points for t in targets]),
+        point_reducer=fold,
         verb=verb,
         **nwarp_kwargs,
     )
-    assert reads is not None
-    r = reads.cpu().numpy()
-    r = r[None] if r.ndim == 1 else r  # (T, P)
+    assert out is not None
     tr = get_tr_from_file(source_path)
     written: list[Path] = []
-    for t, chunk in zip(targets, np.split(r, np.cumsum(counts)[:-1], axis=1), strict=True):
-        folded = t.sampling.fold(chunk)  # (K, V, T)
-        cover = t.sampling.coverage(chunk).min(axis=0)  # (V,)
+    for t, values, cov in fold.split(out.cpu().numpy()):
         stem = f"{prefix}.{t.mesh}.{t.hemi}"
         geom = {
             "white": t.white,
@@ -272,21 +349,32 @@ def project_to_surface(
         )
         if tr and tr > 0:
             meta["TR_seconds"] = f"{tr:g}"
-        if depth_mean or t.sampling.n_depths == 1:
+        combined = combine_depths(values, cov, weights)
+        if depth_combine == "mean" or t.sampling.n_depths == 1:
             path = Path(f"{stem}.func.gii")
-            save_gifti_data(path, folded.mean(axis=0), {**meta, "depth_mean": "1"})
+            dmeta = {
+                "depth_combine": "mean",
+                "depth_weights": " ".join(f"{w:.4g}" for w in weights),
+            }
+            save_gifti_data(path, combined, {**meta, **dmeta})
             written.append(path)
         else:
             for k, f in enumerate(t.sampling.fractions):
                 path = Path(f"{stem}.depth-{f:.2f}.func.gii")
-                save_gifti_data(path, folded[k], {**meta, "depth": f"{f:g}"})
+                save_gifti_data(path, values[k], {**meta, "depth": f"{f:g}"})
                 written.append(path)
+        cover = cov.min(axis=(0, 2))
         mask = cover > 0.99
         if t.cortex is not None:
             mask &= t.cortex
-        for name, values in (("coverage", cover), ("mask", mask.astype(np.float32))):
+        shapes = (
+            ("coverage", cover),
+            ("mask", mask.astype(np.float32)),
+            ("mean", combined.mean(axis=1)),
+        )
+        for name, vals in shapes:
             path = Path(f"{stem}.{name}.shape.gii")
-            save_gifti_data(path, values, meta, time_series=False)
+            save_gifti_data(path, vals.astype(np.float32), meta, time_series=False)
             written.append(path)
         written += [Path(f"{stem}.{name}.surf.gii") for name in geom]
     return written

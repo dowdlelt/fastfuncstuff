@@ -279,14 +279,27 @@ Examples:
         "-surf_depths",
         nargs="+",
         type=float,
-        default=[0.5],
+        default=None,
         help="Equivolume depth fractions, white 0 .. pial 1 (outside [0, 1] extends "
-        "linearly). One file per depth unless -surf_depth_mean.",
+        "linearly). Default: 0.1 0.3 0.5 0.7 0.9, the centres of five equal-volume bins, "
+        "so their equal-weight mean is the ribbon mean without reading the white or pial "
+        "boundary itself.",
     )
     surf_group.add_argument(
-        "-surf_depth_mean",
-        action="store_true",
-        help="Average the depths into one map per hemisphere (a ribbon mean).",
+        "-surf_depth_combine",
+        choices=["mean", "none"],
+        default="mean",
+        help="mean: one series per hemisphere, the depths averaged (equal weights, or "
+        "-surf_depth_weights). none: one file per depth (PREFIX...depth-0.30.func.gii).",
+    )
+    surf_group.add_argument(
+        "-surf_depth_weights",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Weights for -surf_depth_combine mean, one per depth (normalised; e.g. to "
+        "down-weight the pial-vein-heavy outer depths). Default: equal.",
     )
     surf_group.add_argument(
         "-surf_sample",
@@ -451,8 +464,14 @@ def _surface_outputs(args: argparse.Namespace) -> list[str]:
     from fastfuncstuff.processing.surface_projection import output_paths
 
     return output_paths(
-        args.prefix, args.surf_mesh, args.surf_hemi, args.surf_depths, args.surf_depth_mean
+        args.prefix, args.surf_mesh, args.surf_hemi, _surf_depths(args), args.surf_depth_combine
     )
+
+
+def _surf_depths(args: argparse.Namespace) -> tuple[float, ...]:
+    from fastfuncstuff.processing.surface_projection import DEFAULT_DEPTHS
+
+    return tuple(args.surf_depths) if args.surf_depths else DEFAULT_DEPTHS
 
 
 def _validate_batch_run(run_args: argparse.Namespace) -> None:
@@ -666,8 +685,9 @@ def _dispatch_surface(
         prefix=args.prefix,
         meshes=tuple(args.surf_mesh),
         hemis=tuple(args.surf_hemi),
-        fractions=tuple(args.surf_depths),
-        depth_mean=args.surf_depth_mean,
+        fractions=_surf_depths(args),
+        depth_combine=args.surf_depth_combine,
+        depth_weights_=args.surf_depth_weights,
         sample=args.surf_sample,
         verb=args.verb,
         interp=args.interp,
