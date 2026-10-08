@@ -2827,3 +2827,19 @@ def test_a_slow_heavy_draw_does_not_read_as_a_pause(win, qapp, monkeypatch):
         manager._settle.stop()
         manager._held.clear()
         stub.deleteLater()
+
+
+def test_a_scroll_rerenders_only_the_scrolled_plane(win, qapp):
+    """The planes a scroll does not step keep their pixels; only their crosshair moves."""
+    renders: list[Plane] = []
+    for plane in Plane:
+        pane = image_of(win, plane).pane
+        real = pane.set_pane
+        pane.set_pane = lambda img, real=real, plane=plane: (renders.append(plane), real(img))[1]
+    before = {p: image_of(win, p).pane._cross for p in Plane}
+    image_of(win, Plane.AXIAL)._step(1)
+    qapp.processEvents()
+    assert renders == [Plane.AXIAL]
+    # ... and the others' crosshair did follow the step.
+    moved = [p for p in Plane if image_of(win, p).pane._cross != before[p]]
+    assert set(moved) == {Plane.SAGITTAL, Plane.CORONAL}

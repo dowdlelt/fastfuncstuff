@@ -19,7 +19,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Command
-from fastfuncstuff.viewer.compose import plane_view, render_viewport
+from fastfuncstuff.viewer.compose import plane_position, plane_view, render_viewport
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.surfaces import Grab
@@ -839,6 +839,32 @@ class ImageWindow(QtWidgets.QWidget):
         """Re-read the palette after a theme switch."""
         self.setStyleSheet(theme.stylesheet())
         self.pane.update()
+
+    def follow(self) -> None:
+        """A crosshair move: redraw the picture only if it is now another slice.
+
+        A scroll changes one plane's slice; the other windows show the same
+        pixels, outlines and marks, and only their crosshair moves -- which
+        was two thirds of every notch's cost. Oblique and strip windows sample
+        around the crosshair itself, so they always redraw.
+        """
+        vp = self._viewport()
+        state = self.session.state
+        drawn = self.pane.position
+        if vp is None or state.grid is None or drawn is None or vp.strip or self._tilted():
+            self.redraw()
+            return
+        # As render_viewport picks it: a parked window keeps its slice.
+        want = vp.position if not vp.locked and vp.position is not None else None
+        if want is None:
+            want = plane_position(state, vp.plane)
+        want = max(
+            0, min(int(want), state.grid.shape[plane_layout(state.grid.affine, vp.plane).fixed] - 1)
+        )
+        if want != drawn:
+            self.redraw()
+        else:
+            self.redraw_crosshair()
 
     def redraw(self) -> None:
         vp = self._viewport()

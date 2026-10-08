@@ -259,7 +259,7 @@ class WindowManager(QtCore.QObject):
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 if images:
-                    self._timed(win, win.redraw)
+                    self._timed(win, win.follow if moving else win.redraw)
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
                     self._heavy(win, dirty, scrolling)
