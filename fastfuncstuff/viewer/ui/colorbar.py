@@ -70,7 +70,7 @@ class ColorBar(QtWidgets.QWidget):
         self._panes = 0
         self._alpha = AlphaMode.OFF
         self.setToolTip(
-            "Click to reverse the colour scale.\nShift+click to set the threshold there."
+            "Click to set the threshold there.\nShift+click to reverse the colour scale."
         )
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setFixedWidth(BAR_WIDTH)
@@ -142,15 +142,15 @@ class ColorBar(QtWidgets.QWidget):
         p.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
-        """Click to reverse the scale; shift+click to threshold at the cursor.
+        """Click to threshold at the cursor; shift+click to reverse the scale.
 
-        Reversing is the plain click because it is what the bar is for -- a
-        picture of the scale -- and it replaces a ``_r`` twin of every map in
-        the picker.
+        Setting the threshold is the plain click because it is what people
+        reach for while reading a map; reversing (which replaces a ``_r`` twin
+        of every map in the picker) is the rarer one.
         """
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             return
-        if not event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
             self.reverse_requested.emit()
             return
         h = max(self.height() - 2, 1)

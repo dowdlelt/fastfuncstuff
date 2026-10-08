@@ -69,6 +69,12 @@ _SCALES: dict[str, tuple[tuple[float, float, float], ...]] = {
     **SAMPLED_SCALES,
 }
 
+# matplotlib's RdBu and RdYlBu run red at the LOW end, so a positive effect
+# drew blue -- backwards for every brain map. Here they run blue to red like
+# "redblue"; the bar's reverse still flips them.
+for _name in ("RdBu", "RdYlBu"):
+    _SCALES[_name] = _SCALES[_name][::-1]
+
 #: The order the picker lists them in: by family rather than alphabet, so a
 #: diverging scale sits beside the other diverging ones.
 _ORDER = (

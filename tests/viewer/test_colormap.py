@@ -51,7 +51,9 @@ def test_sampled_scales_match_matplotlib(name):
     """A mistyped stop would still build a valid LUT, just not the named one."""
     mpl = pytest.importorskip("matplotlib")
     ours = build_lut(name, 256, device=CPU).numpy()
-    theirs = mpl.colormaps[name](torch.linspace(0, 1, 256).numpy())[:, :3]
+    # RdBu / RdYlBu deliberately run the other way: red is HIGH, as in "redblue".
+    mpl_name = f"{name}_r" if name in ("RdBu", "RdYlBu") else name
+    theirs = mpl.colormaps[mpl_name](torch.linspace(0, 1, 256).numpy())[:, :3]
     assert abs(ours - theirs).max() < 0.03
 
 
@@ -287,3 +289,11 @@ def test_a_stats_overlay_over_anatomy_reads_as_expected():
     # Inside the blob the stat colour wins; outside, anatomy is untouched.
     assert not torch.allclose(out[5, 5], anat_rgb[5, 5], atol=1e-3)
     assert torch.allclose(out[0, 0], anat_rgb[0, 0], atol=1e-6)
+
+
+def test_diverging_scales_put_red_at_the_top():
+    """matplotlib's RdBu / RdYlBu are red at the LOW end, which drew a positive
+    effect blue."""
+    for name in ("redblue", "RdBu", "RdYlBu"):
+        lut = build_lut(name, 256, device=CPU)
+        assert lut[-1, 0] > lut[-1, 2] and lut[0, 2] > lut[0, 0], name

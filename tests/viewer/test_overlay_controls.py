@@ -551,27 +551,24 @@ def test_the_image_corner_follows_the_crosshair(win, qapp):
     assert pane._readout == win.session.overlay_readout()
 
 
-def test_clicking_the_colour_bar_reverses_it_and_shift_click_thresholds(win, qapp):
+def test_clicking_the_colour_bar_thresholds_and_shift_click_reverses_it(win, qapp):
     from PySide6 import QtCore
     from PySide6.QtTest import QTest
 
     bar = win.rangebar.bar
     layer = lambda: win.session.state.layers.overlay  # noqa: E731
     before = layer().threshold
-    QTest.mouseClick(bar, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(10, 5))
+    shift = QtCore.Qt.KeyboardModifier.ShiftModifier
+    left = QtCore.Qt.MouseButton.LeftButton
+    QTest.mouseClick(bar, left, shift, QtCore.QPoint(10, 5))
     qapp.processEvents()
     assert layer().colormap_reversed
     assert layer().threshold == before
-    QTest.mouseClick(bar, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(10, 5))
+    QTest.mouseClick(bar, left, shift, QtCore.QPoint(10, 5))
     qapp.processEvents()
     assert not layer().colormap_reversed
 
-    QTest.mouseClick(
-        bar,
-        QtCore.Qt.MouseButton.LeftButton,
-        QtCore.Qt.KeyboardModifier.ShiftModifier,
-        QtCore.QPoint(10, 5),
-    )
+    QTest.mouseClick(bar, left, pos=QtCore.QPoint(10, 5))
     qapp.processEvents()
     assert not layer().colormap_reversed
     assert layer().threshold != before
