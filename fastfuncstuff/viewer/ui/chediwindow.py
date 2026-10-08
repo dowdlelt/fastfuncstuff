@@ -5,6 +5,8 @@ moves the crosshair -- a click in a slice, on the inflated surface, in a
 profile -- moves it. With no cortex near the crosshair it stays where it was.
 Depth runs from white (0) to pial (1) and past both, so grey matter still
 showing beyond pial, or dura bright inside it, is where the mesh is wrong.
+The wall is the underlay in grey; the row of boxes along the bottom picks the
+layers coloured over it, each in its colour bar from the slices.
 
 Selecting is the surface highlight every window shares (the 2-D MARK dots,
 the 3-D paint), so a selection made here shows everywhere and a recorded
@@ -46,6 +48,7 @@ from fastfuncstuff.viewer.vocab import (
     HighlightSurface,
     MoveSurfaceHighlight,
     SetPatchLayer,
+    SetPatchOverlays,
     SetPatchSize,
     SetSurfaceDepth,
     SetSurfaceStep,
@@ -56,9 +59,14 @@ from fastfuncstuff.viewer.vocab import (
 
 #: How far from the crosshair (mm) a vertex may be and still be followed.
 FOLLOW_MM = 10.0
-#: Colour overlays CHEDI draws over its wall (``i`` toggles them): enough for grey
-#: matter and a thresholded map at once without the patch turning to soup.
+#: Colour overlays CHEDI draws over its wall until a box is ticked (``i`` toggles
+#: them): enough for grey matter and a thresholded map at once without the
+#: patch turning to soup. Ticked boxes are not capped.
 MAX_OVERLAYS = 2
+#: Size of the colour-bar swatch beside each overlay box, pixels.
+SWATCH = (28, 10)
+#: Longest an overlay box's name is shown before its middle is elided, characters.
+OVERLAY_NAME_CHARS = 28
 #: Pixels across the sampled patch. The canvas scales it; more is slower to
 #: build and sample and shows nothing an anatomy at ~1 mm has to give.
 PATCH_PIXELS = 256
@@ -377,6 +385,20 @@ class ChediWindow(QtWidgets.QWidget):
         self.canvas.dragged.connect(self._drag)
         self.canvas.released.connect(self._release)
         v.addWidget(self.canvas, 1)
+        # One box per layer the wall is not: many overlays scroll sideways
+        # rather than squeeze the patch.
+        self.overlay_row = QtWidgets.QWidget()
+        self._overlay_layout = QtWidgets.QHBoxLayout(self.overlay_row)
+        self._overlay_layout.setContentsMargins(6, 2, 6, 2)
+        self._overlay_layout.setSpacing(10)
+        self._overlay_boxes: dict[str, QtWidgets.QCheckBox] = {}
+        self._overlay_key: tuple | None = None
+        self.overlay_scroll = QtWidgets.QScrollArea()
+        self.overlay_scroll.setWidget(self.overlay_row)
+        self.overlay_scroll.setWidgetResizable(True)
+        self.overlay_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.overlay_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        v.addWidget(self.overlay_scroll)
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("value")
         self.status.setContentsMargins(6, 2, 6, 2)
@@ -436,7 +458,7 @@ class ChediWindow(QtWidgets.QWidget):
                 ),
                 Binding(
                     "l",
-                    "sample: follow the selection / each layer in turn",
+                    "grey wall: the underlay / each layer in turn",
                     self._cycle_layer,
                     group="view",
                 ),
@@ -478,7 +500,7 @@ class ChediWindow(QtWidgets.QWidget):
                 ),
                 Binding(
                     "i",
-                    "colour overlays on / off: the top two visible layers over the wall",
+                    "colour overlays on / off (the boxes along the bottom pick them)",
                     self._toggle_overlays,
                     group="view",
                 ),
@@ -546,26 +568,26 @@ class ChediWindow(QtWidgets.QWidget):
             self._dispatch(SetViewSampling(self.vid, nxt))
 
     def _cycle_layer(self) -> None:
-        """l: follow the selection -> each loaded layer, bottom to top -> follow again."""
+        """l: the underlay -> each layer above it, bottom to top -> the underlay again."""
         vp = self._viewport()
         if vp is None:
             return
-        keys = ["", *(layer.key for layer in self.session.state.layers)]
+        keys = ["", *(layer.key for layer in list(self.session.state.layers)[1:])]
         now = vp.patch_layer if vp.patch_layer in keys else ""
         nxt = keys[(keys.index(now) + 1) % len(keys)]
         self._dispatch(SetPatchLayer(self.vid, nxt))
         layer = self.layer()
         name = layer.name if layer is not None else "nothing"
-        self.status.setText(f"samples {name}" + ("" if nxt else " (following the selection)"))
+        self.status.setText(f"wall: {name}" + ("" if nxt else " (the underlay)"))
 
     def layer(self):
-        """What the wall shows: the layer ``l`` picked; else the selected layer, else
-        the top visible overlay, else the base.
+        """What the grey wall shows: the layer ``l`` picked, else the underlay.
 
-        The overlay rather than the base because the base is usually what the
-        slices are anchored to, and the image worth judging the mesh against
-        -- the anatomy loaded again on top, a T2, an edge map -- is above it.
-        Selecting a layer is how to choose.
+        The underlay because it is what the slices show in grey -- the
+        anatomy -- while the layers above it are usually maps, which read in
+        their own colours over it (:meth:`overlay_layers`), not as a grey
+        wall. Following the selected layer made a stats map the wall the
+        moment it was loaded, with the anatomy nowhere.
         """
         layers = self.session.state.layers
         vp = self._viewport()
@@ -573,12 +595,7 @@ class ChediWindow(QtWidgets.QWidget):
             picked = layers.find(vp.patch_layer)
             if picked is not None:
                 return picked
-        base = layers.base
-        selected = self.session.state.selected_layer()
-        if selected is not None and (base is None or selected.key != base.key):
-            return selected
-        above = [layer for layer in list(layers)[1:] if layer.visible]
-        return above[-1] if above else base
+        return layers.base
 
     def _toggle_mesh(self) -> None:
         self.canvas.show_mesh = not self.canvas.show_mesh
@@ -1015,6 +1032,7 @@ class ChediWindow(QtWidgets.QWidget):
         if not surfaces.hemis:
             self._clear("load a subject's surfaces first (SURF)")
             return
+        self._sync_overlay_row()
         self._follow()
         if self._centre is None:
             self._clear("put the crosshair on cortex")
@@ -1143,18 +1161,69 @@ class ChediWindow(QtWidgets.QWidget):
         self.canvas.update()
 
     def overlay_layers(self) -> list:
-        """The colour overlays over the wall: the top two visible layers above the
-        base, other than the one the wall shows -- grey matter and the thresholded
-        map, say. A surface layer is one too (on its own vertices, no depth)."""
-        if not self.show_overlays:
-            return []
+        """The colour overlays drawn over the wall, bottom to top (none while ``i``
+        has them off). A surface layer is one too (on its own vertices, no depth)."""
+        return self.chosen_overlays() if self.show_overlays else []
+
+    def _candidates(self) -> list:
+        """Every layer that could be an overlay: all but the wall, in stack order."""
         wall = self.layer()
-        above = [
-            ly
-            for ly in list(self.session.state.layers)[1:]
-            if ly.visible and (wall is None or ly.key != wall.key)
-        ]
+        return [ly for ly in self.session.state.layers if wall is None or ly.key != wall.key]
+
+    def chosen_overlays(self) -> list:
+        """The ticked layers; untouched, the top two visible above the underlay --
+        grey matter and the thresholded map, say."""
+        vp = self._viewport()
+        candidates = self._candidates()
+        if vp is not None and vp.patch_overlays is not None:
+            chosen = set(vp.patch_overlays)
+            return [ly for ly in candidates if ly.key in chosen]
+        base = self.session.state.layers.base
+        above = [ly for ly in candidates if ly.visible and (base is None or ly.key != base.key)]
         return above[-MAX_OVERLAYS:]
+
+    def _sync_overlay_row(self) -> None:
+        """One box per candidate, ticked as chosen, with its colour bar beside it."""
+        candidates = self._candidates()
+        key = tuple((ly.key, ly.name, ly.colormap, ly.colormap_reversed) for ly in candidates)
+        if key != self._overlay_key:
+            self._overlay_key = key
+            while (item := self._overlay_layout.takeAt(0)) is not None:
+                if (w := item.widget()) is not None:
+                    w.deleteLater()
+            self._overlay_boxes = {}
+            for ly in candidates:
+                # Pipeline file names run long; the middle is what repeats.
+                box = QtWidgets.QCheckBox(_elide(ly.name, OVERLAY_NAME_CHARS))
+                box.setIcon(QtGui.QIcon(_swatch(ly.colormap, ly.colormap_reversed)))
+                box.setIconSize(QtCore.QSize(*SWATCH))
+                box.setToolTip(f"colour {ly.name} over the wall, as on the slices")
+                box.toggled.connect(lambda on, k=ly.key: self._tick_overlay(k, on))
+                self._overlay_layout.addWidget(box)
+                self._overlay_boxes[ly.key] = box
+            self._overlay_layout.addStretch(1)
+            # From the boxes and the style, not the row's size hint: that is
+            # read before the new boxes are laid out, and a sideways scrollbar
+            # then covered the row it was there to scroll.
+            boxes = max((b.sizeHint().height() for b in self._overlay_boxes.values()), default=0)
+            bar = self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+            m = self._overlay_layout.contentsMargins()
+            self.overlay_scroll.setFixedHeight(boxes + m.top() + m.bottom() + bar)
+        chosen = {ly.key for ly in self.chosen_overlays()}
+        for k, box in self._overlay_boxes.items():
+            box.blockSignals(True)
+            box.setChecked(k in chosen)
+            box.blockSignals(False)
+        self.overlay_scroll.setVisible(bool(candidates))
+
+    def _tick_overlay(self, key: str, on: bool) -> None:
+        """A box was ticked: the choice becomes explicit, in stack order."""
+        chosen = {ly.key for ly in self.chosen_overlays()}
+        chosen = chosen | {key} if on else chosen - {key}
+        keys = [ly.key for ly in self._candidates() if ly.key in chosen]
+        if on:
+            self.show_overlays = True  # ticking one is asking to see it
+        self._dispatch(SetPatchOverlays(self.vid, ",".join(keys) or "-"))
 
     def _overlay_rgba(self, layer, depth: float, mode: str) -> np.ndarray | None:
         """``(H, W, 4)`` uint8 of one overlay on the patch, coloured as on the slices."""
@@ -1220,6 +1289,29 @@ class ChediWindow(QtWidgets.QWidget):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         self.closed.emit(self.vid)
         super().closeEvent(event)
+
+
+def _elide(name: str, n: int) -> str:
+    """``name`` cut to ``n`` characters by dropping its middle."""
+    if len(name) <= n:
+        return name
+    head = (n - 1) // 2
+    return f"{name[:head]}…{name[len(name) - (n - 1 - head) :]}"
+
+
+def _swatch(colormap: str, reverse: bool) -> QtGui.QPixmap:
+    """A layer's colour bar, low to high left to right, as a small pixmap."""
+    import torch
+
+    from fastfuncstuff.viewer.compose import cached_lut
+
+    w, h = SWATCH
+    lut = cached_lut(colormap, torch.device("cpu"), size=w, reverse=reverse)
+    row = np.clip(np.round(lut.numpy() * 255), 0, 255).astype(np.uint8)
+    rgb = np.ascontiguousarray(np.broadcast_to(row[None], (h, w, 3)))
+    return QtGui.QPixmap.fromImage(
+        QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format.Format_RGB888).copy()
+    )
 
 
 __all__ = ["ChediWindow", "PatchCanvas"]

@@ -219,9 +219,13 @@ class Viewport:
     #: nearest (the voxels themselves), linear or cubic. Depth is ``depth[0]``.
     patch_mm: float = 25.0
     sampling: str = "nearest"
-    #: The layer it samples, by key; empty follows the selection (see
+    #: The layer its grey wall samples, by key; empty is the underlay (see
     #: ``ChediWindow.layer``).
     patch_layer: str = ""
+    #: The layers it colours over the wall, by key in stack order; ``None`` is
+    #: automatic (the top visible layers above the underlay -- see
+    #: ``ChediWindow.overlay_layers``).
+    patch_overlays: tuple[str, ...] | None = None
 
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.

@@ -877,12 +877,27 @@ class SetPatchSize(Command):
 @command
 @dataclass(frozen=True)
 class SetPatchLayer(Command):
-    """Which layer a CHEDI window samples, by key; empty follows the layer selection."""
+    """Which layer a CHEDI window's grey wall samples, by key; empty is the underlay."""
 
     name = "SET_PATCH_LAYER"
     aspects = Aspect.VIEWPORTS
     view: str
     key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class SetPatchOverlays(Command):
+    """Which layers a CHEDI window colours over its wall, as comma-separated keys.
+
+    Empty puts it back on automatic (the top visible layers above the
+    underlay); ``-`` is none.
+    """
+
+    name = "SET_PATCH_OVERLAYS"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    keys: str = ""
 
 
 @command
@@ -2216,6 +2231,17 @@ def install(
         if cmd.key and st.layers.find(cmd.key) is None:
             raise ValueError(f"no layer {cmd.key!r}")
         return _set_view(st, cmd.view, SetPatchLayer.aspects, patch_layer=cmd.key)
+
+    @bus.handle(SetPatchOverlays.name)
+    def _set_patch_overlays(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetPatchOverlays)
+        if not cmd.keys:
+            return _set_view(st, cmd.view, SetPatchOverlays.aspects, patch_overlays=None)
+        keys = tuple(k for k in cmd.keys.split(",") if k and k != "-")
+        for key in keys:
+            if st.layers.find(key) is None:
+                raise ValueError(f"no layer {key!r}")
+        return _set_view(st, cmd.view, SetPatchOverlays.aspects, patch_overlays=keys)
 
     @bus.handle(SetViewSampling.name)
     def _set_view_sampling(cmd: Command, st: ViewerState) -> Aspect:

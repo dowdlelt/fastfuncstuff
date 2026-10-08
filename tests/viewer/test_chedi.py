@@ -131,16 +131,17 @@ def test_window_follows_the_crosshair_samples_the_overlay_and_steps_depth(tmp_pa
         assert session.state.viewports.get("E1").depth == (1.0, 1.0)
         assert "SET_SURFACE_DEPTH E1" in session.to_script()
 
-        # A second layer on top is what it samples, by name in the caption.
+        # A second layer on top is coloured over the underlay's grey wall --
+        # selected or not, it does not take the wall over.
         import shutil
 
         shutil.copy(anat, tmp_path / "t2ish.nii.gz")
         session.do(Load(str(tmp_path / "t2ish.nii.gz"), "T2ish"))
+        session.do(SelectLayer("T2ish"))
         refresh()
-        assert "t2ish" in win.canvas.caption
-        assert win.layer().key == "T2ish"
-        session.do(SelectLayer(session.state.layers.base.key))
-        assert win.layer().key == "T2ish"  # selecting the base is not choosing it
+        assert win.layer().key == session.state.layers.base.key
+        assert [ly.key for ly in win.overlay_layers()] == ["T2ish"]
+        assert "+ t2ish" in win.canvas.caption
 
         win._cycle_sampling()
         assert session.state.viewports.get("E1").sampling == "linear"
@@ -382,7 +383,7 @@ def test_o_shows_gyri_and_sulci_and_f_g_unselect_them(chedi, subject):
     assert session.surfaces.highlighted("lh").size == 0
 
 
-def test_l_picks_the_sampled_layer_including_the_base_under_an_overlay(chedi, tmp_path):
+def test_l_puts_another_layer_on_the_wall_and_back_to_the_underlay(chedi, tmp_path):
     import shutil
 
     from fastfuncstuff.viewer.vocab import Load
@@ -392,15 +393,48 @@ def test_l_picks_the_sampled_layer_including_the_base_under_an_overlay(chedi, tm
     shutil.copy(session.store.get(base.key).path, tmp_path / "t2.nii.gz")
     session.do(Load(str(tmp_path / "t2.nii.gz"), "T2"))
     win.refresh()
-    assert win.layer().key == "T2"  # following: the overlay
+    assert win.layer().key == base.key  # the underlay, though an overlay is visible
     win._cycle_layer()
-    assert win.layer().key == base.key  # the base, though an overlay is visible
-    assert base.name in win.canvas.caption
+    assert win.layer().key == "T2"  # the T2 loaded on top, as the wall
+    assert "t2" in win.canvas.caption
+    # ... and the underlay is now a candidate overlay, but not drawn unasked.
+    assert base.key in win._overlay_boxes and not win.overlay_layers()
     win._cycle_layer()
-    assert win.layer().key == "T2"
-    win._cycle_layer()
+    assert win.layer().key == base.key
     assert session.state.viewports.get("E1").patch_layer == ""
     assert "SET_PATCH_LAYER E1" in session.to_script()
+
+
+def test_the_overlay_boxes_pick_what_is_coloured_and_replay(chedi, tmp_path):
+    """Untouched, the top two visible layers are ticked; a tick makes the choice
+    explicit and recorded, uncapped; ticking every box off draws plain grey."""
+    import shutil
+
+    from fastfuncstuff.viewer.vocab import Load, SetPatchOverlays
+
+    session, win = chedi
+    base = session.state.layers.base
+    for name in ("A", "B", "C"):
+        shutil.copy(session.store.get(base.key).path, tmp_path / f"{name}.nii.gz")
+        session.do(Load(str(tmp_path / f"{name}.nii.gz"), name))
+    win.refresh()
+    boxes = win._overlay_boxes
+    assert list(boxes) == ["A", "B", "C"]  # every layer but the wall, in stack order
+    assert [k for k, b in boxes.items() if b.isChecked()] == ["B", "C"]
+    assert not boxes["A"].icon().isNull()  # its colour bar
+
+    boxes["A"].setChecked(True)  # the third: no cap once chosen
+    assert [ly.key for ly in win.overlay_layers()] == ["A", "B", "C"]
+    for k in ("A", "B", "C"):
+        boxes[k].setChecked(False)
+    assert win.overlay_layers() == [] and "+ " not in win.canvas.caption
+    assert session.state.viewports.get("E1").patch_overlays == ()
+    assert "SET_PATCH_OVERLAYS E1 -" in session.to_script()
+
+    win._dispatch(SetPatchOverlays("E1", ""))  # back to automatic
+    assert [ly.key for ly in win.overlay_layers()] == ["B", "C"]
+    with pytest.raises(ValueError):
+        session.do(SetPatchOverlays("E1", "nope"))
 
 
 def test_kmeans_finds_planted_groups_repeatably_and_orders_them_by_brightness():
