@@ -105,8 +105,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-mask",
         metavar="FILE",
-        help="Optional brain mask. If absent, voxels with "
-        "non-finite or all-zero (a, b) are skipped.",
+        help="Optional brain mask. If absent, voxels the GLM did not fit "
+        "(StDev 0 or non-finite) are skipped.",
     )
     p.add_argument(
         "-matrix",
@@ -209,6 +209,7 @@ def _format_stataux_block(
 
 #: The AFNI attributes concalc rewrites itself. Everything else in the source
 #: bucket's extension is carried across untouched -- see _save_bucket.
+_SURFACE_SUFFIXES = (".func.gii", ".shape.gii", ".gii")
 _CONCALC_OWNED_ATRS = frozenset({"BRICK_LABS", "BRICK_STATAUX", "BRICK_STATSYM"})
 
 #: Ceiling on distinct (a, b) pairs in a real Rvar. 3dREMLfit's default grid is
@@ -384,6 +385,10 @@ def _rvar_companion(stats_path: str) -> str | None:
     """The ``*_ffsremlvar`` file ffs_reml writes beside a -Rbuck, if it exists."""
     from fastfuncstuff.io.afni import replace_afni_extension
 
+    for ext in _SURFACE_SUFFIXES:
+        if stats_path.endswith(ext):
+            cand = f"{stats_path[: -len(ext)]}_ffsremlvar{ext}"
+            return cand if Path(cand).exists() else None
     stem = replace_afni_extension(stats_path, "")
     for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
         cand = f"{stem}_ffsremlvar{ext}"
@@ -732,7 +737,7 @@ def _resolve_output_path(args: argparse.Namespace) -> Path:
         return Path(args.out)
     src = Path(args.stats)
     name = src.name
-    for suffix in (".nii.gz", ".nii.zst", ".nii"):
+    for suffix in (*_SURFACE_SUFFIXES, ".nii.gz", ".nii.zst", ".nii"):
         if name.endswith(suffix):
             return src.with_name(name[: -len(suffix)] + "_concalc" + suffix)
     return src.with_name(src.stem + "_concalc" + src.suffix)
@@ -747,6 +752,22 @@ def _save_bucket(
 ) -> None:
     """Write a 4D NIfTI with AFNI BRICK_LABS + BRICK_STATAUX + BRICK_STATSYM."""
     import nibabel as nib
+
+    if str(out_path).lower().endswith(".gii"):
+        # A surface bucket: labels and stat codes go into each array's metadata, and
+        # the file metadata -- mesh, geometry, the ClustSim tables -- comes from the
+        # input's (io/gifti.py).
+        from fastfuncstuff.io.afni import save_nifti
+
+        with spinner(f"Writing {out_path.name}"):
+            save_nifti(
+                data_4d,
+                out_path,
+                header=reference_img.header,
+                brick_labels=labels,
+                brick_stataux=stataux,
+            )
+        return
 
     affine = reference_img.affine
     header = reference_img.header.copy()
@@ -942,14 +963,10 @@ def main() -> int:
         # σ² from. Refined further below once we pick a reference stim.
         mask = np.ones(vol_shape, dtype=bool)
     else:
-        # REML: voxels with non-finite or trivially-zero (a, b) get skipped.
-        mask = (
-            np.isfinite(a_map)
-            & np.isfinite(b_map)
-            & np.isfinite(stdev_map)
-            & (stdev_map > 0)
-            & ((a_map != 0) | (b_map != 0))
-        )
+        # REML: voxels ffs_reml did not fit (StDev 0 or non-finite) get skipped.
+        # (a, b) = (0, 0) is not one of them: it is the white-noise grid point,
+        # and a fitted voxel lands there often.
+        mask = np.isfinite(a_map) & np.isfinite(b_map) & np.isfinite(stdev_map) & (stdev_map > 0)
 
     device = setup_device(args.device)
     if args.verb >= 1:

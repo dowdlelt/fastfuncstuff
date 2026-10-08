@@ -374,3 +374,67 @@ def test_dof_adjust_keeps_the_clustsim_tables(tmp_path):
 
     update_dof_in_file(str(path), resolve_dof_adjust_arg("5"), str(path), verbose=False)
     assert _clustsim_attr_names(path) == ["AFNI_CLUSTSIM_NN1_1sided"]
+
+
+def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
+    """A .func.gii bucket and its .func.gii Rvar: concalc adds the contrast ffs_reml
+    would have written, keeps the mesh, the stat codes and the ClustSim tables."""
+    import json
+    import sys
+
+    from fastfuncstuff.cli import reml, util_concalc
+    from fastfuncstuff.design.spec import ContrastSpec, build_stub_spec, write_spec
+    from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
+
+    v, t_n, tr = 400, 80, 2.0
+    rng = np.random.default_rng(3)
+    t = np.arange(t_n) * tr
+    with open(tmp_path / "ev.tsv", "w") as f:
+        f.write("onset\tduration\ttrial_type\n")
+        for i, o in enumerate(np.arange(0, t_n * tr - 20, 20)):
+            f.write(f"{o}\t10\t{'a' if i % 2 else 'b'}\n")
+    a_on = (((t // 20) % 2 == 1) & (t % 20 < 10)).astype(float)
+    sig = np.convolve(a_on, np.exp(-((np.arange(0, 20, tr) - 6) ** 2) / 8))[:t_n]
+    amp = np.linspace(0, 3, v)
+    data = 100 + amp[:, None] * sig[None] + rng.normal(0, 1, (v, t_n))
+    save_gifti_data(tmp_path / "s.func.gii", data.astype(np.float32),
+                    {"TR_seconds": "2", "mesh_fingerprint": "V_test"})  # fmt: skip
+    bold = tmp_path / "shape.nii"
+    nib.save(nib.Nifti1Image(np.zeros((1, 1, 1, t_n), np.float32), np.eye(4)), bold)
+    nib.load(bold).header.set_zooms((1, 1, 1, tr))
+    spec, _ = build_stub_spec([bold], [tmp_path / "ev.tsv"], tr=tr)
+    write_spec(spec, tmp_path / "plain.toml")
+    spec.contrasts = [ContrastSpec(label="a_vs_b", sym="SYM: +1*a -1*b")]
+    write_spec(spec, tmp_path / "con.toml")
+
+    def run(mod, prog, *argv):
+        monkeypatch.setattr(sys, "argv", [prog, *argv, "-device", "cpu", "-verb", "0"])
+        assert not mod.main()
+
+    src = tmp_path / "s.func.gii"
+    run(reml, "ffs_reml", "-input", str(src), "-spec", str(tmp_path / "plain.toml"),
+        "-tout", "-Rbuck", str(tmp_path / "plain.func.gii"))  # fmt: skip
+    run(reml, "ffs_reml", "-input", str(src), "-spec", str(tmp_path / "con.toml"),
+        "-tout", "-Rbuck", str(tmp_path / "ref.func.gii"))  # fmt: skip
+    plain = nib.load(str(tmp_path / "plain.func.gii"))
+    plain.meta["ClustSim_bi-sided"] = json.dumps({"pthr": [0.01]})
+    nib.save(plain, str(tmp_path / "plain.func.gii"))
+
+    run(util_concalc, "ffs_util_concalc", "-stats", str(tmp_path / "plain.func.gii"),
+        "-spec", str(tmp_path / "con.toml"))  # fmt: skip
+    out = tmp_path / "plain_concalc.func.gii"
+    got, meta = load_gifti_data(out)
+    ref, _ = load_gifti_data(tmp_path / "ref.func.gii")
+    names = [dict(a.meta)["Name"] for a in nib.load(str(out)).darrays]
+    ref_names = [dict(a.meta)["Name"] for a in nib.load(str(tmp_path / "ref.func.gii")).darrays]
+    # ffs_reml names a contrast a_vs_b#0_*, concalc a_vs_b_* (as it does for volumes).
+    for lab in ("Coef", "Tstat"):
+        np.testing.assert_allclose(
+            got[:, names.index(f"a_vs_b_{lab}")],
+            ref[:, ref_names.index(f"a_vs_b#0_{lab}")],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+    assert meta["mesh_fingerprint"] == "V_test" and "ClustSim_bi-sided" in meta
+    t_arr = nib.load(str(out)).darrays[names.index("a_vs_b_Tstat")]
+    assert t_arr.intent == 3 and dict(t_arr.meta)["StatCode"] == "3"

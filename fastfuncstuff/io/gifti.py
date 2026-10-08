@@ -187,6 +187,24 @@ def gifti_as_nifti(path: str | os.PathLike):
     if any(labels):
         meta["brick_labels"] = "\t".join(labels)
     set_surface_meta(out.header, meta)
+    # Labels and stat codes also go into a real AFNI extension, so a tool that reads
+    # buckets through the AFNI attributes (ffs_util_concalc) reads a surface bucket
+    # the same way.
+    stat = {}
+    for k, a in enumerate(img.darrays):
+        am = dict(a.meta)
+        if "StatCode" in am:
+            stat[k] = (
+                int(am["StatCode"]),
+                tuple(float(x) for x in am.get("StatParams", "").split()),
+            )
+    if any(labels) or stat:
+        from fastfuncstuff.io.afni import _set_afni_brick_labels, _set_afni_brick_stataux
+
+        if any(labels):
+            _set_afni_brick_labels(out.header, labels)
+        if stat:
+            _set_afni_brick_stataux(out.header, stat, len(cols))
     tr = meta.get("TR_seconds")
     if tr and data.ndim == 4:
         out.header.set_xyzt_units(xyz="mm", t="sec")
