@@ -46,6 +46,8 @@ AUTORANGE_PERCENTILES = (2.0, 98.0)
 #: view of anything -- and low enough that real structure is already on screen
 #: before anyone touches the slider.
 OVERLAY_START_PERCENTILE = 90.0
+#: Where a statistic's threshold starts, as a p (two-sided for t/z, upper tail for F).
+OVERLAY_START_P = 1e-3
 
 
 def derive_range(
@@ -533,10 +535,22 @@ class ViewerSession:
         if finite.size == 0:
             return
         threshold = float(np.percentile(np.abs(finite), OVERLAY_START_PERCENTILE))
+        # A statistic starts at p 0.001, the cut a stats map is usually read at,
+        # rather than at a percentile of its own values. A bucket remembers that
+        # p even when it opens on a coefficient, so its first t gets it.
+        from fastfuncstuff.viewer.vocab import _threshold_at_p
+
+        threshold_p = OVERLAY_START_P if layer.stataux else None
+        at_p = _threshold_at_p(layer, threshold_p)
+        if at_p is not None:
+            threshold = at_p
         # Alpha stays off: a hard threshold is what a stats map is read at, and
         # a fade makes "which voxels survive" something you have to squint at.
         self.state.layers.update(
-            key, threshold=threshold, **self.overlay_look(key, 0, colormap="hot")
+            key,
+            threshold=threshold,
+            threshold_p=threshold_p,
+            **self.overlay_look(key, 0, colormap="hot"),
         )
 
     def _look_values(self, key: str, index: int) -> np.ndarray:

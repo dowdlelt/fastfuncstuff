@@ -251,3 +251,43 @@ def test_an_f_threshold_is_not_halved(session):
         assert seen[-1] == pytest.approx(scipy_f.isf(0.01, dfn=3.0, dfd=120.0), rel=1e-5)
     finally:
         bar.deleteLater()
+
+
+def test_a_bucket_starts_at_p_001_and_the_p_holds_across_statistics(session):
+    """Loaded on its coefficient, the bucket remembers p 0.001; the first statistic
+    the threshold lands on gets that p, and moving from an F to a t keeps the p
+    the user set, not the F value -- an F of 10 and a t of 10 are different cuts."""
+    from scipy import stats
+
+    from fastfuncstuff.viewer.vocab import SetThresholdFollow
+
+    key = _overlay(session).key
+    layer = session.state.layers.get(key)
+    assert layer.threshold_p == pytest.approx(1e-3)
+    session.do(SetThresholdIndex(key, 2))  # Full_Fstat
+    f_thr = session.state.layers.get(key).threshold
+    assert f_thr == pytest.approx(stats.f.isf(1e-3, 3, 120), rel=1e-6)
+    session.do(SetThreshold(key, float(stats.f.isf(0.01, 3, 120))))  # the user loosens it
+    session.do(SetThresholdIndex(key, 1))  # Faces#0_Tstat
+    layer = session.state.layers.get(key)
+    assert layer.threshold == pytest.approx(stats.t.isf(0.005, 120), rel=1e-6)
+    assert layer.threshold_p == pytest.approx(0.01)
+    # onto the coefficient (no p) and back: the value stays put, then the p returns
+    session.do(SetThresholdFollow(key, "same"))
+    assert session.state.layers.get(key).threshold == pytest.approx(layer.threshold)
+    session.do(SetVolume(key, 2))
+    assert session.state.layers.get(key).threshold == pytest.approx(
+        stats.f.isf(0.01, 3, 120), rel=1e-6
+    )
+
+
+def test_an_overlay_shown_on_a_statistic_starts_at_p_001(anat, bucket):
+    from scipy import stats
+
+    s = ViewerSession(device=CPU)
+    s.do(SetUnderlay(str(anat)))
+    s.do(SetOverlay(str(bucket)))
+    key = s.state.layers.overlay.key
+    s.do(SetVolume(key, 2))  # a fresh load opening on the F behaves the same
+    assert s.state.layers.get(key).threshold == pytest.approx(stats.f.isf(1e-3, 3, 120), rel=1e-6)
+    s.close()

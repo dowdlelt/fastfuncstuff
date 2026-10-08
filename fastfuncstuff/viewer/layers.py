@@ -123,6 +123,10 @@ class Layer:
     #: reads the sub-brick after it, which is a bucket's ``_Coef`` / ``_Tstat``
     #: pairing; ``fixed`` stays on the chosen one while the overlay changes.
     threshold_follow: str = "same"
+    #: The p the threshold stands for, kept whenever it is on a statistic. Moving
+    #: the threshold to another statistic (an F to a t, one dof to another)
+    #: re-derives the value from it, so the cut means the same thing on both.
+    threshold_p: float | None = None
     alpha_mode: AlphaMode = AlphaMode.OFF
     boxed: bool = False
     #: Draw the layer as its thin edges instead of its intensities -- AFNI's

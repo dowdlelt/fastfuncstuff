@@ -1543,6 +1543,50 @@ def _next_brick(layer: Layer, index: int) -> int:
     return min(index + 1, layer.n_volumes - 1)
 
 
+def _p_of_threshold(layer: Layer, value: float) -> float | None:
+    """The p ``value`` stands for on the layer's threshold sub-brick, or None."""
+    from fastfuncstuff.stats.fdr import stat_value_to_pvalue
+
+    spec = layer.stat_spec()
+    if spec is None or value <= 0:
+        return None
+    try:
+        return stat_value_to_pvalue(value, spec[0], spec[1])
+    except ValueError:
+        return None
+
+
+def _threshold_at_p(layer: Layer, p: float | None) -> float | None:
+    """The threshold giving ``p`` on the layer's threshold sub-brick, or None."""
+    from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+    spec = layer.stat_spec()
+    if spec is None or p is None:
+        return None
+    try:
+        value = pvalue_to_stat(p, spec[0], spec[1])
+    except ValueError:
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _hold_p(layer: Layer, changes: dict[str, object]) -> None:
+    """When ``changes`` move the threshold to another sub-brick, keep its p.
+
+    An F of 10 and a t of 10 are different cuts; p 0.001 on both is the same
+    one. A move onto a sub-brick that is not a statistic keeps the value as it
+    is, and the p waits for the next statistic.
+    """
+    import dataclasses
+
+    after = dataclasses.replace(layer, **changes)  # type: ignore[arg-type]
+    if after.threshold_brick == layer.threshold_brick:
+        return
+    value = _threshold_at_p(after, layer.threshold_p)
+    if value is not None:
+        changes["threshold"] = value
+
+
 def install(
     bus: CommandBus,
     *,
@@ -2455,9 +2499,13 @@ def install(
     def _set_threshold(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetThreshold)
         value = float(cmd.value)
-        if st.layers.get(cmd.key).threshold == value:
+        layer = st.layers.get(cmd.key)
+        if layer.threshold == value:
             return Aspect.NOTHING
-        st.layers.update(cmd.key, threshold=value)
+        p = _p_of_threshold(layer, value)
+        st.layers.update(
+            cmd.key, threshold=value, threshold_p=layer.threshold_p if p is None else p
+        )
         return SetThreshold.aspects
 
     @bus.handle(SetLayerVisible.name)
@@ -2487,6 +2535,7 @@ def install(
         changes: dict[str, object] = {"volume_index": value}
         if layer.threshold_follow == "next":
             changes["threshold_index"] = _next_brick(layer, value)
+        _hold_p(layer, changes)
         if (
             session is not None
             and not layer.time_linked
@@ -2512,7 +2561,9 @@ def install(
         follow = "same" if value is None else "fixed"
         if (layer.threshold_index, layer.threshold_follow) == (value, follow):
             return Aspect.NOTHING
-        st.layers.update(cmd.key, threshold_index=value, threshold_follow=follow)
+        changes: dict[str, object] = {"threshold_index": value, "threshold_follow": follow}
+        _hold_p(layer, changes)
+        st.layers.update(cmd.key, **changes)
         return SetThresholdIndex.aspects
 
     @bus.handle(SetRangeMirror.name)
@@ -2552,7 +2603,9 @@ def install(
         }[cmd.mode]
         if (layer.threshold_index, layer.threshold_follow) == (index, cmd.mode):
             return Aspect.NOTHING
-        st.layers.update(cmd.key, threshold_index=index, threshold_follow=cmd.mode)
+        changes: dict[str, object] = {"threshold_index": index, "threshold_follow": cmd.mode}
+        _hold_p(layer, changes)
+        st.layers.update(cmd.key, **changes)
         return SetThresholdFollow.aspects
 
     @bus.handle(SetPanes.name)
