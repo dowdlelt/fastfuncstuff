@@ -236,6 +236,15 @@ class Options:
     fs_subject: str | None = None
     # -surface_qc: ffs_nwarp -surf_qc on every run (samples, voxel volume, blur map).
     surface_qc: bool = False
+    # -surface_glm: stage12s, every task's model fit on every surface target and
+    # hemisphere (same spec, censoring, TR, drop and -glm_opts as stage12; its own
+    # smoothing, cluster tables and mask -- the cross-run stage10s mask).
+    surface_glm: bool = False
+    surface_glm_blur: float | None = None  # heat smoothing BY this FWHM (-do_blur)
+    surface_glm_blur_to: float | None = None  # ... or TO it (-blur_to_fwhm)
+    surface_clustsim: bool = False  # SurfClustSim area tables (-clustsim on vertices)
+    surface_clustsim_niter: int | None = None
+    surface_glm_opts: str = ""  # extra ffs_reml flags for the surface fits only
     events: list[str] | None = None  # events TSV(s) passed directly (bids format)
     # Explicit reference override (alternative to -grand_reference DIR): an EPI
     # contrast image to align to, the nwarp-order matrices mapping it to anat, and

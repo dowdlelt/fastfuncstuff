@@ -3636,34 +3636,13 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         common = [
             f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
             f'-Rbuck "{rbuck}"',
-            "-tout",
-            "-fout",
             *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
-            "-do_scale",
             *([f"-do_blur {blur:g}"] if blur else []),
             # The ACF comes from the residuals this fit already has in memory,
             # so this needs no -Rerrts and no second pass over the data.
             *(["-clustsim"] if opt.clustsim else []),
-            # -TR only when the user gave one: a 3D acquisition's header TR is the
-            # per-partition time, not the volume TR the design is sampled at.
-            *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
-            # The slice timing above aligned every slice to tzero; sample the
-            # model there too (explicit: the final resample's header may not
-            # carry the time origin through).
-            *(
-                [f"-microtime_offset {opt.tzero:g}"]
-                if opt.slicetiming_method != "none" and opt.tzero
-                else []
-            ),
-            *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
-            *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
-            # Events past a deliberate -cut_task_vols end are expected, not the
-            # mispaired-timing-file symptom ffs_reml otherwise stops for.
-            *(["-allow_late_events"] if task in opt.cut_task_vols else []),
             *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
-            *([f'-censor "{_task_censor_path(task)}"'] if _censoring_on(opt) else []),
-            *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
-            '-device "$DEVICE"',
+            *_reml_shared(opt, task),
         ]
         if _censoring_on(opt):
             out.append(_concat_censor(task, prs))
@@ -3716,6 +3695,128 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             )
         )
         out.append(_stats_guard_close(task))
+    out.append("fi")
+    return "\n".join(out) + "\n"
+
+
+def _reml_shared(opt, task: str) -> list[str]:
+    """ffs_reml flags the voxel (stage12) and surface (stage12s) fits share: the
+    statistics, scaling, timing, trims, censoring and -glm_opts. Space-specific
+    choices -- mask, smoothing, cluster tables, the NORDIC dof map -- stay with
+    each stage."""
+    return [
+        "-tout",
+        "-fout",
+        "-do_scale",
+        # -TR only when the user gave one: a 3D acquisition's header TR is the
+        # per-partition time, not the volume TR the design is sampled at.
+        *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
+        # The slice timing above aligned every slice to tzero; sample the
+        # model there too (explicit: the final resample's header may not
+        # carry the time origin through).
+        *(
+            [f"-microtime_offset {opt.tzero:g}"]
+            if opt.slicetiming_method != "none" and opt.tzero
+            else []
+        ),
+        *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
+        *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
+        # Events past a deliberate -cut_task_vols end are expected, not the
+        # mispaired-timing-file symptom ffs_reml otherwise stops for.
+        *(["-allow_late_events"] if task in opt.cut_task_vols else []),
+        *([f'-censor "{_task_censor_path(task)}"'] if _censoring_on(opt) else []),
+        *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
+        '-device "$DEVICE"',
+    ]
+
+
+def _surface_glm_tag(opt) -> str:
+    """``blur4`` / ``blurto6`` (and the -glm_label), or ``""``: the surface buckets'
+    variant token, so fits at different smoothings coexist."""
+    from fastfuncstuff.autoproc.naming import blur_tag
+
+    if opt.surface_glm_blur_to:
+        smooth = blur_tag(opt.surface_glm_blur_to).replace("blur", "blurto", 1)
+    else:
+        smooth = blur_tag(opt.surface_glm_blur)
+    return ".".join(t for t in (smooth, (opt.glm_label or "").strip()) if t)
+
+
+def _stage_surface_stats(plan: Plan, bids_root: str | None) -> str:
+    """stage12s: each task's model on each surface target and hemisphere.
+
+    The same design spec as stage12 (the model does not care where the data
+    live), fit on the stage10s series inside the cross-run surface mask. Tasks
+    with no spec (unresolved events) are skipped: stage12's placeholder command is
+    for a human to fix, not to copy four more times.
+    """
+    from fastfuncstuff.autoproc.glm import runs_by_task, spec_path
+    from fastfuncstuff.processing.surface_projection import space_name
+
+    opt = plan.options
+    if not opt.surface_glm:
+        return ""
+    gate = "1" if opt.run_glm else "0"
+    tag = _surface_glm_tag(opt)
+    stem = f"stage12s.{tag}." if tag else "stage12s."
+    spaces = list(dict.fromkeys(space_name(m) for m in opt.surface_target or []))
+    out = [
+        "",
+        "# ============================ stage12s: surface GLM (ffs_reml) =============",
+        "# stage12's model per task, fit on every surface target and hemisphere: the",
+        "# stage10s series inside stage10s's cross-run mask. Smoothing is along the",
+        "# cortex (heat diffusion on the data's own midthickness, mask edge a wall);",
+        "# cluster tables are SurfClustSim areas in mm^2. Gated with stage12 (FFS_RUN_GLM).",
+    ]
+    if _dof_adjust_on(opt):
+        out.append("# NOTE: the NORDIC dof correction is a voxel map and is not applied here.")
+    out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
+    for task, prs in runs_by_task(plan).items():
+        if not events_for_task(task, prs, bids_root, opt):
+            out.append(
+                f"# task-{task}: no design spec (no events found) -- not fit on the surface."
+            )
+            continue
+        if _censoring_on(opt):
+            out.append(_concat_censor(task, prs))
+        for space in spaces:
+            for hemi in ("lh", "rh"):
+                ins = " ".join(f'"stage10s.surf.{_frag(pr)}.{space}.{hemi}.func.gii"' for pr in prs)
+                where = f"task-{task}.{space}.{hemi}"
+                rbuck = f"{stem}stats-reml.{where}.func.gii"
+                flags = [
+                    f"-input {ins}",
+                    f"-spec {spec_path(task, opt)}",
+                    f'-Obuck "{stem}stats-ols.{where}.func.gii"',
+                    f'-Rbuck "{rbuck}"',
+                    f'-mask "{_surface_mask(space, hemi)}"',
+                    *([f"-do_blur {opt.surface_glm_blur:g}"] if opt.surface_glm_blur else []),
+                    *(
+                        [f"-blur_to_fwhm {opt.surface_glm_blur_to:g}"]
+                        if opt.surface_glm_blur_to
+                        else []
+                    ),
+                    *(
+                        ["-clustsim", f'-save_acf "{stem}resid.{where}"']
+                        if opt.surface_clustsim
+                        else []
+                    ),
+                    *(
+                        [f"-clustsim_niter {opt.surface_clustsim_niter}"]
+                        if opt.surface_clustsim and opt.surface_clustsim_niter
+                        else []
+                    ),
+                    *(_split_flags(opt.surface_glm_opts) if opt.surface_glm_opts else []),
+                    *_reml_shared(opt, task),
+                ]
+                out.append(f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then')
+                out.append(_ffs("ffs_reml", flags, indent=""))
+                out.append(
+                    "else\n"
+                    f'  echo "stage12s {where}: bucket exists -- skipping. '
+                    'Set skip_stats=0 above (or delete it) to refit."\n'
+                    "fi"
+                )
     out.append("fi")
     return "\n".join(out) + "\n"
 
@@ -3867,5 +3968,6 @@ def write_script(
         _stage_surface(plan, script_stem),
         _stage_masks(plan),
         _stage_stats(plan, bids_root),
+        _stage_surface_stats(plan, bids_root),
     ]
     return "\n".join(p for p in parts if p).rstrip() + "\n"

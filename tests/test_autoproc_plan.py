@@ -2777,3 +2777,41 @@ def test_censoring_is_off_by_default_and_wired_through_moco_and_reml_when_on(tmp
     script = tmp_path / "proc.sh"
     script.write_text(s)
     assert subprocess.run(["bash", "-n", str(script)], capture_output=True).returncode == 0
+
+
+def _reml_calls(s: str, marker: str) -> list[list[str]]:
+    """Every ffs_reml call after ``marker``, as argv (continuations joined)."""
+    import shlex
+
+    body = s[s.index(marker) :].replace("\\\n", " ")
+    return [
+        shlex.split(x.strip())[1:] for x in body.splitlines() if x.strip().startswith("ffs_reml")
+    ]
+
+
+def test_surface_glm_fits_each_target_and_hemisphere_with_its_own_options():
+    from fastfuncstuff.cli.reml import create_parser
+
+    s = _skull_script(
+        surface_target=["native", "onavg-ico64"], fs_subject="/fs/sub-X", events=["/e/ev.tsv"],
+        surface_glm=True, surface_glm_blur_to=6.0, surface_clustsim=True,
+        surface_clustsim_niter=3000, glm_blur=4.0, clustsim=True, glm_opts="-polort 2",
+        surface_glm_opts="-save_tsnr surf_tsnr",
+    )  # fmt: skip
+    calls = _reml_calls(s, "stage12s: surface GLM")
+    assert len(calls) == 4  # one task x 2 targets x 2 hemispheres
+    parser = create_parser()
+    for argv in calls:
+        a = parser.parse_args(argv)  # every flag stage12s writes is one ffs_reml has
+        assert all(f.endswith(".func.gii") and "stage10s.surf." in f for f in a.input)
+        assert a.mask.startswith("stage10s.surf.allruns.") and a.mask.endswith(".mask.shape.gii")
+        assert a.blur_to_fwhm == 6.0 and a.do_blur is None  # not the voxel -glm_blur 4
+        assert a.clustsim and a.clustsim_niter == 3000 and a.save_acf
+        assert a.Rbuck.startswith("stage12s.blurto6.stats-reml.task-foo.")
+        assert a.polort == 2 and a.save_tsnr == "surf_tsnr"  # shared + surface-only opts
+    hemis = {c[c.index("-Rbuck") + 1].split(".")[-3] for c in calls}
+    spaces = {c[c.index("-Rbuck") + 1].split(".")[-4] for c in calls}
+    assert hemis == {"lh", "rh"} and spaces == {"native", "onavg-ico64"}
+    # the voxel fit keeps its own smoothing
+    vol = _reml_calls(s.split("stage12s: surface GLM")[0], "stage12: GLM")
+    assert vol and all("-do_blur" in c and "-blur_to_fwhm" not in c for c in vol)

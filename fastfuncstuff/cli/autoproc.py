@@ -178,6 +178,56 @@ def build_parser() -> argparse.ArgumentParser:
         "frames per run.",
     )
     g.add_argument(
+        "-surface_glm",
+        "-surface-glm",
+        action="store_true",
+        help="with -surface_target: stage12s fits every task's model on every surface "
+        "target and hemisphere (ffs_reml on the .func.gii series). Shares stage12's "
+        "design spec, censoring, TR, -glm_drop_* and -glm_opts; inside the cross-run "
+        "surface mask. Buckets: stage12s[.TAG].stats-reml.task-T.<SPACE>.?h.func.gii.",
+    )
+    g.add_argument(
+        "-surface_glm_blur",
+        "-surface-glm-blur",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help="surface GLM smoothing BY this FWHM (mm): heat diffusion along the cortex, "
+        "the mask edge a wall (ffs_reml -do_blur on vertices). Independent of -glm_blur.",
+    )
+    g.add_argument(
+        "-surface_glm_blur_to",
+        "-surface-glm-blur-to",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help="surface GLM smoothing TO this FWHM (ffs_reml -blur_to_fwhm, SurfSmooth "
+        "-target_fwhm). Exclusive with -surface_glm_blur.",
+    )
+    g.add_argument(
+        "-surface_clustsim",
+        "-surface-clustsim",
+        action="store_true",
+        help="SurfClustSim cluster-AREA tables (mm^2) for each surface bucket, from that "
+        "fit's residual ACF on its own mesh and mask (ffs_reml -clustsim on vertices); "
+        "the residual ACF is saved beside it (-save_acf). The viewer reads the tables.",
+    )
+    g.add_argument(
+        "-surface_clustsim_niter",
+        "-surface-clustsim-niter",
+        type=int,
+        default=None,
+        metavar="N",
+        help="SurfClustSim iterations (default ffs_reml's).",
+    )
+    g.add_argument(
+        "-surface_glm_opts",
+        "-surface-glm-opts",
+        default="",
+        metavar="OPTS",
+        help="extra ffs_reml flags for the surface fits only (-glm_opts applies to both).",
+    )
+    g.add_argument(
         "-fs_subject",
         "-fs-subject",
         default=None,
@@ -1065,6 +1115,23 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 )
     if opt.surface_qc and not opt.surface_target:
         errors.append("-surface_qc maps the surface projection: it needs -surface_target.")
+    surf_glm_flags = [
+        f
+        for f, on in (
+            ("-surface_glm_blur", opt.surface_glm_blur is not None),
+            ("-surface_glm_blur_to", opt.surface_glm_blur_to is not None),
+            ("-surface_clustsim", opt.surface_clustsim),
+            ("-surface_clustsim_niter", opt.surface_clustsim_niter is not None),
+            ("-surface_glm_opts", bool(opt.surface_glm_opts)),
+        )
+        if on
+    ]
+    if opt.surface_glm and not opt.surface_target:
+        errors.append("-surface_glm fits the surface projection: it needs -surface_target.")
+    elif surf_glm_flags and not opt.surface_glm:
+        errors.append(f"{', '.join(surf_glm_flags)} configure the surface GLM: add -surface_glm.")
+    if opt.surface_glm_blur is not None and opt.surface_glm_blur_to is not None:
+        errors.append("-surface_glm_blur smooths BY, -surface_glm_blur_to smooths TO: pick one.")
     if opt.surface_target:
         if not opt.go_to_anat or opt.grand_reference or opt.ref_file:
             errors.append(
@@ -1908,6 +1975,12 @@ def main(argv: list[str] | None = None) -> int:
         surface_target=_baked_meshes(args.surface_target, fs_subject),
         fs_subject=fs_subject,
         surface_qc=args.surface_qc,
+        surface_glm=args.surface_glm,
+        surface_glm_blur=args.surface_glm_blur,
+        surface_glm_blur_to=args.surface_glm_blur_to,
+        surface_clustsim=args.surface_clustsim,
+        surface_clustsim_niter=args.surface_clustsim_niter,
+        surface_glm_opts=args.surface_glm_opts,
         ref_file=args.ref_file,
         ref_transforms=args.ref_transforms,
         ref_anat=args.ref_anat,
