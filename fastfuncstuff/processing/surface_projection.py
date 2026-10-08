@@ -190,9 +190,11 @@ def depth_weights(fractions, weights=None) -> np.ndarray:
     return w / w.sum()
 
 
-def output_paths(prefix: str, meshes, hemis, fractions, depth_combine: str = "mean") -> list[str]:
+def output_paths(
+    prefix: str, meshes, hemis, fractions, depth_combine: str = "mean", qc: bool = False
+) -> list[str]:
     """Every file :func:`project_to_surface` writes, in order (for -batch_skip)."""
-    out = []
+    out = [f"{prefix}.{space_name(m)}.samples.nii.gz" for m in meshes] if qc else []
     for mesh in meshes:
         for hemi in hemis:
             stem = f"{prefix}.{space_name(mesh)}.{hemi}"
@@ -202,6 +204,10 @@ def output_paths(prefix: str, meshes, hemis, fractions, depth_combine: str = "me
                 out += [f"{stem}.depth-{float(f):.2f}.func.gii" for f in fractions]
             out += [f"{stem}.{n}.shape.gii" for n in ("coverage", "mask", "mean")]
             out += [f"{stem}.{s}.surf.gii" for s in ("white", "pial", "midthickness")]
+            if qc:
+                out += [
+                    f"{stem}.{n}.shape.gii" for n in ("voxel_volume", "blur_fwhm", "noise_ratio")
+                ]
     return out
 
 
@@ -270,6 +276,8 @@ def project_to_surface(
     depth_weights_: list[float] | None = None,
     sample: str = "footprint",
     verb: int = 1,
+    qc: bool = False,
+    qc_frames: int = 64,
     **nwarp_kwargs,
 ) -> list[Path]:
     """Sample ``source`` onto every target mesh through the chain and write GIfTI.
@@ -288,6 +296,9 @@ def project_to_surface(
       mask clips on);
     * ``.white/.pial/.midthickness.surf.gii`` -- the target's vertices placed in THIS
       subject (scanner mm): the geometry smoothing, cluster areas and display need.
+
+    ``qc`` adds :func:`surface_qc.surface_qc`'s maps (samples per native voxel,
+    effective voxel volume, blur FWHM) from ``qc_frames`` noise volumes.
     """
     from fastfuncstuff.io.afni import get_tr_from_file
     from fastfuncstuff.io.gifti import save_gifti_surface
@@ -314,6 +325,10 @@ def project_to_surface(
                 f"  {t.mesh} {t.hemi}: {t.sampling.n_vertices} vertices x "
                 f"{t.sampling.n_depths} depth(s) -> {t.sampling.points.shape[0]} reads ({sample})"
             )
+    if qc and nwarp_kwargs.get("source_image") is None:
+        from .io import load_image
+
+        nwarp_kwargs["source_image"] = load_image(source_path, device=None)  # read once
     fold = SurfaceFold(targets)
     out = nwarpforge(
         source_path=source_path,
@@ -377,4 +392,14 @@ def project_to_surface(
             save_gifti_data(path, vals.astype(np.float32), meta, time_series=False)
             written.append(path)
         written += [Path(f"{stem}.{name}.surf.gii") for name in geom]
+    if qc:
+        from .surface_qc import surface_qc
+
+        written += surface_qc(
+            source_path, nwarp_specs, master_path, targets, prefix, weights,
+            source_image=nwarp_kwargs["source_image"], n_frames=qc_frames,
+            interp=nwarp_kwargs.get("interp", "wsinc5"),
+            ainterp=nwarp_kwargs.get("ainterp", "cubic"),
+            device=nwarp_kwargs.get("device"), verb=verb,
+        )  # fmt: skip
     return written

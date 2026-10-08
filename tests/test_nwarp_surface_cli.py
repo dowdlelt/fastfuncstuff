@@ -298,3 +298,57 @@ def test_surf_jac_auto_form_is_refused_before_anything_is_written(world, tmp_pat
     with pytest.raises(SystemExit, match="AXIS:FIELDMAP"):
         _run(world, tmp_path, "-jac", "y", "-surf_prefix", str(tmp_path / "s"))
     assert not list((tmp_path / "out").glob("*"))
+
+
+def test_noise_ratio_lookup_inverts_and_plateaus():
+    from fastfuncstuff.processing.surface_qc import gaussian_noise_ratio, noise_ratio_to_fwhm
+
+    z = (0.8, 0.8, 1.2)
+    f = np.array([1.5, 2.0, 4.0, 8.0])
+    np.testing.assert_allclose(noise_ratio_to_fwhm(gaussian_noise_ratio(f, z), z), f, rtol=0.01)
+    assert noise_ratio_to_fwhm(np.array([1.0, 1.2]), z).tolist() == [0.0, 0.0]
+
+
+def test_surf_qc_maps_through_the_chain(world, tmp_path):
+    """Identity chain on a 1 mm grid: every EPI voxel is 1 mm^3 in the anatomy; the
+    sample map counts every footprint read once, all of them in the ribbon; nearest
+    point reads leave white noise untouched, footprints average it down."""
+    prefix = _run(world, tmp_path, "-surf_qc", "-surf_qc_frames", "40")
+    stem = f"{prefix}.native.lh"
+    vox, meta = load_gifti_data(f"{stem}.voxel_volume.shape.gii")
+    assert meta["nominal_voxel_mm3"] == "1"
+    np.testing.assert_allclose(vox, 1.0, rtol=1e-3)
+    count = nib.load(f"{prefix}.native.samples.nii.gz").get_fdata()
+    assert count.shape == (60, 60, 60) and count.sum() > 0
+    aff = nib.load(str(world["src"])).affine
+    ijk = np.argwhere(count > 0)
+    r = np.linalg.norm(ijk @ aff[:3, :3].T + aff[:3, 3] - CENTRE, axis=1)
+    assert r.min() > 19.0 and r.max() < 24.0  # only ribbon voxels, white 20 .. pial 23
+    ratio, _ = load_gifti_data(f"{stem}.noise_ratio.shape.gii")
+    fwhm, _ = load_gifti_data(f"{stem}.blur_fwhm.shape.gii")
+    assert np.median(ratio) < 0.5 and np.median(fwhm) > 1.0  # 5 depths x footprints
+
+    pt = tmp_path / "pt"
+    pt.mkdir()
+    prefix = _run(world, pt, "-surf_qc", "-surf_qc_frames", "60", "-surf_sample", "point",
+                  "-surf_depths", "0.5", "-interp", "NN")  # fmt: skip
+    ratio, _ = load_gifti_data(f"{prefix}.native.lh.noise_ratio.shape.gii")
+    fwhm, _ = load_gifti_data(f"{prefix}.native.lh.blur_fwhm.shape.gii")
+    # Below about a voxel the meter plateaus: noise at 0.99 already reads ~0.7 mm.
+    assert abs(np.median(ratio) - 1.0) < 0.06 and np.median(fwhm) < 1.0
+
+
+def test_batch_skip_lists_exactly_what_a_combined_qc_run_writes(world, tmp_path):
+    from fastfuncstuff.cli.nwarp import _expected_outputs, parse_args
+
+    out = tmp_path / "o"
+    out.mkdir()
+    argv = ["-source", str(world["src"]), "-nwarp", str(world["chain"]), "-master",
+            str(world["src"]), "-prefix", str(out / "vol.nii.gz"), "-save_mean",
+            "-surf", str(world["subj"]), "-surf_prefix", str(out / "proj"), "-surf_hemi", "lh",
+            "-surf_qc", "-surf_qc_frames", "4", "-interp", "linear", "-device", "cpu",
+            "-verb", "0"]  # fmt: skip
+    main(argv)
+    expected = {Path(p).resolve() for p in _expected_outputs(parse_args(argv))}
+    written = {p.resolve() for p in out.iterdir()}
+    assert expected == written

@@ -269,6 +269,24 @@ Examples:
         "no second resample. Several targets share one pass over the data.",
     )
     surf_group.add_argument(
+        "-surf_qc",
+        action="store_true",
+        help="Also write what the projection read and how much it blurred, through this "
+        "run's chain: PREFIX.SPACE.samples.nii.gz (footprint reads per NATIVE EPI voxel: "
+        "0 inside the ribbon = a voxel the mesh missed), and per hemisphere "
+        "?h.voxel_volume (the EPI voxel's size in the anatomy, mm^3: distortion), "
+        "?h.blur_fwhm (equivalent Gaussian FWHM of the whole projection, from white "
+        "noise through the same chain, kernel, footprints and depth weights) and "
+        "?h.noise_ratio. Costs about one pass over -surf_qc_frames frames.",
+    )
+    surf_group.add_argument(
+        "-surf_qc_frames",
+        type=int,
+        default=64,
+        metavar="N",
+        help="Noise volumes for the -surf_qc blur map (precision ~1/sqrt(2N)).",
+    )
+    surf_group.add_argument(
         "-surf_prefix",
         default=None,
         metavar="PREFIX",
@@ -483,7 +501,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
 
 
 def _surface_outputs(args: argparse.Namespace) -> list[str]:
-    """The GIfTI files a -surf run writes."""
+    """The files a -surf run writes (GIfTI, and the -surf_qc sample map)."""
     from fastfuncstuff.processing.surface_projection import output_paths
 
     return output_paths(
@@ -492,6 +510,7 @@ def _surface_outputs(args: argparse.Namespace) -> list[str]:
         args.surf_hemi,
         _surf_depths(args),
         args.surf_depth_combine,
+        qc=args.surf_qc,
     )
 
 
@@ -752,6 +771,8 @@ def _dispatch_surface(
         depth_weights_=args.surf_depth_weights,
         sample=args.surf_sample,
         verb=args.verb,
+        qc=args.surf_qc,
+        qc_frames=args.surf_qc_frames,
         interp=args.interp,
         device=device,
         time_range=time_range,
