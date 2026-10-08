@@ -46,6 +46,11 @@ PLACE_STEPS = 6
 #: then draw once, instead of once per wheel notch. A move after a pause (a
 #: click) still draws them at once.
 SETTLE_MS = 150
+#: A move that is not (yet) part of a scroll -- a click, or a scroll's first
+#: notch -- still holds them this long: the slices paint first, and a second
+#: notch inside it makes this a scroll instead of a 250 ms CHEDI stall at its
+#: start. Short enough that a click's windows still feel immediate.
+CLICK_MS = 40
 #: The aspects of a move and nothing else -- what a scroll or a click dispatches.
 NAVIGATION = Aspect.CROSSHAIR | Aspect.GRAPH
 
@@ -262,7 +267,7 @@ class WindowManager(QtCore.QObject):
                     self._timed(win, win.follow if moving else win.redraw)
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
-                    self._heavy(win, dirty, scrolling)
+                    self._heavy(win, dirty, moving, scrolling)
             elif isinstance(win, ChediWindow):
                 # The crosshair (to follow), an edit or a USE (SLICES), what
                 # it samples (LAYERS, TIME, COLORMAP: the range), and its own
@@ -275,17 +280,17 @@ class WindowManager(QtCore.QObject):
                     | Aspect.COLORMAP
                     | Aspect.VIEWPORTS
                 ):
-                    self._heavy(win, dirty, scrolling)
+                    self._heavy(win, dirty, moving, scrolling)
             elif isinstance(win, DepthWindow):
                 # The clicked spot (CROSSHAIR), the volume shown (TIME), what
                 # is loaded (LAYERS) and an edit moving white/pial (SLICES).
                 if dirty & (Aspect.CROSSHAIR | Aspect.TIME | Aspect.LAYERS | Aspect.SLICES):
-                    self._heavy(win, dirty, scrolling)
+                    self._heavy(win, dirty, moving, scrolling)
             elif isinstance(win, ProfileWindow):
                 # The crosshair (to follow), an edit (SLICES: re-sample what
                 # moved), and the anatomy it reads (LAYERS, TIME).
                 if dirty & (Aspect.CROSSHAIR | Aspect.SLICES | Aspect.LAYERS | Aspect.TIME):
-                    self._heavy(win, dirty, scrolling)
+                    self._heavy(win, dirty, moving, scrolling)
             elif graphs:
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
@@ -296,11 +301,12 @@ class WindowManager(QtCore.QObject):
             # before it every one of them read as a click and drew again.
             self._last_move = time.monotonic()
 
-    def _heavy(self, win, dirty: Aspect, scrolling: bool) -> None:
-        """Refresh a 3-D / CHEDI / depth / profile window now, or hold it mid-scroll."""
-        if scrolling:
+    def _heavy(self, win, dirty: Aspect, moving: bool, scrolling: bool) -> None:
+        """Refresh a 3-D / CHEDI / depth / profile window now, or hold it after a move."""
+        if moving:
             self._held[win.vid] = self._held.get(win.vid, Aspect.NOTHING) | dirty
-            self._settle.start()  # restarts: draws SETTLE_MS after the last move
+            # Restarts: draws SETTLE_MS after the last move of a scroll.
+            self._settle.start(SETTLE_MS if scrolling else CLICK_MS)
             return
         dirty = dirty | self._held.pop(win.vid, Aspect.NOTHING)
         self._timed(win, lambda: win.refresh(dirty))

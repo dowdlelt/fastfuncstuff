@@ -2745,11 +2745,13 @@ def test_w_alone_closes_nothing(win, qapp):
 
 
 def test_a_scroll_draws_the_heavy_windows_once_when_it_stops(win, qapp):
-    """A click draws the 3-D / CHEDI / depth / profile windows at once; the moves of
-    a scroll that follow it are held and drawn once, together, when it settles. Any
-    other change draws at once and takes the held moves with it."""
+    """A click draws the 3-D / CHEDI / depth / profile windows after CLICK_MS (the
+    slices paint first); the moves of a scroll that follow it are held and drawn
+    once, together, when it settles. Any other change draws at once and takes the
+    held moves with it."""
     from fastfuncstuff.viewer.commands import Aspect
     from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+    from fastfuncstuff.viewer.ui.manager import CLICK_MS, SETTLE_MS
 
     class Stub(DepthWindow):
         def __init__(self):
@@ -2765,11 +2767,14 @@ def test_a_scroll_draws_the_heavy_windows_once_when_it_stops(win, qapp):
     manager.windows["D9"] = stub
     try:
         manager._last_move = float("-inf")
-        manager.redraw(Aspect.CROSSHAIR)  # a click: drawn now
+        manager.redraw(Aspect.CROSSHAIR)  # a click: held only briefly
+        assert stub.calls == [] and manager._settle.interval() == CLICK_MS
+        manager.flush_held()
         assert stub.calls == [Aspect.CROSSHAIR]
-        for _ in range(5):  # the scroll after it: held
+        for _ in range(5):  # the scroll after it: held until it settles
             manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
         assert len(stub.calls) == 1 and manager._settle.isActive()
+        assert manager._settle.interval() == SETTLE_MS
         manager.flush_held()  # what the settle timer does
         assert len(stub.calls) == 2 and stub.calls[1] & Aspect.CROSSHAIR
         manager.redraw(Aspect.CROSSHAIR)  # a held move ...
@@ -2812,7 +2817,8 @@ def test_a_slow_heavy_draw_does_not_read_as_a_pause(win, qapp, monkeypatch):
     manager.windows["D9"] = stub
     try:
         manager._last_move = float("-inf")
-        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)  # the first notch draws
+        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)  # the first notch ...
+        manager.flush_held()  # ... draws after CLICK_MS, slowly
         for _ in range(5):  # the notches queued behind it arrive at once
             clock[0] += 0.005
             manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
@@ -2843,3 +2849,38 @@ def test_a_scroll_rerenders_only_the_scrolled_plane(win, qapp):
     # ... and the others' crosshair did follow the step.
     moved = [p for p in Plane if image_of(win, p).pane._cross != before[p]]
     assert set(moved) == {Plane.SAGITTAL, Plane.CORONAL}
+
+
+def test_a_scrolls_first_notch_does_not_draw_the_heavy_windows_inline(win, qapp):
+    """The first notch used to draw CHEDI before the slice it moved could paint:
+    a stall at the start of every scroll. A second notch inside CLICK_MS makes it
+    a scroll, and nothing heavy draws until it settles."""
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+    from fastfuncstuff.viewer.ui.manager import SETTLE_MS
+
+    class Stub(DepthWindow):
+        def __init__(self):
+            QtWidgets.QWidget.__init__(self)
+            self.vid = "D9"
+            self.calls = 0
+
+        def refresh(self, dirty):
+            self.calls += 1
+
+    manager = win.manager
+    stub = Stub()
+    manager.windows["D9"] = stub
+    try:
+        manager._last_move = float("-inf")
+        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
+        assert stub.calls == 0  # returned to the event loop: the slices paint
+        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
+        assert stub.calls == 0 and manager._settle.interval() == SETTLE_MS
+        manager.flush_held()
+        assert stub.calls == 1
+    finally:
+        manager.windows.pop("D9")
+        manager._settle.stop()
+        manager._held.clear()
+        stub.deleteLater()
