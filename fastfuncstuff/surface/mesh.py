@@ -226,10 +226,23 @@ def geodesic_ball(
     Edge-path distance overestimates true geodesic distance by a few percent,
     which only makes the brush marginally smaller.
     """
-    graph = topo.edge_graph(np.asarray(vertices, np.float64))
-    d = dijkstra(graph, indices=int(centre), limit=float(radius))
+    v = np.asarray(vertices, np.float64)
+    centre = int(centre)
+    # A path no longer than the radius never leaves the Euclidean ball of that
+    # radius, so only that ball's edges are searched: the whole-hemisphere
+    # graph cost 40 ms a call for the few hundred vertices a brush reaches.
+    reach = float(radius) * (1.0 + 1e-9) + 1e-12
+    near = np.flatnonzero(((v - v[centre]) ** 2).sum(axis=1) <= reach * reach)
+    local = np.full(len(v), -1, np.int64)
+    local[near] = np.arange(near.size)
+    e = topo.edges
+    keep = (local[e[:, 0]] >= 0) & (local[e[:, 1]] >= 0)
+    i, j = local[e[keep, 0]], local[e[keep, 1]]
+    w = np.linalg.norm(v[near[i]] - v[near[j]], axis=1)
+    graph = sp.csr_matrix((np.r_[w, w], (np.r_[i, j], np.r_[j, i])), shape=(near.size, near.size))
+    d = dijkstra(graph, indices=int(local[centre]), limit=float(radius))
     inside = np.flatnonzero(np.isfinite(d))
-    return inside, d[inside]
+    return near[inside], d[inside]
 
 
 __all__ = [

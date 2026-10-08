@@ -531,3 +531,23 @@ def test_even_off_is_the_plain_push():
     # The push is the same along the normal; even only adds the slide.
     assert np.allclose(both.positions[:, 2], plain.positions[:, 2], atol=1e-9)
     assert np.abs(both.positions[:, :2] - plain.positions[:, :2]).max() > 0.01
+
+
+def test_geodesic_ball_matches_the_whole_mesh_search():
+    """The Euclidean pre-cut is exact: same vertices, same distances as Dijkstra
+    over the whole graph, including where a fold brings the far bank close."""
+    from scipy.sparse.csgraph import dijkstra
+
+    u, f = _sphere(4000)
+    # Ridges: geodesic and Euclidean distance genuinely differ.
+    r = 20.0 + 2.5 * np.sin(6 * np.arctan2(u[:, 1], u[:, 0])) * np.sin(5 * np.arccos(u[:, 2]))
+    verts = u * r[:, None]
+    topo = MeshTopology.from_faces(f)
+    graph = topo.edge_graph(verts)
+    for centre in (0, 777, 1999, 3500):
+        for radius in (1.0, 4.0, 9.0, 60.0):
+            ids, dist = geodesic_ball(verts, topo, centre, radius)
+            full = dijkstra(graph, indices=centre, limit=radius)
+            want = np.flatnonzero(np.isfinite(full))
+            np.testing.assert_array_equal(ids, want)
+            np.testing.assert_allclose(dist, full[want], rtol=1e-12)
