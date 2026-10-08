@@ -13,6 +13,9 @@ the actions someone remembered to instrument.
 
 from __future__ import annotations
 
+import os
+import sys
+import time
 from collections.abc import Callable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -38,6 +41,13 @@ TILE_GAP = 6
 #: geometry. Six is fine enough to find a gap beside three image windows and
 #: coarse enough that the search is 36 rectangle intersections.
 PLACE_STEPS = 6
+#: A crosshair move this soon after the last one is part of a scroll: the 3-D,
+#: CHEDI, depth and profile windows wait until the moves stop for this long and
+#: then draw once, instead of once per wheel notch. A move after a pause (a
+#: click) still draws them at once.
+SETTLE_MS = 150
+#: The aspects of a move and nothing else -- what a scroll or a click dispatches.
+NAVIGATION = Aspect.CROSSHAIR | Aspect.GRAPH
 
 #: Every kind of companion window. They share no base class on purpose -- what
 #: they have in common is the four methods the manager calls, not an ancestry.
@@ -87,6 +97,14 @@ class WindowManager(QtCore.QObject):
         self._placing = False
         #: The image and graph viewports as last drawn; see _image_inputs_changed.
         self._image_inputs: tuple = ()
+        #: Heavy-window refreshes held back during a scroll, by view id; see redraw.
+        self._held: dict[str, Aspect] = {}
+        self._last_move = float("-inf")
+        self._settle = QtCore.QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(SETTLE_MS)
+        self._settle.timeout.connect(self.flush_held)
+        self._timing = bool(os.environ.get("FFS_VIEWER_TIMING"))
 
     # -- reconciliation -------------------------------------------------
     def sync(self) -> None:
@@ -233,13 +251,21 @@ class WindowManager(QtCore.QObject):
             | Aspect.CROSSHAIR
             | Aspect.LAYERS
         )
+        # A move hard on the heels of another is a scroll (see SETTLE_MS). Only a
+        # pure move is held: a threshold, an edit, a new layer draws at once, and
+        # takes whatever a scroll left waiting with it.
+        scrolling = False
+        if dirty and not (dirty & ~NAVIGATION):
+            now = time.monotonic()
+            scrolling = (now - self._last_move) * 1000.0 < SETTLE_MS
+            self._last_move = now
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 if images:
-                    win.redraw()
+                    self._timed(win, win.redraw)
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
-                    win.refresh(dirty)
+                    self._heavy(win, dirty, scrolling)
             elif isinstance(win, ChediWindow):
                 # The crosshair (to follow), an edit or a USE (SLICES), what
                 # it samples (LAYERS, TIME, COLORMAP: the range), and its own
@@ -252,21 +278,48 @@ class WindowManager(QtCore.QObject):
                     | Aspect.COLORMAP
                     | Aspect.VIEWPORTS
                 ):
-                    win.refresh(dirty)
+                    self._heavy(win, dirty, scrolling)
             elif isinstance(win, DepthWindow):
                 # The clicked spot (CROSSHAIR), the volume shown (TIME), what
                 # is loaded (LAYERS) and an edit moving white/pial (SLICES).
                 if dirty & (Aspect.CROSSHAIR | Aspect.TIME | Aspect.LAYERS | Aspect.SLICES):
-                    win.refresh(dirty)
+                    self._heavy(win, dirty, scrolling)
             elif isinstance(win, ProfileWindow):
                 # The crosshair (to follow), an edit (SLICES: re-sample what
                 # moved), and the anatomy it reads (LAYERS, TIME).
                 if dirty & (Aspect.CROSSHAIR | Aspect.SLICES | Aspect.LAYERS | Aspect.TIME):
-                    win.refresh(dirty)
+                    self._heavy(win, dirty, scrolling)
             elif graphs:
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
+
+    def _heavy(self, win, dirty: Aspect, scrolling: bool) -> None:
+        """Refresh a 3-D / CHEDI / depth / profile window now, or hold it mid-scroll."""
+        if scrolling:
+            self._held[win.vid] = self._held.get(win.vid, Aspect.NOTHING) | dirty
+            self._settle.start()  # restarts: draws SETTLE_MS after the last move
+            return
+        dirty = dirty | self._held.pop(win.vid, Aspect.NOTHING)
+        self._timed(win, lambda: win.refresh(dirty))
+
+    def flush_held(self) -> None:
+        """Draw every window a scroll held back (the scroll has stopped)."""
+        self._settle.stop()
+        held, self._held = self._held, {}
+        for vid, dirty in held.items():
+            win = self.windows.get(vid)
+            if isinstance(win, SurfaceWindow | ChediWindow | DepthWindow | ProfileWindow):
+                self._timed(win, lambda w=win, d=dirty: w.refresh(d))
+
+    def _timed(self, win, draw: Callable[[], None]) -> None:
+        if not self._timing:
+            draw()
+            return
+        t0 = time.perf_counter()
+        draw()
+        ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[redraw] {type(win).__name__} {win.vid}: {ms:.1f} ms", file=sys.stderr)
 
     def centre_on_crosshair(self) -> None:
         """Bring the crosshair into the middle of every zoomed image and every 3-D view.

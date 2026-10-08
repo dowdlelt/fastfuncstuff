@@ -2742,3 +2742,42 @@ def test_w_alone_closes_nothing(win, qapp):
         for binding in window.help._bindings:
             if binding.description == "close this window":
                 assert QtGui.QKeySequence(binding.keys).toString() == "Ctrl+W", binding
+
+
+def test_a_scroll_draws_the_heavy_windows_once_when_it_stops(win, qapp):
+    """A click draws the 3-D / CHEDI / depth / profile windows at once; the moves of
+    a scroll that follow it are held and drawn once, together, when it settles. Any
+    other change draws at once and takes the held moves with it."""
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+
+    class Stub(DepthWindow):
+        def __init__(self):
+            QtWidgets.QWidget.__init__(self)
+            self.vid = "D9"
+            self.calls: list[Aspect] = []
+
+        def refresh(self, dirty):
+            self.calls.append(dirty)
+
+    manager = win.manager
+    stub = Stub()
+    manager.windows["D9"] = stub
+    try:
+        manager._last_move = float("-inf")
+        manager.redraw(Aspect.CROSSHAIR)  # a click: drawn now
+        assert stub.calls == [Aspect.CROSSHAIR]
+        for _ in range(5):  # the scroll after it: held
+            manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
+        assert len(stub.calls) == 1 and manager._settle.isActive()
+        manager.flush_held()  # what the settle timer does
+        assert len(stub.calls) == 2 and stub.calls[1] & Aspect.CROSSHAIR
+        manager.redraw(Aspect.CROSSHAIR)  # a held move ...
+        assert len(stub.calls) == 2
+        manager.redraw(Aspect.LAYERS)  # ... rides along with a change it listens for
+        assert stub.calls[-1] & Aspect.LAYERS and stub.calls[-1] & Aspect.CROSSHAIR
+        assert not manager._held
+    finally:
+        manager.windows.pop("D9")
+        manager._settle.stop()
+        stub.deleteLater()
