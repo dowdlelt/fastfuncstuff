@@ -576,7 +576,11 @@ def _create_nifti_with_header(
         # int16 source would otherwise quantize our float stats on write.
         new_header.set_data_shape(data.shape)
         new_header.set_data_dtype(data.dtype)
-        img = nib.Nifti1Image(data, affine, header=new_header)
+        # Surface data load as NIfTI-2 (V, 1, 1, T): NIfTI-1 dims stop at 32,767.
+        # Wrapping that header in a Nifti1Image makes nibabel squeeze it back into
+        # NIfTI-1 with its "large vector Freesurfer hack" and a sizeof_hdr complaint.
+        cls = nib.Nifti2Image if isinstance(new_header, nib.Nifti2Header) else nib.Nifti1Image
+        img = cls(data, affine, header=new_header)
     else:
         # Fallback: Create basic header
         img = nib.Nifti1Image(data, affine)

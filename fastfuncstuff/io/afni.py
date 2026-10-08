@@ -3469,6 +3469,10 @@ def save_nifti(
     # Sync header dims to actual data shape (handles sub-brick selection,
     # partial loads, or any processing that changed the volume count)
     if header is not None:
+        if max(data.shape) > 32767 and not isinstance(header, nib.Nifti2Header):
+            # NIfTI-1 dims stop at 32,767 (a surface's (V, 1, 1) is past it); nibabel
+            # would otherwise apply its "large vector Freesurfer hack".
+            header = nib.Nifti2Header.from_header(header)
         header.set_data_shape(data.shape)
         # Sync on-disk dtype to the data. A header copied from a short/int input
         # otherwise forces nibabel to quantize our float32 results to int16 on
@@ -3512,8 +3516,9 @@ def save_nifti(
     # neither. See _resolve_space_codes.
     scode, qcode = _resolve_space_codes(header)
 
-    # Create NIfTI image
-    img = nib.Nifti1Image(_to_file_order(data), affine, header=header)
+    # Create NIfTI image (NIfTI-2 when the header is: see the dims check above)
+    cls = nib.Nifti2Image if isinstance(header, nib.Nifti2Header) else nib.Nifti1Image
+    img = cls(_to_file_order(data), affine, header=header)
 
     # Write BOTH forms from the affine we were handed. nibabel only touches the
     # s/qform when the affine differs from the header's best affine -- and when

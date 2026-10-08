@@ -42,7 +42,7 @@ from scipy.sparse import linalg as spla
 
 from .mesh import vertex_areas
 
-__all__ = ["HeatSmoother", "cotan_laplacian", "mesh_edges", "surface_fwhm"]
+__all__ = ["HeatSmoother", "cotan_laplacian", "mesh_edges", "surface_fwhm", "torch_csr"]
 
 _LN2 = float(np.log(2.0))
 
@@ -105,6 +105,29 @@ def _step_fwhm_ratio(n_steps: int) -> float:
     return float(2.0 * half / np.sqrt(16.0 * _LN2))
 
 
+def torch_csr(a, device):
+    """A scipy sparse matrix as a float32 torch CSR tensor on ``device``.
+
+    scipy built it, so its invariants hold; torch's per-tensor beta and
+    invariant-check warnings are only noise here.
+    """
+    import warnings
+
+    import torch
+
+    a = a.tocsr()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta")
+        warnings.filterwarnings("ignore", message="Sparse invariant checks are implicitly")
+        return torch.sparse_csr_tensor(
+            torch.as_tensor(a.indptr, dtype=torch.int64),
+            torch.as_tensor(a.indices, dtype=torch.int64),
+            torch.as_tensor(a.data, dtype=torch.float32),
+            size=a.shape,
+            check_invariants=False,
+        ).to(device)
+
+
 class HeatSmoother:
     """Smooth per-vertex data to a target FWHM (mm) along a surface.
 
@@ -150,19 +173,9 @@ class HeatSmoother:
         if self.fwhm > 0 and device is None:
             self._solve = spla.factorized(a.tocsc())
         elif self.fwhm > 0:
-            import warnings
-
             import torch
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta")
-                self._a = torch.sparse_csr_tensor(
-                    torch.as_tensor(a.indptr, dtype=torch.int64),
-                    torch.as_tensor(a.indices, dtype=torch.int64),
-                    torch.as_tensor(a.data, dtype=torch.float32),
-                    size=a.shape,
-                    check_invariants=False,
-                ).to(device)
+            self._a = torch_csr(a, device)
             self._m_t = torch.as_tensor(self._mass, dtype=torch.float32, device=device)
             self._dinv = 1.0 / torch.as_tensor(a.diagonal(), dtype=torch.float32, device=device)
 

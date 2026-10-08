@@ -1352,6 +1352,7 @@ def _save_surface_acf(prefix, info) -> None:
         *(f"{r:.3f} {c:.5f}" for r, c in zip(acf.r, acf.curve, strict=True) if np.isfinite(c)),
     ]
     stem = str(prefix).removesuffix(".gii").removesuffix(".shape")
+    Path(stem).parent.mkdir(parents=True, exist_ok=True)
     Path(f"{stem}.acf_{label}.txt").write_text("\n".join(lines) + "\n")
     per = np.nan_to_num(info["per_vertex"], nan=0.0).astype(np.float32)[:, None, None]
     save_nifti(per, f"{stem}.fwhm_{label}.shape.gii", header=info["header"])

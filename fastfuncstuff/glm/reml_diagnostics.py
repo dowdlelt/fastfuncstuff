@@ -343,6 +343,7 @@ class DatasetDiagnostics:
             return False
         from pathlib import Path
 
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(self.tables[name])
         if self.verbose:
             print(f"  • {name}: {path}")

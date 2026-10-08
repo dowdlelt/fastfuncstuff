@@ -178,13 +178,14 @@ def test_surface_chain_blur_to_acf_and_clustsim(tmp_path, monkeypatch):
         "-input", str(tmp_path / "raw.func.gii"), "-events", str(tmp_path / "ev.tsv"),
         "-mask", str(tmp_path / "m.shape.gii"), "-blur_to_fwhm", "5",
         "-Rbuck", str(tmp_path / "s.func.gii"), "-tout",
-        "-save_acf", str(tmp_path / "acf"), "-clustsim", "-clustsim_niter", "200",
+        "-save_acf", str(tmp_path / "new" / "acf"), "-clustsim", "-clustsim_niter", "200",
     )  # fmt: skip
-    text = (tmp_path / "acf.acf_reml.txt").read_text().splitlines()
+    # the -save_acf folder did not exist: it is made, not a lost table
+    text = (tmp_path / "new" / "acf.acf_reml.txt").read_text().splitlines()
     a_, b_, c_, acf_fwhm, classic = map(float, text[1].split())
     assert 4.0 < classic < 6.5  # blurred to ~5 mm (residuals of the smoothed data)
     assert 0.0 <= a_ <= 1.0 and acf_fwhm > classic
-    fwhm_map, _ = load_gifti_data(tmp_path / "acf.fwhm_reml.shape.gii")
+    fwhm_map, _ = load_gifti_data(tmp_path / "new" / "acf.fwhm_reml.shape.gii")
     assert fwhm_map.shape == (n * n,)
     bucket = nib.load(str(tmp_path / "s.func.gii"))
     table = json.loads(bucket.meta["ClustSim_bi-sided"])
