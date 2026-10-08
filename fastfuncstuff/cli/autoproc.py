@@ -169,6 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
         "or the folder above -suma.",
     )
     g.add_argument(
+        "-surface_qc",
+        "-surface-qc",
+        action="store_true",
+        help="with -surface_target: also write ffs_nwarp -surf_qc's maps per run -- "
+        "footprint reads per native EPI voxel (stage10s.surf.<run>.<SPACE>.samples), "
+        "effective voxel volume and blur FWHM per vertex. About one extra pass over 64 "
+        "frames per run.",
+    )
+    g.add_argument(
         "-fs_subject",
         "-fs-subject",
         default=None,
@@ -1054,6 +1063,8 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     f"and it is not there: {', '.join(absent)}. Re-run the reference with "
                     "-do_mni first."
                 )
+    if opt.surface_qc and not opt.surface_target:
+        errors.append("-surface_qc maps the surface projection: it needs -surface_target.")
     if opt.surface_target:
         if not opt.go_to_anat or opt.grand_reference or opt.ref_file:
             errors.append(
@@ -1896,6 +1907,7 @@ def main(argv: list[str] | None = None) -> int:
         suma_dir=args.suma,
         surface_target=_baked_meshes(args.surface_target, fs_subject),
         fs_subject=fs_subject,
+        surface_qc=args.surface_qc,
         ref_file=args.ref_file,
         ref_transforms=args.ref_transforms,
         ref_anat=args.ref_anat,

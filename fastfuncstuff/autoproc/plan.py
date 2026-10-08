@@ -234,6 +234,8 @@ class Options:
     # same chain minus the MNI links, master = the anat. fs_subject holds surf/.
     surface_target: list[str] | None = None
     fs_subject: str | None = None
+    # -surface_qc: ffs_nwarp -surf_qc on every run (samples, voxel volume, blur map).
+    surface_qc: bool = False
     events: list[str] | None = None  # events TSV(s) passed directly (bids format)
     # Explicit reference override (alternative to -grand_reference DIR): an EPI
     # contrast image to align to, the nwarp-order matrices mapping it to anat, and

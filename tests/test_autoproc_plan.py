@@ -2182,6 +2182,14 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     assert s.index("== stage10: final") < s.index("== stage10s: surface masks")
 
 
+def test_surface_qc_rides_the_same_line():
+    s = _skull_script(surface_target=["native"], fs_subject="/fs/sub-X", surface_qc=True)
+    line = next(x for x in s.splitlines() if "-surf " in x and "printf" in x)
+    assert " -surf_qc" in line
+    plain = _skull_script(surface_target=["native"], fs_subject="/fs/sub-X")
+    assert "-surf_qc" not in plain
+
+
 def test_no_surface_target_emits_no_surface_stage():
     s = _skull_script()
     assert "SURFCHAIN" not in s and "stage10s" not in s and "skip_surface" not in s
