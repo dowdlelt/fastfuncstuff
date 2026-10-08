@@ -47,6 +47,7 @@ whole-slice phase rotation) has no place on this path.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Sequence
 
@@ -68,6 +69,21 @@ _KERNEL_HALFWIDTH = {
 }
 
 
+@functools.lru_cache(maxsize=16)
+def _lagrange_denominators(order: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """prod_{m != n}(n-m), ordered by n=-half..half+1, resident on ``device``.
+
+    Cached: built from a Python tuple on every call it was a host-to-device copy
+    (a sync) per tap per frame -- 2.7 s of a 14 s surface pass.
+    """
+    vals = (
+        (-120.0, 24.0, -12.0, 12.0, -24.0, 120.0)
+        if order == 5
+        else (-5040.0, 720.0, -240.0, 144.0, -144.0, 240.0, -720.0, 5040.0)
+    )
+    return torch.tensor(vals, dtype=dtype, device=device)
+
+
 def _lagrange_temporal_weight(dist: Tensor, order: int) -> Tensor:
     """Cardinal Lagrange weight at signed sample distance ``dist``."""
     half = order // 2
@@ -78,15 +94,9 @@ def _lagrange_temporal_weight(dist: Tensor, order: int) -> Tensor:
     for node in nodes:
         product = product * (frac - node)
 
-    # prod_{m != n}(n-m), ordered by n=-half..half+1.
-    denominators = (
-        (-120.0, 24.0, -12.0, 12.0, -24.0, 120.0)
-        if order == 5
-        else (-5040.0, 720.0, -240.0, 144.0, -144.0, 240.0, -720.0, 5040.0)
-    )
     in_support = (offset >= -half) & (offset <= half + 1)
     index = (offset + half).clamp(0, order)
-    denominator = dist.new_tensor(denominators)[index]
+    denominator = _lagrange_denominators(order, dist.device, dist.dtype)[index]
     delta = frac - offset.to(frac.dtype)
     at_node = delta.abs() < 1e-7
     safe_delta = torch.where(at_node, torch.ones_like(delta), delta)
@@ -472,7 +482,10 @@ class TissueFollowingSampler:
             )
             for f in frames
         }
-        active = [f for f in frames if bool(torch.any(weights[f] != 0.0))]
+        # Every tap, with no "is its weight all zero?" check: that check is a host
+        # sync per tap (eleven a frame), which stalls the GPU queue, while a zero
+        # weight adds exactly 0 and its warp is cached for the neighbouring frames.
+        active = frames
 
         # Warped taps are fetched on demand and dropped as the centre advances, so
         # at most three (f-1, f, f+1) are resident -- the derivative's whole cost.

@@ -118,7 +118,7 @@ def surface_qc(
     from fastfuncstuff.io.gifti import save_gifti_data
 
     from .io import load_image, save_image
-    from .surface_projection import SurfaceFold, combine_depths
+    from .surface_projection import SurfaceFold
 
     if source_image is None:
         source_image = load_image(source_path, device=None)
@@ -180,7 +180,7 @@ def surface_qc(
     n_frames = int(max(2, n_frames))
     per_pass = min(n_frames, src.shape[0]) if src.ndim == 4 else n_frames
     gen = torch.Generator().manual_seed(seed)
-    fold = SurfaceFold(targets)
+    fold = SurfaceFold(targets, weights)
     sumsq = [np.zeros(t.sampling.n_vertices) for t in targets]
     cover = [np.ones(t.sampling.n_vertices) for t in targets]
     done = 0
@@ -193,9 +193,9 @@ def surface_qc(
             interp=interp, ainterp=ainterp, device=device, verb=0, point_reducer=fold,
             time_range=(0, m) if m > 1 else None,
         ).cpu().numpy()  # fmt: skip
-        for i, (_, values, cov) in enumerate(fold.split(out)):
-            sumsq[i] += (combine_depths(values, cov, weights).astype(np.float64) ** 2).sum(1)
-            cover[i] = np.minimum(cover[i], cov.min(axis=(0, 2)))
+        for i, (_, combined, _, cov) in enumerate(fold.split(out)):
+            sumsq[i] += (combined.astype(np.float64) ** 2).sum(1)
+            cover[i] = np.minimum(cover[i], cov.min(axis=0))
         done += m
 
     starts = np.cumsum([0] + [c.shape[0] for c in centres])

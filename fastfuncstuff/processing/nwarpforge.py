@@ -2260,7 +2260,10 @@ def nwarpforge(
     # its own (already bounded) batched output and is exempt.
     def _stash(vol: Tensor) -> Tensor:
         if point_plan is not None and point_reducer is not None:
-            return point_reducer(vol.reshape(-1)).to("cpu")
+            # Reduced frames are small (a value per vertex): keep them on the device
+            # and copy once at the end. A copy per frame is a sync per frame, which
+            # serialises the CPU's launches for frame t+1 behind the GPU's frame t.
+            return point_reducer(vol.reshape(-1))
         return vol.to("cpu")
 
     # Affine-only fast path: a chain with no nonlinear warp is a pure per-frame
@@ -2661,7 +2664,7 @@ def nwarpforge(
 
     if point_plan is not None:
         if point_reducer is not None:
-            return output
+            return output.to("cpu")
         n_pts = point_plan.shape[2]
         return output.reshape(-1, n_pts) if output.ndim == 4 else output.reshape(n_pts)
 

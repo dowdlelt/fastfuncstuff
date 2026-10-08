@@ -31,7 +31,6 @@ __all__ = [
     "DEFAULT_DEPTHS",
     "HemiTarget",
     "SurfaceFold",
-    "combine_depths",
     "depth_weights",
     "output_paths",
     "project_to_surface",
@@ -212,55 +211,81 @@ def output_paths(
 
 
 class SurfaceFold:
-    """Fold every frame's reads onto every target's ``(K, V)`` rows as nwarp emits it.
+    """Fold every frame's reads onto every target's vertices as nwarp emits it.
 
-    Per frame and row: the mean of the reads that landed inside the EPI (nwarp reads
-    exactly 0 outside), and the share of the footprint that did. Renormalising over
-    the reads inside keeps a vertex whose footprint pokes out of the slab at its true
-    level instead of averaging in zeros; the share is what the mask is built from.
-    The series is then held as ``2 * sum(K * V)`` per frame instead of every read.
+    Per frame and ``(depth, vertex)`` row: the mean of the reads that landed inside
+    the EPI (nwarp reads exactly 0 outside) -- renormalising keeps a vertex whose
+    footprint pokes out of the slab at its true level instead of averaging in zeros.
+    The depths are then combined with ``weights`` (over the depths that read
+    anything that frame), and the smallest share of each footprint inside the EPI is
+    kept across frames (:attr:`cover`, what the mask is built from).
+
+    It runs on the reads' device as one sparse product per frame, so a frame hands
+    back ``V`` values per target (``V + K * V`` with ``per_depth``) instead of every
+    read: copying the reads to the host and folding there was half the wall time of
+    a GPU pass.
     """
 
-    def __init__(self, targets: list[HemiTarget]):
+    def __init__(self, targets: list[HemiTarget], weights, per_depth: bool = False):
         from scipy import sparse
 
         self.targets = targets
+        self.per_depth = per_depth
         self.rows = [t.sampling.operator.shape[0] for t in targets]
-        self.op = sparse.block_diag([t.sampling.operator for t in targets], format="csr")
+        self.shapes = [(t.sampling.n_depths, t.sampling.n_vertices) for t in targets]
+        self.weights = np.asarray(weights, np.float32)
+        self._op_cpu = sparse.block_diag([t.sampling.operator for t in targets], format="csr")
+        self._op = None
+        self._w = None
+        self.cover = None  # (sum K * V,) min share inside, over frames
+
+    def _setup(self, device):
+        import torch
+
+        from fastfuncstuff.surface.smooth import torch_csr
+        from fastfuncstuff.utils import cpu_if_mps
+
+        dev = cpu_if_mps(device, "sparse_csr_mm")
+        if self._op is None or self._op.device != dev:
+            self._op = torch_csr(self._op_cpu, dev)
+            self._w = torch.as_tensor(self.weights, device=dev)[:, None]
+        return dev
 
     def __call__(self, reads):
         import torch
 
-        r = reads.detach().to("cpu", torch.float32).numpy()
-        num = self.op @ r
-        cov = self.op @ (r != 0).astype(np.float32)
-        val = np.divide(num, cov, out=np.zeros_like(num), where=cov > 0)
-        return torch.from_numpy(np.concatenate([val, cov]).astype(np.float32))
+        dev = self._setup(reads.device)
+        r = reads.detach().to(dev, torch.float32).reshape(-1, 1)
+        num = (self._op @ r).reshape(-1)
+        cov = (self._op @ (r != 0).to(torch.float32)).reshape(-1)
+        val = torch.where(cov > 0, num / cov.clamp_min(1e-12), torch.zeros_like(num))
+        self.cover = cov if self.cover is None else torch.minimum(self.cover, cov)
+        out = []
+        for (k, v), vk, ck in zip(
+            self.shapes, val.split(self.rows), cov.split(self.rows), strict=True
+        ):
+            vk, ck = vk.reshape(k, v), ck.reshape(k, v)
+            w = self._w * (ck > 0)
+            total = w.sum(0)
+            out.append(torch.where(total > 0, (w * vk).sum(0) / total.clamp_min(1e-12), 0.0))
+            if self.per_depth:
+                out.append(vk.reshape(-1))
+        return torch.cat(out)
+
+    def reset(self) -> None:
+        self.cover = None
 
     def split(self, out: np.ndarray):
-        """``(T, 2R)`` frames -> per target ``(values, coverage)``, each ``(K, V, T)``."""
+        """``(T, M)`` frames -> per target ``(combined (V, T), per_depth (K, V, T) or
+        None, cover (K, V))``."""
         out = out[None] if out.ndim == 1 else out
-        half = out.shape[1] // 2
-        edges = np.cumsum(self.rows)[:-1]
-        for t, val, cov in zip(
-            self.targets,
-            np.split(out[:, :half], edges, axis=1),
-            np.split(out[:, half:], edges, axis=1),
-            strict=True,
-        ):
-            k, v = t.sampling.n_depths, t.sampling.n_vertices
-            yield t, val.T.reshape(k, v, -1), cov.T.reshape(k, v, -1)
-
-
-def combine_depths(values: np.ndarray, cover: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """``(K, V, T)`` -> ``(V, T)``: weighted depth mean over the depths that read
-    anything at that vertex and frame (a depth wholly outside the EPI drops out)."""
-    w = weights[:, None, None] * (cover > 0)
-    total = w.sum(axis=0)
-    return np.divide(
-        (w * values).sum(axis=0), total, out=np.zeros(values.shape[1:], np.float32),
-        where=total > 0,
-    ).astype(np.float32)  # fmt: skip
+        cover = self.cover.cpu().numpy() if self.cover is not None else None
+        sizes = [v + (k * v if self.per_depth else 0) for k, v in self.shapes]
+        chunks = np.split(out, np.cumsum(sizes)[:-1], axis=1)
+        covs = np.split(cover, np.cumsum(self.rows)[:-1]) if cover is not None else None
+        for i, (t, (k, v), c) in enumerate(zip(self.targets, self.shapes, chunks, strict=True)):
+            per = c[:, v:].T.reshape(k, v, -1) if self.per_depth else None
+            yield t, np.ascontiguousarray(c[:, :v].T), per, covs[i].reshape(k, v) if covs else None
 
 
 def project_to_surface(
@@ -329,7 +354,8 @@ def project_to_surface(
         from .io import load_image
 
         nwarp_kwargs["source_image"] = load_image(source_path, device=None)  # read once
-    fold = SurfaceFold(targets)
+    per_depth = depth_combine == "none" and len(fractions) > 1
+    fold = SurfaceFold(targets, weights, per_depth=per_depth)
     out = nwarpforge(
         source_path=source_path,
         nwarp_specs=nwarp_specs,
@@ -343,7 +369,7 @@ def project_to_surface(
     assert out is not None
     tr = get_tr_from_file(source_path)
     written: list[Path] = []
-    for t, values, cov in fold.split(out.cpu().numpy()):
+    for t, combined, values, cov in fold.split(out.cpu().numpy()):
         stem = f"{prefix}.{t.mesh}.{t.hemi}"
         geom = {
             "white": t.white,
@@ -364,8 +390,7 @@ def project_to_surface(
         )
         if tr and tr > 0:
             meta["TR_seconds"] = f"{tr:g}"
-        combined = combine_depths(values, cov, weights)
-        if depth_combine == "mean" or t.sampling.n_depths == 1:
+        if not per_depth:
             path = Path(f"{stem}.func.gii")
             dmeta = {
                 "depth_combine": "mean",
@@ -374,11 +399,12 @@ def project_to_surface(
             save_gifti_data(path, combined, {**meta, **dmeta})
             written.append(path)
         else:
+            assert values is not None
             for k, f in enumerate(t.sampling.fractions):
                 path = Path(f"{stem}.depth-{f:.2f}.func.gii")
                 save_gifti_data(path, values[k], {**meta, "depth": f"{f:g}"})
                 written.append(path)
-        cover = cov.min(axis=(0, 2))
+        cover = cov.min(axis=0)  # (K, V) is already the min over frames
         mask = cover > 0.99
         if t.cortex is not None:
             mask &= t.cortex

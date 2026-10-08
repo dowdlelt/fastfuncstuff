@@ -186,6 +186,10 @@ def _torch_at_least(minimum: tuple[int, int]) -> bool:
 # CPU-float32 time over MPS time, so "12000x slower" means MPS took that much
 # longer. Re-run scripts/bench_mps_policy.py after a torch upgrade.
 _MPS_CPU_OPS: dict[str, str] = {
+    # Unmeasured, routed off Metal conservatively: torch's CSR @ dense coverage on
+    # MPS is patchy across releases, and the surface fold is one small product a
+    # frame. Re-measure with scripts/bench_mps_policy.py before moving it.
+    "sparse_csr_mm": "unmeasured: CSR @ dense support on Metal not verified (surface fold)",
     # 2.14's Jacobi QR is a catastrophe at the tall-skinny shapes every nuisance
     # projector in this codebase uses. Not a typo: a (2000,300) QR takes over
     # nine minutes on Metal against 5.8 ms on the CPU.
