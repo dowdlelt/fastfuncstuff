@@ -555,8 +555,8 @@ def _contrast_base_name(label: str) -> str | None:
     Returns ``None`` for labels that don't carry a Coef/Tstat/Fstat/Zstat/R²
     suffix (i.e. not a contrast output). ``_Zstat`` appears when a DoF tool
     (ffs_util_updatedof -numcomps) has post-processed the bucket. The trailing
-    ``#N`` AFNI sub-index — present on ffs_reml-written contrasts but not
-    concalc-written ones — is stripped.
+    ``#N`` AFNI sub-index (``name#0_Coef``, as 3dREMLfit, ffs_reml and concalc
+    write them; concalc before 2026-10-08 wrote none) is stripped.
     """
     for suf in ("_Coef", "_Tstat", "_Fstat", "_Zstat", "_R2semi", "_R2"):
         if label.endswith(suf):
@@ -1159,10 +1159,11 @@ def main() -> int:
             tstat_vol = np.zeros(vol_shape, dtype=np.float32)
             coef_vol[mask] = cb_vox
             tstat_vol[mask] = t_vox
+            # 3dREMLfit's GLT names (and ffs_reml's): name#row_Coef / _Tstat, name_Fstat.
             out_subs.append(coef_vol)
-            out_labels.append(f"{label}_Coef")
+            out_labels.append(f"{label}#0_Coef")
             out_subs.append(tstat_vol)
-            out_labels.append(f"{label}_Tstat")
+            out_labels.append(f"{label}#0_Tstat")
             # -fout: emit F = t² with dof=(1, residual). AFNI's "-fout"
             # behaviour for contrasts. Single coef brick is still kept (you
             # need the magnitude for direction), the F sub-brick lands after.

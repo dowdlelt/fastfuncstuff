@@ -30,6 +30,8 @@ def test_select_non_contrast_subbricks_keeps_stim_drops_contrast():
         "FvH_Coef",  # drop (old contrast)
         "FvH_Tstat",  # drop
         "anyOf_Fstat",  # drop (old F-test contrast)
+        "DvP#0_Coef",  # drop (a contrast as ffs_reml / concalc name it now)
+        "DvP#0_Tstat",  # drop
         "Mask",  # keep (unknown shape, preserved)
     ]
     keep = _select_non_contrast_subbricks(labels, stim_base_labels=["DI", "PI"])
@@ -427,14 +429,15 @@ def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
     ref, _ = load_gifti_data(tmp_path / "ref.func.gii")
     names = [dict(a.meta)["Name"] for a in nib.load(str(out)).darrays]
     ref_names = [dict(a.meta)["Name"] for a in nib.load(str(tmp_path / "ref.func.gii")).darrays]
-    # ffs_reml names a contrast a_vs_b#0_*, concalc a_vs_b_* (as it does for volumes).
+    # Named as ffs_reml and 3dREMLfit name it, so the two buckets read alike.
+    assert names == ref_names
     for lab in ("Coef", "Tstat"):
         np.testing.assert_allclose(
-            got[:, names.index(f"a_vs_b_{lab}")],
+            got[:, names.index(f"a_vs_b#0_{lab}")],
             ref[:, ref_names.index(f"a_vs_b#0_{lab}")],
             rtol=1e-3,
             atol=1e-3,
         )
     assert meta["mesh_fingerprint"] == "V_test" and "ClustSim_bi-sided" in meta
-    t_arr = nib.load(str(out)).darrays[names.index("a_vs_b_Tstat")]
+    t_arr = nib.load(str(out)).darrays[names.index("a_vs_b#0_Tstat")]
     assert t_arr.intent == 3 and dict(t_arr.meta)["StatCode"] == "3"
