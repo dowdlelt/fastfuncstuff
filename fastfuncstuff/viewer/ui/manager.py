@@ -254,11 +254,8 @@ class WindowManager(QtCore.QObject):
         # A move hard on the heels of another is a scroll (see SETTLE_MS). Only a
         # pure move is held: a threshold, an edit, a new layer draws at once, and
         # takes whatever a scroll left waiting with it.
-        scrolling = False
-        if dirty and not (dirty & ~NAVIGATION):
-            now = time.monotonic()
-            scrolling = (now - self._last_move) * 1000.0 < SETTLE_MS
-            self._last_move = now
+        moving = bool(dirty) and not (dirty & ~NAVIGATION)
+        scrolling = moving and (time.monotonic() - self._last_move) * 1000.0 < SETTLE_MS
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 if images:
@@ -293,6 +290,11 @@ class WindowManager(QtCore.QObject):
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
+        if moving:
+            # Stamped after the draws, not before: the notches queued while a
+            # slow CHEDI drew arrive "late" by its draw time, and measured from
+            # before it every one of them read as a click and drew again.
+            self._last_move = time.monotonic()
 
     def _heavy(self, win, dirty: Aspect, scrolling: bool) -> None:
         """Refresh a 3-D / CHEDI / depth / profile window now, or hold it mid-scroll."""
@@ -311,6 +313,8 @@ class WindowManager(QtCore.QObject):
             win = self.windows.get(vid)
             if isinstance(win, SurfaceWindow | ChediWindow | DepthWindow | ProfileWindow):
                 self._timed(win, lambda w=win, d=dirty: w.refresh(d))
+        if held:
+            self._last_move = time.monotonic()  # a scroll resumed mid-draw is still one
 
     def _timed(self, win, draw: Callable[[], None]) -> None:
         if not self._timing:

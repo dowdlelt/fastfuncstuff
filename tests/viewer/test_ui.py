@@ -2781,3 +2781,49 @@ def test_a_scroll_draws_the_heavy_windows_once_when_it_stops(win, qapp):
         manager.windows.pop("D9")
         manager._settle.stop()
         stub.deleteLater()
+
+
+def test_a_slow_heavy_draw_does_not_read_as_a_pause(win, qapp, monkeypatch):
+    """The wheel notches queued while a slow CHEDI drew must still be a scroll.
+
+    The gap was measured from *before* the draw, so a heavy window slower than
+    SETTLE_MS made every next notch look like a click, and the scroll drew all
+    of them -- whatever SETTLE_MS was raised to.
+    """
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.ui import manager as manager_mod
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+
+    clock = [1000.0]
+    monkeypatch.setattr(manager_mod.time, "monotonic", lambda: clock[0])
+
+    class Slow(DepthWindow):
+        def __init__(self):
+            QtWidgets.QWidget.__init__(self)
+            self.vid = "D9"
+            self.calls = 0
+
+        def refresh(self, dirty):
+            self.calls += 1
+            clock[0] += 2 * manager_mod.SETTLE_MS / 1000.0  # a draw slower than the settle
+
+    manager = win.manager
+    stub = Slow()
+    manager.windows["D9"] = stub
+    try:
+        manager._last_move = float("-inf")
+        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)  # the first notch draws
+        for _ in range(5):  # the notches queued behind it arrive at once
+            clock[0] += 0.005
+            manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
+        assert stub.calls == 1
+        manager.flush_held()
+        assert stub.calls == 2
+        clock[0] += 0.005  # the scroll resumes the moment the settled draw ends
+        manager.redraw(Aspect.CROSSHAIR | Aspect.GRAPH)
+        assert stub.calls == 2
+    finally:
+        manager.windows.pop("D9")
+        manager._settle.stop()
+        manager._held.clear()
+        stub.deleteLater()
