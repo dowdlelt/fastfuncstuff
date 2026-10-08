@@ -526,7 +526,7 @@ class ViewerSession:
         if layer is None or layer.is_computed:
             return
         try:
-            values = self.volume(key, 0)
+            values = self._look_values(key, 0)
         except (KeyError, FileNotFoundError, ValueError):
             return
         finite = values[np.isfinite(values)]
@@ -538,6 +538,15 @@ class ViewerSession:
         self.state.layers.update(
             key, threshold=threshold, **self.overlay_look(key, 0, colormap="hot")
         )
+
+    def _look_values(self, key: str, index: int) -> np.ndarray:
+        """The values a colour scale is read from: a surface layer's own vertices
+        (its painted ribbon counts each vertex once per voxel it owns), else the
+        volume."""
+        sld = self.surface_layers.get(key)
+        if sld is not None:
+            return np.concatenate([d.values[:, index] for d in sld.parts.values()])
+        return self.volume(key, index)
 
     def overlay_look(self, key: str, index: int, *, colormap: str) -> dict[str, object]:
         """Colour scale for one sub-brick of an overlay: range, and hot or red-blue.
@@ -551,7 +560,7 @@ class ViewerSession:
         mask, and counting that zero puts the 98th percentile near nothing.
         """
         try:
-            values = self.volume(key, index)
+            values = self._look_values(key, index)
         except (KeyError, FileNotFoundError, ValueError):
             return {}
         finite = values[np.isfinite(values) & (values != 0)]

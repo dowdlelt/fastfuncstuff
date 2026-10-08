@@ -163,9 +163,11 @@ def build_parser() -> FfsArgumentParser:
 def _surf_data_commands(paths: list[str]):
     """Plain LOADs, issued after the meshes: a surface result is a layer like any
     other, it just needs the meshes it was made on to be there first."""
-    from fastfuncstuff.viewer.vocab import AddLayer
+    from fastfuncstuff.viewer.vocab import Load
 
-    return [AddLayer(path) for path in paths]
+    # Load, not AddLayer: a result over an anatomy gets the overlay defaults (a
+    # signed map in red-blue on a symmetric range, a starting threshold).
+    return [Load(path) for path in paths]
 
 
 def _mesh_commands(paths: list[str]):

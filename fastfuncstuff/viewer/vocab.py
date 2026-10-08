@@ -2487,7 +2487,7 @@ def install(
         if (
             session is not None
             and not layer.time_linked
-            and layer.source == "file"
+            and (layer.source == "file" or layer.source.startswith("surface:"))
             and not layer.range_fixed
         ):
             # A bucket's sub-bricks are different quantities: an F's range is

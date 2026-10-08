@@ -217,3 +217,22 @@ def test_a_shape_drawn_in_the_window_fills_as_one_recorded_highlight(world):
     assert not s.surfaces.highlight["lh"].any()
     win.close()
     app.processEvents()
+
+
+def test_a_surface_overlay_gets_the_overlay_look(world):
+    """-surf_data used to AddLayer, which skips the overlay defaults: a signed map
+    arrived gray, unthresholded, on a percentile range. Load gives it what a volume
+    stat gets, and AUTO's look is read off the vertices (the painted ribbon counts
+    each vertex once per voxel it owns)."""
+    from fastfuncstuff.viewer.vocab import Load
+
+    s, tmp, d, f, t = world
+    signed = np.where(d[:, 0] > 0, t, -t).astype(np.float32)
+    for h in ("lh", "rh"):
+        _bucket(tmp / f"g.{h}.func.gii", f, len(d), signed)
+    s.do(Load(str(tmp / "g.lh.func.gii"), "S"))
+    layer = s.state.layers.get("S")
+    assert layer.threshold > 0  # starts see-through over the anatomy
+    assert layer.colormap == "redblue" and layer.range_lo == -layer.range_hi == -3.0
+    look = s.overlay_look("S", 1, colormap=layer.colormap)  # what AUTO applies
+    assert look["range_lo"] == -look["range_hi"] and look["range_hi"] == pytest.approx(6.0)
