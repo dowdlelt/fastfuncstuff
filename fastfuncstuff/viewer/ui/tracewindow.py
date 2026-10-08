@@ -22,7 +22,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.modes.base import Trace
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.viewports import Viewport
 
 MARGIN_LEFT = 64
@@ -233,6 +238,7 @@ class TraceWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"trace · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Binding("Right", "next component", ask("next"), group="review", aliases=(".",)),
                 Binding("Left", "previous component", ask("prev"), group="review", aliases=(",",)),
                 Binding("s", "label signal, then next", ask("signal"), group="review"),

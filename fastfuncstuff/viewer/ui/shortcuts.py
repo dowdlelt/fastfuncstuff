@@ -13,10 +13,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.ui import theme
+
+if TYPE_CHECKING:
+    from fastfuncstuff.viewer.commands import Command
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,18 @@ def double_tap(
             once()
 
     return fire
+
+
+def jump_back_key(dispatch: Callable[[Command], object]) -> Binding:
+    """`j`, in every window: the crosshair is shared, so its way back is too."""
+    from fastfuncstuff.viewer.vocab import JumpBack
+
+    return Binding(
+        "j",
+        "jump back to the previous location (again: return)",
+        lambda: dispatch(JumpBack()),
+        group="navigate",
+    )
 
 
 def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:

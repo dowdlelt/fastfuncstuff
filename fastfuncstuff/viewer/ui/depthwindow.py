@@ -28,7 +28,7 @@ from fastfuncstuff.surface.profiles import sample_depths
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
-from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, jump_back_key, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import SetDepthView, SetIndex, SetSurfaceEquivolume
 
@@ -320,6 +320,7 @@ class DepthWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"depth · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
                 Key("(", "smaller disc", lambda: self._radius_by(1 / 1.25), group="depth"),
                 Key(")", "larger disc", lambda: self._radius_by(1.25), group="depth"),

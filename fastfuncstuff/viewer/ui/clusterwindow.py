@@ -26,7 +26,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.clusters import ClusterTable
 from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.viewports import Viewport
 
 COLUMNS = ("#", "voxels", "mm³", "peak", "x", "y", "z", "α")
@@ -234,6 +239,7 @@ class ClusterWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"clusters · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Binding(
                     "m", "make an ROI layer of these", self.rois_button.click, group="clusters"
                 ),

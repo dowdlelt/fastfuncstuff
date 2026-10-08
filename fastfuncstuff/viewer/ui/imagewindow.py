@@ -29,6 +29,7 @@ from fastfuncstuff.viewer.ui.shortcuts import (
     Binding,
     ShortcutHelp,
     double_tap,
+    jump_back_key,
     keep_keys_for_shortcuts,
 )
 from fastfuncstuff.viewer.ui.stripbar import StripBar
@@ -278,6 +279,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"image · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 *[
                     Binding(k, f"{p.value} plane", lambda p=p: self._set_plane(p), group="plane")
                     for p, k in PLANE_KEYS.items()

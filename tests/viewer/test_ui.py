@@ -2923,3 +2923,43 @@ def test_c_twice_quickly_centres_the_other_windows_too(win, qapp):
     tap()
     qapp.processEvents()
     assert pan(coronal) == (0.0, 0.0)
+
+
+def test_j_jumps_back_over_a_jump_but_not_over_nudges(win):
+    """`j` returns to where the crosshair rested before its last jump, and `j` again returns."""
+    from fastfuncstuff.viewer.vocab import JumpBack, SetIJK
+
+    session = win.session
+    t = [100.0]
+    session.clock = lambda: t[0]
+    session.do(SetIJK(2, 2, 2))
+    t[0] += 5.0
+    session.do(SetIJK(7, 9, 5))  # a click: a jump
+    for _ in range(3):  # arrow keys, quickly and slowly: not jumps
+        t[0] += 0.05
+        session.do(SetIJK(7, 9, session.state.crosshair[2] - 1))
+    t[0] += 5.0
+    session.do(SetIJK(7, 8, 2))
+    assert session.state.crosshair == (7, 8, 2)
+
+    session.do(JumpBack())
+    assert session.state.crosshair == (2, 2, 2)
+    session.do(JumpBack())
+    assert session.state.crosshair == (7, 8, 2)
+
+    # A drag is one jump, from where it started.
+    t[0] += 5.0
+    for x in (2, 4, 6, 8):
+        t[0] += 0.03
+        session.do(SetIJK(x, 1, 1))
+    session.do(JumpBack())
+    assert session.state.crosshair == (7, 8, 2)
+
+
+def test_every_window_offers_j(win, qapp):
+    """The crosshair is shared, so its way back has to work from whichever window has focus."""
+    win.manager.open(ViewKind.GRAPH, Plane.AXIAL)
+    win.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
+    qapp.processEvents()
+    for w in (win, *win.manager.windows.values()):
+        assert "j" in [b.keys for b in w.help._bindings], type(w).__name__

@@ -59,7 +59,12 @@ from fastfuncstuff.viewer.ui.colorbar import RangeBar, colormap_icon, thresholds
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.flow import FlowBar
 from fastfuncstuff.viewer.ui.manager import WindowManager
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
 from fastfuncstuff.viewer.ui.widgets import RowSizedList, install_combo_pickers
@@ -1629,6 +1634,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.help = ShortcutHelp(self, "nexus")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Binding("Left", "crosshair -x", lambda: self._nudge(0, -1), group="navigate"),
                 Binding("Right", "crosshair +x", lambda: self._nudge(0, 1), group="navigate"),
                 Binding("Down", "crosshair -y", lambda: self._nudge(1, -1), group="navigate"),

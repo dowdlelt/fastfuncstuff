@@ -8,6 +8,7 @@ This is what a UI, a CLI or a test drives. Nothing above this layer touches
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -32,7 +33,9 @@ from fastfuncstuff.viewer.vocab import (
     CloseView,
     OpenView,
     ReloadLayer,
+    SetIJK,
     SetVolume,
+    SetXYZ,
     install,
 )
 
@@ -48,6 +51,11 @@ AUTORANGE_PERCENTILES = (2.0, 98.0)
 OVERLAY_START_PERCENTILE = 90.0
 #: Where a statistic's threshold starts, as a p (two-sided for t/z, upper tail for F).
 OVERLAY_START_P = 1e-3
+
+#: How long the crosshair must sit still before the place it leaves becomes the
+#: `j` target, seconds. A drag or a run of clicks is one jump, from where it
+#: started; without this, jumping back lands a few pixels along the drag.
+JUMP_REST_S = 0.5
 
 
 def derive_range(
@@ -220,6 +228,9 @@ class ViewerSession:
         store: VolumeStore | None = None,
     ) -> None:
         self.state = ViewerState()
+        #: Seconds, monotonic; replaceable so a test can step time.
+        self.clock: Callable[[], float] = time.monotonic
+        self._last_move = float("-inf")
         self.store = store or VolumeStore(device=device)
         self.bus = install(
             CommandBus(self.state, record=record), open_layer=self._open, session=self
@@ -457,8 +468,25 @@ class ViewerSession:
 
     def do(self, cmd: Command) -> Aspect:
         self._mode_dirty = Aspect.NOTHING
+        before, before_mm = self.state.crosshair, self.state.crosshair_mm
         dirty = self.bus.dispatch(cmd)
+        if isinstance(cmd, SetIJK | SetXYZ) and self.state.crosshair != before:
+            self._note_move(before, before_mm)
         return dirty | self._mode_dirty
+
+    def _note_move(self, before: tuple[int, int, int], before_mm) -> None:
+        """Remember where the crosshair left from, if that move was a jump.
+
+        A jump is a move of more than one voxel away from a place it rested
+        at. Arrow nudges and slice scrolling step one voxel, so they leave the
+        target alone: jumping somewhere, nudging to look around, then `j`
+        goes back to where you were before the jump.
+        """
+        now = self.clock()
+        far = max(abs(a - b) for a, b in zip(self.state.crosshair, before, strict=True)) > 1
+        if far and before_mm is not None and now - self._last_move >= JUMP_REST_S:
+            self.state.crosshair_back = before_mm
+        self._last_move = now
 
     # -- catalog -------------------------------------------------------
     def read_directory(self, directory: str | Path, *, recursive: bool = False) -> list:

@@ -148,6 +148,10 @@ class ViewerState:
     layers: LayerStack = field(default_factory=LayerStack)
     grid: DisplayGrid | None = None
     crosshair: tuple[int, int, int] = (0, 0, 0)
+    #: Where `j` jumps back to, scanner mm (so it survives a grid change).
+    #: Written by :meth:`ViewerSession.do`, which knows how the crosshair got
+    #: where it is; ``None`` until the crosshair has jumped somewhere.
+    crosshair_back: tuple[float, float, float] | None = None
     time_index: int = 0
     #: The open image and graph windows. Zoom, pan and what a window is locked
     #: to live here rather than on the state, because none of them mean

@@ -27,7 +27,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.matrix import ORDER_LABELS, ORDERINGS, CorrMatrix
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetMatrixOrder,
@@ -362,6 +367,7 @@ class MatrixWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"matrix · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Binding("o", "next node order", self._cycle_order, group="matrix"),
                 Binding(
                     "r", "rebuild", lambda: self.rebuild_requested.emit(self.vid), group="matrix"

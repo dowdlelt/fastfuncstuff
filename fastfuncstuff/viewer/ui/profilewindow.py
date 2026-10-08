@@ -29,7 +29,7 @@ from fastfuncstuff.viewer.profilecolumn import (
 from fastfuncstuff.viewer.surface3d import flag_ramp
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
-from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, jump_back_key, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import SetProfileView
 
@@ -255,6 +255,7 @@ class ProfileWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"profiles · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Key("m", "depth axis: stretched (fraction) / mm", self._toggle_mode, group="profiles"),
                 Key("(", "thinner tube", lambda: self._tube_by(-0.25), group="profiles"),
                 Key(")", "wider tube", lambda: self._tube_by(0.25), group="profiles"),

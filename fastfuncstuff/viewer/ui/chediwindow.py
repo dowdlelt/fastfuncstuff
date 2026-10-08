@@ -42,7 +42,12 @@ from fastfuncstuff.viewer.chedi import (
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.panes import _segment_path
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    Binding,
+    ShortcutHelp,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     HighlightSurface,
@@ -408,6 +413,7 @@ class ChediWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"chedi · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 Binding(
                     "[", "shallower (toward white)", lambda: self._depth_by(-0.1), group="depth"
                 ),

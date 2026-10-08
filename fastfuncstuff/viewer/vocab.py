@@ -55,6 +55,15 @@ class SetXYZ(Command):
 
 @command
 @dataclass(frozen=True)
+class JumpBack(Command):
+    """Swap the crosshair with where it was before its last jump (AFNI's Jumpback)."""
+
+    name = "JUMP_BACK"
+    aspects = Aspect.CROSSHAIR | Aspect.GRAPH
+
+
+@command
+@dataclass(frozen=True)
 class SetIndex(Command):
     """Set the time index (volume) shown across the stack."""
 
@@ -2094,6 +2103,20 @@ def install(
             return Aspect.NOTHING
         st.crosshair = target
         return SetXYZ.aspects
+
+    @bus.handle(JumpBack.name)
+    def _jump_back(cmd: Command, st: ViewerState) -> Aspect:
+        if st.grid is None or st.crosshair_back is None:
+            return Aspect.NOTHING
+        ijk = st.grid.mm_to_ijk(st.crosshair_back)
+        target = st.grid.clamp((round(ijk[0]), round(ijk[1]), round(ijk[2])))
+        # A swap, so a second `j` comes back: flipping between two places is
+        # what checking one against the other actually looks like.
+        st.crosshair_back = st.crosshair_mm
+        if target == st.crosshair:
+            return Aspect.NOTHING
+        st.crosshair = target
+        return JumpBack.aspects
 
     @bus.handle(SetIndex.name)
     def _set_index(cmd: Command, st: ViewerState) -> Aspect:

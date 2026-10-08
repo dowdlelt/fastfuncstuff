@@ -57,7 +57,12 @@ from fastfuncstuff.viewer import surface3d as s3
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
-from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, double_tap, keep_keys_for_shortcuts
+from fastfuncstuff.viewer.ui.shortcuts import (
+    ShortcutHelp,
+    double_tap,
+    jump_back_key,
+    keep_keys_for_shortcuts,
+)
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetAtlas,
@@ -1010,6 +1015,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.help = ShortcutHelp(self, f"surface · {vid}")
         self.help.apply(
             [
+                jump_back_key(self._dispatch),
                 *[
                     Key(k, f"{s} shape", lambda s=s: self._set_shape(s), group="shape")
                     for s, k in self._SHAPE_KEYS.items()
