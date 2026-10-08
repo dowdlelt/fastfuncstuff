@@ -348,8 +348,8 @@ def sample_time_offset(info: DatasetInfo) -> float | None:
 def read_info(path: str | Path) -> DatasetInfo:
     """Describe a dataset from its header alone (no image payload is read).
 
-    Accepts ``.nii`` / ``.nii.gz`` / ``.nii.zst``, AFNI ``.HEAD`` / ``.BRIK`` and
-    FreeSurfer ``.mgz`` / ``.mgh``,
+    Accepts ``.nii`` / ``.nii.gz`` / ``.nii.zst``, AFNI ``.HEAD`` / ``.BRIK``,
+    FreeSurfer ``.mgz`` / ``.mgh`` and GIfTI data (``.func.gii`` / ``.shape.gii``),
     with an optional AFNI ``[selector]`` suffix — the selector adjusts the
     reported volume count exactly as it would on a real load.
     """
@@ -363,7 +363,50 @@ def read_info(path: str | Path) -> DatasetInfo:
         return _read_afni_info(p, raw_arg, indices)
     if p.name.lower().endswith((".mgz", ".mgh")):
         return _read_mgh_info(p, raw_arg, indices)
+    if p.name.lower().endswith(".gii"):
+        return _read_gifti_info(p, raw_arg, indices)
     return _read_nifti_info(p, raw_arg, indices)
+
+
+def _read_gifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetInfo:
+    """A surface dataset as AFNI's 1-D volume ``(V, 1, 1, n_arrays)``, from the XML
+    alone: the arrays are base64 inline (a 460-frame series is ~75 MB), so this
+    counts and labels them without decoding any."""
+    import re
+
+    raw = p.read_bytes()
+    n_arr = raw.count(b"<DataArray")
+    dim0 = re.search(rb'Dim0="(\d+)"', raw)
+    info = DatasetInfo(path=p, iname=iname, exists=True, selector=indices)
+    info.storage = "GIFTI"
+    info.file_bytes = len(raw)
+    info.datum = "float"
+    info.itemsize = 4
+    nv = _apply_selector(n_arr, indices)
+    info.shape = (int(dim0.group(1)) if dim0 else 0, 1, 1, nv)
+    import html
+
+    # <MD><Name>k</Name><Value>v</Value></MD>, with or without CDATA (writers differ)
+    cdata = rb"(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?"
+    pairs = [
+        (html.unescape(k.decode()), html.unescape(v.decode()))
+        for k, v in re.findall(
+            rb"<Name>" + cdata + rb"</Name>\s*<Value>" + cdata + rb"</Value>", raw
+        )
+    ]
+    first_array = raw.find(b"<DataArray")
+    head = re.findall(rb"<Name>" + cdata + rb"</Name>", raw[: max(first_array, 0)])
+    file_md = dict(pairs[: len(head)])  # file-level metadata precedes the first array
+    try:
+        info.tr = float(file_md.get("TR_seconds", 0.0))
+    except ValueError:
+        info.tr = 0.0
+    labels = [v for k, v in pairs[len(head) :] if k == "Name"]
+    if labels and len(labels) == n_arr:
+        info.labels = (
+            labels if indices is None else [labels[i] for i in _resolve_indices(indices, n_arr)]
+        )
+    return info
 
 
 def _apply_selector(n_volumes: int, indices: list[int] | None) -> int:

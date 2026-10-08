@@ -26,6 +26,9 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info
 #: Extensions the viewer can open. Ordered longest-first so ``.nii.gz`` is
 #: matched before ``.gz``.
 SUFFIXES = (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD", ".BRIK.gz", ".BRIK")
+#: Surface DATA (a result on a mesh; it loads as a surface layer once its mesh is
+#: in). Meshes themselves (.surf.gii) are not datasets: the mesh list loads those.
+SURFACE_SUFFIXES = (".func.gii", ".shape.gii")
 
 
 class Kind(StrEnum):
@@ -97,7 +100,7 @@ def _looks_openable(name: str) -> bool:
     # same dataset twice; the HEAD is the one to keep.
     if lowered.endswith((".brik", ".brik.gz")):
         return False
-    return any(lowered.endswith(s.lower()) for s in SUFFIXES)
+    return any(lowered.endswith(s.lower()) for s in SUFFIXES + SURFACE_SUFFIXES)
 
 
 def _walk_fd(directory: Path, recursive: bool) -> list[Path] | None:
@@ -114,7 +117,7 @@ def _walk_fd(directory: Path, recursive: bool) -> list[Path] | None:
     cmd = [exe, "--type", "f", "--absolute-path"]
     if not recursive:
         cmd += ["--max-depth", "1"]
-    for suffix in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD"):
+    for suffix in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD", ".gii"):
         cmd += ["-e", suffix.lstrip(".")]
     cmd += [".", str(directory)]
     try:

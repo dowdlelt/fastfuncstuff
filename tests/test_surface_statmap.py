@@ -80,3 +80,29 @@ def test_a_reml_bucket_round_trips(tmp_path):
     assert data.stat == {1: (3, (55.0,))} and data.labels == ["c#0_Coef", "c#0_Tstat"]
     assert data.fingerprint == mesh_fingerprint(f, len(v))
     assert data.default_sub_brick() == 1
+
+
+def test_pickers_list_surface_data_from_the_xml_alone(tmp_path):
+    """The viewer's pickers header-read every candidate; a .func.gii is AFNI's 1-D
+    volume (V, 1, 1, n) with its brick labels, and a .surf.gii mesh is not a dataset."""
+    import nibabel as nib
+
+    from fastfuncstuff.io.dsetinfo import read_info
+    from fastfuncstuff.viewer.catalog import Kind, describe, discover
+
+    arrays = []
+    for name in ("Full_Fstat", "task#0_Coef", "task#0_Tstat"):
+        da = nib.gifti.GiftiDataArray(np.zeros(40962, np.float32), datatype="NIFTI_TYPE_FLOAT32")
+        da.meta = nib.gifti.GiftiMetaData({"Name": name})
+        arrays.append(da)
+    img = nib.gifti.GiftiImage(darrays=arrays, meta=nib.gifti.GiftiMetaData({"TR_seconds": "1.5"}))
+    nib.save(img, str(tmp_path / "stats.lh.func.gii"))
+    (tmp_path / "x.lh.white.surf.gii").write_text("not data")
+    info = read_info(tmp_path / "stats.lh.func.gii")
+    assert info.shape == (40962, 1, 1, 3) and info.tr == 1.5 and info.storage == "GIFTI"
+    assert info.labels == ["Full_Fstat", "task#0_Coef", "task#0_Tstat"]
+    assert read_info(f"{tmp_path / 'stats.lh.func.gii'}[2]").labels == ["task#0_Tstat"]
+    found = discover(tmp_path)
+    assert [p.name for p in found] == ["stats.lh.func.gii"]
+    (entry,) = describe(found)
+    assert entry.kind == Kind.STATS and entry.n_volumes == 3
