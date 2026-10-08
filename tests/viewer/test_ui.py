@@ -1885,6 +1885,22 @@ def test_changing_the_cluster_minimum_recomputes_the_table(win4d, qapp, tmp_path
     assert window.table.rowCount() == 1
 
 
+def test_an_alpha_takes_over_the_minimum_and_says_so_without_a_table(win4d, qapp, tmp_path):
+    """α greys out MIN (the table sets it); a map with no ClustSim table keeps the
+    typed MIN and the note says that is what happened."""
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    window.alpha_box.setCurrentIndex(window.alpha_box.findData(0.05))
+    window.alpha_box.activated.emit(window.alpha_box.currentIndex())
+    qapp.processEvents()
+    assert window.alpha == 0.05 and not window.min_spin.isEnabled()
+    assert window.table.rowCount() == 2
+    assert "MIN 1 used" in window.info.text()
+    window.alpha_box.setCurrentIndex(0)
+    window.alpha_box.activated.emit(0)
+    qapp.processEvents()
+    assert window.alpha is None and window.min_spin.isEnabled()
+
+
 def test_hide_small_hides_what_the_table_left_out(win4d, qapp, tmp_path):
     """The picture shows what the table lists: the 4-voxel blob under MIN goes,
     the kept cluster and the sub-threshold background stay drawable."""

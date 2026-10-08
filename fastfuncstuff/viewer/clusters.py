@@ -94,6 +94,11 @@ class ClusterTable:
     #: display mask drop the speckle and still leave the sub-threshold alpha
     #: ramp around the clusters that survived.
     dropped: np.ndarray | None = None
+    #: Clustered on a cortical surface (sized in mm^2), even with no cluster left.
+    on_surface: bool = False
+    #: How the minimum size was set when it came from an alpha, e.g.
+    #: ``"α 0.05 → ≥ 37 voxels"``; empty for a minimum typed in.
+    size_rule: str = ""
 
     def __len__(self) -> int:
         return len(self.clusters)
@@ -111,7 +116,7 @@ class ClusterTable:
     @property
     def is_surface(self) -> bool:
         """Found on a cortical surface: sized by area (mm^2), not volume."""
-        return any(c.area_mm2 is not None for c in self.clusters)
+        return self.on_surface or any(c.area_mm2 is not None for c in self.clusters)
 
     def summary(self) -> str:
         text = f"{len(self.clusters)} clusters, {self.n_voxels:,} voxels"
@@ -121,7 +126,11 @@ class ClusterTable:
         text += f"   thr {self.threshold:.4g}"
         if self.pthr is not None:
             text += f" (p {self.pthr:.2g})"
-        text += f"   NN{self.nn} {self.sidedness}"
+        text += (
+            f"   NN{self.nn} {self.sidedness}" if not self.is_surface else f"   {self.sidedness}"
+        )
+        if self.size_rule:
+            text += f"   {self.size_rule}"
         return text
 
 
@@ -138,6 +147,7 @@ def clusterize(
     table=None,
     pthr: float | None = None,
     mask: np.ndarray | None = None,
+    alpha: float | None = None,
 ) -> ClusterTable:
     """Label a thresholded volume and measure every blob.
 
@@ -153,6 +163,11 @@ def clusterize(
     ``mask`` restricts clustering to its nonzero voxels, as ``3dClusterize
     -mask`` does: a blob that runs out of the brain is sized by the part
     inside it, and speckle outside the brain is never a cluster at all.
+
+    ``alpha`` replaces ``min_voxels`` with the size the ClustSim table asks for at
+    that corrected alpha, this ``pthr`` and this ``nn`` -- what 3dClusterize's
+    ``-clust_nvox`` would be given from the table. Without a table or a p it falls
+    back to ``min_voxels`` and the note says why.
     """
     from fastfuncstuff.stats.cluster import cluster_map
 
@@ -177,6 +192,21 @@ def clusterize(
     work = -cut if sign_mode is SignMode.NEG else cut
     sidedness = SIDEDNESS[sign_mode]
     labels, sizes, _masses = cluster_map(work, threshold, sidedness=sidedness, nn=nn)
+    note = ""
+    if table is None:
+        note = "no ClustSim table in this dataset"
+    elif pthr is None:
+        note = "the threshold has no p, so no ClustSim row applies"
+    size_rule = ""
+    if alpha is not None:
+        need = None if table is None or pthr is None else table.min_size(pthr, alpha)
+        if need is not None:
+            min_voxels = int(need + 0.951)  # AFNI's rounding (find_cluster_thresh)
+            size_rule = f"α {alpha:g} → ≥ {min_voxels:,} voxels"
+        elif not note:
+            note = f"the table has no size for α {alpha:g} at p {pthr:.2g}"
+        if not size_rule:
+            note += f"; MIN {int(min_voxels)} used instead"
 
     keep = [i + 1 for i, n in enumerate(sizes) if int(n) >= max(int(min_voxels), 1)]
     # Renumber so the table's indices are the label map's, biggest first -- a
@@ -188,12 +218,6 @@ def clusterize(
         renumber[label] = position + 1
     dropped = (labels > 0) & (renumber[labels] == 0)
     labels = renumber[labels]
-
-    note = ""
-    if table is None:
-        note = "no ClustSim table in this dataset"
-    elif pthr is None:
-        note = "the threshold has no p, so no ClustSim row applies"
 
     clusters = _measure_all(
         volume,
@@ -216,6 +240,7 @@ def clusterize(
         alpha_range=None if table is None or pthr is None else table.alpha_range,
         note=note,
         dropped=dropped,
+        size_rule=size_rule,
     )
 
 

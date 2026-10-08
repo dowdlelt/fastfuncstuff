@@ -236,3 +236,20 @@ def test_a_surface_overlay_gets_the_overlay_look(world):
     assert layer.colormap == "redblue" and layer.range_lo == -layer.range_hi == -3.0
     look = s.overlay_look("S", 1, colormap=layer.colormap)  # what AUTO applies
     assert look["range_lo"] == -look["range_hi"] and look["range_hi"] == pytest.approx(6.0)
+
+
+def test_an_alpha_sizes_each_hemisphere_by_its_own_table(world):
+    """Each hemisphere was simulated apart: at α 0.05 lh asks for 150 mm², rh (a
+    smoother map, say) for 900 -- more than its ~580 mm² cap -- so only lh's stays."""
+    from fastfuncstuff.viewer.vocab import SetThreshold, SetThresholdIndex
+
+    s, tmp, d, f, t = world
+    rough = {"pthr": [0.01, 0.001], "athr": [0.1, 0.05], "area_mm2": [[1500.0, 1800.0], [700.0, 900.0]]}  # fmt: skip
+    _bucket(tmp / "s.rh.func.gii", f, len(d), t, rough)
+    key = s.load(str(tmp / "s.lh.func.gii"))
+    s.do(SetThresholdIndex(key, 1))
+    s.do(SetThreshold(key, float(stats.t.isf(0.0005, DOF))))
+    _, table = s.clusterize(key, min_voxels=1, alpha=0.05)
+    assert len(table) == 1 and table.clusters[0].peak_xyz[0] < 0  # lh's cap
+    assert "lh ≥ 150 mm²" in table.size_rule and "rh ≥ 900 mm²" in table.size_rule
+    assert table.is_surface and table.dropped is not None and table.dropped.any()

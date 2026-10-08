@@ -159,3 +159,22 @@ def test_dropped_marks_exactly_the_speckle_under_min_voxels():
     assert int(table.dropped.sum()) == 4
     assert np.all(v[table.dropped] == -6.0)
     assert not (table.dropped & (table.labels > 0)).any()
+
+
+def test_an_alpha_sets_the_minimum_size_from_the_table():
+    """α 0.05 at p 0.01 asks for 20.0 voxels: the 32-voxel blob stays, the 4-voxel
+    one goes, whatever MIN was typed; without a table MIN stands and the note says so."""
+    from fastfuncstuff.stats.clustsim import ClustSimTable
+
+    cs = ClustSimTable(
+        nn=1, sidedness="bi-sided", pthr=(0.01,), athr=(0.10, 0.05, 0.01),
+        sizes=np.array([[3.0, 20.0, 40.0]]),
+    )  # fmt: skip
+    table = clusterize(_two_blobs(), threshold=2.0, table=cs, pthr=0.01, alpha=0.05, min_voxels=1)
+    assert [c.n_voxels for c in table] == [32] and table.min_voxels == 20
+    assert "≥ 20 voxels" in table.summary()
+    assert table.dropped is not None and table.dropped.sum() == 4
+    loose = clusterize(_two_blobs(), threshold=2.0, table=cs, pthr=0.01, alpha=0.10)
+    assert [c.n_voxels for c in loose] == [32, 4]  # 3.0 + 0.951 rounds to 3
+    bare = clusterize(_two_blobs(), threshold=2.0, alpha=0.05, min_voxels=5)
+    assert [c.n_voxels for c in bare] == [32] and "MIN 5 used" in bare.note

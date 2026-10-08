@@ -1719,8 +1719,12 @@ class ViewerSession:
         nn: int = 1,
         min_voxels: int = 1,
         mask: np.ndarray | None = None,
+        alpha: float | None = None,
     ):
         """Cluster one layer at the threshold it is currently drawn with.
+
+        ``alpha`` sets the minimum size from the dataset's ClustSim table (voxels,
+        or mm^2 per hemisphere on a surface) in place of ``min_voxels``.
 
         The layer's own threshold, not one passed in: a table computed at a
         different cut does not describe the picture beside it, and two things
@@ -1757,7 +1761,9 @@ class ViewerSession:
                 )
                 for h in sld.parts
             }
-            return layer, surface_clusterize(layer, sld, geometry, min_voxels=min_voxels, pthr=pthr)
+            return layer, surface_clusterize(
+                layer, sld, geometry, min_voxels=min_voxels, pthr=pthr, alpha=alpha
+            )
         values = self.volume(layer.key, layer.volume_index)
         stat = self.volume(layer.key, layer.threshold_brick)
 
@@ -1786,6 +1792,7 @@ class ViewerSession:
             table=table,
             pthr=pthr,
             mask=mask,
+            alpha=alpha,
         )
 
     # -- display masks -----------------------------------------------------

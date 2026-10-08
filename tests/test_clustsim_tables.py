@@ -9,6 +9,7 @@ at which point every corrected p silently becomes "none available".
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from fastfuncstuff.stats.clustsim import (
     ClustSimTable,
@@ -114,3 +115,23 @@ def test_tables_are_found_by_nn_and_sidedness(tmp_path):
     assert set(found) == {(1, "1-sided"), (2, "bi-sided")}
     assert isinstance(found[(1, "1-sided")], ClustSimTable)
     assert found[(2, "bi-sided")].nn == 2
+
+
+def test_the_size_for_an_alpha_is_afni_find_cluster_thresh():
+    """afni_cluster.c:find_cluster_thresh: the tabulated alpha at or below the one
+    asked for, a power law between the bracketing p rows, nothing past the loose end."""
+    from fastfuncstuff.stats.clustsim import clustsim_min_size
+
+    pthr, athr = (0.01, 0.001), (0.10, 0.05, 0.01)
+    sizes = np.array([[40.0, 50.0, 80.0], [10.0, 12.0, 20.0]])
+    assert clustsim_min_size(pthr, athr, sizes, 0.001, 0.05) == 12.0
+    assert clustsim_min_size(pthr, athr, sizes, 0.01, 0.05) == 50.0
+    # half-way in log p is the geometric mean of the two rows
+    mid = np.sqrt(0.01 * 0.001)
+    assert clustsim_min_size(pthr, athr, sizes, mid, 0.05) == pytest.approx(np.sqrt(50 * 12))
+    # an alpha between columns takes the stricter one, never the looser
+    assert clustsim_min_size(pthr, athr, sizes, 0.001, 0.03) == 20.0
+    # stricter than every row: the strictest row (over-asks); looser: no answer
+    assert clustsim_min_size(pthr, athr, sizes, 1e-5, 0.05) == 12.0
+    assert clustsim_min_size(pthr, athr, sizes, 0.02, 0.05) is None
+    assert clustsim_min_size(pthr, athr, sizes, 0.001, 0.005) is None

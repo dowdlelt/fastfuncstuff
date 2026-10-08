@@ -881,6 +881,47 @@ class ClustSimTable:
         """``(strictest, loosest)`` alpha the simulation actually covers."""
         return (float(min(self.athr)), float(max(self.athr)))
 
+    def min_size(self, pthr: float, alpha: float) -> float | None:
+        """Smallest cluster that reaches ``alpha`` at a per-voxel ``pthr``, in voxels
+        (fractional; AFNI rounds with ``int(c + 0.951)``). See :func:`clustsim_min_size`."""
+        return clustsim_min_size(self.pthr, self.athr, self.sizes, pthr, alpha)
+
+
+def clustsim_min_size(pthr, athr, sizes, pval: float, alpha: float) -> float | None:
+    """The cluster size a ClustSim table asks for at ``alpha``, thresholded at ``pval``.
+
+    AFNI's own lookup (``afni_cluster.c:find_cluster_thresh``), so the viewer and the
+    AFNI GUI give one number: the tabulated alpha at or below ``alpha`` (never a
+    looser one), and between the two per-voxel p rows bracketing ``pval`` a power
+    law -- linear in log size against log p. A p stricter than every row uses the
+    strictest row, which over-asks (conservative). ``None`` when ``pval`` is looser
+    than every row, or ``alpha`` stricter than every column: the simulation has
+    nothing to say there, and extrapolating it would be inventing a threshold.
+
+    ``sizes`` is ``(len(pthr), len(athr))``: voxels for 3dClustSim, mm^2 for
+    SurfClustSim.
+    """
+    p = np.asarray(pthr, dtype=float)
+    a = np.asarray(athr, dtype=float)
+    s = np.asarray(sizes, dtype=float)
+    pval, alpha = float(pval), float(alpha)
+    if not (pval > 0 and alpha > 0) or pval > p.max() * (1 + 1e-6):
+        return None
+    ok = np.flatnonzero(a <= alpha * (1 + 1e-6))
+    if ok.size == 0:
+        return None
+    col = s[:, ok[np.argmax(a[ok])]]
+    order = np.argsort(-p)  # loosest row first, as AFNI stores them
+    p, col = p[order], col[order]
+    if pval <= p[-1]:
+        return float(col[-1])
+    hi = int(np.searchsorted(-p, -pval, side="left"))  # first row with p <= pval
+    lo = max(hi - 1, 0)
+    if hi == lo or p[hi] == pval:
+        return float(col[hi])
+    t = np.log(pval / p[lo]) / np.log(p[hi] / p[lo])
+    return float(col[lo] * (col[hi] / col[lo]) ** t)
+
 
 def parse_clustsim_niml(text: str) -> ClustSimTable | None:
     """Parse one ``<3dClustSim_NNn …>`` element. Inverse of the writer above."""

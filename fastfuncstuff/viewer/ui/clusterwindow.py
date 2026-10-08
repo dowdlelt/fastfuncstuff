@@ -39,6 +39,9 @@ BARE_WIDTH = 260
 #: asked to draw. Lowering it is one edit; waiting out a table nobody wanted
 #: is not.
 DEFAULT_MIN_VOXELS = 100
+#: Corrected alphas the α box offers; each picks the minimum cluster size off the
+#: dataset's own ClustSim table.
+ALPHAS = (0.10, 0.05, 0.02, 0.01)
 #: Rows actually put in the table. The clusters past it are still counted in
 #: the summary and still in the label map MAKE ROIS adopts -- a QTableWidget
 #: row is milliseconds, and nobody reads row 5,000.
@@ -152,6 +155,20 @@ class ClusterWindow(QtWidgets.QWidget):
         self.min_spin.valueChanged.connect(lambda _: self.rebuild_requested.emit(self.vid))
         bar.addWidget(self.min_spin)
 
+        bar.addWidget(QtWidgets.QLabel("α"))
+        self.alpha_box = QtWidgets.QComboBox()
+        self.alpha_box.addItem("off", userData=None)
+        for a in ALPHAS:
+            self.alpha_box.addItem(f"{a:g}", userData=a)
+        self.alpha_box.setToolTip(
+            "Set MIN from the dataset's ClustSim table: the smallest cluster that is "
+            "significant at this corrected alpha, for the per-voxel p the threshold "
+            "is at, the NN and the sidedness. Voxels on a volume; on a surface, mm² "
+            "of cortex for each hemisphere from its own table. Off: MIN as typed."
+        )
+        self.alpha_box.activated.connect(lambda _: self._alpha_changed())
+        bar.addWidget(self.alpha_box)
+
         bar.addStretch(1)
         self.rois_button = QtWidgets.QPushButton(theme.key_label("MAKE ROIS", "m"))
         self.rois_button.setToolTip(
@@ -243,6 +260,15 @@ class ClusterWindow(QtWidgets.QWidget):
         return int(self.min_spin.value())
 
     @property
+    def alpha(self) -> float | None:
+        """The corrected alpha MIN is read off the ClustSim table at, or ``None``."""
+        return self.alpha_box.currentData()
+
+    def _alpha_changed(self) -> None:
+        self.min_spin.setEnabled(self.alpha is None)
+        self.rebuild_requested.emit(self.vid)
+
+    @property
     def hide_small(self) -> bool:
         return self.hide_check.isChecked()
 
@@ -313,6 +339,13 @@ class ClusterWindow(QtWidgets.QWidget):
         # it came about, and what its alpha was simulated in -- not by the volume
         # its ribbon happens to paint on this grid.
         surface = table.is_surface
+        # Mesh neighbours share an edge; there is no face/edge/corner choice to make,
+        # and SurfClustSim tables are not keyed by one.
+        self.nn_box.setEnabled(not surface)
+        if table.size_rule and not surface:
+            self.min_spin.blockSignals(True)
+            self.min_spin.setValue(table.min_voxels)
+            self.min_spin.blockSignals(False)
         self.table.setHorizontalHeaderItem(
             2, QtWidgets.QTableWidgetItem("mm²" if surface else "mm³")
         )

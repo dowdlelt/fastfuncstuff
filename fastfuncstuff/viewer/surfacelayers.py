@@ -174,7 +174,7 @@ def _cluster_alpha(table: dict, pthr: float | None, area: float) -> float | None
 
 
 def surface_clusterize(layer, sld: SurfaceLayerData, hemis_geometry, *, min_voxels: int = 1,
-                       pthr: float | None = None):  # fmt: skip
+                       pthr: float | None = None, alpha: float | None = None):  # fmt: skip
     """Cluster a surface layer at its own threshold, on the mesh; a volume ClusterTable.
 
     ``hemis_geometry[hemi] = (white, pial, faces)``. Clusters are connected over mesh
@@ -183,7 +183,13 @@ def surface_clusterize(layer, sld: SurfaceLayerData, hemis_geometry, *, min_voxe
     painted into the layer grid through the ribbon map -- so ``labels`` and
     ``dropped`` are voxels, as every consumer of a cluster table expects. A cluster is
     "small" by its voxel count on that grid, the cluster window's own unit.
+
+    ``alpha`` replaces that with cortical area: each hemisphere keeps the clusters
+    at least as big as its own SurfClustSim table asks for at ``alpha`` and ``pthr``
+    (the hemispheres were simulated apart, so the two minimums differ). A hemisphere
+    with no table, or no size at that p, falls back to ``min_voxels``.
     """
+    from fastfuncstuff.stats.clustsim import clustsim_min_size
     from fastfuncstuff.surface.mesh import vertex_areas
     from fastfuncstuff.surface.statmap import surviving_clusters
     from fastfuncstuff.viewer.clusters import SIDEDNESS, Cluster, ClusterTable
@@ -199,6 +205,7 @@ def surface_clusterize(layer, sld: SurfaceLayerData, hemis_geometry, *, min_voxe
     found = []
     sld.clusters = {}
     alphas_seen = []
+    rules, fallback = [], []
     for hemi, data in sld.parts.items():
         white, pial, faces = hemis_geometry[hemi]
         mid = 0.5 * (np.asarray(white, np.float64) + np.asarray(pial, np.float64))
@@ -215,13 +222,23 @@ def surface_clusterize(layer, sld: SurfaceLayerData, hemis_geometry, *, min_voxe
         counts = np.bincount(lab[rm.vertex], minlength=int(lab.max()) + 1) if lab.max() else []
         vdropped = np.zeros(len(vals), bool)
         table = data.tables.get(sided)
+        min_area = None
+        if alpha is not None and table is not None and pthr is not None:
+            min_area = clustsim_min_size(
+                table["pthr"], table["athr"], table["area_mm2"], pthr, alpha
+            )
+        if min_area is not None:
+            rules.append(f"{hemi} ≥ {min_area:,.0f} mm²")
+        elif alpha is not None:
+            fallback.append(hemi)
         for c in range(1, int(lab.max()) + 1):
             ids = np.flatnonzero(lab == c)
             nvox = int(counts[c]) if c < len(counts) else 0
-            if nvox < max(min_voxels, 1):
+            a_mm2 = float(area[ids].sum())
+            small = a_mm2 < min_area if min_area is not None else nvox < max(min_voxels, 1)
+            if small:
                 vdropped[ids] = True
                 continue
-            a_mm2 = float(area[ids].sum())
             peak_v = ids[np.argmax(np.abs(vals[ids]))]
             w = np.abs(vals[ids])
             com = (mid[ids] * w[:, None]).sum(0) / max(w.sum(), 1e-12)
@@ -258,11 +275,16 @@ def surface_clusterize(layer, sld: SurfaceLayerData, hemis_geometry, *, min_voxe
     note = "" if any(tables) else "no SurfClustSim table in this bucket: no corrected alpha"
     if pthr is None and any(tables):
         note = "the threshold sub-brick is not a statistic: no corrected alpha"
+    if fallback:
+        note = "; ".join(
+            x for x in (note, f"no α size for {', '.join(fallback)}: MIN voxels used") if x
+        )
     arange = None
     if any(tables) and pthr is not None:
         t = next(x for x in tables if x)
         arange = (float(min(t["athr"])), float(max(t["athr"])))
     return ClusterTable(
         tuple(clusters), labels, float(layer.threshold), sided, 0, int(min_voxels), pthr,
-        arange, note, dropped,
+        arange, note, dropped, on_surface=True,
+        size_rule=f"α {alpha:g} → {', '.join(rules)}" if rules else "",
     )  # fmt: skip

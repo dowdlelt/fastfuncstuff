@@ -1036,7 +1036,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 if layer is not None and window.within is not None:
                     within = session.mask_from_layer(window.within, layer)
                 source, table = session.clusterize(
-                    None, nn=window.nn, min_voxels=window.min_voxels, mask=within
+                    None,
+                    nn=window.nn,
+                    min_voxels=window.min_voxels,
+                    mask=within,
+                    alpha=window.alpha,
                 )
             except (ValueError, KeyError, FileNotFoundError) as exc:
                 # On the window, not the status bar: the thing that could not
