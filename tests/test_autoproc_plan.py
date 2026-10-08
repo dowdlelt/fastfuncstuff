@@ -2182,6 +2182,23 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     assert s.index("== stage10: final") < s.index("== stage10s: surface masks")
 
 
+def test_surface_chain_array_survives_bash():
+    """Run keys are "ses:task:run"; an array missing from `declare -A` is indexed, and
+    bash evaluates the key as arithmetic -- every SURFCHAIN assignment failed that way
+    on real data while the string checks above passed."""
+    import subprocess
+
+    s = _skull_script(surface_target=["native"], fs_subject="/fs/sub-X")
+    lines = [x for x in s.splitlines() if x.startswith(("declare -A", "SURFCHAIN[", "CHAIN["))]
+    keys = [x.split("[", 1)[1].split("]", 1)[0] for x in lines if x.startswith("SURFCHAIN[")]
+    assert keys
+    probe = "\n".join(lines + [f'echo "${{SURFCHAIN[{k}]}}"' for k in keys])
+    out = subprocess.run(["bash", "-c", probe], capture_output=True, text=True)
+    assert out.returncode == 0 and out.stderr == "", out.stderr
+    assert all(line.strip() for line in out.stdout.splitlines())
+    assert len(out.stdout.splitlines()) == len(keys)
+
+
 def test_surface_qc_rides_the_same_line():
     s = _skull_script(surface_target=["native"], fs_subject="/fs/sub-X", surface_qc=True)
     line = next(x for x in s.splitlines() if "-surf " in x and "printf" in x)

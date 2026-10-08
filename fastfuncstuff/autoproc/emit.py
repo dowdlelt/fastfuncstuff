@@ -1239,6 +1239,9 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
     lines.append(
         "declare -A MAG PHASE NOISE SBREF TR PEDIR JSON FRAG CHAIN AVGCHAIN XRUNBASE EVENTS "
         f"{moco_arrays} PRECHAIN REFGRID JAC"
+        # Keys are "ses:task:run": undeclared, bash takes SURFCHAIN as an indexed
+        # array and evaluates the key as arithmetic, failing every assignment.
+        + (" SURFCHAIN" if plan.options.surface_target else "")
     )
 
     # first run per session (the no-fmap anchor).

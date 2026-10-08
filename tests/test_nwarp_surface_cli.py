@@ -352,3 +352,9 @@ def test_batch_skip_lists_exactly_what_a_combined_qc_run_writes(world, tmp_path)
     expected = {Path(p).resolve() for p in _expected_outputs(parse_args(argv))}
     written = {p.resolve() for p in out.iterdir()}
     assert expected == written
+
+
+def test_empty_surf_nwarp_is_refused(world, tmp_path):
+    """An unset shell variable must not become 'no transforms'."""
+    with pytest.raises(SystemExit, match="-surf_nwarp is empty"):
+        _run(world, tmp_path, "-surf_prefix", str(tmp_path / "s"), "-surf_nwarp", " ")

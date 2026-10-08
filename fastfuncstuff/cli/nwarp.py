@@ -656,6 +656,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if verb >= 1:
         print_cli_section("Applying transforms")
 
+    if args.surf_nwarp is not None and not args.surf_nwarp.split():
+        # An empty chain would sample raw EPI as if it were already in the anatomy.
+        raise SystemExit("ffs_nwarp: -surf_nwarp is empty (an unset shell variable?)")
     if args.surf and jac_axis is not None and jac_match is None:
         # Checked before the volume pass, not after it has been written.
         raise SystemExit(
@@ -738,6 +741,7 @@ def _dispatch_surface(
 
     if args.surf_nwarp is not None:
         nwarp_specs = parse_nwarp_string(args.surf_nwarp)
+
     master = args.surf_master or args.master
     wrong = [
         flag
