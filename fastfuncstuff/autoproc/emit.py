@@ -3162,7 +3162,8 @@ def _surface_args(plan: Plan) -> str:
     return (
         f" -surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
         ' -surf_prefix \\"stage10s.surf.${FRAG[$k]}\\" -surf_master \\"$ANAT\\"'
-        ' -surf_nwarp \\"${SURFCHAIN[$k]}\\"' + (" -surf_qc" if opt.surface_qc else "")
+        ' -surf_nwarp \\"${SURFCHAIN[$k]}\\" -surf_geom_prefix stage10s.surf'
+        + (" -surf_qc" if opt.surface_qc else "")
     )
 
 

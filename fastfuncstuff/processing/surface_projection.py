@@ -37,6 +37,7 @@ __all__ = [
     "resolve_mesh",
     "resolve_subject",
     "space_name",
+    "subject_on_mesh",
     "surface_targets",
 ]
 
@@ -170,6 +171,59 @@ def surface_targets(
     return out
 
 
+def subject_on_mesh(subject_dir: str | os.PathLike, mesh: str, hemis=("lh", "rh")) -> dict:
+    """A FreeSurfer subject's hemispheres on a template mesh, for display.
+
+    Every surface state the subject has (white, pial, smoothwm, inflated, sphere)
+    and its curv / sulc / thickness are carried onto the template's vertices
+    through ``?h.sphere.reg`` -- the same placement the projection used, so a
+    result made on that template matches by fingerprint. The cortex mask is the
+    template's own label. ``"native"`` is just the subject. The hemispheres have
+    no file ``paths``: a template copy is not something to write edits back into.
+    """
+    from fastfuncstuff.io.freesurfer import Hemisphere, load_hemisphere, load_subject
+
+    subject_dir = resolve_subject(subject_dir)
+    folder = resolve_mesh(mesh, subject_dir)
+    if folder is None:
+        return load_subject(subject_dir, tuple(hemis))
+    out = {}
+    for hemi in hemis:
+        if not (subject_dir / "surf" / f"{hemi}.white").exists():
+            continue
+        native = load_hemisphere(subject_dir, hemi, patches=False)
+        reg = read_surface(subject_dir / "surf" / f"{hemi}.sphere.reg")
+        tgt = read_surface(folder / "surf" / f"{hemi}.sphere.reg")
+        positions = {f"surf:{k}": v.astype(np.float64) for k, v in native.states.items()}
+        positions["surf:sphere.reg"] = reg.vertices.astype(np.float64)
+        spherical = {"surf:sphere.reg": np.zeros(3)}
+        if "surf:sphere" in positions:
+            # the display sphere was shifted into scanner space with everything else
+            spherical["surf:sphere"] = native.tkr_to_scanner[:3, 3].astype(np.float64)
+        bundle = MeshBundle(
+            faces=native.faces.astype(np.int64),
+            positions=positions,
+            scalars={k: v.astype(np.float64) for k, v in native.morph.items()},
+            spherical=spherical,
+        )
+        placed, _ = remesh_via_sphere(bundle, tgt.vertices, tgt.faces)
+        states = {
+            name.removeprefix("surf:"): placed.positions[name].astype(np.float32)
+            for name in positions
+            if name != "surf:sphere.reg"
+        }
+        n = len(tgt.vertices)
+        out[hemi] = Hemisphere(
+            name=hemi,
+            faces=np.asarray(tgt.faces, np.int32),
+            states=states,
+            tkr_to_scanner=native.tkr_to_scanner,
+            morph={k: placed.scalars[k].astype(np.float32) for k in native.morph},
+            cortex=_cortex(folder, hemi, n),
+        )
+    return out
+
+
 def _voxel_face(source_path: str) -> float:
     """Face area of the source voxel (mm^2), the geometric mean for anisotropic voxels."""
     from fastfuncstuff.io.headers import read_nifti_header
@@ -190,7 +244,13 @@ def depth_weights(fractions, weights=None) -> np.ndarray:
 
 
 def output_paths(
-    prefix: str, meshes, hemis, fractions, depth_combine: str = "mean", qc: bool = False
+    prefix: str,
+    meshes,
+    hemis,
+    fractions,
+    depth_combine: str = "mean",
+    qc: bool = False,
+    geom_prefix: str | None = None,
 ) -> list[str]:
     """Every file :func:`project_to_surface` writes, in order (for -batch_skip)."""
     out = [f"{prefix}.{space_name(m)}.samples.nii.gz" for m in meshes] if qc else []
@@ -202,7 +262,8 @@ def output_paths(
             else:
                 out += [f"{stem}.depth-{float(f):.2f}.func.gii" for f in fractions]
             out += [f"{stem}.{n}.shape.gii" for n in ("coverage", "mask", "mean")]
-            out += [f"{stem}.{s}.surf.gii" for s in ("white", "pial", "midthickness")]
+            gstem = f"{geom_prefix or prefix}.{space_name(mesh)}.{hemi}"
+            out += [f"{gstem}.{s}.surf.gii" for s in ("white", "pial", "midthickness")]
             if qc:
                 out += [
                     f"{stem}.{n}.shape.gii" for n in ("voxel_volume", "blur_fwhm", "noise_ratio")
@@ -303,6 +364,7 @@ def project_to_surface(
     verb: int = 1,
     qc: bool = False,
     qc_frames: int = 64,
+    geom_prefix: str | None = None,
     **nwarp_kwargs,
 ) -> list[Path]:
     """Sample ``source`` onto every target mesh through the chain and write GIfTI.
@@ -321,6 +383,9 @@ def project_to_surface(
       mask clips on);
     * ``.white/.pial/.midthickness.surf.gii`` -- the target's vertices placed in THIS
       subject (scanner mm): the geometry smoothing, cluster areas and display need.
+
+    ``geom_prefix`` puts the placed geometry under another stem: it depends only on
+    (subject, mesh), so every run of a subject can share one copy.
 
     ``qc`` adds :func:`surface_qc.surface_qc`'s maps (samples per native voxel,
     effective voxel volume, blur FWHM) from ``qc_frames`` noise volumes.
@@ -371,13 +436,15 @@ def project_to_surface(
     written: list[Path] = []
     for t, combined, values, cov in fold.split(out.cpu().numpy()):
         stem = f"{prefix}.{t.mesh}.{t.hemi}"
+        gstem = f"{geom_prefix or prefix}.{t.mesh}.{t.hemi}"
         geom = {
             "white": t.white,
             "pial": t.pial,
             "midthickness": 0.5 * (t.white + t.pial),
         }
         for name, pos in geom.items():
-            path = Path(f"{stem}.{name}.surf.gii")
+            path = Path(f"{gstem}.{name}.surf.gii")
+            path.parent.mkdir(parents=True, exist_ok=True)
             save_gifti_surface(path, pos, t.faces, {**t.meta, "surface": name})
         meta = dict(t.meta)
         meta.update(
@@ -385,8 +452,8 @@ def project_to_surface(
             sampling=sample,
             depths=" ".join(f"{f:g}" for f in t.sampling.fractions),
             equivolume="1",
-            # Relative, so the outputs can move together.
-            geometry=Path(f"{stem}.midthickness.surf.gii").name,
+            # Relative to the data file, so the outputs can move together.
+            geometry=os.path.relpath(f"{gstem}.midthickness.surf.gii", Path(stem).parent),
         )
         if tr and tr > 0:
             meta["TR_seconds"] = f"{tr:g}"
@@ -417,7 +484,7 @@ def project_to_surface(
             path = Path(f"{stem}.{name}.shape.gii")
             save_gifti_data(path, vals.astype(np.float32), meta, time_series=False)
             written.append(path)
-        written += [Path(f"{stem}.{name}.surf.gii") for name in geom]
+        written += [Path(f"{gstem}.{name}.surf.gii") for name in geom]
     if qc:
         from .surface_qc import surface_qc
 
@@ -426,6 +493,6 @@ def project_to_surface(
             source_image=nwarp_kwargs["source_image"], n_frames=qc_frames,
             interp=nwarp_kwargs.get("interp", "wsinc5"),
             ainterp=nwarp_kwargs.get("ainterp", "cubic"),
-            device=nwarp_kwargs.get("device"), verb=verb,
+            device=nwarp_kwargs.get("device"), verb=verb, geom_prefix=geom_prefix,
         )  # fmt: skip
     return written

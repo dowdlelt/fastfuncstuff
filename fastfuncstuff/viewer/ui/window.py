@@ -749,9 +749,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if subject:
             self.load_surfaces(subject)
 
-    def load_surfaces(self, subject: str | Path) -> None:
+    def load_surfaces(self, subject: str | Path, space: str = "") -> None:
         try:
-            self._dispatch(LoadSurfaces(str(subject)))
+            self._dispatch(LoadSurfaces(str(subject), space=space))
         except (OSError, ValueError) as exc:
             self.statusBar().showMessage(f"surfaces: {exc}", 8000)
             return
@@ -2449,6 +2449,7 @@ def launch(
     directory: str | None = None,
     surfaces: str | None = None,
     meshes: list[str] | None = None,
+    surf_space: str | None = None,
     surf_data: list | None = None,
 ) -> int:
     """Open the controller and run the Qt loop."""
@@ -2471,7 +2472,7 @@ def launch(
     for p in paths:
         win.open_path(p)
     if surfaces:
-        win.load_surfaces(surfaces)
+        win.load_surfaces(surfaces, space=surf_space or "")
     if meshes:
         win._open_meshes()
         assert win.mesh_window is not None

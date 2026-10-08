@@ -133,6 +133,16 @@ def build_parser() -> FfsArgumentParser:
         "they line up with orig.mgz, the SUMA SurfVol, or anything aligned to them.",
     )
     p.add_argument(
+        "-surf_space",
+        metavar="MESH",
+        default=None,
+        help="With -surfaces: show the subject on a template mesh (onavg-ico64, "
+        "fsaverage... by name or path, as ffs_nwarp -surf_mesh finds them), its "
+        "vertices placed in this subject through sphere.reg -- white, pial, inflated, "
+        "curv/sulc carried along. Results made on that template then load with "
+        "-surf_data directly. View-only: edits are saved from the native mesh.",
+    )
+    p.add_argument(
         "-mesh",
         metavar="FILE",
         action="append",
@@ -205,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.surfaces:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
 
-                session.do(LoadSurfaces(args.surfaces))
+                session.do(LoadSurfaces(args.surfaces, space=args.surf_space or ""))
             for cmd in [*_mesh_commands(args.mesh), *_surf_data_commands(args.surf_data)]:
                 session.do(cmd)
             if args.script:
@@ -230,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         script=args.script,
         directory=args.read,
         surfaces=args.surfaces,
+        surf_space=args.surf_space,
         meshes=args.mesh,
         surf_data=_surf_data_commands(args.surf_data),
     )

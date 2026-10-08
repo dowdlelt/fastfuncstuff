@@ -446,6 +446,9 @@ class LoadSurfaces(Command):
     major = True
     subject_dir: str
     hemis: str = "lh,rh"
+    #: A template mesh to show the subject on (``onavg-ico64``: placed through
+    #: sphere.reg, view-only); empty or ``native`` is the subject's own mesh.
+    space: str = ""
 
 
 @command
@@ -1617,7 +1620,7 @@ def install(
         if session is None:
             raise RuntimeError("LOAD_SURFACES needs a session")
         hemis = tuple(h for h in cmd.hemis.split(",") if h)
-        session.surfaces.load(cmd.subject_dir, hemis)
+        session.surfaces.load(cmd.subject_dir, hemis, space=cmd.space or "native")
         st.surface_subject = cmd.subject_dir
         return LoadSurfaces.aspects
 

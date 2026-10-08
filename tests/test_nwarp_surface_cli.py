@@ -358,3 +358,54 @@ def test_empty_surf_nwarp_is_refused(world, tmp_path):
     """An unset shell variable must not become 'no transforms'."""
     with pytest.raises(SystemExit, match="-surf_nwarp is empty"):
         _run(world, tmp_path, "-surf_prefix", str(tmp_path / "s"), "-surf_nwarp", " ")
+
+
+def test_viewer_shows_the_subject_on_the_template_its_data_were_made_on(world, tmp_path):
+    """-surf_space: the viewer places the template in the subject itself (no per-run
+    .surf.gii to load), exactly where the projection read, so the data match."""
+    import torch
+
+    from fastfuncstuff.processing.surface_projection import subject_on_mesh
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.vocab import Load, LoadSurfaces
+
+    prefix = _run(world, tmp_path, "-surf_mesh", str(world["tpl"]), "-surf_sample", "point")
+    placed = subject_on_mesh(world["subj"], str(world["tpl"]), ("lh",))["lh"]
+    v, f, _ = load_gifti_surface(f"{prefix}.tpl-test.lh.white.surf.gii")
+    assert np.array_equal(placed.faces, f) and np.abs(placed.states["white"] - v).max() < 1e-3
+    assert placed.cortex is not None and placed.cortex.sum() == len(world["keep"])
+
+    s = ViewerSession(device=torch.device("cpu"))
+    try:
+        s.load(str(world["src"]))
+        s.do(LoadSurfaces(str(world["subj"]), hemis="lh", space=str(world["tpl"])))
+        s.do(Load(f"{prefix}.tpl-test.lh.func.gii", "S"))
+        assert s.state.layers.get("S").source == "surface:lh"
+        with pytest.raises(ValueError, match="for viewing"):
+            s.surfaces.save()
+    finally:
+        s.close()
+
+
+def test_geometry_written_once_under_its_own_stem(world, tmp_path):
+    """The placed geometry depends only on (subject, mesh), not the run: every run
+    can point at one copy, and the data's 'geometry' still resolves from its file."""
+    from fastfuncstuff.cli.nwarp import _expected_outputs, parse_args
+
+    out = tmp_path / "o"
+    out.mkdir()
+    shared = tmp_path / "geom" / "subj"
+    argv = ["-source", str(world["src"]), "-nwarp", str(world["chain"]), "-master",
+            str(world["src"]), "-prefix", str(out / "run1"), "-surf", str(world["subj"]),
+            "-surf_hemi", "lh", "-surf_geom_prefix", str(shared), "-interp", "linear",
+            "-device", "cpu", "-verb", "0"]  # fmt: skip
+    main(argv)
+    assert not list(out.glob("*.surf.gii"))
+    assert (tmp_path / "geom" / "subj.native.lh.midthickness.surf.gii").is_file()
+    _, meta = load_gifti_data(out / "run1.native.lh.func.gii")
+    assert (out / meta["geometry"]).resolve() == (
+        tmp_path / "geom" / "subj.native.lh.midthickness.surf.gii"
+    ).resolve()
+    expected = {Path(p).resolve() for p in _expected_outputs(parse_args(argv))}
+    written = {p.resolve() for p in [*out.iterdir(), *(tmp_path / "geom").iterdir()]}
+    assert expected == written

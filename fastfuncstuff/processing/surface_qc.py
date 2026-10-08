@@ -28,6 +28,7 @@ scales intensity; neither is spatial smoothing.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -108,6 +109,7 @@ def surface_qc(
     step_mm: float = 0.25,
     seed: int = 0,
     verb: int = 1,
+    geom_prefix: str | None = None,
 ) -> list[Path]:
     """Write the QC maps for ``targets`` (:func:`surface_targets` output) at ``prefix``.
 
@@ -213,7 +215,10 @@ def surface_qc(
             "nominal_voxel_mm3": f"{nominal:.4g}",
             "voxel_mm": " ".join(f"{z:.4g}" for z in zooms),
             "noise_frames": str(n_frames),
-            "geometry": Path(f"{stem}.midthickness.surf.gii").name,
+            "geometry": os.path.relpath(
+                f"{geom_prefix or prefix}.{t.mesh}.{t.hemi}.midthickness.surf.gii",
+                Path(stem).parent,
+            ),
         }
         for name, vals in (("voxel_volume", vox), ("blur_fwhm", fwhm), ("noise_ratio", ratio)):
             path = Path(f"{stem}.{name}.shape.gii")

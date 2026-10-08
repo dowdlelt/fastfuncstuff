@@ -23,7 +23,6 @@ import numpy as np
 from fastfuncstuff.io.freesurfer import (
     Annotation,
     Hemisphere,
-    load_subject,
     read_annotation,
     read_color_lut,
 )
@@ -114,6 +113,8 @@ class SurfaceStore:
 
     def __init__(self) -> None:
         self.subject: Path | None = None
+        #: "native", or the template mesh the subject is shown on (view-only).
+        self.space = "native"
         self.hemis: dict[str, Hemisphere] = {}
         #: Slice indices per display grid, most recently used last: the shared
         #: grid plus any oblique windows' tilted ones. One grid used to be
@@ -251,10 +252,20 @@ class SurfaceStore:
             self._ribbons[key] = hit
         return hit
 
-    def load(self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh")) -> None:
-        loaded = load_subject(subject_dir, hemis)
+    def load(
+        self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh"), space: str = "native"
+    ) -> None:
+        """A subject's hemispheres, on its own mesh or on a template's (``space``):
+        the template's vertices placed in this subject through sphere.reg, so a
+        result made on that template lands on them. A subject may be a folder or a
+        name in $SUBJECTS_DIR."""
+        from fastfuncstuff.processing.surface_projection import resolve_subject, subject_on_mesh
+
+        subject_dir = resolve_subject(subject_dir)
+        loaded = subject_on_mesh(subject_dir, space, hemis)
         if not loaded:
             raise FileNotFoundError(f"no ?h.white surfaces under {subject_dir}/surf")
+        self.space = space
         self.subject = Path(subject_dir)
         self.hemis = loaded
         self.bare.clear()
@@ -266,6 +277,7 @@ class SurfaceStore:
 
     def clear(self) -> None:
         self.subject = None
+        self.space = "native"
         self.hemis = {}
         self.bare.clear()
         self.stand_ins.clear()
@@ -1347,6 +1359,11 @@ class SurfaceStore:
         displacement. Copies only -- :meth:`Hemisphere.save_state` refuses the original's own
         path -- plus a JSON log of the edits that produced them.
         """
+        if self.space != "native":
+            raise ValueError(
+                f"these surfaces are the subject placed on {self.space}, for viewing: edits "
+                "are saved from the subject's own mesh (load it without a space)"
+            )
         if not suffix or "/" in suffix:
             raise ValueError(f"bad suffix {suffix!r}")
         written: list[Path] = []

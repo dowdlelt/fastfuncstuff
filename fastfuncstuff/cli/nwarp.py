@@ -295,6 +295,15 @@ Examples:
         "Without it, -surf writes the surface only, at -prefix.",
     )
     surf_group.add_argument(
+        "-surf_geom_prefix",
+        default=None,
+        metavar="PREFIX",
+        help="Write the placed geometry (?h.white/pial/midthickness.surf.gii) under this "
+        "stem instead of the data's: it depends only on the subject and mesh, so every "
+        "run can share one copy (PREFIX.SPACE.?h.*.surf.gii). The data's 'geometry' "
+        "metadata points at it, relative to the data file.",
+    )
+    surf_group.add_argument(
         "-surf_master",
         default=None,
         metavar="ANAT",
@@ -511,6 +520,7 @@ def _surface_outputs(args: argparse.Namespace) -> list[str]:
         _surf_depths(args),
         args.surf_depth_combine,
         qc=args.surf_qc,
+        geom_prefix=args.surf_geom_prefix,
     )
 
 
@@ -777,6 +787,7 @@ def _dispatch_surface(
         verb=args.verb,
         qc=args.surf_qc,
         qc_frames=args.surf_qc_frames,
+        geom_prefix=args.surf_geom_prefix,
         interp=args.interp,
         device=device,
         time_range=time_range,
