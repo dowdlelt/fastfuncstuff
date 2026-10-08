@@ -1780,6 +1780,7 @@ def nwarpforge(
     progress: Callable[[str], AbstractContextManager[None]] | None = None,
     points: np.ndarray | None = None,
     point_reducer: Callable[[Tensor], Tensor] | None = None,
+    source_image: tuple[Tensor, Any] | None = None,
 ) -> Tensor | None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1885,6 +1886,9 @@ def nwarpforge(
             as it comes out, so the series is held as the reduced ``(M,)`` instead of
             ``(N,)`` -- a surface fold of millions of footprint reads onto vertices.
             The return is then ``(T, M)`` (``(M,)`` for a 3-D source).
+        source_image: ``load_image(source_path, device=None)``'s result, already in
+            memory: a volume and a surface pass from one read of a big series (ffs_nwarp
+            -surf_prefix). Read only, never modified.
 
     Returns:
         The sampled points when ``points`` is given, else None (the volume is saved).
@@ -1917,7 +1921,7 @@ def nwarpforge(
     # A full fMRI series can exceed VRAM even though one interpolation batch fits.
     # Keep 4-D data on the host and stream memory-planned frame batches below;
     # 3-D inputs are small enough to place directly on the compute device.
-    source, source_header = load_image(source_path, device=None)
+    source, source_header = source_image or load_image(source_path, device=None)
     if source.ndim == 3:
         source = source.to(device)
     # load_image's header_info is declared `object` (loose I/O boundary type)

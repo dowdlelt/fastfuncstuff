@@ -269,6 +269,28 @@ Examples:
         "no second resample. Several targets share one pass over the data.",
     )
     surf_group.add_argument(
+        "-surf_prefix",
+        default=None,
+        metavar="PREFIX",
+        help="Write BOTH: the volume at -prefix as usual (every volume option applies) and "
+        "the surface outputs at this prefix, from one read of the source in one process. "
+        "Without it, -surf writes the surface only, at -prefix.",
+    )
+    surf_group.add_argument(
+        "-surf_master",
+        default=None,
+        metavar="ANAT",
+        help="With -surf_prefix: the surface pass's master, when the volume's -master is "
+        "another grid (an EPI-resolution warpmaster). Default: -master.",
+    )
+    surf_group.add_argument(
+        "-surf_nwarp",
+        default=None,
+        metavar="CHAIN",
+        help="With -surf_prefix: the surface pass's chain, when the volume's goes further "
+        "than the anatomy (MNI links). Default: -nwarp.",
+    )
+    surf_group.add_argument(
         "-surf_hemi",
         nargs="+",
         choices=["lh", "rh"],
@@ -445,8 +467,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     parse_prefix). The phase output, mean, and first/last files are listed on
     intent; a mean/first-last that a 3-D output skips just means the run isn't
     skipped next time (safe)."""
-    if getattr(args, "surf", None):
-        return [str(p) for p in _surface_outputs(args)]
+    surf = [str(p) for p in _surface_outputs(args)] if getattr(args, "surf", None) else []
+    if surf and not args.surf_prefix:
+        return surf
     outs: list[str] = [args.prefix]
     if args.phase:
         outs.append(args.phase_prefix or derive_phase_output_path(args.prefix))
@@ -456,7 +479,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
             outs.append(path)
     if args.save_first_last:
         outs.append(derive_prefixed_output_path(args.prefix, "firstlast"))
-    return outs
+    return outs + surf
 
 
 def _surface_outputs(args: argparse.Namespace) -> list[str]:
@@ -464,7 +487,11 @@ def _surface_outputs(args: argparse.Namespace) -> list[str]:
     from fastfuncstuff.processing.surface_projection import output_paths
 
     return output_paths(
-        args.prefix, args.surf_mesh, args.surf_hemi, _surf_depths(args), args.surf_depth_combine
+        args.surf_prefix or args.prefix,
+        args.surf_mesh,
+        args.surf_hemi,
+        _surf_depths(args),
+        args.surf_depth_combine,
     )
 
 
@@ -610,7 +637,19 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if verb >= 1:
         print_cli_section("Applying transforms")
 
-    if args.surf:
+    if args.surf and jac_axis is not None and jac_match is None:
+        # Checked before the volume pass, not after it has been written.
+        raise SystemExit(
+            "ffs_nwarp: -jac with -surf needs the AXIS:FIELDMAP form: the auto mode "
+            "differentiates along grid axes, and surface points have none"
+        )
+    source_image = None
+    if args.surf and args.surf_prefix:
+        # Volume and surface from one read: a big series is decompressed once.
+        from fastfuncstuff.processing.io import load_image
+
+        source_image = load_image(args.source, device=None)
+    elif args.surf:
         _dispatch_surface(
             args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
         )
@@ -649,18 +688,38 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         jac_axis=jac_axis,
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=verb >= 1),
+        source_image=source_image,
     )
+    if source_image is not None:
+        if verb >= 1:
+            print_cli_section("Surface pass (same source read)")
+        _dispatch_surface(
+            args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis,
+            jac_match, source_image=source_image,
+        )  # fmt: skip
 
     if verb >= 1:
         print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
 
 
 def _dispatch_surface(
-    args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
+    args,
+    device,
+    nwarp_specs,
+    time_range,
+    ainterp,
+    slice_times,
+    tr,
+    jac_axis,
+    jac_match,
+    source_image=None,
 ) -> None:
     """-surf: the same chain, read at surface points, written as GIfTI."""
     from fastfuncstuff.processing.surface_projection import project_to_surface
 
+    if args.surf_nwarp is not None:
+        nwarp_specs = parse_nwarp_string(args.surf_nwarp)
+    master = args.surf_master or args.master
     wrong = [
         flag
         for flag, val in (
@@ -673,16 +732,19 @@ def _dispatch_surface(
         )
         if val
     ]
-    if wrong:
-        raise SystemExit(f"ffs_nwarp: {', '.join(wrong)} cannot be used with -surf")
-    if args.master is None:
+    if wrong and not args.surf_prefix:
+        raise SystemExit(
+            f"ffs_nwarp: {', '.join(wrong)} cannot be used with -surf alone "
+            "(they are volume options: add -surf_prefix to write both)"
+        )
+    if master is None:
         raise SystemExit("ffs_nwarp: -surf needs -master, the anatomy the surfaces were built on")
     written = project_to_surface(
         source_path=args.source,
         nwarp_specs=nwarp_specs,
-        master_path=args.master,
+        master_path=master,
         subject_dir=args.surf,
-        prefix=args.prefix,
+        prefix=args.surf_prefix or args.prefix,
         meshes=tuple(args.surf_mesh),
         hemis=tuple(args.surf_hemi),
         fractions=_surf_depths(args),
@@ -704,6 +766,7 @@ def _dispatch_surface(
         jac_axis=jac_axis,
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=args.verb >= 1),
+        source_image=source_image,
     )
     if args.verb >= 1:
         for path in written:

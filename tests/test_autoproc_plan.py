@@ -2165,14 +2165,21 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     for sc, c in zip(surf, chain, strict=True):
         links = c.split('="')[1].rstrip('"').split()
         assert sc.split('="')[1].rstrip('"').split() == [x for x in links if "mni" not in x]
-    assert "stage10s" in s and "skip_surface=1" in s
-    line = next(x for x in s.splitlines() if "SURFCHAIN[$k]" in x and "printf" in x)
-    assert '-master \\"$ANAT\\"' in line
+    assert "stage10s" in s and "skip_surface" not in s
+    # The surface rides stage10's own per-run line: one process, one read of the source.
+    line = next(x for x in s.splitlines() if "-surf " in x and "printf" in x)
+    assert '-surf_master \\"$ANAT\\"' in line
+    assert '-surf_nwarp \\"${SURFCHAIN[$k]}\\"' in line
+    assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}\\"' in line
     assert "-surf /fs/sub-X -surf_mesh native onavg-ico64" in line
-    assert "-dxyz" not in line and "-save_mean" not in line
-    # one interpolation per run from the raw series, never from stage10's output
-    assert "stage10.final" not in line
-    assert s.index("== stage10: final") < s.index("== stage10s: surface")
+    # the volume half keeps its own (MNI) chain and warpmaster
+    assert '-nwarp \\"${CHAIN[$k]}\\"' in line and "-master stage10.warpmaster" in line
+    assert sum("printf" in x and "-surf " in x for x in s.splitlines()) == 1
+    # cross-run masks, per space and hemisphere, after the runs are written
+    for space in ("native", "onavg-ico64"):
+        for hemi in ("lh", "rh"):
+            assert f'-prefix "stage10s.surf.allruns.{space}.{hemi}"' in s
+    assert s.index("== stage10: final") < s.index("== stage10s: surface masks")
 
 
 def test_no_surface_target_emits_no_surface_stage():

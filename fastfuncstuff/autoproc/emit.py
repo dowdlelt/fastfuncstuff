@@ -1220,9 +1220,7 @@ trap _ffs_toc EXIT
 # The batched moco + final stages pass their toggle to the tool as -batch_skip.
 skip_nordic=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
 skip_xfmap=1  skip_xrun=1 skip_runmean=1 skip_xses=1 skip_anat=1
-skip_final={_skip_default(opt)} skip_stats=1{phase_skip}{
-        f" skip_surface={_skip_default(opt)}" if opt.surface_target else ""
-    }
+skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
 """
 
 
@@ -3110,6 +3108,14 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
         '  phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"\n' if _phase_on(plan) else ""
     )
     meanf = _final_mean("${FRAG[$k]}")
+    surf_args, surf_note = _surface_args(plan), ""
+    if surf_args:
+        surf_note = (
+            "# -surface_target: the same process also reads each run at cortical surface\n"
+            "# points (-surf_prefix stage10s.surf.<frag>), from the same read of the source,\n"
+            "# through SURFCHAIN (CHAIN without the MNI links) onto $ANAT, whose scanner\n"
+            "# space the FreeSurfer surfaces share: one interpolation for both outputs.\n"
+        )
     # -save_mean is not optional: stage10.final.<frag>_mean is the per-run image
     # the final QC stack is built from, and it costs one temporal reduction of a
     # series ffs_nwarp already has in memory.
@@ -3122,7 +3128,7 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
 # so no raw copy is materialised. The chain lands every run on the stage10a
 # warpmaster grid (MASTER/FINAL_DXYZ set there). skip_final=1 → -batch_skip.
 # -save_mean writes stage10.final.<frag>_mean per run — the QC stack below.
-{phase_note}echo '== stage10: final compose + resample =='
+{phase_note}{surf_note}echo '== stage10: final compose + resample =='
 nwarpbatch="{batchfile}"
 : > "$nwarpbatch"
 for k in "${{RUN_KEYS[@]}}"; do
@@ -3130,7 +3136,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   meanf="{meanf}"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}{surf_args}" >> "$nwarpbatch"
 done
 {_numcomps_final_jobs(plan)}{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -3142,41 +3148,73 @@ echo 'done → stage10.final.*'
 _MNI_TOKENS = ("mni_nl", "mni_lin")
 
 
-def _stage_surface(plan: Plan, script_stem: str) -> str:
-    """stage10s: every run onto the cortical mesh, through the same chain (minus MNI).
-
-    One interpolation from the raw series, exactly like stage10 -- the surface points
-    replace the master grid. The master is the anat ($ANAT) because the FreeSurfer
-    surfaces share its scanner space; the chain ends there.
-    """
+def _surface_args(plan: Plan) -> str:
+    """stage10's per-run surface flags (escaped for its printf), or "" without
+    -surface_target. Footprint reads at equivolume depths, averaged over the ribbon."""
     opt = plan.options
     if not opt.surface_target:
         return ""
     assert opt.fs_subject is not None
-    st = _final_st_line(plan)
-    nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
-    batchfile = f"{script_stem}_surfbatch.txt"
     meshes = " ".join(shlex.quote(m) for m in opt.surface_target)
-    surf = f"-surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
+    return (
+        f" -surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
+        ' -surf_prefix \\"stage10s.surf.${FRAG[$k]}\\" -surf_master \\"$ANAT\\"'
+        ' -surf_nwarp \\"${SURFCHAIN[$k]}\\"'
+    )
+
+
+def _stage_surface(plan: Plan, script_stem: str) -> str:
+    """stage10s: the cross-run surface masks. The sampling itself rides stage10's
+    nwarp line (:func:`_surface_args`), so it needs no pass of its own."""
+    opt = plan.options
+    if not opt.surface_target:
+        return ""
     return f"""
-# ============================ stage10s: onto the cortical surface ==========
-# The same single interpolation as stage10, read at cortical surface points instead
-# of the warpmaster grid: footprint reads on the equivolume mid-surface of
-# {" + ".join(opt.surface_target)}, templates placed in this subject through
-# ?h.sphere.reg. SURFCHAIN is CHAIN without the MNI links; the master is $ANAT, whose
-# scanner space the FreeSurfer surfaces share. skip_surface=1 -> -batch_skip.
-echo '== stage10s: surface sampling =='
-surfbatch="{batchfile}"
-: > "$surfbatch"
-for k in "${{RUN_KEYS[@]}}"; do
-{st}
-{_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{SURFCHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master \\"$ANAT\\" {nwarp_flags} $st_str {surf} -prefix \\"stage10s.surf.${{FRAG[$k]}}\\"" >> "$surfbatch"
-done
-batch_skip=(); [ "$skip_surface" -eq 1 ] && batch_skip=(-batch_skip)
-ffs_nwarp -batch "$surfbatch" "${{batch_skip[@]}}" -device "$DEVICE"
-echo 'done -> stage10s.surf.*.?h.*.gii'
-"""
+# ============================ stage10s: surface masks =======================
+# stage10 wrote every run onto {" + ".join(Path(m).name for m in opt.surface_target)}
+# (stage10s.surf.<frag>.<SPACE>.?h.*.gii) in the same pass as its volume.
+echo '== stage10s: surface masks =='
+{_surface_masks(plan)}"""
+
+
+def _surface_mask(space: str, hemi: str) -> str:
+    """The cross-run statistics mask of one target and hemisphere (ffs_reml -mask)."""
+    return f"stage10s.surf.allruns.{space}.{hemi}.mask.shape.gii"
+
+
+def _surface_masks(plan: Plan) -> str:
+    """stage10s masks: every run's cortex-and-coverage mask intersected, then clipped
+    on the runs' mean signal -- stage10b's rules, on vertices (ffs_util_surfmask)."""
+    from fastfuncstuff.processing.surface_projection import space_name
+
+    opt = plan.options
+    assert opt.surface_target
+    out = [
+        "# Masks: every run's (cortex AND full footprint coverage) intersected, then",
+        "# AFNI's clip level on the runs' mean signal -- stage10b's rules, on vertices.",
+        "# ffs_reml -mask on surface data takes these.",
+    ]
+    for space in dict.fromkeys(space_name(m) for m in opt.surface_target):
+        for hemi in ("lh", "rh"):
+            run = f"stage10s.surf.${{FRAG[$k]}}.{space}.{hemi}"
+            target = _surface_mask(space, hemi)
+            out += [
+                f'if [ ! -f "{target}" ]; then',
+                "  masks=(); means=()",
+                '  for k in "${RUN_KEYS[@]}"; do',
+                f'    masks+=("{run}.mask.shape.gii"); means+=("{run}.mean.shape.gii")',
+                "  done",
+                _ffs(
+                    "ffs_util_surfmask",
+                    [
+                        '-mask "${masks[@]}"',
+                        '-mean "${means[@]}"',
+                        f'-prefix "{target.removesuffix(".mask.shape.gii")}"',
+                    ],
+                ),  # fmt: skip
+                "fi",
+            ]
+    return "\n".join(out) + "\n"
 
 
 def _numcomps_final_jobs(plan: Plan) -> str:

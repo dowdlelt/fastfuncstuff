@@ -254,3 +254,47 @@ def test_default_output_is_the_equal_weight_mean_of_five_depths(world, tmp_path)
     np.testing.assert_allclose(low, np.mean(depths[:3], axis=0), rtol=1e-5)
     tmean, _ = load_gifti_data(f"{prefix}.native.lh.mean.shape.gii")
     np.testing.assert_allclose(tmean, low.mean(axis=1), rtol=1e-5)
+
+
+def test_surf_prefix_writes_volume_and_surface_from_one_read(world, tmp_path, monkeypatch):
+    """-surf_prefix: the volume at -prefix as if run alone, and the surface as if run
+    alone, with the source loaded once."""
+    import fastfuncstuff.processing.io as ffs_io
+    import fastfuncstuff.processing.nwarpforge as forge
+
+    vol_alone = tmp_path / "alone.nii.gz"
+    main(["-source", str(world["src"]), "-nwarp", str(world["chain"]), "-master",
+          str(world["src"]), "-prefix", str(vol_alone), "-interp", "linear", "-device", "cpu",
+          "-verb", "0"])  # fmt: skip
+    surf_alone = _run(world, tmp_path)
+
+    loads = []
+    real = ffs_io.load_image
+
+    def counting(path, *a, **k):
+        loads.append(str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(ffs_io, "load_image", counting)
+    monkeypatch.setattr(forge, "load_image", counting)
+    both = tmp_path / "both"
+    both.mkdir()
+    master = both / "master.nii.gz"  # the same grid, so only the SOURCE loads are counted
+    master.write_bytes(world["src"].read_bytes())
+    main(["-source", str(world["src"]), "-nwarp", str(world["chain"]), "-master",
+          str(master), "-prefix", str(both / "vol.nii.gz"), "-surf", str(world["subj"]),
+          "-surf_prefix", str(both / "proj"), "-surf_hemi", "lh", "-interp", "linear",
+          "-device", "cpu", "-verb", "0"])  # fmt: skip
+    assert loads.count(str(world["src"])) == 1
+    np.testing.assert_array_equal(
+        nib.load(str(both / "vol.nii.gz")).get_fdata(), nib.load(str(vol_alone)).get_fdata()
+    )
+    a, _ = load_gifti_data(f"{surf_alone}.native.lh.func.gii")
+    b, _ = load_gifti_data(f"{both / 'proj'}.native.lh.func.gii")
+    np.testing.assert_array_equal(a, b)
+
+
+def test_surf_jac_auto_form_is_refused_before_anything_is_written(world, tmp_path):
+    with pytest.raises(SystemExit, match="AXIS:FIELDMAP"):
+        _run(world, tmp_path, "-jac", "y", "-surf_prefix", str(tmp_path / "s"))
+    assert not list((tmp_path / "out").glob("*"))
