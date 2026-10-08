@@ -272,3 +272,29 @@ def test_a_full_hinge_lays_the_hemispheres_end_to_end(hinge):
     n_l = m["lh"][:3, :3] @ np.array([1.0, 0, 0])
     n_r = m["rh"][:3, :3] @ np.array([-1.0, 0, 0])
     assert np.allclose(n_l, n_r)
+
+
+def test_flat_patches_turn_to_meet_occipital_to_occipital():
+    """Each patch file comes out of flattening at its own angle, either one possibly
+    mirrored; laid out, both read as lateral views -- superior up, posterior toward
+    the other hemisphere -- whatever turn the file had."""
+    from fastfuncstuff.io.freesurfer import FlatPatch, Hemisphere
+
+    rng = np.random.default_rng(0)
+    yz = rng.uniform(-50, 50, (300, 2))  # anterior-posterior, superior-inferior
+    white = np.c_[rng.normal(0, 5, 300), yz]
+
+    def hemi(name, angle, mirror):
+        c, s = np.cos(angle), np.sin(angle)
+        flat = yz @ np.array([[c, -s], [s, c]]) * [1.0, -1.0 if mirror else 1.0] + [17.0, -9.0]
+        coords = np.c_[flat, np.zeros(300)]
+        patch = FlatPatch("flat", coords, np.ones(300, bool), np.zeros(300, bool))
+        return Hemisphere(name, np.zeros((0, 3), np.int64), {"white": white}, np.eye(4),
+                          patches={"flat": patch})  # fmt: skip
+
+    for name, angle, mirror in (("lh", 1.1, False), ("rh", -2.3, True), ("lh", 0.4, True)):
+        xy = s3.shape_positions(hemi(name, angle, mirror), "flat")[:, :2]
+        toward_rh = 1.0 if name == "lh" else -1.0
+        # screen x follows posterior toward the other hemisphere, screen y superior
+        np.testing.assert_allclose(xy[:, 0], -toward_rh * (yz[:, 0] - yz[:, 0].mean()), atol=1e-4)
+        np.testing.assert_allclose(xy[:, 1], yz[:, 1] - yz[:, 1].mean(), atol=1e-4)

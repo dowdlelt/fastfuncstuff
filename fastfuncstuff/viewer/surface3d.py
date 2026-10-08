@@ -46,6 +46,34 @@ def flat_patch(hemi: Hemisphere):
     return next(iter(hemi.patches.values()))
 
 
+def flat_layout(hemi: Hemisphere, patch) -> np.ndarray:
+    """``(V, 2)`` patch coordinates turned to a lateral view: superior up, and
+    posterior toward the other hemisphere (lh's to the right, rh's to the left), so
+    side by side the two flat maps meet occipital pole to occipital pole, as
+    pycortex lays them out.
+
+    A patch file's own x/y are whatever the flattening left -- two hemispheres come
+    out at unrelated angles, and either can be mirrored. The turn is the orthogonal
+    map (a reflection allowed) that best carries the patch onto the anatomy's own
+    anterior-posterior / superior-inferior plane, fitted over every patch vertex.
+    """
+    xy = patch.coords[:, :2].astype(np.float64)
+    inside = patch.in_patch
+    out = np.zeros_like(xy)
+    if inside.sum() < 3:
+        return out.astype(np.float32)
+    f = xy[inside] - xy[inside].mean(axis=0)
+    anat = hemi.states["white"][inside][:, 1:3].astype(np.float64)
+    target = anat - anat.mean(axis=0)
+    if hemi.name.startswith("lh"):
+        target[:, 0] *= -1.0  # lh: posterior (-y) points right, toward rh
+    u, sv, vt = np.linalg.svd(f.T @ target)
+    if sv[1] <= 1e-9 * sv[0]:
+        return xy.astype(np.float32)  # no 2-D anatomy to turn by (a flat test sheet)
+    out[inside] = f @ (u @ vt)
+    return out.astype(np.float32)
+
+
 def shape_positions(hemi: Hemisphere, shape: str) -> np.ndarray | None:
     """``(V, 3)`` float32 positions of ``shape``, before layout; ``None`` if absent."""
     if shape == "mid":
@@ -56,9 +84,8 @@ def shape_positions(hemi: Hemisphere, shape: str) -> np.ndarray | None:
             return None
         # A patch is 2-D in its own x/y; lay it in the axial plane so the
         # default (superior) camera looks straight at it.
-        xy = patch.coords[:, :2].astype(np.float32)
-        out = np.zeros((xy.shape[0], 3), np.float32)
-        out[:, :2] = xy
+        out = np.zeros((patch.coords.shape[0], 3), np.float32)
+        out[:, :2] = flat_layout(hemi, patch)
         return out
     found = hemi.states.get(shape)
     return None if found is None else found.astype(np.float32)
