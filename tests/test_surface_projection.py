@@ -21,10 +21,22 @@ def _sheet(n: int, spacing: float, z: float = 0.0) -> tuple[np.ndarray, np.ndarr
 def test_lattice_tiles_the_triangle_into_equal_thirds():
     for level in range(1, 9):
         bary, share = _lattice(level)
-        assert bary.shape[0] == level * level
+        n = 3 if level == 1 else level * level  # level 1: one read per corner's third
+        assert bary.shape[0] == n
         np.testing.assert_allclose(bary.sum(1), 1.0)
         assert (bary > 0).all()  # centroids, strictly inside
-        np.testing.assert_allclose(share.sum(0), level * level / 3.0)
+        np.testing.assert_allclose(share.sum(0), n / 3.0)
+        # every read belongs to the corner it is nearest (none to a far corner)
+        owner = share.argmax(1)
+        assert (bary[np.arange(n), owner] >= bary.max(1) - 1e-12).all()
+
+
+def test_small_triangles_read_each_corner_third_not_the_centroid():
+    """Level 1 used to read only the centroid, shared three ways: a vertex then averaged
+    a ring of centroids and never itself. Its third's centroid is 11/18 of the way in."""
+    bary, share = _lattice(1)
+    np.testing.assert_allclose(np.diag(bary), 11 / 18)
+    np.testing.assert_array_equal(share, np.eye(3))
 
 
 def test_point_mode_reads_each_vertex_once():

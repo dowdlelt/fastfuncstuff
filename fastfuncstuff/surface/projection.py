@@ -57,7 +57,17 @@ def _lattice(level: int) -> tuple[np.ndarray, np.ndarray]:
     """Centroids of the level x level sub-triangles (barycentric) and each corner's
     share of them: 1 for the nearest corner, split evenly on a tie (the triangle's own
     centroid is a sub-centroid when level % 3 == 1), so each corner gets exactly a third.
+
+    Level 1 is the exception: its one sub-triangle is the triangle, and a single read
+    at the centroid shared three ways leaves every vertex averaging a ring of
+    centroids around it -- never itself -- which on a mesh finer than the voxels is
+    an extra blur (the bands benchmark: 0.50 vs 0.57 amplitude at 3 mm). Instead each
+    corner's third (corner, mid-edges, centroid) is read once at its own centroid.
     """
+    if level == 1:
+        a, b = 11.0 / 18.0, 3.5 / 18.0  # centroid of a corner's third
+        bary = np.array([[a, b, b], [b, a, b], [b, b, a]])
+        return bary, np.eye(3)
     pts = []
     for i in range(level):
         for j in range(level - i):
