@@ -2501,10 +2501,12 @@ def nwarpforge(
             )
             output_volumes.extend(_stash(_apply_jac(vol, static_composed)) for vol in warped_batch)
 
+    frame_range = range(t_start, t_end) if not (affine_only or static_series_batched) else range(0)
     time_iter = tqdm(
-        range(t_start, t_end) if not (affine_only or static_series_batched) else range(0),
+        frame_range,
         desc="Warping volumes",
-        disable=verb == 0 or (t_end - t_start) == 1,
+        # The batched paths did the work already: an empty range is not a bar.
+        disable=verb == 0 or len(frame_range) <= 1,
     )
     for t in time_iter:
         if follow_sampler is not None:
