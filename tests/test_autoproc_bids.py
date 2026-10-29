@@ -876,3 +876,38 @@ def test_single_echo_runs_are_unchanged(tmp_path: Path):
     _touch(func / "sub-01_task-foo_run-1_bold.nii.gz", {"EchoTime": 0.03, "RepetitionTime": 2.0})
     r = scan_subject(tmp_path, "01").sessions[0].bold_runs[0]
     assert not r.is_multiecho and r.n_echoes == 1 and r.echo_mags == []
+
+
+def test_ref_anat_mp2rage_partners_are_found_beside_an_explicit_file(tmp_path, monkeypatch):
+    """-ref_anat FILE still gets its INV2 looked up (unlike -anat FILE): the ref is
+    the 7T MP2RAGE, and presurfer is what keeps UNI's noise out of its fits."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.autoproc import _resolve_ref_presurf
+
+    monkeypatch.delenv("FFS_TPM", raising=False)
+    anat = tmp_path / "sub-A" / "ses-7T" / "anat"
+    for acq in ("uni", "inv1", "inv2"):
+        _touch(anat / f"sub-A_ses-7T_acq-{acq}_T1w.nii.gz", {})
+    uni = str(anat / "sub-A_ses-7T_acq-uni_T1w.nii.gz")
+
+    def res(**kw):
+        base = dict(
+            ref_anat=uni,
+            ref_anat_inv2=None,
+            ref_anat_inv1=None,
+            presurf="auto",
+            presurf_tpm=None,
+            spm_tpm="/t/TPM.nii",
+            tpm=None,
+        )
+        return _resolve_ref_presurf(Namespace(**{**base, **kw}))
+
+    triple, tpm, _ = res()
+    assert triple == (uni, uni.replace("acq-uni", "acq-inv2"), uni.replace("acq-uni", "acq-inv1"))
+    assert tpm == "/t/TPM.nii"
+    assert res(ref_anat_inv2="/x/inv2.nii.gz")[0][1] == "/x/inv2.nii.gz"  # override wins
+    assert res(presurf="no")[0] is None
+    assert res(spm_tpm=None)[0] is None  # no template: skipped, with a note
+    plain = str(anat / "sub-A_ses-7T_acq-inv2_T1w.nii.gz")  # not a UNI: used as given
+    assert res(ref_anat=plain)[0] is None

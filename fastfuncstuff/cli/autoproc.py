@@ -228,6 +228,20 @@ def build_parser() -> argparse.ArgumentParser:
         "only, cannot absorb a through-slice difference.",
     )
     g.add_argument(
+        "-ref_anat_inv2",
+        "-ref-anat-inv2",
+        metavar="FILE",
+        help="-ref_anat is an MP2RAGE UNI: its INV2, for ffs_util_presurf to MPRAGEise "
+        "it (as -presurf does for -anat). Default: the acq-inv2 filed beside an acq-uni "
+        "-ref_anat. -presurf no turns it off.",
+    )
+    g.add_argument(
+        "-ref_anat_inv1",
+        "-ref-anat-inv1",
+        metavar="FILE",
+        help="...and its INV1 (only read by -presurf_denoise). Default: the acq-inv1 beside it.",
+    )
+    g.add_argument(
         "-ref_anat_nonlin_method",
         "-ref-anat-nonlin-method",
         choices=["segment", "register"],
@@ -1804,11 +1818,15 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-ref_file", opt.ref_file),
         ("-ref_file_anat", opt.ref_file_anat),
         ("-ref_anat", opt.ref_anat),
+        ("-ref_anat_inv2", args.ref_anat_inv2),
+        ("-ref_anat_inv1", args.ref_anat_inv1),
         ("-slicetiming", opt.slicetiming_file),
     ):
         if val and not Path(val).exists():
             errors.append(f"{label} not found: {val}")
     no_inv1 = [Path(uni).name for uni, _, inv1 in opt.presurf if inv1 is None]
+    if opt.ref_presurf and opt.ref_presurf[2] is None:
+        no_inv1.append(Path(opt.ref_presurf[0]).name)
     if opt.presurf_denoise != "off" and no_inv1:
         errors.append(
             f"-presurf_denoise {opt.presurf_denoise} denoises INV1 and INV2 jointly, but "
@@ -2636,6 +2654,36 @@ def _resolve_presurf(
     )
 
 
+def _resolve_ref_presurf(args) -> tuple[tuple[str, str, str | None] | None, str | None, str]:
+    """(uni, inv2, inv1) for an MP2RAGE -ref_anat, the TPM presurfer needs, a report line.
+
+    Unlike -anat FILE, an explicit -ref_anat still gets its partners looked up:
+    the ref is the 7T anat, which is the MP2RAGE case, and its UNI's noise
+    background is exactly what the ref's alignment and segmentation must not see."""
+    from fastfuncstuff.autoproc.bids import mp2rage_partners
+
+    if not args.ref_anat or args.presurf == "no":
+        return None, None, ""
+    inv2, inv1 = mp2rage_partners(Path(args.ref_anat))
+    inv2 = args.ref_anat_inv2 or (str(inv2) if inv2 else None)
+    inv1 = args.ref_anat_inv1 or (str(inv1) if inv1 else None)
+    if inv2 is None:
+        return None, None, ""
+    tpm = args.presurf_tpm or args.spm_tpm or args.tpm or os.environ.get("FFS_TPM")
+    if not tpm:
+        return (
+            None,
+            None,
+            "  ref presurfer skipped: an INV2 was found for -ref_anat, but no tissue "
+            "template. Pass -presurf_tpm (SPM's tpm/TPM.nii) or set $FFS_TPM.",
+        )
+    return (
+        (args.ref_anat, inv2, inv1),
+        tpm,
+        f"  ref presurfer: MPRAGEise -ref_anat by {Path(inv2).name}",
+    )
+
+
 def _report_anat(anat_paths: list[str], from_bids: bool, skipped: list[Path] | None = None) -> None:
     """Print the T1w the anat step will use — all of them when several are being
     averaged, and the ones the scan saw but rejected.
@@ -2701,6 +2749,8 @@ _PATH_ARGS = (
     "ref_file",
     "ref_file_anat",
     "ref_anat",
+    "ref_anat_inv2",
+    "ref_anat_inv1",
 )
 _PATH_LIST_ARGS = ("anat", "ref_transforms", "events")
 
@@ -2841,6 +2891,9 @@ def main(argv: list[str] | None = None) -> int:
     _report_anat(anat_paths, from_bids=from_bids, skipped=unused)
     if presurf_note:
         print(presurf_note, file=sys.stderr)
+    ref_presurf, ref_presurf_tpm, ref_note = _resolve_ref_presurf(args)
+    if ref_note:
+        print(ref_note, file=sys.stderr)
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
     fs_subject = _baked_subject(
@@ -2959,13 +3012,14 @@ def main(argv: list[str] | None = None) -> int:
         anat_skull=anat_skull,
         presurf=presurf if go_to_anat else [],
         presurf_denoise=args.presurf_denoise,
-        presurf_tpm=presurf_tpm,
+        presurf_tpm=presurf_tpm or ref_presurf_tpm,
         do_mni=args.do_mni,
         mni_backend=mni_backend,
         mni_template=mni_template,
         anat_nonlin_input=args.anat_nonlin_input,
         anat_nonlin_method=args.anat_nonlin_method,
         ref_anat_nonlin_method=args.ref_anat_nonlin_method,
+        ref_presurf=ref_presurf if go_to_anat else None,
         anat_path=anat_path if go_to_anat else None,
         anat_extra=anat_paths[1:] if go_to_anat else [],
         moco_ref=args.moco_ref,

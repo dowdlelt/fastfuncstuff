@@ -1565,6 +1565,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         # The TPM build reads these before stage09 can produce a nonlinear anat.
         | {p for p in (plan.options.spm_tpm, plan.options.anat_t2) if p and plan.options.anat_tpm}
         | ({plan.options.ref_anat} if plan.options.ref_anat else set())
+        | {p for p in (plan.options.ref_presurf or ())[1:] if p}
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # Only the *command* is checked, not the flags that fix a backend's identity
@@ -1585,7 +1586,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         tools = [*tools, "ffs_phase_unwrap"]
         if opt.phase_drift:
             tools = [*tools, "ffs_phasedrift"]
-    if opt.presurf and _own_anat(opt):
+    if (opt.presurf or opt.ref_presurf) and _own_anat(opt):
         tools = [*tools, "ffs_util_presurf"]
     if opt.anat_skull and _own_anat(opt):
         tools = [*tools, "mri_synthstrip"]
@@ -3196,6 +3197,12 @@ def _refanat_box() -> str:
     return "stage09.refanat_autobox.nii.gz"
 
 
+def _refanat_presurf_image(opt) -> str:
+    """-ref_anat's MPRAGEised head (ffs_util_presurf), named as _presurf_image is."""
+    kind = "UNIreg" if opt.presurf_denoise == "reg" else "MPRAGEised"
+    return f"presurf_work/refanat_{kind}.nii.gz"
+
+
 def _refanat_brain(opt) -> str:
     """The ref anat the EPI aligns to: stripped on the box grid when the anat is
     being stripped too (-anat_skull), else the box itself, taken to be a brain."""
@@ -3255,12 +3262,21 @@ def _stage_ref_anat(plan: Plan) -> str:
         return ""
     box, brain, mat = _refanat_box(), _refanat_brain(opt), _refanat_matrix()
     out = ["# --- -ref_anat: the anat → the ref anat (the EPI's own scanner) ---"]
+    head = shlex.quote(opt.ref_anat)
+    if opt.ref_presurf:
+        # An MP2RAGE ref: UNI's background is amplified noise, which every cost
+        # below would have to work around. Only the MPRAGEised head is used —
+        # presurfer's own masks are not; the strip (if any) is synthstrip's.
+        mprage = _refanat_presurf_image(opt)
+        call = _presurf_call(opt, opt.ref_presurf, "presurf_work/refanat.nii.gz", ["-no_classes"])
+        out.append(f'if [ ! -f "{mprage}" ]; then\n  mkdir -p presurf_work\n{call}\nfi')
+        head = f'"{mprage}"'
     out.append(
         f'[ -f "{box}" ] || \\\n'
         + _ffs(
             "ffs_util_autobox",
             [
-                f"-input {shlex.quote(opt.ref_anat)}",
+                f"-input {head}",
                 "-npad 3",
                 f'-prefix "{box}"',
                 '-device "$DEVICE"',
@@ -3591,13 +3607,31 @@ def _anat_inputs(opt, first: str) -> list[str]:
     return [first, *opt.anat_extra]
 
 
+def _presurf_call(opt, mp2rage: tuple[str, str, str | None], prefix: str, flags: list[str]) -> str:
+    """One ffs_util_presurf run: (uni, inv2, inv1-or-None) → ``prefix``'s head."""
+    uni, inv2, inv1 = mp2rage
+    tpm = shlex.quote(opt.presurf_tpm) if opt.presurf_tpm else '"${FFS_TPM:?set FFS_TPM}"'
+    return _ffs(
+        "ffs_util_presurf",
+        [
+            f"-uni {shlex.quote(uni)}",
+            f"-inv2 {shlex.quote(inv2)}",
+            f"-inv1 {shlex.quote(inv1)}" if inv1 else "",
+            f"-tpm {tpm}",
+            f'-prefix "{prefix}"',
+            f"-denoise {opt.presurf_denoise}" if opt.presurf_denoise != "off" else "",
+            *flags,
+            '-device "$DEVICE"',
+        ],
+    )
+
+
 def _presurf_block(opt) -> str:
     """MP2RAGE inv1/inv2/uni → an MPRAGE-like head, once per anat input.
 
     UNI is a ratio image: its background is noise amplified to full brightness,
     which synthstrip and every cross-modal cost then have to work around.
     MPRAGEising multiplies it by the bias-corrected INV2, which is dark there."""
-    tpm = shlex.quote(opt.presurf_tpm) if opt.presurf_tpm else '"${FFS_TPM:?set FFS_TPM}"'
     base_flags = _split_flags(config.DEFAULT_OPTS["presurf"])
     steps = []
     for k, (uni, inv2, inv1) in enumerate(opt.presurf, start=1):
@@ -3605,19 +3639,7 @@ def _presurf_block(opt) -> str:
         # (_tissue_files): keep them then, and rerun a presurf that skipped them.
         classes = k == 1 and _presurf_classes_needed(opt)
         flags = [f for f in base_flags if not (classes and f == "-no_classes")]
-        call = _ffs(
-            "ffs_util_presurf",
-            [
-                f"-uni {shlex.quote(uni)}",
-                f"-inv2 {shlex.quote(inv2)}",
-                f"-inv1 {shlex.quote(inv1)}" if inv1 else "",
-                f"-tpm {tpm}",
-                f'-prefix "presurf_work/anat{k}.nii.gz"',
-                f"-denoise {opt.presurf_denoise}" if opt.presurf_denoise != "off" else "",
-                *flags,
-                '-device "$DEVICE"',
-            ],
-        )
+        call = _presurf_call(opt, (uni, inv2, inv1), f"presurf_work/anat{k}.nii.gz", flags)
         need = f'[ ! -f "{_presurf_image(opt, k)}" ]'
         if classes:
             need += f' || [ ! -f "{_tissue_files(opt)[0]}" ]'

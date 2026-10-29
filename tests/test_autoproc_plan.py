@@ -2492,6 +2492,30 @@ def test_ref_anat_register_chains_the_backend_warp_in_the_same_slot():
     assert "refanat_seg" not in s
 
 
+def test_ref_anat_mp2rage_is_mprageised_before_anything_reads_it():
+    """An MP2RAGE ref: presurfer's MPRAGEised head replaces the UNI from the autobox
+    on, so the ref's strip, rigid fit and segmentation never see UNI's noise
+    background. Its classes are not wanted (-no_classes); only the head is used."""
+    uni = "/bids/sub-X/anat/sub-X_acq-uni_T1w.nii.gz"
+    s = _skull_script(
+        anat_skull=True,
+        ref_anat=uni,
+        ref_presurf=(uni, "/bids/sub-X/anat/sub-X_acq-inv2_T1w.nii.gz", None),
+        presurf_tpm="/t/TPM.nii",
+    )
+    end = s.index('-prefix "presurf_work/refanat.nii.gz"')
+    call = s[s.rindex("ffs_util_presurf", 0, end) : end + 200]
+    assert f"-uni {uni}" in call
+    assert "-inv2 /bids/sub-X/anat/sub-X_acq-inv2_T1w.nii.gz" in call
+    assert "-no_classes" in call
+    box = s[s.index("ffs_util_autobox", s.index("refanat.nii.gz")) :]
+    assert box.split("\n")[1].strip() == '-input "presurf_work/refanat_MPRAGEised.nii.gz" \\'
+    assert s.index("presurf_work/refanat.nii.gz") < s.index(
+        '-1Dmatrix_save "stage09.refanat.aff12.1D"'
+    )
+    assert "ffs_util_presurf" in s.split("stage: preflight")[1].split("stage")[0]
+
+
 def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     """-surface_target: the SAME one interpolation as stage10, read at surface points.
     The surfaces live in the anat's scanner space, so the MNI links must not be in

@@ -349,6 +349,9 @@ class Options:
     # (segment) or from the ref_anat_nl backend (register).
     ref_anat: str | None = None
     ref_anat_nonlin_method: str = "segment"
+    # (uni, inv2, inv1-or-None) when -ref_anat is an MP2RAGE UNI: presurfer's
+    # MPRAGEised head stands in for it from the first step on.
+    ref_presurf: tuple[str, str, str | None] | None = None
     # Emit the ``stageNN.QC.*`` stacks: at every level, the set of images that
     # stage claims to have brought into one space, concatenated along time into a
     # single 4-D file. Cheap (one temporal concat per group) and it is what makes
