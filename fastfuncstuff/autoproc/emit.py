@@ -347,10 +347,7 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) 
     if tok == "refanat_lin":
         return [_refanat_matrix()]
     if tok == "refanat_nl":
-        # .gz like the MNI warp: anat-sized, written once, and opened beside the anat.
-        if opt.ref_anat_nonlin_method == "register":
-            return [stem(NameKey("refanat")) + "_nl_WARP.nii.gz"]
-        return [_refanat_seg() + "_invwarp.nii.gz"]
+        return [_refanat_warp(opt)]
     if tok == "xfam_lin":
         return [_xfam_matrix()]
     if tok == "xfam_nl":
@@ -2932,8 +2929,9 @@ if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.xref.aff12.1D" ]; then
 
 
 _SHARED_ANAT_NOTE = (
-    "# Anat prep (strip, autobox, subject TPM, MNI link) is shared by every family:\n"
-    "# built once in the parent folder and linked in here (see the shared section)."
+    "# Anat prep (strip, autobox, subject TPM, ref-anat and MNI links) is shared by\n"
+    "# every family: built once in the parent folder and linked in here (see the\n"
+    "# shared section)."
 )
 
 
@@ -3007,6 +3005,9 @@ def _shared_anat_section(plan: Plan) -> str:
         f'ANAT="{anat_ph}"',
         _anat_box_block(),
         _tpm_block(opt),
+        # EPI-free like the MNI link, and shared for the same reason: families that
+        # meet at the anat must reach it through ONE ref→anat warp.
+        _stage_ref_anat(plan),
         _mni_estimate(plan),
     ]
     return "\n".join(p for p in parts if p) + "\n"
@@ -3074,9 +3075,8 @@ def _stage_anat(plan: Plan) -> str:
         # -ref_anat's segment reads the subject TPM, and the EPI matrix's base is
         # the ref, so both come first. The TPM build has its own exists-guard.
         ref = ""
-        if opt.ref_anat:
-            tpm_first = "" if plan.shared_anat else _tpm_block(opt)
-            ref = "\n".join(p for p in (tpm_first, _stage_ref_anat(plan)) if p) + "\n"
+        if opt.ref_anat and not plan.shared_anat:
+            ref = "\n".join(p for p in (_tpm_block(opt), _stage_ref_anat(plan)) if p) + "\n"
         note = ""
         if opt.anat_source not in (mode, "auto"):
             note = f"  # (-anat_source {opt.anat_source} unavailable here → {mode})\n"
@@ -3213,6 +3213,14 @@ def _refanat_matrix() -> str:
     return stem(NameKey("refanat")) + ".aff12.1D"
 
 
+def _refanat_warp(opt) -> str:
+    """The refanat_nl link. .gz like the MNI warp: anat-sized, written once (in the
+    parent folder when there are families), and opened beside the anat."""
+    if opt.ref_anat_nonlin_method == "register":
+        return stem(NameKey("refanat")) + "_nl_WARP.nii.gz"
+    return _refanat_seg() + "_invwarp.nii.gz"
+
+
 def _refanat_seg() -> str:
     """ffs_segment's prefix for the ref head against the anat's subject TPM."""
     return stem(NameKey("refanat")) + "_seg"
@@ -3342,7 +3350,7 @@ def _stage_ref_anat(plan: Plan) -> str:
         # In the ref's frame (-matrix + the un-allineated ref): the warp then acts
         # after the matrix on the output coordinate, the same slot segment's
         # invwarp takes, so the chain does not depend on which method ran.
-        warp = _token_files(plan.runs[0], "refanat_nl", ".nii.gz", opt)[0]
+        warp = _refanat_warp(opt)
         nl = _ffs(
             _nl_tool(opt, "ref_anat_nl"),
             [
@@ -3356,9 +3364,7 @@ def _stage_ref_anat(plan: Plan) -> str:
             ],
         )
         out.append(f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{warp}" ]; then\n{nl}\nfi')
-    links = " ".join(
-        _token_files(plan.runs[0], t, ".nii.gz", opt)[0] for t in ("refanat_lin", "refanat_nl")
-    )
+    links = f"{mat} {_refanat_warp(opt)}"
     out.append(
         f'[ -f "{_refanat_in_anat()}" ] || \\\n'
         + _ffs(

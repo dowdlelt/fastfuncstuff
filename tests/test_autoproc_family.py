@@ -138,7 +138,7 @@ def _two_family_subject(tmp: Path, prim_ses="01") -> Subject:
 
 
 def test_each_family_plans_alone_with_only_its_own_fieldmaps(tmp_path):
-    opt = Options(go_to_anat=True, anat_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True)
     plan = build_plan(_two_family_subject(tmp_path), opt)
     # The higher-res family is the root, and its folder runs first.
     assert [fam.label for fam, _ in plan.family_plans] == ["prim", "floc"]
@@ -155,7 +155,7 @@ def test_each_family_plans_alone_with_only_its_own_fieldmaps(tmp_path):
 
 
 def test_multi_family_script_runs_each_family_in_its_own_folder(tmp_path):
-    opt = Options(go_to_anat=True, anat_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True)
     script = write_script(build_plan(_two_family_subject(tmp_path), opt), "wd", bids_root="/bids")
     sh = tmp_path / "proc.sh"
     sh.write_text(script)
@@ -214,7 +214,7 @@ def test_overlap_reads_fraction_and_slab_extent_from_headers(tmp_path):
 
 
 def test_child_links_to_the_root_through_its_corrected_anchor(tmp_path):
-    opt = Options(go_to_anat=True, anat_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True)
     plan = build_plan(_slab_subject(tmp_path), opt)
     links = {f.label: f.link for f in plan.families}
     assert links == {"prim": "root", "floc": "xfam"}
@@ -244,7 +244,9 @@ def test_child_links_to_the_root_through_its_corrected_anchor(tmp_path):
 
 def test_thin_overlap_falls_back_to_the_anat(tmp_path):
     # prim starts at z=70 of floc's 80 mm: 10 mm of shared slab cannot pin rotation.
-    plan = build_plan(_slab_subject(tmp_path, prim_z0=70.0), Options(go_to_anat=True))
+    plan = build_plan(
+        _slab_subject(tmp_path, prim_z0=70.0), Options(go_to_anat=True, family_ref="highest_res")
+    )
     fam = {f.label: f for f in plan.families}["floc"]
     assert fam.link == "anat" and "20 mm" in fam.link_reason
     assert all(sub.xfam_root is None for _, sub in plan.family_plans)
@@ -256,7 +258,7 @@ def test_family_ref_and_link_overrides(tmp_path):
     assert {f.label: f.link for f in plan.families}["floc"] == "root"
     plan = build_plan(
         _slab_subject(tmp_path, prim_z0=70.0),
-        Options(go_to_anat=True, family_links={"floc": "root"}),
+        Options(go_to_anat=True, family_ref="highest_res", family_links={"floc": "root"}),
     )
     assert {f.label: f.link for f in plan.families}["floc"] == "xfam"
     plan = build_plan(_slab_subject(tmp_path), Options(go_to_anat=True, family_ref="anat"))
@@ -298,8 +300,55 @@ def test_anat_prep_and_mni_run_once_and_are_linked_into_each_family(tmp_path):
         assert "_al_mni" in fam
 
 
+def test_families_align_to_the_anat_on_their_own_by_default(tmp_path):
+    """Families can be very different acquisitions; by default none is a root, and
+    each is aligned to the anat by its own anat_lin/anat_nl, onto its own grid."""
+    plan = build_plan(_slab_subject(tmp_path), Options(go_to_anat=True, anat_nonlin=True))
+    assert {f.label: f.link for f in plan.families} == {"prim": "anat", "floc": "anat"}
+    for _, fplan in plan.family_plans:
+        assert fplan.xfam_root is None
+        assert all(not t.startswith("xfam_") for pr in fplan.runs for t in pr.warp_chain)
+
+
+def test_ref_anat_link_is_fitted_once_and_shared_by_every_family(tmp_path):
+    """Families meet at the anat, so they must reach it through ONE ref→anat warp:
+    the ref block runs in the parent folder (like the MNI link), and each family
+    still aligns its own EPI to the ref and chains the shared links."""
+    opt = Options(
+        go_to_anat=True,
+        anat_nonlin=True,
+        anat_tpm=True,
+        anat_skull=True,
+        anat_path=str(tmp_path / "T1w.nii.gz"),
+        spm_tpm="/TPM.nii",
+        ref_anat="/data/7T_T1w.nii.gz",
+    )
+    script = write_script(build_plan(_slab_subject(tmp_path), opt), "wd", bids_root="/bids")
+    sh = tmp_path / "proc.sh"
+    sh.write_text(script)
+    assert subprocess.run(["bash", "-n", str(sh)], capture_output=True).returncode == 0
+    head, *families = script.split("\n# family ")
+    shared = head.split("shared: anat prep")[1]
+    assert len(families) == 2
+    for step in (
+        '-1Dmatrix_save "stage09.refanat.aff12.1D"',
+        '-prefix "stage09.refanat_seg.nii.gz"',
+        '-prefix "tpm_work/refanat_TPM.nii.gz"',
+    ):
+        assert step in shared and all(step not in fam for fam in families), step
+    # The TPM the ref segment reads is built before it.
+    assert shared.index('-prefix "tpm_work/anatseg"') < shared.index("stage09.refanat_seg.nii.gz")
+    for fam in families:
+        assert '-base "stage09.refanat_brain.nii.gz"' in fam  # own EPI → the ref
+        assert '-tpm "tpm_work/refanat_TPM.nii.gz"' in fam
+        chain = next(x for x in fam.splitlines() if x.startswith("CHAIN["))
+        assert chain.split('="')[1].startswith(
+            "stage09.refanat.aff12.1D stage09.refanat_seg_invwarp.nii.gz stage09.anat.aff12.1D"
+        )
+
+
 def test_xfam_nonlin_fits_on_the_childs_own_grid_along_its_pe_axis(tmp_path):
-    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True, xfam_nonlin=True)
     plan = build_plan(_slab_subject(tmp_path), opt)
     (_, root), (_, child) = plan.family_plans
     toks = child.runs[0].warp_chain
@@ -330,7 +379,7 @@ def test_cross_family_links_stay_out_of_the_grandmean_chain(tmp_path):
     # makes from that very grandmean, so the script died on a missing matrix.
     from fastfuncstuff.autoproc.emit import _grandmean_tokens, _needs_gmrun
 
-    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True, xfam_nonlin=True)
     plan = build_plan(_slab_subject(tmp_path), opt)
     (_, _), (_, child) = plan.family_plans
     toks = _grandmean_tokens(child.runs[0])
@@ -341,7 +390,7 @@ def test_cross_family_links_stay_out_of_the_grandmean_chain(tmp_path):
 
 
 def test_every_family_cuts_its_own_warpmaster_and_mask(tmp_path):
-    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    opt = Options(go_to_anat=True, family_ref="highest_res", anat_nonlin=True, xfam_nonlin=True)
     script = write_script(build_plan(_slab_subject(tmp_path), opt), "wd", bids_root="/bids")
     _, prim, floc = script.split("\n# family ")
     for fam, anchor in ((prim, "grandmean_al_anat_nl"), (floc, "xfam_nl_al_anat")):

@@ -509,13 +509,15 @@ def build_parser() -> argparse.ArgumentParser:
         "-family_ref",
         default=None,
         metavar="MODE|LABEL",
-        help="with several acquisition families, the one the others align to (the "
-        "root): highest_res (default: the low-res family moves toward the sharper "
-        "target), lowest_res, coverage (largest field of view), least_distorted "
-        "(smallest readout time x PE voxel size), a family LABEL, or anat (no root: "
-        "every family aligns to the anat on its own). A child links to the root "
-        "only when their slabs overlap enough (-xfam_min_overlap); otherwise it "
-        "too aligns to the anat on its own.",
+        help="with several acquisition families, how they reach the anat. anat "
+        "(default): no root -- every family aligns to the anat on its own, with its own "
+        "anat_lin, anat_nl and output grid, and they meet at the anat, whose chain "
+        "(-ref_anat, -do_mni) they share. Or name a root the others align to EPI-to-EPI "
+        "(xfam): highest_res (the low-res family moves toward the sharper target), "
+        "lowest_res, coverage (largest field of view), least_distorted (smallest "
+        "readout time x PE voxel size), or a family LABEL. A child links to the root "
+        "only when their slabs overlap enough (-xfam_min_overlap); otherwise it too "
+        "aligns to the anat on its own.",
     )
     g.add_argument(
         "-family_link",
@@ -1593,9 +1595,21 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
             "to build one from FreeSurfer (aseg.auto + SurfVol)." + why
         )
+    rooted = [label for label, mode in opt.family_links.items() if mode == "root"]
+    if rooted and opt.family_ref == "anat":
+        errors.append(
+            f"-family_link {rooted[0]} root: with -family_ref anat (the default) there is "
+            "no root to link to. Name one: -family_ref highest_res, or a family label."
+        )
     if opt.ref_anat:
         if not opt.go_to_anat:
             errors.append("-ref_anat is a step on the way to -anat: it needs one (not -no_anat).")
+        if opt.xfam_nonlin:
+            errors.append(
+                "-ref_anat with -xfam_nonlin: that warp is fitted by pulling the root's "
+                "anchor back through the inverted anat chain, and the ref→anat link is a "
+                "warp, which ffs_nwarp cannot invert. Drop -xfam_nonlin (xfam_lin is fine)."
+            )
         if opt.ref_file or opt.grand_reference:
             errors.append(
                 "-ref_anat with -ref_file / -grand_reference: the anat link is borrowed "
@@ -2946,7 +2960,7 @@ def main(argv: list[str] | None = None) -> int:
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
         family_overrides=_resolve_family_overrides(args),
-        family_ref=args.family_ref or "highest_res",
+        family_ref=args.family_ref or "anat",
         family_links=_resolve_family_links(args),
         xfam_min_overlap=(0.5 if args.xfam_min_overlap is None else args.xfam_min_overlap),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),

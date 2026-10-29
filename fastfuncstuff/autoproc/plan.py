@@ -85,8 +85,11 @@ class Options:
     # acquisition signatures say (see family.detect_families).
     family_overrides: dict[str, str] = field(default_factory=dict)
     # -family_ref: which family the others align to (a family.ROOT_MODES mode or a
-    # label); "anat" aligns every family to the anat on its own.
-    family_ref: str = "highest_res"
+    # label); "anat" (the default) aligns every family to the anat on its own.
+    # Families can differ a great deal (slab vs whole brain, 7T vs 3T-like
+    # readouts), and each is best aligned to the anat by its own anat_lin/anat_nl
+    # rather than through a root; they meet at the anat, whose chain they share.
+    family_ref: str = "anat"
     # -family_link LABEL root|anat: per-child override of the overlap decision.
     family_links: dict[str, str] = field(default_factory=dict)
     # -xfam_min_overlap: least fraction of a child's FoV the root must cover.
@@ -946,15 +949,6 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
     # Separate families meet only at the anat. Without one they would land in
     # unrelated EPI spaces, so they stay one pipeline, linked by cross-fmap alignment.
     if len(families) > 1 and opt.go_to_anat:
-        if opt.ref_anat:
-            # Each family folder would fit its own ref→anat warp, and families that
-            # meet only at the anat must reach it through the same one.
-            raise ValueError(
-                f"-ref_anat with {len(families)} acquisition families "
-                f"({', '.join(f.label for f in families)}) is not supported yet: the "
-                "ref→anat link is not part of the shared anat prep. Select one family "
-                "(-task / -session) per run."
-            )
         rep = {
             fam.label: next(pr.bold.mag_path for pr in runs if pr.family == fam.label)
             for fam in families
