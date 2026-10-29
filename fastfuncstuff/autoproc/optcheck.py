@@ -48,6 +48,10 @@ STAGE_TOOL: dict[str, str] = {
     "segment_fstpm": "segment",
     "anat_tpm": "segment",
     "anat_t2": "allineate",
+    "ref_anat": "allineate",
+    "ref_anat_seg": "segment",
+    # The engine is a runtime choice (-ref_anat_nl_backend); this is only the default.
+    "ref_anat_nl": "formwarp",
     "nwarp": "nwarp",
     "glm": "reml",
 }

@@ -81,6 +81,19 @@ DEFAULT_OPTS: dict[str, str] = {
     # with (a T1 head against tpm/TPM.nii), so only the unused output is dropped:
     # nothing reads the inverse of an anat-space warp we never compose.
     "anat_tpm": "-no_invwarp",
+    # -ref_anat: the final anat → the same-scanner ref anat, rigid (one head, two
+    # scanners: anything past pose is gradient nonlinearity, which the warp after
+    # it is for). lpa: both sides are T1-weighted, just differently.
+    "ref_anat": "-rigid -cost lpa -source_automask -autoweight -cmass -final wsinc5",
+    # ...its nonlinear half by ffs_segment: the ref head segmented against the anat's
+    # subject TPM, full 3-D. Its invwarp is the chain link and its posteriors become
+    # the ref-space TPM for -anat_nonlin. SPM's defaults, as for anat_tpm: a T1 head
+    # against priors made from a T1 head. (Not -no_warp: that drops the deformation
+    # itself, not just the forward-warp file.)
+    "ref_anat_seg": "",
+    # ...or by registration (-ref_anat_nonlin_method register), in the ref's frame.
+    "ref_anat_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # T2w → T1w before a two-channel segmentation. Rigid: one head, one session,
     # so anything past pose is contrast, not motion. lpc because the two are
     # different contrasts, and -smallrange because a cross-modal cost over a wide
@@ -127,7 +140,14 @@ DEFAULT_OPTS: dict[str, str] = {
 # these same backends, and a name that means one thing to the tuner and another
 # to the pipeline is how a tuned setting ends up applied to the wrong engine.
 # ---------------------------------------------------------------------------
-NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl", "anat_nl", "xfam_nl")
+NL_STAGE_KEYS: tuple[str, ...] = (
+    "xrun_nl",
+    "xfmap_nl",
+    "xses_nl",
+    "anat_nl",
+    "ref_anat_nl",
+    "xfam_nl",
+)
 DEFAULT_NL_BACKEND = "formwarp"
 
 

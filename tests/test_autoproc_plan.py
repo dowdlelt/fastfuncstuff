@@ -2399,6 +2399,99 @@ def test_do_mni_stays_out_of_the_grandmean_chain():
     assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D"' not in s
 
 
+def _chain_links(s: str) -> list[str]:
+    chain = next(line for line in s.splitlines() if line.startswith("CHAIN["))
+    return chain.split('="')[1].rstrip('"').split()
+
+
+def test_ref_anat_links_sit_between_the_anat_and_the_epi_alignment():
+    """-ref_anat: the anat stays the output space and the EPI aligns to the ref, so
+    on the output coordinate the ref links act first (anat → ref), then the EPI's
+    own anat_lin/anat_nl (ref → EPI); MNI stays outermost. The ref warp is
+    segment's INVwarp — the forward warp maps ref → anat, the wrong way round."""
+    s = _skull_script(
+        anat_skull=True,
+        anat_nonlin=True,
+        tpm="/t/tpm.nii.gz",
+        ref_anat="/data/sub-X_acq-7T_T1w.nii.gz",
+        do_mni=True,
+        mni_template="/t/MNI.nii.gz",
+    )
+    assert _chain_links(s)[:6] == [
+        "stage09.mni_nl_WARP.nii.gz",
+        "stage09.mni.aff12.1D",
+        "stage09.refanat.aff12.1D",
+        "stage09.refanat_seg_invwarp.nii.gz",
+        "stage09.anat.aff12.1D",
+        "stage09.nlanat_invwarp.nii$FMT",
+    ]
+    # Estimated on the anat as before: -ref_anat leaves the MNI hop alone.
+    assert '-source "stage09.anat_autobox.nii.gz"' in s
+    gm = [line for line in s.splitlines() if "stage08.gmrun" in line or "$GMGRID" in line]
+    assert not any("refanat" in line for line in gm), gm
+
+
+def test_ref_anat_is_what_the_epi_aligns_to_and_segments_against():
+    """The EPI shares the ref's gradients, so both EPI fits use the ref: the anat
+    matrix's base, and anat_nl's priors -- the anat's TPM as the ref's own
+    posteriors, made by the same ffs_segment that finds the ref → anat warp."""
+    s = _skull_script(
+        anat_skull=True,
+        anat_nonlin=True,
+        tpm="/t/tpm.nii.gz",
+        ref_anat="/data/sub-X_acq-7T_T1w.nii.gz",
+    )
+    ref_seg = s.index('-prefix "stage09.refanat_seg.nii.gz"')
+    epi_lin = s.index('-1Dmatrix_save "stage09.anat.aff12.1D"')
+    assert ref_seg < epi_lin  # the ref (and its TPM) exist before the EPI step
+    seg = s[s.rindex("ffs_segment", 0, ref_seg) : ref_seg]
+    assert '-input "stage09.refanat_autobox.nii.gz"' in seg  # the head, skull on
+    assert "-tpm /t/tpm.nii.gz" in seg
+    assert '-1Dmatrix "stage09.refanat.aff12.1D"' in seg
+    assert '-matrix_base "stage09.anat_autobox.nii.gz"' in seg
+    assert "-pe_axis" not in seg  # free on all three axes
+    lin = s[s.rindex("ffs_allineate", 0, epi_lin) : epi_lin]
+    assert '-base "stage09.refanat_brain.nii.gz"' in lin
+    epi_seg = s[s.index('-prefix "stage09.nlanat.nii$FMT"') - 600 :]
+    epi_seg = epi_seg[: epi_seg.index('-prefix "stage09.nlanat.nii$FMT"')]
+    assert '-tpm "tpm_work/refanat_TPM.nii.gz"' in epi_seg
+    assert '-matrix_base "stage09.refanat_brain.nii.gz"' in epi_seg
+
+
+def test_ref_anat_keeps_the_anat_as_the_final_space():
+    """Without anat_nl too: the anchor still has to go through the ref links, or
+    the final grid would be cut from an image sitting on the ref."""
+    s = _skull_script(anat_skull=True, ref_anat="/data/sub-X_acq-7T_T1w.nii.gz")
+    assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_anat_nl.nii$FMT}"' in s
+    anchor = s[: s.index('-prefix "stage09.grandmean_al_anat_nl.nii$FMT"')]
+    anchor = anchor[anchor.rindex("ffs_nwarp") :]
+    assert (
+        '-nwarp "stage09.refanat.aff12.1D stage09.refanat_seg_invwarp.nii.gz stage09.anat.aff12.1D"'
+        in anchor
+    )
+    assert '-master "stage09.anat_autobox.nii.gz"' in anchor
+    assert '-input "stage09.anat_autobox.nii.gz"' in s  # underlay ancestor unchanged
+
+
+def test_ref_anat_register_chains_the_backend_warp_in_the_same_slot():
+    """register: the backend runs in the ref's frame (-matrix + the raw ref), so its
+    warp takes segment's slot and nothing else in the chain moves."""
+    s = _skull_script(
+        anat_skull=True,
+        ref_anat="/data/sub-X_acq-7T_T1w.nii.gz",
+        ref_anat_nonlin_method="register",
+    )
+    assert _chain_links(s)[:3] == [
+        "stage09.refanat.aff12.1D",
+        "stage09.refanat_nl_WARP.nii.gz",
+        "stage09.anat.aff12.1D",
+    ]
+    assert '-matrix "stage09.refanat.aff12.1D"' in s
+    assert '-warp_prefix "stage09.refanat_nl"' in s
+    # Nothing reads a TPM here (no -anat_nonlin), so no segment of the ref.
+    assert "refanat_seg" not in s
+
+
 def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     """-surface_target: the SAME one interpolation as stage10, read at surface points.
     The surfaces live in the anat's scanner space, so the MNI links must not be in

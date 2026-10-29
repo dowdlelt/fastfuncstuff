@@ -212,6 +212,33 @@ def build_parser() -> argparse.ArgumentParser:
         "e.g. a thin-slab multi-echo GRE.",
     )
     g.add_argument(
+        "-ref_anat",
+        "-ref-anat",
+        metavar="FILE",
+        help="an anat from the EPI's OWN scanner (same gradient coils, ideally the same "
+        "session), e.g. the 7T MP2RAGE when -anat is a 3T T1w. The EPI aligns to it "
+        "instead of to -anat (anat_lin, and anat_nl with the ref's own posteriors as "
+        "priors), so gradient nonlinearity the two share needs no correcting. Then the "
+        "ref is taken onto -anat, rigid + a full 3-D warp (-ref_anat_nonlin_method), "
+        "and -anat stays the final space: grid, masks, tissue, surfaces and -do_mni are "
+        "all unchanged. Both links ride the head of every chain, so the data still makes "
+        "one trip through an interpolator. Stripped with mri_synthstrip when -anat is. "
+        "The shared-gradient premise holds when both were (or were not) gradient-"
+        "corrected alike -- check ImageType for DIS2D/DIS3D/ND -- and anat_nl, PE-axis "
+        "only, cannot absorb a through-slice difference.",
+    )
+    g.add_argument(
+        "-ref_anat_nonlin_method",
+        "-ref-anat-nonlin-method",
+        choices=["segment", "register"],
+        default="segment",
+        help="how the -ref_anat → -anat warp is found. segment (default): ffs_segment of "
+        "the ref head against -anat's subject TPM, free on all three axes; tissue "
+        "priors hold up where a 7T ref's intensities do not (ventral B1 dropout). "
+        "register: the -ref_anat_nl_backend engine (default -nl_backend), ref brain to "
+        "anat brain on intensity, in the ref's frame.",
+    )
+    g.add_argument(
         "-surface_target",
         "-surface-target",
         nargs="+",
@@ -419,7 +446,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="matrices/warps mapping the reference to anat, in nwarp order",
     )
     g.add_argument(
-        "-ref_anat", "-ref-anat", help="reference anat (copied in; ffs_segment tpm-space anat + QC)"
+        "-ref_file_anat",
+        "-ref-file-anat",
+        help="with -ref_file: the anat the reference's transforms land in (copied in; "
+        "ffs_segment tpm-space anat + QC, and the output grid)",
     )
 
     g = p.add_argument_group("NORDIC / phase")
@@ -888,6 +918,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("xfmap", "cross-fmap-group"),
         ("xses", "cross-session"),
         ("anat", "EPI-to-anat (-anat_nonlin_method register)"),
+        ("ref_anat", "ref-anat-to-anat (-ref_anat_nonlin_method register)"),
         ("xfam", "cross-family (-xfam_nonlin)"),
     ):
         suggest(
@@ -1548,6 +1579,20 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
             "to build one from FreeSurfer (aseg.auto + SurfVol)." + why
         )
+    if opt.ref_anat:
+        if not opt.go_to_anat:
+            errors.append("-ref_anat is a step on the way to -anat: it needs one (not -no_anat).")
+        if opt.ref_file or opt.grand_reference:
+            errors.append(
+                "-ref_anat with -ref_file / -grand_reference: the anat link is borrowed "
+                "there, so there is no own anat step for the ref to stand in for."
+            )
+        if opt.ref_anat_nonlin_method == "segment" and not opt.tpm:
+            errors.append(
+                "-ref_anat_nonlin_method segment needs -anat's subject TPM: -tpm FILE, "
+                "-suma DIR, or an unstripped -anat plus -spm_tpm / $FFS_TPM. Or use "
+                "-ref_anat_nonlin_method register."
+            )
     if opt.anat_extra and (opt.grand_reference or opt.ref_file):
         borrowed = "-grand_reference" if opt.grand_reference else "-ref_file"
         warnings.append(
@@ -1757,6 +1802,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-presurf_tpm (or $FFS_TPM)", opt.presurf_tpm),
         ("-tpm_source", opt.tpm_source),
         ("-ref_file", opt.ref_file),
+        ("-ref_file_anat", opt.ref_file_anat),
         ("-ref_anat", opt.ref_anat),
         ("-slicetiming", opt.slicetiming_file),
     ):
@@ -1780,9 +1826,9 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     for m in opt.ref_transforms or []:
         if not Path(m).exists():
             errors.append(f"-ref_transforms not found: {m}")
-    if opt.ref_file and not (opt.ref_transforms or opt.ref_anat):
+    if opt.ref_file and not (opt.ref_transforms or opt.ref_file_anat):
         warnings.append(
-            "-ref_file given without -ref_transforms/-ref_anat: the reference is assumed to "
+            "-ref_file given without -ref_transforms/-ref_file_anat: the reference is assumed to "
             "already be in anat space."
         )
     if opt.anat_source != "grandmean":
@@ -2507,7 +2553,9 @@ def _resolve_tpm(
     tpm, fs_tpm, anat_tpm = args.tpm, False, False
     spm_tpm = args.spm_tpm or os.environ.get("FFS_TPM")
     anat_t2 = None
-    if not (anat_nonlin and args.anat_nonlin_method == "segment") or tpm:
+    # -ref_anat segment reads the same subject TPM, on the ref head.
+    ref_seg = bool(args.ref_anat) and args.ref_anat_nonlin_method == "segment"
+    if not ((anat_nonlin and args.anat_nonlin_method == "segment") or ref_seg) or tpm:
         return tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2
     if args.suma:
         fs_tpm = True
@@ -2651,6 +2699,7 @@ _PATH_ARGS = (
     "tpm_source",
     "grand_reference",
     "ref_file",
+    "ref_file_anat",
     "ref_anat",
 )
 _PATH_LIST_ARGS = ("anat", "ref_transforms", "events")
@@ -2916,6 +2965,7 @@ def main(argv: list[str] | None = None) -> int:
         mni_template=mni_template,
         anat_nonlin_input=args.anat_nonlin_input,
         anat_nonlin_method=args.anat_nonlin_method,
+        ref_anat_nonlin_method=args.ref_anat_nonlin_method,
         anat_path=anat_path if go_to_anat else None,
         anat_extra=anat_paths[1:] if go_to_anat else [],
         moco_ref=args.moco_ref,
@@ -2943,6 +2993,7 @@ def main(argv: list[str] | None = None) -> int:
         surface_glm_opts=args.surface_glm_opts,
         ref_file=args.ref_file,
         ref_transforms=args.ref_transforms,
+        ref_file_anat=args.ref_file_anat,
         ref_anat=args.ref_anat,
         events=args.events,
     )

@@ -766,6 +766,8 @@ def _tpm_args(**kw):
         anat_nonlin_method="segment",
         ref_file=None,
         grand_reference=None,
+        ref_anat=None,
+        ref_anat_nonlin_method="segment",
     )
     return Namespace(**{**base, **kw})
 
@@ -791,6 +793,13 @@ def test_tpm_resolution_builds_from_the_anat_when_there_is_no_freesurfer(tmp_pat
     # -suma wins (FreeSurfer labels are sharper), and an explicit -tpm wins outright.
     assert res(suma="/fs/SUMA")[1:3] == (True, False)
     assert res(tpm="/my/tpm.nii")[:3] == ("/my/tpm.nii", False, False)
+    # -ref_anat's segment reads the same TPM, so it is built without -anat_nonlin too;
+    # register reads none.
+    ref = dict(ref_anat="/r/7T.nii.gz")
+    built = _resolve_tpm(_tpm_args(**ref), anat_nonlin=False, anat_path=t1, anat_skull=True)
+    assert built[0] == "tpm_work/sub_specific_anatTPM.nii.gz"
+    reg = _tpm_args(**ref, ref_anat_nonlin_method="register")
+    assert _resolve_tpm(reg, anat_nonlin=False, anat_path=t1, anat_skull=True)[0] is None
     # Nothing to segment: no group TPM, a stripped anat, or a borrowed anat link.
     assert res(spm_tpm=None)[2] is False
     assert _resolve_tpm(_tpm_args(), anat_nonlin=True, anat_path=t1, anat_skull=False)[2] is False

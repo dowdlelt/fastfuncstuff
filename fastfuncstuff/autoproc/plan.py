@@ -9,7 +9,7 @@ tokens into filenames.
 Warp-chain token order (output/anat space → native source; the same order
 ``ffs_nwarp -nwarp`` consumes, leftmost acting first on the output coordinate)::
 
-    mni_nl mni_lin  anat_lin  xref_nl xref_lin  anat_nl  xses_nl xses_lin
+    mni_nl mni_lin  refanat_lin refanat_nl  anat_lin  xref_nl xref_lin  anat_nl  xses_nl xses_lin
         xfmap_nl xfmap_lin  blip_half  wxrun_nl wxrun_lin  locomoco  moco
 
 Verified against both reference ffs scripts and the AFNI final-apply block:
@@ -259,6 +259,7 @@ class Options:
     xfmap_nl_backend: str = config.DEFAULT_NL_BACKEND
     xses_nl_backend: str = config.DEFAULT_NL_BACKEND
     anat_nl_backend: str = config.DEFAULT_NL_BACKEND
+    ref_anat_nl_backend: str = config.DEFAULT_NL_BACKEND
     xfam_nl_backend: str = config.DEFAULT_NL_BACKEND
     # -anat_nonlin by ffs_segment (TPM-driven) or by registering the anat anchor
     # to the anat along the PE axis with the anat_nl backend.
@@ -340,7 +341,14 @@ class Options:
     # the anat itself (copied in; used as ffs_segment tpm-space / QC).
     ref_file: str | None = None
     ref_transforms: list[str] | None = None
+    ref_file_anat: str | None = None
+    # -ref_anat: an anat from the EPI's own scanner (same gradients, usually the same
+    # session) that the EPI aligns to -- anat_lin and anat_nl both land on it -- and
+    # that is then taken rigid + full-3D nonlinear onto -anat, which stays the final
+    # space. The ref→anat warp comes from ffs_segment against the anat's subject TPM
+    # (segment) or from the ref_anat_nl backend (register).
     ref_anat: str | None = None
+    ref_anat_nonlin_method: str = "segment"
     # Emit the ``stageNN.QC.*`` stacks: at every level, the set of images that
     # stage claims to have brought into one space, concatenated along time into a
     # single 4-D file. Cheap (one temporal concat per group) and it is what makes
@@ -381,6 +389,13 @@ _CHAIN_ORDER = (
     # anchors are in anat space, so it acts on the output coordinate before this
     # family's own anat_lin does — and below MNI, which is estimated on the anat.
     "xfam_lin",
+    # -ref_anat: the final anat → the same-scanner ref anat the EPI was aligned to.
+    # Lin-then-nl like anat_*: the warp is fitted in the ref anat's own frame
+    # (ffs_segment's source-side invwarp, or a backend run in-source), so it acts
+    # after the matrix on the output coordinate. Below xfam_lin, which links two
+    # anchors that are already in the final anat's space.
+    "refanat_lin",
+    "refanat_nl",
     "anat_lin",
     "xref_nl",
     "xref_lin",
@@ -788,6 +803,8 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
         "mni_lin": opt.go_to_anat and opt.do_mni,
         "mni_nl": opt.go_to_anat and opt.do_mni,
         "anat_lin": opt.go_to_anat,
+        "refanat_lin": opt.go_to_anat and opt.ref_anat is not None,
+        "refanat_nl": opt.go_to_anat and opt.ref_anat is not None,
         "xfam_lin": opt.go_to_anat and opt.xfam_link,
         "xfam_nl": opt.go_to_anat and opt.xfam_link and opt.xfam_nonlin,
         # xref: align this data's grandmean to the external reference's grandmean.
@@ -926,6 +943,15 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
     # Separate families meet only at the anat. Without one they would land in
     # unrelated EPI spaces, so they stay one pipeline, linked by cross-fmap alignment.
     if len(families) > 1 and opt.go_to_anat:
+        if opt.ref_anat:
+            # Each family folder would fit its own ref→anat warp, and families that
+            # meet only at the anat must reach it through the same one.
+            raise ValueError(
+                f"-ref_anat with {len(families)} acquisition families "
+                f"({', '.join(f.label for f in families)}) is not supported yet: the "
+                "ref→anat link is not part of the shared anat prep. Select one family "
+                "(-task / -session) per run."
+            )
         rep = {
             fam.label: next(pr.bold.mag_path for pr in runs if pr.family == fam.label)
             for fam in families

@@ -344,6 +344,13 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) 
         return _mni_files(opt, ".aff12.1D")
     if tok == "anat_lin":
         return _anat_lin_files(opt)
+    if tok == "refanat_lin":
+        return [_refanat_matrix()]
+    if tok == "refanat_nl":
+        # .gz like the MNI warp: anat-sized, written once, and opened beside the anat.
+        if opt.ref_anat_nonlin_method == "register":
+            return [stem(NameKey("refanat")) + "_nl_WARP.nii.gz"]
+        return [_refanat_seg() + "_invwarp.nii.gz"]
     if tok == "xfam_lin":
         return [_xfam_matrix()]
     if tok == "xfam_nl":
@@ -1055,16 +1062,30 @@ def _qc_anat(plan: Plan) -> str:
     if not (_qc_on(plan) and _own_anat(plan.options)):
         return ""
     src = effective_anat_source(plan)
-    items: QCItems = [
-        (_anat_box(), "anat"),
-        (_al_anat(plan), f"{src}_al_anat"),
-    ]
-    if plan.options.anat_nonlin:
-        # Both states, so the nonlinear link is visible as the step between them —
-        # and so the one the final grid is built from is the one you can see.
-        items.append((_al_anat_nl(plan), f"{src}_al_anat_nl"))
     opt = plan.options
-    calls = [_qc_call(_qc_stem("anat"), items)]
+    if opt.ref_anat:
+        # Two grids, so two stacks: the EPI's alignment on the ref (what anat_lin
+        # and anat_nl were fitted against), and everything on the anat after the
+        # ref links -- the ref affine-only, then warped, then the EPI anchor.
+        refanat = stem(NameKey("refanat"))
+        ref_items: QCItems = [(_refanat_brain(opt), "ref_anat"), (_al_anat(plan), f"{src}_al_ref")]
+        items: QCItems = [
+            (_anat_box(), "anat"),
+            (f"{refanat}_lin.nii.gz", "ref_anat_affine"),
+            (_refanat_in_anat(), "ref_anat_nonlin"),
+            (_al_anat_nl(plan), f"{src}_al_anat_nl"),
+        ]
+        calls = [_qc_call(_qc_stem("refanat"), ref_items), _qc_call(_qc_stem("anat"), items)]
+    else:
+        items = [
+            (_anat_box(), "anat"),
+            (_al_anat(plan), f"{src}_al_anat"),
+        ]
+        if opt.anat_nonlin:
+            # Both states, so the nonlinear link is visible as the step between them —
+            # and so the one the final grid is built from is the one you can see.
+            items.append((_al_anat_nl(plan), f"{src}_al_anat_nl"))
+        calls = [_qc_call(_qc_stem("anat"), items)]
     if opt.anat_skull:
         # pre-strip vs brain on the input grid: the one stack that shows whether
         # the strip ate cortex. It cannot join the group above — that one lives on
@@ -1086,7 +1107,7 @@ def _qc_anat(plan: Plan) -> str:
         ins += [(_anat_in_al(k), f"anat_in{k}") for k in range(2, len(opt.anat_extra) + 2)]
         ins.append((_anat_avg(), "anat_avg"))
         calls.insert(0, _qc_call(_qc_stem("anat_avg"), ins))
-    return _qc_block("EPI → anat", calls)
+    return _qc_block("EPI → ref anat → anat" if opt.ref_anat else "EPI → anat", calls)
 
 
 def _final_mean(frag: str) -> str:
@@ -1543,6 +1564,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         }
         # The TPM build reads these before stage09 can produce a nonlinear anat.
         | {p for p in (plan.options.spm_tpm, plan.options.anat_t2) if p and plan.options.anat_tpm}
+        | ({plan.options.ref_anat} if plan.options.ref_anat else set())
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # Only the *command* is checked, not the flags that fix a backend's identity
@@ -1571,6 +1593,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         tools = [*tools, config.nl_command(opt.mni_backend).split()[0]]
     if opt.anat_nonlin and opt.anat_nonlin_method == "register":
         tools = [*dict.fromkeys([*tools, _nl_tool(opt, "anat_nl").split()[0]])]
+    if opt.ref_anat and opt.ref_anat_nonlin_method == "register":
+        tools = [*dict.fromkeys([*tools, _nl_tool(opt, "ref_anat_nl").split()[0]])]
     return f"""
 # =============================== stage: preflight ===========================
 echo '== preflight: inputs + tools =='
@@ -2942,9 +2966,18 @@ def _anat_box_block() -> str:
     return f'[ -f "{box}" ] || \\\n{boxing}'
 
 
+def _needs_anat_tpm(opt) -> bool:
+    """Whether some ffs_segment run reads the anat's subject TPM: the EPI fit
+    (without -ref_anat; with it the EPI reads the ref's copy, made from this one)
+    or the ref head's segmentation."""
+    epi = opt.anat_nonlin and opt.anat_nonlin_method == "segment"
+    return epi or bool(opt.ref_anat and _refanat_needs_seg(opt))
+
+
 def _tpm_block(opt) -> str:
-    """The subject-TPM build ffs_segment's EPI fit reads, if this run makes one."""
-    if not (opt.anat_nonlin and opt.anat_nonlin_method != "register"):
+    """The subject-TPM build ffs_segment reads (the EPI fit, or -ref_anat's), if
+    this run makes one."""
+    if not _needs_anat_tpm(opt):
         return ""
     if opt.fs_tpm:
         return _fs_tpm_block(opt)
@@ -2999,17 +3032,17 @@ def _stage_anat(plan: Plan) -> str:
         )
     out = ["", "# ============================ stage09: anatomical alignment ================="]
     out.append("echo '== stage09: anat alignment =='")
-    # tpm_source default: an explicit -ref_anat (copied in) doubles as the anat in
+    # tpm_source default: an explicit -ref_file_anat (copied in) doubles as the anat in
     # tpm space, useful for ffs_segment QC; else the user's -tpm_source.
     tpm_src_path = opt.tpm_source
     if opt.ref_file is not None:
-        # Explicit reference override: transforms are user-supplied; copy ref_anat
+        # Explicit reference override: transforms are user-supplied; copy ref_file_anat
         # in (tpm-space anat + QC). anat_lin links = -ref_transforms (see chain).
         refmats = " ".join(shlex.quote(m) for m in (opt.ref_transforms or []))
         out.append("# explicit reference: -ref_transforms map ref→anat (baked into CHAIN).")
-        if opt.ref_anat:
-            out.append(f"cp -f {shlex.quote(opt.ref_anat)} stage09.ref_anat.nii.gz")
-            tpm_src_path = tpm_src_path or "stage09.ref_anat.nii.gz"
+        if opt.ref_file_anat:
+            out.append(f"cp -f {shlex.quote(opt.ref_file_anat)} stage09.ref_file_anat.nii.gz")
+            tpm_src_path = tpm_src_path or "stage09.ref_file_anat.nii.gz"
         seg_mats = f"{refmats} stage09.xref.aff12.1D".strip()
     elif opt.grand_reference:
         gr = opt.grand_reference.rstrip("/")
@@ -3025,11 +3058,10 @@ def _stage_anat(plan: Plan) -> str:
             out.extend(prep)
         src = _anat_source_image(plan)
         mode = effective_anat_source(plan)
-        box = _anat_box()
         lin = _ffs(
             "ffs_allineate",
             [
-                f'-base "{box}"',
+                f'-base "{_anat_lin_base(opt)}"',
                 f'-source "{src}"',
                 f'-prefix "{_al_anat(plan)}"',
                 '-1Dmatrix_save "stage09.anat.aff12.1D"',
@@ -3038,6 +3070,12 @@ def _stage_anat(plan: Plan) -> str:
                 '-device "$DEVICE"',
             ],
         )
+        # -ref_anat's segment reads the subject TPM, and the EPI matrix's base is
+        # the ref, so both come first. The TPM build has its own exists-guard.
+        ref = ""
+        if opt.ref_anat:
+            tpm_first = "" if plan.shared_anat else _tpm_block(opt)
+            ref = "\n".join(p for p in (tpm_first, _stage_ref_anat(plan)) if p) + "\n"
         note = ""
         if opt.anat_source not in (mode, "auto"):
             note = f"  # (-anat_source {opt.anat_source} unavailable here → {mode})\n"
@@ -3051,8 +3089,10 @@ def _stage_anat(plan: Plan) -> str:
             "# free lunch: anything reading the matrix against the uncropped anat must\n"
             "# be told the crop was the base, or it slips by a fixed shift.\n"
             f"{'' if plan.shared_anat else _anat_box_block() + chr(10)}"
+            f"{ref}"
             'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.anat.aff12.1D" ]; then\n'
             "  # cross-modal rigid lpc: base=anat → matrix maps anat→EPI (chain head).\n"
+            f"{"  # (-ref_anat: base = the ref anat, the EPI scanner's own.)" + chr(10) if opt.ref_anat else ''}"
             f"  # source = -anat_source {mode} (all choices share the reference-fmap grid).\n"
             f"{note}{lin}\nfi"
         )
@@ -3064,16 +3104,21 @@ def _stage_anat(plan: Plan) -> str:
     elif opt.anat_nonlin:
         # Optionally build the subject TPM first: from FreeSurfer (SUMA), so no SPM
         # TPM is needed ahead of time, else from the anat's own segmentation.
-        if not plan.shared_anat:
+        if not (plan.shared_anat or opt.ref_anat):
             out.append(_tpm_block(opt))
-        if opt.anat_tpm and not opt.fs_tpm:
+        if opt.ref_anat:
+            # The EPI landed on the ref, so its priors are the ref's posteriors.
+            tpm_src_path = tpm_src_path or _refanat_box()
+        elif opt.anat_tpm and not opt.fs_tpm:
             # The head is the image those priors were fitted to, so it is the
             # anat-in-EPI QC source that costs nothing extra to ask for.
             tpm_src_path = tpm_src_path or _anat_prestrip(opt)
         # One last ffs_segment on the CURRENT data (PE-mode nonlinear anat), init
         # from the anat matrix/matrices. Needs a subject TPM.
         tpm = (
-            shlex.quote(opt.tpm)
+            f'"{_refanat_tpm()}"'
+            if opt.ref_anat
+            else shlex.quote(opt.tpm)
             if opt.tpm
             else '"${FFS_TPM:?set FFS_TPM to the subject tissue-probability template}"'
         )
@@ -3081,7 +3126,7 @@ def _stage_anat(plan: Plan) -> str:
         seg_tune = _split_flags(config.DEFAULT_OPTS["segment_fstpm" if opt.fs_tpm else "segment"])
         # The matrix's base is the anat autobox; the TPM is on the uncropped anat. On an
         # oblique anat those are different cardinal frames, so say which one it was.
-        seg_base = _anat_matrix_base(opt)
+        seg_base = _refanat_brain(opt) if opt.ref_anat else _anat_matrix_base(opt)
         seg = _ffs(
             "ffs_segment",
             [
@@ -3100,6 +3145,9 @@ def _stage_anat(plan: Plan) -> str:
             f'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.nlanat_invwarp.nii$FMT" ]; then\n'
             f"{seg}\nfi"
         )
+        out.append(_anat_nl_anchor_call(plan))
+    elif opt.ref_anat:
+        # No anat_nl, but the ref links still sit above anat_lin.
         out.append(_anat_nl_anchor_call(plan))
     out.append(_stage_xfam(plan))
     out.append(_qc_anat(plan))
@@ -3122,7 +3170,7 @@ def _anat_nl_register(plan: Plan, matrix: str) -> str:
     call = _ffs(
         _nl_tool(plan.options, "anat_nl"),
         [
-            f'-base "{_anat_box()}"',
+            f'-base "{_anat_lin_base(plan.options)}"',
             f'-source "{_anat_source_image(plan)}"',
             f'-matrix "{matrix}"',
             '-prefix "stage09.nlanat.nii$FMT"',
@@ -3138,6 +3186,178 @@ def _anat_nl_register(plan: Plan, matrix: str) -> str:
         f'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.nlanat_WARP.nii$FMT" ]; then\n'
         f"{call}\nfi"
     )
+
+
+def _refanat_box() -> str:
+    """-ref_anat autoboxed — the grid every ref-side image shares. One lattice for
+    the matrix's source, the segment input and the EPI matrix's base, because an
+    .aff12.1D lives in its dataset's cardinal frame, and on an oblique ref a crop of
+    it is a different frame ([[project_aff12_base_grid]])."""
+    return "stage09.refanat_autobox.nii.gz"
+
+
+def _refanat_brain(opt) -> str:
+    """The ref anat the EPI aligns to: stripped on the box grid when the anat is
+    being stripped too (-anat_skull), else the box itself, taken to be a brain."""
+    return "stage09.refanat_brain.nii.gz" if opt.anat_skull else _refanat_box()
+
+
+def _refanat_matrix() -> str:
+    return stem(NameKey("refanat")) + ".aff12.1D"
+
+
+def _refanat_seg() -> str:
+    """ffs_segment's prefix for the ref head against the anat's subject TPM."""
+    return stem(NameKey("refanat")) + "_seg"
+
+
+def _refanat_tpm() -> str:
+    """The anat's subject TPM as the ref anat's own posteriors, on the ref grid —
+    the priors -anat_nonlin's EPI fit reads when the EPI lands on the ref."""
+    return "tpm_work/refanat_TPM.nii.gz"
+
+
+def _refanat_in_anat() -> str:
+    """The ref anat through both ref links onto the anat — the QC image that says
+    whether the ref→anat warp did its job."""
+    return stem(NameKey("refanat")) + "_in_anat.nii.gz"
+
+
+def _anat_lin_base(opt) -> str:
+    """The image the EPI's anat matrix is fitted against: the ref anat when there is
+    one (the EPI's own scanner), else the anat autobox."""
+    return _refanat_brain(opt) if opt.ref_anat else _anat_box()
+
+
+def _refanat_needs_seg(opt) -> bool:
+    """ffs_segment of the ref runs for the ref→anat warp (segment) and for the
+    ref-space TPM a segment-driven -anat_nonlin reads, whichever warp is chained."""
+    return opt.ref_anat_nonlin_method == "segment" or (
+        opt.anat_nonlin and opt.anat_nonlin_method == "segment"
+    )
+
+
+def _stage_ref_anat(plan: Plan) -> str:
+    """-ref_anat: the final anat → the same-scanner ref anat, rigid then full 3-D.
+
+    The EPI and the ref share gradient coils (and usually a session), so whatever
+    gradient nonlinearity the ref carries the EPI carries too, and anat_lin/anat_nl
+    align the EPI to it as they would to -anat. The anat — another scanner, a
+    better ventral brain — stays the final space, and this is the link between
+    them: the same brain, so a rigid pose plus a deformation free on all three axes.
+
+    The segment route reuses the anat's subject TPM: segmenting the ref head
+    against it gives the warp (its source-side invwarp, chained after the matrix
+    like anat_nl's) and, as posteriors, those priors on the ref grid. Needs $ANAT
+    and the subject TPM, and runs before the EPI's anat matrix, whose base it makes."""
+    opt = plan.options
+    if not opt.ref_anat:
+        return ""
+    box, brain, mat = _refanat_box(), _refanat_brain(opt), _refanat_matrix()
+    out = ["# --- -ref_anat: the anat → the ref anat (the EPI's own scanner) ---"]
+    out.append(
+        f'[ -f "{box}" ] || \\\n'
+        + _ffs(
+            "ffs_util_autobox",
+            [
+                f"-input {shlex.quote(opt.ref_anat)}",
+                "-npad 3",
+                f'-prefix "{box}"',
+                '-device "$DEVICE"',
+            ],
+        )
+    )
+    if opt.anat_skull:
+        strip_opts = " ".join(_split_flags(config.DEFAULT_OPTS["synthstrip"]))
+        out.append(f'[ -f "{brain}" ] || mri_synthstrip -i "{box}" -o "{brain}" {strip_opts}')
+    # base = the anat, as for ffs_segment's -1Dmatrix: the matrix maps anat → ref,
+    # which is also the direction the chain reads it in.
+    lin = _ffs(
+        "ffs_allineate",
+        [
+            f'-base "{_anat_box()}"',
+            f'-source "{brain}"',
+            f'-prefix "{stem(NameKey("refanat"))}_lin.nii.gz"',
+            f'-1Dmatrix_save "{mat}"',
+            *_split_flags(config.DEFAULT_OPTS["ref_anat"]),
+            '-device "$DEVICE"',
+        ],
+    )
+    out.append(f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{mat}" ]; then\n{lin}\nfi')
+    if _refanat_needs_seg(opt):
+        tpm = shlex.quote(opt.tpm) if opt.tpm else '"${FFS_TPM:?set FFS_TPM}"'
+        tune = [
+            *(_split_flags(config.DEFAULT_OPTS["segment_fstpm"]) if opt.fs_tpm else []),
+            *_split_flags(config.DEFAULT_OPTS["ref_anat_seg"]),
+        ]
+        # The head, skull on: the TPM's non-brain classes need the tissue they describe.
+        seg = _ffs(
+            "ffs_segment",
+            [
+                f'-input "{box}"',
+                f"-tpm {tpm}",
+                f'-1Dmatrix "{mat}"',
+                f'-matrix_base "{_anat_box()}"',
+                f'-prefix "{_refanat_seg()}.nii.gz"',
+                *tune,
+                '-device "$DEVICE"',
+            ],
+        )
+        out.append(
+            f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{_refanat_seg()}_invwarp.nii.gz" ]; then\n'
+            f"{seg}\nfi"
+        )
+        if opt.anat_nonlin and opt.anat_nonlin_method == "segment":
+            # -V so c10 sorts after c9, as for the anat's own TPM.
+            out.append(
+                f'[ -f "{_refanat_tpm()}" ] || {{\n  mkdir -p tpm_work\n'
+                + _ffs(
+                    "ffs_util_3dmath",
+                    [
+                        f"-input $(ls {_refanat_seg()}_c*.nii* | grep -E '_c[0-9]+\\.nii' | sort -V)",
+                        "-tcat",
+                        f'-prefix "{_refanat_tpm()}"',
+                        '-device "$DEVICE"',
+                    ],
+                )
+                + "\n}"
+            )
+    if opt.ref_anat_nonlin_method == "register":
+        # In the ref's frame (-matrix + the un-allineated ref): the warp then acts
+        # after the matrix on the output coordinate, the same slot segment's
+        # invwarp takes, so the chain does not depend on which method ran.
+        warp = _token_files(plan.runs[0], "refanat_nl", ".nii.gz", opt)[0]
+        nl = _ffs(
+            _nl_tool(opt, "ref_anat_nl"),
+            [
+                f'-base "{_anat_box()}"',
+                *_nl_source_args(True, "", brain, mat),
+                f'-prefix "{stem(NameKey("refanat"))}_nl.nii.gz"',
+                "-save_warp",
+                f'-warp_prefix "{stem(NameKey("refanat"))}_nl"',
+                *_split_flags(config.DEFAULT_OPTS["ref_anat_nl"]),
+                '-device "$DEVICE"',
+            ],
+        )
+        out.append(f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{warp}" ]; then\n{nl}\nfi')
+    links = " ".join(
+        _token_files(plan.runs[0], t, ".nii.gz", opt)[0] for t in ("refanat_lin", "refanat_nl")
+    )
+    out.append(
+        f'[ -f "{_refanat_in_anat()}" ] || \\\n'
+        + _ffs(
+            "ffs_nwarp",
+            [
+                f'-source "{brain}"',
+                f'-nwarp "{links}"',
+                f'-master "{_anat_box()}"',
+                *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+                f'-prefix "{_refanat_in_anat()}"',
+                '-device "$DEVICE"',
+            ],
+        )
+    )
+    return "\n".join(out)
 
 
 def _mni_lin_anat() -> str:
@@ -3661,13 +3881,16 @@ def _anat_head_chain(plan: Plan) -> list[str]:
         return []
     pr = plan.runs[0]
     toks = list(pr.warp_chain)
-    if "anat_nl" not in toks:
+    last = "anat_nl" if "anat_nl" in toks else "anat_lin"
+    # Without anat_nl the anchor needs a head only when -ref_anat put links above
+    # anat_lin; otherwise ffs_allineate's own output is already it.
+    if last not in toks or (last == "anat_lin" and "refanat_lin" not in toks):
         return []
     # ...but NOT the -do_mni pair above it: this image is the anchor in ANAT
     # space (it is mastered on the anat), and stage09b's own anchor is the one
     # that goes on to MNI. Nor xfam_lin: it is estimated FROM this anchor, and its
     # own output (stage09.xfam_lin) is the anchor with that link applied.
-    head = [t for t in toks[: toks.index("anat_nl") + 1] if not t.startswith(("mni_", "xfam_"))]
+    head = [t for t in toks[: toks.index(last) + 1] if not t.startswith(("mni_", "xfam_"))]
     return chain_files(pr, ".nii$FMT", plan.options, tokens=head)
 
 
@@ -3678,7 +3901,7 @@ def _anat_nl_anchor_call(plan: Plan) -> str:
     Only for a locally-computed anat: the borrowing modes take their grid from the
     reference results dir, so the link that matters there is the *reference's*
     anat_nl, already baked into the image :func:`_final_master` globs."""
-    if not (plan.options.anat_nonlin and _own_anat(plan.options)):
+    if not ((plan.options.anat_nonlin or plan.options.ref_anat) and _own_anat(plan.options)):
         return ""
     head = _anat_head_chain(plan)
     if not head:
@@ -3711,7 +3934,7 @@ def _final_master(plan: Plan) -> str:
         return _grandmean()
     if opt.ref_file is not None:
         # explicit reference: the copied-in ref anat defines the shared grid.
-        return "stage09.ref_anat.nii.gz" if opt.ref_anat else _grandmean()
+        return "stage09.ref_file_anat.nii.gz" if opt.ref_file_anat else _grandmean()
     if opt.grand_reference:
         # Borrow the reference's anat-space grid so all subjects/tasks co-register.
         # Globbed because the reference's file is named for ITS -anat_source, which
@@ -3742,7 +3965,8 @@ def _final_master(plan: Plan) -> str:
 def _anat_anchor(plan: Plan) -> str:
     """This family's EPI anchor in anat space, in the state its data lands in
     below any cross-family link: through anat_nl when there is one."""
-    return _al_anat_nl(plan) if plan.options.anat_nonlin else _al_anat(plan)
+    opt = plan.options
+    return _al_anat_nl(plan) if (opt.anat_nonlin or opt.ref_anat) else _al_anat(plan)
 
 
 def _xfam_matrix() -> str:
