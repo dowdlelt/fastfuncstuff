@@ -91,6 +91,21 @@ def lag_width_bank(h: np.ndarray, dt: float, grid: LagGrid) -> np.ndarray:
     return np.stack([stretch_shift(h, dt, lag, w) for w in grid.widths for lag in grid.lags])
 
 
+def screen_basis(h: np.ndarray, dt: float, grid: LagGrid, k: int = 3) -> np.ndarray:
+    """``(k, n_t)`` leading components of ``h``'s own (width, lag) bank, first one positive.
+
+    A screen on ``h`` alone keeps the voxels shaped like ``h``, and those are the
+    ones whose lag says least; a late voxel loses ~30% of its R² to a 2 s shift.
+    The bank's span covers every candidate step 3 will try, and being fixed
+    before the data are seen it keeps the F-test honest.
+    """
+    _, _, vt = np.linalg.svd(lag_width_bank(h, dt, grid), full_matrices=False)
+    b = vt[:k].copy()
+    if b[0, np.argmax(np.abs(b[0]))] < 0:
+        b[0] = -b[0]
+    return b / np.abs(b).max(1, keepdims=True).clip(1e-12, None)
+
+
 def as_bank(design: Tensor, n_curves: int) -> Tensor:
     """``(T, P * C)`` condition-major, curve-minor design -> ``(C, T, P)``."""
     T = design.shape[0]
@@ -140,11 +155,14 @@ def screen_responsive(
     p_thresh: float,
     device: torch.device,
     chunk_size: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    sign_cols: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Voxels whose projected series an F-test on ``design`` passes, with a positive mean beta.
 
     ``y`` is ``(T, V)`` and ``design`` ``(T, P)``, both nuisance-projected. Positive only:
-    a negative response's lag says nothing about veins draining it.
+    a negative response's lag says nothing about veins draining it.  The sign is the
+    mean beta over ``sign_cols`` (default all): with a :func:`screen_basis` design only
+    the first component has a meaningful sign.  Returns (responsive, R², positive).
     """
     from scipy.stats import f as fdist
 
@@ -154,6 +172,8 @@ def screen_responsive(
     P = design.shape[1]
     x = design.to(device=device, dtype=torch.float64)
     pinv = torch.linalg.pinv(x)
+    if sign_cols is not None:
+        pinv = pinv[torch.as_tensor(sign_cols, device=device)]
     q, _ = torch.linalg.qr(x)
     chunk = chunk_size or estimate_chunk_size(V, T, P, device, operation="glm")
     r2 = np.empty(V)
@@ -166,7 +186,8 @@ def screen_responsive(
     dof = T - n_nuisance - P
     F = (r2 / P) / np.clip((1 - r2) / dof, 1e-12, None)
     p = fdist.sf(F, P, dof)
-    return (p < p_thresh) & (mean_beta > 0), r2
+    positive = mean_beta > 0
+    return (p < p_thresh) & positive, r2, positive
 
 
 def unit_shapes(means: Tensor, q_lib: Tensor) -> tuple[np.ndarray, np.ndarray]:
@@ -573,6 +594,7 @@ def fit_hrftdv(
     percentiles: tuple[float, float] = (10.0, 90.0),
     min_voxels: int = 8,
     lag_step: float = 0.2,
+    unit_weight: np.ndarray | None = None,
     device: torch.device,
     verbose: bool = True,
 ) -> TdvResult:
@@ -580,21 +602,30 @@ def fit_hrftdv(
 
     ``design_for(curves)`` builds the ``(T, P * C)`` task design for ``C``
     impulse curves; ``project`` removes the nuisance from a ``(..., T, k)``
-    stack.  ``unit`` labels each voxel ``0..U-1``.
+    stack.  ``unit`` labels each voxel ``0..U-1``.  ``unit_weight`` ``(V,)``
+    replaces the responsive-only unit mean of step 2 with a weighted mean
+    over every voxel, so a unit the screen barely reached still gets its own
+    shape; the pair (step 4) still comes from the responsive voxels.
     """
     V = y.shape[1]
     U = int(unit.max()) + 1
     S = shapes.shape[0]
 
-    # -- step 2: each unit's curve, from the mean of its responsive voxels
+    # -- step 2: each unit's curve, from the (weighted) mean of its voxels
     q_lib = bank_q(project(as_bank(design_for(shapes), S).to(device)))
+    w = (
+        responsive.astype(np.float64)
+        if unit_weight is None
+        else np.asarray(unit_weight, np.float64)
+    )
     sums = torch.zeros(y.shape[0], U, dtype=torch.float64)
-    counts = np.bincount(unit[responsive], minlength=U)
-    resp_idx = np.flatnonzero(responsive)
+    counts = np.bincount(unit, weights=w, minlength=U)
+    resp_idx = np.flatnonzero(w > 0)
     for a in range(0, resp_idx.size, 50000):
         sel = resp_idx[a : a + 50000]
-        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu())
-    means = (sums / torch.as_tensor(np.clip(counts, 1, None))).float()
+        wt = torch.as_tensor(w[sel])
+        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu() * wt)
+    means = (sums / torch.as_tensor(np.where(counts > 0, counts, 1.0))).float()
     best, _ = unit_shapes(means, q_lib)
     del q_lib
     has = counts > 0

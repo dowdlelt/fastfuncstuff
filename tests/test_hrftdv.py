@@ -216,6 +216,57 @@ def test_fit_hrftdv_finds_a_later_pair_where_voxels_are_later():
     assert np.nanmax(np.abs(res.rel_lag[:30])) < 0.9
 
 
+def test_bank_screen_passes_late_voxels_the_canonical_screen_misses():
+    """A response 2 s late loses much of its canonical R²; the bank screen keeps
+    nearly all of it, and still calls a negative response not positive."""
+    T, n_runs = 200, 2
+    h = _hrf()
+    build = _design_for(_events(n_runs, T, seed=7), T)
+    project, _, _ = _projector(n_runs, T)
+    grid = tdv.LagGrid.make(2.0, 0.1)
+    rng = np.random.default_rng(1)
+    truth = build(tdv.stretch_shift(h, DT, 2.0, 1.0)).numpy() @ np.array([1.0, 1.0])
+    noise = 0.3 * rng.standard_normal((T * n_runs, 2))
+    y = project(torch.as_tensor(np.c_[truth, -truth] + noise)[None])[0].float()
+    k = 3
+    x_bank = project(build(tdv.screen_basis(h, DT, grid, k)))
+    x_can = project(build(h))
+    _, r2_bank, pos_bank = tdv.screen_responsive(
+        y, x_bank, 2, 1e-3, CPU, sign_cols=np.arange(2) * k
+    )
+    _, r2_can, _ = tdv.screen_responsive(y, x_can, 2, 1e-3, CPU)
+    best = project(build(tdv.stretch_shift(h, DT, 2.0, 1.0)))
+    _, r2_true, _ = tdv.screen_responsive(y, best, 2, 1e-3, CPU)
+    assert r2_bank[0] > 0.95 * r2_true[0]
+    assert r2_can[0] < 0.85 * r2_true[0]
+    assert pos_bank[0] and not pos_bank[1]
+
+
+def test_weighted_unit_mean_gives_an_unscreened_unit_its_own_shape():
+    """Unit 1's voxels are all wide but none passed the screen: the responsive-only
+    mean leaves it on the commonest shape, the weighted mean finds its own."""
+    T, n_runs = 200, 2
+    h = _hrf()
+    wide = tdv.stretch_shift(h, DT, 0.0, 1.5)
+    build = _design_for(_events(n_runs, T, seed=4), T)
+    project, _, _ = _projector(n_runs, T)
+    rng = np.random.default_rng(3)
+    ys = [
+        build(c).numpy() @ np.array([1.0, 0.8]) + 0.1 * rng.standard_normal(T * n_runs)
+        for c in [h] * 20 + [wide] * 20
+    ]
+    y = project(torch.as_tensor(np.stack(ys, 1))[None])[0].float()
+    unit = np.r_[np.zeros(20, int), np.ones(20, int)]
+    responsive = np.r_[np.ones(20, bool), np.zeros(20, bool)]
+    kw = dict(min_voxels=8, lag_step=0.1, device=CPU, verbose=False)
+    args = (y, unit, np.zeros(2, int), np.stack([h, wide]), build, project, responsive)
+    grid = tdv.LagGrid.make(1.0, 0.1, (1.0,))
+    plain = tdv.fit_hrftdv(*args, np.ones(40), grid, DT, **kw)
+    weighted = tdv.fit_hrftdv(*args, np.ones(40), grid, DT, unit_weight=np.ones(40), **kw)
+    assert plain.shape[20] == 0
+    assert weighted.shape[20] == 1 and weighted.shape[0] == 0
+
+
 def test_pooled_late_pattern_recovers_the_units_late_condition_mix():
     """Early carries conditions 1:0.7, late 0.2:1.0; the pooled pattern is the
     late mix, L1-normalised, and the unit with no responsive voxel takes it too."""

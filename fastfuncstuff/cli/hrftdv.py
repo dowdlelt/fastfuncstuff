@@ -202,7 +202,29 @@ def create_parser() -> FfsArgumentParser:
         "-p_thresh",
         type=float,
         default=1e-4,
-        help="F-test p (canonical HRF) a voxel must pass to help set its unit's shape and pair",
+        help="F-test p a voxel must pass to help set its unit's shape and pair",
+    )
+    model.add_argument(
+        "-screen",
+        choices=["canonical", "bank"],
+        default="canonical",
+        help="Design of the responsiveness F-test. canonical: one column per condition, "
+        "which favours voxels shaped like the canonical HRF, the ones whose lag says "
+        "least. bank: the leading -screen_k components of the canonical curve's own "
+        "lag x width bank, so a voxel 2 s late passes as easily as one on time",
+    )
+    model.add_argument(
+        "-screen_k", type=int, default=3, help="Components per condition for -screen bank"
+    )
+    model.add_argument(
+        "-unit_mean",
+        choices=["responsive", "weighted", "all"],
+        default="responsive",
+        help="Which voxels set a unit's shape. responsive: the mean of those passing "
+        "-p_thresh (units with none take the commonest shape). weighted: every "
+        "positive voxel, weighted by its screen R². all: the plain mean of every "
+        "voxel, no screen at all. Veins dominate the last two; the pair is relative "
+        "to the unit curve, so that only moves the anchor",
     )
     model.add_argument("-microtime_dt", type=float, default=0.1, help="Microtime step (s)")
     add_microtime_offset_arg(model)
@@ -422,11 +444,24 @@ def main(argv: list[str] | None = None) -> None:
     del data
 
     canon, _ = build_shape_library("canonical", dt, 32.0)
-    x_canon = project(design_for(canon))
-    responsive, screen_r2 = tdv.screen_responsive(y, x_canon, n_nuisance, args.p_thresh, device)
+    grid = tdv.LagGrid.make(args.max_lag, args.lag_step, args.widths)
+    sign_cols = None
+    if args.screen == "bank":
+        k = args.screen_k
+        canon = tdv.screen_basis(canon[0], dt, grid, k)
+        sign_cols = np.arange(len(timing.condition_labels)) * k
+    x_screen = project(design_for(canon))
+    responsive, screen_r2, positive = tdv.screen_responsive(
+        y, x_screen, n_nuisance, args.p_thresh, device, sign_cols=sign_cols
+    )
+    unit_weight = {
+        "responsive": None,
+        "weighted": np.where(positive, screen_r2, 0.0),
+        "all": np.ones(screen_r2.shape),
+    }[args.unit_mean]
     if verbose:
         print(
-            f"  Responsive (canonical F p < {args.p_thresh:g}, positive): {int(responsive.sum()):,}"
+            f"  Responsive ({args.screen} F p < {args.p_thresh:g}, positive): {int(responsive.sum()):,}"
         )
 
     lib = get_hrf_library(
@@ -439,7 +474,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     shapes = np.atleast_2d(lib.cpu().numpy().astype(np.float64))
     shapes /= np.abs(shapes).max(1, keepdims=True).clip(1e-12, None)
-    grid = tdv.LagGrid.make(args.max_lag, args.lag_step, args.widths)
     res = tdv.fit_hrftdv(
         y,
         unit_of,
@@ -454,6 +488,7 @@ def main(argv: list[str] | None = None) -> None:
         percentiles=(args.percentiles[0], args.percentiles[1]),
         min_voxels=args.min_voxels,
         lag_step=args.pair_step,
+        unit_weight=unit_weight,
         device=device,
         verbose=verbose,
     )
@@ -527,6 +562,10 @@ def main(argv: list[str] | None = None) -> None:
         "extend_mm": args.extend_mm,
         "tile_mm": args.tile_mm,
         "p_thresh": args.p_thresh,
+        "screen": args.screen,
+        "screen_k": args.screen_k if args.screen == "bank" else None,
+        "unit_mean": args.unit_mean,
+        "n_responsive": int(responsive.sum()),
         "n_units": int(unit_kind.size),
         "n_patches": int((unit_kind == 0).sum()),
         "n_fallback_units": res.n_fallback,
