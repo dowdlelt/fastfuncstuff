@@ -292,3 +292,24 @@ def test_pooled_late_pattern_recovers_the_units_late_condition_mix():
     np.testing.assert_allclose(pat[1], pat[0])
     regs = tdv.late_regressors(lib, pat, build)
     np.testing.assert_allclose(regs[:, 0], x[:, [1, 3]] @ pat[0], rtol=1e-5, atol=1e-6)
+
+
+def test_atlas_labels_make_rois_units_and_keep_the_rest_as_patches():
+    """Six covered ribbon voxels on two patches; ROI 0 claims vertices 0-2, ROI 1
+    vertices 2-3 (vertex 2 overlaps: the first ROI wins)."""
+    oh = np.array([0, 0, 0, 0, 0, 0, -1])
+    ov = np.array([0, 1, 2, 3, 4, 5, -1])
+    patch = np.array([0, 0, 1, 1, 1, 0, -1])
+    rp = tdv.RibbonPatches(patch, 2, np.zeros(7, np.float32), oh, ov)
+    m0 = {0: np.isin(np.arange(6), [0, 1, 2])}
+    m1 = {0: np.isin(np.arange(6), [2, 3])}
+    a = tdv.atlas_labels(rp, [m0, m1], "roi")
+    assert a.n_roi_units == 2 and a.n_overlap == 1
+    assert list(a.label[:4]) == [0, 0, 0, 1] and a.label[6] == -1
+    # vertices 4 (patch 1) and 5 (patch 0) are outside the atlas: their own patches
+    assert a.label[4] != a.label[5] and min(a.label[4], a.label[5]) >= 2
+    assert list(a.unit_roi) == [0, 1, -1, -1] and a.n_units == 4
+    p = tdv.atlas_labels(rp, [m0, m1], "patch", keep_rest=False)
+    # ROI 0 spans patches 0 and 1 -> two units; ROI 1 only patch 1 -> one
+    assert p.n_roi_units == 3 and list(p.unit_roi) == [0, 0, 1]
+    assert (p.label[4:] == -1).all()

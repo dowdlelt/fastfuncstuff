@@ -86,6 +86,13 @@ def stretch_shift(h: np.ndarray, dt: float, lag: float, width: float) -> np.ndar
     return v / pk if pk > 0 else v
 
 
+def curve_peak_fwhm(h: np.ndarray, dt: float) -> tuple[float, float]:
+    """Peak time and full width at half maximum of a curve sampled every ``dt`` s."""
+    i = int(np.argmax(h))
+    above = np.flatnonzero(h >= 0.5 * h[i])
+    return i * dt, float(above[-1] - above[0]) * dt
+
+
 def lag_width_bank(h: np.ndarray, dt: float, grid: LagGrid) -> np.ndarray:
     """``(grid.n, n_t)`` candidates in grid order (width-major, then lag)."""
     return np.stack([stretch_shift(h, dt, lag, w) for w in grid.widths for lag in grid.lags])
@@ -358,6 +365,8 @@ class RibbonPatches:
     label: np.ndarray  # patch per voxel, -1 = not a covered ribbon voxel
     n_patches: int
     depth: np.ndarray  # equivolume, 0 white .. 1 pial, NaN outside the ribbon
+    owner_hemi: np.ndarray | None = None  # surface index per voxel, -1 = not covered ribbon
+    owner_vertex: np.ndarray | None = None  # owning vertex per voxel, -1 likewise
 
 
 def ribbon_patches(
@@ -384,6 +393,9 @@ def ribbon_patches(
     depth = np.full(int(np.prod(shape)), np.nan, np.float32)
     depth[dv.gm_idx] = dv.equivol
     label = np.full(int(np.prod(shape)), -1, np.int64)
+    owner_h = np.full(label.size, -1, np.int64)
+    owner_v = np.full(label.size, -1, np.int64)
+    owner_h[gm_idx], owner_v[gm_idx] = o_hemi, o_vert
     n_units = 0
     for h, s in enumerate(surfaces):
         sel = o_hemi == h
@@ -395,7 +407,63 @@ def ribbon_patches(
         ok = lab >= 0
         label[gm_idx[sel][ok]] = lab[ok] + n_units
         n_units += int(vlab.max()) + 1
-    return RibbonPatches(label, n_units, depth)
+    return RibbonPatches(label, n_units, depth, owner_h, owner_v)
+
+
+@dataclass
+class AtlasUnits:
+    """Ribbon voxels relabelled by ROI: units ``0..n_roi_units-1`` belong to ROIs."""
+
+    label: np.ndarray  # unit per voxel, -1 = none; ROI units first, then other patches
+    n_units: int  # every cortical unit (ROI units + remaining patches)
+    n_roi_units: int
+    unit_roi: np.ndarray  # (n_units,) region index of each unit, -1 = not in an ROI
+    n_overlap: int  # covered ribbon voxels whose column more than one ROI claims
+
+
+def atlas_labels(
+    patches: RibbonPatches,
+    members: Sequence[dict[int, np.ndarray]],
+    unit: str = "roi",
+    keep_rest: bool = True,
+) -> AtlasUnits:
+    """Units from ROIs' columns: one per ROI, or one per (ROI, patch) with ``unit="patch"``.
+
+    ``members[r]`` maps a surface index to the vertex mask of region ``r``.  A voxel
+    joins the region owning its column, the first one listed where regions overlap
+    (a unit has to be a partition).  ``keep_rest`` keeps the ordinary patch of every
+    covered ribbon voxel outside the atlas, so the rest of cortex still gets pairs.
+    """
+    if unit not in ("roi", "patch"):
+        raise ValueError(f"atlas unit must be 'roi' or 'patch', not {unit!r}")
+    assert patches.owner_hemi is not None and patches.owner_vertex is not None
+    oh, ov = patches.owner_hemi, patches.owner_vertex
+    covered = patches.label >= 0
+    region = np.full(oh.size, -1, np.int64)
+    claims = np.zeros(oh.size, np.int64)
+    for r, m in enumerate(members):
+        hit = np.zeros(oh.size, bool)
+        for h, mask in m.items():
+            mask = np.asarray(mask, bool)
+            sel = covered & (oh == h)
+            hit[sel] = mask[ov[sel]]
+        claims += hit
+        region[hit & (region < 0)] = r
+    in_roi = region >= 0
+    key = region if unit == "roi" else region * patches.n_patches + patches.label
+    roi_keys, roi_lab = np.unique(key[in_roi], return_inverse=True)
+    n_roi = roi_keys.size
+    label = np.full(oh.size, -1, np.int64)
+    label[in_roi] = roi_lab
+    unit_roi = roi_keys if unit == "roi" else roi_keys // patches.n_patches
+    n_units = n_roi
+    if keep_rest:
+        rest = covered & ~in_roi
+        rest_keys, rest_lab = np.unique(patches.label[rest], return_inverse=True)
+        label[rest] = rest_lab + n_roi
+        n_units += rest_keys.size
+        unit_roi = np.r_[unit_roi, np.full(rest_keys.size, -1, np.int64)]
+    return AtlasUnits(label, n_units, n_roi, unit_roi.astype(np.int64), int((claims > 1).sum()))
 
 
 def extend_labels(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: float) -> np.ndarray:

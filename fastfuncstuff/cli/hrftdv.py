@@ -67,6 +67,8 @@ outputs
   {prefix}_tdv.nii.gz          bucket: lag, rel_lag, width, r2, at_bound, responsive,
                                unit, unit_early_lag, unit_late_lag, depth
   {prefix}_pairs.tsv           one row per library entry
+  {prefix}_roi.tsv             with -atlas: one row per ROI (its pair, curve timing,
+                               voxel and responsive counts)
   {prefix}_metadata.json
 
   lag is relative to the unit curve's peak (s); rel_lag subtracts the unit's
@@ -151,6 +153,49 @@ def create_parser() -> FfsArgumentParser:
         type=int,
         default=8,
         help="Responsive voxels a unit needs for its own pair; fewer -> the median pair",
+    )
+
+    atlas = parser.add_argument_group("Atlas units (-atlas)")
+    atlas.add_argument(
+        "-atlas",
+        "-rois",
+        dest="atlas",
+        nargs="+",
+        default=None,
+        metavar="ROI_FILE",
+        help="ROIs as units instead of geodesic patches. Volume ROIs (3-D labels, a "
+        "mask, a 4-D stack) claim the columns they touch; surface ROIs (.label.gii, "
+        ".label, .annot) name them. A voxel joins the ROI owning its column (the first "
+        "listed where ROIs overlap), so every pair is an ROI's. Writes {prefix}_roi.tsv. "
+        "For ROI x depth early/late betas, give the same files to ffs_reml -atlas",
+    )
+    atlas.add_argument(
+        "-atlas_unit",
+        choices=["roi", "patch"],
+        default="roi",
+        help="roi: one pair per ROI. patch: one per geodesic patch inside each ROI, "
+        "so a large ROI keeps local timing (the table then reports medians)",
+    )
+    atlas.add_argument(
+        "-atlas_only",
+        action="store_true",
+        help="Fit only the atlas: no patches outside it, no tiles (reml gives the rest "
+        "the entry closest to canonical)",
+    )
+    atlas.add_argument(
+        "-roi_claim",
+        choices=["any", "mid"],
+        default="any",
+        help="How a volume ROI claims a column: any = it covers the column at any depth "
+        "(a blob in the outer third still counts); mid = at the midthickness point",
+    )
+    atlas.add_argument(
+        "-roi_hemi",
+        choices=["auto", "split", "major", "both"],
+        default="auto",
+        help="An ROI with columns on both hemispheres: split into one per hemisphere, "
+        "keep the major side, or keep both as one unit (auto: split when the smaller "
+        "side has a third of the columns)",
     )
 
     model = parser.add_argument_group("HRF and timing")
@@ -242,6 +287,79 @@ def create_parser() -> FfsArgumentParser:
     add_device_arg(nuis)
     add_verbose_arg(nuis)
     return parser
+
+
+def _atlas_regions(args, surfaces, verbose: bool) -> list:
+    """-atlas read against the ribbon, one region per hemisphere by -roi_hemi."""
+    from fastfuncstuff.processing.roi_depth import CLAIM_ANY, CLAIM_MID, read_depth_rois
+    from fastfuncstuff.surface.volume_depth import split_regions
+
+    notes: list[str] = []
+    try:
+        rois = read_depth_rois(
+            args.atlas, surfaces, notes, CLAIM_ANY if args.roi_claim == "any" else CLAIM_MID
+        )
+        regions = split_regions(rois, surfaces, args.roi_hemi, notes)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"ERROR: -atlas: {exc}")
+    if verbose:
+        for note in notes:
+            print(f"  {note}")
+    return regions
+
+
+def _write_roi_table(
+    path, regions, surfaces, roi_of_unit, unit_of, res, shapes, shape_labels, dt
+) -> str:
+    """One row per ROI: its pair and curve timing, voxel-weighted medians over its units."""
+    import csv
+
+    from fastfuncstuff.processing.hrftdv import curve_peak_fwhm, stretch_shift
+
+    usable = res.responsive & ~res.fit.at_bound
+    n_vox = np.bincount(unit_of, minlength=len(res.pairs))
+    n_resp = np.bincount(unit_of, weights=res.responsive.astype(float), minlength=len(res.pairs))
+    n_use = np.bincount(unit_of, weights=usable.astype(float), minlength=len(res.pairs))
+    unit_shape = res.shape[np.unique(unit_of, return_index=True)[1]]
+    cols = ["roi", "name", "hemi", "n_columns", "n_units", "n_fallback", "n_voxels",
+            "n_responsive", "n_usable", "shape", "column_peak_s", "column_fwhm_s",
+            "early_lag", "late_lag", "separation", "early_width", "late_width",
+            "early_peak_s", "late_peak_s", "early_fwhm_s", "late_fwhm_s"]  # fmt: skip
+
+    def wmed(x, w):
+        if w.sum() <= 0:
+            return float("nan")
+        o = np.argsort(x)
+        c = np.cumsum(w[o])
+        return float(x[o][min(int(np.searchsorted(c, 0.5 * c[-1])), x.size - 1)])
+
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(cols)
+        for r, reg in enumerate(regions):
+            units = np.flatnonzero(roi_of_unit == r)
+            hemi = ",".join(surfaces[h].name for h, m in sorted(reg.members.items()) if np.any(m))
+            n_cols = int(sum(np.asarray(m, bool).sum() for m in reg.members.values()))
+            if units.size == 0:
+                w.writerow([reg.rid, reg.name, hemi, n_cols, 0] + [""] * (len(cols) - 5))
+                continue
+            wt = n_vox[units].astype(np.float64)
+            pr = [res.pairs[u] for u in units]
+            shp = unit_shape[units]
+            main_shape = int(np.bincount(shp, weights=wt).argmax())
+            col = curve_peak_fwhm(shapes[main_shape], dt)
+            e_lag = wmed(np.array([p.early_lag for p in pr]), wt)
+            l_lag = wmed(np.array([p.late_lag for p in pr]), wt)
+            e_w = wmed(np.array([p.early_width for p in pr]), wt)
+            l_w = wmed(np.array([p.late_width for p in pr]), wt)
+            early = curve_peak_fwhm(stretch_shift(shapes[main_shape], dt, e_lag, e_w), dt)
+            late = curve_peak_fwhm(stretch_shift(shapes[main_shape], dt, l_lag, l_w), dt)
+            vals = [reg.rid, reg.name, hemi, n_cols, units.size, sum(p.fallback for p in pr),
+                    int(wt.sum()), int(n_resp[units].sum()), int(n_use[units].sum()),
+                    shape_labels[main_shape], *col, e_lag, l_lag, l_lag - e_lag, e_w, l_w,
+                    early[0], late[0], early[1], late[1]]  # fmt: skip
+            w.writerow([f"{v:.4g}" if isinstance(v, float) else v for v in vals])
+    return str(path)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -358,13 +476,32 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"ERROR: {exc}")
     patches = tdv.ribbon_patches(surfaces, affine, shape, coverage, args.patch_mm, device)
     depth_flat, n_units = patches.depth, patches.n_patches
-    n_patches = n_units
     label = patches.label
+    regions: list = []
+    atlas = None
+    if args.atlas:
+        regions = _atlas_regions(args, surfaces, verbose)
+        atlas = tdv.atlas_labels(
+            patches, [r.members for r in regions], args.atlas_unit, keep_rest=not args.atlas_only
+        )
+        label, n_units = atlas.label, atlas.n_units
+        if verbose:
+            n_in = int(((atlas.label >= 0) & (atlas.label < atlas.n_roi_units)).sum())
+            print(
+                f"  Atlas: {len(regions)} ROI(s) -> {atlas.n_roi_units:,} unit(s) "
+                f"({args.atlas_unit}); {n_in:,} covered ribbon voxels in them"
+                + (
+                    f"; {atlas.n_overlap:,} claimed by >1 ROI (first wins)"
+                    if atlas.n_overlap
+                    else ""
+                )
+            )
+    n_patches = n_units
     label_vol = tdv.extend_labels(label.reshape(shape), voxel_mm, args.extend_mm)
     label_vol[~coverage] = -1
     label = label_vol.reshape(-1)
     n_ribbon = int((label >= 0).sum())
-    if args.tile_mm > 0:
+    if args.tile_mm > 0 and not args.atlas_only:
         # Coverage alone is the whole field of view in data that is positive
         # outside the head; tiles are for brain, so the brain is asked for.
         if args.tile_mask:
@@ -543,6 +680,16 @@ def main(argv: list[str] | None = None) -> None:
         fh.write("\t".join([*cols, "n_units", "n_voxels"]) + "\n")
         for row, nu, nv in zip(table, n_units_per, n_vox_per, strict=True):
             fh.write("\t".join(str(row[c]) for c in cols) + f"\t{nu}\t{nv}\n")
+    if atlas is not None:
+        # Units are numbered densely over every label in use; tiles sit past the atlas's.
+        roi_of_unit = np.full(used.size, -1, np.int64)
+        cortical = used < atlas.n_units
+        roi_of_unit[cortical] = atlas.unit_roi[used[cortical]]
+        path = _write_roi_table(
+            f"{pfx.stem}_roi.tsv", regions, surfaces, roi_of_unit, unit_of, res, shapes, labels, dt
+        )
+        if verbose:
+            print(f"  Wrote {path}")
     meta = {
         "tool": "ffs_hrftdv",
         "microtime_dt": dt,
@@ -563,6 +710,9 @@ def main(argv: list[str] | None = None) -> None:
         "patch_mm": args.patch_mm,
         "extend_mm": args.extend_mm,
         "tile_mm": args.tile_mm,
+        "atlas": args.atlas,
+        "atlas_unit": args.atlas_unit if args.atlas else None,
+        "roi_claim": args.roi_claim if args.atlas else None,
         "p_thresh": args.p_thresh,
         "screen": args.screen,
         "screen_k": args.screen_k if args.screen == "bank" else None,

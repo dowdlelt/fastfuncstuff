@@ -225,3 +225,54 @@ def test_spec_gives_the_events_fit_and_splits_its_contrasts(tmp_path):
     con = vsp[..., names_sp.index("AvB_early#0_Coef")]
     a = vsp[..., names_sp.index("a_early#0_Coef")] - vsp[..., names_sp.index("b_early#0_Coef")]
     np.testing.assert_allclose(con, a, atol=1e-4)
+
+
+@pytest.mark.slow  # 13s
+def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
+    """A volume label map (+x half = 1, -x/+y quarter = 2) as units: every ribbon voxel
+    of an ROI shares one library entry, -atlas_only leaves the rest uncovered, the
+    table's pair is early < late, and -atlas_unit patch splits an ROI into patches."""
+    import csv
+
+    ribbon, _ = _write(tmp_path)
+    subj = _subject(tmp_path)
+    aff = nib.load(tmp_path / "run1.nii.gz").affine
+    ijk = np.stack(np.meshgrid(*[np.arange(N)] * 3, indexing="ij"), -1)
+    xyz = ijk * VOX + aff[:3, 3]
+    lab = np.zeros((N, N, N), np.int16)
+    lab[xyz[..., 0] > 0] = 1
+    lab[(xyz[..., 0] < 0) & (xyz[..., 1] > 0)] = 2
+    nib.save(nib.Nifti1Image(lab, aff), tmp_path / "atlas.nii.gz")
+    common = ["-input", "run1.nii.gz", "run2.nii.gz", "-events", "ev1.tsv", "ev2.tsv",
+              "-fs_subj", str(subj), "-hemi", "lh", "-tr", "1", "-device", "cpu",
+              "-atlas", "atlas.nii.gz", "-extend_mm", "0"]  # fmt: skip
+
+    def run(*extra):
+        res = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "fastfuncstuff.cli.hrftdv", *common, *extra],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+        assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+
+    run("-atlas_only", "-prefix", "roi")
+    index = np.asanyarray(nib.load(tmp_path / "roi_hrf_index.nii.gz").dataobj)[..., 0]
+    for r in (1, 2):
+        got = index[ribbon & (lab == r)]
+        assert (got > 0).mean() > 0.9 and np.unique(got[got > 0]).size == 1
+    # A voxel joins by its column's owner, so within half a voxel of the cut it can fall
+    # on the other side; away from it nothing outside the atlas has a pair.
+    far = (xyz[..., 0] < -VOX) & (xyz[..., 1] < -VOX)
+    assert (index[ribbon & far] == 0).all()
+    rows = list(csv.DictReader(open(tmp_path / "roi_roi.tsv"), delimiter="\t"))
+    assert len(rows) == 2
+    for row in rows:
+        assert row["n_units"] == "1" and row["n_fallback"] == "0"
+        assert float(row["early_lag"]) < 0 < float(row["late_lag"])
+        assert float(row["early_peak_s"]) < float(row["column_peak_s"]) < float(row["late_peak_s"])
+
+    run("-atlas_unit", "patch", "-patch_mm", "6", "-prefix", "patch")
+    rows = list(csv.DictReader(open(tmp_path / "patch_roi.tsv"), delimiter="\t"))
+    assert all(int(row["n_units"]) > 1 for row in rows)
