@@ -35,7 +35,7 @@ import matplotlib.image as mpimg
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_load_threads_arg,
@@ -59,6 +59,7 @@ from fastfuncstuff.design.hrf import (
     load_canonical_hrf_basic,
     load_canonical_hrf_library,
 )
+from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 from fastfuncstuff.design.prf import (
     PRFRefinedFit,
     PRFRefinementConfig,
@@ -356,7 +357,7 @@ def _default_hrf_select(hrf_mode: str) -> str:
     well under half the cost. A PIGHS library is not ordered by shape, so its
     window has to be ranked by grid fit rather than walked by index.
     """
-    return "grid-2" if hrf_mode in ("pighs", "blend") else "grid+1"
+    return "grid-2" if hrf_mode == "pighs" or hrf_mode.startswith("blend") else "grid+1"
 
 
 def _hrf_select_spec(value: str) -> str:
@@ -479,22 +480,25 @@ def create_parser() -> argparse.ArgumentParser:
             "degrees instead of aperture pixels"
         ),
     )
-    model.add_argument(
-        "-hrf",
-        "-hrf-mode",
-        "-hrf_mode",
-        dest="hrf_mode",
-        choices=["canonical", "library", "pighs", "blend"],
-        default="library",
-        help=(
-            "HRF source. 'canonical' is a single fixed double-gamma, which skips "
-            "per-HRF selection entirely and is by far the fastest. 'library' is the "
-            "20-HRF double-gamma family (or -hrf_library), refined per voxel in a "
-            "grid+1 window. 'pighs' generates a half-cosine family of "
-            "-num_hrfs shapes; its draws are not ordered by shape, so it defaults "
-            "to a grid-2 window instead. 'blend' is the library plus the -num_hrfs "
-            "PIGHS shapes it matches worst (fast/thin, slow/narrow), also grid-2"
+    suggest(
+        model.add_argument(
+            "-hrf",
+            "-hrf-mode",
+            "-hrf_mode",
+            dest="hrf_mode",
+            type=hrf_mode_type(extra=("canonical",)),
+            default="library",
+            help=(
+                "HRF source. 'canonical' is a single fixed double-gamma, which skips "
+                "per-HRF selection entirely and is by far the fastest. 'library' is the "
+                "20-HRF double-gamma family (or -hrf_library), refined per voxel in a "
+                "grid+1 window. 'pighs' generates a half-cosine family of "
+                "-num_hrfs shapes; its draws are not ordered by shape, so it defaults "
+                "to a grid-2 window instead. 'blend' is the library plus the -num_hrfs "
+                "PIGHS shapes it matches worst (fast/thin, slow/narrow), also grid-2"
+            ),
         ),
+        ("canonical", *HRF_LIBRARY_MODES),
     )
     model.add_argument(
         "-num-hrfs",
@@ -1117,7 +1121,7 @@ def _build_hrf_library(
     if args.hrf_mode == "canonical":
         return canonical, 0
 
-    if args.hrf_mode in ("pighs", "blend"):
+    if args.hrf_mode == "pighs" or args.hrf_mode.startswith("blend"):
         library = get_hrf_library(
             mode=args.hrf_mode,
             microtime_dt=tr,

@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from scipy.interpolate import interp1d
 
+from fastfuncstuff.design.hrf_modes import BLEND_DEFAULT_EXTRA, parse_hrf_mode
 from fastfuncstuff.utils import get_device, to_tensor
 
 # Constants for pre-computed HRF files
@@ -1098,7 +1099,8 @@ def get_hrf_library(
         HRF source selection:
         - 'library' - Load 20-HRF library from file (recommended for HRF optimization)
         - 'pighs' - Generate PIGHS (Parametric Individually Generated HRFs)
-        - 'blend' - the 20-HRF library plus ``n_hrfs`` PIGHS shapes it matches worst
+        - 'blend' / 'blend:N' - the 20-HRF library plus the N (default 20) PIGHS
+          shapes it matches worst; ``n_hrfs`` is not used
         - 'single' or 'glmsingle' - Load single canonical HRF from file (GLMsingle-style)
         - 'spmg1' - Generate AFNI's SPMG1 canonical HRF
     stim_duration : float, default=0.0
@@ -1139,7 +1141,7 @@ def get_hrf_library(
     if device is None:
         device = get_device()
 
-    mode_lower = mode.lower()
+    mode_lower, blend_extra = parse_hrf_mode(mode)
 
     if mode_lower in ("single", "glmsingle"):
         # Load basic canonical HRF from file (GLMsingle/nilearn-style)
@@ -1181,7 +1183,7 @@ def get_hrf_library(
         )
         return create_blend_library(
             base,
-            n_hrfs,
+            blend_extra or BLEND_DEFAULT_EXTRA,
             duration=hrf_duration,
             microtime_dt=microtime_dt,
             stim_duration=stim_duration,

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_bids_events_args,
     add_device_arg,
@@ -27,6 +27,7 @@ from fastfuncstuff.cli_utils import (
     add_round_onsets_arguments,
     add_verbose_arg,
 )
+from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 from fastfuncstuff.surface.ribbon_args import add_depth_args, add_ribbon_args
 
 _EPILOG = """\
@@ -214,16 +215,17 @@ def create_parser() -> FfsArgumentParser:
     )
 
     model = parser.add_argument_group("HRF and timing")
-    model.add_argument(
-        "-hrf_mode",
-        choices=["library", "pighs", "blend"],
-        default="library",
-        help="Column curves: the 20-curve library, -n_hrfs PIGHS shapes, or the library "
-        "plus the -n_hrfs PIGHS shapes it matches worst",
+    suggest(
+        model.add_argument(
+            "-hrf_mode",
+            type=hrf_mode_type(),
+            default="library",
+            help="Column curves: the 20-curve library, -n_hrfs PIGHS shapes, or "
+            "blend[:N], the library plus the N (default 20) PIGHS shapes it matches worst",
+        ),
+        HRF_LIBRARY_MODES,
     )
-    model.add_argument(
-        "-n_hrfs", type=int, default=20, help="PIGHS curves for -hrf_mode pighs / blend"
-    )
+    model.add_argument("-n_hrfs", type=int, default=20, help="PIGHS curves for -hrf_mode pighs")
     model.add_argument(
         "-hrf_library",
         default=None,
@@ -546,6 +548,7 @@ def main(argv: list[str] | None = None) -> None:
         setup_device,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
+    from fastfuncstuff.design.hrf_modes import BLEND_DEFAULT_EXTRA, parse_hrf_mode
     from fastfuncstuff.design.matrices import build_task_design
     from fastfuncstuff.design.shifted_hrf import build_shape_library
     from fastfuncstuff.io.afni import load_nifti, save_nifti
@@ -844,8 +847,9 @@ def main(argv: list[str] | None = None) -> None:
         affine=affine,
         brick_labels=[*bricks, "depth"],
     )
+    mode, blend_extra = parse_hrf_mode(args.hrf_mode)
     n_lib = {"library": shapes.shape[0], "pighs": 0}.get(
-        args.hrf_mode, shapes.shape[0] - args.n_hrfs
+        mode, shapes.shape[0] - (blend_extra or BLEND_DEFAULT_EXTRA)
     )
     labels = [f"lib{i:02d}" for i in range(n_lib)] + [
         f"pighs{i:02d}" for i in range(shapes.shape[0] - n_lib)

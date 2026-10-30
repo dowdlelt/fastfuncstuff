@@ -1356,7 +1356,9 @@ def build_shape_library(
     Sources
     -------
     ``library``  the 20-HRF double-gamma library (same file ffs_hrfopt uses)
-    ``pighs``    ``n_hrfs`` half-cosine curves, stratified over peak time
+    ``pighs``    ``n_hrfs`` half-cosine curves, picked spread over shape
+    ``blend``    the library plus the N (``blend:N``, default 20) PIGHS shapes it
+                 matches worst; ``n_hrfs`` is not used
     ``flobs``    curves reconstructed from the FLOBS eigenbasis by sampling
                  the empirical MVN(m, C) on its coefficients, so every
                  candidate is a shape the FLOBS prior considers sensible
@@ -1414,14 +1416,14 @@ def build_shape_library(
         lib, _ = create_pighs_library(n_hrfs=n_hrfs, duration=duration, microtime_dt=dt, device=cpu)
         curves = lib.cpu().numpy()
         labels = [f"pighs{i:02d}" for i in range(curves.shape[0])]
-    elif key == "blend":
+    elif key.split(":")[0] == "blend":
         from fastfuncstuff.design.hrf import get_hrf_library
+        from fastfuncstuff.design.hrf_modes import BLEND_DEFAULT_EXTRA, parse_hrf_mode
 
-        curves = get_hrf_library(
-            "blend", microtime_dt=dt, n_hrfs=n_hrfs, hrf_duration=duration, device=cpu
-        ).numpy()
-        n_lib = curves.shape[0] - n_hrfs
-        labels = [f"lib{i:02d}" for i in range(n_lib)] + [f"pighs{i:02d}" for i in range(n_hrfs)]
+        n_extra = parse_hrf_mode(key)[1] or BLEND_DEFAULT_EXTRA
+        curves = get_hrf_library(key, microtime_dt=dt, hrf_duration=duration, device=cpu).numpy()
+        n_lib = curves.shape[0] - n_extra
+        labels = [f"lib{i:02d}" for i in range(n_lib)] + [f"pighs{i:02d}" for i in range(n_extra)]
     elif key == "flobs":
         from fastfuncstuff.design.flobs import generate_flobs_basis
 

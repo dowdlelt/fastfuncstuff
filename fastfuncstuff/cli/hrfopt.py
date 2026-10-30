@@ -28,7 +28,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
+from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 
 try:
     import nibabel as nib  # noqa: F401
@@ -233,20 +234,23 @@ Notes:
 
     # HRF library options
     hrf_opts = parser.add_argument_group("HRF Library Options")
-    hrf_opts.add_argument(
-        "-hrf_mode",
-        choices=["library", "pighs", "blend"],
-        default="library",
-        help="HRF library type: 'library' (the 20 double-gamma curves), 'pighs' "
-        "(-n_hrfs half-cosine shapes, spread over shape space), or 'blend' (the "
-        "library plus the -n_hrfs PIGHS shapes it matches worst: fast/thin, "
-        "slow/narrow, other undershoots). Default: library",
+    suggest(
+        hrf_opts.add_argument(
+            "-hrf_mode",
+            type=hrf_mode_type(),
+            default="library",
+            help="HRF library: 'library' (the 20 double-gamma curves), 'pighs' (-n_hrfs "
+            "half-cosine shapes, spread over shape space), or 'blend[:N]' (the whole "
+            "library plus the N PIGHS shapes it matches worst -- fast/thin, slow/narrow, "
+            "other undershoots; N defaults to 20, -n_hrfs is not used). Default: library",
+        ),
+        HRF_LIBRARY_MODES,
     )
     hrf_opts.add_argument(
         "-n_hrfs",
         type=int,
         default=20,
-        help="pighs: HRFs in the library; blend: PIGHS shapes added to the 20 (default: 20)",
+        help="HRFs in a pighs library (default: 20). blend takes its count as blend:N",
     )
     hrf_opts.add_argument(
         "-save_selected_tr",
@@ -950,7 +954,7 @@ def main():
 
     # Build PIGHS kwargs if using pighs mode
     pighs_kwargs = {}
-    if args.hrf_mode in ("pighs", "blend"):
+    if args.hrf_mode == "pighs" or args.hrf_mode.startswith("blend"):
         pighs_kwargs = {
             "peak_time_range": tuple(args.pighs_peak_time_range),
             "rise_fraction_range": tuple(args.pighs_rise_fraction_range),

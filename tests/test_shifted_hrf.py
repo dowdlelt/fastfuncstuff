@@ -1183,11 +1183,26 @@ def test_blend_keeps_the_library_and_adds_what_it_misses():
     from fastfuncstuff.design.shifted_hrf import build_shape_library
 
     lib, _ = build_shape_library("library", 0.1, 32.0)
-    blend, labels = build_shape_library("blend", 0.1, 32.0, n_hrfs=12)
+    blend, labels = build_shape_library("blend:12", 0.1, 32.0)
     assert blend.shape[0] == lib.shape[0] + 12 and labels[0] == "lib00" and labels[-1] == "pighs11"
     np.testing.assert_allclose(blend[: lib.shape[0]], lib, atol=1e-6)
     extra = _unit(blend[lib.shape[0] :])
     # each added shape is one the library fits badly
     assert ((extra @ _unit(lib).T).max(1) ** 2).max() < 0.8
-    again, _ = build_shape_library("blend", 0.1, 32.0, n_hrfs=12)
+    again, _ = build_shape_library("blend:12", 0.1, 32.0)
     np.testing.assert_array_equal(blend, again)
+
+
+def test_blend_count_comes_from_the_mode_not_n_hrfs():
+    import argparse
+
+    from fastfuncstuff.design.hrf_modes import hrf_mode_type, parse_hrf_mode
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    assert parse_hrf_mode("blend") == ("blend", None) and parse_hrf_mode("Blend:7") == ("blend", 7)
+    for bad in ("pighs:3", "blend:x", "blend:0", "nope"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            hrf_mode_type()(bad)
+    assert hrf_mode_type(extra=("canonical",))("canonical") == "canonical"
+    curves, labels = build_shape_library("blend:5", 0.1, 32.0, n_hrfs=99)
+    assert curves.shape[0] == 25 and labels[-1] == "pighs04"
