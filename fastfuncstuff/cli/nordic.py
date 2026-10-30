@@ -200,8 +200,10 @@ Examples:
     algo_group.add_argument(
         "-gfactor-patch-overlap",
         type=int,
-        default=2,
-        help="Patch overlap divisor for g-factor pass",
+        default=6,
+        help="Patch overlap divisor for g-factor pass (stride = kernel / this). "
+        "6 gives a g map without the patch-grid ripple that MATLAB's default 2 "
+        "leaves, and tracks the noise volumes' own sigma map more closely.",
     )
     algo_group.add_argument(
         "-use-magn-for-gfactor",

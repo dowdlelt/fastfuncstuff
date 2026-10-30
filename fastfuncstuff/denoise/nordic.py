@@ -67,7 +67,7 @@ class NordicConfig:
     kernel_size_gfactor: tuple[int, int, int] = (14, 14, 1)
     gfactor_nvols: int = 90
     patch_overlap: int = 2
-    gfactor_patch_overlap: int = 2
+    gfactor_patch_overlap: int = 6  # MATLAB: 2; see -gfactor-patch-overlap help
     use_magn_for_gfactor: bool = False
     phase_slice_average: bool = False
     save_gfactor_map: bool = False

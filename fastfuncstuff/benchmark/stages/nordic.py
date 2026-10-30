@@ -144,7 +144,9 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-input-phase {PHASE} "
         f"-prefix {FFS_PREFIX} "
         f"-noise-volume-last {NOISE_VOLS} "
-        f"-noise-sigma-first-vol "  # MATLAB's estimator, so the reference stays apples-to-apples
+        # MATLAB's estimator and g-factor overlap, so the reference stays apples-to-apples
+        f"-noise-sigma-first-vol "
+        f"-gfactor-patch-overlap 2 "
         f"-decomp-method eigh "
         f"-save-gfactor-map"
         f"{ctx.ffs_device_flag()}",
