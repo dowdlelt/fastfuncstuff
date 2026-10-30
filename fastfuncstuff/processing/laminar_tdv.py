@@ -18,6 +18,7 @@ from fastfuncstuff.laminar.timeseries import (
     dynamic_inverse,
     linearized_vasculature,
     loro_prior_ridge,
+    split_half_scores,
     vascular_transfer,
 )
 from fastfuncstuff.memory import estimate_chunk_size
@@ -345,6 +346,84 @@ def voxel_gain_removal(
 
 
 @dataclass
+class SplitSelection:
+    scores: torch.Tensor  # (S, U) held-out R² across voxels, NaN where a unit had no split
+    leak: np.ndarray  # (U,) A-B cross-spectrum above the model band, NaN likewise
+    n_scored: np.ndarray  # (U,) splits that scored each unit
+
+
+def split_half_selection(
+    runs: list[torch.Tensor],
+    depth: np.ndarray,
+    labels: np.ndarray,
+    columns: ColumnProfiles,
+    blocks: np.ndarray,
+    full: torch.Tensor,
+    *,
+    K: int,
+    polort: int,
+    strengths: tuple[float, ...],
+    tr: float,
+    pad: int,
+    cutoff_hz: float,
+    robust: bool,
+    in_columns: np.ndarray | None,
+    repeats: int = 2,
+    seed: int = 0,
+    device: torch.device,
+    verbose: bool = True,
+) -> SplitSelection:
+    """Per-unit ridge scores from voxel halves (:func:`split_half_scores`), no repeated runs.
+
+    ``blocks`` labels each voxel's small spatial block; whole blocks go to one half,
+    so neighbours that share resampled noise stay together. Each repeat draws a new
+    assignment; a unit whose halves do not both span every depth goes unscored.
+    """
+    U = len(columns.unit_labels)
+    pos = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
+    use = np.ones(len(labels), bool) if in_columns is None else np.asarray(in_columns, bool)
+    total = torch.zeros(len(strengths), U)
+    leak = np.zeros(U)
+    count = np.zeros(U, np.int64)
+    rng = np.random.default_rng(seed)
+    ids = np.unique(blocks)
+    for _ in range(repeats):
+        side = np.zeros(int(ids.max()) + 1, bool)
+        side[ids] = rng.random(ids.size) < 0.5
+        halves = []
+        for want in (True, False):
+            try:
+                halves.append(column_profiles(
+                    runs, depth, labels, K, polort, device, use=use & (side[blocks] == want),
+                    robust=robust,
+                ))  # fmt: skip
+            except ValueError:  # no unit spans every depth in this half
+                break
+        if len(halves) < 2:
+            continue
+        a, b = halves
+        both = np.intersect1d(a.unit_labels, b.unit_labels)
+        if both.size == 0:
+            continue
+        ia = np.searchsorted(a.unit_labels, both)
+        ib = np.searchsorted(b.unit_labels, both)
+        sc, lk = split_half_scores(
+            (a.profiles[:, ia], a.sampling[ia], a.noise_cov[ia]),
+            (b.profiles[:, ib], b.sampling[ib], b.noise_cov[ib]),
+            full, strengths=strengths, tr=tr, pad=pad, cutoff_hz=cutoff_hz, device=device,
+            verbose=verbose,
+        )  # fmt: skip
+        dst = np.array([pos[int(x)] for x in both])
+        total[:, dst] += sc
+        leak[dst] += lk.numpy()
+        count[dst] += 1
+    scores = total / torch.as_tensor(np.maximum(count, 1), dtype=total.dtype)
+    scores[:, count == 0] = float("nan")
+    out_leak = np.where(count > 0, leak / np.maximum(count, 1), np.nan)
+    return SplitSelection(scores, out_leak, count)
+
+
+@dataclass
 class VolumeTdvResult:
     corrected: list[torch.Tensor]  # input units, V x T per run, original means retained
     removed_psc: list[torch.Tensor]  # V x T
@@ -355,6 +434,7 @@ class VolumeTdvResult:
     valid: np.ndarray
     profiles: torch.Tensor  # R x U x T x K, GE only
     gains: VoxelGains | None = None  # removal="voxel" only; its removed/fit are above
+    split_leak: np.ndarray | None = None  # V; ridge_cv="split" only
 
 
 def devein_volume_runs(
@@ -374,6 +454,9 @@ def devein_volume_runs(
     removal: str = "column",
     in_columns: np.ndarray | None = None,
     gain_lambdas: tuple[float, ...] = DEFAULT_GAIN_LAMBDAS,
+    ridge_cv: str = "loro",
+    split_blocks: np.ndarray | None = None,
+    split_repeats: int = 2,
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -390,11 +473,20 @@ def devein_volume_runs(
 
     With ``"voxel"`` the column profiles are precision-weighted (see
     :func:`column_profiles`), so the column describes its typical voxel.
+
+    ``ridge_cv="split"`` chooses each patch's strength across voxel halves
+    (:func:`split_half_selection`, by ``split_blocks``) instead of across runs, so
+    the runs need not share a schedule; a patch no split could score takes the
+    strength most patches chose.
     """
     if pad_seconds < 0:
         raise ValueError("padding must be nonnegative")
     if removal not in ("column", "voxel"):
         raise ValueError("removal must be column or voxel")
+    if ridge_cv not in ("loro", "split"):
+        raise ValueError("ridge_cv must be loro or split")
+    if ridge_cv == "split" and len(strengths) > 1 and split_blocks is None:
+        raise ValueError("ridge_cv split needs split_blocks")
     if removal == "voxel" and len(runs) < 2:
         raise ValueError("voxel gains are chosen by leave-one-run-out: need >=2 runs")
     device = spec.device
@@ -420,6 +512,29 @@ def devein_volume_runs(
     if transfer_mode == "static":
         frequencies = torch.zeros_like(frequencies)
     full, desired = vascular_transfer(system, frequencies, target)
+    scores, leak_u = None, None
+    if ridge_cv == "split" and len(strengths) > 1:
+        assert split_blocks is not None
+        sel = split_half_selection(
+            runs, depth, labels, columns, split_blocks, full, K=K, polort=polort,
+            strengths=strengths, tr=spec.TR, pad=pad, cutoff_hz=cutoff_hz,
+            robust=removal == "voxel", in_columns=in_columns, repeats=split_repeats,
+            device=device, verbose=verbose,
+        )  # fmt: skip
+        scores, leak_u = sel.scores, sel.leak
+        unscored = ~torch.isfinite(scores).all(0)
+        unscored_np = unscored.numpy()
+        if unscored.all():
+            raise ValueError("no patch could be split into two halves spanning every depth")
+        if unscored.any():
+            mode = int(torch.bincount(scores[:, ~unscored].argmax(0)).argmax())
+            scores[:, unscored] = 0.0
+            scores[mode, unscored] = 1.0
+        if verbose:
+            print(
+                f"  Split-half ridge: {int((~unscored).sum()):,}/{len(unscored):,} patches scored; "
+                f"median leak above the model band {np.nanmedian(leak_u):.3f}"
+            )
 
     result = dynamic_inverse(
         profiles,
@@ -432,8 +547,15 @@ def devein_volume_runs(
         pad=pad,
         cutoff_hz=cutoff_hz,
         device=device,
+        scores=scores,
         verbose=verbose,
     )
+    leak_v = None
+    if leak_u is not None:
+        result.cv_r2[torch.as_tensor(unscored_np)] = float("nan")  # chosen by the majority
+        pos_u = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
+        unit_v = np.array([pos_u.get(int(lab), -1) for lab in labels], np.int64)
+        leak_v = np.where(unit_v >= 0, leak_u[np.maximum(unit_v, 0)], np.nan).astype(np.float32)
     if removal == "voxel":
         pos = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
         unit_of = np.array([pos.get(int(lab), -1) for lab in labels], np.int64)
@@ -457,7 +579,7 @@ def devein_volume_runs(
             r - rem * m / 100 for r, rem, m in zip(runs, gains.removed, means, strict=True)
         ]
         return VolumeTdvResult(
-            corrected, gains.removed, gains.fit, *diagnostics, valid, profiles, gains
+            corrected, gains.removed, gains.fit, *diagnostics, valid, profiles, gains, leak_v
         )
     chunk = estimate_chunk_size(V, T, K, device, operation="paired_corr", n_trials=4)
     for u in tqdm(
@@ -494,4 +616,6 @@ def devein_volume_runs(
     )
     removed = list(rem_concat.split(T, dim=-1))
     corrected = [r - rem * m / 100 for r, rem, m in zip(runs, removed, means, strict=True)]
-    return VolumeTdvResult(corrected, removed, smooth, *diagnostics, valid, profiles)
+    return VolumeTdvResult(
+        corrected, removed, smooth, *diagnostics, valid, profiles, split_leak=leak_v
+    )

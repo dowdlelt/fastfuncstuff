@@ -255,3 +255,75 @@ def test_loro_prior_ridge_returns_prior_when_strong_and_finds_a_real_gain():
     xty[..., 1] = 0
     beta, _, _ = loro_prior_ridge(xtx, xty, yy, prior, pen, (0.01, 1.0))
     assert torch.isfinite(beta).all()
+
+
+def _smooth_sources(rng, n, T, tr, band_hz=0.06):
+    """(n, T, 3) random depth CBF histories, band-limited below ``band_hz``."""
+    f = np.fft.rfftfreq(T, tr)
+    spec = rng.standard_normal((n, f.size, 3)) + 1j * rng.standard_normal((n, f.size, 3))
+    spec[:, f > band_hz] = 0
+    spec[:, 0] = 0
+    x = np.fft.irfft(spec, n=T, axis=1)
+    return torch.as_tensor(x / x.std(axis=(1, 2), keepdims=True) * 0.01)
+
+
+@pytest.mark.parametrize("noise", [0.3, 3.0])
+def test_split_half_picks_the_strength_that_best_recovers_transport(system, noise):
+    """Halves = the same depth histories under independent noise. The strength split-half
+    scoring picks must be (within one grid step) the one that recovers the transported
+    signal best from the FULL profile -- low shrinkage at low noise, high at high."""
+    from fastfuncstuff.laminar.timeseries import split_half_scores
+
+    T, tr, pad = 160, 2.0, 0
+    h, g = vascular_transfer(system, torch.fft.rfftfreq(T, tr))
+    rng = np.random.default_rng(0)
+    x = _smooth_sources(rng, 30, T, tr)
+    xf = torch.fft.rfft(x, dim=1)
+    y = torch.fft.irfft(torch.einsum("fkn,ufn->ufk", h, xf), n=T, dim=1)
+    trans = torch.fft.irfft(torch.einsum("fkn,ufn->ufk", h - g, xf), n=T, dim=1)
+    sd = noise * y.std()
+    na, nb = (torch.as_tensor(rng.standard_normal(y.shape)) * sd for _ in range(2))
+    strengths = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
+    scores, leak = split_half_scores(
+        ((y + na)[None].float(), None, None), ((y + nb)[None].float(), None, None), h,
+        strengths=strengths, tr=tr, pad=pad, device=CPU, verbose=False,
+    )  # fmt: skip
+    full = ((y + (na + nb) / 2)[None]).float()
+    err = []
+    for s in strengths:
+        res = dynamic_inverse(full, h, g, tr=tr, pad=pad, strengths=(s,), device=CPU, verbose=False)
+        err.append(float((res.correction[0] - trans).square().sum()))
+    oracle = int(np.argmin(err))
+    picked = int(scores.mean(1).argmax())
+    assert abs(picked - oracle) <= 1, (picked, oracle, err)
+    assert leak.abs().median() < 0.15
+
+
+def test_split_half_leak_flags_noise_the_halves_share(system):
+    from fastfuncstuff.laminar.timeseries import split_half_scores
+
+    T, tr = 160, 2.0
+    h, _ = vascular_transfer(system, torch.fft.rfftfreq(T, tr))
+    rng = np.random.default_rng(1)
+    shared = torch.as_tensor(rng.standard_normal((1, 10, T, 3))).float()
+    own = torch.as_tensor(rng.standard_normal((2, 1, 10, T, 3))).float()
+    _, leak_shared = split_half_scores(
+        (shared + 0.2 * own[0], None, None), (shared + 0.2 * own[1], None, None), h,
+        strengths=(0.1,), tr=tr, pad=0, device=CPU, verbose=False,
+    )  # fmt: skip
+    _, leak_own = split_half_scores(
+        (own[0], None, None), (own[1], None, None), h,
+        strengths=(0.1,), tr=tr, pad=0, device=CPU, verbose=False,
+    )  # fmt: skip
+    assert leak_shared.median() > 0.8 and leak_own.abs().median() < 0.15
+
+
+def test_given_scores_select_strengths_with_a_single_run(system):
+    T = 60
+    h, g = vascular_transfer(system, torch.fft.rfftfreq(T, 2.5))
+    y = torch.randn(1, 2, T, 3)
+    scores = torch.tensor([[0.1, 0.5], [0.4, 0.2]])
+    res = dynamic_inverse(y, h, g, tr=2.5, pad=0, strengths=(0.01, 1.0), scores=scores,
+                          device=CPU, verbose=False)  # fmt: skip
+    assert res.regularization.tolist() == pytest.approx([1.0, 0.01])
+    assert res.cv_r2.tolist() == pytest.approx([0.4, 0.5])

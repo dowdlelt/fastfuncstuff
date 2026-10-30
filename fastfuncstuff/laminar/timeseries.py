@@ -451,3 +451,91 @@ def dynamic_inverse(
         ng = (filt.abs().square().sum((-1, -2)) * weights_f).sum(-1) / (K * weights_f.sum())
         gain[start:stop] = ng.sqrt().to(gain)
     return DynamicResult(correction, predicted, grid_correction, grid_predicted, chosen, cv, gain)
+
+
+def split_half_scores(
+    half_a: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+    half_b: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+    full: torch.Tensor,
+    *,
+    strengths: tuple[float, ...],
+    tr: float,
+    pad: int,
+    cutoff_hz: float = 0.1,
+    factor: float = 2.0,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score ridge strengths across voxels instead of across runs: no repeated timing.
+
+    Each half is ``(profiles (R,U,T,K), sampling, noise_cov)`` from disjoint voxels of
+    the same units: the same blood-flow histories under independent noise.  The
+    inverse fit to one half at each strength predicts the other through the forward
+    model, at the same moment, and both directions are pooled into a held-out R²
+    ``(len(strengths), U)``.  Every fluctuation the halves share counts as signal,
+    task-locked or not -- which is what the correction removes -- where predicting
+    a held-out run rewards only the task-locked part, i.e. smoothing.
+
+    A half carries ``factor`` times the noise of the full profile, and strengths are
+    relative to the unit's whitened model scale, so each half is fit at ``factor x``
+    the strength being scored.  Also returns each unit's normalised A-B
+    cross-spectrum above the model's band (``leak``, ~0 when the halves' noise is
+    independent): shared resampling noise would read as signal and favour too
+    little shrinkage.  Physiological signal up there inflates it, so it is an
+    upper bound on the leak, not a measure of it.
+    """
+    ya_all, yb_all = half_a[0], half_b[0]
+    if ya_all.shape != yb_all.shape or ya_all.ndim != 4:
+        raise ValueError("both halves need (runs, units, time, depths) profiles of one shape")
+    R, U, T, K = ya_all.shape
+    nf = (T + 2 * pad) // 2 + 1
+    if full.shape != (nf, K, K):
+        raise ValueError("transfer grid must match rfftfreq(T+2*pad, tr) and K depths")
+    if not strengths or any(x <= 0 for x in strengths) or factor <= 0:
+        raise ValueError("positive strengths and factor required")
+    dev = device or ya_all.device
+    dtype = torch.float32
+    cdtype = torch.complex64
+    H = full.to(device=dev, dtype=cdtype)
+    freq = torch.fft.rfftfreq(T + 2 * pad, tr, device=dev)
+    penalty = 1 + (freq / cutoff_hz) ** 4
+    band = freq >= min(2 * cutoff_hz, 0.8 * float(freq[-1]))
+    scaled = tuple(st * factor for st in strengths)
+    scores = torch.empty(len(strengths), U, dtype=dtype)
+    leak = torch.empty(U, dtype=dtype)
+    chunk = estimate_chunk_size(
+        U, T + 2 * pad, K, dev, operation="laminar_dynamic", n_runs=2 * R,
+        n_designs=2 * len(strengths),
+    )  # fmt: skip
+
+    def part(t, a, b):
+        return None if t is None else t[a:b]
+
+    for start in tqdm(
+        range(0, U, chunk), desc="Split-half ridge", leave=True, disable=not verbose or U <= chunk
+    ):
+        stop = min(U, start + chunk)
+        b = stop - start
+        ya = ya_all[:, start:stop].to(device=dev, dtype=dtype)
+        yb = yb_all[:, start:stop].to(device=dev, dtype=dtype)
+        fa, fb = _padded_spectrum(ya, pad), _padded_spectrum(yb, pad)
+        sa, _, inv_a = _inverse_operators(
+            H, b, part(half_a[1], start, stop), part(half_a[2], start, stop), scaled, penalty,
+            dev, dtype, cdtype,
+        )  # fmt: skip
+        sb, _, inv_b = _inverse_operators(
+            H, b, part(half_b[1], start, stop), part(half_b[2], start, stop), scaled, penalty,
+            dev, dtype, cdtype,
+        )  # fmt: skip
+        total = (ya.square().sum((0, 2, 3)) + yb.square().sum((0, 2, 3))).clamp_min(1e-30)
+        for i in range(len(strengths)):
+            # a -> b and b -> a, each through the OTHER half's own depth sampling
+            pb = _crop(torch.einsum("bfij,rbfj->rbfi", sb @ H @ inv_a[i], fa), T, pad)
+            pa = _crop(torch.einsum("bfij,rbfj->rbfi", sa @ H @ inv_b[i], fb), T, pad)
+            err = (pb - yb).square().sum((0, 2, 3)) + (pa - ya).square().sum((0, 2, 3))
+            scores[i, start:stop] = (1 - err / total).cpu()
+        cross = (fa[:, :, band] * fb[:, :, band].conj()).real.sum((0, 2, 3))
+        norm = (fa[:, :, band].abs().square().sum((0, 2, 3))
+                * fb[:, :, band].abs().square().sum((0, 2, 3))).sqrt().clamp_min(1e-30)  # fmt: skip
+        leak[start:stop] = (cross / norm).cpu()
+    return scores, leak

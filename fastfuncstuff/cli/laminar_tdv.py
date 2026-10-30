@@ -96,10 +96,22 @@ ridge regularization (-ridge)
   With -removal voxel the gains rescale the transport per voxel, so -ridge
   shapes the column estimate more than it sets the amount removed.
 
-  Several values: each patch picks its own by leave-one-run-out, predicting
-  each run from the mean of the others and keeping the LAMBDA that predicts
-  best.  That is only meaningful when every run has the same task timing, so
-  it needs -repeated_runs.  Rest, or differing schedules: give one value.
+  Several values: each patch picks its own (-ridge_cv).
+
+    split  each patch's voxels go into two halves (whole -ridge_cv_mm cubes,
+           so neighbours sharing resampled noise stay together); the inverse
+           of one half at each LAMBDA predicts the other half, same run, same
+           moment, and both ways are pooled.  Any schedule works, rest too,
+           and every fluctuation the halves share counts as signal -- what
+           the correction removes.  A half is twice as noisy as the patch, so
+           it is fit at twice the LAMBDA being scored.  split_leak in the
+           bucket is the halves' correlation above the model's band: near 0
+           when their noise is independent; high values mean shared noise is
+           being read as signal, favouring too little shrinkage.
+    loro   predict each run from the mean of the others.  Needs every run to
+           have the same task timing (-repeated_runs), and rewards only the
+           task-locked part: on repeated-run data it mostly picks the
+           largest LAMBDA, i.e. smoothing.
 
 targets (-target)
 
@@ -167,11 +179,13 @@ outputs
                                       (+ voxel: gain_local, gain_transport,
                                       gain_shift, gain_lambda, gain_cv)
                                       (+ events: phys_cv_r2, phys_best)
+                                      (+ -ridge_cv split: split_leak)
   {prefix}_physiology_cv.tsv          (events) each candidate's pooled held-out R²
   {prefix}_metadata.json
 
   ridge is each patch's LAMBDA; ge_cv_r2 the held-out R² of the full model
-  (selection runs only, never SE); noise_gain the white-noise RMS gain of the
+  (held-out runs, or held-out voxel halves with -ridge_cv split; NaN for a
+  patch too small to split, which takes the majority's LAMBDA; never SE); noise_gain the white-noise RMS gain of the
   correction (1 = noise unchanged); removed_rms the RMS of the removed series
   (% signal change, all runs); depth is equivolume, 0 at white, 1 at pial
   (a shell voxel's is its nearest ribbon voxel's).  -save_fit with -removal
@@ -347,8 +361,29 @@ def create_parser() -> FfsArgumentParser:
         default=[0.001, 0.01, 0.1, 1.0],
         metavar="LAMBDA",
         help="Ridge strength(s), relative to each patch's model scale; several are "
-        "chosen between per patch by leave-one-run-out (needs -repeated_runs). See "
-        "'ridge regularization' below",
+        "chosen between per patch (-ridge_cv). See 'ridge regularization' below",
+    )
+    inv.add_argument(
+        "-ridge_cv",
+        choices=["auto", "loro", "split"],
+        default="auto",
+        help="How several -ridge values are chosen between. loro: predict each run from "
+        "the others (needs -repeated_runs). split: predict half of each patch's voxels "
+        "from the other half, same run, same moment -- any schedule, rest included. "
+        "auto: loro with -repeated_runs, else split",
+    )
+    inv.add_argument(
+        "-ridge_cv_mm",
+        type=float,
+        default=2.0,
+        help="-ridge_cv split: voxels go to a half in cubes this size, so neighbours that "
+        "share resampled noise stay together (see split_leak in the bucket)",
+    )
+    inv.add_argument(
+        "-ridge_cv_repeats",
+        type=int,
+        default=2,
+        help="-ridge_cv split: random half assignments averaged",
     )
     inv.add_argument(
         "-repeated_runs",
@@ -538,10 +573,13 @@ def main(argv: list[str] | None = None) -> None:
     timed = bool(args.onsets or args.events)
     if args.cv_p0 and not timed:
         sys.exit("ERROR: -cv_p0 scores physiologies from events: give -events or -onsets")
-    if len(args.ridge) > 1 and not args.repeated_runs:
-        sys.exit("ERROR: several -ridge values are chosen between by leave-one-run-out, "
-                 "which needs runs with the same task timing: add -repeated_runs, or "
-                 "give one -ridge value")  # fmt: skip
+    if args.ridge_cv == "auto":
+        args.ridge_cv = "loro" if args.repeated_runs else "split"
+    if len(args.ridge) > 1 and args.ridge_cv == "loro" and not args.repeated_runs:
+        sys.exit("ERROR: -ridge_cv loro predicts each run from the others, which needs runs "
+                 "with the same task timing: add -repeated_runs, or use -ridge_cv split")  # fmt: skip
+    if args.ridge_cv_mm <= 0 or args.ridge_cv_repeats < 1:
+        sys.exit("ERROR: -ridge_cv_mm must be positive and -ridge_cv_repeats >= 1")
 
     import torch
 
@@ -675,6 +713,12 @@ def main(argv: list[str] | None = None) -> None:
     runs = [s[torch.from_numpy(rows)] for s in series]
     del series
     depth, labels, in_columns = depth_vol[mask], lab_vol[mask], ribbon[mask]
+    split_blocks = None
+    if args.ridge_cv == "split" and len(args.ridge) > 1:
+        from fastfuncstuff.processing.hrftdv import volume_tiles
+
+        ijk = np.array(np.unravel_index(np.flatnonzero(mask), mask.shape)).T
+        split_blocks = volume_tiles(ijk, spacing, args.ridge_cv_mm)
 
     polort = max_polort(resolve_polort(args.polort, [n_t] * len(runs), tr, verbose=verbose))
     overrides = json.loads(Path(args.vascular_json).read_text()) if args.vascular_json else {}
@@ -740,6 +784,9 @@ def main(argv: list[str] | None = None) -> None:
         removal=args.removal,
         in_columns=in_columns,
         gain_lambdas=tuple(args.gain_lambdas),
+        ridge_cv=args.ridge_cv,
+        split_blocks=split_blocks,
+        split_repeats=args.ridge_cv_repeats,
         verbose=verbose,
     )
     del runs
@@ -776,6 +823,8 @@ def main(argv: list[str] | None = None) -> None:
             bricks[f"gain_{term}"] = result.gains.beta[:, i]
         bricks["gain_lambda"] = result.gains.lam
         bricks["gain_cv"] = result.gains.cv_gain
+    if result.split_leak is not None:
+        bricks["split_leak"] = result.split_leak
     if cv is not None and columns is not None:
         patch_r2, patch_best = np.zeros(len(depth), np.float32), np.zeros(len(depth), np.float32)
         r2 = cv.patch_r2

@@ -132,6 +132,23 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
     meta = json.loads((tmp_path / "out_metadata.json").read_text())
     assert meta["n_valid"] == 59
 
+    # Several -ridge values without -repeated_runs: chosen across voxel halves.
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    res = subprocess.run(
+        [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "r0.nii.gz",
+         "r1.nii.gz", "-depth", "depth.nii.gz", "-gmfrac", "gm.nii.gz", "-depth_order",
+         "pial_to_white", "-columns", "columns.nii.gz", "-depths", "3", "-extend_mm", "0",
+         "-tr", "2", "-ridge", ".01", ".1", "1", "-ridge_cv_mm", "1", "-te", ".025", "-b0",
+         "7", "-device", "cpu", "-prefix", "split"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert json.loads((tmp_path / "split_metadata.json").read_text())["ridge_cv"] == "split"
+    import nibabel as nib
+
+    assert "split_leak" in _read_brick_labels(nib.load(tmp_path / "split_ltdv.nii.gz"))
+
 
 def test_cli_refuses_to_guess_echo_time(tmp_path):
     runs, *_ = _runs()
@@ -317,3 +334,40 @@ def test_voxel_gains_remove_a_veins_excess_and_keep_local_signal():
     b = vox.gains.beta
     assert np.median(b[vein, 1]) > 3 and abs(np.median(b[normal, 1]) - 1) < 0.5
     np.testing.assert_array_equal(vox.corrected[0][depth > 0.8], runs[0][depth > 0.8])
+
+
+def test_split_half_ridge_shrinks_the_noisier_patch_without_repeated_runs():
+    """Two patches, same signal, 10x different noise, every run a different source
+    (nothing repeats, so leave-one-run-out has nothing to predict): split-half picks
+    more shrinkage for the noisy patch, and its halves' noise does not leak."""
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+
+    T, K, n = 120, 3, 90
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    freq = torch.fft.rfftfreq(T, spec.TR)
+    h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 2 * n // 3)
+    labels = np.repeat([0, 1], n)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    noise = torch.from_numpy(np.repeat([0.002, 0.02], n))[:, None]
+    torch.manual_seed(3)
+    runs = []
+    for _ in range(2):
+        a = torch.randn(T, K, dtype=torch.float64) * 0.003
+        a = torch.fft.irfft(
+            torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+        psc = read @ y.T + noise * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+    res = devein_volume_runs(
+        runs, depth, labels, spec, strengths=(1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0),
+        pad_seconds=0, polort=1, ridge_cv="split", split_blocks=np.arange(depth.size),
+        split_repeats=3, verbose=False,
+    )  # fmt: skip
+    quiet, loud = res.regularization[labels == 0][0], res.regularization[labels == 1][0]
+    assert loud >= 10 * quiet, (quiet, loud)
+    assert np.isfinite(res.cv_r2).all()
+    # The leak index is an upper bound: in the quiet patch the little real signal above
+    # the model band dominates it (~0.27 measured); where noise dominates it is ~0.
+    assert np.abs(res.split_leak[labels == 1]).max() < 0.1
