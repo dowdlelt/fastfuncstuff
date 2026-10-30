@@ -95,7 +95,9 @@ def screen_basis(h: np.ndarray, dt: float, grid: LagGrid, k: int = 3) -> np.ndar
     """``(k, n_t)`` leading components of ``h``'s own (width, lag) bank, first one positive.
 
     A screen on ``h`` alone keeps the voxels shaped like ``h``, and those are the
-    ones whose lag says least; a late voxel loses ~30% of its R² to a 2 s shift.
+    ones whose lag says least.  Canonical sits near the *late* (venous) response,
+    so it is the early, narrow microvascular voxels it fits worst; any 2 s shift
+    costs ~30% of the R².
     The bank's span covers every candidate step 3 will try, and being fixed
     before the data are seen it keeps the F-test honest.
     """

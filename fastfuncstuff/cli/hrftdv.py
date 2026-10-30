@@ -210,8 +210,10 @@ def create_parser() -> FfsArgumentParser:
         default="canonical",
         help="Design of the responsiveness F-test. canonical: one column per condition, "
         "which favours voxels shaped like the canonical HRF, the ones whose lag says "
-        "least. bank: the leading -screen_k components of the canonical curve's own "
-        "lag x width bank, so a voxel 2 s late passes as easily as one on time",
+        "least: canonical is close to the late (venous) response, so the early, "
+        "narrow voxels fare worst. bank: the leading -screen_k components of the "
+        "canonical curve's own lag x width bank, so a voxel peaking 2 s earlier or "
+        "later, narrower or wider, passes as easily as a canonical one",
     )
     model.add_argument(
         "-screen_k", type=int, default=3, help="Components per condition for -screen bank"
