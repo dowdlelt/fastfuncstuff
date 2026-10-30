@@ -53,7 +53,6 @@ Examples:
     io_group = parser.add_argument_group("Input/Output")
     io_group.add_argument(
         "-input-magn",
-        "-input_magn",
         nargs="+",
         required=True,
         help="Input magnitude NIfTI file(s). Pass one per echo (>=2) to enable "
@@ -61,7 +60,6 @@ Examples:
     )
     io_group.add_argument(
         "-input-phase",
-        "-input_phase",
         nargs="+",
         default=None,
         help="Input phase NIfTI file(s); one per magnitude file. Required unless -magnitude-only.",
@@ -84,13 +82,11 @@ Examples:
     )
     io_group.add_argument(
         "-save-num-comps",
-        "-save_num_comps",
         action="store_true",
         help="Save per-voxel count of components removed (patch-averaged, fractional)",
     )
     io_group.add_argument(
         "-add-mean",
-        "-add_mean",
         action="store_true",
         help="Add the raw magnitude's per-voxel temporal mean onto the saved residual "
         "(mean + removed noise), so it survives downstream resampling like real data. "
@@ -98,7 +94,6 @@ Examples:
     )
     io_group.add_argument(
         "-no-resid-qc",
-        "-no_resid_qc",
         dest="resid_qc",
         action="store_false",
         help="Disable the multi-echo cross-echo residual correlation QC maps (on by default)",
@@ -140,7 +135,6 @@ Examples:
     )
     algo_group.add_argument(
         "-retain-dof",
-        "-retain_dof",
         type=float,
         default=None,
         metavar="N|FRAC",
@@ -168,7 +162,6 @@ Examples:
     )
     algo_group.add_argument(
         "-per-echo-gfactor",
-        "-per_echo_gfactor",
         action="store_true",
         help=(
             "Multi-echo: estimate each echo's own g-factor (and thermal sigma) "
@@ -224,7 +217,6 @@ Examples:
     me_group = parser.add_argument_group("Multi-echo rescue (>=2 echoes)")
     me_group.add_argument(
         "-no-rescue",
-        "-no_rescue",
         dest="rescue",
         action="store_false",
         help="Disable the cross-echo signal-rescue guard (denoise each echo "
@@ -232,7 +224,6 @@ Examples:
     )
     me_group.add_argument(
         "-rescue-band",
-        "-rescue_band",
         type=float,
         default=0.25,
         help="Fraction of each echo's kill set (top singular values, nearest the "
@@ -240,7 +231,6 @@ Examples:
     )
     me_group.add_argument(
         "-rescue-alpha",
-        "-rescue_alpha",
         type=float,
         default=0.05,
         help="Per-patch false-rescue rate. The rescue threshold is the "
@@ -250,14 +240,12 @@ Examples:
     sweep_group = parser.add_argument_group("Factor-sweep diagnostic (single-echo)")
     sweep_group.add_argument(
         "-factor-sweep",
-        "-factor_sweep",
         action="store_true",
         help="Sweep the threshold factor and emit residual voxel-to-voxel correlation "
         "diagnostic plots/table (single-echo, NORDIC threshold). Off by default.",
     )
     sweep_group.add_argument(
         "-factor-sweep-range",
-        "-factor_sweep_range",
         nargs=3,
         type=float,
         default=None,
@@ -267,7 +255,6 @@ Examples:
     )
     sweep_group.add_argument(
         "-factor-sweep-values",
-        "-factor_sweep_values",
         nargs="+",
         type=float,
         default=None,
@@ -275,27 +262,23 @@ Examples:
     )
     sweep_group.add_argument(
         "-factor-sweep-max-voxels",
-        "-factor_sweep_max_voxels",
         type=int,
         default=40000,
         help="Per-mask voxel cap for the correlation (random subsample). 0 = all voxels.",
     )
     sweep_group.add_argument(
         "-save-imgs",
-        "-save_imgs",
         action="store_true",
         help="Save the generated automask and the top_pairs voxel mask as NIfTIs.",
     )
     sweep_group.add_argument(
         "-save-factor-img",
-        "-save_factor_img",
         action="store_true",
         help="Save a 4D patch-averaged #components-removed image; sub-bricks step the "
         "factor 0.1..5.0 (shows how the keep/kill floor moves with factor).",
     )
     sweep_group.add_argument(
         "-save-eigen-img",
-        "-save_eigen_img",
         action="store_true",
         help="Save a 4D patch-averaged singular-value spectrum image (sub-bricks = "
         "component rank); shows where factor*lambda lands on each patch's spectrum.",
@@ -349,7 +332,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_polort",
-        "-task-polort",
         type=int,
         default=None,
         metavar="DEG",
@@ -358,7 +340,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_top_frac",
-        "-task-top-frac",
         type=float,
         default=0.1,
         metavar="FRAC",
@@ -367,7 +348,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_thresh",
-        "-task-thresh",
         type=float,
         default=None,
         metavar="R",
@@ -376,7 +356,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_rescue",
-        "-task-rescue",
         nargs="?",
         const="ica",
         default=None,
@@ -401,7 +380,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_comps",
-        "-task-comps",
         default="auto",
         metavar="N|auto|est|off",
         help="Component count for the scan of the removed field. 'auto' (default) uses a "
@@ -429,7 +407,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_alpha",
-        "-task-alpha",
         type=float,
         default=0.05,
         metavar="A",
@@ -437,7 +414,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_surrogates",
-        "-task-surrogates",
         type=int,
         default=2000,
         metavar="N",
@@ -445,7 +421,6 @@ Examples:
     )
     task_group.add_argument(
         "-task_fdr_q",
-        "-task-fdr-q",
         type=float,
         default=0.05,
         metavar="Q",
@@ -462,7 +437,6 @@ Examples:
     )
     task_group.add_argument(
         "-save-task-loss",
-        "-save_task_loss",
         action="store_true",
         dest="save_task_loss",
         help="Write {prefix}_taskloss: the signed magnitude-domain loss series, "
