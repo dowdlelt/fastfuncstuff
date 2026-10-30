@@ -266,17 +266,18 @@ def create_parser() -> FfsArgumentParser:
     )
     model.add_argument(
         "-screen",
-        choices=["canonical", "bank"],
+        choices=["canonical", "bank", "library"],
         default="canonical",
         help="Design of the responsiveness F-test. canonical: one column per condition, "
         "which favours voxels shaped like the canonical HRF, the ones whose lag says "
         "least: canonical is close to the late (venous) response, so the early, "
-        "narrow voxels fare worst. bank: the leading -screen_k components of the "
-        "canonical curve's own lag x width bank, so a voxel peaking 2 s earlier or "
-        "later, narrower or wider, passes as easily as a canonical one",
+        "narrow voxels fare worst. library: the leading -screen_k components of the "
+        "HRF library in use (-hrf_mode), one valid test of 'responds with any library "
+        "shape' (taking each voxel's best curve would give noise many chances). bank: "
+        "the same for the canonical curve's own lag x width bank",
     )
     model.add_argument(
-        "-screen_k", type=int, default=3, help="Components per condition for -screen bank"
+        "-screen_k", type=int, default=3, help="Components per condition for -screen bank/library"
     )
     model.add_argument(
         "-unit_mean",
@@ -734,12 +735,26 @@ def main(argv: list[str] | None = None) -> None:
         y[:, a : a + step] = project(data[a : a + step].T).float().cpu()
     del data
 
+    lib = get_hrf_library(
+        mode=args.hrf_mode,
+        stim_duration=0.0,
+        microtime_dt=dt,
+        n_hrfs=args.n_hrfs,
+        device=torch.device("cpu"),
+        library_path=args.hrf_library,
+    )
+    shapes = np.atleast_2d(lib.cpu().numpy().astype(np.float64))
+    shapes /= np.abs(shapes).max(1, keepdims=True).clip(1e-12, None)
     canon, _ = build_shape_library("canonical", dt, 32.0)
     grid = tdv.LagGrid.make(args.max_lag, args.lag_step, args.widths)
     sign_cols = None
-    if args.screen == "bank":
+    if args.screen != "canonical":
         k = args.screen_k
-        canon = tdv.screen_basis(canon[0], dt, grid, k)
+        canon = (
+            tdv.screen_basis(canon[0], dt, grid, k)
+            if args.screen == "bank"
+            else tdv.span_basis(shapes, k)
+        )
         sign_cols = np.arange(len(timing.condition_labels)) * k
     x_screen = project(design_for(canon))
     responsive, screen_r2, positive = tdv.screen_responsive(
@@ -755,16 +770,6 @@ def main(argv: list[str] | None = None) -> None:
             f"  Responsive ({args.screen} F p < {args.p_thresh:g}, positive): {int(responsive.sum()):,}"
         )
 
-    lib = get_hrf_library(
-        mode=args.hrf_mode,
-        stim_duration=0.0,
-        microtime_dt=dt,
-        n_hrfs=args.n_hrfs,
-        device=torch.device("cpu"),
-        library_path=args.hrf_library,
-    )
-    shapes = np.atleast_2d(lib.cpu().numpy().astype(np.float64))
-    shapes /= np.abs(shapes).max(1, keepdims=True).clip(1e-12, None)
     res = tdv.fit_hrftdv(
         y,
         unit_of,
@@ -883,7 +888,7 @@ def main(argv: list[str] | None = None) -> None:
         "roi_claim": args.roi_claim if args.atlas else None,
         "p_thresh": args.p_thresh,
         "screen": args.screen,
-        "screen_k": args.screen_k if args.screen == "bank" else None,
+        "screen_k": args.screen_k if args.screen != "canonical" else None,
         "unit_mean": args.unit_mean,
         "n_responsive": int(responsive.sum()),
         "n_units": int(unit_kind.size),

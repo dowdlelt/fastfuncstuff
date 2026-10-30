@@ -356,3 +356,16 @@ def test_override_pairs_rebuilds_the_library_for_the_units_given():
         and e1[1] == pytest.approx(-1.0)
         and e1[2] == pytest.approx(1.2)
     )
+
+
+def test_span_basis_holds_every_curve_of_its_set():
+    """Three components of a family of shifted/stretched curves reproduce each member
+    (what lets one F-test on them stand for 'any of these shapes')."""
+    h = _hrf()
+    curves = np.stack(
+        [tdv.stretch_shift(h, DT, lag, w) for lag in (-1.5, 0, 1.5) for w in (0.7, 1.0, 1.3)]
+    )
+    q, _ = np.linalg.qr(tdv.span_basis(curves, 3).T)
+    kept = [1 - np.sum((c - q @ (q.T @ c)) ** 2) / np.sum(c**2) for c in curves]
+    assert min(kept) > 0.95
+    assert tdv.span_basis(curves, 3)[0].max() == pytest.approx(1.0)  # first one positive

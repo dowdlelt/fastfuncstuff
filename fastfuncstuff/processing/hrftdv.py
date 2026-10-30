@@ -98,21 +98,31 @@ def lag_width_bank(h: np.ndarray, dt: float, grid: LagGrid) -> np.ndarray:
     return np.stack([stretch_shift(h, dt, lag, w) for w in grid.widths for lag in grid.lags])
 
 
+def span_basis(curves: np.ndarray, k: int = 3) -> np.ndarray:
+    """``(k, n_t)`` leading components of ``curves`` ``(n, n_t)``, the first one positive.
+
+    An F-test on these asks "does the voxel respond with any shape in this set?" in
+    one go.  Fitting every curve and keeping the best asks the same thing but gives a
+    noise voxel ``n`` chances, so its p-value is not what it says.  Being fixed before
+    the data are seen, the span keeps the test honest; for the 20-curve library three
+    components hold 99.5% of the shapes' variance.
+    """
+    _, _, vt = np.linalg.svd(np.asarray(curves, np.float64), full_matrices=False)
+    b = vt[:k].copy()
+    if b[0, np.argmax(np.abs(b[0]))] < 0:
+        b[0] = -b[0]
+    return b / np.abs(b).max(1, keepdims=True).clip(1e-12, None)
+
+
 def screen_basis(h: np.ndarray, dt: float, grid: LagGrid, k: int = 3) -> np.ndarray:
-    """``(k, n_t)`` leading components of ``h``'s own (width, lag) bank, first one positive.
+    """:func:`span_basis` of ``h``'s own (width, lag) bank.
 
     A screen on ``h`` alone keeps the voxels shaped like ``h``, and those are the
     ones whose lag says least.  Canonical sits near the *late* (venous) response,
     so it is the early, narrow microvascular voxels it fits worst; any 2 s shift
     costs ~30% of the R².
-    The bank's span covers every candidate step 3 will try, and being fixed
-    before the data are seen it keeps the F-test honest.
     """
-    _, _, vt = np.linalg.svd(lag_width_bank(h, dt, grid), full_matrices=False)
-    b = vt[:k].copy()
-    if b[0, np.argmax(np.abs(b[0]))] < 0:
-        b[0] = -b[0]
-    return b / np.abs(b).max(1, keepdims=True).clip(1e-12, None)
+    return span_basis(lag_width_bank(h, dt, grid), k)
 
 
 def as_bank(design: Tensor, n_curves: int) -> Tensor:
