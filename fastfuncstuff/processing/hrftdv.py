@@ -209,6 +209,55 @@ def screen_responsive(
     return (p < p_thresh) & positive, r2, positive
 
 
+def screen_library(
+    y: Tensor,
+    designs: Tensor,
+    n_nuisance: int,
+    p_thresh: float,
+    device: torch.device,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Responsive voxels by their best library curve: (responsive, R², positive, best).
+
+    ``designs`` ``(S, T, P)`` are the nuisance-projected designs of the S library
+    curves.  Each voxel is fit with every curve and keeps the best, so a voxel only
+    counts as responsive in a shape the library allows -- free components would also
+    admit dips and double peaks.  The p-value is the best curve's own F, which is
+    optimistic for a best-of-S choice; with library curves this correlated the
+    effective number of chances is small, and this is a screen, not inference.
+    Positive means the best curve's mean beta is.
+    """
+    from scipy.stats import f as fdist
+
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    T, V = y.shape
+    S, _, P = designs.shape
+    x = designs.to(device=device, dtype=torch.float64)
+    q = torch.linalg.qr(x)[0].float()
+    pinv = torch.linalg.pinv(x).float()  # (S, P, T)
+    chunk = chunk_size or estimate_chunk_size(
+        V, T, P, device, operation="lag_bank", n_designs=S, empty_cache=False
+    )
+    r2 = np.empty(V)
+    best = np.empty(V, np.int64)
+    mean_beta = np.empty(V)
+    for a in range(0, V, chunk):
+        yc = y[:, a : a + chunk].to(device=device, dtype=torch.float32)
+        ss = (torch.einsum("stp,tv->spv", q, yc) ** 2).sum(1)
+        r2_all = ss / (yc**2).sum(0).clamp_min(1e-12)
+        b = r2_all.argmax(0)
+        cols = torch.arange(b.numel(), device=device)
+        beta = torch.einsum("spt,tv->spv", pinv, yc)[b, :, cols]  # (v, P)
+        r2[a : a + chunk] = r2_all[b, cols].cpu().numpy()
+        best[a : a + chunk] = b.cpu().numpy()
+        mean_beta[a : a + chunk] = beta.mean(1).cpu().numpy()
+    dof = T - n_nuisance - P
+    F = (r2 / P) / np.clip((1 - r2) / dof, 1e-12, None)
+    positive = mean_beta > 0
+    return (fdist.sf(F, P, dof) < p_thresh) & positive, r2, positive, best
+
+
 def unit_shapes(means: Tensor, q_lib: Tensor) -> tuple[np.ndarray, np.ndarray]:
     """Best library curve for each unit's mean series: index ``(U,)`` and R² ``(S, U)``.
 

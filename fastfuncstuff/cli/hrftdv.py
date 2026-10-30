@@ -271,13 +271,14 @@ def create_parser() -> FfsArgumentParser:
         help="Design of the responsiveness F-test. canonical: one column per condition, "
         "which favours voxels shaped like the canonical HRF, the ones whose lag says "
         "least: canonical is close to the late (venous) response, so the early, "
-        "narrow voxels fare worst. library: the leading -screen_k components of the "
-        "HRF library in use (-hrf_mode), one valid test of 'responds with any library "
-        "shape' (taking each voxel's best curve would give noise many chances). bank: "
-        "the same for the canonical curve's own lag x width bank",
+        "narrow voxels fare worst. library: every voxel fit with every curve of the "
+        "HRF library in use (-hrf_mode), judged by its best one -- responsive only in "
+        "a shape the library allows. bank: an F-test on the leading -screen_k "
+        "components of the canonical curve's lag x width bank (free combinations: "
+        "admits shapes no library curve has)",
     )
     model.add_argument(
-        "-screen_k", type=int, default=3, help="Components per condition for -screen bank/library"
+        "-screen_k", type=int, default=3, help="Components per condition for -screen bank"
     )
     model.add_argument(
         "-unit_mean",
@@ -747,19 +748,21 @@ def main(argv: list[str] | None = None) -> None:
     shapes /= np.abs(shapes).max(1, keepdims=True).clip(1e-12, None)
     canon, _ = build_shape_library("canonical", dt, 32.0)
     grid = tdv.LagGrid.make(args.max_lag, args.lag_step, args.widths)
-    sign_cols = None
-    if args.screen != "canonical":
-        k = args.screen_k
-        canon = (
-            tdv.screen_basis(canon[0], dt, grid, k)
-            if args.screen == "bank"
-            else tdv.span_basis(shapes, k)
+    if args.screen == "library":
+        designs = project(tdv.as_bank(design_for(shapes), shapes.shape[0]).to(device))
+        responsive, screen_r2, positive, _ = tdv.screen_library(
+            y, designs, n_nuisance, args.p_thresh, device
         )
-        sign_cols = np.arange(len(timing.condition_labels)) * k
-    x_screen = project(design_for(canon))
-    responsive, screen_r2, positive = tdv.screen_responsive(
-        y, x_screen, n_nuisance, args.p_thresh, device, sign_cols=sign_cols
-    )
+        del designs
+    else:
+        sign_cols = None
+        if args.screen == "bank":
+            k = args.screen_k
+            canon = tdv.screen_basis(canon[0], dt, grid, k)
+            sign_cols = np.arange(len(timing.condition_labels)) * k
+        responsive, screen_r2, positive = tdv.screen_responsive(
+            y, project(design_for(canon)), n_nuisance, args.p_thresh, device, sign_cols=sign_cols
+        )
     unit_weight = {
         "responsive": None,
         "weighted": np.where(positive, screen_r2, 0.0),
@@ -888,7 +891,7 @@ def main(argv: list[str] | None = None) -> None:
         "roi_claim": args.roi_claim if args.atlas else None,
         "p_thresh": args.p_thresh,
         "screen": args.screen,
-        "screen_k": args.screen_k if args.screen != "canonical" else None,
+        "screen_k": args.screen_k if args.screen == "bank" else None,
         "unit_mean": args.unit_mean,
         "n_responsive": int(responsive.sum()),
         "n_units": int(unit_kind.size),
