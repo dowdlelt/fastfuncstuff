@@ -773,7 +773,7 @@ def create_pighs_library(
     duration: float = 32.0,
     microtime_dt: float = 0.1,
     stim_duration: float = 0.0,
-    seed: int | None = None,
+    seed: int | None = 0,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -832,7 +832,8 @@ def create_pighs_library(
     # Use LHS for the other 4 parameters (rise_fraction, fall, recovery, undershoot)
     from scipy.stats import qmc
 
-    # Seeded, or the library is a different set of HRFs on every call: the four
+    # Seeded (0 unless the caller says otherwise), or the library is a different
+    # set of HRFs on every call -- no caller passed a seed until 2026-10-30: the four
     # non-peak-time parameters are Latin-hypercube samples, so an unseeded run
     # is not reproducible and two fits of the same data select from different
     # candidate shapes.

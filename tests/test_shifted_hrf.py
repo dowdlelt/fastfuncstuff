@@ -1141,3 +1141,12 @@ def test_tau0_baseline_is_measured_on_the_same_estimator(setup):
             f"-amp-ridge {ridge!r}: tau=0 baseline beat the full fit by "
             f"{-gap:.4f}; r2_fixed is not measured on the same estimator as r2"
         )
+
+
+def test_pighs_library_is_the_same_on_every_call():
+    """No caller passed a seed, so every fit drew a different pighs library."""
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    a, _ = build_shape_library("pighs", 0.1, 32.0, n_hrfs=20)
+    b, _ = build_shape_library("pighs", 0.1, 32.0, n_hrfs=20)
+    np.testing.assert_array_equal(a, b)
