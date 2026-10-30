@@ -125,6 +125,14 @@ Examples:
         help="Number of trailing volumes used as noise-only",
     )
     algo_group.add_argument(
+        "-noise-sigma-first-vol",
+        action="store_true",
+        help="Estimate the noise sigma from the first trailing noise volume only, "
+        "as MATLAB NORDIC does (parity). Default pools all -noise-volume-last "
+        "volumes: the first reads slightly high, and pooling averages N times "
+        "the samples.",
+    )
+    algo_group.add_argument(
         "-factor-error",
         type=float,
         default=1.0,
@@ -1266,6 +1274,7 @@ def main(argv: list[str] | None = None) -> None:
         temporal_phase=args.temporal_phase,
         phase_filter_width=args.phase_filter_width,
         noise_volume_last=args.noise_volume_last,
+        noise_sigma_first_vol=args.noise_sigma_first_vol,
         factor_error=args.factor_error,
         nordic=(True if (args.nordic or args.mp == 0) else False),
         mp_mode=args.mp,

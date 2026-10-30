@@ -54,6 +54,11 @@ class NordicConfig:
     temporal_phase: int = 1
     phase_filter_width: float = 10.0
     noise_volume_last: int = 0
+    # MATLAB takes sigma from the first trailing noise volume alone, and that one
+    # read a consistent 0.1-0.3% high on HiHiFaces 7T (all four tasks). Pooling
+    # every noise volume removes that bias and averages N times the samples;
+    # True restores the single-volume estimate for parity.
+    noise_sigma_first_vol: bool = False
     factor_error: float = 1.0
     nordic: bool = True
     mp_mode: int = 0
@@ -1877,7 +1882,9 @@ def _prepare_echo(
     # Extract noise volume BEFORE DD_phase (MATLAB line ~470)
     noise_vol: torch.Tensor | None = None
     if cfg.noise_volume_last > 0 and nt > cfg.noise_volume_last:
-        noise_vol = II[..., nt - cfg.noise_volume_last].clone()
+        first = nt - cfg.noise_volume_last
+        last = first + 1 if cfg.noise_sigma_first_vol else nt
+        noise_vol = II[..., first:last].clone()
 
     # temporal_phase==3 correction (applied AFTER gfactor division, BEFORE dd_phase)
     if effective_tp == 3 and dd_phase is not None:
@@ -2165,6 +2172,7 @@ def _finalize_echo(
             "temporal_phase": cfg.temporal_phase,
             "phase_filter_width": cfg.phase_filter_width,
             "noise_volume_last": cfg.noise_volume_last,
+            "noise_sigma_first_vol": cfg.noise_sigma_first_vol,
             "factor_error": cfg.factor_error,
             "nordic": cfg.nordic,
             "mp_mode": cfg.mp_mode,

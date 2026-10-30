@@ -385,6 +385,39 @@ def test_noise_volume_branch_drives_measured_noise(tmp_path):
     assert meta["threshold"]["measured_noise"] > 1.0
 
 
+def test_noise_sigma_pools_all_noise_volumes(tmp_path):
+    """Sigma comes from every trailing noise volume unless -noise-sigma-first-vol
+    asks for MATLAB's first-volume-only estimate. A first noise volume at twice
+    the scale of the other two must pull the parity estimate well above the pooled one."""
+    rng = np.random.default_rng(55)
+    nt = 20
+    magn = np.abs(rng.normal(scale=0.05, size=(8, 8, 4, nt))).astype(np.float32)
+    magn[..., -3] = np.abs(rng.normal(scale=4.0, size=(8, 8, 4))).astype(np.float32)
+    magn[..., -2:] = np.abs(rng.normal(scale=2.0, size=(8, 8, 4, 2))).astype(np.float32)
+    magn_file = tmp_path / "magn_pool.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    def sigma(first_only: bool) -> float:
+        cfg = NordicConfig(
+            temporal_phase=0,
+            magnitude_only=True,
+            noise_volume_last=3,
+            noise_sigma_first_vol=first_only,
+            kernel_size_pca=(3, 3, 2),
+            kernel_size_gfactor=(3, 3, 1),
+            gfactor_nvols=8,
+            verbose=False,
+        )
+        out = run_nordic(str(magn_file), None, str(tmp_path / f"N_{first_only}"), cfg)
+        with open(out.metadata_file, encoding="utf-8") as f:
+            return json.load(f)["threshold"]["measured_noise"]
+
+    pooled, first = sigma(False), sigma(True)
+    # measured 1.28x (g-factor normalisation and half-normal std pull it below
+    # the raw-RMS 1.41x); identical estimators would give 1.0
+    assert first > 1.15 * pooled
+
+
 def test_noise_volumes_trimmed_from_output(tmp_path):
     """Trailing noise volumes calibrate the threshold then get trimmed.
 
