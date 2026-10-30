@@ -278,6 +278,53 @@ def loro_prior_ridge(
     return solve(tot_a, tot_b, lam_best), best, sse
 
 
+def _padded_spectrum(y: torch.Tensor, pad: int) -> torch.Tensor:
+    """``(R, b, T, K)`` -> reflect-padded rfft, ``(R, b, F, K)``."""
+    R, b, T, K = y.shape
+    yp = F.pad(y.permute(0, 1, 3, 2).reshape(-1, 1, T), (pad, pad), mode="reflect")
+    return torch.fft.rfft(yp.reshape(R, b, K, T + 2 * pad), dim=-1).permute(0, 1, 3, 2)
+
+
+def _crop(z: torch.Tensor, T: int, pad: int) -> torch.Tensor:
+    """Inverse of :func:`_padded_spectrum`: ``(R, b, F, K)`` -> ``(R, b, T, K)``."""
+    return torch.fft.irfft(z.permute(0, 1, 3, 2), n=T + 2 * pad, dim=-1)[
+        ..., pad : pad + T
+    ].permute(0, 1, 3, 2)
+
+
+def _inverse_operators(H, b, sampling, noise_cov, strengths, penalty, dev, dtype, cdtype):
+    """Sampling ``S`` ``(b, 1, K, K)`` (complex), the sampled forward ``S H`` and one
+    ridge inverse per strength.
+
+    ``sampling`` / ``noise_cov`` are ``(b, K, K)`` or None (identity) for ``b`` units. Strengths are
+    relative to the unit's own whitened model scale, so a unit measured with more
+    voxels (a larger whitened gram) is penalised in proportion.
+    """
+    K = H.shape[-1]
+    eye = torch.eye(K, device=dev, dtype=cdtype)
+    S = eye.real.expand(b, -1, -1) if sampling is None else sampling.to(device=dev, dtype=dtype)
+    cov = eye.real.expand(b, -1, -1) if noise_cov is None else noise_cov.to(device=dev, dtype=dtype)
+    chol = torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky"))).to(dev)
+    whiten = torch.linalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(cdtype)
+    Sc = S.to(cdtype)[:, None]
+    hs = Sc @ H
+    hw = whiten[:, None] @ hs
+    gram = hw.mH @ hw
+    scale = gram[:, 0].diagonal(dim1=-2, dim2=-1).real.mean(-1).clamp_min(torch.finfo(dtype).eps)
+    solve_device = cpu_if_mps(dev, "solve")
+    rhs_solve = (hw.mH @ whiten[:, None]).to(solve_device)
+    inverses = [
+        torch.linalg.solve(
+            (gram + st * scale[:, None, None, None] * penalty[None, :, None, None] * eye).to(
+                solve_device
+            ),
+            rhs_solve,
+        ).to(dev)
+        for st in strengths
+    ]
+    return Sc, hs, inverses
+
+
 @dataclass
 class DynamicResult:
     correction: torch.Tensor  # (R,U,T,K), transported contribution, sample depths
@@ -301,9 +348,14 @@ def dynamic_inverse(
     pad: int,
     cutoff_hz: float = 0.1,
     device: torch.device | None = None,
+    scores: torch.Tensor | None = None,
     verbose: bool = True,
 ) -> DynamicResult:
     """Regularized spectral inverse, selecting shrinkage per unit by GE LORO.
+
+    ``scores`` ``(len(strengths), U)`` selects instead (the largest wins), e.g.
+    :func:`split_half_scores`, which needs no repeated runs; they are reported
+    as ``cv_r2``.
 
     profiles are detrended PSC, (runs, units, time, depths). Runs used for LORO
     MUST have the same task schedule and length. With one run a single supplied
@@ -318,8 +370,12 @@ def dynamic_inverse(
     R, U, T, K = profiles.shape
     if U < 1 or T < 3 or not 0 <= pad < T or tr <= 0 or cutoff_hz <= 0:
         raise ValueError("need units, >=3 samples, 0<=pad<T, and positive TR/cutoff")
-    if not strengths or any(x <= 0 for x in strengths) or (R < 2 and len(strengths) > 1):
-        raise ValueError("positive strengths required; selection needs >=2 repeated runs")
+    if not strengths or any(x <= 0 for x in strengths):
+        raise ValueError("positive strengths required")
+    if scores is None and R < 2 and len(strengths) > 1:
+        raise ValueError("selection needs >=2 repeated runs, or scores")
+    if scores is not None and tuple(scores.shape) != (len(strengths), U):
+        raise ValueError("scores must be (len(strengths), units)")
     nf = (T + 2 * pad) // 2 + 1
     if full.shape != (nf, K, K) or target.shape != full.shape:
         raise ValueError("transfer grid must match rfftfreq(T+2*pad, tr) and K depths")
@@ -351,67 +407,39 @@ def dynamic_inverse(
         stop = min(U, start + chunk)
         b = stop - start
         y = profiles[:, start:stop].to(device=dev, dtype=dtype)
-        yp = F.pad(y.permute(0, 1, 3, 2).reshape(-1, 1, T), (pad, pad), mode="reflect")
-        yf = torch.fft.rfft(yp.reshape(R, b, K, T + 2 * pad), dim=-1).permute(0, 1, 3, 2)
-        S = (
-            eye.real.expand(b, -1, -1)
-            if sampling is None
-            else sampling[start:stop].to(device=dev, dtype=dtype)
-        )
-        cov = (
-            eye.real.expand(b, -1, -1)
-            if noise_cov is None
-            else noise_cov[start:stop].to(device=dev, dtype=dtype)
-        )
-        chol = torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky"))).to(dev)
-        whiten = torch.linalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(
-            cdtype
-        )
-        hs, gs = S.to(cdtype)[:, None] @ H, S.to(cdtype)[:, None] @ G
-        hw = whiten[:, None] @ hs
-        gram = hw.mH @ hw
-        scale = (
-            gram[:, 0].diagonal(dim1=-2, dim2=-1).real.mean(-1).clamp_min(torch.finfo(dtype).eps)
-        )
-        solve_device = cpu_if_mps(dev, "solve")
-        rhs_solve = (hw.mH @ whiten[:, None]).to(solve_device)
-        scores, inverses = [], []
+        yf = _padded_spectrum(y, pad)
+        Sc, hs, inverses = _inverse_operators(
+            H,
+            b,
+            None if sampling is None else sampling[start:stop],
+            None if noise_cov is None else noise_cov[start:stop],
+            strengths, penalty, dev, dtype, cdtype,
+        )  # fmt: skip
         total = y.square().sum((0, 2, 3)).clamp_min(torch.finfo(dtype).eps)
-        for strength in strengths:
-            inverse = torch.linalg.solve(
-                (
-                    gram
-                    + strength * scale[:, None, None, None] * penalty[None, :, None, None] * eye
-                ).to(solve_device),
-                rhs_solve,
-            ).to(dev)
-            inverses.append(inverse)
-            if R > 1:
-                train = (yf.sum(0, keepdim=True) - yf) / (R - 1)
-                held = torch.einsum("bfij,rbfj->rbfi", hs @ inverse, train)
-                held_t = torch.fft.irfft(held.permute(0, 1, 3, 2), n=T + 2 * pad, dim=-1)[
-                    ..., pad : pad + T
-                ].permute(0, 1, 3, 2)
-                scores.append(1 - (held_t - y).square().sum((0, 2, 3)) / total)
-            else:
-                scores.append(torch.full((b,), float("nan"), device=dev, dtype=dtype))
-        scores_t = torch.stack(scores)
+        if scores is not None:
+            scores_t = scores[:, start:stop].to(device=dev, dtype=dtype)
+        else:
+            rows = []
+            for inverse in inverses:
+                if R > 1:
+                    train = (yf.sum(0, keepdim=True) - yf) / (R - 1)
+                    held = torch.einsum("bfij,rbfj->rbfi", hs @ inverse, train)
+                    rows.append(1 - (_crop(held, T, pad) - y).square().sum((0, 2, 3)) / total)
+                else:
+                    rows.append(torch.full((b,), float("nan"), device=dev, dtype=dtype))
+            scores_t = torch.stack(rows)
         best = (
-            scores_t.argmax(0)
+            scores_t.nan_to_num(float("-inf")).argmax(0)
             if len(strengths) > 1
             else torch.zeros(b, device=dev, dtype=torch.long)
         )
         inv = torch.stack(inverses)[best, torch.arange(b, device=dev)]
-        remove = (hs - gs) @ inv
+        remove = (hs - Sc @ G) @ inv
         transported = torch.einsum("bfij,rbfj->rbfi", remove, yf)
         fit = torch.einsum("bfij,rbfj->rbfi", hs @ inv, yf)
 
         def crop(z):
-            return (
-                torch.fft.irfft(z.permute(0, 1, 3, 2), n=T + 2 * pad, dim=-1)[..., pad : pad + T]
-                .permute(0, 1, 3, 2)
-                .to(profiles)
-            )
+            return _crop(z, T, pad).to(profiles)
 
         correction[:, start:stop], predicted[:, start:stop] = crop(transported), crop(fit)
         grid_correction[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", (H - G) @ inv, yf))
