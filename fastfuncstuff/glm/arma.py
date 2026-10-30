@@ -2978,14 +2978,29 @@ def fit_glm_arma11_grouped(
     per_hrf_results: dict[int, ARMA11Results] = {}
     per_hrf_local_mask: dict[int, _torch.Tensor] = {}  # voxel positions in `data` axis
 
+    # Composite groupings (per-column HRF x dsort, slibase x HRF) reach hundreds of
+    # groups; a full verbose report from each inner fit buries the run log. Past
+    # one group, the inner fits run quiet under a single voxel-weighted bar.
+    many_groups = len(unique_hrfs) > 1
+    if many_groups:
+        inner_kwargs["verbose"] = False
+    group_bar = tqdm(
+        total=n_voxels,
+        desc=f"REML per {group_label}",
+        unit="vox",
+        leave=True,
+        disable=not (verbose and many_groups),
+    )
+
     for hrf_idx in unique_hrfs:
         sub_mask = group_indices == hrf_idx
         n_sub = int(sub_mask.sum().item())
-        if verbose:
+        if verbose and not many_groups:
             print(
                 f"\n  ─── {group_label} {hrf_idx}: {n_sub:,} voxels "
                 f"({100.0 * n_sub / n_voxels:.1f}%) ───"
             )
+        group_bar.set_postfix_str(f"{group_label} {hrf_idx}", refresh=False)
         sub_data = data_t[sub_mask]
         sub_design = designs_by_group[hrf_idx]
 
@@ -3020,6 +3035,8 @@ def fit_glm_arma11_grouped(
             _torch.cuda.empty_cache()
         per_hrf_results[hrf_idx] = results_h
         per_hrf_local_mask[hrf_idx] = sub_mask
+        group_bar.update(n_sub)
+    group_bar.close()
 
     # Merge: allocate full-size arrays on CPU, scatter per-HRF results in.
     merged = ARMA11Results()
