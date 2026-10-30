@@ -24,7 +24,12 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from fastfuncstuff.design.bids_events import EventFilter, parse_path_entities, read_tsv_rows
+from fastfuncstuff.design.bids_events import (
+    EventFilter,
+    entity_label_prefix,
+    parse_path_entities,
+    read_tsv_rows,
+)
 
 # Entities parsed from the events filename, in the order they become columns.
 _ENTITY_COLUMNS = ("sub", "ses", "task", "run")
@@ -113,6 +118,7 @@ def read_run_event_rows(
     event_cols: tuple[str, str, str] | None = None,
     n_runs: int | None = None,
     event_filters: list[EventFilter] | None = None,
+    event_prefix: str | None = None,
 ) -> tuple[list[list[dict[str, Any]]], list[str]]:
     """Read every events TSV, applying the same filtering as ``parse_bids_events``.
 
@@ -127,8 +133,11 @@ def read_run_event_rows(
     for path in event_files:
         rows, names = read_tsv_rows(path, onset_col, duration_col, trial_type_col, event_filters)
         rows = [r for r in rows if r["_trial_type"] not in ignore]
+        tag = entity_label_prefix(path, event_prefix) if event_prefix else None
         for r in rows:
             r["_source_file"] = str(path)
+            if tag:
+                r["_trial_type"] = f"{tag}_{r['_trial_type']}"
         rows_by_run.append(rows)
         for name in names:
             if name not in fieldnames:
@@ -193,6 +202,7 @@ def build_trial_table(
     n_basis: int = 1,
     basis_names: list[str] | None = None,
     event_filters: list[EventFilter] | None = None,
+    event_prefix: str | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     """Build the companion table: one row per single-trial beta volume, in order.
 
@@ -206,6 +216,7 @@ def build_trial_table(
         event_cols=event_cols,
         n_runs=n_runs,
         event_filters=event_filters,
+        event_prefix=event_prefix,
     )
     ordered = order_trials(rows_by_run, run_starts, tr, run_lengths_sec=run_lengths_sec)
 
@@ -299,6 +310,7 @@ def write_single_trial_event_table(
     n_basis: int = 1,
     basis_names: list[str] | None = None,
     event_filters: list[EventFilter] | None = None,
+    event_prefix: str | None = None,
     verbose: bool = True,
 ) -> str | None:
     """Write ``{output_prefix}_single_trial_events.tsv``; return the path or ``None``.
@@ -326,6 +338,7 @@ def write_single_trial_event_table(
             tr,
             event_ignore=event_ignore,
             event_filters=event_filters,
+            event_prefix=event_prefix,
             event_cols=event_cols,
             n_runs=n_runs,
             run_lengths_sec=run_lengths_sec,

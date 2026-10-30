@@ -3588,6 +3588,16 @@ def add_bids_events_args(group, *, events_help: str, required: bool = False) -> 
         "(default: onset duration trial_type), e.g. -event_cols onset duration "
         "stim_type. Only valid with -events.",
     )
+    group.add_argument(
+        "-event_prefix",
+        default=None,
+        metavar="ENTITY",
+        help="Prefix every trial_type with the value of this BIDS entity in its own "
+        "file's name, so runs of different tasks keep their conditions apart: "
+        "-event_prefix task makes 'hi' in ..._task-gender_run-1_events.tsv "
+        "'gender_hi'. Applied after -event_ignore, which names the files' own "
+        "labels. Only valid with -events.",
+    )
     add_event_filter_arguments(group)
 
 
@@ -3602,7 +3612,9 @@ def check_bids_event_args(args, *, has_events: bool | None = None) -> None:
     if has_events is None:
         has_events = bool(getattr(args, "events", None))
     if not has_events:
-        for flag in ("event_ignore", "event_cols", "event_filter_in", "event_filter_out"):
+        for flag in (
+            "event_ignore", "event_cols", "event_prefix", "event_filter_in", "event_filter_out",
+        ):  # fmt: skip
             if getattr(args, flag, None):
                 print(f"ERROR: -{flag} requires -events")
                 sys.exit(1)
@@ -3625,6 +3637,7 @@ def bids_event_kwargs(args) -> dict:
         "event_ignore": getattr(args, "event_ignore", None),
         "event_cols": tuple(cols) if cols else None,
         "event_filters": resolve_event_filters(args),
+        "event_prefix": getattr(args, "event_prefix", None),
     }
 
 
@@ -3659,6 +3672,7 @@ def parse_timing_spec(
     trim: TrimSpec | None = None,
     run_lengths_tr: list[int] | None = None,
     allow_missing_durations: bool = False,
+    event_prefix: str | None = None,
 ) -> TimingSpec:
     """Parse the timing spec of an ``ffs_*`` GLM tool into a common structure.
 
@@ -3707,6 +3721,7 @@ def parse_timing_spec(
             event_files=events,
             event_ignore=event_ignore,
             event_cols=event_cols,
+            event_prefix=event_prefix,
             round_durations=round_durations,
             n_runs=n_runs,
             event_filters=event_filters,

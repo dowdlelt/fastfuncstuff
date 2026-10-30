@@ -583,6 +583,16 @@ def _read_tsv(
 # ---------------------------------------------------------------------------
 
 
+def entity_label_prefix(path: str | Path, entity: str) -> str:
+    """The value of BIDS ``entity`` in ``path``'s name, for ``-event_prefix``."""
+    value = parse_path_entities(path, normalize=False).get(entity)
+    if not value:
+        raise ValueError(
+            f"-event_prefix {entity}: {Path(path).name} has no '{entity}-' entity in its name"
+        )
+    return value
+
+
 def parse_bids_events(
     event_files: list[str | Path],
     event_ignore: list[str] | None = None,
@@ -590,6 +600,7 @@ def parse_bids_events(
     round_durations: int | None = None,
     n_runs: int | None = None,
     event_filters: list[EventFilter] | None = None,
+    event_prefix: str | None = None,
 ) -> tuple[list[list[np.ndarray]], list[float], list[str]]:
     """
     Parse BIDS *_events.tsv files into onset/duration/label structures.
@@ -688,6 +699,10 @@ def parse_bids_events(
         events = _read_tsv(Path(tsv_path), onset_col, duration_col, trial_type_col, event_filters)
         # Drop ignored conditions
         events = [(on, dur, ct) for on, dur, ct in events if ct not in ignore_set]
+        if event_prefix:
+            # After -event_ignore, which names the file's own labels.
+            tag = entity_label_prefix(tsv_path, event_prefix)
+            events = [(on, dur, f"{tag}_{ct}") for on, dur, ct in events]
         run_events.append(events)
         all_conditions.update(ct for _, _, ct in events)
 

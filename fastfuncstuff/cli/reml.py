@@ -2810,6 +2810,7 @@ def main():
                 round_durations=args.round_durations,
                 input_files=input_files,
                 event_filters=event_filters,
+                event_prefix=args.event_prefix,
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -3107,6 +3108,7 @@ def main():
                 run_lengths_sec=_run_len_sec if args.allow_late_events else None,
                 n_basis=n_basis if n_basis else 1,
                 event_filters=event_filters,
+                event_prefix=args.event_prefix,
             )
 
             # Override label/count bookkeeping so downstream design_info uses

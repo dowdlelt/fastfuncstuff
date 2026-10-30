@@ -748,3 +748,27 @@ def test_events_without_trial_type_are_one_condition(tmp_path):
 
     with pytest.raises(ValueError, match="not found"):
         read_tsv_rows(ev, trial_type_col="condition")
+
+
+def test_event_prefix_keeps_each_tasks_conditions_apart(tmp_path):
+    """Two tasks with the same trial_type values: -event_prefix task gives each its own
+    conditions, in the right runs; -event_ignore names the files' own labels."""
+    from fastfuncstuff.design.bids_events import parse_bids_events
+    from fastfuncstuff.design.trial_table import read_run_event_rows
+
+    rows = "onset\tduration\ttrial_type\n10\t1\thi\n20\t1\tlo\n30\t1\tfix\n"
+    files = []
+    for task in ("gender", "fixate"):
+        f = tmp_path / f"sub-01_task-{task}_run-1_events.tsv"
+        f.write_text(rows)
+        files.append(f)
+    onsets, _, labels = parse_bids_events(files, event_ignore=["fix"], event_prefix="task")
+    assert labels == ["fixate_hi", "fixate_lo", "gender_hi", "gender_lo"]
+    assert onsets[labels.index("gender_hi")][0].tolist() == [10.0]
+    assert onsets[labels.index("gender_hi")][1].size == 0
+    assert onsets[labels.index("fixate_lo")][1].tolist() == [20.0]
+    by_run, _ = read_run_event_rows(files, event_ignore=["fix"], event_prefix="task")
+    assert [r["_trial_type"] for r in by_run[1]] == ["fixate_hi", "fixate_lo"]
+    (tmp_path / "plain.tsv").write_text(rows)
+    with pytest.raises(ValueError, match="no 'task-' entity"):
+        parse_bids_events([tmp_path / "plain.tsv"], event_prefix="task")

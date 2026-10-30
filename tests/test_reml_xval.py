@@ -309,3 +309,71 @@ def test_spec_without_hrf_opt_scores_xval_r2(tmp_path):
     assert out, sorted(p.name for p in tmp_path.iterdir())
     r2 = np.asarray(nib.load(out[0]).dataobj).squeeze()
     assert np.median(r2[signal]) > 0.2 > np.median(r2[~signal])
+
+
+def test_event_prefix_fits_tasks_jointly_and_contrasts_them(tmp_path):
+    """Runs of two tasks sharing trial_type 'hi', 3x the response in gender: with
+    -event_prefix task they are two conditions, and gender_hi - fixate_hi is ~2x."""
+    import subprocess
+    import sys
+
+    import nibabel as nib
+    from scipy.stats import gamma
+
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    nt, shape = 120, (3, 3, 3)
+    t = np.arange(0, 30, 0.1)
+    h = gamma.pdf(t, 6) - gamma.pdf(t, 16) / 6
+    rng = np.random.default_rng(1)
+    names = []
+    for task, amp in (("gender", 3.0), ("fixate", 1.0)):
+        on = np.cumsum(rng.uniform(5, 9, 20))
+        on = on[on < nt - 20]
+        ev = tmp_path / f"sub-01_task-{task}_run-1_events.tsv"
+        ev.write_text("onset\tduration\ttrial_type\n" + "".join(f"{o:.1f}\t1\thi\n" for o in on))
+        box = np.zeros(nt * 10)
+        for o in on:
+            box[int(o * 10) : int(o * 10) + 10] = 1
+        x = np.convolve(box, h)[: nt * 10][::10]
+        data = 100 + amp * x / x.max() + rng.normal(0, 0.2, (*shape, nt))
+        bold = tmp_path / f"sub-01_task-{task}_run-1_bold.nii.gz"
+        nib.save(nib.Nifti1Image(data.astype(np.float32), np.eye(4)), bold)
+        names.append((bold.name, ev.name))
+    (tmp_path / "con.toml").write_text(
+        '[[contrasts]]\nlabel = "g_vs_f"\nsym = "SYM: +1*gender_hi -1*fixate_hi"\n'
+    )
+    res = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "fastfuncstuff.cli.reml",
+            "-input",
+            *(b for b, _ in names),
+            "-events",
+            *(e for _, e in names),
+            "-event_prefix",
+            "task",
+            "-contrasts",
+            "con.toml",
+            "-TR",
+            "1",
+            "-Rbuck",
+            "r.nii.gz",
+            "-device",
+            "cpu",
+        ],  # fmt: skip
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    img = nib.load(tmp_path / "r.nii.gz")
+    labels = _read_brick_labels(img)
+    vol = np.asanyarray(img.dataobj)
+    g = vol[..., labels.index("gender_hi#0_Coef")]
+    f = vol[..., labels.index("fixate_hi#0_Coef")]
+    c = vol[..., labels.index("g_vs_f#0_Coef")]
+    np.testing.assert_allclose(c, g - f, atol=1e-4)
+    assert np.median(g / f) == pytest.approx(3.0, rel=0.15)
