@@ -1414,6 +1414,14 @@ def build_shape_library(
         lib, _ = create_pighs_library(n_hrfs=n_hrfs, duration=duration, microtime_dt=dt, device=cpu)
         curves = lib.cpu().numpy()
         labels = [f"pighs{i:02d}" for i in range(curves.shape[0])]
+    elif key == "blend":
+        from fastfuncstuff.design.hrf import get_hrf_library
+
+        curves = get_hrf_library(
+            "blend", microtime_dt=dt, n_hrfs=n_hrfs, hrf_duration=duration, device=cpu
+        ).numpy()
+        n_lib = curves.shape[0] - n_hrfs
+        labels = [f"lib{i:02d}" for i in range(n_lib)] + [f"pighs{i:02d}" for i in range(n_hrfs)]
     elif key == "flobs":
         from fastfuncstuff.design.flobs import generate_flobs_basis
 

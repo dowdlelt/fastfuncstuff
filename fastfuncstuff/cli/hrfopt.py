@@ -235,15 +235,18 @@ Notes:
     hrf_opts = parser.add_argument_group("HRF Library Options")
     hrf_opts.add_argument(
         "-hrf_mode",
-        choices=["library", "pighs"],
+        choices=["library", "pighs", "blend"],
         default="library",
-        help="HRF library type: 'library' (double-gamma variations) or 'pighs' (half-cosine basis). Default: library",
+        help="HRF library type: 'library' (the 20 double-gamma curves), 'pighs' "
+        "(-n_hrfs half-cosine shapes, spread over shape space), or 'blend' (the "
+        "library plus the -n_hrfs PIGHS shapes it matches worst: fast/thin, "
+        "slow/narrow, other undershoots). Default: library",
     )
     hrf_opts.add_argument(
         "-n_hrfs",
         type=int,
         default=20,
-        help="Number of HRFs in library (default: 20, only affects pighs mode)",
+        help="pighs: HRFs in the library; blend: PIGHS shapes added to the 20 (default: 20)",
     )
     hrf_opts.add_argument(
         "-save_selected_tr",
@@ -336,25 +339,25 @@ Notes:
         "-pighs_peak_time_range",
         type=float,
         nargs=2,
-        default=[3, 10],
+        default=[2, 10],
         metavar=("MIN", "MAX"),
-        help="Range for time-to-peak in seconds. Default: 3 10",
+        help="Range for time-to-peak in seconds. Default: 2 10",
     )
     pighs_opts.add_argument(
         "-pighs_rise_fraction_range",
         type=float,
         nargs=2,
-        default=[0.3, 0.9],
+        default=[0.3, 1.0],
         metavar=("MIN", "MAX"),
-        help="Range for rise_fraction (fraction of peak_time that is rise vs delay). Default: 0.3 0.9",
+        help="Range for rise_fraction (fraction of peak_time that is rise vs delay). Default: 0.3 1.0 (1 = no delay: the library's fast curves rise almost at once)",
     )
     pighs_opts.add_argument(
         "-pighs_fall_range",
         type=float,
         nargs=2,
-        default=[3, 10],
+        default=[2, 10],
         metavar=("MIN", "MAX"),
-        help="Range for peak-to-undershoot time (m3) in seconds. Default: 3 10",
+        help="Range for peak-to-undershoot time (m3) in seconds. Default: 2 10",
     )
     pighs_opts.add_argument(
         "-pighs_recovery_range",
@@ -368,9 +371,9 @@ Notes:
         "-pighs_undershoot_range",
         type=float,
         nargs=2,
-        default=[0, 0.35],
+        default=[0, 0.4],
         metavar=("MIN", "MAX"),
-        help="Range for undershoot magnitude (c2). Default: 0 0.35",
+        help="Range for undershoot magnitude (c2). Default: 0 0.4",
     )
 
     # Cross-validation options
@@ -947,7 +950,7 @@ def main():
 
     # Build PIGHS kwargs if using pighs mode
     pighs_kwargs = {}
-    if args.hrf_mode == "pighs":
+    if args.hrf_mode in ("pighs", "blend"):
         pighs_kwargs = {
             "peak_time_range": tuple(args.pighs_peak_time_range),
             "rise_fraction_range": tuple(args.pighs_rise_fraction_range),

@@ -356,7 +356,7 @@ def _default_hrf_select(hrf_mode: str) -> str:
     well under half the cost. A PIGHS library is not ordered by shape, so its
     window has to be ranked by grid fit rather than walked by index.
     """
-    return "grid-2" if hrf_mode == "pighs" else "grid+1"
+    return "grid-2" if hrf_mode in ("pighs", "blend") else "grid+1"
 
 
 def _hrf_select_spec(value: str) -> str:
@@ -484,7 +484,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-hrf-mode",
         "-hrf_mode",
         dest="hrf_mode",
-        choices=["canonical", "library", "pighs"],
+        choices=["canonical", "library", "pighs", "blend"],
         default="library",
         help=(
             "HRF source. 'canonical' is a single fixed double-gamma, which skips "
@@ -492,7 +492,8 @@ def create_parser() -> argparse.ArgumentParser:
             "20-HRF double-gamma family (or -hrf_library), refined per voxel in a "
             "grid+1 window. 'pighs' generates a half-cosine family of "
             "-num_hrfs shapes; its draws are not ordered by shape, so it defaults "
-            "to a grid-2 window instead"
+            "to a grid-2 window instead. 'blend' is the library plus the -num_hrfs "
+            "PIGHS shapes it matches worst (fast/thin, slow/narrow), also grid-2"
         ),
     )
     model.add_argument(
@@ -1116,9 +1117,9 @@ def _build_hrf_library(
     if args.hrf_mode == "canonical":
         return canonical, 0
 
-    if args.hrf_mode == "pighs":
+    if args.hrf_mode in ("pighs", "blend"):
         library = get_hrf_library(
-            mode="pighs",
+            mode=args.hrf_mode,
             microtime_dt=tr,
             hrf_duration=args.hrf_duration,
             stim_duration=tr,

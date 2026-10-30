@@ -763,18 +763,48 @@ def pighs_halfcos(
 flobs_halfcos = pighs_halfcos
 
 
+def select_spread(curves: np.ndarray, k: int, existing: np.ndarray | None = None) -> np.ndarray:
+    """Indices of ``k`` rows of ``curves`` picked to be as different as possible.
+
+    Greedy farthest-point selection on shape (R² of the best scaled fit): each pick is
+    the curve worst matched by everything chosen so far -- including ``existing``
+    curves, which are never picked themselves (a library to extend). Without
+    ``existing`` the first pick is the curve closest to the mean shape.
+    """
+    u = np.asarray(curves, np.float64)
+    u = u / np.linalg.norm(u, axis=1, keepdims=True).clip(1e-12, None)
+    if k > len(u):
+        raise ValueError(f"cannot pick {k} of {len(u)} curves")
+    if existing is not None and len(existing):
+        e = np.asarray(existing, np.float64)
+        e = e / np.linalg.norm(e, axis=1, keepdims=True).clip(1e-12, None)
+        best = ((u @ e.T) ** 2).max(1)
+        picks: list[int] = []
+    else:
+        mean = u.mean(0)
+        first = int(np.argmax(u @ mean))
+        picks = [first]
+        best = (u @ u[first]) ** 2
+    while len(picks) < k:
+        j = int(np.argmin(best))
+        picks.append(j)
+        best = np.maximum(best, (u @ u[j]) ** 2)
+    return np.asarray(picks)
+
+
 def create_pighs_library(
     n_hrfs: int = 20,
-    peak_time_range: tuple[float, float] = (3, 10),
-    rise_fraction_range: tuple[float, float] = (0.3, 0.7),
-    fall_time_range: tuple[float, float] = (3, 10),
+    peak_time_range: tuple[float, float] = (2, 10),
+    rise_fraction_range: tuple[float, float] = (0.3, 1.0),
+    fall_time_range: tuple[float, float] = (2, 10),
     recovery_time_range: tuple[float, float] = (3, 12),
-    undershoot_range: tuple[float, float] = (0, 0.35),
+    undershoot_range: tuple[float, float] = (0, 0.4),
     duration: float = 32.0,
     microtime_dt: float = 0.1,
     stim_duration: float = 0.0,
     seed: int | None = 0,
     device: torch.device | None = None,
+    pool_factor: int = 50,
 ) -> tuple[torch.Tensor, dict]:
     """
     Create HRF library using PIGHS (Parametric Individually Generated HRFs).
@@ -782,6 +812,17 @@ def create_pighs_library(
     Uses stratified sampling for uniform coverage of the parameter space:
     - Peak times are evenly spaced (grid) to guarantee full range coverage
     - Secondary parameters use Latin Hypercube Sampling for variety
+    - With ``pool_factor`` > 1, ``pool_factor x n_hrfs`` (>= 1000) such curves are
+      drawn and ``n_hrfs`` picked by :func:`select_spread`, so the library covers
+      the shapes rather than the parameters. Drawn directly, the four secondary
+      parameters are independent random draws, and a shape needing a particular
+      combination (an early peak with no delay, a short fall and a deep undershoot,
+      like the canonical library's fastest curves) turns up only by luck: 60
+      direct draws matched the library's worst curve at R² ~0.67, 60 spread
+      picks at ~0.90.
+
+    The default ranges reach the canonical library's fast end: it starts rising
+    almost at once (rise fraction ~0.95) and peaks from 2.7 s.
 
     Parameters
     ----------
@@ -825,9 +866,11 @@ def create_pighs_library(
     # 1. Grid sampling for peak_time (most important - guarantees coverage)
     # 2. LHS for secondary parameters within each peak_time stratum
 
+    n_draw = n_hrfs if pool_factor <= 1 else max(n_hrfs * pool_factor, 1000)
+
     # Create evenly-spaced peak times that span the full range
     # This guarantees we get HRFs with peaks at 3s, 4s, 5s, etc.
-    peak_times = np.linspace(peak_time_range[0], peak_time_range[1], n_hrfs)
+    peak_times = np.linspace(peak_time_range[0], peak_time_range[1], n_draw)
 
     # Use LHS for the other 4 parameters (rise_fraction, fall, recovery, undershoot)
     from scipy.stats import qmc
@@ -838,7 +881,7 @@ def create_pighs_library(
     # is not reproducible and two fits of the same data select from different
     # candidate shapes.
     sampler = qmc.LatinHypercube(d=4, seed=seed)
-    samples = sampler.random(n=n_hrfs)
+    samples = sampler.random(n=n_draw)
 
     # Sample rise_fraction to split peak_time into delay (m1) and rise (m2)
     rise_fractions = rise_fraction_range[0] + samples[:, 0] * (
@@ -866,7 +909,7 @@ def create_pighs_library(
     t_highres = np.arange(0, duration, gen_dt)
     hrfs_highres = []
 
-    for i in range(n_hrfs):
+    for i in range(n_draw):
         hrf = pighs_halfcos(
             m1_vals[i],
             m2_vals[i],
@@ -887,7 +930,7 @@ def create_pighs_library(
         boxcar[: int(stim_duration / gen_dt)] = 1
 
         hrfs_convolved = np.zeros_like(hrfs_highres)
-        for i in range(n_hrfs):
+        for i in range(n_draw):
             convolved = np.convolve(hrfs_highres[i], boxcar, mode="full")
             hrfs_convolved[i] = convolved[: len(t_highres)]
             # Renormalize
@@ -897,7 +940,7 @@ def create_pighs_library(
         hrfs_highres = hrfs_convolved
 
     # Normalize at high resolution before resampling
-    for i in range(n_hrfs):
+    for i in range(n_draw):
         peak = np.max(hrfs_highres[i])
         if peak > 0:
             hrfs_highres[i] = hrfs_highres[i] / peak
@@ -907,12 +950,19 @@ def create_pighs_library(
     target_times = np.arange(n_target) * microtime_dt
     source_times = np.arange(len(t_highres)) * gen_dt
 
-    hrfs_resampled = np.zeros((n_hrfs, n_target))
-    for i in range(n_hrfs):
+    hrfs_resampled = np.zeros((n_draw, n_target))
+    for i in range(n_draw):
         interpolator = interp1d(
             source_times, hrfs_highres[i], kind="linear", fill_value=0, bounds_error=False
         )
         hrfs_resampled[i] = interpolator(np.clip(target_times, 0, source_times[-1]))
+
+    if n_draw > n_hrfs:
+        keep = select_spread(hrfs_resampled, n_hrfs)
+        hrfs_resampled = hrfs_resampled[keep]
+        peak_times, m1_vals, m2_vals, m3_vals, m4_vals, c2_vals = (
+            a[keep] for a in (peak_times, m1_vals, m2_vals, m3_vals, m4_vals, c2_vals)
+        )
 
     # Sort by empirical waveform properties so the index map is interpretable:
     # primary = time-to-peak, secondary = FWHM, tertiary = time to undershoot trough.
@@ -964,6 +1014,44 @@ def create_pighs_library(
     return hrf_library, params
 
 
+def create_blend_library(
+    library: torch.Tensor,
+    n_extra: int = 20,
+    *,
+    duration: float = 32.0,
+    microtime_dt: float = 0.1,
+    stim_duration: float = 0.0,
+    seed: int | None = 0,
+    device: torch.device | None = None,
+    **pighs_kwargs,
+) -> torch.Tensor:
+    """``library`` followed by the ``n_extra`` PIGHS shapes it matches worst.
+
+    The canonical library is one axis of shapes from one kind of data (later goes
+    with wider), so it leaves whole regions of plausible HRFs uncovered -- fast and
+    thin, slow and narrow, deep or absent undershoots: against a pool of PIGHS
+    shapes its worst match is R² ~0.2. This keeps every library curve (same rows,
+    same order) and appends the pool curves farthest from it and from each other
+    (:func:`select_spread`), so index maps into the library keep their meaning.
+    """
+    pool, _ = create_pighs_library(
+        n_hrfs=max(50 * n_extra, 1000),
+        duration=duration,
+        microtime_dt=microtime_dt,
+        stim_duration=stim_duration,
+        seed=seed,
+        device=torch.device("cpu"),
+        pool_factor=1,
+        **pighs_kwargs,
+    )
+    lib = library.detach().cpu().double()
+    n_t = min(lib.shape[1], pool.shape[1])
+    pool_np = pool[:, :n_t].double().numpy()
+    picks = select_spread(pool_np, n_extra, existing=lib[:, :n_t].numpy())
+    out = torch.cat([lib[:, :n_t], torch.as_tensor(pool_np[picks])], 0)
+    return out.to(device=device or library.device, dtype=library.dtype)
+
+
 # Backwards compatibility alias
 def create_flobs_library(
     n_hrfs: int = 20,
@@ -1010,6 +1098,7 @@ def get_hrf_library(
         HRF source selection:
         - 'library' - Load 20-HRF library from file (recommended for HRF optimization)
         - 'pighs' - Generate PIGHS (Parametric Individually Generated HRFs)
+        - 'blend' - the 20-HRF library plus ``n_hrfs`` PIGHS shapes it matches worst
         - 'single' or 'glmsingle' - Load single canonical HRF from file (GLMsingle-style)
         - 'spmg1' - Generate AFNI's SPMG1 canonical HRF
     stim_duration : float, default=0.0
@@ -1080,6 +1169,24 @@ def get_hrf_library(
             stim_duration=stim_duration,
             device=device,
             library_path=library_path,
+        )
+
+    elif mode_lower == "blend":
+        base = load_canonical_hrf_library(
+            microtime_dt=microtime_dt,
+            hrf_duration=hrf_duration,
+            stim_duration=stim_duration,
+            device=device,
+            library_path=library_path,
+        )
+        return create_blend_library(
+            base,
+            n_hrfs,
+            duration=hrf_duration,
+            microtime_dt=microtime_dt,
+            stim_duration=stim_duration,
+            device=device,
+            **kwargs,
         )
 
     elif mode_lower in ("pighs", "flobs"):

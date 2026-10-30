@@ -214,8 +214,16 @@ def create_parser() -> FfsArgumentParser:
     )
 
     model = parser.add_argument_group("HRF and timing")
-    model.add_argument("-hrf_mode", choices=["library", "pighs"], default="library")
-    model.add_argument("-n_hrfs", type=int, default=20, help="Curves for -hrf_mode pighs")
+    model.add_argument(
+        "-hrf_mode",
+        choices=["library", "pighs", "blend"],
+        default="library",
+        help="Column curves: the 20-curve library, -n_hrfs PIGHS shapes, or the library "
+        "plus the -n_hrfs PIGHS shapes it matches worst",
+    )
+    model.add_argument(
+        "-n_hrfs", type=int, default=20, help="PIGHS curves for -hrf_mode pighs / blend"
+    )
     model.add_argument(
         "-hrf_library",
         default=None,
@@ -836,11 +844,12 @@ def main(argv: list[str] | None = None) -> None:
         affine=affine,
         brick_labels=[*bricks, "depth"],
     )
-    labels = (
-        [f"lib{i:02d}" for i in range(shapes.shape[0])]
-        if args.hrf_mode == "library"
-        else [f"pighs{i:02d}" for i in range(shapes.shape[0])]
+    n_lib = {"library": shapes.shape[0], "pighs": 0}.get(
+        args.hrf_mode, shapes.shape[0] - args.n_hrfs
     )
+    labels = [f"lib{i:02d}" for i in range(n_lib)] + [
+        f"pighs{i:02d}" for i in range(shapes.shape[0] - n_lib)
+    ]
     table = res.library.table(labels)
     n_units_per = np.bincount(res.library.index, minlength=len(table))
     n_vox_per = np.bincount(res.voxel_entry, minlength=len(table))

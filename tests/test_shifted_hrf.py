@@ -1150,3 +1150,44 @@ def test_pighs_library_is_the_same_on_every_call():
     a, _ = build_shape_library("pighs", 0.1, 32.0, n_hrfs=20)
     b, _ = build_shape_library("pighs", 0.1, 32.0, n_hrfs=20)
     np.testing.assert_array_equal(a, b)
+
+
+def _unit(m):
+    m = np.asarray(m, np.float64)
+    return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+
+def test_select_spread_picks_the_curve_worst_matched_so_far():
+    from fastfuncstuff.design.hrf import select_spread
+
+    t = np.arange(300) * 0.1
+    curves = np.stack([np.exp(-0.5 * ((t - c) / 1.0) ** 2) for c in (5, 5.1, 5.2, 15, 25)])
+    assert {3, 4} <= set(select_spread(curves, 3).tolist())  # the two far curves, whatever starts
+    picks = select_spread(curves, 2, existing=curves[:3])
+    assert set(picks.tolist()) == {3, 4}
+
+
+def test_pighs_reaches_the_librarys_fast_end():
+    """Drawn directly, 60 PIGHS matched the canonical library's fastest curve at
+    R² ~0.67 (early peak, no delay, deep undershoot needs a lucky combination);
+    picked spread over a pool, ~0.87."""
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    lib, _ = build_shape_library("library", 0.1, 32.0)
+    pighs, _ = build_shape_library("pighs", 0.1, 32.0, n_hrfs=60)
+    best = ((_unit(lib) @ _unit(pighs).T).max(1)) ** 2
+    assert best.min() > 0.83 and np.median(best) > 0.9
+
+
+def test_blend_keeps_the_library_and_adds_what_it_misses():
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    lib, _ = build_shape_library("library", 0.1, 32.0)
+    blend, labels = build_shape_library("blend", 0.1, 32.0, n_hrfs=12)
+    assert blend.shape[0] == lib.shape[0] + 12 and labels[0] == "lib00" and labels[-1] == "pighs11"
+    np.testing.assert_allclose(blend[: lib.shape[0]], lib, atol=1e-6)
+    extra = _unit(blend[lib.shape[0] :])
+    # each added shape is one the library fits badly
+    assert ((extra @ _unit(lib).T).max(1) ** 2).max() < 0.8
+    again, _ = build_shape_library("blend", 0.1, 32.0, n_hrfs=12)
+    np.testing.assert_array_equal(blend, again)

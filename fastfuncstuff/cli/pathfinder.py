@@ -260,9 +260,12 @@ Notes:
     hrf_opts = parser.add_argument_group("HRF Library Options")
     hrf_opts.add_argument(
         "-hrf_mode",
-        choices=["library", "pighs"],
+        choices=["library", "pighs", "blend"],
         default="library",
-        help="HRF library type: 'library' (double-gamma) or 'pighs'. Default: library",
+        help="HRF library type: 'library' (the 20 double-gamma curves), 'pighs' "
+        "(-n_hrfs half-cosine shapes, spread over shape space), or 'blend' (the "
+        "library plus the -n_hrfs PIGHS shapes it matches worst: fast/thin, "
+        "slow/narrow, other undershoots). Default: library",
     )
     hrf_opts.add_argument(
         "-n_hrfs",
