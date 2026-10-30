@@ -18,6 +18,8 @@ import functools
 import importlib
 import re
 
+from fastfuncstuff.cli_help import spelling_variants
+
 # Stage key → the cli module whose parser owns that stage's flags.
 STAGE_TOOL: dict[str, str] = {
     "nordic": "nordic",
@@ -142,9 +144,13 @@ def check_opts(key: str, opts: str, module: str | None = None) -> list[str]:
     if parser is None:
         return []
     known = set(parser._option_string_actions)
+    # FfsArgumentParser adds each flag's -foo_bar/-foo-bar twin only at parse
+    # time, so an unparsed parser lists one spelling while the tool accepts both.
+    # Suggestions still come from `known`, which holds just the documented names.
+    accepted = known | {v for opt in known for v in spelling_variants(opt)}
     errors = []
     for token in opts.split():
-        if not _is_flag(token) or token in known:
+        if not _is_flag(token) or token in accepted:
             continue
         near = difflib.get_close_matches(token, known, n=3, cutoff=0.6)
         hint = f" — did you mean {', '.join(near)}?" if near else ""

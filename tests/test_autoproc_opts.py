@@ -148,6 +148,15 @@ def test_typo_is_caught_with_a_suggestion():
     assert "-nordic" in errs[0].split("did you mean")[1]
 
 
+def test_either_spelling_of_a_flag_passes():
+    """FfsArgumentParser accepts both separators, but only adds the twin at parse
+    time — the validator once rejected -gfactor_patch_overlap that ffs_nordic
+    would have taken (it registers -gfactor-patch-overlap)."""
+    assert optcheck.check_opts("nordic", "-gfactor_patch_overlap 6") == []
+    assert optcheck.check_opts("nordic", "-gfactor-patch-overlap 6") == []
+    assert optcheck.check_opts("nordic", "-gfactor_patch_overlapp 6") != []
+
+
 def test_negative_number_values_are_not_mistaken_for_flags():
     """Values may start with '-' (ranges like -0.9,0.9,65); AFNI-style
     digit-leading flags (-1Dfile) still get checked."""
