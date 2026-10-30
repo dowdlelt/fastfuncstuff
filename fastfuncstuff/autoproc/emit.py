@@ -3108,8 +3108,9 @@ def _stage_anat(plan: Plan) -> str:
         if not (plan.shared_anat or opt.ref_anat):
             out.append(_tpm_block(opt))
         if opt.ref_anat:
-            # The EPI landed on the ref, so its priors are the ref's posteriors.
-            tpm_src_path = tpm_src_path or _refanat_box()
+            # The EPI landed on the ref, so its priors are the ref's posteriors, on the
+            # ref grid — whatever -tpm_source (or -suma's SurfVol) the anat TPM had.
+            tpm_src_path = _refanat_box()
         elif opt.anat_tpm and not opt.fs_tpm:
             # The head is the image those priors were fitted to, so it is the
             # anat-in-EPI QC source that costs nothing extra to ask for.
@@ -3332,13 +3333,18 @@ def _stage_ref_anat(plan: Plan) -> str:
             f"{seg}\nfi"
         )
         if opt.anat_nonlin and opt.anat_nonlin_method == "segment":
-            # -V so c10 sorts after c9, as for the anat's own TPM.
+            # -V so c10 sorts after c9, as for the anat's own TPM. Only the TPM's own
+            # classes: a posterior beyond them is the background class ffs_segment
+            # synthesised (an FS TPM does not cover air), which the EPI fit adds back
+            # itself — kept, it would be a "real" class -ngaus does not describe.
             out.append(
                 f'[ -f "{_refanat_tpm()}" ] || {{\n  mkdir -p tpm_work\n'
+                f"  tpm_n=$(ffs_info -nv {tpm})\n"
                 + _ffs(
                     "ffs_util_3dmath",
                     [
-                        f"-input $(ls {_refanat_seg()}_c*.nii* | grep -E '_c[0-9]+\\.nii' | sort -V)",
+                        f"-input $(ls {_refanat_seg()}_c*.nii* | grep -E '_c[0-9]+\\.nii' "
+                        '| sort -V | head -n "$tpm_n")',
                         "-tcat",
                         f'-prefix "{_refanat_tpm()}"',
                         '-device "$DEVICE"',

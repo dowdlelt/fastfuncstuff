@@ -2458,6 +2458,27 @@ def test_ref_anat_is_what_the_epi_aligns_to_and_segments_against():
     assert '-matrix_base "stage09.refanat_brain.nii.gz"' in epi_seg
 
 
+def test_ref_anat_tpm_keeps_only_the_tpms_own_classes_on_the_ref_grid():
+    """Real-data bug: an FS TPM (8 classes, no air) makes the ref segment add a 9th,
+    background posterior; tcat'd whole, the EPI fit then saw 9 "real" classes and
+    refused -ngaus ×8. And -suma's SurfVol, the anat TPM's grid, is not the ref's."""
+    s = _skull_script(
+        anat_skull=True,
+        anat_nonlin=True,
+        tpm="/t/tpm.nii.gz",
+        tpm_source="/fs/SUMA/sub_SurfVol.nii",
+        ref_anat="/data/sub-X_acq-7T_T1w.nii.gz",
+    )
+    build = s[s.index('[ -f "tpm_work/refanat_TPM.nii.gz" ] ||') :]
+    build = build[: build.index('-prefix "tpm_work/refanat_TPM.nii.gz"')]
+    assert "tpm_n=$(ffs_info -nv /t/tpm.nii.gz)" in build
+    assert 'sort -V | head -n "$tpm_n"' in build
+    epi_seg = s[s.index('-prefix "stage09.nlanat.nii$FMT"') - 600 :]
+    epi_seg = epi_seg[: epi_seg.index('-prefix "stage09.nlanat.nii$FMT"')]
+    assert "-tpm_source stage09.refanat_autobox.nii.gz" in epi_seg
+    assert "SurfVol" not in epi_seg
+
+
 def test_ref_anat_keeps_the_anat_as_the_final_space():
     """Without anat_nl too: the anchor still has to go through the ref links, or
     the final grid would be cut from an image sitting on the ref."""
