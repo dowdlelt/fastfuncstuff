@@ -240,3 +240,72 @@ class TestCensoredXval:
 
         xw, _ = _whiten_per_run(xk, xk.clone(), [(0, 0, len(keep))], a, b, {}, tau=keep)
         torch.testing.assert_close(xw.T @ xw, expected)
+
+
+def test_spec_without_hrf_opt_scores_xval_r2(tmp_path):
+    """-spec alone compiles to an xmat, whose design info has only AFNI's stim
+    bots/tops; -xval_r2 once died there on a missing 'stim_indices'."""
+    import subprocess
+    import sys
+
+    import nibabel as nib
+    from scipy.stats import gamma
+
+    from fastfuncstuff.design.spec import EventSpec, MetaSpec, RunSpec, Spec, write_spec
+
+    nt, shape = 120, (4, 4, 4)
+    t = np.arange(0, 30, 0.1)
+    h = gamma.pdf(t, 6) - gamma.pdf(t, 16) / 6
+    rng = np.random.default_rng(0)
+    signal = np.zeros(shape, bool)
+    signal[:2] = True
+    for run in (1, 2):
+        on = np.cumsum(rng.uniform(5, 9, 20))
+        on = on[on < nt - 20]
+        (tmp_path / f"ev{run}.tsv").write_text(
+            "onset\tduration\ttrial_type\n" + "".join(f"{o:.1f}\t1\ta\n" for o in on)
+        )
+        box = np.zeros(nt * 10)
+        for o in on:
+            box[int(o * 10) : int(o * 10) + 10] = 1
+        x = np.convolve(box, h)[: nt * 10][::10]
+        data = 100 + rng.normal(0, 1, (*shape, nt))
+        data[signal] += 3 * x / x.max()
+        nib.save(nib.Nifti1Image(data.astype(np.float32), np.eye(4)), tmp_path / f"run{run}.nii.gz")
+    write_spec(
+        Spec(
+            meta=MetaSpec(
+                runs=[RunSpec(bold=f"run{r}.nii.gz", events=f"ev{r}.tsv") for r in (1, 2)],
+                tr=1.0,
+                n_timepoints_per_run=[nt, nt],
+            ),
+            events=[EventSpec(trial_type="a")],
+        ),
+        tmp_path / "design.toml",
+    )
+    res = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "fastfuncstuff.cli.reml",
+            "-input",
+            "run1.nii.gz",
+            "run2.nii.gz",
+            "-spec",
+            "design.toml",
+            "-Rbuck",
+            "r.nii.gz",
+            "-xval_r2",
+            "-device",
+            "cpu",
+        ],  # fmt: skip
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    out = list(tmp_path.glob("*xval_r2*.nii*"))
+    assert out, sorted(p.name for p in tmp_path.iterdir())
+    r2 = np.asarray(nib.load(out[0]).dataobj).squeeze()
+    assert np.median(r2[signal]) > 0.2 > np.median(r2[~signal])

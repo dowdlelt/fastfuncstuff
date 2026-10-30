@@ -1291,8 +1291,19 @@ def _run_condition_xval(
     data = data.float()
 
     design = np.asarray(design_info["matrix"], dtype=np.float32)
-    stim_indices = list(design_info["stim_indices"])
-    nuisance_indices = list(design_info["nuisance_indices"])
+    if "stim_indices" in design_info:
+        stim_indices = list(design_info["stim_indices"])
+        nuisance_indices = list(design_info["nuisance_indices"])
+    else:
+        # A design read back from an xmat (-matrix, or -spec without -hrf_opt,
+        # which compiles to one) carries only AFNI's stim bots/tops.
+        bots, tops = design_info.get("stim_bots") or [], design_info.get("stim_tops") or []
+        stim_indices = [i for b, t in zip(bots, tops, strict=True) for i in range(b, t + 1)]
+        if not stim_indices:
+            print("  ⚠️  -xval_r2: the design names no stimulus columns; skipped.")
+            return []
+        stim_set = set(stim_indices)
+        nuisance_indices = [i for i in range(design.shape[1]) if i not in stim_set]
 
     # (voxel mask, design) pairs; one pair covering every voxel unless per-HRF.
     groups: list = [(None, design)]
