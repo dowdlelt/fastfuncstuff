@@ -227,7 +227,7 @@ def test_spec_gives_the_events_fit_and_splits_its_contrasts(tmp_path):
     np.testing.assert_allclose(con, a, atol=1e-4)
 
 
-@pytest.mark.slow  # 20s
+@pytest.mark.slow  # 31s
 def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
     """A volume label map (+x half = 1, -x/+y quarter = 2) as units: every ribbon voxel
     of an ROI shares one library entry, -atlas_only leaves the rest uncovered, the
@@ -258,7 +258,7 @@ def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
         )
         assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
 
-    run("-atlas_only", "-prefix", "roi")
+    run("-atlas_only", "-roi_lag", "-depths", "3", "-prefix", "roi")
     index = np.asanyarray(nib.load(tmp_path / "roi_hrf_index.nii.gz").dataobj)[..., 0]
     for r in (1, 2):
         got = index[ribbon & (lab == r)]
@@ -317,6 +317,27 @@ def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
         rows = sorted((t for t in table if t["roi"] == r), key=lambda t: int(t["depth"]))
         late = [float(t["a_late#0_Coef"]) / (abs(float(t["a_early#0_Coef"])) + abs(float(t["a_late#0_Coef"]))) for t in rows]  # fmt: skip
         assert late[0] < late[1] < late[2] and late[2] - late[0] > 0.4
+
+    # -roi_lag: the ROI x depth means are later toward pial, by about the simulated
+    # 1.2 s over the ribbon (bin centres 1/6 .. 5/6 -> ~0.8 s); one PNG, the best ROI.
+    depth = list(csv.DictReader(open(tmp_path / "roi_roi_depth.tsv"), delimiter="\t"))
+    assert len(depth) == 6 and len(list(tmp_path.glob("roi_roi_depth_*.png"))) == 1
+    for r in ("1", "2"):
+        lags = [float(t["lag"]) for t in sorted((t for t in depth if t["roi"] == r), key=lambda t: int(t["depth"]))]  # fmt: skip
+        assert lags[0] < lags[1] < lags[2] and 0.6 < lags[2] - lags[0] < 1.0
+    # -pair_from depth sets each pair from its deepest and outermost rows
+    run("-atlas_only", "-roi_lag", "-depths", "3", "-pair_from", "depth", "-prefix", "dep")
+    deep = {t["roi"]: float(t["lag"]) for t in depth if t["depth"] == "1"}
+    rows = list(csv.DictReader(open(tmp_path / "dep_roi.tsv"), delimiter="\t"))
+    for row in rows:
+        assert float(row["early_lag"]) == pytest.approx(deep[row["roi"]], abs=0.11)
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.hrftdv_plot", "-prefix", "roi", "-reml",
+         "r_roi.tsv", "-rois", "atlas_2", "-out_dir", "plots"],  # fmt: skip
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp_path,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-2000:]
+    assert [p.name for p in (tmp_path / "plots").iterdir()] == ["roi_roi_depth_atlas_2_lh.png"]
 
     run("-atlas_unit", "patch", "-patch_mm", "6", "-prefix", "patch")
     rows = list(csv.DictReader(open(tmp_path / "patch_roi.tsv"), delimiter="\t"))

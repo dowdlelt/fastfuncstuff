@@ -27,7 +27,7 @@ from fastfuncstuff.cli_utils import (
     add_round_onsets_arguments,
     add_verbose_arg,
 )
-from fastfuncstuff.surface.ribbon_args import add_ribbon_args
+from fastfuncstuff.surface.ribbon_args import add_depth_args, add_ribbon_args
 
 _EPILOG = """\
 what it does
@@ -69,6 +69,9 @@ outputs
   {prefix}_pairs.tsv           one row per library entry
   {prefix}_roi.tsv             with -atlas: one row per ROI (its pair, curve timing,
                                voxel and responsive counts)
+  {prefix}_roi_depth.tsv       with -roi_lag: one row per ROI per depth (lag, width,
+                               R², peak, FWHM, per-run lags), and one PNG of the
+                               best-fit ROI (more: python -m fastfuncstuff.cli.hrftdv_plot)
   {prefix}_metadata.json
 
   lag is relative to the unit curve's peak (s); rel_lag subtracts the unit's
@@ -184,19 +187,30 @@ def create_parser() -> FfsArgumentParser:
         "the entry closest to canonical)",
     )
     atlas.add_argument(
-        "-roi_claim",
-        choices=["any", "mid"],
-        default="any",
-        help="How a volume ROI claims a column: any = it covers the column at any depth "
-        "(a blob in the outer third still counts); mid = at the midthickness point",
-    )
-    atlas.add_argument(
         "-roi_hemi",
         choices=["auto", "split", "major", "both"],
         default="auto",
         help="An ROI with columns on both hemispheres: split into one per hemisphere, "
         "keep the major side, or keep both as one unit (auto: split when the smaller "
         "side has a third of the columns)",
+    )
+    add_depth_args(atlas, ribbon=False)
+    atlas.add_argument(
+        "-roi_lag",
+        action="store_true",
+        help="Also fit lag and width on each ROI x depth mean (-depths N), against its "
+        "ROI's column curve, on all runs and on each run alone: the best-SNR measure of "
+        "how timing changes through cortex. Writes {prefix}_roi_depth.tsv and a plot of "
+        "the best-fit ROI",
+    )
+    atlas.add_argument(
+        "-pair_from",
+        choices=["percentiles", "depth"],
+        default="percentiles",
+        help="Where an ROI's early/late pair comes from. percentiles: its voxels' lags "
+        "(-percentiles). depth: the -roi_lag fit of its deepest and outermost depth rows, "
+        "anchoring the split on anatomy. Experimental; an ROI whose outer row is not "
+        "later than its deep row keeps its percentile pair",
     )
 
     model = parser.add_argument_group("HRF and timing")
@@ -287,6 +301,7 @@ def create_parser() -> FfsArgumentParser:
     add_ortvec_arguments(nuis)
     add_device_arg(nuis)
     add_verbose_arg(nuis)
+    parser.set_defaults(roi_claim="any")
     return parser
 
 
@@ -363,6 +378,136 @@ def _write_roi_table(
     return str(path)
 
 
+def _fit_roi_depth(
+    args, surfaces, affine, shape, analysed, y, unit_of, res, shapes, design_for, project,
+    grid, dt, run_starts, device, verbose,
+) -> dict:  # fmt: skip
+    """ROI x depth means of the projected data, each fit for lag and width (-roi_lag)."""
+    import torch
+
+    from fastfuncstuff.processing import hrftdv as tdv
+    from fastfuncstuff.processing.roi_depth import (
+        build_depth_roi_sets,
+        depth_list,
+        options_from_args,
+    )
+
+    try:
+        (rs,) = build_depth_roi_sets(
+            args.atlas, surfaces, affine, shape, analysed.reshape(shape),
+            options_from_args(args), depth_list(args), device=device,
+        )  # fmt: skip
+    except (OSError, ValueError) as exc:
+        sys.exit(f"ERROR: -roi_lag: {exc}")
+    vox = np.flatnonzero(analysed)
+    pos = np.searchsorted(vox, np.flatnonzero(rs.rows.reshape(-1)))
+    y_rows = rs.collapse(y[:, torch.as_tensor(pos)].T.contiguous()).T.float()
+    row_unit, share = rs.dominant(unit_of[pos])
+    unit_shape = np.zeros(len(res.pairs), np.int64)
+    unit_shape[res.unit] = res.shape
+    row_shape = unit_shape[row_unit]
+    lags = tdv.fit_row_lags(
+        y_rows, row_shape, shapes, design_for, project, grid, dt, run_starts, device
+    )
+    if verbose:
+        print(
+            f"  ROI x depth lags: {rs.n_rois} rows, median R² {np.nanmedian(lags.r2):.2f}, "
+            f"{int(lags.at_bound.sum())} at the lag bound"
+        )
+    return {"set": rs, "unit": row_unit, "share": share, "shape": row_shape, "lags": lags}
+
+
+def _roi_keys(rs) -> list[tuple]:
+    """(roi id, hemi) of every row of a depth-sampled set."""
+    hemi = rs.index.get("hemi", [""] * rs.n_rois)
+    return list(zip(rs.ids, hemi, strict=True))
+
+
+def _pairs_from_depth(rd, res, shapes, dt, lag_step, grid, verbose):
+    """-pair_from depth: each ROI's pair from its deepest and outermost depth rows."""
+    from fastfuncstuff.processing import hrftdv as tdv
+
+    rs, lags = rd["set"], rd["lags"]
+    depth = np.asarray(rs.index["depth"]).astype(int)
+    keys = _roi_keys(rs)
+    overrides, kept = {}, []
+    for key in dict.fromkeys(keys):
+        rows = [i for i, k in enumerate(keys) if k == key]
+        deep = min(rows, key=lambda i: depth[i])
+        outer = max(rows, key=lambda i: depth[i])
+        unit = int(rd["unit"][deep])
+        ok = (
+            rd["unit"][outer] == unit
+            and min(rd["share"][deep], rd["share"][outer]) >= 0.9
+            and not (lags.at_bound[deep] or lags.at_bound[outer])
+            and lags.lag[outer] > lags.lag[deep]
+        )
+        if not ok:
+            kept.append(rs.names[deep])
+            continue
+        overrides[unit] = tdv.ColumnPair(
+            float(lags.lag[deep]), float(lags.lag[outer]),
+            float(lags.width[deep]), float(lags.width[outer]),
+            res.pairs[unit].n_voxels,
+        )  # fmt: skip
+    if verbose:
+        print(f"  Pairs from depth: {len(overrides)} ROI(s) set by their deepest/outermost rows")
+        if kept:
+            more = ", ..." if len(kept) > 5 else ""
+            print(
+                f"  ⚠️  {len(kept)} kept their percentile pair (outer row not later, at the "
+                f"lag bound, or not one unit): {', '.join(kept[:5])}{more}"
+            )
+    return tdv.override_pairs(res, overrides, shapes, dt, lag_step, grid.widths)
+
+
+def _write_roi_depth(stem, rd, res, shapes, dt) -> list[str]:
+    """{stem}.tsv, one row per ROI x depth, and a PNG of the best-fit ROI."""
+    from fastfuncstuff.processing.hrftdv import curve_peak_fwhm, stretch_shift
+
+    rs, lags = rd["set"], rd["lags"]
+    timing = np.array([
+        curve_peak_fwhm(stretch_shift(shapes[s], dt, lg, w), dt)
+        if np.isfinite(lg) else (np.nan, np.nan)
+        for s, lg, w in zip(rd["shape"], lags.lag, lags.width, strict=True)
+    ])  # fmt: skip
+    pairs = [res.pairs[u] for u in rd["unit"]]
+    columns = {
+        "unit_share": rd["share"],
+        "lag": lags.lag,
+        "width": lags.width,
+        "r2": lags.r2,
+        "at_bound": lags.at_bound.astype(float),
+        "peak_s": timing[:, 0],
+        "fwhm_s": timing[:, 1],
+        "shape": rd["shape"].astype(float),
+        "pair_early_lag": np.array([p.early_lag for p in pairs]),
+        "pair_late_lag": np.array([p.late_lag for p in pairs]),
+        "pair_early_width": np.array([p.early_width for p in pairs]),
+        "pair_late_width": np.array([p.late_width for p in pairs]),
+        "lag_run_sd": np.nanstd(lags.run_lag, axis=1),
+        "lag_run": lags.run_lag,
+    }
+    return [rs.write_table(f"{stem}.tsv", columns)]
+
+
+def _plot_best_roi(prefix: str, rd) -> list[str]:
+    """The sanity-check plot: the ROI whose depth rows fit best (mean R²)."""
+    keys = _roi_keys(rd["set"])
+    r2 = rd["lags"].r2
+
+    def score(k):
+        return float(np.nanmean([r2[i] for i, kk in enumerate(keys) if kk == k]))
+
+    best = max(dict.fromkeys(keys), key=score)
+    try:
+        from fastfuncstuff.cli.hrftdv_plot import plot_from_files
+
+        return plot_from_files(prefix, [best])
+    except ImportError:  # no matplotlib: the table is the result
+        return []
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = create_parser()
     if argv is None and len(sys.argv) == 1:
@@ -426,6 +571,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("ERROR: -durations is required with -onsets")
     if args.fs_subj is None and not (args.white_mesh and args.pial_mesh):
         sys.exit("ERROR: give -fs_subj, or -white_mesh and -pial_mesh")
+    if (args.roi_lag or args.pair_from == "depth") and not args.atlas:
+        sys.exit("ERROR: -roi_lag and -pair_from depth fit ROI x depth means: give -atlas")
+    if len(args.depths) != 1:
+        sys.exit("ERROR: -depths takes one count here")
+    if args.pair_from == "depth" and (args.depths[0] < 2 or args.atlas_unit != "roi"):
+        sys.exit("ERROR: -pair_from depth needs -depths 2 or more and -atlas_unit roi")
 
     input_files = parse_input_files(args.input)
     try:
@@ -633,6 +784,15 @@ def main(argv: list[str] | None = None) -> None:
         verbose=verbose,
     )
 
+    roi_depth = None
+    if args.roi_lag or args.pair_from == "depth":
+        roi_depth = _fit_roi_depth(
+            args, surfaces, affine, shape, analysed, y, unit_of, res, shapes, design_for,
+            project, grid, dt, run_starts, device, verbose,
+        )  # fmt: skip
+        if args.pair_from == "depth":
+            res = _pairs_from_depth(roi_depth, res, shapes, dt, args.pair_step, grid, verbose)
+
     # -- outputs
     vox = np.flatnonzero(analysed)
 
@@ -691,6 +851,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         if verbose:
             print(f"  Wrote {path}")
+    if roi_depth is not None:
+        for path in _write_roi_depth(f"{pfx.stem}_roi_depth", roi_depth, res, shapes, dt):
+            if verbose:
+                print(f"  Wrote {path}")
     meta = {
         "tool": "ffs_hrftdv",
         "microtime_dt": dt,
@@ -713,6 +877,9 @@ def main(argv: list[str] | None = None) -> None:
         "tile_mm": args.tile_mm,
         "atlas": args.atlas,
         "atlas_unit": args.atlas_unit if args.atlas else None,
+        "roi_lag": bool(args.roi_lag),
+        "pair_from": args.pair_from,
+        "depths": list(args.depths) if roi_depth is not None else None,
         "roi_claim": args.roi_claim if args.atlas else None,
         "p_thresh": args.p_thresh,
         "screen": args.screen,
@@ -730,10 +897,16 @@ def main(argv: list[str] | None = None) -> None:
             "hrf_index": torch.as_tensor(res.voxel_entry),
             "metadata": meta,
             "duration_convolved": False,
+            # The unit curves the pairs are shifted from, for plots of them.
+            "unit_shapes": torch.as_tensor(shapes, dtype=torch.float32),
         },
         f"{pfx.stem}_hrf_library.pt",
     )
     Path(f"{pfx.stem}_metadata.json").write_text(json.dumps(meta, indent=2, default=str))
+    if roi_depth is not None:
+        for path in _plot_best_roi(pfx.stem, roi_depth):
+            if verbose:
+                print(f"  Wrote {path}  (more ROIs: python -m fastfuncstuff.cli.hrftdv_plot)")
 
     dsort_files: list[str] = []
     if args.pooled_late:

@@ -45,13 +45,15 @@ def add_ribbon_args(group, *, hemi: bool = True) -> None:
     )
 
 
-def add_depth_args(group, *, interp: bool = True) -> None:
+def add_depth_args(group, *, interp: bool = True, ribbon: bool = True) -> None:
     """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_smooth -depth_interp``.
 
     Giving surfaces is what switches depth sampling on: the ROI means are then read
     along the cortical ribbon, one per ROI per depth, instead of over ROI voxels.
+    ``ribbon=False`` adds only the depth flags, for a tool that has its own surfaces.
     """
-    add_ribbon_args(group, hemi=False)
+    if ribbon:
+        add_ribbon_args(group, hemi=False)
     group.add_argument(
         "-depths",
         type=int,

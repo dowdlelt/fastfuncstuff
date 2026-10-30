@@ -313,3 +313,46 @@ def test_atlas_labels_make_rois_units_and_keep_the_rest_as_patches():
     # ROI 0 spans patches 0 and 1 -> two units; ROI 1 only patch 1 -> one
     assert p.n_roi_units == 3 and list(p.unit_roi) == [0, 0, 1]
     assert (p.label[4:] == -1).all()
+
+
+def test_fit_row_lags_recovers_each_rows_lag_overall_and_per_run():
+    T, n_runs = 200, 2
+    h = _hrf()
+    build = _design_for(_events(n_runs, T, seed=9), T)
+    project, _, starts = _projector(n_runs, T)
+    rng = np.random.default_rng(4)
+    lags = np.array([-0.8, 0.0, 0.7])
+    ys = [build(tdv.stretch_shift(h, DT, lag, 1.0)).numpy() @ np.array([1.0, 0.6])
+          + 0.02 * rng.standard_normal(T * n_runs) for lag in lags]  # fmt: skip
+    y = project(torch.as_tensor(np.stack(ys, 1))[None])[0].float()
+    grid = tdv.LagGrid.make(2.0, 0.1, (1.0,))
+    out = tdv.fit_row_lags(y, np.zeros(3, int), h[None], build, project, grid, DT, starts, CPU)
+    np.testing.assert_allclose(out.lag, lags, atol=0.06)
+    np.testing.assert_allclose(out.run_lag, np.repeat(lags[:, None], n_runs, 1), atol=0.1)
+    assert not out.at_bound.any() and (out.r2 > 0.9).all()
+
+
+def test_override_pairs_rebuilds_the_library_for_the_units_given():
+    h = _hrf()
+    res = tdv.TdvResult(
+        unit=np.array([0, 0, 1, 1]),
+        unit_kind=np.zeros(2, int),
+        shape=np.zeros(4, int),
+        fit=tdv.LagFit(np.zeros(4), np.ones(4), np.ones(4), np.zeros(4, bool)),
+        rel_lag=np.zeros(4),
+        responsive=np.ones(4, bool),
+        screen_r2=np.ones(4),
+        pairs=[tdv.ColumnPair(-0.4, 0.4, 1.0, 1.0, 2)] * 2,
+        library=tdv.build_pair_library(h[None], np.zeros(2, int),
+                                       [tdv.ColumnPair(-0.4, 0.4, 1.0, 1.0, 2)] * 2, DT, 0.2, (1.0,)),
+    )  # fmt: skip
+    new = tdv.override_pairs(
+        res, {1: tdv.ColumnPair(-1.0, 1.2, 1.0, 1.0, 2)}, h[None], DT, 0.2, (1.0,)
+    )
+    assert new.library.curves.shape[0] == 2
+    e0, e1 = new.library.entries[new.voxel_entry[0]], new.library.entries[new.voxel_entry[2]]
+    assert (
+        e0[1] == pytest.approx(-0.4)
+        and e1[1] == pytest.approx(-1.0)
+        and e1[2] == pytest.approx(1.2)
+    )

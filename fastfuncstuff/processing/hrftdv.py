@@ -36,7 +36,7 @@ profile of the early betas, at a real cost in sensitivity (VIF ~10).
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -766,3 +766,65 @@ def fit_hrftdv(
         library=library,
         voxel_entry=library.index[unit],
     )
+
+
+@dataclass
+class RowLags:
+    lag: np.ndarray  # (R,) s, relative to the row's unit curve peak
+    width: np.ndarray  # (R,)
+    r2: np.ndarray  # (R,)
+    at_bound: np.ndarray  # (R,) bool
+    run_lag: np.ndarray  # (R, n_runs): the same fit on each run alone
+
+
+def fit_row_lags(
+    y_rows: Tensor,
+    row_shape: np.ndarray,
+    shapes: np.ndarray,
+    design_for: Callable[[np.ndarray], Tensor],
+    project: Callable[[Tensor], Tensor],
+    grid: LagGrid,
+    dt: float,
+    run_starts: Sequence[int],
+    device: torch.device,
+) -> RowLags:
+    """Step 3 on ROI x depth means: each row's (width, lag) against its unit's curve.
+
+    ``y_rows`` is ``(T, R)``, nuisance-projected like the voxels.  An ROI mean has the
+    SNR a single voxel never does, so this is where lag is best measured; fitting
+    each run alone as well gives the spread a depth profile should be read against.
+    """
+    R = y_rows.shape[1]
+    T = y_rows.shape[0]
+    bounds = [*run_starts, T]
+    out = RowLags(np.full(R, np.nan), np.full(R, np.nan), np.full(R, np.nan),
+                  np.zeros(R, bool), np.full((R, len(run_starts)), np.nan))  # fmt: skip
+    for s in np.unique(row_shape):
+        sel = np.flatnonzero(row_shape == s)
+        designs = project(
+            as_bank(design_for(lag_width_bank(shapes[int(s)], dt, grid)), grid.n).to(device)
+        )
+        part = fit_lag_width(y_rows[:, sel], bank_q(designs), grid, device)
+        out.lag[sel], out.width[sel], out.r2[sel], out.at_bound[sel] = (
+            part.lag, part.width, part.r2, part.at_bound,
+        )  # fmt: skip
+        for r, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            one = fit_lag_width(y_rows[a:b, sel], bank_q(designs[:, a:b, :]), grid, device)
+            out.run_lag[sel, r] = one.lag
+    return out
+
+
+def override_pairs(
+    res: TdvResult,
+    overrides: dict[int, ColumnPair],
+    shapes: np.ndarray,
+    dt: float,
+    lag_step: float,
+    widths: Sequence[float],
+) -> TdvResult:
+    """``res`` with the pairs of the units in ``overrides`` replaced and the library rebuilt."""
+    pairs = [overrides.get(u, p) for u, p in enumerate(res.pairs)]
+    unit_shape = np.zeros(len(pairs), np.int64)
+    unit_shape[res.unit] = res.shape
+    library = build_pair_library(shapes, unit_shape, pairs, dt, lag_step, widths)
+    return replace(res, pairs=pairs, library=library, voxel_entry=library.index[res.unit])
