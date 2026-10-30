@@ -100,6 +100,15 @@ def add_depth_args(group, *, interp: bool = True) -> None:
         "per column, but noisier depths); more pools across neighbours, which cuts noise but "
         "blurs across abrupt folding (outer bin ~5%% light at 2 rounds on real cortex)",
     )
+    group.add_argument(
+        "-roi_claim",
+        choices=("mid", "any"),
+        default="mid",
+        help="How a volume ROI claims a cortical column: mid = the ROI holds the column's "
+        "midthickness point; any = it covers the column at any depth, so a blob in the "
+        "outer third still claims it. Match ffs_hrftdv -atlas (default any) when fitting "
+        "its pairs",
+    )
     if not interp:  # the tool reads through its own transform chain, with its own -interp
         return
     group.add_argument(

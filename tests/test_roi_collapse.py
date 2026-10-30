@@ -180,3 +180,25 @@ def test_freesurfer_label_and_annot(tmp_path, lh_data):
     nfs.write_annot(str(tmp_path / "lh.aparc.annot"), annot_lab, ctab, ["unknown", "V1", "MT"])
     roi = _surface_set(str(tmp_path / "lh.aparc.annot"), lh_data)
     assert roi.names == ["V1", "MT"] and roi.sizes.tolist() == [4.0, 10.0]
+
+
+def test_dominant_label_and_its_share_per_roi(labels, tmp_path):
+    """Label map: ROI 3 is uniformly entry 5, ROI 7 is 4:2 entries 1:2. A weighted
+    4-D set shifts the winner when the weights do."""
+    roi = build_roi_set(labels, SHAPE)
+    lab = np.zeros(SHAPE, np.int64)
+    lab[:2, :, 0] = 5
+    lab[2:, :2, 0] = 1
+    lab[2:, 2, 0] = 2
+    best, share = roi.dominant(lab[roi.rows])
+    assert list(best) == [5, 1]
+    np.testing.assert_allclose(share, [1.0, 4 / 6])
+    w = np.zeros((*SHAPE, 2), np.float32)
+    w[2:, :2, 0, 0] = 0.1
+    w[2:, 2, 0, 0] = 1.0
+    w[:2, :, 0, 1] = 1.0
+    wroi = build_roi_set(_save(tmp_path, "w.nii.gz", w), SHAPE)
+    best, share = wroi.dominant(lab[wroi.rows])
+    assert list(best) == [2, 5] and share[0] == pytest.approx(2 / 2.4)
+    with pytest.raises(ValueError, match=">= 0"):
+        roi.dominant(np.full(roi.n_rows, -1))

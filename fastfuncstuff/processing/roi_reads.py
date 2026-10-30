@@ -174,7 +174,7 @@ def plan_depth_reads_multi(
     ks = sorted({int(k) for k in depths})
     k_max = ks[-1]
     notes: list[str] = []
-    rois = rd.read_depth_rois(files, surfaces, notes)
+    rois = rd.read_depth_rois(files, surfaces, notes, opts.claim_fracs)
     rd._check_options(opts)
     step = opts.dxyz or voxel_size
     cap = int(max_reads) if max_reads else default_max_reads(device)

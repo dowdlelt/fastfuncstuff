@@ -227,11 +227,12 @@ def test_spec_gives_the_events_fit_and_splits_its_contrasts(tmp_path):
     np.testing.assert_allclose(con, a, atol=1e-4)
 
 
-@pytest.mark.slow  # 13s
+@pytest.mark.slow  # 20s
 def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
     """A volume label map (+x half = 1, -x/+y quarter = 2) as units: every ribbon voxel
     of an ROI shares one library entry, -atlas_only leaves the rest uncovered, the
-    table's pair is early < late, and -atlas_unit patch splits an ROI into patches."""
+    table's pair is early < late, ffs_reml fits ROI x depth means with those pairs, and
+    -atlas_unit patch splits an ROI into patches."""
     import csv
 
     ribbon, _ = _write(tmp_path)
@@ -272,6 +273,50 @@ def test_atlas_units_give_one_pair_per_roi_and_a_table(tmp_path):
         assert row["n_units"] == "1" and row["n_fallback"] == "0"
         assert float(row["early_lag"]) < 0 < float(row["late_lag"])
         assert float(row["early_peak_s"]) < float(row["column_peak_s"]) < float(row["late_peak_s"])
+
+    # ffs_reml fits the ROI x depth means with each ROI's own pair: the late share
+    # rises toward pial, as the lag does.
+    res = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "fastfuncstuff.cli.reml",
+            "-input",
+            "run1.nii.gz",
+            "run2.nii.gz",
+            "-events",
+            "ev1.tsv",
+            "ev2.tsv",
+            "-TR",
+            "1",
+            "-device",
+            "cpu",
+            "-atlas",
+            "atlas.nii.gz",
+            "-roi_claim",
+            "any",
+            "-fs_subj",
+            str(subj),
+            "-depths",
+            "3",
+            "-hrf_opt",
+            "roi",
+            "-Rbuck",
+            "r",
+        ],  # fmt: skip
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    assert "median share 1.00" in res.stdout
+    table = list(csv.DictReader(open(tmp_path / "r_roi.tsv"), delimiter="\t"))
+    assert len(table) == 6
+    for r in ("1", "2"):
+        rows = sorted((t for t in table if t["roi"] == r), key=lambda t: int(t["depth"]))
+        late = [float(t["a_late#0_Coef"]) / (abs(float(t["a_early#0_Coef"])) + abs(float(t["a_late#0_Coef"]))) for t in rows]  # fmt: skip
+        assert late[0] < late[1] < late[2] and late[2] - late[0] > 0.4
 
     run("-atlas_unit", "patch", "-patch_mm", "6", "-prefix", "patch")
     rows = list(csv.DictReader(open(tmp_path / "patch_roi.tsv"), delimiter="\t"))

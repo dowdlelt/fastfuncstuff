@@ -295,6 +295,38 @@ class RoiSet:
         div = self.sizes if self.divisor is None else self.divisor
         return collapse_to_rois(data, self.spec, div, device=device)
 
+    def dominant(self, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Each ROI's commonest of the per-voxel ``labels`` ``(n_rows,)`` ints >= 0, by weight.
+
+        Returns ``(label, share)`` per ROI, ``share`` being the weight fraction the
+        winner holds -- 1 where every voxel of the ROI carries the same label (an
+        ``ffs_hrftdv -atlas`` index), less where the ROI averages over several.
+        """
+        labels = np.asarray(labels, np.int64).reshape(-1)
+        if labels.size != self.n_rows:
+            raise ValueError(f"{labels.size} labels for {self.n_rows} voxel rows")
+        if labels.size and labels.min() < 0:
+            raise ValueError("labels must be >= 0")
+        if sp.issparse(self.spec):
+            w = sp.csr_matrix(self.spec)
+        elif self.spec.ndim == 1:
+            j = np.flatnonzero(self.spec >= 0)
+            w = sp.csr_matrix(
+                (np.ones(j.size), (self.spec[j], j)), shape=(self.n_rois, self.n_rows)
+            )
+        else:
+            w = sp.csr_matrix(np.asarray(self.spec, np.float64))
+        n_lab = int(labels.max()) + 1 if labels.size else 1
+        onehot = sp.csr_matrix(
+            (np.ones(labels.size), (np.arange(labels.size), labels)), shape=(labels.size, n_lab)
+        )
+        mass = (w @ onehot).toarray()  # (n_rois, n_labels)
+        total = mass.sum(1)
+        best = mass.argmax(1)
+        share = np.divide(mass[np.arange(mass.shape[0]), best], total, where=total > 0,
+                          out=np.zeros(mass.shape[0]))  # fmt: skip
+        return best, share
+
     def paint(self, values: Tensor | np.ndarray, fill: float = 0.0) -> np.ndarray:
         """``(n_rois, ...)`` -> ``(n_rows, ...)``, every voxel carrying its ROI's value."""
         return paint_rois_to_voxels(values, self.spec, self.n_rows, fill=fill)

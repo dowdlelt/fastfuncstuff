@@ -46,6 +46,13 @@ class DepthOptions:
     smooth: int = 1
     #: How each read interpolates the data grid (:data:`READ_KERNELS`).
     interp: str = "cubic"
+    #: How a volume ROI claims a column: ``mid`` (its midthickness point) or ``any``
+    #: (the ROI covers it at any depth).
+    claim: str = "mid"
+
+    @property
+    def claim_fracs(self) -> tuple[float, ...]:
+        return CLAIM_ANY if self.claim == "any" else CLAIM_MID
 
 
 @dataclass
@@ -404,6 +411,8 @@ def _check_options(opts: DepthOptions) -> None:
         raise ValueError(f"depth method must be equidistant or equivolume, not {opts.method!r}")
     if opts.interp not in READ_KERNELS:
         raise ValueError(f"read interpolation must be one of {READ_KERNELS}, not {opts.interp!r}")
+    if opts.claim not in ("mid", "any"):
+        raise ValueError(f"-roi_claim must be mid or any, not {opts.claim!r}")
 
 
 def read_depth_rois(
@@ -602,7 +611,7 @@ def build_depth_roi_sets(
     aff = np.asarray(data_affine, np.float64)
     mask3 = None if mask is None else np.asarray(mask).astype(bool).reshape(shape3)
     notes: list[str] = []
-    rois = read_depth_rois(files, surfaces, notes)
+    rois = read_depth_rois(files, surfaces, notes, opts.claim_fracs)
     step = opts.dxyz or default_step(aff)
     plans = plan_depth_multi(rois, surfaces, step, opts, depths, device=device)
     cells = plans[0].cells
@@ -796,7 +805,7 @@ def depth_sampling_multi(
     _check_options(opts)
     shape3 = tuple(int(n) for n in data_shape[:3])
     aff = np.asarray(data_affine, np.float64)
-    rois = read_depth_rois(files, surfaces, [])
+    rois = read_depth_rois(files, surfaces, [], opts.claim_fracs)
     step = opts.dxyz or default_step(aff)
     plans = plan_depth_multi(
         rois, surfaces, step, opts, depths, halo_mm=psf_halo_mm(opts.interp, default_step(aff)),
@@ -908,6 +917,7 @@ def options_from_args(args) -> DepthOptions:
         dxyz=args.depth_dxyz,
         interp=str(getattr(args, "depth_interp", "cubic")),
         smooth=int(getattr(args, "depth_smooth", 1)),
+        claim=str(getattr(args, "roi_claim", "mid")),
     )
 
 

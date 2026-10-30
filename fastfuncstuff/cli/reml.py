@@ -1988,8 +1988,6 @@ _ROI_INCOMPATIBLE = {
     "save_mask": "-save_mask",
     "save_runmask": "-save_runmask",
     "save_dofloss": "-save_dofloss",
-    "hrfopt_prefix": "-hrfopt_prefix",
-    "hrf_opt": "-hrf_opt",
     "cache": "-cache",
     "test": "-test",
     "Obuck": "-Obuck",
@@ -2054,6 +2052,31 @@ def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_pat
         print(f"   {line}")
     series = roi_set.collapse(torch.from_numpy(data[roi_set.rows.reshape(-1)])).numpy()
     return roi_set, series.reshape(roi_set.n_rois, 1, 1, series.shape[1])
+
+
+def _roi_hrf_indices(roi_set, hrf_indices):
+    """Per-voxel HRF indices -> one per ROI row: the entry holding most of its weight.
+
+    Exact for ``ffs_hrftdv -atlas`` (every voxel of an ROI shares its pair); for any
+    other index an ROI row averages voxels fit with different curves, so say how
+    mixed the rows are.
+    """
+    import torch
+
+    flat = np.asarray(hrf_indices.detach().cpu()).reshape(-1)
+    best, share = roi_set.dominant(flat[roi_set.rows.reshape(-1)])
+    mixed = np.flatnonzero(share < 0.9)
+    print(
+        f"  Per-ROI HRF: each of {roi_set.n_rois} rows takes its dominant library entry "
+        f"({len(np.unique(best))} distinct; median share {np.median(share):.2f})"
+    )
+    if mixed.size:
+        names = ", ".join(roi_set.names[i] for i in mixed[:5]) + (", ..." if mixed.size > 5 else "")
+        print(
+            f"  ⚠️  {mixed.size} row(s) hold under 90% of one entry ({names}): their mean mixes "
+            "voxels fit with other curves. ffs_hrftdv -atlas on the same files gives one per ROI."
+        )
+    return torch.as_tensor(best, dtype=hrf_indices.dtype)
 
 
 def _roi_rows(values, voxel_mask, n_rois: int) -> torch.Tensor:
@@ -3882,6 +3905,8 @@ def main():
             roi_set, fmri_data_preprocessed = _collapse_preprocessed_to_rois(
                 args, fmri_data_preprocessed, volume_shape, roi_geometry, input_files[0], device
             )
+            if locals().get("hrf_indices_obj") is not None:
+                hrf_indices_obj = _roi_hrf_indices(roi_set, hrf_indices_obj)
             # The fit sees a (n_rois, 1, 1) grid with no mask: x is the ROI index.
             volume_shape = fmri_data_preprocessed.shape[:3]
             preproc_cached_metadata = {"affine": np.eye(4), "volume_shape": volume_shape}

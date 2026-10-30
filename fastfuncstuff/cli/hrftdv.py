@@ -167,7 +167,8 @@ def create_parser() -> FfsArgumentParser:
         "mask, a 4-D stack) claim the columns they touch; surface ROIs (.label.gii, "
         ".label, .annot) name them. A voxel joins the ROI owning its column (the first "
         "listed where ROIs overlap), so every pair is an ROI's. Writes {prefix}_roi.tsv. "
-        "For ROI x depth early/late betas, give the same files to ffs_reml -atlas",
+        "For ROI x depth early/late betas: ffs_reml -atlas (same files) -roi_claim any "
+        "-fs_subj ... -depths N -hrf_opt PREFIX",
     )
     atlas.add_argument(
         "-atlas_unit",
