@@ -285,6 +285,23 @@ def test_per_run_global_mode_fits_every_run_with_the_chosen_lambda():
     torch.testing.assert_close(out.betas, ref.betas)
 
 
+def test_global_lambda_refuses_a_condition_held_in_one_run():
+    from fastfuncstuff.glm.smooth_basis import choose_global_lambda
+
+    # A split half: every condition in a single run. Leave-one-run-out then predicts
+    # the held-out condition from the penalty alone and chose the top of the grid.
+    y, design, _, _ = _problem(n_vox=20, seed=5)
+    d = design.numpy().copy()
+    per_run = [d[:, :K].copy() for _ in range(RUNS)]
+    for r, block in enumerate(per_run):
+        keep = np.zeros(d.shape[0], bool)
+        keep[STARTS[r] : (STARTS[r + 1] if r + 1 < RUNS else d.shape[0])] = True
+        block[~keep] = 0
+    split = torch.tensor(np.hstack([*per_run, d[:, K:]]))
+    with pytest.raises(ValueError, match="every event of some condition"):
+        choose_global_lambda(y, split, K * RUNS, roughness_penalty([K] * RUNS), STARTS, device=CPU)
+
+
 def test_global_lambda_falls_back_to_every_voxel_without_signal():
     from fastfuncstuff.glm.smooth_basis import choose_global_lambda
 

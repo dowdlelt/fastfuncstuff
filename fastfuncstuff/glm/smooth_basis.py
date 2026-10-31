@@ -574,6 +574,21 @@ def choose_global_lambda(
     lams = torch.exp(log_grid)
     bounds = list(run_starts) + [n_t]
     design64 = design.detach().cpu().double().numpy()
+    # A condition held out with no events left in training is predicted by the
+    # penalty alone, and the median held-out R^2 then rewards smoothing every curve
+    # flat: one run per task (a split half) chose the top of the grid, silently.
+    task = np.abs(design64[:, :n_task]) > 0
+    for r in range(len(run_starts)):
+        inside = task[bounds[r] : bounds[r + 1]].any(axis=0)
+        outside = task[: bounds[r]].any(axis=0) | task[bounds[r + 1] :].any(axis=0)
+        if (inside & ~outside).any():
+            raise ValueError(
+                f"run {r + 1} holds every event of some condition, so leave-one-run-out "
+                "cannot choose a global lambda (each condition needs events in at least "
+                "two runs). Give a fixed lambda instead (-tent-smooth <lambda>, e.g. 10 to "
+                "the <prefix>_smooth_log10lambda a fit with more runs wrote) or "
+                "-tent-smooth reml"
+            )
     folds = []
     for r in range(len(run_starts)):
         test = torch.arange(bounds[r], bounds[r + 1])
