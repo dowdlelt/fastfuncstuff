@@ -167,3 +167,16 @@ def test_regions_from_map_finds_each_surface_cluster(sphere, tmp_path):
     # Members are each cap's vertices (claimed at any depth, closed along the mesh).
     north = regions.vertex_id[regions.members[int(np.argmax(centres[:, 2]))].indices]
     assert (v[north, 2] > 0.75).all() and len(north) > 20
+
+
+def test_regions_from_atlas_keeps_names_and_hemispheres(sphere, tmp_path):
+    from fastfuncstuff.laminar.columns import regions_from_atlas
+
+    surf, affine, shape, data, v = sphere
+    a = _label(tmp_path, np.flatnonzero(v[:, 2] > 0.7), "lh.north.label")
+    b = _label(tmp_path, np.flatnonzero(v[:, 2] < -0.7), "lh.south.label")
+    regions = regions_from_atlas([surf], [a, b])
+    assert regions.n_columns == 2 and regions.names == ["lh.north", "lh.south"]
+    north = regions.vertex_id[regions.members[0].indices]
+    assert set(north) == set(np.flatnonzero(v[:, 2] > 0.7))
+    assert v[regions.centre_vertex[0], 2] > 0.9

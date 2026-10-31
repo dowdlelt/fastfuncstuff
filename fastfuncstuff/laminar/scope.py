@@ -65,6 +65,14 @@ class ScopeFits:
     #: The best model's averaged posterior over the vascular parameters, name ->
     #: (mean (C,), sd (C,)), for carrying to another fit as a prior (``vascular_given``).
     vascular: dict = field(default_factory=dict)
+    #: B averaged over the model space with the model probabilities (Bayesian model
+    #: averaging): a model without depth k contributes 0 there. Prefer it to the
+    #: winner's B for group tests -- the winner over-selects.
+    B_bma: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    B_bma_sd: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: Global neuronal self-inhibition sigma (Hz), model-averaged; the test condition's
+    #: self-inhibition at depth k is sigma - B_bma[:, k] (A_kk = -sigma + u B_k).
+    sigma_hz: np.ndarray = field(default_factory=lambda: np.zeros(0))
     timing: dict = field(default_factory=dict)
     #: K -> the empirical vascular prior applied (vascular_prior != "none").
     empirical: dict = field(default_factory=dict)
@@ -170,6 +178,7 @@ def fit_columns(
     b_stats = np.zeros((3, n_m, n_cols, n))  # mean, sd, P per model, picked after
     s_d_all = np.zeros((n_m, n_cols))
     vasc_all = {name: np.zeros((2, n_m, n_cols)) for name in VASCULAR}
+    sigma_all = np.zeros((n_m, n_cols))
     timing: dict[str, float] = {}
 
     bar = None
@@ -211,6 +220,7 @@ def fit_columns(
         spec = runs[0].spec
         s_d_all[m, c0:c1] = unvec(bpa.Ep_vec, spec)["s_d"].reshape(-1).cpu().numpy()
         ep_d, vp_d = unvec(bpa.Ep_vec, spec), unvec(bpa.Vp_vec, spec)
+        sigma_all[m, c0:c1] = (spec.p0.sigma * torch.exp(ep_d["sigma"].reshape(-1))).cpu().numpy()
         for name in VASCULAR:
             vasc_all[name][0, m, c0:c1] = ep_d[name].reshape(-1).cpu().numpy()
             vasc_all[name][1, m, c0:c1] = np.sqrt(
@@ -290,6 +300,13 @@ def fit_columns(
     idx = np.arange(n_cols)
     pick = np.clip(best, 0, None)
     b_mean, b_sd, b_p = (b_stats[s, pick, idx] for s in range(3))
+    # Bayesian model averaging over the space: a mixture of the models' posteriors.
+    pm = p_model.T[:, :, None]  # (M, C, 1)
+    m1 = b_stats[0]  # (M, C, N); exactly 0 where a model pins the depth
+    m2 = b_stats[1] ** 2 + m1**2
+    b_bma = (pm * m1).sum(0)
+    b_bma_sd = np.sqrt(np.clip((pm * m2).sum(0) - b_bma**2, 0, None))
+    sigma_hz = (p_model.T * sigma_all).sum(0)
 
     # Nesting: a model can never truly score below a model it contains.
     nesting = np.zeros(n_cols)
@@ -301,8 +318,61 @@ def fit_columns(
     return ScopeFits(
         list(names), [tuple(t) for t in targets], ks, F, per_k_F, p_model, p_depth, best,
         b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx],
-        {name: (v[0, pick, idx], v[1, pick, idx]) for name, v in vasc_all.items()}, timing, empirical,
+        {name: (v[0, pick, idx], v[1, pick, idx]) for name, v in vasc_all.items()}, b_bma,
+        b_bma_sd, sigma_hz, timing, empirical,
     )  # fmt: skip
 
 
-__all__ = ["ScopeFits", "fit_columns"]
+LONG_COLUMNS = (
+    "subject", "comparison", "region", "name", "hemi", "n_vertices", "area_mm2",
+    "neuronal_depth", "p_modulated", "B_bma", "B_bma_sd", "best_model", "p_best",
+    "B_best", "B_best_sd", "P_B_best", "sigma_hz", "sigma_test_hz", "s_d", "r2_best",
+    "stalled", "failed", "nesting_nats",
+)  # fmt: skip
+
+
+def write_long_table(
+    path: str,
+    fits: ScopeFits,
+    *,
+    subject: str,
+    comparison: str,
+    region_ids: np.ndarray,
+    names: list[str],
+    hemis: list[str],
+    n_vertices: np.ndarray,
+    area_mm2: np.ndarray,
+    depth_names: list[str],
+) -> str:
+    """One line per region x neuronal depth, tidy, for group tests: concatenate the
+    subjects' tables and test B_bma (or p_modulated, sigma_test_hz) per region and
+    depth. The rows of ``fits`` are the regions, in the order of the other arguments.
+
+    ``sigma_test_hz`` is the self-inhibition during the test condition,
+    sigma - B_bma: positive B lowers inhibition (A_kk = -sigma + u B_k), and a
+    negative value is net self-excitation while the modulation is on -- what the
+    published example ROI's fit has (sigma 0.13 Hz, B 2-5 Hz).
+    """
+    import csv
+
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(LONG_COLUMNS)
+        for j in range(len(region_ids)):
+            b = int(fits.best[j])
+            model = fits.models[b] if b >= 0 else "none"
+            for i, d in enumerate(depth_names):
+                vals = [
+                    subject, comparison, int(region_ids[j]), names[j], hemis[j],
+                    int(n_vertices[j]), float(area_mm2[j]), d, fits.p_depth[j, i],
+                    fits.B_bma[j, i], fits.B_bma_sd[j, i], model,
+                    fits.p_model[j, max(b, 0)], fits.B_mean[j, i], fits.B_sd[j, i],
+                    fits.B_p[j, i], fits.sigma_hz[j], fits.sigma_hz[j] - fits.B_bma[j, i],
+                    fits.s_d[j], fits.r2[j, max(b, 0)], int(fits.stalled[j].any()),
+                    int(fits.failed[j].any()), fits.nesting[j],
+                ]  # fmt: skip
+                w.writerow([f"{v:.6g}" if isinstance(v, float) else v for v in vals])
+    return path
+
+
+__all__ = ["LONG_COLUMNS", "ScopeFits", "fit_columns", "write_long_table"]

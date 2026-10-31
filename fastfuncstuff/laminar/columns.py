@@ -107,6 +107,8 @@ class ColumnSet:
     vertex_id: np.ndarray  # (n_v,)
     radius_mm: float
     spacing_mm: float
+    #: Region names (atlas labels); None for disks and clusters, which are numbered.
+    names: list[str] | None = None
 
     @property
     def n_columns(self) -> int:
@@ -239,6 +241,48 @@ def regions_from_map(
     return ColumnSet(
         np.asarray(cs), np.asarray(cv), members, (keys // _KEY).astype(np.int64),
         (keys % _KEY).astype(np.int64), float("nan"), float("nan"),
+    )  # fmt: skip
+
+
+def regions_from_atlas(surfaces, paths: list[str], claim: str = "any") -> ColumnSet:
+    """Regions from an atlas: each label of ``paths`` (``.annot``, ``.label``, GIfTI
+    label map, or a volume atlas claimed along the column) is one region, read
+    through depth like a column, keeping its name. The way to get the same regions
+    in every subject -- a FreeSurfer parcellation, or a group atlas resampled to
+    each subject -- so per-region values go straight into group tests.
+    """
+    from fastfuncstuff.processing.roi_depth import CLAIM_ANY, CLAIM_MID, read_depth_rois
+
+    notes: list[str] = []
+    rois = read_depth_rois(list(paths), surfaces, notes, CLAIM_ANY if claim == "any" else CLAIM_MID)
+    cs, cv, names, member_lists = [], [], [], []
+    for roi in rois:
+        for h, member in sorted(roi.members.items()):
+            verts = np.flatnonzero(member)
+            if surfaces[h].cortex is not None:
+                verts = verts[np.asarray(surfaces[h].cortex, bool)[verts]]
+            if verts.size == 0:
+                continue
+            mid = _midthickness(surfaces[h])
+            centroid = mid[verts].mean(0)
+            cs.append(h)
+            cv.append(int(verts[np.argmin(((mid[verts] - centroid) ** 2).sum(1))]))
+            hemi = surfaces[h].name
+            names.append(
+                roi.name if roi.name.startswith((f"{hemi}.", f"{hemi}_")) else f"{hemi}.{roi.name}"
+            )
+            member_lists.append(h * _KEY + verts.astype(np.int64))
+    if not cs:
+        raise ValueError("no atlas region covers any cortex vertex of the surfaces given")
+    keys = np.unique(np.concatenate(member_lists))
+    rows = np.repeat(np.arange(len(member_lists)), [m.size for m in member_lists])
+    cols = np.searchsorted(keys, np.concatenate(member_lists))
+    members = sp.csr_matrix(
+        (np.ones(cols.size), (rows, cols)), shape=(len(member_lists), keys.size)
+    )
+    return ColumnSet(
+        np.asarray(cs), np.asarray(cv), members, (keys // _KEY).astype(np.int64),
+        (keys % _KEY).astype(np.int64), float("nan"), float("nan"), names,
     )  # fmt: skip
 
 

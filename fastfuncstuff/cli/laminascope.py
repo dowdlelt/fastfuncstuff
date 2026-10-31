@@ -94,6 +94,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "statistic above -regions_thresh (e.g. faces > objects from a localiser), "
                    "closed along the mesh by 1 mm, at least -regions_min_mm2. The data's own "
                    "patches, often 8-10 mm or more across. Select on independent runs.")  # fmt: skip
+    c.add_argument("-regions_atlas", nargs="+", default=None, metavar="FILE",
+                   help="Instead of disks: one region per atlas label (.annot, .label, GIfTI "
+                   "label map, or a volume atlas claimed along the column), named. The way "
+                   "to have the same regions in every subject for group tests.")  # fmt: skip
     c.add_argument("-regions_thresh", type=float, default=3.1, metavar="T",
                    help="Threshold for -regions_from (value >= T; |value| with -regions_abs).")  # fmt: skip
     c.add_argument("-regions_abs", action="store_true",
@@ -169,6 +173,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     o.add_argument("-chunk", type=int, default=None, metavar="N",
                    help="Columns per batched inversion (default 1024 on a GPU, 64 on CPU).")  # fmt: skip
     o.add_argument("-prefix", required=True, help="Output prefix.")
+    o.add_argument("-subject", default=None, metavar="ID",
+                   help="Subject label written into the long tables (default: the prefix's "
+                   "file name), so subjects' tables concatenate for group tests.")  # fmt: skip
     o.add_argument("-verb", type=int, default=1, help="0 quiet, 1 progress.")
     return p.parse_args(argv)
 
@@ -254,7 +261,12 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,
         args.cortex_label, hemi=args.hemi, log=logs.append,
     )  # fmt: skip
-    if args.regions_from:
+    if args.regions_atlas and args.regions_from:
+        raise ValueError("give -regions_atlas or -regions_from, not both")
+    if args.regions_atlas:
+        columns = col.regions_from_atlas(surfaces, args.regions_atlas)
+        say(f"Regions: {columns.n_columns} atlas region(s) from {', '.join(args.regions_atlas)}")
+    elif args.regions_from:
         t0 = time.time()
         columns = col.regions_from_map(surfaces, args.regions_from, args.regions_thresh,
                                        absolute=args.regions_abs, min_area_mm2=args.regions_min_mm2)  # fmt: skip
@@ -395,6 +407,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         results[cmp.name] = fits
         _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
                           depth_names(args.N), device, say)  # fmt: skip
+        _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say)
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
                     "stalled", "failed", "nesting", "s_d"):  # fmt: skip
             out_npz[f"{cmp.name}_{key}"] = getattr(fits, key)
@@ -452,6 +465,40 @@ def _vascular_from(spec, columns, fit_idx):
                 mean[i], var[i] = mean_o[j], sd_o[j] ** 2
         out[name] = (mean, var)
     return out
+
+
+def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say) -> None:
+    from pathlib import Path
+
+    from fastfuncstuff.laminar.scope import write_long_table
+    from fastfuncstuff.surface.mesh import vertex_areas
+
+    areas = {}
+    for h, s in enumerate(surfaces):
+        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
+        areas[h] = vertex_areas(mid, np.asarray(s.faces), mid.shape[0])
+    m = columns.members.tocsr()
+    n_vert, area, names, hemis = [], [], [], []
+    for c in fit_idx:
+        vi = m[c].indices
+        n_vert.append(vi.size)
+        area.append(
+            float(
+                sum(
+                    areas[int(h)][v]
+                    for h, v in zip(columns.vertex_surface[vi], columns.vertex_id[vi], strict=True)
+                )
+            )
+        )
+        hemis.append(surfaces[int(columns.centre_surface[c])].name)
+        names.append(columns.names[c] if columns.names else f"{hemis[-1]}.region{c}")
+    path = write_long_table(
+        f"{args.prefix}_{cmp.name}_regions_long.tsv", fits,
+        subject=args.subject or Path(args.prefix).name, comparison=cmp.name,
+        region_ids=np.asarray(fit_idx), names=names, hemis=hemis,
+        n_vertices=np.asarray(n_vert), area_mm2=np.asarray(area), depth_names=dnames,
+    )  # fmt: skip
+    say(f"  wrote {path}")
 
 
 def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,

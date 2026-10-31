@@ -275,4 +275,12 @@ def test_fit_columns_reduce_reaches_the_published_answer():
     )
     assert abs(fits.F[0, fits.models.index("superficial+deep")] - (-125.72)) < 2.0
     assert fits.nesting[0] == 0.0  # every nested model reduced from the one posterior
+    # Model averaging: the full model holds ~99% here, so B_bma is close to its B; the
+    # mixture sd is never below the winner's own.
+    assert fits.p_model[0].max() > 0.95
+    np.testing.assert_allclose(fits.B_bma[0], fits.B_mean[0], rtol=0.1, atol=0.05)
+    assert (fits.B_bma_sd[0] >= 0.9 * fits.B_sd[0]).all()
+    # The serial (MATLAB-exact) full model has sigma = 3 exp(-3.171) = 0.126 Hz with B of
+    # 2.7 / 2.0 / 4.8 Hz: the modulated self-connection -sigma + B is net excitatory.
+    assert fits.sigma_hz[0] == pytest.approx(0.126, abs=0.01)
     assert np.isfinite(fits.r2[0]).all() and (fits.r2[0] <= 1).all()

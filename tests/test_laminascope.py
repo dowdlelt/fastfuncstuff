@@ -111,3 +111,32 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     assert np.array_equal(z2["fitted"], z["fitted"])
     # The prior narrowed to the first posterior: the second posterior is no wider.
     assert (z2["ab_post_s_d_sd"] <= z["ab_post_s_d_sd"] + 1e-9).all()
+
+    # Atlas regions and the group table: one line per region x neuronal depth.
+    for name, sel in (("cap", v[:, 2] > 0.85), ("ring", (v[:, 2] > 0.6) & (v[:, 2] <= 0.85))):
+        ids = np.flatnonzero(sel)
+        (tmp_path / f"lh.{name}.label").write_text(
+            f"#!ascii label\n{len(ids)}\n" + "\n".join(f"{i}  0 0 0 1" for i in ids) + "\n"
+        )
+    third = str(tmp_path / "out" / "u")
+    rc = laminascope.main([
+        "-iresp_prefix", str(tmp_path / "c"), "-window", "0", "14", "-duration", "1",
+        "-compare", "ab", "a_base", "a_test",
+        "-white_mesh", str(tmp_path / "lh.white.surf.gii"),
+        "-pial_mesh", str(tmp_path / "lh.pial.surf.gii"),
+        "-regions_atlas", str(tmp_path / "lh.cap.label"), str(tmp_path / "lh.ring.label"),
+        "-depths", "6", "-models", "null", "superficial", "-max_iter", "3", "-rescue", "0",
+        "-device", "cpu", "-subject", "sub-x", "-prefix", third, "-verb", "0",
+    ])  # fmt: skip
+    assert rc == 0
+    import csv
+
+    rows = list(csv.DictReader(open(f"{third}_ab_regions_long.tsv"), delimiter="\t"))
+    assert len(rows) == 2 * 3 and {r["name"] for r in rows} == {"lh.cap", "lh.ring"}
+    assert {r["subject"] for r in rows} == {"sub-x"}
+    assert [r["neuronal_depth"] for r in rows[:3]] == ["superficial", "middle", "deep"]
+    for r in rows:
+        assert float(r["sigma_test_hz"]) == pytest.approx(
+            float(r["sigma_hz"]) - float(r["B_bma"]), rel=1e-4, abs=1e-5
+        )
+        assert 0 <= float(r["p_modulated"]) <= 1 and float(r["area_mm2"]) > 0
