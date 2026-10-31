@@ -485,12 +485,122 @@ def bpa_batched(runs: list[BatchedVL], *, free_energy: str = "reference") -> Bat
     return BatchedBPA(Ep, Vp, Pp, F, per_k)
 
 
+_LOG2PI = math.log(2.0 * math.pi)
+
+
+def predict_batched(
+    spec: ModelSpec,
+    Ep_vec: torch.Tensor,
+    u: torch.Tensor,
+    n_scans: int,
+    *,
+    kernel: torch.Tensor | None = None,
+    **integrate_kwargs,
+) -> torch.Tensor:
+    """Predicted BOLD ``(B, n_scans, K)`` at parameter vectors ``Ep_vec`` (one forward
+    pass, PSF as in :func:`variational_laplace_batched`)."""
+    dev = Ep_vec.device
+    spec = dataclasses.replace(spec, device=dev)
+    B = Ep_vec.shape[0]
+    width = batch_bucket(B)
+    rows = Ep_vec if width == B else torch.cat([Ep_vec, Ep_vec[-1:].expand(width - B, -1)])
+    per_fit = kernel is not None and kernel.ndim == 3
+    shared = None if (kernel is None or per_fit) else kernel.to(dev, Ep_vec.dtype)
+    pred = integrate(u.to(dev, Ep_vec.dtype), unvec(rows, spec), spec, n_scans, kernel=shared,
+                     **integrate_kwargs)[:B]  # fmt: skip
+    if per_fit:
+        pred = _psf_after(pred[:, None], kernel.to(dev))[:, 0]
+    return pred
+
+
+def reduce_batched(
+    full: BatchedVL,
+    full_priors: Priors,
+    reduced_priors: Priors,
+) -> BatchedVL:
+    """Bayesian model reduction: what inverting under ``reduced_priors`` would give,
+    from the full model's posterior alone ([[Friston & Penny 2011]]).
+
+    The free energy and posterior of a model whose prior differs from the full
+    model's -- here a modulation B pinned at zero at some depths, or a tighter
+    prior on a vascular parameter -- follow from the full posterior in closed form
+    under the Laplace assumption, with the likelihood (and the noise estimate) held
+    at the full model's. In two steps:
+
+    1. parameters the reduced prior pins (variance 0) are conditioned on their
+       pinned value: the evidence changes by log q(θ_s = r_s) − log p(θ_s = r_s),
+       the Savage–Dickey ratio, and the rest take the Gaussian conditional;
+    2. a changed prior on the parameters that stay free is the general reduction
+       of ``spm_log_evidence_reduce``.
+
+    Because every nested model comes from the same posterior, nested evidences are
+    consistent by construction: there is no separate optimisation to stall in.
+    """
+    dev, dtype = full.Ep_vec.device, full.Ep_vec.dtype
+    free = full.free_idx.to(dev)
+    pE = vec(full_priors.pE).to(dev, dtype)[free]
+    pC = vec(full_priors.pC).to(dev, dtype)[free]
+    rE_all = vec(reduced_priors.pE).to(dev, dtype)
+    rC_all = vec(reduced_priors.pC).to(dev, dtype)
+    outside = torch.ones_like(rC_all, dtype=torch.bool)
+    outside[free] = False
+    if bool((rC_all[outside] > 0).any()):
+        raise ValueError("the reduced model frees a parameter the full model fixed")
+    rE, rC = rE_all[free], rC_all[free]
+    s = rC <= 0
+    k = ~s
+    q = full.Ep_vec[:, free]  # absolute posterior means
+    C = full.Cp
+    B = q.shape[0]
+    dF = torch.zeros(B, dtype=dtype, device=dev)
+    qk, Ck = q[:, k], C[:, k][:, :, k]
+    if bool(s.any()):
+        Css = C[:, s][:, :, s]
+        Csk = C[:, s][:, :, k]
+        d = q[:, s] - rE[s]
+        L = torch.linalg.cholesky(Css)
+        alpha = torch.cholesky_solve(d[..., None], L)[..., 0]
+        logdet_ss = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+        ns = int(s.sum())
+        log_q = -0.5 * ((d * alpha).sum(-1) + logdet_ss + ns * _LOG2PI)
+        dp = rE[s] - pE[s]
+        log_p = -0.5 * ((dp * dp / pC[s]).sum() + torch.log(pC[s]).sum() + ns * _LOG2PI)
+        dF = dF + log_q - log_p
+        qk = qk - (Csk.mT @ alpha[..., None])[..., 0]
+        Ck = Ck - Csk.mT @ torch.cholesky_solve(Csk, L)
+    pEk, pCk, rEk, rCk = pE[k], pC[k], rE[k], rC[k]
+    if not (torch.equal(pEk, rEk) and torch.equal(pCk, rCk)):
+        qP = inv_b(Ck)
+        pP = torch.diag(1.0 / pCk)
+        rP = torch.diag(1.0 / rCk)
+        sP = qP + rP - pP
+        sC = inv_b(sP)
+        sE = (sC @ ((qP @ qk[..., None])[..., 0] + rP @ rEk - pP @ pEk)[..., None])[..., 0]
+        quad = (
+            (qk * (qP @ qk[..., None])[..., 0]).sum(-1)
+            + rEk @ rP @ rEk
+            - pEk @ pP @ pEk
+            - (sE * (sP @ sE[..., None])[..., 0]).sum(-1)
+        )
+        dF = dF + 0.5 * (logdet_b(qP) + torch.log(1.0 / rCk).sum() - logdet_b(sP)
+                         - torch.log(1.0 / pCk).sum()) - 0.5 * quad  # fmt: skip
+        qk, Ck = sE, sC
+    Ep = full.Ep_vec.clone()
+    Ep[:, free[s]] = rE[s]
+    Ep[:, free[k]] = qk
+    return dataclasses.replace(
+        full, Ep_vec=Ep, Cp=Ck, F=full.F + dF, free_idx=full.free_idx[k.cpu()]
+    )
+
+
 __all__ = [
     "BatchedBPA",
     "BatchedVL",
     "bpa_batched",
+    "reduce_batched",
     "dx_b",
     "inv_b",
     "logdet_b",
+    "predict_batched",
     "variational_laplace_batched",
 ]

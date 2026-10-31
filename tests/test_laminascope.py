@@ -74,7 +74,7 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
         "-pial_mesh", str(tmp_path / "lh.pial.surf.gii"),
         "-responsive", str(tmp_path / "resp.nii.gz"), "-column_radius", "8",
         "-column_spacing", "6", "-depths", "6", "-models", "null", "superficial",
-        "-max_iter", "3", "-rescue", "0", "-max_columns", "3", "-device", "cpu",
+        "-max_iter", "3", "-rescue", "0", "-model_space", "invert", "-max_columns", "3", "-device", "cpu",
         "-prefix", prefix, "-verb", "0",
     ])  # fmt: skip
     assert rc == 0

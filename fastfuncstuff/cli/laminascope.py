@@ -118,6 +118,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("-TE", type=float, default=0.028, help="Echo time (s).")
     m.add_argument("-B0", type=float, default=7.0, help="Field strength (T).")
     m.add_argument("-max_iter", type=int, default=128, help="Variational Laplace iterations.")
+    m.add_argument("-model_space", choices=("reduce", "invert"), default="reduce",
+                   help="'reduce' (default): invert only the full model (every depth "
+                   "modulated) and derive the other layer hypotheses by Bayesian model "
+                   "reduction (Friston & Penny 2011) -- 2^N-fold fewer inversions, and nested "
+                   "evidences consistent by construction (brute force left ~23%% of real "
+                   "columns with a model far below one it contains). On the published data it "
+                   "ranks all models as brute force does, the competitive ones within 1.3-1.6 "
+                   "nats. 'invert': every model separately, as Faes et al.")  # fmt: skip
     m.add_argument("-rescue", type=int, default=2, metavar="N",
                    help="Restart fits that stalled (ended on rejected steps) up to N times from "
                    "their best point. On real columns half stalled somewhere without it, and a "
@@ -317,7 +325,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         fits = fit_columns(data_for_k, kern_for_k, targets=targets, names=names,
                            free_energy=args.free_energy, max_iter=args.max_iter,
                            hyper_from_rows=args.hyperprior == "rows", device=device,
-                           chunk=chunk, progress=args.verb >= 1, rescue=args.rescue)  # fmt: skip
+                           chunk=chunk, progress=args.verb >= 1, rescue=args.rescue,
+                           model_space=args.model_space)  # fmt: skip
         say(
             f"  fitted in {time.time() - t0:.0f} s ({(time.time() - t0) / fit_idx.size:.3f} s/column)"
         )
@@ -344,7 +353,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             "comparisons": [vars(c) for c in comps], "K": ks, "columns": columns.n_columns,
             "fitted": int(fit_idx.size), "radius_mm": columns.radius_mm,
             "spacing_mm": columns.spacing_mm, "depth_method": opts.method, "psf": args.psf,
-            "device": str(device), "modulation": modulation, "notes": logs + reads.notes,
+            "device": str(device), "modulation": modulation, "model_space": args.model_space, "notes": logs + reads.notes,
             "timing_s": {c: r.timing for c, r in results.items()},
         }, fh, indent=2, default=str)  # fmt: skip
     say(f"\nffs_laminascope: done in {time.time() - t_start:.0f} s")

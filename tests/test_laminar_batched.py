@@ -169,3 +169,110 @@ def test_fit_columns_matches_fit_roi_per_column():
         np.testing.assert_allclose(batched.B_mean[i], one.B_mean, rtol=1e-5, atol=1e-8)
         np.testing.assert_allclose(batched.B_sd[i], one.B_sd, rtol=1e-5, atol=1e-8)
         np.testing.assert_allclose(batched.r2[i], one.r2, rtol=1e-6, atol=1e-8)
+
+
+def _spm_reduce_dense(qE, qC, pE, pC, rE, rC):
+    """spm_log_evidence_reduce, dense and literal (rC may be tiny, not zero)."""
+    qP, pP, rP = np.linalg.inv(qC), np.linalg.inv(pC), np.linalg.inv(rC)
+    sP = qP + rP - pP
+    sC = np.linalg.inv(sP)
+    sE = sC @ (qP @ qE + rP @ rE - pP @ pE)
+    ld = np.linalg.slogdet(rP @ qP @ sC @ pC)[1]
+    F = ld / 2 - (qE @ qP @ qE + rE @ rP @ rE - pE @ pP @ pE - sE @ sP @ sE) / 2
+    return F, sE, sC
+
+
+def test_reduction_matches_the_spm_formula():
+    """Pinning entries (Savage-Dickey) and shrinking others (general reduction) against
+    the dense formula, where pinning is a vanishing prior variance."""
+    import dataclasses as dc
+
+    from fastfuncstuff.laminar.batched import BatchedVL, reduce_batched
+    from fastfuncstuff.laminar.experiment import faes_priors
+    from fastfuncstuff.laminar.params import ModelSpec
+
+    spec = ModelSpec(N=3, K=6, n_inputs=2, n_mod=1)
+    full_pr = faes_priors(spec, (1, 1, 1))
+    pE_v, pC_v = vec(full_pr.pE), vec(full_pr.pC)
+    free = torch.nonzero(pC_v > 0).squeeze(-1)
+    n = free.numel()
+    g = torch.Generator().manual_seed(2)
+    Bn = 3
+    a = torch.randn(Bn, n, n, generator=g, dtype=torch.float64) * 0.1
+    Cp = a @ a.mT + 0.05 * torch.eye(n, dtype=torch.float64)
+    Ep = pE_v.expand(Bn, -1).clone()
+    Ep[:, free] += 0.3 * torch.randn(Bn, n, generator=g, dtype=torch.float64)
+    full = BatchedVL(Ep_vec=Ep, Cp=Cp, Eh=torch.zeros(Bn, 6, dtype=torch.float64),
+                     F=torch.full((Bn,), -100.0, dtype=torch.float64),
+                     L=torch.zeros(Bn, 3, dtype=torch.float64),
+                     y_pred=torch.zeros(Bn, 4, 6, dtype=torch.float64), free_idx=free,
+                     n_iter=torch.ones(Bn, dtype=torch.long),
+                     converged=torch.ones(Bn, dtype=torch.bool),
+                     stalled=torch.zeros(Bn, dtype=torch.bool),
+                     failed=torch.zeros(Bn, dtype=torch.bool), spec=spec)  # fmt: skip
+    red_pr = faes_priors(spec, (1, 0, 0))
+    red_pr = dc.replace(red_pr, pC={**red_pr.pC, "s_d": red_pr.pC["s_d"] * 0.25},
+                        pE={**red_pr.pE, "s_d": red_pr.pE["s_d"] + 0.4})  # fmt: skip
+    got = reduce_batched(full, full_pr, red_pr)
+    rE_v, rC_v = vec(red_pr.pE)[free].numpy(), vec(red_pr.pC)[free].numpy()
+    rC_dense = np.where(rC_v > 0, rC_v, 1e-14)
+    keep = rC_v > 0
+    for i in range(Bn):
+        F, sE, sC = _spm_reduce_dense(
+            Ep[i, free].numpy(), Cp[i].numpy(), pE_v[free].numpy(), np.diag(pC_v[free].numpy()),
+            rE_v, np.diag(rC_dense),
+        )  # fmt: skip
+        assert float(got.F[i]) == pytest.approx(-100.0 + F, abs=1e-5)
+        np.testing.assert_allclose(got.Ep_vec[i, got.free_idx].numpy(), sE[keep], atol=1e-8)
+        np.testing.assert_allclose(got.Cp[i].numpy(), sC[np.ix_(keep, keep)], atol=1e-8)
+
+
+@pytest.mark.slow  # 89 s: brute force over the model space vs one full inversion
+def test_reduced_model_space_tracks_brute_force_on_the_oracle():
+    """BMR's evidence for the nested models, from the full model alone, against
+    inverting each nested model (the 'internal validation' of Friston & Penny 2011).
+    Measured agreement is recorded in the assertion bounds."""
+    from fastfuncstuff.laminar.batched import reduce_batched
+    from fastfuncstuff.laminar.experiment import faes_priors, layer_model_targets
+
+    spec, y, u, rows, kernel = _oracle_problem()
+    kw = dict(rows=rows, kernel=kernel, device=CPU, rescue=2)
+    full_pr = faes_priors(spec, (1, 1, 1))
+    full = variational_laplace_batched(spec, full_pr, u, y[None], **kw)
+    brute, red = [], []
+    for target in layer_model_targets(3)[:-1]:
+        pr = faes_priors(spec, target)
+        brute.append(float(variational_laplace_batched(spec, pr, u, y[None], **kw).F[0]))
+        red.append(float(reduce_batched(full, full_pr, pr).F[0]))
+    brute, red = np.array(brute), np.array(red)
+    # Measured 2026-10-31: the same ranking of all seven; reduction is never above brute
+    # force; competitive models (within 10 nats of the best) agree to 1.3-1.6 nats, distant
+    # ones read 8-11 nats low (one Laplace point stretched far from where it was fitted).
+    assert list(np.argsort(-brute)) == list(np.argsort(-red))
+    assert (red <= brute + 0.5).all()
+    near = brute >= brute.max() - 10
+    assert np.abs(red - brute)[near].max() < 2.0
+
+
+@pytest.mark.slow  # 26 s: one full inversion + forward passes
+def test_fit_columns_reduce_reaches_the_published_answer():
+    """The reduced model space on the published data (K = 9 block): MATLAB's brute force
+    ranks superficial+middle+deep first (F -120.78) and superficial+deep second
+    (-125.72). The full model is inverted, so its F is MATLAB's; the runner-up is a
+    reduction, within the measured BMR gap."""
+    from fastfuncstuff.laminar.io import LaminarData
+    from fastfuncstuff.laminar.scope import fit_columns
+
+    spec, y, u, rows, kernel = _oracle_problem()
+    fits = fit_columns(
+        {spec.K: LaminarData(y=y[None], rows=rows, u=u, spec=spec)}, {spec.K: kernel},
+        device=CPU, progress=False, rescue=2, model_space="reduce",
+    )  # fmt: skip
+    order = [fits.models[i] for i in np.argsort(-fits.F[0])]
+    assert order[:2] == ["superficial+middle+deep", "superficial+deep"]
+    assert fits.F[0, fits.models.index("superficial+middle+deep")] == pytest.approx(
+        -120.78, abs=0.01
+    )
+    assert abs(fits.F[0, fits.models.index("superficial+deep")] - (-125.72)) < 2.0
+    assert fits.nesting[0] == 0.0  # every nested model reduced from the one posterior
+    assert np.isfinite(fits.r2[0]).all() and (fits.r2[0] <= 1).all()

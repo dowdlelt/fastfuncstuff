@@ -16,12 +16,19 @@ and operators stay per ROI in ``ffs_laminar``.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
-from fastfuncstuff.laminar.batched import BatchedVL, bpa_batched, variational_laplace_batched
+from fastfuncstuff.laminar.batched import (
+    BatchedVL,
+    bpa_batched,
+    predict_batched,
+    reduce_batched,
+    variational_laplace_batched,
+)
 from fastfuncstuff.laminar.experiment import faes_priors, layer_model_names, layer_model_targets
 from fastfuncstuff.laminar.inversion import unvec
 from fastfuncstuff.laminar.io import LaminarData
@@ -73,6 +80,7 @@ def fit_columns(
     chunk: int | None = None,
     progress: bool = True,
     rescue: int = 0,
+    model_space: str = "invert",
 ) -> ScopeFits:
     """Invert, average across K and compare every column of ``data_for_k``.
 
@@ -81,7 +89,17 @@ def fit_columns(
     the same order at every K. ``kernel_for_k[K]`` is the depth PSF: ``(C, K, K)``
     per column, one shared kernel, or None. ``chunk`` columns go through one
     batched call (None: all of them).
+
+    ``model_space``: ``"invert"`` inverts every model separately, as the published
+    analysis does. ``"reduce"`` inverts only the full model (every depth modulated)
+    and derives the others by Bayesian model reduction
+    (:func:`~fastfuncstuff.laminar.batched.reduce_batched`). That is 2^N-fold fewer
+    inversions, and nested evidences come out consistent. On the published data it
+    gives the same ranking of all seven nested models, with competitive models within
+    1.3-1.6 nats of brute force.
     """
+    if model_space not in ("invert", "reduce"):
+        raise ValueError(f"model_space must be 'invert' or 'reduce', not {model_space!r}")
     import time
 
     ks = sorted(data_for_k)
@@ -116,33 +134,55 @@ def fit_columns(
         from tqdm.auto import tqdm
 
         n_chunks = -(-n_cols // chunk)
-        bar = tqdm(total=n_m * n_k * n_chunks, desc=f"laminar {n_cols} columns", leave=True,
-                   disable=n_m * n_k * n_chunks < 2)  # fmt: skip
-    for m, target in enumerate(targets):
-        for c0 in range(0, n_cols, chunk):
-            c1 = min(n_cols, c0 + chunk)
+        n_inv = n_k * n_chunks * (1 if model_space == "reduce" else n_m)
+        bar = tqdm(total=n_inv, desc=f"laminar {n_cols} columns", leave=True,
+                   disable=n_inv < 2)  # fmt: skip
+    full_target = tuple([1] * n)
+    for c0 in range(0, n_cols, chunk):
+        c1 = min(n_cols, c0 + chunk)
+
+        def invert(target, k, label, c0=c0, c1=c1):
+            d = data_for_k[k]
+            kern = kernels.get(k)
+            if kern is not None and kern.ndim == 3:
+                kern = kern[c0:c1]
+            t0 = time.perf_counter()
+            run = variational_laplace_batched(
+                d.spec, faes_priors(d.spec, target), d.u, d.y[c0:c1], rows=d.rows,
+                kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
+                device=device, rescue=rescue, **d.integrate_kwargs,
+            )  # fmt: skip
+            timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
+            if bar is not None:
+                bar.update(1)
+            return run, kern
+
+        full_runs = {}
+        if model_space == "reduce":
+            full_runs = {k: invert(full_target, k, "full") for k in ks}
+        for m, target in enumerate(targets):
             runs = []
             for j, k in enumerate(ks):
                 d = data_for_k[k]
-                kern = kernels.get(k)
-                if kern is not None and kern.ndim == 3:
-                    kern = kern[c0:c1]
-                t0 = time.perf_counter()
-                run = variational_laplace_batched(
-                    d.spec, faes_priors(d.spec, target), d.u, d.y[c0:c1], rows=d.rows,
-                    kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
-                    device=device, rescue=rescue, **d.integrate_kwargs,
-                )  # fmt: skip
-                timing[f"{names[m]}/K{k}"] = (
-                    timing.get(f"{names[m]}/K{k}", 0.0) + time.perf_counter() - t0
-                )
+                if model_space == "reduce":
+                    full, kern = full_runs[k]
+                    if tuple(target) == full_target:
+                        run = full
+                    else:
+                        run = reduce_batched(
+                            full, faes_priors(d.spec, full_target), faes_priors(d.spec, target)
+                        )
+                        if j == 0:  # one forward pass, for the variance explained
+                            run = dataclasses.replace(run, y_pred=predict_batched(
+                                d.spec, run.Ep_vec, d.u, int(d.y.shape[1]), kernel=kern,
+                                **d.integrate_kwargs))  # fmt: skip
+                else:
+                    run, _ = invert(target, k, names[m])
                 runs.append(run)
                 stalled[c0:c1, m, j] = run.stalled.cpu().numpy()
                 failed[c0:c1, m, j] = run.failed.cpu().numpy()
                 if j == 0:
                     r2[c0:c1, m] = _r2(run, d.y[c0:c1], d.rows)
-                if bar is not None:
-                    bar.update(1)
             bpa = bpa_batched(runs, free_energy=free_energy)
             f = bpa.F.cpu().numpy()
             bad = failed[c0:c1, m].any(1)
