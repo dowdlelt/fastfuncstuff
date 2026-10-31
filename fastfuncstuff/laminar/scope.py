@@ -29,6 +29,7 @@ from fastfuncstuff.laminar.batched import (
     reduce_batched,
     variational_laplace_batched,
 )
+from fastfuncstuff.laminar.empirical import EmpiricalPrior, batch_priors, empirical_vascular_prior
 from fastfuncstuff.laminar.experiment import faes_priors, layer_model_names, layer_model_targets
 from fastfuncstuff.laminar.inversion import unvec
 from fastfuncstuff.laminar.io import LaminarData
@@ -57,6 +58,8 @@ class ScopeFits:
     #: prior): the drainage parameter whose UNDERestimate gives wrong profiles.
     s_d: np.ndarray = field(default_factory=lambda: np.zeros(0))
     timing: dict = field(default_factory=dict)
+    #: K -> the empirical vascular prior applied (vascular_prior != "none").
+    empirical: dict = field(default_factory=dict)
 
 
 def _r2(run: BatchedVL, y: torch.Tensor, rows: torch.Tensor) -> np.ndarray:
@@ -65,6 +68,17 @@ def _r2(run: BatchedVL, y: torch.Tensor, rows: torch.Tensor) -> np.ndarray:
     ss_tot = ((y0 - y0.mean((1, 2), keepdim=True)) ** 2).sum((1, 2))
     ss_res = ((y0 - yp) ** 2).sum((1, 2))
     return (1.0 - ss_res / torch.clamp(ss_tot, min=1e-30)).cpu().numpy()
+
+
+def _cat_runs(parts: list[BatchedVL]) -> BatchedVL:
+    """Chunks of one model's batched inversion, joined along the dataset axis."""
+    if len(parts) == 1:
+        return parts[0]
+    out = dataclasses.replace(parts[0])
+    for f in dataclasses.fields(BatchedVL):
+        if f.name not in ("free_idx", "spec"):
+            setattr(out, f.name, torch.cat([getattr(p, f.name) for p in parts]))
+    return out
 
 
 def fit_columns(
@@ -81,6 +95,10 @@ def fit_columns(
     progress: bool = True,
     rescue: int = 0,
     model_space: str = "invert",
+    vascular_prior: str = "none",
+    vascular_radius_mm: float = 10.0,
+    centres: np.ndarray | None = None,
+    hemi: np.ndarray | None = None,
 ) -> ScopeFits:
     """Invert, average across K and compare every column of ``data_for_k``.
 
@@ -97,9 +115,21 @@ def fit_columns(
     inversions, and nested evidences come out consistent. On the published data it
     gives the same ranking of all seven nested models, with competitive models within
     1.3-1.6 nats of brute force.
+
+    ``vascular_prior`` (reduce only): ``"local"`` gives each column an empirical prior
+    on the vascular parameters from the columns within ``vascular_radius_mm`` of its
+    centre (``centres`` ``(C, 3)`` mm, ``hemi`` ``(C,)``); ``"global"`` pools a whole
+    hemisphere (:mod:`~fastfuncstuff.laminar.empirical`).
     """
     if model_space not in ("invert", "reduce"):
         raise ValueError(f"model_space must be 'invert' or 'reduce', not {model_space!r}")
+    if vascular_prior not in ("none", "local", "global"):
+        raise ValueError(f"vascular_prior must be none, local or global, not {vascular_prior!r}")
+    if vascular_prior != "none" and model_space != "reduce":
+        raise ValueError(
+            "an empirical vascular prior is applied by reduction: model_space='reduce'"
+        )
+    empirical: dict[int, EmpiricalPrior] = {}
     import time
 
     ks = sorted(data_for_k)
@@ -138,62 +168,79 @@ def fit_columns(
         bar = tqdm(total=n_inv, desc=f"laminar {n_cols} columns", leave=True,
                    disable=n_inv < 2)  # fmt: skip
     full_target = tuple([1] * n)
-    for c0 in range(0, n_cols, chunk):
-        c1 = min(n_cols, c0 + chunk)
 
-        def invert(target, k, label, c0=c0, c1=c1):
-            d = data_for_k[k]
-            kern = kernels.get(k)
-            if kern is not None and kern.ndim == 3:
-                kern = kern[c0:c1]
-            t0 = time.perf_counter()
-            run = variational_laplace_batched(
-                d.spec, faes_priors(d.spec, target), d.u, d.y[c0:c1], rows=d.rows,
-                kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
-                device=device, rescue=rescue, **d.integrate_kwargs,
-            )  # fmt: skip
-            timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
-            if bar is not None:
-                bar.update(1)
-            return run, kern
+    def invert(target, k, label, c0, c1):
+        d = data_for_k[k]
+        kern = kernels.get(k)
+        if kern is not None and kern.ndim == 3:
+            kern = kern[c0:c1]
+        t0 = time.perf_counter()
+        run = variational_laplace_batched(
+            d.spec, faes_priors(d.spec, target), d.u, d.y[c0:c1], rows=d.rows,
+            kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
+            device=device, rescue=rescue, **d.integrate_kwargs,
+        )  # fmt: skip
+        timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
+        if bar is not None:
+            bar.update(1)
+        return run
 
-        full_runs = {}
-        if model_space == "reduce":
-            full_runs = {k: invert(full_target, k, "full") for k in ks}
+    def record(m, c0, c1, runs):
+        for j, (k, run) in enumerate(zip(ks, runs, strict=True)):
+            stalled[c0:c1, m, j] = run.stalled.cpu().numpy()
+            failed[c0:c1, m, j] = run.failed.cpu().numpy()
+            if j == 0:
+                r2[c0:c1, m] = _r2(run, data_for_k[k].y[c0:c1], data_for_k[k].rows)
+        bpa = bpa_batched(runs, free_energy=free_energy)
+        bad = failed[c0:c1, m].any(1)
+        F[c0:c1, m] = np.where(bad, -np.inf, bpa.F.cpu().numpy())
+        per_k_F[c0:c1, m] = bpa.per_k_F.cpu().numpy()
+        spec = runs[0].spec
+        s_d_all[m, c0:c1] = unvec(bpa.Ep_vec, spec)["s_d"].reshape(-1).cpu().numpy()
+        for s, vecs in enumerate((bpa.Ep_vec, bpa.Vp_vec, bpa.Pp_vec)):
+            B = unvec(vecs, spec)["B"][:, 0]  # (b, N, N)
+            v = torch.diagonal(B, dim1=-2, dim2=-1).cpu().numpy()
+            b_stats[s, m, c0:c1] = np.sqrt(np.clip(v, 0, None)) if s == 1 else v
+
+    chunks = [(c0, min(n_cols, c0 + chunk)) for c0 in range(0, n_cols, chunk)]
+    if model_space == "invert":
+        for c0, c1 in chunks:
+            for m, target in enumerate(targets):
+                record(m, c0, c1, [invert(target, k, names[m], c0, c1) for k in ks])
+    else:
+        full_all = {k: _cat_runs([invert(full_target, k, "full", c0, c1) for c0, c1 in chunks])
+                    for k in ks}  # fmt: skip
+        overrides: dict[int, dict] = {k: {} for k in ks}
+        if vascular_prior != "none":
+            if centres is None or hemi is None:
+                raise ValueError("an empirical vascular prior needs the column centres")
+            for k in ks:
+                ep = empirical_vascular_prior(
+                    full_all[k], faes_priors(data_for_k[k].spec, full_target), centres, hemi,
+                    radius_mm=None if vascular_prior == "global" else vascular_radius_mm,
+                )  # fmt: skip
+                empirical[k] = ep
+                for j, name in enumerate(ep.names):
+                    overrides[k][f"pE:{name}"] = torch.as_tensor(ep.mean[:, j])
+                    overrides[k][f"pC:{name}"] = ep.priors.pC[name].reshape(-1)
         for m, target in enumerate(targets):
             runs = []
             for j, k in enumerate(ks):
                 d = data_for_k[k]
-                if model_space == "reduce":
-                    full, kern = full_runs[k]
-                    if tuple(target) == full_target:
-                        run = full
-                    else:
-                        run = reduce_batched(
-                            full, faes_priors(d.spec, full_target), faes_priors(d.spec, target)
-                        )
-                        if j == 0:  # one forward pass, for the variance explained
-                            run = dataclasses.replace(run, y_pred=predict_batched(
-                                d.spec, run.Ep_vec, d.u, int(d.y.shape[1]), kernel=kern,
-                                **d.integrate_kwargs))  # fmt: skip
-                else:
-                    run, _ = invert(target, k, names[m])
+                full = full_all[k]
+                if tuple(target) == full_target and not overrides[k]:
+                    runs.append(full)
+                    continue
+                pri = faes_priors(d.spec, target)
+                if overrides[k]:
+                    pri = batch_priors(pri, n_cols, overrides[k])
+                run = reduce_batched(full, faes_priors(d.spec, full_target), pri)
+                if j == 0:  # one forward pass, for the variance explained
+                    run = dataclasses.replace(run, y_pred=predict_batched(
+                        d.spec, run.Ep_vec, d.u, int(d.y.shape[1]), kernel=kernels.get(k),
+                        **d.integrate_kwargs))  # fmt: skip
                 runs.append(run)
-                stalled[c0:c1, m, j] = run.stalled.cpu().numpy()
-                failed[c0:c1, m, j] = run.failed.cpu().numpy()
-                if j == 0:
-                    r2[c0:c1, m] = _r2(run, d.y[c0:c1], d.rows)
-            bpa = bpa_batched(runs, free_energy=free_energy)
-            f = bpa.F.cpu().numpy()
-            bad = failed[c0:c1, m].any(1)
-            F[c0:c1, m] = np.where(bad, -np.inf, f)
-            per_k_F[c0:c1, m] = bpa.per_k_F.cpu().numpy()
-            spec = runs[0].spec
-            s_d_all[m, c0:c1] = unvec(bpa.Ep_vec, spec)["s_d"].reshape(-1).cpu().numpy()
-            for s, vecs in enumerate((bpa.Ep_vec, bpa.Vp_vec, bpa.Pp_vec)):
-                B = unvec(vecs, spec)["B"][:, 0]  # (b, N, N)
-                v = torch.diagonal(B, dim1=-2, dim2=-1).cpu().numpy()
-                b_stats[s, m, c0:c1] = np.sqrt(np.clip(v, 0, None)) if s == 1 else v
+            record(m, 0, n_cols, runs)
     if bar is not None:
         bar.close()
 
@@ -219,7 +266,7 @@ def fit_columns(
                 nesting = np.maximum(nesting, gap)
     return ScopeFits(
         list(names), [tuple(t) for t in targets], ks, F, per_k_F, p_model, p_depth, best,
-        b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx], timing,
+        b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx], timing, empirical,
     )  # fmt: skip
 
 

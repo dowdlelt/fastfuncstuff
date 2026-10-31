@@ -538,55 +538,58 @@ def reduce_batched(
     """
     dev, dtype = full.Ep_vec.device, full.Ep_vec.dtype
     free = full.free_idx.to(dev)
+    B = full.Ep_vec.shape[0]
     pE = vec(full_priors.pE).to(dev, dtype)[free]
     pC = vec(full_priors.pC).to(dev, dtype)[free]
-    rE_all = vec(reduced_priors.pE).to(dev, dtype)
-    rC_all = vec(reduced_priors.pC).to(dev, dtype)
-    outside = torch.ones_like(rC_all, dtype=torch.bool)
+    # A reduced prior may differ per dataset: (n,) or (B, n) after vec.
+    rE_all = vec(reduced_priors.pE).to(dev, dtype).expand(B, -1)
+    rC_all = vec(reduced_priors.pC).to(dev, dtype).expand(B, -1)
+    outside = torch.ones(rC_all.shape[1], dtype=torch.bool, device=dev)
     outside[free] = False
-    if bool((rC_all[outside] > 0).any()):
+    if bool((rC_all[:, outside] > 0).any()):
         raise ValueError("the reduced model frees a parameter the full model fixed")
-    rE, rC = rE_all[free], rC_all[free]
-    s = rC <= 0
+    rE, rC = rE_all[:, free], rC_all[:, free]
+    s_all = rC <= 0
+    s = s_all[0]
+    if not bool((s_all == s).all()):
+        raise ValueError("every dataset must pin the same parameters")
     k = ~s
     q = full.Ep_vec[:, free]  # absolute posterior means
     C = full.Cp
-    B = q.shape[0]
     dF = torch.zeros(B, dtype=dtype, device=dev)
     qk, Ck = q[:, k], C[:, k][:, :, k]
     if bool(s.any()):
         Css = C[:, s][:, :, s]
         Csk = C[:, s][:, :, k]
-        d = q[:, s] - rE[s]
+        d = q[:, s] - rE[:, s]
         L = torch.linalg.cholesky(Css)
         alpha = torch.cholesky_solve(d[..., None], L)[..., 0]
         logdet_ss = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
         ns = int(s.sum())
         log_q = -0.5 * ((d * alpha).sum(-1) + logdet_ss + ns * _LOG2PI)
-        dp = rE[s] - pE[s]
-        log_p = -0.5 * ((dp * dp / pC[s]).sum() + torch.log(pC[s]).sum() + ns * _LOG2PI)
+        dp = rE[:, s] - pE[s]
+        log_p = -0.5 * ((dp * dp / pC[s]).sum(-1) + torch.log(pC[s]).sum() + ns * _LOG2PI)
         dF = dF + log_q - log_p
         qk = qk - (Csk.mT @ alpha[..., None])[..., 0]
         Ck = Ck - Csk.mT @ torch.cholesky_solve(Csk, L)
-    pEk, pCk, rEk, rCk = pE[k], pC[k], rE[k], rC[k]
-    if not (torch.equal(pEk, rEk) and torch.equal(pCk, rCk)):
+    pEk, pCk, rEk, rCk = pE[k], pC[k], rE[:, k], rC[:, k]
+    if not (bool((rEk == pEk).all()) and bool((rCk == pCk).all())):
         qP = inv_b(Ck)
-        pP = torch.diag(1.0 / pCk)
-        rP = torch.diag(1.0 / rCk)
-        sP = qP + rP - pP
+        pPd, rPd = 1.0 / pCk, 1.0 / rCk  # diagonal precisions: (np,), (B, np)
+        sP = qP + torch.diag_embed(rPd - pPd)
         sC = inv_b(sP)
-        sE = (sC @ ((qP @ qk[..., None])[..., 0] + rP @ rEk - pP @ pEk)[..., None])[..., 0]
+        sE = (sC @ ((qP @ qk[..., None])[..., 0] + rPd * rEk - pPd * pEk)[..., None])[..., 0]
         quad = (
             (qk * (qP @ qk[..., None])[..., 0]).sum(-1)
-            + rEk @ rP @ rEk
-            - pEk @ pP @ pEk
+            + (rPd * rEk * rEk).sum(-1)
+            - (pPd * pEk * pEk).sum()
             - (sE * (sP @ sE[..., None])[..., 0]).sum(-1)
         )
-        dF = dF + 0.5 * (logdet_b(qP) + torch.log(1.0 / rCk).sum() - logdet_b(sP)
-                         - torch.log(1.0 / pCk).sum()) - 0.5 * quad  # fmt: skip
+        dF = dF + 0.5 * (logdet_b(qP) + torch.log(rPd).sum(-1) - logdet_b(sP)
+                         - torch.log(pPd).sum()) - 0.5 * quad  # fmt: skip
         qk, Ck = sE, sC
     Ep = full.Ep_vec.clone()
-    Ep[:, free[s]] = rE[s]
+    Ep[:, free[s]] = rE[:, s]
     Ep[:, free[k]] = qk
     return dataclasses.replace(
         full, Ep_vec=Ep, Cp=Ck, F=full.F + dF, free_idx=full.free_idx[k.cpu()]

@@ -126,6 +126,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "columns with a model far below one it contains). On the published data it "
                    "ranks all models as brute force does, the competitive ones within 1.3-1.6 "
                    "nats. 'invert': every model separately, as Faes et al.")  # fmt: skip
+    m.add_argument("-vascular_prior", choices=("none", "local", "global"), default="none",
+                   help="Empirical Bayes on the vascular parameters (s_d, al_d), with -model_space "
+                   "reduce: each column's prior is centred on its neighbours' posteriors "
+                   "(columns within -vascular_radius; 'global': the whole hemisphere) with the "
+                   "spread that maximises the summed evidence (Friston et al. 2016). The "
+                   "vasculature belongs to the tissue, not to one column, and a column's own "
+                   "s_d otherwise drifts low -- the direction that gives wrong profiles.")  # fmt: skip
+    m.add_argument("-vascular_radius", type=float, default=10.0, metavar="MM",
+                   help="Neighbourhood of -vascular_prior local (column centres, mm).")  # fmt: skip
     m.add_argument("-rescue", type=int, default=2, metavar="N",
                    help="Restart fits that stalled (ended on rejected steps) up to N times from "
                    "their best point. On real columns half stalled somewhere without it, and a "
@@ -298,6 +307,10 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         )
 
     chunk = args.chunk or (1024 if device.type == "cuda" else 64)
+    centres = np.stack([
+        0.5 * (np.asarray(surfaces[int(h)].white[v]) + np.asarray(surfaces[int(h)].pial[v]))
+        for h, v in zip(columns.centre_surface, columns.centre_vertex, strict=True)
+    ])  # fmt: skip
     results = {}
     out_npz: dict[str, np.ndarray] = {}
     for cmp in comps:
@@ -326,7 +339,12 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                            free_energy=args.free_energy, max_iter=args.max_iter,
                            hyper_from_rows=args.hyperprior == "rows", device=device,
                            chunk=chunk, progress=args.verb >= 1, rescue=args.rescue,
-                           model_space=args.model_space)  # fmt: skip
+                           model_space=args.model_space, vascular_prior=args.vascular_prior,
+                           vascular_radius_mm=args.vascular_radius, centres=centres[fit_idx],
+                           hemi=columns.centre_surface[fit_idx])  # fmt: skip
+        for k, ep in fits.empirical.items():
+            say(f"  vascular prior K={k}: shrink {ep.shrink:.3g} of the prior variance; "
+                f"s_d prior mean {np.percentile(ep.mean[:, 0], 5):.2f}..{np.percentile(ep.mean[:, 0], 95):.2f}")  # fmt: skip
         say(
             f"  fitted in {time.time() - t0:.0f} s ({(time.time() - t0) / fit_idx.size:.3f} s/column)"
         )
@@ -353,7 +371,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             "comparisons": [vars(c) for c in comps], "K": ks, "columns": columns.n_columns,
             "fitted": int(fit_idx.size), "radius_mm": columns.radius_mm,
             "spacing_mm": columns.spacing_mm, "depth_method": opts.method, "psf": args.psf,
-            "device": str(device), "modulation": modulation, "model_space": args.model_space, "notes": logs + reads.notes,
+            "device": str(device), "modulation": modulation, "model_space": args.model_space, "vascular_prior": args.vascular_prior,
+            "vascular_radius_mm": args.vascular_radius, "notes": logs + reads.notes,
             "timing_s": {c: r.timing for c, r in results.items()},
         }, fh, indent=2, default=str)  # fmt: skip
     say(f"\nffs_laminascope: done in {time.time() - t_start:.0f} s")
