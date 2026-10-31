@@ -36,7 +36,7 @@ def test_read_comparisons(tmp_path):
         read_comparisons(str(p), LABELS)
 
 
-@pytest.mark.slow  # 37 s: full model, reductions and a local vascular prior on three columns
+@pytest.mark.slow  # 25 s: two runs (local vascular prior, then priors from the first run)
 def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     from fastfuncstuff.cli import laminascope
     from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_surface
@@ -92,3 +92,22 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     assert z["ab_p_model"].shape == (3, 2) and z["psf_K6"].shape[1:] == (6, 6)
     vol = nib.load(f"{prefix}_ab_ribbon.nii.gz")
     assert vol.shape[:3] == (n, n, n)
+    assert z["ab_post_s_d_mean"].shape == (3,) and (z["ab_post_s_d_sd"] > 0).all()
+
+    # The same columns again, priors on the vascular parameters from the first run.
+    second = str(tmp_path / "out" / "t")
+    rc = laminascope.main([
+        "-iresp_prefix", str(tmp_path / "c"), "-window", "0", "14", "-duration", "1",
+        "-compare", "ab", "a_base", "a_test",
+        "-white_mesh", str(tmp_path / "lh.white.surf.gii"),
+        "-pial_mesh", str(tmp_path / "lh.pial.surf.gii"),
+        "-responsive", str(tmp_path / "resp.nii.gz"), "-column_radius", "8",
+        "-column_spacing", "6", "-depths", "6", "-models", "null", "superficial",
+        "-max_iter", "3", "-rescue", "0", "-max_columns", "3", "-device", "cpu",
+        "-vascular_from", f"{prefix}_columns.npz", "ab", "-prefix", second, "-verb", "0",
+    ])  # fmt: skip
+    assert rc == 0
+    z2 = np.load(f"{second}_columns.npz")
+    assert np.array_equal(z2["fitted"], z["fitted"])
+    # The prior narrowed to the first posterior: the second posterior is no wider.
+    assert (z2["ab_post_s_d_sd"] <= z["ab_post_s_d_sd"] + 1e-9).all()

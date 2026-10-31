@@ -29,7 +29,12 @@ from fastfuncstuff.laminar.batched import (
     reduce_batched,
     variational_laplace_batched,
 )
-from fastfuncstuff.laminar.empirical import EmpiricalPrior, batch_priors, empirical_vascular_prior
+from fastfuncstuff.laminar.empirical import (
+    VASCULAR,
+    EmpiricalPrior,
+    batch_priors,
+    empirical_vascular_prior,
+)
 from fastfuncstuff.laminar.experiment import faes_priors, layer_model_names, layer_model_targets
 from fastfuncstuff.laminar.inversion import unvec
 from fastfuncstuff.laminar.io import LaminarData
@@ -57,6 +62,9 @@ class ScopeFits:
     #: The best model's ascending-vein slope s_d (posterior mean, log-deviation from the
     #: prior): the drainage parameter whose UNDERestimate gives wrong profiles.
     s_d: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: The best model's averaged posterior over the vascular parameters, name ->
+    #: (mean (C,), sd (C,)), for carrying to another fit as a prior (``vascular_given``).
+    vascular: dict = field(default_factory=dict)
     timing: dict = field(default_factory=dict)
     #: K -> the empirical vascular prior applied (vascular_prior != "none").
     empirical: dict = field(default_factory=dict)
@@ -99,6 +107,7 @@ def fit_columns(
     vascular_radius_mm: float = 10.0,
     centres: np.ndarray | None = None,
     hemi: np.ndarray | None = None,
+    vascular_given: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> ScopeFits:
     """Invert, average across K and compare every column of ``data_for_k``.
 
@@ -119,13 +128,16 @@ def fit_columns(
     ``vascular_prior`` (reduce only): ``"local"`` gives each column an empirical prior
     on the vascular parameters from the columns within ``vascular_radius_mm`` of its
     centre (``centres`` ``(C, 3)`` mm, ``hemi`` ``(C,)``); ``"global"`` pools a whole
-    hemisphere (:mod:`~fastfuncstuff.laminar.empirical`).
+    hemisphere (:mod:`~fastfuncstuff.laminar.empirical`). ``vascular_given`` instead
+    sets each column's prior on the vascular parameters from another fit's posterior
+    (name -> (mean, variance) per column, NaN to keep the original), e.g. a high-SNR
+    localiser on the same tissue: the vasculature does not change with the task.
     """
     if model_space not in ("invert", "reduce"):
         raise ValueError(f"model_space must be 'invert' or 'reduce', not {model_space!r}")
     if vascular_prior not in ("none", "local", "global"):
         raise ValueError(f"vascular_prior must be none, local or global, not {vascular_prior!r}")
-    if vascular_prior != "none" and model_space != "reduce":
+    if (vascular_prior != "none" or vascular_given) and model_space != "reduce":
         raise ValueError(
             "an empirical vascular prior is applied by reduction: model_space='reduce'"
         )
@@ -157,6 +169,7 @@ def fit_columns(
     failed = np.zeros((n_cols, n_m, n_k), bool)
     b_stats = np.zeros((3, n_m, n_cols, n))  # mean, sd, P per model, picked after
     s_d_all = np.zeros((n_m, n_cols))
+    vasc_all = {name: np.zeros((2, n_m, n_cols)) for name in VASCULAR}
     timing: dict[str, float] = {}
 
     bar = None
@@ -197,6 +210,12 @@ def fit_columns(
         per_k_F[c0:c1, m] = bpa.per_k_F.cpu().numpy()
         spec = runs[0].spec
         s_d_all[m, c0:c1] = unvec(bpa.Ep_vec, spec)["s_d"].reshape(-1).cpu().numpy()
+        ep_d, vp_d = unvec(bpa.Ep_vec, spec), unvec(bpa.Vp_vec, spec)
+        for name in VASCULAR:
+            vasc_all[name][0, m, c0:c1] = ep_d[name].reshape(-1).cpu().numpy()
+            vasc_all[name][1, m, c0:c1] = np.sqrt(
+                np.clip(vp_d[name].reshape(-1).cpu().numpy(), 0, None)
+            )
         for s, vecs in enumerate((bpa.Ep_vec, bpa.Vp_vec, bpa.Pp_vec)):
             B = unvec(vecs, spec)["B"][:, 0]  # (b, N, N)
             v = torch.diagonal(B, dim1=-2, dim2=-1).cpu().numpy()
@@ -211,7 +230,20 @@ def fit_columns(
         full_all = {k: _cat_runs([invert(full_target, k, "full", c0, c1) for c0, c1 in chunks])
                     for k in ks}  # fmt: skip
         overrides: dict[int, dict] = {k: {} for k in ks}
-        if vascular_prior != "none":
+        if vascular_given:
+            for k in ks:
+                pr0 = faes_priors(data_for_k[k].spec, full_target)
+                for name, (mean, var) in vascular_given.items():
+                    mean, var = np.asarray(mean, np.float64), np.asarray(var, np.float64)
+                    ok = np.isfinite(mean) & np.isfinite(var) & (var > 0)
+                    # A column the other fit lacks keeps the original prior; the prior
+                    # only narrows, which keeps every reduction well posed.
+                    pE0, pC0 = float(pr0.pE[name]), float(pr0.pC[name])
+                    overrides[k][f"pE:{name}"] = torch.as_tensor(np.where(ok, mean, pE0))
+                    overrides[k][f"pC:{name}"] = torch.as_tensor(
+                        np.where(ok, np.minimum(var, pC0), pC0)
+                    )
+        elif vascular_prior != "none":
             if centres is None or hemi is None:
                 raise ValueError("an empirical vascular prior needs the column centres")
             for k in ks:
@@ -268,7 +300,8 @@ def fit_columns(
                 nesting = np.maximum(nesting, gap)
     return ScopeFits(
         list(names), [tuple(t) for t in targets], ks, F, per_k_F, p_model, p_depth, best,
-        b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx], timing, empirical,
+        b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx],
+        {name: (v[0, pick, idx], v[1, pick, idx]) for name, v in vasc_all.items()}, timing, empirical,
     )  # fmt: skip
 
 

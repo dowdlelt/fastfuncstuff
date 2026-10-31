@@ -133,6 +133,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "spread that maximises the summed evidence (Friston et al. 2016). The "
                    "vasculature belongs to the tissue, not to one column, and a column's own "
                    "s_d otherwise drifts low -- the direction that gives wrong profiles.")  # fmt: skip
+    m.add_argument("-vascular_from", nargs=2, default=None, metavar=("NPZ", "COMPARISON"),
+                   help="Each column's prior on the vascular parameters (s_d, al_d) from another "
+                   "ffs_laminascope run's posterior: its PREFIX_columns.npz and comparison name. "
+                   "Columns are matched by centre vertex, so build both runs with the same "
+                   "-responsive, -column_radius/-column_spacing and -seed. Use a high-SNR "
+                   "localiser on separate runs: the vasculature belongs to the tissue, not "
+                   "the task. Unmatched columns keep the original prior. Needs -model_space "
+                   "reduce; replaces -vascular_prior.")  # fmt: skip
     m.add_argument("-vascular_radius", type=float, default=10.0, metavar="MM",
                    help="Neighbourhood of -vascular_prior local (column centres, mm).")  # fmt: skip
     m.add_argument("-rescue", type=int, default=2, metavar="N",
@@ -307,6 +315,13 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         )
 
     chunk = args.chunk or (1024 if device.type == "cuda" else 64)
+    vascular_given = None
+    if args.vascular_from:
+        vascular_given = _vascular_from(args.vascular_from, columns, fit_idx)
+        say(
+            f"Vascular priors from {args.vascular_from[0]} ({args.vascular_from[1]}): "
+            f"{int(np.isfinite(vascular_given['s_d'][0]).sum()):,} of {fit_idx.size:,} columns matched"
+        )
     centres = np.stack([
         0.5 * (np.asarray(surfaces[int(h)].white[v]) + np.asarray(surfaces[int(h)].pial[v]))
         for h, v in zip(columns.centre_surface, columns.centre_vertex, strict=True)
@@ -341,7 +356,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                            chunk=chunk, progress=args.verb >= 1, rescue=args.rescue,
                            model_space=args.model_space, vascular_prior=args.vascular_prior,
                            vascular_radius_mm=args.vascular_radius, centres=centres[fit_idx],
-                           hemi=columns.centre_surface[fit_idx])  # fmt: skip
+                           hemi=columns.centre_surface[fit_idx],
+                           vascular_given=vascular_given)  # fmt: skip
         for k, ep in fits.empirical.items():
             if ep.shrink == 0.0:
                 say(
@@ -360,6 +376,9 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
                     "stalled", "failed", "nesting", "s_d"):  # fmt: skip
             out_npz[f"{cmp.name}_{key}"] = getattr(fits, key)
+        for name, (mean, sd) in fits.vascular.items():
+            out_npz[f"{cmp.name}_post_{name}_mean"] = mean
+            out_npz[f"{cmp.name}_post_{name}_sd"] = sd
 
     m = columns.members.tocsr()
     np.savez_compressed(
@@ -383,6 +402,34 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         }, fh, indent=2, default=str)  # fmt: skip
     say(f"\nffs_laminascope: done in {time.time() - t_start:.0f} s")
     return 0
+
+
+def _vascular_from(spec, columns, fit_idx):
+    """Per fitted column, (mean, variance) of s_d and al_d from another run's npz."""
+    path, cmp = spec
+    z = np.load(path)
+    key = f"{cmp}_post_s_d_mean"
+    if key not in z.files:
+        raise ValueError(
+            f"{path}: no posterior for comparison {cmp!r} (have: "
+            + ", ".join(sorted({f.split("_post_")[0] for f in z.files if "_post_" in f}))
+            + ")"
+        )
+    fitted = z["fitted"]
+    other = {
+        (int(z["centre_surface"][c]), int(z["centre_vertex"][c])): j for j, c in enumerate(fitted)
+    }
+    out = {}
+    for name in ("s_d", "al_d"):
+        mean_o, sd_o = z[f"{cmp}_post_{name}_mean"], z[f"{cmp}_post_{name}_sd"]
+        mean = np.full(fit_idx.size, np.nan)
+        var = np.full(fit_idx.size, np.nan)
+        for i, c in enumerate(fit_idx):
+            j = other.get((int(columns.centre_surface[c]), int(columns.centre_vertex[c])))
+            if j is not None:
+                mean[i], var[i] = mean_o[j], sd_o[j] ** 2
+        out[name] = (mean, var)
+    return out
 
 
 def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
