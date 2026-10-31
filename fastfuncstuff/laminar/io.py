@@ -154,20 +154,53 @@ def two_condition_data(
             )
     if not np.array_equal(first.times, second.times):
         raise ValueError("the two conditions are sampled at different times")
-    step = np.diff(first.times)
+    data = two_condition_batch(
+        first.values[None], second.values[None], first.times, duration=duration,
+        n_neuronal=n_neuronal, gap=gap, noise_sd=noise_sd, seed=seed,
+        delay_seconds=delay_seconds, TE=TE, B0=B0, p0=p0, dtype=dtype,
+    )  # fmt: skip
+    data.y = data.y[0]
+    data.meta.update({"roi": first.name, "hemi": first.hemi})
+    return data
+
+
+def two_condition_batch(
+    first: np.ndarray,
+    second: np.ndarray,
+    times: np.ndarray,
+    *,
+    duration: float,
+    n_neuronal: int = 3,
+    gap: int = 20,
+    noise_sd: float = 0.1,
+    seed: int = 20260918,
+    delay_seconds: float | None = 0.0,
+    TE: float = 0.028,
+    B0: float = 7.0,
+    p0=None,
+    dtype: torch.dtype = torch.float64,
+) -> LaminarData:
+    """:func:`two_condition_data` for many regions sharing one design: ``first`` and
+    ``second`` ``(B, n_times, K)``, depth 1 (deepest) first. ``y`` comes back
+    ``(B, n_scans, K)``; ``u``, ``rows`` and ``spec`` are shared, as
+    :func:`~fastfuncstuff.laminar.batched.variational_laplace_batched` wants. Every
+    region gets the same padding draw, as separate calls with one seed would."""
+    step = np.diff(times)
     if step.size == 0 or not np.allclose(step, step[0], rtol=1e-6):
         raise ValueError("curve samples must be evenly spaced (uniform TENT knots)")
     tr = float(step[0])
-    k = first.values.shape[1]
-    block = len(first.times) + 1  # one zero baseline row, then the response
+    n_b, _, k = first.shape
+    block = len(times) + 1  # one zero baseline row, then the response
 
     rng = np.random.default_rng(seed)
     pad = noise_sd * rng.standard_normal((gap, k))
     flip = slice(None, None, -1)  # depth 1 (deepest) first -> superficial first
+    zero = np.zeros((n_b, 1, k))
     y = np.concatenate(
-        [np.zeros((1, k)), first.values[:, flip], pad, np.zeros((1, k)), second.values[:, flip]]
+        [zero, first[:, :, flip], np.broadcast_to(pad, (n_b, gap, k)), zero, second[:, :, flip]],
+        axis=1,
     )
-    rows = np.zeros(len(y), bool)
+    rows = np.zeros(y.shape[1], bool)
     rows[1:block] = True
     rows[block + gap + 1 :] = True
 
@@ -179,7 +212,7 @@ def two_condition_data(
 
     onset_a = tr  # the event on the first response sample
     onset_b = (block + gap + 1) * tr
-    n_micro = int(round(len(y) * tr / spec.dt))
+    n_micro = int(round(y.shape[1] * tr / spec.dt))
     # The reference's modulatory pulse: 0.1 s, ending one sample after the second event.
     u = build_input(
         spec, [[onset_b + tr - 0.1], [onset_a, onset_b]], [[0.1], [duration, duration]], n_micro
@@ -191,7 +224,7 @@ def two_condition_data(
         u=u,
         spec=spec,
         integrate_kwargs=kwargs,
-        meta={"roi": first.name, "hemi": first.hemi, "TR": tr, "K": k, "block": block, "gap": gap},
+        meta={"TR": tr, "K": k, "block": block, "gap": gap},
     )
 
 
