@@ -46,7 +46,8 @@ def test_the_cli_writes_the_four_tables(reference, tmp_path):
     prefix = str(tmp_path / "quick")
     rc = laminar.main(
         ["-cond1", str(a), "-cond2", str(b), "-duration", "1.6", "-psf_kernel", str(kern),
-         "-reference_delay", "-models", "null", "-max_iter", "2", "-prefix", prefix,
+         "-reference_delay", "-modulation", "reference", "-models", "null", "-max_iter", "2",
+         "-prefix", prefix,
          "-workers", "1", "-verb", "0"]
     )  # fmt: skip
     assert rc == 0
@@ -90,7 +91,7 @@ def test_the_pipeline_reaches_matlabs_free_energy_with_its_padding(reference):
     y = np.asarray(o["y"], float).reshape(o["ns"], o["K"])
     data = two_condition_data(
         pick_roi(read_iresp_table(a), "V1"), pick_roi(read_iresp_table(b), "V1"),
-        duration=1.6, delay_seconds=None, p0=reference_p0(),
+        duration=1.6, delay_seconds=None, p0=reference_p0(), modulation="reference",
     )  # fmt: skip
     data.y[8:28] = torch.tensor(y[8:28])
     k = torch.tensor(np.loadtxt(kern))
@@ -108,7 +109,8 @@ def test_the_cli_reaches_matlabs_model_comparison(reference, tmp_path):
     prefix = str(tmp_path / "parity")
     rc = laminar.main(
         ["-cond1", str(a), "-cond2", str(b), "-duration", "1.6", "-psf_kernel", str(kern),
-         "-reference_delay", "-models", "superficial", "null", "-prefix", prefix,
+         "-reference_delay", "-modulation", "reference", "-models", "superficial", "null",
+         "-prefix", prefix,
          "-workers", "1", "-verb", "0"]
     )  # fmt: skip
     assert rc == 0
@@ -204,7 +206,7 @@ def test_a_stalled_fit_is_flagged_warned_about_and_rescued_on_request(reference)
     o, a, b, kern = reference
     data = two_condition_data(
         pick_roi(read_iresp_table(a), "V1"), pick_roi(read_iresp_table(b), "V1"),
-        duration=1.6, delay_seconds=None, p0=reference_p0(),
+        duration=1.6, delay_seconds=None, p0=reference_p0(), modulation="reference",
     )  # fmt: skip
     k = torch.tensor(np.loadtxt(kern))
     kw = dict(targets=[(0, 0, 1), (1, 0, 1)], names=["deep", "superficial+deep"])
@@ -218,3 +220,4 @@ def test_a_stalled_fit_is_flagged_warned_about_and_rescued_on_request(reference)
     assert not fixed.stalled.any() and not fixed.warnings
     assert fixed.F[1] > fixed.F[0] - 5  # a superset is no worse than what it contains
     assert abs(fixed.F[1] - (-125.7)) < 6  # MATLAB's value, on a different padding draw
+

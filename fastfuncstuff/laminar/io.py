@@ -130,6 +130,7 @@ def two_condition_data(
     min_coverage: float = 0.99,
     p0=None,
     dtype: torch.dtype = torch.float64,
+    modulation: str | tuple[float, float] = "event",
 ) -> LaminarData:
     """Faes et al.'s design from two conditions' curves of one ROI.
 
@@ -157,7 +158,7 @@ def two_condition_data(
     data = two_condition_batch(
         first.values[None], second.values[None], first.times, duration=duration,
         n_neuronal=n_neuronal, gap=gap, noise_sd=noise_sd, seed=seed,
-        delay_seconds=delay_seconds, TE=TE, B0=B0, p0=p0, dtype=dtype,
+        delay_seconds=delay_seconds, TE=TE, B0=B0, p0=p0, dtype=dtype, modulation=modulation,
     )  # fmt: skip
     data.y = data.y[0]
     data.meta.update({"roi": first.name, "hemi": first.hemi})
@@ -179,12 +180,21 @@ def two_condition_batch(
     B0: float = 7.0,
     p0=None,
     dtype: torch.dtype = torch.float64,
+    modulation: str | tuple[float, float] = "event",
 ) -> LaminarData:
     """:func:`two_condition_data` for many regions sharing one design: ``first`` and
     ``second`` ``(B, n_times, K)``, depth 1 (deepest) first. ``y`` comes back
     ``(B, n_scans, K)``; ``u``, ``rows`` and ``spec`` are shared, as
     :func:`~fastfuncstuff.laminar.batched.variational_laplace_batched` wants. Every
-    region gets the same padding draw, as separate calls with one seed would."""
+    region gets the same padding draw, as separate calls with one seed would.
+
+    ``modulation`` is when the modulatory input is on, relative to the second event:
+    ``"event"`` (default) for the whole event, which is what a condition difference
+    means when the conditions are simply different stimuli or tasks. ``"reference"``
+    is the published pulse, 0.1 s ending one sample after the event onset. In Faes et
+    al. that is the fourth tone of a 1.6 s quartet at TR 1.6, the moment of the
+    prediction violation: a property of that paradigm, needed only for parity.
+    ``(start, duration)`` gives seconds after the second onset."""
     step = np.diff(times)
     if step.size == 0 or not np.allclose(step, step[0], rtol=1e-6):
         raise ValueError("curve samples must be evenly spaced (uniform TENT knots)")
@@ -213,9 +223,20 @@ def two_condition_batch(
     onset_a = tr  # the event on the first response sample
     onset_b = (block + gap + 1) * tr
     n_micro = int(round(y.shape[1] * tr / spec.dt))
-    # The reference's modulatory pulse: 0.1 s, ending one sample after the second event.
+    if modulation == "event":
+        m_start, m_dur = 0.0, float(duration)
+    elif modulation == "reference":
+        m_start, m_dur = tr - 0.1, 0.1
+    elif isinstance(modulation, str):
+        raise ValueError(
+            f"modulation must be 'event', 'reference' or (start, duration), not {modulation!r}"
+        )
+    else:
+        m_start, m_dur = float(modulation[0]), float(modulation[1])
+    if m_dur <= 0:
+        raise ValueError("the modulatory input needs a positive duration")
     u = build_input(
-        spec, [[onset_b + tr - 0.1], [onset_a, onset_b]], [[0.1], [duration, duration]], n_micro
+        spec, [[onset_b + m_start], [onset_a, onset_b]], [[m_dur], [duration, duration]], n_micro
     )
     kwargs = {} if delay_seconds is None else {"delay_seconds": float(delay_seconds)}
     return LaminarData(
