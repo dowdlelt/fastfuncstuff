@@ -141,3 +141,31 @@ def test_per_fit_matrix_kernel_matches_serial():
         s = variational_laplace(spec, pr, u, Y[i], rows=rows, kernel=kern[i])
         assert batch.result(i).n_iter == s.n_iter
         assert math.isclose(float(batch.F[i]), float(s.F), rel_tol=1e-9, abs_tol=1e-7)
+
+
+@pytest.mark.slow  # 107 s: two models, serial reference per column
+def test_fit_columns_matches_fit_roi_per_column():
+    """The batched model space reports what the validated per-ROI pipeline does:
+    F per model, model and depth probabilities, the best model's B."""
+    from fastfuncstuff.laminar.io import LaminarData
+    from fastfuncstuff.laminar.pipeline import fit_roi
+    from fastfuncstuff.laminar.scope import fit_columns
+
+    spec, y, u, rows, kernel = _oracle_problem()
+    g = torch.Generator().manual_seed(5)
+    Y = torch.stack([y, 0.8 * y + 0.05 * torch.randn(y.shape, generator=g, dtype=torch.float64)])
+    targets = [(0, 0, 0), (1, 0, 0)]
+    batched = fit_columns(
+        {spec.K: LaminarData(y=Y, rows=rows, u=u, spec=spec)}, {spec.K: kernel},
+        targets=targets, device=CPU, progress=False,
+    )  # fmt: skip
+    for i in range(2):
+        one = fit_roi({spec.K: LaminarData(y=Y[i], rows=rows, u=u, spec=spec)}, {spec.K: kernel},
+                      targets=targets)  # fmt: skip
+        np.testing.assert_allclose(batched.F[i], one.F, rtol=1e-9, atol=1e-6)
+        np.testing.assert_allclose(batched.p_model[i], one.p_model, atol=1e-6)
+        np.testing.assert_allclose(batched.p_depth[i], one.p_depth, atol=1e-6)
+        assert batched.best[i] == one.best
+        np.testing.assert_allclose(batched.B_mean[i], one.B_mean, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(batched.B_sd[i], one.B_sd, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(batched.r2[i], one.r2, rtol=1e-6, atol=1e-8)

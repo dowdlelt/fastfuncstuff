@@ -399,4 +399,55 @@ def variational_laplace_batched(
     )
 
 
-__all__ = ["BatchedVL", "dx_b", "inv_b", "logdet_b", "variational_laplace_batched"]
+@dataclass
+class BatchedBPA:
+    """One model's posteriors averaged across K, per dataset (``spm_dcm_bpa``)."""
+
+    Ep_vec: torch.Tensor  # noqa: N815  (B, n_params)
+    Vp_vec: torch.Tensor  # noqa: N815  (B, n_params) posterior variance, 0 where fixed
+    Pp_vec: torch.Tensor  # noqa: N815  (B, n_params) P(parameter differs from 0)
+    F: torch.Tensor  # (B,)
+    per_k_F: torch.Tensor  # noqa: N815  (B, n_K)
+
+
+def bpa_batched(runs: list[BatchedVL], *, free_energy: str = "reference") -> BatchedBPA:
+    """:func:`~fastfuncstuff.laminar.experiment.bayesian_parameter_average` for
+    ``B`` datasets at once; ``runs`` is one :class:`BatchedVL` per K."""
+    if not runs:
+        raise ValueError("no inversions to average")
+    free_idx = runs[0].free_idx
+    for r in runs[1:]:
+        if not torch.equal(r.free_idx, free_idx):
+            raise ValueError("inversions must share a parameter structure to be averaged")
+    precisions = torch.stack([inv_b(r.Cp) for r in runs])  # (nK, B, np, np)
+    Cp = inv_b(precisions.sum(0))
+    reduced = torch.stack([r.Ep_vec[:, free_idx] for r in runs])  # (nK, B, np)
+    Ep_red = (Cp @ (precisions @ reduced[..., None]).sum(0))[..., 0]
+    Ep = torch.stack([r.Ep_vec for r in runs]).mean(0)
+    Ep[:, free_idx] = Ep_red
+    Vp = torch.zeros_like(Ep)
+    Vp[:, free_idx] = torch.diagonal(Cp, dim1=-2, dim2=-1)
+    sd = torch.sqrt(torch.clamp(Vp, min=0))
+    z = torch.where(sd > 0, Ep.abs() / torch.clamp(sd, min=1e-300), torch.zeros_like(sd))
+    Pp = torch.where(sd > 0, 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))), torch.zeros_like(sd))
+    per_k = torch.stack([r.F for r in runs], dim=1)
+    if free_energy == "reference":
+        F = per_k[:, 0]
+    elif free_energy == "sum":
+        F = per_k.sum(1)
+    elif free_energy == "mean":
+        F = per_k.mean(1)
+    else:
+        raise ValueError(f"free_energy must be 'reference', 'sum' or 'mean', got {free_energy!r}")
+    return BatchedBPA(Ep, Vp, Pp, F, per_k)
+
+
+__all__ = [
+    "BatchedBPA",
+    "BatchedVL",
+    "bpa_batched",
+    "dx_b",
+    "inv_b",
+    "logdet_b",
+    "variational_laplace_batched",
+]
