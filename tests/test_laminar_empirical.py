@@ -48,12 +48,15 @@ def test_columns_that_agree_are_shrunk_toward_their_neighbours():
     assert abs(np.mean(ep.mean[:, 0]) - (-0.4)) < 0.1
 
 
-def test_columns_that_truly_differ_keep_a_wide_prior():
+def test_columns_that_truly_differ_keep_their_own_prior():
     centres, hemi = _grid_centres(8)
     rng = np.random.default_rng(3)
     run, pr, _ = _posteriors(rng.normal(0, 1.5, len(centres)), sd_post=0.1)
     ep = empirical_vascular_prior(run, pr, centres, hemi, radius_mm=7.0)
-    assert ep.shrink >= 0.3
+    # No pooled prior beats each column's own, so none is applied (shrink 0), and the
+    # prior means stay where they were instead of moving toward the neighbours.
+    assert ep.shrink == 0.0 and ep.grid_free_energy.max() <= 0
+    assert np.allclose(ep.mean, 0.0)
 
 
 def test_neighbourhoods_respect_radius_and_hemisphere():

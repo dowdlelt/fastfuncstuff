@@ -220,6 +220,8 @@ def fit_columns(
                     radius_mm=None if vascular_prior == "global" else vascular_radius_mm,
                 )  # fmt: skip
                 empirical[k] = ep
+                if ep.shrink == 0.0:
+                    continue
                 for j, name in enumerate(ep.names):
                     overrides[k][f"pE:{name}"] = torch.as_tensor(ep.mean[:, j])
                     overrides[k][f"pC:{name}"] = ep.priors.pC[name].reshape(-1)

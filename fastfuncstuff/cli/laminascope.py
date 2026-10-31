@@ -343,6 +343,12 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                            vascular_radius_mm=args.vascular_radius, centres=centres[fit_idx],
                            hemi=columns.centre_surface[fit_idx])  # fmt: skip
         for k, ep in fits.empirical.items():
+            if ep.shrink == 0.0:
+                say(
+                    f"  vascular prior K={k}: no pooled prior beats the columns' own "
+                    f"(best summed dF {ep.grid_free_energy.max():.1f} nats) -- not applied"
+                )
+                continue
             say(f"  vascular prior K={k}: shrink {ep.shrink:.3g} of the prior variance; "
                 f"s_d prior mean {np.percentile(ep.mean[:, 0], 5):.2f}..{np.percentile(ep.mean[:, 0], 95):.2f}")  # fmt: skip
         say(

@@ -89,7 +89,7 @@ class EmpiricalPrior:
 
     names: tuple[str, ...]
     mean: np.ndarray  # (C, P) prior mean per column and parameter
-    shrink: float  # prior variance as a fraction of the original
+    shrink: float  # prior variance as a fraction of the original; 0 = not applied
     grid_free_energy: np.ndarray  # (G,) summed reduced F per grid value
     priors: Priors  # per-column reduced priors for the full model
 
@@ -141,6 +141,17 @@ def empirical_vascular_prior(
         if best is None or grid_free_energy[g] > grid_free_energy[best[0]]:
             best = (g, mu, pri)
     assert best is not None
+    if grid_free_energy[best[0]] <= 0.0:
+        # No pooled prior beats each column's own: keep the original prior (shrink 0
+        # marks "not applied"). Measured on sub-3003: re-centring at full width moved
+        # s_d further from its prior while the evidence said nothing was shared.
+        n = m.shape[0]
+        keep = {}
+        for j, name in enumerate(names):
+            keep[f"pE:{name}"] = torch.full((n,), float(pE0[j]), dtype=torch.float64)
+            keep[f"pC:{name}"] = torch.full((n,), float(pC0[j]), dtype=torch.float64)
+        return EmpiricalPrior(tuple(names), np.tile(pE0, (n, 1)), 0.0, grid_free_energy,
+                              batch_priors(full_priors, n, keep))  # fmt: skip
     return EmpiricalPrior(tuple(names), best[1], float(grid[best[0]]), grid_free_energy, best[2])
 
 
