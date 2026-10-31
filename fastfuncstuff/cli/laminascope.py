@@ -409,7 +409,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                           depth_names(args.N), device, say)  # fmt: skip
         _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say)
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
-                    "stalled", "failed", "nesting", "s_d"):  # fmt: skip
+                    "stalled", "failed", "nesting", "s_d", "refit"):  # fmt: skip
             out_npz[f"{cmp.name}_{key}"] = getattr(fits, key)
         for name, (mean, sd) in fits.vascular.items():
             out_npz[f"{cmp.name}_post_{name}_mean"] = mean

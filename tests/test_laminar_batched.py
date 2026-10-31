@@ -284,3 +284,34 @@ def test_fit_columns_reduce_reaches_the_published_answer():
     # 2.7 / 2.0 / 4.8 Hz: the modulated self-connection -sigma + B is net excitatory.
     assert fits.sigma_hz[0] == pytest.approx(0.126, abs=0.01)
     assert np.isfinite(fits.r2[0]).all() and (fits.r2[0] <= 1).all()
+
+
+@pytest.mark.slow  # 42 s: full inversion, one refit
+def test_unintegrable_reductions_are_inverted_instead(monkeypatch):
+    """Where a reduced posterior cannot be integrated, the model is inverted for those
+    columns: its F becomes brute force's (MATLAB: superficial -276.81 on this block)."""
+    import fastfuncstuff.laminar.scope as scope
+    from fastfuncstuff.laminar.io import LaminarData
+
+    spec, y, u, rows, kernel = _oracle_problem()
+    real = scope.predict_batched
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        out = real(*a, **k)
+        calls["n"] += 1
+        if calls["n"] == 1:  # the first reduced model: column 1 "blows up"
+            out = out.clone()
+            out[1] = float("nan")
+        return out
+
+    monkeypatch.setattr(scope, "predict_batched", flaky)
+    fits = scope.fit_columns(
+        {spec.K: LaminarData(y=torch.stack([y, y]), rows=rows, u=u, spec=spec)},
+        {spec.K: kernel}, targets=[(1, 0, 0), (1, 1, 1)], device=CPU, progress=False,
+        model_space="reduce",
+    )  # fmt: skip
+    assert fits.refit[:, 0].tolist() == [False, True] and not fits.refit[:, 1].any()
+    assert fits.F[1, 0] == pytest.approx(-276.81, abs=0.05)  # inverted
+    assert fits.F[0, 0] < -276.81  # reduced: the measured BMR gap, below brute force
+    assert np.isfinite(fits.r2).all()

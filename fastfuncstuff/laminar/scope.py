@@ -73,6 +73,9 @@ class ScopeFits:
     #: Global neuronal self-inhibition sigma (Hz), model-averaged; the test condition's
     #: self-inhibition at depth k is sigma - B_bma[:, k] (A_kk = -sigma + u B_k).
     sigma_hz: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: (C, M) models whose reduced posterior was not integrable and were inverted
+    #: instead (or withheld, under per-column priors).
+    refit: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), bool))
     timing: dict = field(default_factory=dict)
     #: K -> the empirical vascular prior applied (vascular_prior != "none").
     empirical: dict = field(default_factory=dict)
@@ -94,6 +97,20 @@ def _cat_runs(parts: list[BatchedVL]) -> BatchedVL:
     for f in dataclasses.fields(BatchedVL):
         if f.name not in ("free_idx", "spec"):
             setattr(out, f.name, torch.cat([getattr(p, f.name) for p in parts]))
+    return out
+
+
+def _replace_rows(run: BatchedVL, idx: torch.Tensor, sub: BatchedVL) -> BatchedVL:
+    """``run`` with datasets ``idx`` replaced by ``sub`` (same parameter structure)."""
+    if not torch.equal(run.free_idx.cpu(), sub.free_idx.cpu()):
+        raise ValueError("a refit must estimate the same parameters as the reduction")
+    out = dataclasses.replace(run)
+    for f in dataclasses.fields(BatchedVL):
+        if f.name in ("free_idx", "spec"):
+            continue
+        whole = getattr(run, f.name).clone()
+        whole[idx.to(whole.device)] = getattr(sub, f.name).to(whole.device, whole.dtype)
+        setattr(out, f.name, whole)
     return out
 
 
@@ -177,6 +194,7 @@ def fit_columns(
     failed = np.zeros((n_cols, n_m, n_k), bool)
     b_stats = np.zeros((3, n_m, n_cols, n))  # mean, sd, P per model, picked after
     s_d_all = np.zeros((n_m, n_cols))
+    refit = np.zeros((n_cols, n_m), bool)
     vasc_all = {name: np.zeros((2, n_m, n_cols)) for name in VASCULAR}
     sigma_all = np.zeros((n_m, n_cols))
     timing: dict[str, float] = {}
@@ -205,6 +223,20 @@ def fit_columns(
         timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
         if bar is not None:
             bar.update(1)
+        return run
+
+    def invert_idx(target, k, label, idx):
+        d = data_for_k[k]
+        kern = kernels.get(k)
+        if kern is not None and kern.ndim == 3:
+            kern = kern[idx.cpu()]
+        t0 = time.perf_counter()
+        run = variational_laplace_batched(
+            d.spec, faes_priors(d.spec, target), d.u, d.y[idx.cpu()], rows=d.rows,
+            kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
+            device=device, rescue=rescue, **d.integrate_kwargs,
+        )  # fmt: skip
+        timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
         return run
 
     def record(m, c0, c1, runs):
@@ -269,7 +301,7 @@ def fit_columns(
                     overrides[k][f"pC:{name}"] = ep.priors.pC[name].reshape(-1)
         for m, target in enumerate(targets):
             runs = []
-            for j, k in enumerate(ks):
+            for k in ks:
                 d = data_for_k[k]
                 full = full_all[k]
                 if tuple(target) == full_target and not overrides[k]:
@@ -279,10 +311,26 @@ def fit_columns(
                 if overrides[k]:
                     pri = batch_priors(pri, n_cols, overrides[k])
                 run = reduce_batched(full, faes_priors(d.spec, full_target), pri)
-                if j == 0:  # one forward pass, for the variance explained
-                    run = dataclasses.replace(run, y_pred=predict_batched(
-                        d.spec, run.Ep_vec, d.u, int(d.y.shape[1]), kernel=kernels.get(k),
-                        **d.integrate_kwargs))  # fmt: skip
+                # The reduced posterior must at least be integrable: where it is not (a
+                # net self-excitation held through a long block grows without bound),
+                # the Laplace step from the full posterior has failed, and that model is
+                # inverted properly for those columns instead.
+                pred = predict_batched(d.spec, run.Ep_vec, d.u, int(d.y.shape[1]),
+                                       kernel=kernels.get(k), **d.integrate_kwargs)  # fmt: skip
+                bad = ~torch.isfinite(pred).all(-1).all(-1)
+                if bool(bad.any()):
+                    idx = torch.nonzero(bad).flatten()
+                    refit[idx.cpu().numpy(), m] = True
+                    if overrides[k]:
+                        # Per-column priors cannot go through a shared-prior inversion;
+                        # the flag stands and the model's evidence is withheld.
+                        run = dataclasses.replace(run, F=torch.where(bad, -torch.inf, run.F))
+                    else:
+                        sub = invert_idx(target, k, f"{names[m]} (refit)", idx)
+                        run = _replace_rows(run, idx, sub)
+                        pred = pred.clone()
+                        pred[idx] = sub.y_pred.to(pred)
+                run = dataclasses.replace(run, y_pred=pred)
                 runs.append(run)
             record(m, 0, n_cols, runs)
     if bar is not None:
@@ -319,7 +367,7 @@ def fit_columns(
         list(names), [tuple(t) for t in targets], ks, F, per_k_F, p_model, p_depth, best,
         b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx],
         {name: (v[0, pick, idx], v[1, pick, idx]) for name, v in vasc_all.items()}, b_bma,
-        b_bma_sd, sigma_hz, timing, empirical,
+        b_bma_sd, sigma_hz, refit, timing, empirical,
     )  # fmt: skip
 
 
@@ -327,7 +375,7 @@ LONG_COLUMNS = (
     "subject", "comparison", "region", "name", "hemi", "n_vertices", "area_mm2",
     "neuronal_depth", "p_modulated", "B_bma", "B_bma_sd", "best_model", "p_best",
     "B_best", "B_best_sd", "P_B_best", "sigma_hz", "sigma_test_hz", "s_d", "r2_best",
-    "stalled", "failed", "nesting_nats",
+    "stalled", "failed", "nesting_nats", "n_refit",
 )  # fmt: skip
 
 
@@ -370,6 +418,7 @@ def write_long_table(
                     fits.B_p[j, i], fits.sigma_hz[j], fits.sigma_hz[j] - fits.B_bma[j, i],
                     fits.s_d[j], fits.r2[j, max(b, 0)], int(fits.stalled[j].any()),
                     int(fits.failed[j].any()), fits.nesting[j],
+                    int(fits.refit[j].sum()) if fits.refit.size else 0,
                 ]  # fmt: skip
                 w.writerow([f"{v:.6g}" if isinstance(v, float) else v for v in vals])
     return path
