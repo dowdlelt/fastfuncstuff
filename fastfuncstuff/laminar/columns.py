@@ -52,7 +52,8 @@ def responsive_vertices(
     absolute: bool = True,
     fracs: tuple[float, ...] = (0.1, 0.25, 0.4, 0.55, 0.7, 0.85),
 ) -> list[np.ndarray]:
-    """Per surface, the vertices whose column the volume ``path`` marks.
+    """Per surface, the vertices whose column the volume ``path`` marks (``file[N]``
+    picks brick N of a 4-D file).
 
     Read nearest-voxel along each column at ``fracs`` (white 0 .. pial 1): a
     column is responsive if any read passes -- non-zero for a mask, ``|value| >=
@@ -60,12 +61,19 @@ def responsive_vertices(
     statistic. Any depth, because a responsive patch need not span the ribbon
     (a thresholded map that peaks by pial). The medial wall never is.
     """
+    import re
+
     from fastfuncstuff.io.afni import load_nifti
 
-    img = load_nifti(path)
-    arr = np.asanyarray(img.dataobj).astype(np.float64)
+    m = re.fullmatch(r"(.+)\[(\d+)\]", path)
+    brick = int(m.group(2)) if m else 0
+    img = load_nifti(m.group(1) if m else path)
+    arr = np.asanyarray(img.dataobj)
     if arr.ndim == 4:
-        arr = arr[..., 0]
+        arr = arr[..., brick]
+    elif brick:
+        raise ValueError(f"{path}: a 3-D volume has no brick {brick}")
+    arr = np.asarray(arr, np.float64)
     inv = np.linalg.inv(np.asarray(img.affine, np.float64))
     out = []
     for s in surfaces:
@@ -238,7 +246,7 @@ def vertex_depth_reads(
             shape=(n_v * k, len(cells)),
         )
     stacked = sp.vstack([ops[k] for k in ks]).tocsr()
-    w_all, dropped = _compose(stacked, cells.centre, aff, shape3, opts.interp, mask3, n_vox)
+    w_all, _ = _compose(stacked, cells.centre, aff, shape3, opts.interp, mask3, n_vox)
     voxels = np.flatnonzero(np.asarray((w_all != 0).sum(axis=0)).ravel() > 0)
     w_all = w_all[:, voxels].tocsr()
     out = VertexDepthReads(ks, voxels, {}, {}, {}, notes=[ln for ln in plans[0].notes])
@@ -304,12 +312,84 @@ def column_curves(
     return ColumnCurves(K, values.reshape(-1, K, *trailing), coverage, psf)
 
 
+def paint_vertices(
+    columns: ColumnSet, values: np.ndarray, valid: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each vertex's mean over the (valid) columns that contain it, and how many.
+
+    ``values`` is ``(C, ...)``; returns ``(n_v, ...)`` (NaN where no valid column
+    reaches) and ``(n_v,)`` counts. Overlapping columns are not independent, so
+    the mean is a consensus of fits that share data, not a pooled estimate.
+    """
+    valid = np.ones(columns.n_columns, bool) if valid is None else np.asarray(valid, bool)
+    M = columns.members[np.flatnonzero(valid)]
+    vals = np.asarray(values, np.float64)[valid]
+    flat = vals.reshape(vals.shape[0], -1)
+    finite = np.isfinite(flat)
+    sums = np.asarray(M.T @ np.where(finite, flat, 0.0))
+    cnt = np.asarray(M.T @ finite.astype(np.float64))
+    out = np.divide(sums, cnt, out=np.full_like(sums, np.nan), where=cnt > 0)
+    n_cov = np.asarray(M.sum(axis=0)).ravel()
+    return out.reshape(-1, *vals.shape[1:]), n_cov
+
+
+def vertex_winner(
+    columns: ColumnSet, best: np.ndarray, n_models: int, valid: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each vertex's most frequent winning model over the columns containing it (-1
+    where none), and the share of those columns that agree -- the stability of
+    the answer to where the column edges fall."""
+    valid = np.ones(columns.n_columns, bool) if valid is None else np.asarray(valid, bool)
+    valid = valid & (best >= 0)
+    M = columns.members[np.flatnonzero(valid)]
+    onehot = np.zeros((int(valid.sum()), n_models))
+    onehot[np.arange(onehot.shape[0]), best[valid]] = 1.0
+    counts = np.asarray(M.T @ onehot)
+    tot = counts.sum(1)
+    winner = np.where(tot > 0, counts.argmax(1), -1)
+    agree = np.divide(counts.max(1), tot, out=np.full(tot.shape, np.nan), where=tot > 0)
+    return winner, agree
+
+
+def full_surface(columns: ColumnSet, vertex_values: np.ndarray, surface: int, n_vertices: int):
+    """Values on the column vertices of one surface, scattered to the whole mesh (NaN
+    elsewhere)."""
+    sel = columns.vertex_surface == surface
+    out = np.full((n_vertices, *vertex_values.shape[1:]), np.nan)
+    out[columns.vertex_id[sel]] = vertex_values[sel]
+    return out
+
+
+def paint_ribbon(
+    surfaces, columns: ColumnSet, vertex_values: np.ndarray, affine, shape, *, device=None
+) -> np.ndarray:
+    """Vertex values into the ribbon voxels of a grid, through each voxel's owning
+    vertex (nearest midthickness point, as the depth sampling owns its cells):
+    ``(X*Y*Z, ...)``, NaN off the columns."""
+    from fastfuncstuff.surface.volume_depth import cortical_depth_volumes
+
+    dv = cortical_depth_volumes(list(surfaces), affine, tuple(shape[:3]), n_layers=3,
+                                owners=True, device=device)  # fmt: skip
+    assert dv.owner_hemi is not None and dv.owner_vertex is not None
+    key = dv.owner_hemi.astype(np.int64) * _KEY + dv.owner_vertex
+    vkeys = columns.vertex_surface * _KEY + columns.vertex_id
+    slot = np.searchsorted(vkeys, key)
+    ok = (slot < vkeys.size) & (vkeys[np.minimum(slot, vkeys.size - 1)] == key)
+    out = np.full((int(np.prod(shape[:3])), *vertex_values.shape[1:]), np.nan)
+    out[dv.gm_idx[ok]] = vertex_values[slot[ok]]
+    return out
+
+
 __all__ = [
     "ColumnCurves",
     "ColumnSet",
     "VertexDepthReads",
     "column_curves",
+    "full_surface",
     "make_columns",
+    "paint_ribbon",
+    "paint_vertices",
     "responsive_vertices",
     "vertex_depth_reads",
+    "vertex_winner",
 ]

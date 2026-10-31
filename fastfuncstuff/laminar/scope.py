@@ -46,6 +46,9 @@ class ScopeFits:
     stalled: np.ndarray  # (C, M, nK)
     failed: np.ndarray  # (C, M, nK)
     nesting: np.ndarray  # (C,) worst shortfall of a model below one it contains (nats)
+    #: The best model's ascending-vein slope s_d (posterior mean, log-deviation from the
+    #: prior): the drainage parameter whose UNDERestimate gives wrong profiles.
+    s_d: np.ndarray = field(default_factory=lambda: np.zeros(0))
     timing: dict = field(default_factory=dict)
 
 
@@ -69,6 +72,7 @@ def fit_columns(
     device: torch.device | str | None = None,
     chunk: int | None = None,
     progress: bool = True,
+    rescue: int = 0,
 ) -> ScopeFits:
     """Invert, average across K and compare every column of ``data_for_k``.
 
@@ -104,6 +108,7 @@ def fit_columns(
     stalled = np.zeros((n_cols, n_m, n_k), bool)
     failed = np.zeros((n_cols, n_m, n_k), bool)
     b_stats = np.zeros((3, n_m, n_cols, n))  # mean, sd, P per model, picked after
+    s_d_all = np.zeros((n_m, n_cols))
     timing: dict[str, float] = {}
 
     bar = None
@@ -126,7 +131,7 @@ def fit_columns(
                 run = variational_laplace_batched(
                     d.spec, faes_priors(d.spec, target), d.u, d.y[c0:c1], rows=d.rows,
                     kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
-                    device=device, **d.integrate_kwargs,
+                    device=device, rescue=rescue, **d.integrate_kwargs,
                 )  # fmt: skip
                 timing[f"{names[m]}/K{k}"] = (
                     timing.get(f"{names[m]}/K{k}", 0.0) + time.perf_counter() - t0
@@ -144,6 +149,7 @@ def fit_columns(
             F[c0:c1, m] = np.where(bad, -np.inf, f)
             per_k_F[c0:c1, m] = bpa.per_k_F.cpu().numpy()
             spec = runs[0].spec
+            s_d_all[m, c0:c1] = unvec(bpa.Ep_vec, spec)["s_d"].reshape(-1).cpu().numpy()
             for s, vecs in enumerate((bpa.Ep_vec, bpa.Vp_vec, bpa.Pp_vec)):
                 B = unvec(vecs, spec)["B"][:, 0]  # (b, N, N)
                 v = torch.diagonal(B, dim1=-2, dim2=-1).cpu().numpy()
@@ -173,7 +179,7 @@ def fit_columns(
                 nesting = np.maximum(nesting, gap)
     return ScopeFits(
         list(names), [tuple(t) for t in targets], ks, F, per_k_F, p_model, p_depth, best,
-        b_mean, b_sd, b_p, r2, stalled, failed, nesting, timing,
+        b_mean, b_sd, b_p, r2, stalled, failed, nesting, s_d_all[pick, idx], timing,
     )  # fmt: skip
 
 
