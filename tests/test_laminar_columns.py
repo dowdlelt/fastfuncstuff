@@ -144,3 +144,26 @@ def test_responsive_vertices_reads_a_statistic_along_the_column(sphere, tmp_path
     (hit,) = responsive_vertices(str(path), [surf], threshold=4.0)
     assert hit[v[:, 0] > 0.2].mean() > 0.95
     assert not hit[v[:, 0] < -0.2].any()
+
+
+def test_regions_from_map_finds_each_surface_cluster(sphere, tmp_path):
+    from fastfuncstuff.laminar.columns import regions_from_map
+
+    surf, affine, shape, data, v = sphere
+    n = shape[0]
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    xyz = ijk @ affine[:3, :3].T + affine[:3, 3]
+    unit = xyz / np.maximum(np.linalg.norm(xyz, axis=-1, keepdims=True), 1e-9)
+    t = np.zeros(shape)
+    t[unit[..., 2] > 0.85] = 5.0  # a cap at the north pole
+    t[unit[..., 0] > 0.85] = 4.0  # another on +x, well apart
+    t[unit[..., 1] > 0.995] = 6.0  # a speck: too small to keep
+    path = tmp_path / "t.nii.gz"
+    nib.save(nib.Nifti1Image(t.astype(np.float32), affine), path)
+    regions = regions_from_map([surf], str(path), 3.1, min_area_mm2=30.0)
+    assert regions.n_columns == 2
+    centres = v[regions.centre_vertex]
+    assert sorted(np.argmax(np.abs(centres), axis=1).tolist()) == [0, 2]
+    # Members are each cap's vertices (claimed at any depth, closed along the mesh).
+    north = regions.vertex_id[regions.members[int(np.argmax(centres[:, 2]))].indices]
+    assert (v[north, 2] > 0.75).all() and len(north) > 20

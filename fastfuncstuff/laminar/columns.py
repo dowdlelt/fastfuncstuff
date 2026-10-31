@@ -178,6 +178,70 @@ def make_columns(
     )  # fmt: skip
 
 
+def regions_from_map(
+    surfaces,
+    path: str,
+    threshold: float,
+    *,
+    absolute: bool = False,
+    min_area_mm2: float = 20.0,
+    close_mm: float = 1.0,
+) -> ColumnSet:
+    """Regions as the connected surface clusters of a statistic: every patch where
+    ``path`` (read along each column, as :func:`responsive_vertices`) passes
+    ``threshold`` becomes one region, read through depth like a column.
+
+    For a selectivity map (faces > objects at t > 3.1) this gives the data's own
+    patches, typically several mm across, instead of disks of a chosen size. The
+    patch is closed along the mesh by ``close_mm`` first (sub-threshold holes inside
+    a patch come back, its outline does not move), and patches under
+    ``min_area_mm2`` (midthickness) are dropped. Select on independent data: a
+    localiser, never the contrast being tested.
+    """
+    from scipy.sparse.csgraph import connected_components
+
+    from fastfuncstuff.surface.mesh import MeshTopology, close_patch, vertex_areas
+
+    hits = responsive_vertices(path, surfaces, threshold=threshold, absolute=absolute)
+    cs, cv, member_lists = [], [], []
+    for h, (s, hit) in enumerate(zip(surfaces, hits, strict=True)):
+        if not hit.any():
+            continue
+        mid = _midthickness(s)
+        faces = np.asarray(s.faces)
+        topo = MeshTopology.from_faces(faces, mid.shape[0])
+        if close_mm > 0:
+            hit = close_patch(mid, topo, hit, close_mm)
+            if s.cortex is not None:
+                hit &= np.asarray(s.cortex, bool)
+        ids = np.flatnonzero(hit)
+        sub = topo.adjacency()[ids][:, ids]
+        n_comp, lab = connected_components(sub, directed=False)
+        area = vertex_areas(mid, faces, mid.shape[0])
+        for c in range(n_comp):
+            verts = ids[lab == c]
+            if area[verts].sum() < min_area_mm2:
+                continue
+            centroid = mid[verts].mean(0)
+            cs.append(h)
+            cv.append(int(verts[np.argmin(((mid[verts] - centroid) ** 2).sum(1))]))
+            member_lists.append(h * _KEY + verts.astype(np.int64))
+    if not cs:
+        raise ValueError(
+            f"{path}: no surface cluster of at least {min_area_mm2:g} mm2 passes {threshold:g}"
+        )
+    keys = np.unique(np.concatenate(member_lists))
+    rows = np.repeat(np.arange(len(member_lists)), [m.size for m in member_lists])
+    cols = np.searchsorted(keys, np.concatenate(member_lists))
+    members = sp.csr_matrix(
+        (np.ones(cols.size), (rows, cols)), shape=(len(member_lists), keys.size)
+    )
+    return ColumnSet(
+        np.asarray(cs), np.asarray(cv), members, (keys // _KEY).astype(np.int64),
+        (keys % _KEY).astype(np.int64), float("nan"), float("nan"),
+    )  # fmt: skip
+
+
 @dataclass
 class VertexDepthReads:
     """Vertex x depth reads of a data grid, per depth count ``K``.

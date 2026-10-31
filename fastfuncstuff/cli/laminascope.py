@@ -77,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     c = p.add_argument_group("Columns")
     add_ribbon_args(c)
-    c.add_argument("-responsive", required=True, metavar="FILE",
+    c.add_argument("-responsive", default=None, metavar="FILE",
                    help="Volume marking responsive cortex: a mask, or a statistic with "
                    "-responsive_thresh. A column centre goes wherever it marks the ribbon at "
                    "any depth. Select on something independent of the comparisons (an omnibus "
@@ -89,6 +89,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     c.add_argument("-within", default=None, metavar="FILE",
                    help="Only centre columns inside this region (label, annot or volume ROI): "
                    "for trying a few places before the whole cortex.")  # fmt: skip
+    c.add_argument("-regions_from", default=None, metavar="MAP",
+                   help="Instead of disks: one region per connected surface cluster of this "
+                   "statistic above -regions_thresh (e.g. faces > objects from a localiser), "
+                   "closed along the mesh by 1 mm, at least -regions_min_mm2. The data's own "
+                   "patches, often 8-10 mm or more across. Select on independent runs.")  # fmt: skip
+    c.add_argument("-regions_thresh", type=float, default=3.1, metavar="T",
+                   help="Threshold for -regions_from (value >= T; |value| with -regions_abs).")  # fmt: skip
+    c.add_argument("-regions_abs", action="store_true",
+                   help="Cluster |value| >= T, so negative patches (objects > faces) count too.")  # fmt: skip
+    c.add_argument("-regions_min_mm2", type=float, default=20.0, metavar="MM2",
+                   help="Smallest cluster kept as a region (midthickness area).")  # fmt: skip
     c.add_argument("-column_radius", type=float, default=3.0, metavar="MM",
                    help="Geodesic radius of a column on the midthickness.")  # fmt: skip
     c.add_argument("-column_spacing", type=float, default=None, metavar="MM",
@@ -243,27 +254,38 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,
         args.cortex_label, hemi=args.hemi, log=logs.append,
     )  # fmt: skip
-    resp = col.responsive_vertices(args.responsive, surfaces, threshold=args.responsive_thresh,
-                                   absolute=not args.responsive_positive)  # fmt: skip
-    if args.within:
-        notes: list[str] = []
-        inside = [np.zeros(len(s.white), bool) for s in surfaces]
-        for r in read_depth_rois([args.within], surfaces, notes, CLAIM_ANY):
-            for h, mbr in r.members.items():
-                inside[h] |= mbr
-        resp = [a & b for a, b in zip(resp, inside, strict=True)]
-    say(
-        "Responsive vertices: "
-        + ", ".join(f"{s.name} {int(r.sum()):,}" for s, r in zip(surfaces, resp, strict=True))
-    )
-
-    t0 = time.time()
-    columns = col.make_columns(surfaces, resp, radius_mm=args.column_radius,
-                               spacing_mm=args.column_spacing, seed=args.seed)  # fmt: skip
-    cover = columns.coverage_count()
-    say(f"Columns: {columns.n_columns:,} (radius {columns.radius_mm:g} mm, spacing "
-        f"{columns.spacing_mm:g} mm) over {columns.vertex_id.size:,} vertices; columns per "
-        f"vertex median {np.median(cover):.0f} ({time.time() - t0:.0f} s)")  # fmt: skip
+    if args.regions_from:
+        t0 = time.time()
+        columns = col.regions_from_map(surfaces, args.regions_from, args.regions_thresh,
+                                       absolute=args.regions_abs, min_area_mm2=args.regions_min_mm2)  # fmt: skip
+        sizes = np.asarray(columns.members.sum(axis=1)).ravel()
+        say(f"Regions: {columns.n_columns} cluster(s) of {args.regions_from} >= {args.regions_thresh:g}, "
+            f"{int(np.median(sizes)):,} vertices median ({time.time() - t0:.0f} s)")  # fmt: skip
+    else:
+        if not args.responsive:
+            raise ValueError(
+                "give -responsive (columns centred on responsive cortex) or -regions_from"
+            )
+        resp = col.responsive_vertices(args.responsive, surfaces, threshold=args.responsive_thresh,
+                                       absolute=not args.responsive_positive)  # fmt: skip
+        if args.within:
+            notes: list[str] = []
+            inside = [np.zeros(len(s.white), bool) for s in surfaces]
+            for r in read_depth_rois([args.within], surfaces, notes, CLAIM_ANY):
+                for h, mbr in r.members.items():
+                    inside[h] |= mbr
+            resp = [a & b for a, b in zip(resp, inside, strict=True)]
+        say(
+            "Responsive vertices: "
+            + ", ".join(f"{s.name} {int(r.sum()):,}" for s, r in zip(surfaces, resp, strict=True))
+        )
+        t0 = time.time()
+        columns = col.make_columns(surfaces, resp, radius_mm=args.column_radius,
+                                   spacing_mm=args.column_spacing, seed=args.seed)  # fmt: skip
+        cover = columns.coverage_count()
+        say(f"Columns: {columns.n_columns:,} (radius {columns.radius_mm:g} mm, spacing "
+            f"{columns.spacing_mm:g} mm) over {columns.vertex_id.size:,} vertices; columns per "
+            f"vertex median {np.median(cover):.0f} ({time.time() - t0:.0f} s)")  # fmt: skip
 
     ks = depth_list(args)
     opts = options_from_args(args)
