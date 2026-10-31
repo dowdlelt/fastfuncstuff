@@ -373,7 +373,7 @@ def fit_columns(
 
 LONG_COLUMNS = (
     "subject", "comparison", "region", "name", "hemi", "n_vertices", "area_mm2",
-    "neuronal_depth", "p_modulated", "B_bma", "B_bma_sd", "best_model", "p_best",
+    "in_fov", "baseline_peak", "neuronal_depth", "p_modulated", "B_bma", "B_bma_sd", "best_model", "p_best",
     "B_best", "B_best_sd", "P_B_best", "sigma_hz", "sigma_test_hz", "s_d", "r2_best",
     "stalled", "failed", "nesting_nats", "n_refit",
 )  # fmt: skip
@@ -391,10 +391,17 @@ def write_long_table(
     n_vertices: np.ndarray,
     area_mm2: np.ndarray,
     depth_names: list[str],
+    in_fov: np.ndarray | None = None,
+    baseline_peak: np.ndarray | None = None,
 ) -> str:
     """One line per region x neuronal depth, tidy, for group tests: concatenate the
     subjects' tables and test B_bma (or p_modulated, sigma_test_hz) per region and
     depth. The rows of ``fits`` are the regions, in the order of the other arguments.
+
+    ``in_fov`` is the share of the region's ribbon that was read (a slab can cover
+    part of V1), and ``baseline_peak`` the peak of the depth-averaged baseline curve
+    (percent): a region with no response has nothing for the model to explain, and
+    its B values are noise however well flagged.
 
     ``sigma_test_hz`` is the self-inhibition during the test condition,
     sigma - B_bma: positive B lowers inhibition (A_kk = -sigma + u B_k), and a
@@ -403,6 +410,11 @@ def write_long_table(
     """
     import csv
 
+    n = len(region_ids)
+    in_fov = np.ones(n) if in_fov is None else np.asarray(in_fov, float)
+    baseline_peak = (
+        np.full(n, np.nan) if baseline_peak is None else np.asarray(baseline_peak, float)
+    )
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
         w.writerow(LONG_COLUMNS)
@@ -412,7 +424,8 @@ def write_long_table(
             for i, d in enumerate(depth_names):
                 vals = [
                     subject, comparison, int(region_ids[j]), names[j], hemis[j],
-                    int(n_vertices[j]), float(area_mm2[j]), d, fits.p_depth[j, i],
+                    int(n_vertices[j]), float(area_mm2[j]), float(in_fov[j]),
+                    float(baseline_peak[j]), d, fits.p_depth[j, i],
                     fits.B_bma[j, i], fits.B_bma_sd[j, i], model,
                     fits.p_model[j, max(b, 0)], fits.B_mean[j, i], fits.B_sd[j, i],
                     fits.B_p[j, i], fits.sigma_hz[j], fits.sigma_hz[j] - fits.B_bma[j, i],

@@ -134,6 +134,7 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     rows = list(csv.DictReader(open(f"{third}_ab_regions_long.tsv"), delimiter="\t"))
     assert len(rows) == 2 * 3 and {r["name"] for r in rows} == {"lh.cap", "lh.ring"}
     assert {r["subject"] for r in rows} == {"sub-x"}
+    assert all(float(r["in_fov"]) == 1.0 and float(r["baseline_peak"]) > 0 for r in rows)
     assert [r["neuronal_depth"] for r in rows[:3]] == ["superficial", "middle", "deep"]
     for r in rows:
         assert float(r["sigma_test_hz"]) == pytest.approx(

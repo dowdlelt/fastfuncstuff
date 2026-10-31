@@ -15,6 +15,7 @@ from fastfuncstuff.laminar.columns import (
     column_curves,
     make_columns,
     responsive_vertices,
+    trim_to_coverage,
     vertex_depth_reads,
 )
 from fastfuncstuff.processing.roi_depth import (
@@ -129,6 +130,28 @@ def test_mask_shows_up_as_coverage(sphere):
                                device=CPU)  # fmt: skip
     cc = column_curves(reads, cols, data[reads.voxels], 4)
     assert cc.coverage[0, 0] > 0.99 and cc.coverage[0, -1] < 0.5
+
+
+def test_a_region_cut_by_the_slab_keeps_its_covered_part(sphere):
+    surf, affine, shape, data, v = sphere
+    resp = np.zeros(len(v), bool)
+    resp[int(np.argmax(v[:, 2]))] = True
+    cols = make_columns([surf], [resp], radius_mm=9.0, spacing_mm=0.5)
+    # A slab boundary through the region: x >= 1 mm out of the FOV.
+    n = shape[0]
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    x = (ijk @ affine[:3, :3].T + affine[:3, 3])[:, 0]
+    mask = (x < 1.0).reshape(shape)
+    opts = DepthOptions(n_depths=4, dxyz=1.0)
+    reads = vertex_depth_reads([surf], cols, affine, shape, [4], opts, mask=mask, psf=False,
+                               device=CPU)  # fmt: skip
+    assert column_curves(reads, cols, data[reads.voxels], 4).coverage.min() < 0.9
+    trimmed, kept = trim_to_coverage(cols, reads, 0.9)
+    cc = column_curves(reads, trimmed, data[reads.voxels], 4)
+    assert cc.coverage.min() >= 0.9
+    assert 0.3 < kept[0] < 0.8
+    ids = trimmed.vertex_id[trimmed.members[0].indices]
+    assert (v[ids, 0] * RP < 1.0).all()
 
 
 def test_responsive_vertices_reads_a_statistic_along_the_column(sphere, tmp_path):

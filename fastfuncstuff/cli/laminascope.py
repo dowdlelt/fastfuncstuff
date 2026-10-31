@@ -305,6 +305,14 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
     reads = col.vertex_depth_reads(surfaces, columns, affine, shape3, ks, opts, mask=mask,
                                    psf=args.psf == "measured", device=device)  # fmt: skip
     say(f"Depth reads: K = {ks}, {reads.voxels.size:,} voxels ({time.time() - t0:.0f} s)")
+    in_fov = np.ones(columns.n_columns)
+    if args.regions_atlas or args.regions_from:
+        columns, in_fov = col.trim_to_coverage(columns, reads, args.min_coverage)
+        cut = in_fov < 0.999
+        if cut.any():
+            say("Regions trimmed to the FOV/mask: " + ", ".join(
+                f"{columns.names[c] if columns.names else c} {100 * in_fov[c]:.0f}%"
+                for c in np.flatnonzero(cut)))  # fmt: skip
 
     # Voxel curves of every label used, on the voxels the reads touch.
     curves_vox = {}
@@ -407,7 +415,10 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         results[cmp.name] = fits
         _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
                           depth_names(args.N), device, say)  # fmt: skip
-        _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say)
+        k_mid = ks[len(ks) // 2]
+        base_mid = np.mean([col_curves[k_mid][lab][fit_idx] for lab in cmp.baseline], axis=0)
+        _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say,
+                    in_fov=in_fov[fit_idx], baseline_peak=base_mid.mean(1).max(1))  # fmt: skip
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
                     "stalled", "failed", "nesting", "s_d", "refit"):  # fmt: skip
             out_npz[f"{cmp.name}_{key}"] = getattr(fits, key)
@@ -467,7 +478,8 @@ def _vascular_from(spec, columns, fit_idx):
     return out
 
 
-def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say) -> None:
+def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say, *, in_fov,
+                baseline_peak) -> None:  # fmt: skip
     from pathlib import Path
 
     from fastfuncstuff.laminar.scope import write_long_table
@@ -497,6 +509,7 @@ def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say) -> Non
         subject=args.subject or Path(args.prefix).name, comparison=cmp.name,
         region_ids=np.asarray(fit_idx), names=names, hemis=hemis,
         n_vertices=np.asarray(n_vert), area_mm2=np.asarray(area), depth_names=dnames,
+        in_fov=in_fov, baseline_peak=baseline_peak,
     )  # fmt: skip
     say(f"  wrote {path}")
 

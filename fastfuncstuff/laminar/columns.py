@@ -26,7 +26,7 @@ the fit of the column mean.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import scipy.sparse as sp
@@ -383,6 +383,29 @@ def vertex_depth_reads(
     return out
 
 
+def trim_to_coverage(
+    columns: ColumnSet, reads: VertexDepthReads, min_coverage: float
+) -> tuple[ColumnSet, np.ndarray]:
+    """Drop from every column the vertices whose own depth reads are cut (FOV or mask
+    under ``min_coverage`` at any bin, at any K). For named regions, which are large
+    and fixed in advance: a slab that misses part of V1 should give V1's covered
+    part, not lose V1. Returns the trimmed set and each column's kept share of
+    ribbon volume."""
+    keep = np.ones(columns.vertex_id.size, bool)
+    for k in reads.ks:
+        cov = np.divide(reads.volume[k], reads.volume_all[k], out=np.ones_like(reads.volume[k]),
+                        where=reads.volume_all[k] > 0)  # fmt: skip
+        keep &= cov.min(axis=1) >= min_coverage
+    M = columns.members.tocsr()
+    k0 = reads.ks[0]
+    before = np.asarray(M @ reads.volume_all[k0].sum(1)).ravel()
+    trimmed = sp.csr_matrix(M.multiply(keep[None, :]))
+    trimmed.eliminate_zeros()
+    after = np.asarray(trimmed @ reads.volume_all[k0].sum(1)).ravel()
+    kept = np.divide(after, before, out=np.zeros_like(after), where=before > 0)
+    return replace(columns, members=trimmed), kept
+
+
 @dataclass
 class ColumnCurves:
     """Every column's depth-resolved curves at one depth count."""
@@ -498,6 +521,7 @@ __all__ = [
     "paint_ribbon",
     "paint_vertices",
     "responsive_vertices",
+    "trim_to_coverage",
     "vertex_depth_reads",
     "vertex_winner",
 ]
