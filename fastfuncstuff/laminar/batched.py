@@ -134,6 +134,18 @@ class BatchedVL:
         )
 
 
+def _replace_fits(res: BatchedVL, idx: torch.Tensor, sub: BatchedVL) -> BatchedVL:
+    """``res`` with fits ``idx`` replaced by ``sub``'s."""
+    out = dataclasses.replace(res)
+    for f in dataclasses.fields(BatchedVL):
+        if f.name in ("free_idx", "spec"):
+            continue
+        whole = getattr(res, f.name).clone()
+        whole[idx] = getattr(sub, f.name).to(whole.device)
+        setattr(out, f.name, whole)
+    return out
+
+
 def _psf_after(preds: torch.Tensor, kernels: torch.Tensor) -> torch.Tensor:
     """Per-fit depth PSF on ``(B, P, n_scans, K)`` predictions: a ``(B, K, K)`` matrix
     per fit. Linear and applied per scan, so applying it after the integration is
@@ -153,9 +165,19 @@ def variational_laplace_batched(
     hyper_from_rows: bool = False,
     device: torch.device | str | None = None,
     progress: bool = False,
+    rescue: int = 0,
+    start: tuple[torch.Tensor, torch.Tensor] | None = None,
+    width: int | None = None,
     **integrate_kwargs,
 ) -> BatchedVL:
     """Invert one model against ``Y`` ``(B, n_scans, K)``, all fits at once.
+
+    ``rescue`` restarts fits that stalled (ended on rejected steps) from their best
+    point with the damping reset, up to that many times, as
+    :func:`~fastfuncstuff.laminar.inversion.variational_laplace` does: a restarted
+    fit takes the restarted run's result. ``start`` is ``(p, h)`` per fit (reduced
+    parameters, log-precisions) and ``width`` the compiled batch width; both exist
+    for the restarts.
 
     ``kernel`` is the depth PSF: ``None``, one kernel for every fit (1-D or
     ``(K, K)``, applied inside the integration exactly as the serial path does),
@@ -163,6 +185,24 @@ def variational_laplace_batched(
     shared: every dataset has the same design. ``device`` moves the whole
     inversion (default: ``spec.device``).
     """
+    if rescue:
+        kw = dict(rows=rows, max_iter=max_iter, hyper_from_rows=hyper_from_rows, device=device,
+                  progress=progress, **integrate_kwargs)  # fmt: skip
+        res = variational_laplace_batched(spec, priors, u, Y, kernel=kernel, **kw)
+        pe_free = vec(priors.pE).to(res.Ep_vec)[res.free_idx]
+        n_probe = int(res.free_idx.numel()) + 1
+        for _ in range(int(rescue)):
+            redo = torch.nonzero(res.stalled).flatten()
+            if redo.numel() == 0:
+                break
+            per_fit = kernel is not None and kernel.ndim == 3
+            sub = variational_laplace_batched(
+                spec, priors, u, Y[redo.cpu()], kernel=kernel[redo.cpu()] if per_fit else kernel,
+                start=(res.Ep_vec[redo][:, res.free_idx] - pe_free, res.Eh[redo]),
+                width=batch_bucket(Y.shape[0] * n_probe), **kw,
+            )  # fmt: skip
+            res = _replace_fits(res, redo, sub)
+        return res
     device = torch.device(device) if device is not None else spec.device
     spec = dataclasses.replace(spec, device=device)
     dtype = spec.dtype
@@ -208,7 +248,7 @@ def variational_laplace_batched(
     else:
         ihC = inv_b(priors.hC.to(dtype=dtype, device=device)[None])[0]
 
-    width = batch_bucket(B * (np_ + 1))
+    width = width or batch_bucket(B * (np_ + 1))
     eye_np = torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
 
     def predict(p: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -239,6 +279,9 @@ def variational_laplace_batched(
 
     p = torch.zeros(B, np_, dtype=dtype, device=device)
     h = hE.clone()
+    if start is not None:  # a restart: the damping resets, the position does not
+        p = start[0].to(dtype=dtype, device=device).clone()
+        h = start[1].to(dtype=dtype, device=device).clone()
     v_rate = torch.full((B,), -4.0, dtype=dtype, device=device)
     best_F = torch.full((B,), -math.inf, dtype=dtype, device=device)
     best_p, best_h = p.clone(), h.clone()

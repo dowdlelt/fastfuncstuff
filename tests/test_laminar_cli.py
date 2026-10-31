@@ -221,3 +221,32 @@ def test_a_stalled_fit_is_flagged_warned_about_and_rescued_on_request(reference)
     assert fixed.F[1] > fixed.F[0] - 5  # a superset is no worse than what it contains
     assert abs(fixed.F[1] - (-125.7)) < 6  # MATLAB's value, on a different padding draw
 
+
+@pytest.mark.slow  # 56 s: the stalled fit, serial and batched, each with rescue
+def test_batched_rescue_matches_serial_rescue(reference):
+    """The stall case above, through the batched engine: the same fit stalls, and
+    rescue restarts it to the serial rescue's answer."""
+    import torch
+
+    from fastfuncstuff.laminar.batched import variational_laplace_batched
+    from fastfuncstuff.laminar.experiment import faes_priors
+    from fastfuncstuff.laminar.inversion import variational_laplace
+    from fastfuncstuff.laminar.io import pick_roi, read_iresp_table, two_condition_data
+    from fastfuncstuff.laminar.pipeline import reference_p0
+
+    o, a, b, kern = reference
+    data = two_condition_data(
+        pick_roi(read_iresp_table(a), "V1"), pick_roi(read_iresp_table(b), "V1"),
+        duration=1.6, delay_seconds=None, p0=reference_p0(), modulation="reference",
+    )  # fmt: skip
+    k = torch.tensor(np.loadtxt(kern))
+    pr = faes_priors(data.spec, (1, 0, 1))
+    Y = torch.stack([data.y, data.y])  # one stalls; the copy checks rows stay apart
+    kw = dict(rows=data.rows, kernel=k, **data.integrate_kwargs)
+    plain = variational_laplace_batched(data.spec, pr, data.u, Y, device="cpu", **kw)
+    assert bool(plain.stalled.all())
+    fixed = variational_laplace_batched(data.spec, pr, data.u, Y, device="cpu", rescue=2, **kw)
+    serial = variational_laplace(data.spec, pr, data.u, data.y, rescue=2, **kw)
+    assert not bool(fixed.stalled.any()) and not serial.stalled
+    for i in range(2):
+        assert float(fixed.F[i]) == pytest.approx(float(serial.F), rel=1e-8, abs=1e-6)
