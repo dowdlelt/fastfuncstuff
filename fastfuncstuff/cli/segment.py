@@ -765,17 +765,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    device_spec = args.device
-    if (
-        device_spec is None or str(device_spec).lower() == "auto"
-    ) and not torch.cuda.is_available():
-        device_spec = "cpu"
-    device = setup_device(device_spec)
-    if device.type == "mps":
-        raise SystemExit(
-            "ffs_segment: MPS cannot run the required float64 geometry and 3-D backward path; "
-            "use -device cpu on Mac."
-        )
+    # float64 geometry and a 3-D backward pass, so never Metal.
+    device = setup_device(args.device, float64_only="ffs_segment")
     verbose = not args.quiet
     if verbose:
         print(f"ffs_segment on {device}: {args.input}")
@@ -929,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
             source_affine=fit_affine_np,
             fitted_base_affine=matrix_base_np,
             fitted_source_affine=np.asarray(hdr["affine"], dtype=np.float64),
-        ).to(dtype=torch.float64, device=device)
+        ).to(device=device).to(torch.float64)
         vox2vox = torch.linalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
     elif world_affine is None:
         world_affine = torch.eye(4, dtype=torch.float64, device=device)

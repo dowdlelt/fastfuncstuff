@@ -683,19 +683,8 @@ def _estmov_for(config: str, flag: bool | None) -> bool:
 
 
 def _resolve_device(device_spec) -> torch.device:
-    """Device for a blipflip run: auto falls back to CPU without CUDA, and MPS is
-    refused outright (the CG reductions are float64)."""
-    if (
-        device_spec is None or str(device_spec).lower() == "auto"
-    ) and not torch.cuda.is_available():
-        device_spec = "cpu"
-    device = setup_device(device_spec, tf32=REGISTRATION_TF32)
-    if device.type == "mps":
-        raise SystemExit(
-            "ffs_blipflip: MPS cannot run the required float64 CG reductions; "
-            "use -device cpu on Mac."
-        )
-    return device
+    """Device for a blipflip run. The CG reductions are float64, so never Metal."""
+    return setup_device(device_spec, tf32=REGISTRATION_TF32, float64_only="ffs_blipflip")
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:

@@ -13,6 +13,8 @@ FOV. Callers wanting a harder zero-weight threshold override via ``-*_opts``.
 
 from __future__ import annotations
 
+import sys
+
 # Per-stage op strings. Every key here gets a ``-<key>_opts`` CLI flag (see
 # STAGE_OPT_KEYS); structural flags (-input/-prefix/-device/paths the emitter
 # computes) are NOT in these strings and cannot be overridden this way.
@@ -207,7 +209,9 @@ DEFAULT_FMT = ".zst"
 DEFAULT_FINAL_FMT = ".gz"
 DEFAULT_GLM_FMT = ".gz"
 
-DEFAULT_DEVICE = "cuda"
+# A CUDA box keeps the loud failure when the card goes missing. A Mac has no card to
+# name, and each stage's own auto-detection already picks Metal or the CPU per op.
+DEFAULT_DEVICE = "auto" if sys.platform == "darwin" else "cuda"
 DEFAULT_FINAL_INTERP = "wsinc5"
 
 

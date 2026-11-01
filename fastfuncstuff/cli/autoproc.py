@@ -1292,7 +1292,8 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default: {config.DEFAULT_DEVICE}). cuda | mps | cpu | auto, or the "
         "indexed/threaded forms every ffs CLI accepts (cuda,0 / cpu,8). "
         "Edit DEVICE at the top of the emitted script to change it later. "
-        "On Apple Silicon prefer cpu: float64 ops fall back off MPS anyway.",
+        "On a Mac, auto or mps uses Metal for the stages it helps and the CPU for the "
+        "float64-only ones (ffs_blipflip, ffs_segment).",
     )
 
     g = p.add_argument_group("output format (nii | nii.gz/gz | nii.zst/zst)")

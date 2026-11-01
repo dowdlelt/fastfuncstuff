@@ -3388,16 +3388,25 @@ def setup_device(
     device_spec: str | None,
     *,
     tf32: bool = True,
+    float64_only: str | None = None,
 ) -> torch.device:
     """Resolve ``-device`` and configure the torch backends in one step.
 
     The one-call form exists because the two halves were drifting apart: a tool
     that parsed the device by hand also tended to drop the ``cpu,N`` thread
     override on the floor. Registration tools pass ``tf32=REGISTRATION_TF32``.
+
+    ``float64_only`` names a tool whose core is float64 throughout, with no float32
+    variant worth having. On MPS it runs on the CPU with a one-time notice instead
+    of refusing, so ``-device mps`` means "Metal where it helps" for a whole
+    pipeline rather than failing at the first such stage.
     """
-    from .utils import configure_torch_backends
+    from .utils import configure_torch_backends, linalg_device, warn_mps_cpu_fallback
 
     device, cpu_threads_override, _cuda_device_id = parse_device_arg(device_spec)
+    if float64_only is not None and linalg_device(device) != device:
+        warn_mps_cpu_fallback(float64_only)
+        device = linalg_device(device)
     configure_torch_backends(device, n_threads=cpu_threads_override, tf32=tf32)
     return device
 
@@ -3474,7 +3483,9 @@ def parse_device_arg(
         else:
             device = torch.device("cuda")
     elif device_type == "mps":
-        device = torch.device("mps")
+        from .utils import MPS_DEVICE
+
+        device = MPS_DEVICE
     else:
         raise ValueError(f"Unknown device type: {device_type}. Use 'cpu', 'cuda', or 'mps'.")
 

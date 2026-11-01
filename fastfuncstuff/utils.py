@@ -45,6 +45,13 @@ def suppress_io_progress() -> Iterator[None]:
             _io_progress_depth -= 1
 
 
+# Indexed, because a tensor made on bare ``torch.device("mps")`` reports ``mps:0``
+# and the two compare unequal. Every ``x.device == device`` in the tree (is this
+# data resident? does this plan match?) would otherwise be false on a Mac: wrong
+# branch at best, a refusal at worst. There is only ever one Metal device.
+MPS_DEVICE = torch.device("mps", 0)
+
+
 def get_device(prefer_device: str | None = None) -> torch.device:
     """
     Select the execution device.
@@ -94,7 +101,7 @@ def get_device(prefer_device: str | None = None) -> torch.device:
                     "MPS device requested but not available. Enable Apple Metal Performance "
                     "Shaders (macOS 13+ with Apple Silicon) before running."
                 )
-            return torch.device("mps")
+            return MPS_DEVICE
         if prefer_device == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError(
@@ -124,7 +131,7 @@ def get_device(prefer_device: str | None = None) -> torch.device:
             )
             return torch.device("cpu")
         if mps_fallback_active():
-            return torch.device("mps")
+            return MPS_DEVICE
         warnings.warn(
             "MPS is available but the PyTorch CPU fallback did not arm (torch was "
             "imported before fastfuncstuff, or PYTORCH_ENABLE_MPS_FALLBACK=0). "

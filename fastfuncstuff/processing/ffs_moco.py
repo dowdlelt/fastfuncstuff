@@ -27,6 +27,8 @@ from fastfuncstuff.memory import (
 # Suppress PyTorch internal deprecation warnings from torch.compile
 warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*", category=FutureWarning)
 
+from fastfuncstuff.utils import MPS_DEVICE  # noqa: E402
+
 from .affine import (  # noqa: E402
     _build_homo_coords,
     apply_affine_interp,
@@ -1178,7 +1180,7 @@ def resample_timeseries(
         # its shifts and drops the scale. det tests that whatever the voxel sizes
         # (a rigid motion in anisotropic voxel indices is D^-1 R D: not orthogonal,
         # det still 1).
-        det = torch.linalg.det(matrices_batch[:, :3, :3].double().cpu())
+        det = torch.linalg.det(matrices_batch[:, :3, :3].cpu().double())
         rigid = (det - 1).abs() < 1e-6
         use_triton = (
             config.use_shear and device.type == "cuda" and shear_resample_triton is not None
@@ -1271,7 +1273,7 @@ def moco(
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = MPS_DEVICE
     else:
         device = torch.device("cpu")
 
@@ -2115,7 +2117,7 @@ def moco_spacetime(
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = MPS_DEVICE
     else:
         device = torch.device("cpu")
     dtype = torch.float32
