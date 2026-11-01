@@ -59,6 +59,7 @@ from fastfuncstuff.stats.cluster import (
     _null_worker_chunk,
     _null_worker_init,
 )
+from fastfuncstuff.utils import widest_float_dtype
 
 # 3dClustSim's own defaults (pthr_init / athr_init in 3dClustSim.c).
 DEFAULT_CS_PTHR = (0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001)
@@ -240,7 +241,7 @@ def make_radial_weight(
             torch.arange(n, device=device) < n // 2,
             torch.arange(n, device=device),
             n - torch.arange(n, device=device),
-        ).to(torch.float64)
+        ).to(widest_float_dtype(device))
         * d
         for n, d in ((nx, dx), (ny, dy), (nz, dz))
     ]

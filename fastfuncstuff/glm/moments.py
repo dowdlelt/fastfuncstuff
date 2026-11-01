@@ -28,6 +28,8 @@ from typing import NamedTuple
 
 import torch
 
+from fastfuncstuff.utils import to_linalg_f64
+
 __all__ = ["RunMoments", "compute_run_moments", "solve_from_moments", "run_bounds"]
 
 
@@ -135,7 +137,7 @@ def compute_run_moments(
             device=device,
         )
         X = design_proj.to(device)
-        xtx_blocks.append(X.T.double() @ X.double())
+        xtx_blocks.append(to_linalg_f64(X).T @ to_linalg_f64(X))
 
         n_vox = data_proj.shape[0]
         xty = torch.zeros(n_cols, n_vox, device=store_device, dtype=X.dtype)
@@ -169,5 +171,6 @@ def solve_from_moments(
     # The same small ridge the combinatorial fit uses: a subset design can be
     # genuinely rank-deficient for a condition no contributing run sampled.
     n_cols = xtx.shape[0]
-    xtx = xtx + ridge * torch.eye(n_cols, device=device, dtype=xtx.dtype)
-    return torch.linalg.solve(xtx, xty.to(device).double()).to(out_dtype)
+    xtx = xtx + ridge * torch.eye(n_cols, device=xtx.device, dtype=xtx.dtype)
+    solved = torch.linalg.solve(xtx, xty.to(xtx.device).double())
+    return solved.to(out_dtype).to(device)

@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import linalg_device
+
 
 def compute_design_matrix_for_condition(
     onsets: torch.Tensor,
@@ -265,6 +267,7 @@ def compute_estimation_efficiency(
     """
     if device is None:
         device = torch.device("cpu")
+    device = linalg_device(device)  # float64 throughout; Metal has none
     design = torch.as_tensor(design, device=device).to(torch.float64)
     nuisance_t = None if nuisance is None else torch.as_tensor(nuisance, device=device)
 
@@ -363,6 +366,7 @@ def compute_detection_power(
     """
     if device is None:
         device = torch.device("cpu")
+    device = linalg_device(device)  # float64 throughout; Metal has none
     design = torch.as_tensor(design, device=device).to(torch.float64)
     h0 = torch.as_tensor(hrf_assumed, device=device).to(torch.float64).flatten()
     nuisance_t = None if nuisance is None else torch.as_tensor(nuisance, device=device)

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastfuncstuff.utils import linalg_device
+
 
 def task_design_from_events(args, n_timepoints: int, tr: float, device):
     """Convolved (T, K) task design for the coupling diagnostic, plus condition labels.
@@ -58,7 +60,7 @@ def task_design_from_events(args, n_timepoints: int, tr: float, device):
         )
 
     dt = commensurate_microtime_dt(tr)
-    hrf = torch.tensor(spm_canonical_hrf(tr=dt), dtype=torch.float64, device=device)
+    hrf = torch.tensor(spm_canonical_hrf(tr=dt), dtype=torch.float64, device=linalg_device(device))
     design = build_task_design(
         hrf_bases=hrf,
         n_timepoints=n_timepoints,

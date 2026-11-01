@@ -44,6 +44,7 @@ from fastfuncstuff.stats.localstat import (
     build_neighborhood,
     fit_acf_batched,
 )
+from fastfuncstuff.utils import linalg_device
 
 # AFNI get_ACF_cluster point budget (mri_fwhm.c).
 _NCLU_BASE = 111
@@ -175,6 +176,7 @@ def _trigref(corder: int, nvals: int, device) -> Tensor:
     sin/cos pairs at ``2*pi*k/nvals`` (``thd_detrend.c:559``) -- the same basis
     3dDespike uses, deliberately not a polynomial one.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     t = torch.arange(nvals, dtype=torch.float64, device=device)
     tm = 0.5 * (nvals - 1.0)
     fac = 2.0 / nvals
@@ -293,6 +295,7 @@ def estimate_fwhmx_run(
     """
     if device is None:
         device = resid_2d.device if resid_2d.is_cuda else torch.device("cpu")
+    device = linalg_device(device)  # float64 throughout; Metal has none
 
     # AFNI -detrend: project out the trigonometric baseline before anything else
     # (3dFWHMx.c:546 -> THD_build_trigref), and force -unif as AFNI does.
@@ -524,6 +527,7 @@ def _half_max_crossing(rs: list[float], ys: list[float]) -> float:
 
 def fit_acf_curve(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, float, float]:
     """Fit ACF(r)=a e^{-r²/2b²}+(1-a)e^{-r/c} and return (a, b, c, FWHM)."""
+    device = linalg_device(device)  # float64 throughout; Metal has none
     if bin_r.numel() < 5:
         return -1.0, -1.0, -1.0, -1.0
     radii = bin_r.to(device=device).to(torch.float64)

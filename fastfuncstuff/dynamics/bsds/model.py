@@ -22,6 +22,7 @@ from fastfuncstuff.dynamics.bsds import ar, hmm, vb
 from fastfuncstuff.dynamics.bsds.elbo import lower_bound
 from fastfuncstuff.dynamics.bsds.init import init_state
 from fastfuncstuff.dynamics.bsds.vb import VBState
+from fastfuncstuff.utils import linalg_device
 
 _DTYPE = torch.float64
 
@@ -445,12 +446,14 @@ def fit_bsds(
     a diagnostic — a free speedup that skips the ELBO cholesky/slogdet and its
     GPU sync without changing the fit. Pass ``1`` to force a dense F curve.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if len(sessions) == 0:
         raise ValueError("sessions is empty")
     criterion = _normalize_criterion(criterion)
     obj_every = obj_every if obj_every is not None else (10 if criterion == "weights" else 1)
     device = sessions[0].device if device is None else device
-    sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
+    sessions = [s.to(device=device).to(_DTYPE) for s in sessions]
     d = sessions[0].shape[0]
     if max_ldim == "auto":
         from fastfuncstuff.dynamics.preprocess import estimate_latent_dim
@@ -602,7 +605,7 @@ def decode(
     """
     g = model.state
     device = g.lm.device if device is None else device
-    sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
+    sessions = [s.to(device=device).to(_DTYPE) for s in sessions]
     if sessions[0].shape[0] != g.n_roi:
         raise ValueError(f"new data has D={sessions[0].shape[0]} but the model expects D={g.n_roi}")
     lengths = [int(s.shape[1]) for s in sessions]

@@ -29,6 +29,7 @@ import torch
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas
 from fastfuncstuff.surface.voxelize import MeshDistance, winding_number
+from fastfuncstuff.utils import linalg_device
 
 #: Rim labels, as LN2_LAYERS reads them.
 RIM_CSF, RIM_WM, RIM_GM = 1, 2, 3
@@ -293,7 +294,10 @@ def column_depth_cdf(
     smoothing pool each column with its neighbours (default: enough that a column
     holds ~``column_voxels`` samples, for counting noise -- samples, not volume).
     """
-    device = rho.device
+    device = linalg_device(rho.device)  # float64 throughout; Metal has none
+    rho, face, bary = rho.to(device), face.to(device), bary.to(device)
+    weight = None if weight is None else weight.to(device)
+    rho_hi = None if rho_hi is None else rho_hi.to(device)
     f = torch.as_tensor(faces, device=device)[face]  # (N, 3) vertex ids
     w = bary.double() if weight is None else bary.double() * weight.double()[:, None]
     hist = torch.zeros(n_vertices * bins, dtype=torch.float64, device=device)

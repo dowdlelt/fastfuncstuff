@@ -61,6 +61,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import get_available_memory
+from fastfuncstuff.utils import linalg_device
 
 # View ordering constrains the SIGN of the shift: partitions encoded in a fixed
 # order accumulate the drift phase monotonically, so a known ordering halves the
@@ -867,6 +868,7 @@ def partition_shift_from_phase(
     across the head). Returns ``(T, 2)``: shift at the centre [voxels] and stretch
     [voxels per voxel], both at the first echo, for :func:`fold_partition_into_matrices`.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
     if te.numel() < 2:
         raise ValueError("the echo-slope estimate needs at least two echoes")

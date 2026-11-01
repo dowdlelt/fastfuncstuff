@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import accum_dtype, linalg_device
+
 ProgressFn = Callable[[float, str], None]
 
 
@@ -154,7 +156,7 @@ def decompose(
         norm = torch.linalg.vector_norm(c, dim=1)
         return c / norm.clamp(min=1e-10)[:, None], norm, mean
 
-    gram = torch.zeros(n_time, n_time, dtype=torch.float64, device=device)
+    gram = torch.zeros(n_time, n_time, dtype=torch.float64, device=linalg_device(device))
     norms = np.empty(n_vox, dtype=np.float64)
     means = np.empty(n_vox, dtype=np.float64)
     # One chunk -- the usual case on CPU -- is kept for the maps pass rather
@@ -165,7 +167,7 @@ def decompose(
             if progress is not None:
                 progress(0.05 + 0.45 * i / n_vox, "gram")
             c, norm, mean = prepared(i)
-            gram += (c.T @ c).double()
+            gram += (c.T @ c).to(gram.device).to(torch.float64)
             norms[i : i + step] = norm.cpu().double().numpy()
             means[i : i + step] = mean.cpu().double().numpy()
             if step >= n_vox:
@@ -187,13 +189,13 @@ def decompose(
         # give the same picture -- and the same sign on the saved regressor.  The
         # cube sum is taken here, per chunk on the device: as one host float64 pass
         # over the finished (V, K) maps it was 3 of the 4 s of a 1.8M-voxel run.
-        skew = torch.zeros(k, dtype=torch.float64, device=device)
+        skew = torch.zeros(k, dtype=torch.float64, device=linalg_device(device))
         for i in range(0, n_vox, step):
             if progress is not None:
                 progress(0.55 + 0.4 * i / n_vox, "maps")
             c = kept if kept is not None else prepared(i)[0]
             m = c @ u_dev
-            skew += m.double().pow(3).sum(0)
+            skew += m.to(accum_dtype(device)).pow(3).sum(0).to(skew.device)
             corr[i : i + step] = m.cpu().numpy()
             del c, m
         kept = None

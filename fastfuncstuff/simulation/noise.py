@@ -33,7 +33,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.unique import sorted_unique
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, linalg_device, to_tensor
 
 
 def _infer_time_axis(
@@ -1085,7 +1085,7 @@ def estimate_sfnr(
 
 def _per_voxel(value: float | torch.Tensor | np.ndarray, n_voxels: int, device, name: str):
     """A scalar or one value per voxel, as a float64 (n_voxels,) tensor."""
-    t = torch.as_tensor(value, dtype=torch.float64, device=device).flatten()
+    t = torch.as_tensor(value, dtype=torch.float64, device=linalg_device(device)).flatten()
     if t.numel() == 1:
         return t.expand(n_voxels).clone()
     if t.numel() != n_voxels:
@@ -1252,17 +1252,19 @@ def generate_thermal_physio_noise(
         ).reshape(n_timepoints, n_voxels)
         # Analytic unit variance, so each voxel keeps its own sampling variability.
         gamma0 = (1 + 2 * a_ * b_ + b_**2) / (1 - a_**2)
-        return (raw.double() / np.sqrt(gamma0) * sigma).to(torch.float32)
+        return (
+            (raw.to(sigma.device).double() / np.sqrt(gamma0) * sigma).to(torch.float32).to(device)
+        )
     sigma_white = sigma * torch.sqrt(1.0 - f_v)
     sigma_phys = sigma * torch.sqrt(f_v)
     phi = torch.exp(-tr / tau_v)
 
     white = torch.randn(
-        n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
+        n_timepoints, n_voxels, device=sigma.device, generator=generator, dtype=torch.float64
     )
     innov = torch.randn(
-        n_timepoints, n_voxels, device=device, generator=generator, dtype=torch.float64
+        n_timepoints, n_voxels, device=sigma.device, generator=generator, dtype=torch.float64
     )
     phys = _unit_ar1(innov, phi)
     noise = sigma_white * white + sigma_phys * phys
-    return noise.to(torch.float32)
+    return noise.to(torch.float32).to(device)

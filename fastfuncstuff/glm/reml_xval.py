@@ -192,11 +192,12 @@ def _score_voxel_chunk(
         predicted = (test_stim @ task_betas).T  # (n_group_voxels, n_test_tps)
         actual = test_data_all[voxel_mask.to(test_data_all.device)]
 
-        residual = (actual - predicted).to(torch.float64)
+        residual = (actual - predicted).to(accumulator_device).to(torch.float64)
         index = voxel_mask.nonzero(as_tuple=True)[0].to(accumulator_device) + voxel_offset
         ss_residual[index] += residual.square().sum(dim=1).to(accumulator_device)
-        sum_actual[index] += actual.to(torch.float64).sum(dim=1).to(accumulator_device)
-        sum_sq_actual[index] += actual.to(torch.float64).square().sum(dim=1).to(accumulator_device)
+        actual = actual.to(accumulator_device).to(torch.float64)
+        sum_actual[index] += actual.sum(dim=1)
+        sum_sq_actual[index] += actual.square().sum(dim=1)
 
         del group_data, design_white, data_white, predicted, actual, residual
 

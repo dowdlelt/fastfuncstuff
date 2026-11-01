@@ -439,7 +439,7 @@ def dynamic_inverse(
         fit = torch.einsum("bfij,rbfj->rbfi", hs @ inv, yf)
 
         def crop(z):
-            return _crop(z, T, pad).to(profiles)
+            return _crop(z, T, pad).to(profiles.device).to(profiles.dtype)
 
         correction[:, start:stop], predicted[:, start:stop] = crop(transported), crop(fit)
         grid_correction[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", (H - G) @ inv, yf))

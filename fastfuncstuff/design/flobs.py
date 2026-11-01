@@ -1674,8 +1674,8 @@ def cv_basis_constrained_ridge(
             torch.from_numpy(
                 legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
             )
-            .to(device)
             .float()
+            .to(device)
             for r in range(n_runs)
         ]
         if verbose:
@@ -2458,8 +2458,8 @@ def fit_basis_fracridge(
             torch.from_numpy(
                 legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
             )
-            .to(device)
             .float()
+            .to(device)
             for r in range(n_runs)
         ]
         if verbose:

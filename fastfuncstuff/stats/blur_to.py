@@ -223,7 +223,7 @@ def volume_fwhm(x: np.ndarray, mask: np.ndarray, voxdims, device=None) -> float:
             out.append(0.0)
             continue
         corr = (z[(slice(None), *lo)] * z[(slice(None), *hi)]).sum(0)[pair]
-        rho = float(corr.double().mean())
+        rho = float(corr.cpu().double().mean())
         out.append(2.35482 * width * np.sqrt(-1.0 / (4.0 * np.log(rho))) if 0 < rho < 1 else 0.0)
     return _geom_combine(*out)
 

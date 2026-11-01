@@ -63,7 +63,7 @@ from fastfuncstuff.processing.tissue import (
     tissue_projector,
     tissue_synthesis_cost,
 )
-from fastfuncstuff.utils import REGISTRATION_TF32
+from fastfuncstuff.utils import REGISTRATION_TF32, linalg_device, to_linalg_f64
 
 
 def _normalize_targets(tokens: list[str]) -> set[str]:
@@ -365,14 +365,20 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── Affine: anat→epi in voxel space (A), composing the -1Dmatrix stack.
     #    Invert to cast anat masks into EPI space. ──
-    A = load_matrix_chain(args.matrix, base_affine=anat_aff, source_affine=epi_aff).to(device=device).to(torch.float64)
+    A = (
+        load_matrix_chain(args.matrix, base_affine=anat_aff, source_affine=epi_aff)
+        .to(device=linalg_device(device))
+        .to(torch.float64)
+    )
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
     A_inv = torch.linalg.inv(A)  # epi→anat voxel map
 
     def anat_to_epi(vol: torch.Tensor, mat_inv: torch.Tensor) -> torch.Tensor:
         # apply_affine(source, M, out_shape): M maps out(base) voxel → source voxel.
-        return apply_affine(vol, mat_inv.to(torch.float32), tuple(epi.shape), zero_outside=True)
+        return apply_affine(
+            vol, mat_inv.to(device=device, dtype=torch.float32), tuple(epi.shape), zero_outside=True
+        )
 
     # ── Offset (voxels) ──
     offset = args.offset
@@ -477,7 +483,7 @@ def main(argv: list[str] | None = None) -> None:
         lr=args.lr,
         verbose=bool(verb),
     )
-    T = res["matrix"].to(torch.float64)
+    T = to_linalg_f64(res["matrix"])
     disp = res["params"].detach().cpu().numpy()
     qc = ""
     if wm_pts is not None:

@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.utils import to_linalg_f64
+
 
 def pearson_correlation(base: Tensor, source: Tensor, weight: Tensor | None = None) -> Tensor:
     """Compute weighted Pearson correlation between two images.
@@ -83,13 +85,13 @@ def spearman_correlation(base: Tensor, source: Tensor) -> Tensor:
     Unweighted by construction — AFNI marks ``sp`` as a no-weight method, since
     ranking discards the magnitudes a weight would modulate.
     """
-    b = base.reshape(-1).double()
-    s = source.reshape(-1).double()
+    b = to_linalg_f64(base.reshape(-1))
+    s = to_linalg_f64(source.reshape(-1))
     n = max(1, b.numel())
     # Ranks run to N (millions of voxels), and the correlation sums their
     # squares — in float32 that overflows to inf and the correlation collapses
     # to 0. Rank in float64 and rescale to [0, 1] before correlating.
-    return pearson_correlation(_rankify(b) / n, _rankify(s) / n).float()
+    return pearson_correlation(_rankify(b) / n, _rankify(s) / n).float().to(base.device)
 
 
 def clipped_pearson_correlation(

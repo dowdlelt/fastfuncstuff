@@ -36,6 +36,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.glm.xval import cod_from_ss_residual
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.unique import sorted_unique
+from fastfuncstuff.utils import linalg_device
 
 #: log10 lambda grid.  lambda is relative (penalty scaled to the Gram trace),
 #: so the same grid spans "no smoothing" to "straight lines" for any design.
@@ -237,6 +238,8 @@ def fit_smooth_basis(
     fits a subset of timepoints (``design`` already sliced to it) without
     copying ``data``: the slice is taken per chunk.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if method not in SELECTION_METHODS:
         raise ValueError(f"method must be one of {SELECTION_METHODS}, got {method!r}")
     if method == "fixed" and (lam is None or bool((torch.as_tensor(lam) <= 0).any())):
@@ -326,6 +329,7 @@ class _FoldPenalty:
 def _fold_penalty(
     design64: np.ndarray, n_task: int, penalty, train, test, device, score64: np.ndarray
 ) -> _FoldPenalty:
+    device = linalg_device(device)  # float64 throughout; Metal has none
     spec = _spectrum(design64[train.numpy()], n_task, penalty)
     x_test = score64[test.numpy(), :n_task]
     nuis = score64[test.numpy(), n_task:]
@@ -385,6 +389,8 @@ def fit_smooth_selected(
     fitted -- prewhitened fits are trained on whitened data but scored on the
     raw series, so their R^2 compares with an unwhitened fit's.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if rule not in SMOOTH_RULES:
         raise ValueError(f"rule must be one of {SMOOTH_RULES}, got {rule!r}")
     if not penalties:
@@ -445,7 +451,9 @@ def fit_smooth_selected(
         total_sq = torch.zeros(b - a, dtype=torch.float64, device=device)
         n_test = 0
         y_all = data[a:b].to(device=device).to(torch.float64)
-        y_score = y_all if score_data is None else score_src[a:b].to(device=device).to(torch.float64)
+        y_score = (
+            y_all if score_data is None else score_src[a:b].to(device=device).to(torch.float64)
+        )
         for fold in folds:
             y_te = y_score[:, fold[0].test.to(device)]
             if fold[0].q_test.shape[1]:
@@ -565,6 +573,8 @@ def choose_global_lambda(
     everywhere makes the fit a linear estimator.  One pass over the data:
     every fold's held-out error at every grid lambda is a closed form.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if len(run_starts) < 2:
         raise ValueError("choosing a global lambda by held-out runs needs at least two runs")
     device = device if device is not None else torch.device("cpu")
@@ -676,6 +686,7 @@ def _residual_autocorr(
     Residual = the data minus the task fit, projected off the nuisance.  Lags
     never pair samples across a run boundary.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     n_vox, n_t = data.shape
     design64 = design.detach().cpu().double().numpy()
     nuis = design64[:, n_task:]
@@ -765,6 +776,8 @@ def fit_smooth_arma(
     raw series held-out runs are scored on (e.g. unfiltered data behind a
     temporally filtered fit).
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.glm.arma import build_arma11_covariance
 
     device = device if device is not None else torch.device("cpu")
@@ -867,6 +880,7 @@ def _nuisance_basis(nuis: np.ndarray) -> np.ndarray:
 
 
 def _run_blocks(design64, n_task, penalty, bounds, a, b, device) -> list[_RunBlock]:
+    device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.glm.arma import build_arma11_covariance
 
     blocks = []
@@ -981,6 +995,8 @@ def fit_smooth_per_run(
     ``data``) is the series held-out runs are scored on, when that is not the
     fitted data -- unfiltered data behind a temporally filtered fit.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if lambda_mode not in PER_RUN_LAMBDA:
         raise ValueError(f"lambda_mode must be one of {PER_RUN_LAMBDA}, got {lambda_mode!r}")
     if xval_lambda not in PER_RUN_XVAL_LAMBDA:

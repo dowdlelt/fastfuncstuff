@@ -1766,7 +1766,7 @@ def _select_hrf_per_voxel(
     res = fit_glm_hrf_library_with_xval(
         data=data,
         onsets=onset_matrix,
-        hrf_library=torch.from_numpy(np.ascontiguousarray(shapes)).to(device).float(),
+        hrf_library=torch.from_numpy(np.ascontiguousarray(shapes)).float().to(device),
         tr=tr,
         run_starts=list(run_starts),
         stim_durations=list(durations),

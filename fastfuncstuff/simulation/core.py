@@ -13,7 +13,7 @@ import torch
 
 from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.io.afni import save_nifti
-from fastfuncstuff.utils import get_device, print_device_info, to_tensor
+from fastfuncstuff.utils import get_device, linalg_device, print_device_info, to_tensor
 
 from .noise import add_drift, generate_thermal_physio_noise
 
@@ -77,6 +77,7 @@ def simulate_fmri_run(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
 
     onsets = to_tensor(onsets, device=device)
     hrf = to_tensor(hrf, device=device)

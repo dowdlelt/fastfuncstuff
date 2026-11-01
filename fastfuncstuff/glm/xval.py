@@ -2136,19 +2136,23 @@ def single_trial_cv_helper(
                         actual = test_betas
 
                     resid = actual - predicted
-                    acc_sum_y[:, chunk_slice] += actual.sum(dim=-1, dtype=torch.float64).cpu()
-                    acc_sum_p[:, chunk_slice] += predicted.sum(dim=-1, dtype=torch.float64).cpu()
+                    acc_sum_y[:, chunk_slice] += actual.sum(
+                        dim=-1, dtype=accum_dtype(actual.device)
+                    ).cpu()
+                    acc_sum_p[:, chunk_slice] += predicted.sum(
+                        dim=-1, dtype=accum_dtype(actual.device)
+                    ).cpu()
                     acc_sum_yy[:, chunk_slice] += (
-                        (actual * actual).sum(dim=-1, dtype=torch.float64).cpu()
+                        (actual * actual).sum(dim=-1, dtype=accum_dtype(actual.device)).cpu()
                     )
                     acc_sum_pp[:, chunk_slice] += (
-                        (predicted * predicted).sum(dim=-1, dtype=torch.float64).cpu()
+                        (predicted * predicted).sum(dim=-1, dtype=accum_dtype(actual.device)).cpu()
                     )
                     acc_sum_yp[:, chunk_slice] += (
-                        (actual * predicted).sum(dim=-1, dtype=torch.float64).cpu()
+                        (actual * predicted).sum(dim=-1, dtype=accum_dtype(actual.device)).cpu()
                     )
                     acc_ss_res[:, chunk_slice] += (
-                        (resid * resid).sum(dim=-1, dtype=torch.float64).cpu()
+                        (resid * resid).sum(dim=-1, dtype=accum_dtype(actual.device)).cpu()
                     )
                     del cond_avg, predicted, actual, resid
 

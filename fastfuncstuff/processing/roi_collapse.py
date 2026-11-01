@@ -130,7 +130,7 @@ def collapse_to_rois(
         n_vox = coo.shape[1]
         for c0 in range(0, n_cols, chunk_size):
             c1 = min(c0 + chunk_size, n_cols)
-            out[:, c0:c1] = torch.sparse.mm(w, betas[:, c0:c1].to(device).float())
+            out[:, c0:c1] = torch.sparse.mm(w, betas[:, c0:c1].float().to(device))
         return out / sizes[:, None]
 
     w_full = torch.as_tensor(roi_spec, dtype=torch.float32)

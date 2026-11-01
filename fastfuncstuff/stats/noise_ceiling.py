@@ -47,6 +47,7 @@ import torch
 
 from fastfuncstuff.glm.xval import _compute_projection_matrix
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import linalg_device, to_linalg_f64
 
 
 @dataclass
@@ -454,9 +455,9 @@ def _centered_cov_and_ss(
     folds of unequal length by simple addition -- the same reason
     :func:`compute_xval_r2` accumulates sums instead of per-fold R2 values.
     """
-    a = first.to(torch.float64)
-    b = second.to(torch.float64)
-    y = actual.to(torch.float64)
+    a = to_linalg_f64(first)
+    b = to_linalg_f64(second)
+    y = to_linalg_f64(actual)
     return (
         (a * b).sum(dim=1),
         a.sum(dim=1),
@@ -513,6 +514,7 @@ def loro_two_half_ceiling(
 
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
 
     design_matrix = to_tensor(design_matrix, device=device, dtype=torch.float32)
     n_voxels, n_timepoints = data.shape

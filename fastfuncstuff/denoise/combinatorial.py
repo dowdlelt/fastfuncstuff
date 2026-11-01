@@ -36,6 +36,7 @@ from fastfuncstuff.glm.xval import (
     slice_by_runs,
 )
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory, get_memory_config
+from fastfuncstuff.utils import accum_dtype
 
 
 def _combination_work_chunks(
@@ -378,9 +379,9 @@ def evaluate_all_combinations_for_run(
             dp = _strip_poly(data_chunk.T)  # (T, chunk)
             resid_poly = dp - design_poly @ betas_chunk.T  # (T, chunk)
 
-            ss_e = (resid_poly * resid_poly).sum(dim=0, dtype=torch.float64)
-            ss_dp = (dp * dp).sum(dim=0, dtype=torch.float64)
-            sum_dp = dp.sum(dim=0, dtype=torch.float64)
+            ss_e = (resid_poly * resid_poly).sum(dim=0, dtype=accum_dtype(resid_poly.device))
+            ss_dp = (dp * dp).sum(dim=0, dtype=accum_dtype(dp.device))
+            sum_dp = dp.sum(dim=0, dtype=accum_dtype(dp.device))
 
             for combo_batch_start in range(0, n_combos, combo_batch_size):
                 combo_batch_end = min(combo_batch_start + combo_batch_size, n_combos)

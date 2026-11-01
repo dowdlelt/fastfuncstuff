@@ -365,7 +365,7 @@ def outlier_counts(
     counts = torch.zeros(T, dtype=torch.int64, device=device)
     starts = range(0, V, chunk_size)
     for s in tqdm(starts, desc="outliers", leave=True, disable=not progress or len(starts) < 2):
-        y = series[:, s : s + chunk_size].to(device=device, dtype=dtype)
+        y = series[:, s : s + chunk_size].to(device=device).to(dtype)
         if basis is None:
             r = y - afni_median(y, dim=0)
         else:

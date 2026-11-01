@@ -43,7 +43,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from fastfuncstuff.utils import parabolic_peak_offset
+from fastfuncstuff.utils import linalg_device, parabolic_peak_offset
 
 DEFAULT_WIDTHS = (0.6, 0.75, 0.875, 1.0, 1.15, 1.3, 1.5)
 """Stretch factors about the peak.  Wide on purpose: at low R² the fit piles up
@@ -133,6 +133,7 @@ def as_bank(design: Tensor, n_curves: int) -> Tensor:
 
 def orthonormal_nuisance(nuisance_per_run: Sequence[Tensor], device: torch.device) -> list[Tensor]:
     """Per-run orthonormal bases of the nuisance column space (rank-safe)."""
+    device = linalg_device(device)  # float64 throughout; Metal has none
     out = []
     for n in nuisance_per_run:
         n = n.to(device=device).to(torch.float64)
@@ -183,6 +184,7 @@ def screen_responsive(
     mean beta over ``sign_cols`` (default all): with a :func:`screen_basis` design only
     the first component has a meaningful sign.  Returns (responsive, R², positive).
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     from scipy.stats import f as fdist
 
     from fastfuncstuff.memory import estimate_chunk_size
@@ -227,6 +229,7 @@ def screen_library(
     effective number of chances is small, and this is a screen, not inference.
     Positive means the best curve's mean beta is.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     from scipy.stats import f as fdist
 
     from fastfuncstuff.memory import estimate_chunk_size
@@ -644,6 +647,7 @@ def pooled_late_patterns(
     The price is an assumption: whatever selectivity the whole unit shares is
     called late, so a genuinely smooth pattern loses some of its early part.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     U = int(unit.max()) + 1
     T = y.shape[0]
     sums = torch.zeros(T, U, dtype=torch.float64)
@@ -736,6 +740,7 @@ def fit_hrftdv(
     over every voxel, so a unit the screen barely reached still gets its own
     shape; the pair (step 4) still comes from the responsive voxels.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     V = y.shape[1]
     U = int(unit.max()) + 1
     S = shapes.shape[0]
@@ -853,6 +858,7 @@ def fit_row_lags(
     SNR a single voxel never does, so this is where lag is best measured; fitting
     each run alone as well gives the spread a depth profile should be read against.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     R = y_rows.shape[1]
     T = y_rows.shape[0]
     bounds = [*run_starts, T]

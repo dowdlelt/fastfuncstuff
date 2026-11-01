@@ -251,7 +251,7 @@ class _CostTrace:
         if step_costs is None:
             lo = med = hi = best
         else:
-            vals = torch.as_tensor(step_costs, dtype=torch.float64).flatten()
+            vals = torch.as_tensor(step_costs).cpu().to(torch.float64).flatten()
             lo = float(vals.min())
             hi = float(vals.max())
             med = float(vals.median())

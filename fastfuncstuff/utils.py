@@ -426,6 +426,23 @@ def linalg_lstsq(a: torch.Tensor, b: torch.Tensor, **kwargs):
     return type(result)([x.to(a.device) if isinstance(x, torch.Tensor) else x for x in result])
 
 
+def on_policy_device(op: str, fn, *tensors: torch.Tensor, **kwargs):
+    """Run ``fn(*tensors, **kwargs)`` where :func:`cpu_if_mps` says, return on the input device.
+
+    The general form of :func:`linalg_lstsq`, for the ops in :data:`_MPS_CPU_OPS`: a
+    direct ``torch.linalg.svd`` of a batch aborts inside Metal's shader compiler, and a
+    direct ``torch.linalg.qr`` of a tall matrix takes minutes. A no-op off Metal.
+    """
+    home = tensors[0].device
+    work = cpu_if_mps(home, op)
+    if work == home:
+        return fn(*tensors, **kwargs)
+    result = fn(*(t.to(work) for t in tensors), **kwargs)
+    if isinstance(result, torch.Tensor):
+        return result.to(home)
+    return type(result)([x.to(home) if isinstance(x, torch.Tensor) else x for x in result])
+
+
 def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:
     """Pseudo-inverse computed in float64 on :func:`factor_device`.
 

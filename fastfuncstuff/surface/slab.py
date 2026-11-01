@@ -32,6 +32,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fastfuncstuff.utils import linalg_device
+
 __all__ = [
     "RibbonCells",
     "Tiling",
@@ -323,7 +325,7 @@ def equivolume_metric(t: Tiling, surf, smooth_rounds: int = 1, device=None) -> n
     other = np.r_[t.lo_i + 1, t.lo_i]
 
     def dev(a):
-        return torch.as_tensor(a, device=device)
+        return torch.as_tensor(a, device=linalg_device(device))
 
     cdf, _ = column_depth_cdf(
         dev(t.rho[ends]), dev(t.foot_face[ends]), dev(t.foot_bary[ends]), faces,

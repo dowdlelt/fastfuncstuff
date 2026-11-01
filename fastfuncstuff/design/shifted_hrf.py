@@ -67,7 +67,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.unique import sorted_unique
-from fastfuncstuff.utils import get_device, linalg_lstsq, parabolic_peak_offset
+from fastfuncstuff.utils import get_device, linalg_device, linalg_lstsq, parabolic_peak_offset
 
 AMP_RIDGE_DEFAULT = 1e-3
 """Default ridge on the amplitude solve (relative to ``mean(diag(XtX))``).
@@ -256,6 +256,7 @@ def build_shifted_design_bank(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
     n_blocks = len(block_onsets)
     n_grid = int(tau_grid.size)
     h = torch.as_tensor(np.asarray(hrf, dtype=np.float64), device=device)
@@ -534,6 +535,7 @@ def fit_shifted_hrf(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
     y_src = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
     if y_src.ndim != 2:
         raise ValueError(f"data must be 2-D (n_voxels, n_t); got {y_src.shape}")
@@ -962,6 +964,7 @@ def build_blockdiag_polys(
     basis so drift is never shared across run boundaries. ``polort`` is one
     degree for every run or one per run (aligned with ``n_tp_per_run``).
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.design.polort import max_polort, polort_per_run
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
@@ -995,6 +998,7 @@ def append_blockdiag_extras(
     outside run *r*, so a component estimated on one run can never explain
     another ([[Block-diagonal nuisance]]).
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     n_runs = len(n_tp_per_run)
     if len(extra_per_run) != n_runs:
         raise ValueError(
@@ -1101,6 +1105,7 @@ def xval_shifted_hrf(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
     n_runs = len(per_run_data)
     if n_runs < 2:
         raise ValueError(f"cross-validation needs >= 2 runs; got {n_runs}")
@@ -1522,6 +1527,7 @@ def select_shape_per_voxel(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # float64 throughout; Metal has none
     y_src = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
     n_voxels, n_t = y_src.shape
     n_shapes = shapes.shape[0]

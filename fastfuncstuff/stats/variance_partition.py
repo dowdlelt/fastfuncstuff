@@ -61,7 +61,7 @@ from tqdm import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.unique import sorted_unique
-from fastfuncstuff.utils import get_device, pinv_f64
+from fastfuncstuff.utils import get_device, on_policy_device, pinv_f64
 
 # Off-diagonal Gram mass above this fraction of the diagonal means the bands are no longer
 # orthogonal and the closed-form decoupling in this module does not hold.
@@ -893,7 +893,9 @@ def partition_variance(
                 # (n_a, n_b) cell-mean matrix -- same answer, smaller decomposition.
                 sl = band_slices[pname]
                 b_i = coef[:, 1 + sl.start : 1 + sl.stop].reshape(nvc, ia, ib)
-                u, s, vh = torch.linalg.svd(b_i, full_matrices=False)
+                u, s, vh = on_policy_device(
+                    "svd_batched", torch.linalg.svd, b_i, full_matrices=False
+                )
                 sv_all[pname][:, fi, : min(mr, s.shape[1])] = s[:, :mr]
 
                 # A multiplicative gain model, m = mu + a_s * (1 + g_t), leaves an

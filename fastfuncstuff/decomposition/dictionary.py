@@ -23,6 +23,7 @@ import torch
 from torch import Tensor
 
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import linalg_device
 
 
 @dataclass
@@ -59,7 +60,9 @@ def _fista(D: Tensor, Gm: Tensor, L: float, xc: Tensor, Sc: Tensor, lam: float, 
 def _top_components(X: Tensor, k: int, chunk: int) -> Tensor:
     """Top-k left singular vectors of the wide (T, V) matrix via its (T, T) Gram."""
     T, V = X.shape
-    G = torch.zeros(T, T, dtype=torch.float64, device=X.device if chunk >= V else "cpu")
+    G = torch.zeros(
+        T, T, dtype=torch.float64, device=linalg_device(X.device) if chunk >= V else "cpu"
+    )
     for s in range(0, V, chunk):
         xc = X[:, s : s + chunk]
         G += (xc @ xc.T).to(device=G.device).to(torch.float64)

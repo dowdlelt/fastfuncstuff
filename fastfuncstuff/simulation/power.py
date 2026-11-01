@@ -183,7 +183,7 @@ def _glm_setup(
     """The fitted GLM and the planted signal's deterministic parts, shared by both engines."""
     from fastfuncstuff.design.polort import auto_polort_per_run
 
-    X_task = torch.as_tensor(design, dtype=torch.float64)
+    X_task = torch.as_tensor(design).cpu().to(torch.float64)
     n_t, n_cond = X_task.shape
     if sum(run_lengths) != n_t:
         raise ValueError(f"run lengths sum to {sum(run_lengths)}, design has {n_t} rows")
@@ -839,7 +839,7 @@ def design_quality(
     """
     from fastfuncstuff.design.polort import auto_polort_per_run
 
-    X_task = torch.as_tensor(design, dtype=torch.float64)
+    X_task = torch.as_tensor(design).cpu().to(torch.float64)
     n_t, n_cond = X_task.shape
     if poly_degree is None:
         poly_degree = auto_polort_per_run(run_lengths, tr)

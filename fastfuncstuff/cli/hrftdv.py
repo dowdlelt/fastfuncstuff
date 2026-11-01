@@ -604,7 +604,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     except (FileNotFoundError, ValueError) as exc:
         sys.exit(f"ERROR: {exc}")
-    device = setup_device(args.device)
+    device = setup_device(args.device, float64_only="ffs_hrftdv")
 
     # -- coverage: positive in every run, one run in memory at a time
     coverage = None

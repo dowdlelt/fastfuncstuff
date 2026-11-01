@@ -60,6 +60,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import to_linalg_f64
+
 __all__ = [
     "MIN_GAMMA_SHAPE",
     "MIN_SEPARATION_SD",
@@ -135,7 +137,7 @@ def fit_gaussian_gamma_mixture(
     Returns a dict of ``(K,)`` parameter tensors plus ``(K, V)`` posteriors, in the
     standardised frame (``centre`` and ``scale`` map back to data units).
     """
-    x, centre, scale = _robust_standardise(maps_kv.to(torch.float64))
+    x, centre, scale = _robust_standardise(to_linalg_f64(maps_kv))
     k, v = x.shape
     dev = x.device
 

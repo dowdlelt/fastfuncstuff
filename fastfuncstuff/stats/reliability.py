@@ -29,6 +29,8 @@ from collections.abc import Sequence
 
 import torch
 
+from fastfuncstuff.utils import to_linalg_f64
+
 
 def average_ranks(values: torch.Tensor) -> torch.Tensor:
     """Rank ``values`` ascending, averaging the ranks within each tie group.
@@ -60,8 +62,10 @@ def pearson_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
         raise ValueError("inputs must have the same shape")
     if first.numel() < 2:
         return float("nan")
-    a = first.to(torch.float64) - first.to(torch.float64).mean()
-    b = second.to(torch.float64) - second.to(torch.float64).mean()
+    a = to_linalg_f64(first)
+    b = to_linalg_f64(second)
+    a = a - a.mean()
+    b = b - b.mean()
     denominator = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
     if denominator <= 0:
         return float("nan")
@@ -91,8 +95,8 @@ def circular_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
         raise ValueError("inputs must have the same shape")
     if first.numel() < 2:
         return float("nan")
-    a = first.to(torch.float64)
-    b = second.to(torch.float64)
+    a = to_linalg_f64(first)
+    b = to_linalg_f64(second)
     mean_a = torch.atan2(a.sin().mean(), a.cos().mean())
     mean_b = torch.atan2(b.sin().mean(), b.cos().mean())
     sin_a = (a - mean_a).sin()

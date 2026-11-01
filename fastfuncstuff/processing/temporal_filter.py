@@ -23,6 +23,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import linalg_device
 
 TEMPORAL_FILTER_KINDS = ("lowpass", "highpass", "bandpass", "movavg")
 
@@ -149,8 +150,10 @@ def apply_temporal_filter(
         disable=not verbose or n_vox <= chunk,
     ):
         b = min(a + chunk, n_vox)
-        y = data[a:b].to(
-            device=device, dtype=torch.float64 if data.dtype == torch.float64 else torch.float32
+        y = (
+            data[a:b].to(device=linalg_device(device)).to(torch.float64)
+            if data.dtype == torch.float64
+            else data[a:b].to(device=device, dtype=torch.float32)
         )
         res = torch.empty_like(y)
         for r in range(len(bounds) - 1):

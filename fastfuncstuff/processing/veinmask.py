@@ -26,6 +26,7 @@ from torch import Tensor
 
 from fastfuncstuff.stats.smooth3d import _gaussian_kernel_1d, blur_axis
 from fastfuncstuff.unique import sorted_unique
+from fastfuncstuff.utils import to_linalg_f64
 
 
 def masked_blur(x: Tensor, weight: Tensor, sigma_vox: tuple[float, float, float]) -> Tensor:
@@ -144,7 +145,7 @@ def local_tissue_darkness(
     A pial vein at the brain edge is compared with the GM beside it (the fit only sees
     ``fit_mask``), and a vein in bright CSF with CSF. Returns ``(ratio, expected)``."""
     dt = torch.float64
-    m, c = mean.to(dt), tissue.to(dt)
+    m, c = to_linalg_f64(mean), to_linalg_f64(tissue)
     use = fit_mask & (m > 0) & (c.sum(0) > 0.5)
     sel = use.reshape(-1)
     glob = torch.linalg.lstsq(c.reshape(3, -1)[:, sel].T, m.reshape(-1)[sel][:, None]).solution

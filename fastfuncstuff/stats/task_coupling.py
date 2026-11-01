@@ -73,6 +73,8 @@ from dataclasses import field as dc_field
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import linalg_device
+
 __all__ = [
     "TaskCoupling",
     "default_polort",
@@ -99,6 +101,8 @@ def _design_tensor(
     """float64 copy of a design matrix on ``device``. A tensor is moved, never routed
     through numpy: np.asarray raises on a CUDA tensor, and callers build designs on
     the fitting device."""
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     if isinstance(design, torch.Tensor):
         return design.to(device=device).to(torch.float64)
     return torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
@@ -293,6 +297,8 @@ def task_coupling(
     scoring a perfect fit is a bug this codebase has shipped twice (the MELODIC/GGM
     parity hunt, the denoisatorial PC selection); it is guarded explicitly.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.memory import estimate_chunk_size
 
@@ -560,6 +566,7 @@ def project_task_out(
     f = torch.as_tensor(field)
     if device is None:
         device = f.device
+    device = linalg_device(device)  # float64 throughout; Metal has none
     n_t = f.shape[3]
     x = _design_tensor(design, device)
     if x.ndim == 1:
@@ -718,6 +725,8 @@ def notch_basis(
     split :func:`project_task_out` makes, and for the same reason: a slow drift is real
     residual motion, not something the task filter should be eating.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
     t = torch.arange(n_t, dtype=torch.float64, device=device)
@@ -816,6 +825,8 @@ def filter_task_band(
     contaminated, so nothing can bleed through an iterative solve into other frames or
     voxels, and the corrected series is still resampled from the raw input.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.memory import estimate_chunk_size
 
     f = torch.as_tensor(data)
@@ -903,6 +914,8 @@ def component_variance_in_data(
     ``T - polort - 1`` dimensional residual space takes ``1/(T-polort-1)`` of the
     variance and ``K/(T-polort-1)`` of the task subspace by construction.
     """
+    if device is not None:
+        device = linalg_device(device)  # float64 throughout; Metal has none
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.memory import estimate_chunk_size
 

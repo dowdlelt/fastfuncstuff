@@ -27,7 +27,14 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import estimate_chunk_size, estimate_keep_on_cpu
-from fastfuncstuff.utils import cpu_if_mps, get_device, linalg_lstsq, to_tensor
+from fastfuncstuff.utils import (
+    cpu_if_mps,
+    get_device,
+    linalg_lstsq,
+    to_linalg_f64,
+    to_tensor,
+    widest_float_dtype,
+)
 
 from .hrf import get_hrf_library
 from .matrices import build_task_design
@@ -295,6 +302,7 @@ def _evaluate_hrfs_batched(
     r2 : torch.Tensor
         (n_voxels, n_designs) CV R² for each design, on CPU.
     """
+    wide = widest_float_dtype(device)
     n_voxels, n_timepoints = projected_data.shape
     n_designs = len(projected_designs)
     n_splits = len(cv_splits)
@@ -382,7 +390,7 @@ def _evaluate_hrfs_batched(
             # free insurance. Rank-deficient designs (missing events) still get
             # the minimum-norm solution via pinv, as pinv(X) == (X'X)^+ X'.
             xtx_by_run = [
-                torch.matmul(stack.transpose(1, 2).double(), stack.double())
+                torch.matmul(to_linalg_f64(stack).transpose(1, 2), to_linalg_f64(stack))
                 for stack in designs_stack_by_run
             ]
             xtx_total = torch.stack(xtx_by_run, dim=0).sum(dim=0)  # (n_designs, n_reg, n_reg)
@@ -394,7 +402,7 @@ def _evaluate_hrfs_batched(
                     xtx_train -= xtx_by_run[r]
                 # Small enough that CPU float64 is both fast and the most robust
                 # place to factor (also sidesteps the MPS pinv fallback).
-                pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device)
+                pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
                 test_stack = torch.cat(
                     [designs_stack_by_run[r] for r in test_runs], dim=1
                 )  # (n_designs, n_test_tps, n_reg)
@@ -404,20 +412,18 @@ def _evaluate_hrfs_batched(
                 ce = min(cs + chunk_size, n_voxels)
 
                 # Pass 1: X'y over every run, so no fold touches the training data
-                xty_total = torch.zeros(
-                    n_designs, n_reg, ce - cs, dtype=torch.float64, device=device
-                )
+                xty_total = torch.zeros(n_designs, n_reg, ce - cs, dtype=wide, device=device)
                 for r in range(n_runs):
                     y_run = data_by_run[r][cs:ce].to(device)
                     xty_total += torch.matmul(
-                        designs_stack_by_run[r].transpose(1, 2).double(), y_run.T.double()
+                        designs_stack_by_run[r].transpose(1, 2).to(wide), y_run.T.to(wide)
                     )
                     del y_run
 
                 # Pass 2: folds, touching only their held-out runs
                 for test_runs, pinv_xtx, test_stack in fold_plans:
                     y_test = torch.cat([data_by_run[r][cs:ce] for r in test_runs], dim=1).to(device)
-                    xty_test = torch.matmul(test_stack.transpose(1, 2).double(), y_test.T.double())
+                    xty_test = torch.matmul(test_stack.transpose(1, 2).to(wide), y_test.T.to(wide))
                     betas = torch.matmul(pinv_xtx, xty_total - xty_test).float()
 
                     # Per design rather than batched: yhat for all designs at once
@@ -526,21 +532,22 @@ def _evaluate_hrfs_batched(
     ]
     xtx_by_run = torch.stack(
         [
-            torch.matmul(stack.transpose(1, 2).double(), stack.double())
+            torch.matmul(to_linalg_f64(stack).transpose(1, 2), to_linalg_f64(stack))
             for stack in designs_stack_by_run
         ],
         dim=0,
     )  # (run, design, reg, reg)
 
-    train_membership = torch.zeros(n_splits, n_runs, dtype=torch.float64, device=device)
+    train_membership = torch.zeros(n_splits, n_runs, dtype=torch.float64, device=xtx_by_run.device)
     test_membership = torch.zeros(n_splits, n_runs, dtype=torch.float32, device=device)
     for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
         train_membership[fold_idx, train_runs] = 1.0
         test_membership[fold_idx, test_runs] = 1.0
 
     xtx_train = torch.einsum("fr,rdpq->fdpq", train_membership, xtx_by_run)
+    train_membership = train_membership.to(device=device, dtype=wide)
     # These matrices are tiny; CPU float64 is robust and avoids MPS fallback.
-    pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device)
+    pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
     del xtx_train
 
     test_count_by_run = test_membership.sum(dim=0)
@@ -568,7 +575,7 @@ def _evaluate_hrfs_batched(
         for r in range(n_runs):
             y_run = data_by_run[r][cs:ce].to(device)
             xty_by_run.append(
-                torch.matmul(designs_stack_by_run[r].transpose(1, 2).double(), y_run.T.double())
+                torch.matmul(designs_stack_by_run[r].transpose(1, 2).to(wide), y_run.T.to(wide))
             )
             del y_run
         xty_by_run_t = torch.stack(xty_by_run, dim=0)  # (run, design, reg, chunk)
@@ -2637,7 +2644,7 @@ def closest_to_canonical_index(
     curves.  Row order carries no meaning (a multi-group ffs_librarian set is not
     sorted by latency), which is why "the middle row" was not a fallback.
     """
-    lib = torch.as_tensor(hrf_library, dtype=torch.float64).detach().cpu()
+    lib = torch.as_tensor(hrf_library).detach().cpu().to(torch.float64)
     lib = lib.reshape(1, -1) if lib.ndim == 1 else lib
     canon, _ = canonical_hrf_curve(canonical_mode, microtime_dt, torch.device("cpu"))
     canon = canon.detach().cpu().to(torch.float64).reshape(-1)

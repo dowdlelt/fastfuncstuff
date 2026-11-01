@@ -64,7 +64,7 @@ from fastfuncstuff.processing.rbr import (
     resample_with_affine_field,
 )
 from fastfuncstuff.processing.tissue import build_tissue_design, tissue_projector
-from fastfuncstuff.utils import REGISTRATION_TF32
+from fastfuncstuff.utils import REGISTRATION_TF32, linalg_device
 
 _AXIS = {"x": 0, "y": 1, "z": 2}
 
@@ -327,9 +327,13 @@ def main(argv: list[str] | None = None) -> None:
 
     # anat→epi voxel affine (composing the -1Dmatrix stack); invert to cast anat
     # masks/PVEs into EPI space.
-    A = load_matrix_chain(
-        args.matrix, base_affine=anat_ref_hdr["affine"], source_affine=epi_hdr["affine"]
-    ).to(device=device).to(torch.float64)
+    A = (
+        load_matrix_chain(
+            args.matrix, base_affine=anat_ref_hdr["affine"], source_affine=epi_hdr["affine"]
+        )
+        .to(device=linalg_device(device))
+        .to(torch.float64)
+    )
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
     A_inv = torch.linalg.inv(A)

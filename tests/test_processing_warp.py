@@ -1046,6 +1046,7 @@ class TestPatchWriteBackDedup:
 
     @pytest.mark.gpu
     @pytest.mark.slow
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="the script calls .cuda()")
     def test_qwarp_batch_is_deterministic_when_asked(self):
         """-deterministic must make the batched multi-volume fit bit-reproducible.
 

@@ -294,8 +294,8 @@ def _pcpatch_project(
 
         # Skipped-variance fraction, patch-weighted by valid-voxel count.
         pw = vscale.sum(dim=1)  # (B,)
-        frac = (skip_var / total_var.clamp(min=1e-30)).to(torch.float64)
-        total_skipvar += float((frac * pw).sum().item())
+        frac = (skip_var / total_var.clamp(min=1e-30)).cpu().to(torch.float64)
+        total_skipvar += float((frac * pw.cpu()).sum().item())
         total_skipvar_w += float(pw.sum().item())
 
         if pbar is not None:

@@ -126,6 +126,109 @@ CASES: dict[str, tuple[str, object]] = {
         "pinv batched (50,150,150)",
         lambda d, t: lambda A=_build((50, 150, 150), d, t): torch.linalg.pinv(A),
     ),
+    # The shapes these actually arrive in: a small design or per-group system, one at
+    # a time or as a large batch. Metal's cost is mostly per-call latency, so a verdict
+    # at (500,500) says nothing about (12,12), and the batch can flip it.
+    "qr_small": (
+        "QR (300,12) -- one run's design",
+        lambda d, t: lambda A=_build((300, 12), d, t): torch.linalg.qr(A),
+    ),
+    "qr_batched": (
+        "QR batched (64,300,12)",
+        lambda d, t: lambda A=_build((64, 300, 12), d, t): torch.linalg.qr(A),
+    ),
+    "cholesky_small": (
+        "cholesky (60,60) -- ARMA whitening shape",
+        lambda d, t: lambda A=_build((1, 60, 60), d, t, spd=True)[0]: torch.linalg.cholesky(A),
+    ),
+    "inv": (
+        "inv (100,100)",
+        lambda d, t: lambda A=_build((1, 100, 100), d, t, spd=True)[0]: torch.linalg.inv(A),
+    ),
+    "inv_small": (
+        "inv (4,4) -- one affine",
+        lambda d, t: lambda A=_build((1, 4, 4), d, t, spd=True)[0]: torch.linalg.inv(A),
+    ),
+    "inv_batched": (
+        "inv batched (1000,12,12)",
+        lambda d, t: lambda A=_build((1000, 12, 12), d, t, spd=True): torch.linalg.inv(A),
+    ),
+    "solve_small": (
+        "solve (12,12) x (12,5000)",
+        lambda d, t: (
+            lambda A=_build((1, 12, 12), d, t, spd=True)[0], B=_build((12, 5000), d, t, seed=1): (
+                torch.linalg.solve(A, B)
+            )
+        ),
+    ),
+    "solve_batched": (
+        "solve batched (5000,6,6) -- GN patch shape",
+        lambda d, t: (
+            lambda A=_build((5000, 6, 6), d, t, spd=True), B=_build((5000, 6, 1), d, t, seed=1): (
+                torch.linalg.solve(A, B)
+            )
+        ),
+    ),
+    "solve_triangular": (
+        "solve_triangular (300,300) x (300,5000)",
+        lambda d, t: (
+            lambda L=torch.linalg.cholesky(_build((1, 300, 300), d, t, spd=True)[0]), B=_build((300, 5000), d, t, seed=1): (
+                torch.linalg.solve_triangular(L, B, upper=False)
+            )
+        ),
+    ),
+    "solve_triangular_batched": (
+        "solve_triangular batched (2000,32,8)",
+        lambda d, t: (
+            lambda L=torch.linalg.cholesky(_build((2000, 32, 32), d, t, spd=True)), B=_build((2000, 32, 8), d, t, seed=1): (
+                torch.linalg.solve_triangular(L, B, upper=False)
+            )
+        ),
+    ),
+    "slogdet": (
+        "slogdet (300,300)",
+        lambda d, t: lambda A=_build((1, 300, 300), d, t, spd=True)[0]: torch.linalg.slogdet(A),
+    ),
+    "det_batched": (
+        "det batched (300,3,3)",
+        lambda d, t: lambda A=_build((300, 3, 3), d, t, spd=True): torch.linalg.det(A),
+    ),
+    "eigvalsh": (
+        "eigvalsh (300,300) -- component Gram",
+        lambda d, t: lambda A=_build((1, 300, 300), d, t, spd=True)[0]: torch.linalg.eigvalsh(A),
+    ),
+    "svdvals": (
+        "svdvals (1000,200)",
+        lambda d, t: lambda A=_build((1000, 200), d, t): torch.linalg.svdvals(A),
+    ),
+    "median": (
+        "median (50k,300)",
+        lambda d, t: lambda A=_build((50000, 300), d, t): A.median(dim=-1).values,
+    ),
+    "quantile": (
+        "quantile (50k,300)",
+        lambda d, t: lambda A=_build((50000, 300), d, t): torch.quantile(A, 0.9, dim=-1),
+    ),
+    "sort": (
+        "sort (1M,)",
+        lambda d, t: lambda A=_build((1000000,), d, t): torch.sort(A),
+    ),
+    "unique": (
+        "unique (1M ints)",
+        lambda d, t: lambda A=(_build((1000000,), d, t) * 100).long(): torch.unique(A),
+    ),
+    "unique_dim0": (
+        "unique dim=0 (300,10000)",
+        lambda d, t: lambda A=(_build((300, 10000), d, t) > 0).float(): torch.unique(A, dim=0),
+    ),
+    "index_add": (
+        "index_add (1M -> 1000 bins)",
+        lambda d, t: (
+            lambda A=_build((1000000,), d, t), I=(_build((1000000,), d, t, seed=1).abs() * 300).long().clamp(max=999): (
+                torch.zeros(1000, device=d, dtype=t).index_add(0, I, A)
+            )
+        ),
+    ),
     "fft": (
         "rfft (100k,256)",
         lambda d, t: lambda A=_build((100000, 256), d, t): torch.fft.rfft(A, dim=-1),

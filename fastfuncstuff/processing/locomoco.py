@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
 
-from ..utils import get_device
+from ..utils import get_device, linalg_device, to_linalg_f64
 
 if TYPE_CHECKING:
     from fastfuncstuff.stats.fwhmx import FWHMxResult
@@ -349,8 +349,8 @@ def jitter_recovery(
     Sign is normalised so a correct recovery reads positive: the estimator returns the
     PULL displacement that undoes the shift, which is the negative of the one applied.
     """
-    e = estimated[mask].reshape(-1).double()
-    i = injected[mask].reshape(-1).double()
+    e = estimated[mask].reshape(-1).cpu().double()
+    i = injected[mask].reshape(-1).cpu().double()
     e = e - e.mean()
     i = i - i.mean()
     den = float((i * i).sum())
@@ -2872,7 +2872,7 @@ def estimate_residual_flow_rotaware(
         )
 
     Mv = matrices_vox.to(device=device, dtype=torch.float32)  # (T,4,4) ref→raw
-    Mv_inv = torch.linalg.inv(Mv.double()).float()  # raw→ref
+    Mv_inv = torch.linalg.inv(to_linalg_f64(Mv)).float().to(device)  # raw→ref
 
     flow_fn = _build_flow_fn(
         backend,
@@ -7764,7 +7764,7 @@ def _warp_grams(blocks, device=None, want_means=False):
         for _axis, _shape, mat in blocks:
             n_vox = mat.shape[0]
             step = _warp_chunk(n_vox, n_t, dev)
-            g = torch.zeros(n_t, n_t, dtype=torch.float64, device=dev)
+            g = torch.zeros(n_t, n_t, dtype=torch.float64, device=linalg_device(dev))
             mu = torch.empty(n_vox, dtype=torch.float64) if want_means else None
             for i in range(0, n_vox, step):
                 staged = mat[i : i + step].to(dev, torch.float32)
@@ -7773,7 +7773,7 @@ def _warp_grams(blocks, device=None, want_means=False):
                 # caller's own warp field, and centering it would silently strip the
                 # per-voxel mean out of the data everything downstream still uses.
                 c = staged - m
-                g += (c.T @ c).double()
+                g += (c.T @ c).to(g.device).to(torch.float64)
                 if mu is not None:
                     mu[i : i + step] = m[:, 0].cpu().double()
                 del staged, c, m
@@ -7891,7 +7891,7 @@ def warp_project_out(components, bad_timecourses, device=None):
         shape = tuple(disp.shape[:3])
         n_t = disp.shape[-1]
         n_vox = int(np.prod(shape))
-        dev = device if device is not None else disp.device
+        dev = linalg_device(device if device is not None else disp.device)
         a = bad.to(device=dev).to(torch.float64)
         # The basis is (T, m) with m tiny, so the QR is free and hoists out of the loop.
         q, _ = torch.linalg.qr(a - a.mean(dim=0, keepdim=True))

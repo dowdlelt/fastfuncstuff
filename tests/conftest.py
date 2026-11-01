@@ -78,6 +78,22 @@ def pytest_configure(config):
     )
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    """A gpu test that names CUDA has nothing to check on a machine without it.
+
+    ``gpu`` means "lets a device default happen", and on a Mac that is Metal. Most of
+    that set is meaningful there, so it is worth running; the tests that spell out
+    ``.cuda()`` skip here rather than each carrying its own availability check.
+    """
+    try:
+        return (yield)
+    except AssertionError as exc:
+        if item.get_closest_marker("gpu") and "not compiled with CUDA" in str(exc):
+            pytest.skip("needs CUDA")
+        raise
+
+
 @pytest.fixture(scope="session")
 def device():
     """Ordinary tests are CPU-only; GPU tests must opt in with @pytest.mark.gpu."""

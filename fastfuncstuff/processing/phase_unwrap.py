@@ -51,6 +51,8 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff.utils import linalg_device
+
 from ..memory import get_available_memory
 
 TWO_PI = 2.0 * np.pi
@@ -464,6 +466,7 @@ def _fit_frame_field(
     captures the frame-wide field (breathing, breath-holds, drift) even where it
     moves by more than half a period; slab views as in :func:`unwrap_timeseries`.
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     d0, d1, d2 = pv.shape[:3]
     nt = pv.shape[-1]
     k = _poly_basis(torch.zeros(1, 3), order).shape[1]
@@ -483,8 +486,12 @@ def _fit_frame_field(
             - _gather(uv[a:b, :, :, 0], (n,), idx)[:, None]
         )
         u, smooth = _time_path(c, rough_max)
-        y = (u - u.median(1, keepdim=True).values)[smooth].double()
-        x = _poly_basis(_slab_coords(a, b, (d0, d1, d2), idx[smooth]), order).double()
+        y = (u - u.median(1, keepdim=True).values)[smooth].to(device).to(torch.float64)
+        x = (
+            _poly_basis(_slab_coords(a, b, (d0, d1, d2), idx[smooth]), order)
+            .to(device)
+            .to(torch.float64)
+        )
         xtx += x.T @ x
         xty += x.T @ y
     ridge = 1e-6 * torch.trace(xtx) / k * torch.eye(k, dtype=xtx.dtype, device=device)
@@ -640,9 +647,9 @@ def _gaussian_symmetric(vols: Tensor, sigma: float) -> Tensor:
 
 def _low_rank(a: Tensor, k: int) -> Tensor:
     """Rank-``k`` reconstruction of a tall (V, T) matrix via its T x T Gram matrix."""
-    from ..utils import factor_device
+    from ..utils import to_factor_f64
 
-    g = (a.T.double() @ a.double()).to(factor_device(a.device))
+    g = to_factor_f64(a.T @ a)
     _, vecs = torch.linalg.eigh(g)
     v = vecs[:, -k:].to(a.device, a.dtype)
     return (a @ v) @ v.T
@@ -705,6 +712,7 @@ def remove_offset_drift(
     ``unwrapped``/``mag``: ``(x, y, z, e, t)``; needs 2+ echoes. Returns the per-volume
     polynomial coefficients ``(4, t)`` [rad] (offset, x, y, z on [-1, 1] coordinates).
     """
+    device = linalg_device(device)  # float64 throughout; Metal has none
     te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
     if te.numel() < 2:
         raise ValueError("the offset drift needs at least two echoes")
