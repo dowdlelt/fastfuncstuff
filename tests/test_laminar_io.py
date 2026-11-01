@@ -54,7 +54,7 @@ def test_the_reference_design_comes_back_from_deconvolve_style_tables(oracle, tm
     b = _write_table(tmp_path / "b_iresp_c3.tsv", times, second[:, ::-1])
     data = two_condition_data(
         pick_roi(read_iresp_table(a), "V1"), pick_roi(read_iresp_table(b), "V1"), duration=1.6,
-        delay_seconds=None,
+        delay_seconds=None, modulation="reference",
     )  # fmt: skip
     u_ref = torch.tensor(np.asarray(o["u"], float)).reshape(-1, 2)
     rows_ref = torch.tensor(np.asarray(o["mask_rows"], float)).reshape(-1).bool()
@@ -101,3 +101,26 @@ def test_a_matrix_depth_kernel_is_a_plain_mixing_and_the_gaussian_path_is_untouc
         apply_depth_psf(lbr, torch.eye(5, dtype=torch.float64))
     g = torch.tensor([0.25, 0.5, 0.25], dtype=torch.float64)
     assert apply_depth_psf(lbr, g).shape == lbr.shape  # the reference's 1-D Gaussian
+
+
+def test_modulation_defaults_to_the_event_and_keeps_the_reference_pulse():
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    times = np.arange(8) * 1.85
+    curves = np.zeros((1, 8, 5))
+    ref = two_condition_batch(curves, curves, times, duration=1.0, gap=4, modulation="reference")
+    ev = two_condition_batch(curves, curves, times, duration=1.0, gap=4)
+    dt = ref.spec.dt
+    on_ref = np.flatnonzero(ref.u[:, 0].numpy() > 0) * dt
+    on_ev = np.flatnonzero(ev.u[:, 0].numpy() > 0) * dt
+    onset_b = (ref.meta["block"] + 4 + 1) * 1.85
+    # Reference: 0.1 s ending one sample after the second event (Faes's fourth tone).
+    assert on_ref.min() == pytest.approx(onset_b + 1.85 - 0.1, abs=dt)
+    assert on_ref.max() - on_ref.min() < 0.1
+    # Event (the default): the whole second event; boxcars are end-inclusive.
+    assert on_ev.min() == pytest.approx(onset_b, abs=dt)
+    assert on_ev.max() == pytest.approx(onset_b + 1.0, abs=dt)
+    span = two_condition_batch(curves, curves, times, duration=1.0, gap=4, modulation=(0.0, 1.0))
+    torch.testing.assert_close(span.u, ev.u)
+    # The driving input is untouched.
+    torch.testing.assert_close(ref.u[:, 1], ev.u[:, 1])

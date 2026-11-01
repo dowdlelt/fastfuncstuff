@@ -749,8 +749,31 @@ def _mix_matrices(
     indices of the voxels the reads touch (a distorted EPI voxel is not its nominal size).
     """
     k_n = plan.n_depths
+    mixed, total = mix_rows(plan.all_cells, k_n, w, every_ijk, shape3, voxel_mm3)
+    out = []
+    for r_idx, roi in enumerate(plan.rois):
+        rows = slice(r_idx * k_n, (r_idx + 1) * k_n)
+        m = np.divide(mixed[rows], total[rows, None], out=np.full((k_n, k_n), np.nan),
+                      where=total[rows, None] > 0)  # fmt: skip
+        if normalise:
+            sm = m.sum(axis=1, keepdims=True)
+            m = np.divide(m, sm, out=np.full_like(m, np.nan), where=sm > 0)
+        out.append((roi.name, plan.hemi_of[r_idx], m))
+    return out
+
+
+def mix_rows(
+    every, k_n: int, w: sp.csr_matrix, every_ijk: np.ndarray, shape3, voxel_mm3
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(mixed, total)`` per read row: ``mixed[r, j]`` is how much true depth ``j``
+    row ``r``'s reads pick up (unnormalised), ``total[r]`` its read weight -- so
+    ``mixed / total`` is the row's depth PSF. Linear in the rows, so the PSF of a
+    union of rows is the ratio of their sums.
+
+    ``every`` are all the cells that can sit in a read voxel (``DepthPlan.all_cells``),
+    ``every_ijk`` where they lie on the read grid.
+    """
     touched = np.flatnonzero(np.asarray((w != 0).sum(axis=0)).ravel() > 0)
-    every = plan.all_cells
     assert every is not None
     ijk = np.rint(every_ijk).astype(np.int64)
     inside = np.all((ijk >= 0) & (ijk < np.asarray(shape3)), axis=1) & np.isfinite(every_ijk).all(1)
@@ -769,16 +792,7 @@ def _mix_matrices(
 
     total = np.asarray(w.sum(axis=1)).ravel()
     mixed = np.asarray(w[:, touched] @ v)  # (rows, K)
-    out = []
-    for r_idx, roi in enumerate(plan.rois):
-        rows = slice(r_idx * k_n, (r_idx + 1) * k_n)
-        m = np.divide(mixed[rows], total[rows, None], out=np.full((k_n, k_n), np.nan),
-                      where=total[rows, None] > 0)  # fmt: skip
-        if normalise:
-            sm = m.sum(axis=1, keepdims=True)
-            m = np.divide(m, sm, out=np.full_like(m, np.nan), where=sm > 0)
-        out.append((roi.name, plan.hemi_of[r_idx], m))
-    return out
+    return mixed, total
 
 
 def psf_halo_mm(interp: str, voxel_mm: float) -> float:

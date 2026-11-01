@@ -131,6 +131,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "times after the event, so 0.")  # fmt: skip
     m.add_argument("-reference_delay", action="store_true",
                    help="The reference's slice-timing delay instead, TR/2.")  # fmt: skip
+    m.add_argument("-modulation", nargs="+", default=["event"], metavar="WHEN",
+                   help="When the modulatory input (the second condition's difference) is on: "
+                   "'event' (default) for the whole second event -- the conditions are "
+                   "different stimuli or tasks; 'reference' for the published 0.1 s pulse "
+                   "ending one sample after the event, which in Faes et al. is the fourth tone "
+                   "of the quartet (the prediction violation) -- for parity only; or START DUR, "
+                   "seconds after the second onset.")  # fmt: skip
     m.add_argument("-TE", type=float, default=0.028, help="Echo time (s).")
     m.add_argument("-B0", type=float, default=7.0, help="Field strength (T).")
     m.add_argument("-max_iter", type=int, default=128, help="Variational Laplace iterations.")
@@ -265,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("no ROI is in every table (and matches -roi / -hemi)")
 
         delay = None if args.reference_delay else args.delay
+        modulation = parse_modulation(args.modulation)
         jobs = []
         for rid, name, hemi in keys:
             data_for_k = {
@@ -280,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
                     TE=args.TE,
                     B0=args.B0,
                     p0=reference_p0(),
+                    modulation=modulation,
                 )  # fmt: skip
                 for k in ks
             }
@@ -316,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                     "padding": {"rows": args.pad_rows, "sd": args.pad_sd, "seed": args.pad_seed,
                                 "hyperprior": args.hyperprior}, "free_energy": args.free_energy,
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
+                    "modulation": modulation,
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
     )  # fmt: skip
     if args.plots:
@@ -339,6 +349,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  wrote {path}")
         print(f"ffs_laminar: done in {time.time() - t0:.0f} s")
     return 0
+
+
+def parse_modulation(words: list[str]):
+    """``-modulation``: 'event', 'reference', or START DUR (seconds)."""
+    if len(words) == 1 and words[0] in ("event", "reference"):
+        return words[0]
+    if len(words) == 2:
+        try:
+            return (float(words[0]), float(words[1]))
+        except ValueError:
+            pass
+    raise ValueError(f"-modulation takes 'event', 'reference' or START DUR, not {' '.join(words)}")
 
 
 def _names(n):
