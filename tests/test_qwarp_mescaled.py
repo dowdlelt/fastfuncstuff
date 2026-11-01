@@ -428,14 +428,16 @@ def test_slicewise_single_echo_untouched_by_te_scaling():
     # perturbation. Calibrate against that instead of guessing an absolute bound:
     # rescaling the data by 1+1e-6 cannot change the true displacement, so whatever it
     # moves is this problem's own noise floor. A real E-dependence would push past it
-    # and would grow with the echo count; a tie-flip stays inside it.
-    floor = (_run(base * (1 + 1e-6), 1, None) - f_none).abs()
+    # and would grow with the echo count; a tie-flip stays inside it. One rescale is not
+    # enough to know the floor: across ten on an M4 its q99 ran from 1.9e-3 to 1.1e-2,
+    # and +1e-6 alone happens to be the lowest.
+    floor = max(_q99((_run(base * (1 + e), 1, None) - f_none).abs()) for e in (1e-6, -1e-6, -2e-6))
     f_dup = _run(base, 2, torch.tensor([1.0, 1.0]))
     d = (f_dup - f_none).abs()
     assert float(d.median()) < 1e-5, "a duplicated echo changed the E=1 solution"
-    assert _q99(d) <= max(3.0 * _q99(floor), 1e-4), (
+    assert _q99(d) <= max(2.0 * floor, 1e-4), (
         f"echo duplication moved the field past its own noise floor: "
-        f"q99 {_q99(d):.3e} vs floor {_q99(floor):.3e}"
+        f"q99 {_q99(d):.3e} vs floor {floor:.3e}"
     )
 
 

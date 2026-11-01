@@ -1243,7 +1243,10 @@ class TestCrossRunBatchedParity:
             memory.estimate_chunk_size = real
 
         assert calls, "the scorer must size its chunks through memory.py, not a constant"
-        assert np.abs(whole - chunked).max() < 1e-10
+        # The data is float32, and a different chunk shape rounds differently: 1.3e-9 on a
+        # score of 0.03 on an M4, 4e-8 relative, under float32's 1.2e-7. A dropped or
+        # misaligned voxel moves the median across 900 of them by far more.
+        assert (np.abs(whole - chunked) / np.abs(whole)).max() < 1.2e-7
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")

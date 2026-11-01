@@ -28,6 +28,17 @@ from fastfuncstuff.processing import locomoco as L
 # held throughout. 2-D xcorr still uses the linear shift + argmax (untouched), unchanged.
 ATOL = 6e-3
 
+# Where one seed's tail statistics cannot be pinned at ATOL. Measured on an M4: rescaling the
+# input by 1 +/- 2e-5, which cannot change the true displacement, moved these by up to
+# 0.022 (q95), 0.014 (q05), 0.0095 (q50), 0.0047 (mean) and 0.18 (absmax) on the learned
+# scaling path, more than the gap from the Linux baselines. Those baselines all sit inside
+# that range. These are that spread with some margin, per path and statistic; everything
+# else, including the fixed-scaling path, stays at ATOL, and test_locomoco.py is the accuracy gate.
+ME_JOINT_TOL = {"mean": 8e-3, "q05": 0.025, "q50": 0.015, "q95": 0.035, "absmax": 0.25}
+ME_INTERECHO_TOL = {"absmax": 0.2}
+ME_SCALED_TOL = {"absmax": 0.015}
+ME_JOINT_ALPHA_TOL = 0.02
+
 
 def _phantom4d(nx=28, ny=28, nz=8, nt=6, seed=0, decay=1.0):
     rng = np.random.default_rng(seed)
@@ -54,10 +65,12 @@ def _stats(field):
     }
 
 
-def _assert_stats(field, expected):
+def _assert_stats(field, expected, tol=None):
     got = _stats(field)
+    tol = tol or {}
     for k, v in expected.items():
-        assert abs(got[k] - v) < ATOL, f"{k}: {got[k]:.6f} != {v:.6f} (Δ {got[k] - v:+.6f})"
+        limit = tol.get(k, ATOL)
+        assert abs(got[k] - v) < limit, f"{k}: {got[k]:.6f} != {v:.6f} (Δ {got[k] - v:+.6f})"
 
 
 _DEV = torch.device("cpu")
@@ -164,8 +177,9 @@ def test_char_me_joint():
             "q95": 0.990209,
             "absmax": 2.845777,
         },
+        ME_JOINT_TOL,
     )
-    assert np.allclose(r.alpha.tolist(), [1.0, 0.19318, 0.17425], atol=ATOL)
+    assert np.allclose(r.alpha.tolist(), [1.0, 0.19318, 0.17425], atol=ME_JOINT_ALPHA_TOL)
 
 
 def test_char_me_fixed():
@@ -206,6 +220,7 @@ def test_char_me_interecho():
             "q95": 0.655723,
             "absmax": 1.603773,
         },
+        ME_INTERECHO_TOL,
     )
 
 
@@ -223,4 +238,5 @@ def test_char_me_scaled():
             "q95": 0.113341,
             "absmax": 0.595628,
         },
+        ME_SCALED_TOL,
     )

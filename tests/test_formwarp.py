@@ -906,9 +906,11 @@ def test_damping_mask_is_the_same_computed_on_a_box(monkeypatch):
         ),
         "nothing bad": torch.ones(24, 26, 28),
     }
+    # One ULP, not bit-equality: a sub-volume's blur vectorises differently from the whole
+    # volume's. "on the face" differed by 6e-8 at 0.49 in 131 voxels on an M4 with torch 2.14.
     for name, jac in cases.items():
         torch.testing.assert_close(
-            _fold_damping_mask(jac, 0.3, 0.5), dense(jac, 0.3, 0.5), rtol=0.0, atol=0.0, msg=name
+            _fold_damping_mask(jac, 0.3, 0.5), dense(jac, 0.3, 0.5), rtol=1e-6, atol=1e-6, msg=name
         )
 
 
