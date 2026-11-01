@@ -486,6 +486,36 @@ def test_script_rejects_unsupported_shell_before_creating_outputs(tmp_path):
     assert not out_dir.exists()
 
 
+def _modern_bash() -> str | None:
+    """A Bash >= 4 from the places the emitted preamble looks, or None."""
+    for candidate in (shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash"):
+        if candidate and Path(candidate).exists():
+            probe = subprocess.run(
+                [candidate, "-c", '[ "${BASH_VERSINFO[0]}" -ge 4 ]'], capture_output=True
+            )
+            if probe.returncode == 0:
+                return candidate
+    return None
+
+
+def test_script_run_by_an_older_shell_continues_under_a_modern_bash(tmp_path):
+    """Stock macOS bash and plain sh both land here; neither should stop the pipeline."""
+    if _modern_bash() is None:
+        pytest.skip("no Bash >= 4 on this machine")
+    plan = build_plan(
+        Subject("X", [Session("01", [_run("01", "foo", "1")])]), Options(go_to_anat=False)
+    )
+    preamble = write_script(plan, str(tmp_path / "outputs")).split("\nOUT=", 1)[0]
+    path = tmp_path / "s.sh"
+    path.write_text(preamble + '\necho "major=${BASH_VERSINFO[0]} args=$*"\n')
+    # sh: bash in POSIX mode on a Mac, dash on Debian. Either way not a Bash >= 4 script run.
+    out = subprocess.run(["sh", str(path), "one", "two"], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    major, args = out.stdout.strip().removeprefix("major=").split(" args=")
+    assert int(major) >= 4
+    assert args == "one two"
+
+
 def test_script_preamble_checks_the_running_bash_version(tmp_path):
     plan = build_plan(
         Subject("X", [Session("01", [_run("01", "foo", "1")])]), Options(go_to_anat=False)

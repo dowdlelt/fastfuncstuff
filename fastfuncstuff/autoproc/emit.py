@@ -1328,9 +1328,19 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
         _invocation_note(invocation)
     }
 # ---- Bash version -----------------------------------------------------------
+# macOS ships Bash 3.2, so hand over to a newer one if it is installed anywhere usual.
 if [ -z "${{BASH_VERSION:-}}" ] || [ "${{BASH_VERSINFO[0]}}" -lt 4 ]; then
+    if [ -f "$0" ]; then
+        for _bash in "$(command -v bash)" /opt/homebrew/bin/bash /usr/local/bin/bash \
+                /opt/local/bin/bash "${{CONDA_PREFIX:-}}/bin/bash"; do
+            if [ -x "$_bash" ] && "$_bash" -c '[ "${{BASH_VERSINFO[0]}}" -ge 4 ]' 2>/dev/null; then
+                echo "ffs_autoproc: continuing under $_bash" >&2
+                exec "$_bash" "$0" "$@"
+            fi
+        done
+    fi
     echo "ERROR: ffs_autoproc pipelines require Bash >= 4 (associative arrays)." >&2
-    echo "On macOS: brew install bash; run this script with the installed Bash." >&2
+    echo "On macOS: brew install bash, then run this script again." >&2
     exit 1
 fi
 set -euo pipefail
