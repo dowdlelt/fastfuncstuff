@@ -59,9 +59,10 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.unique import sorted_unique
-from fastfuncstuff.utils import get_device, on_policy_device, pinv_f64
+from fastfuncstuff.utils import get_device, pinv_f64
 
 # Off-diagonal Gram mass above this fraction of the diagonal means the bands are no longer
 # orthogonal and the closed-form decoupling in this module does not hold.
@@ -172,7 +173,7 @@ def _orthonormal_contrasts(n_levels: int, dtype: torch.dtype) -> Tensor:
         raise ValueError(f"factor needs >= 2 levels, got {n_levels}")
     m = torch.eye(n_levels, dtype=dtype)
     m[:, 0] = 1.0
-    q, _ = torch.linalg.qr(m)
+    q, _ = plinalg.qr(m)
     return q[:, 1:].contiguous()
 
 
@@ -462,7 +463,7 @@ def _solve_gammas_from_gram(gram: Tensor, rhs: Tensor) -> Tensor:
     # is exactly the rank-0 variant, where the interaction column is structurally absent.
     scale = torch.diagonal(gram, dim1=-2, dim2=-1).mean(dim=-1).clamp_min(1e-12)
     reg = gram + 1e-8 * scale[..., None, None] * eye
-    gam = torch.linalg.solve(reg, rhs.unsqueeze(-1)).squeeze(-1)
+    gam = plinalg.solve(reg, rhs.unsqueeze(-1)).squeeze(-1)
     return gam.clamp(0.0, 1.0)
 
 
@@ -893,9 +894,7 @@ def partition_variance(
                 # (n_a, n_b) cell-mean matrix -- same answer, smaller decomposition.
                 sl = band_slices[pname]
                 b_i = coef[:, 1 + sl.start : 1 + sl.stop].reshape(nvc, ia, ib)
-                u, s, vh = on_policy_device(
-                    "svd_batched", torch.linalg.svd, b_i, full_matrices=False
-                )
+                u, s, vh = plinalg.svd(b_i, full_matrices=False)
                 sv_all[pname][:, fi, : min(mr, s.shape[1])] = s[:, :mr]
 
                 # A multiplicative gain model, m = mu + a_s * (1 + g_t), leaves an
@@ -2077,7 +2076,7 @@ def _column_space(x: Tensor) -> tuple[Tensor, int]:
     fit, which is both cheaper and stable when dropped trials leave the design rank
     deficient -- the normal case here, not an edge case.
     """
-    u, s, _ = torch.linalg.svd(x.double(), full_matrices=False)
+    u, s, _ = plinalg.svd(x.double(), full_matrices=False)
     tol = float(s.max()) * max(x.shape) * torch.finfo(torch.float64).eps if s.numel() else 0.0
     rank = int((s > tol).sum())
     return u[:, :rank].contiguous().float(), rank

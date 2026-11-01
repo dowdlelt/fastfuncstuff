@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.decomposition.model_order import select_model_order
 from fastfuncstuff.denoise.sequential import estimate_noise_component_caps_per_run
 from fastfuncstuff.design.builder import (
@@ -132,7 +133,7 @@ def apply_polort_projection(
 
     if poly.shape[1] == 0:
         return data_vox_t
-    q, _ = torch.linalg.qr(poly)
+    q, _ = plinalg.qr(poly)
     # Project out polynomials in-place via chunking to avoid allocating
     # a full (V, T) intermediate when V is very large.
     from fastfuncstuff.memory import estimate_chunk_size
@@ -368,7 +369,7 @@ def estimate_ica_component_count(
     # Use identity: (X-m)(X-m)^T = XX^T - V*mm^T to avoid a (T,V) copy.
     row_mean = x_t_dev.mean(dim=1, keepdim=True)  # (T, 1)
     corr_t = (x_t_dev @ x_t_dev.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)
-    ev_all = torch.linalg.eigvalsh(corr_t).flip(0)  # descending
+    ev_all = plinalg.eigvalsh(corr_t).flip(0)  # descending
     del corr_t
     ev_all = torch.clamp(ev_all, min=0)
     total_var = ev_all.sum()

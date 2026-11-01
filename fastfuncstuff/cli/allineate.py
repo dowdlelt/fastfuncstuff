@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_batch_args,
@@ -80,7 +81,7 @@ def _out_matrix(
     # this avoids both slow consumer-CUDA float64 and MPS's lack of float64.
     ab = torch.as_tensor(np.asarray(base_affine), dtype=torch.float64)
     ao = torch.as_tensor(np.asarray(out_affine), dtype=torch.float64)
-    out = matrix.detach().cpu().double() @ torch.linalg.inv(ab) @ ao
+    out = matrix.detach().cpu().double() @ plinalg.inv(ab) @ ao
     return out.to(device=device, dtype=matrix.dtype)
 
 
@@ -97,7 +98,7 @@ def _inverse_dicom_matrix(
     none at all.
     """
     dicom = voxel_matrix_to_dicom(matrix.detach().cpu(), base_affine, source_affine)
-    return torch.linalg.inv(dicom.double())
+    return plinalg.inv(dicom.double())
 
 
 def _resample(
@@ -153,7 +154,7 @@ def _apply_followers(
         with spinner(f"Loading {Path(path).name}"):
             follower, follower_header = load_image(path, device=device)
         a_fol = torch.as_tensor(np.asarray(follower_header["affine"]), dtype=torch.float64)
-        fm = torch.linalg.inv(a_fol) @ a_src @ matrix.detach().cpu().double()
+        fm = plinalg.inv(a_fol) @ a_src @ matrix.detach().cpu().double()
         fm = fm.to(device=device, dtype=matrix.dtype)
         if follower.ndim == 4:
             warped = torch.stack(

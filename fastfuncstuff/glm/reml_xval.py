@@ -29,6 +29,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.glm.xval import _compute_projection_matrix
 from fastfuncstuff.memory import estimate_chunk_size
@@ -87,11 +88,11 @@ def _whiten_per_run(
             )
             if covariance is None:
                 raise ValueError(f"invalid ARMA(1,1) parameters a={a}, b={b}")
-            factor = torch.linalg.cholesky(covariance).to(design.device, dtype=design.dtype)
+            factor = plinalg.cholesky(covariance).to(design.device, dtype=design.dtype)
             cholesky_cache[key] = factor
 
-        design_white[block] = torch.linalg.solve_triangular(factor, design[block], upper=False)
-        data_white[block] = torch.linalg.solve_triangular(factor, data[block], upper=False)
+        design_white[block] = plinalg.solve_triangular(factor, design[block], upper=False)
+        data_white[block] = plinalg.solve_triangular(factor, data[block], upper=False)
 
     return design_white, data_white
 
@@ -180,7 +181,7 @@ def _score_voxel_chunk(
             keep[column] = present
         fit_design = design_white[:, keep]
         gram = fit_design.T @ fit_design
-        gram_inv = torch.linalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
+        gram_inv = plinalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
         betas_kept = (gram_inv @ fit_design.T) @ data_white  # (n_kept, n_group_voxels)
 
         betas_full = torch.zeros(
@@ -261,7 +262,7 @@ def compute_xval_r2_arma(
     # Quantise to the grid step so floating-point noise in the stored parameters
     # cannot explode the group count into thousands of near-identical pairs.
     quantised = torch.round(arma_params.detach().cpu() * 1000.0) / 1000.0
-    pairs, inverse = torch.unique(quantised, dim=0, return_inverse=True)
+    pairs, inverse = plinalg.unique_rows(quantised, return_inverse=True)
     if verbose:
         print(f"  ARMA-aware CV: {len(pairs)} distinct (a, b) group(s) over {n_voxels:,} voxels")
 

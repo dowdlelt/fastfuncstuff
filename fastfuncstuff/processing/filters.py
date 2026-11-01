@@ -17,6 +17,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 
 def _sgf_coefficients(
     window_length: int,
@@ -55,11 +57,11 @@ def _sgf_coefficients(
         legendre = [torch.ones_like(u), u]
         for n in range(1, poly_order):
             legendre.append(((2 * n + 1) * u * legendre[n] - n * legendre[n - 1]) / (n + 1))
-        q = torch.linalg.qr(torch.stack(legendre[: poly_order + 1], dim=1))[0]
+        q = plinalg.qr(torch.stack(legendre[: poly_order + 1], dim=1))[0]
         coeffs = q @ q[half]  # centre row of the local-fit hat matrix
     else:
         vander = u.unsqueeze(1) ** torch.arange(poly_order + 1, dtype=torch.float64)
-        coeffs = torch.linalg.pinv(vander)[deriv] / float(max(half, 1)) ** deriv
+        coeffs = plinalg.pinv(vander)[deriv] / float(max(half, 1)) ** deriv
     coeffs = coeffs.to(device=device, dtype=dtype)
     return coeffs
 

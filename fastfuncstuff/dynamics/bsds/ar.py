@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 _DTYPE = torch.float64
 # ARD prior mean on vec(B) precision: reference uses ao=bo=1e-3, i.e. E[alpha]=1.
 _AR_RIDGE = 1e-3
@@ -74,7 +76,7 @@ def fit_state_var(
     ldim = x_lat.shape[0]
     suu, svu, syy, neff = _lag_moments(x_lat, gamma_state, session_lengths)
     eye = torch.eye(ldim, dtype=_DTYPE, device=x_lat.device)
-    b = svu @ torch.linalg.inv(suu + _AR_RIDGE * eye)  # (ldim, ldim)
+    b = svu @ plinalg.inv(suu + _AR_RIDGE * eye)  # (ldim, ldim)
     if neff > 1:
         resid_2m = syy - b @ svu.T  # E[(v - Bu)(v - Bu)'] * Neff
         noise_cov = resid_2m / neff

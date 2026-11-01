@@ -66,6 +66,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, linalg_device, linalg_lstsq, parabolic_peak_offset
 
@@ -444,7 +445,7 @@ def _solve_amplitudes(
         # well-posed even where the prior asks for (almost) nothing.
         ridge = torch.maximum(ridge, 1e-8 * _scale)
         XtX = XtX + ridge[:, None, None] * eye
-        out[s:e] = torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
+        out[s:e] = plinalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
         del XtX, Xty, ridge, band_vals, gi_nb
     return out
 
@@ -598,7 +599,7 @@ def fit_shifted_hrf(
     raw_support = (bank_raw.abs().amax(dim=1) > 0).to(torch.float64)  # (NB, T)
     overlap = (raw_support @ raw_support.T) > 0  # (NB, NB)
     if Z is not None:
-        Q, _ = torch.linalg.qr(Z)  # orthonormal basis of the nuisance space
+        Q, _ = plinalg.qr(Z)  # orthonormal basis of the nuisance space
         u = (bank_raw.reshape(n_blocks * n_grid, n_t) @ Q).reshape(n_blocks, n_grid, -1)
         umag = u.abs().amax(dim=1)  # (NB, nz)
         cpl = umag @ umag.T
@@ -654,7 +655,7 @@ def fit_shifted_hrf(
         G0 = G0 + 1e-10 * torch.diagonal(G0).mean().clamp_min(1e-30) * torch.eye(
             n_blocks, dtype=G0.dtype, device=device
         )
-        dinv0 = torch.diagonal(torch.linalg.inv(G0)).clamp_min(0.0)
+        dinv0 = torch.diagonal(plinalg.inv(G0)).clamp_min(0.0)
         del X0, G0
 
     tau_t = torch.as_tensor(tau_grid, device=device)
@@ -1564,13 +1565,13 @@ def select_shape_per_voxel(
         XtX = XtX + 1e-8 * float(torch.diagonal(XtX).mean()) * torch.eye(
             n_blocks, dtype=XtX.dtype, device=device
         )
-        L = torch.linalg.cholesky(XtX)
+        L = plinalg.cholesky(XtX)
         for s in range(0, n_voxels, chunk_size):
             e = min(s + chunk_size, n_voxels)
             y = _project_out(
                 y_src[s:e].to(device=device, non_blocking=True).to(torch.float64), nuisance
             )
-            beta = torch.cholesky_solve(X.T @ y.T, L)  # (NB, nv)
+            beta = plinalg.cholesky_solve(X.T @ y.T, L)  # (NB, nv)
             # SSE = ||y||^2 - beta' X'y  (exact for the OLS solution)
             sse = (y**2).sum(dim=1) - (beta * (X.T @ y.T)).sum(dim=0)
             ss_res[s:e, si] = sse.clamp_min(0).float().cpu().numpy()

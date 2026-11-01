@@ -60,6 +60,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.utils import linalg_device
 
@@ -924,7 +925,7 @@ def partition_shift_from_phase(
             nc = torch.stack([torch.ones_like(te), te[0] / te], 1)  # e, 2
             ntwn = torch.einsum("ec,vex,ed->vcd", nc, wt, nc)  # V, 2, 2
             ridge = 1e-9 * ntwn.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None]
-            inv = torch.linalg.inv(ntwn + ridge * torch.eye(2, device=device))
+            inv = plinalg.inv(ntwn + ridge * torch.eye(2, device=device))
 
             def proj(x, wt=wt, nc=nc, inv=inv):
                 ntwx = torch.einsum("ec,vex,vet->vct", nc, wt, x)
@@ -940,7 +941,7 @@ def partition_shift_from_phase(
             num[i] += (wt * Ap[i] * Rp).sum((0, 1)).double()
             for j in range(n_basis):
                 den[i, j] += (wt * Ap[i] * Ap[j]).sum().double()
-    coef = torch.linalg.solve(den, num).float().cpu().numpy()[:n_shift]  # (n_shift, T)
+    coef = plinalg.solve(den, num).float().cpu().numpy()[:n_shift]  # (n_shift, T)
     coef = coef - coef.mean(1, keepdims=True)
     return coef.T if stretch else coef[0]
 

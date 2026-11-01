@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 from fastfuncstuff.dynamics.bsds import ar
+from fastfuncstuff.utils import linalg_device
 
 _DTYPE = torch.float64
 
@@ -35,8 +36,8 @@ def per_state_directed_connectivity(
 
     Returns ``B (K, D, D)`` directed transitions and ``noise_cov (K, D, D)``.
     """
-    device = sessions[0].device
-    sessions = [s.to(device=device, dtype=_DTYPE) for s in sessions]
+    device = linalg_device(sessions[0].device)  # float64 throughout; Metal has none
+    sessions = [s.to(device=device).to(_DTYPE) for s in sessions]
     lengths = [int(s.shape[1]) for s in sessions]
     y = torch.cat(sessions, dim=1)  # (D, N)
 

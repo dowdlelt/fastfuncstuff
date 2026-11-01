@@ -11,6 +11,7 @@ import torch
 from scipy.sparse.csgraph import dijkstra
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.glm.xval import project_out_nuisance_per_run
 from fastfuncstuff.laminar.params import P0, ModelSpec
@@ -298,7 +299,7 @@ def voxel_gain_removal(
     if todo.size == 0:
         return VoxelGains(removed, fit, beta_out, lam_out, gain_out)
     dtype = accum_dtype(device)
-    q = [torch.linalg.qr(n.to(device=device, dtype=torch.float32))[0] for n in nuisance]
+    q = [plinalg.qr(n.to(device=device, dtype=torch.float32))[0] for n in nuisance]
 
     def detrend(x):  # (R, b, T, ...) per run
         flat = x.reshape(R, x.shape[1], T, -1)
@@ -336,8 +337,8 @@ def voxel_gain_removal(
         rem = b32[None, :, 1, None] * X[..., 1] + b32[None, :, 2, None] * X[..., 2]
         full = rem + b32[None, :, 0, None] * X[..., 0]
         for r in range(R):
-            removed[r][j] = rem[r].to(removed[r])
-            fit[r][j] = full[r].to(fit[r])
+            removed[r][j] = rem[r].to(removed[r].device).to(removed[r].dtype)
+            fit[r][j] = full[r].to(fit[r].device).to(fit[r].dtype)
         beta_out[j] = beta.float().cpu().numpy()
         lam_out[j] = np.asarray(lambdas, np.float32)[best.cpu().numpy()]
         gain_out[j] = ((sse[-1] - sse[best, torch.arange(len(j), device=sse.device)])
@@ -595,8 +596,8 @@ def devein_volume_runs(
             j = ix[start : start + chunk]
             w = torch.as_tensor(read[j], device=device)
             for r in range(R):
-                removed[r][j] = (w @ rem[r].T).to(removed[r])
-                smooth[r][j] = (w @ fit[r].T).to(smooth[r])
+                removed[r][j] = (w @ rem[r].T).to(removed[r].device).to(removed[r].dtype)
+                smooth[r][j] = (w @ fit[r].T).to(smooth[r].device).to(smooth[r].dtype)
         valid[ix] = True
         for out, val in zip(
             diagnostics,

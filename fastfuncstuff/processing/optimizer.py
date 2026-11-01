@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from ..utils import linalg_lstsq
 
 
@@ -340,7 +342,7 @@ def optimize_warp_params_gauss_newton(
         diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-12)
         damped = hmat + lam * torch.diag_embed(diag) + 1e-9 * eye
         try:
-            delta = torch.linalg.solve(damped, grad.unsqueeze(-1)).squeeze(-1)
+            delta = plinalg.solve(damped, grad.unsqueeze(-1)).squeeze(-1)
         except RuntimeError:
             delta = linalg_lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)

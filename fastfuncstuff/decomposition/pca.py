@@ -20,6 +20,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import cpu_if_mps, get_device, to_tensor
 
 
@@ -148,7 +149,7 @@ class PCA:
             # Covariance approach: SVD on (n_samples, n_samples) instead of (n_samples, n_features)
             cov = X @ X.T  # (n_samples, n_samples)
             svd_device = cpu_if_mps(self.device, "svd")
-            U, S_squared, _ = torch.linalg.svd(cov.to(svd_device), full_matrices=False)
+            U, S_squared, _ = plinalg.svd(cov.to(svd_device), full_matrices=False)
             U = U.to(self.device)
             S_squared = S_squared.to(self.device)
             S = torch.sqrt(torch.clamp(S_squared, min=0))  # Eigenvalues → singular values
@@ -176,7 +177,7 @@ class PCA:
             # Components are rows of V^T (columns of V)
             # Scores are U @ S
             svd_device = cpu_if_mps(self.device, "svd")
-            U, S, Vt = torch.linalg.svd(X.to(svd_device), full_matrices=False)
+            U, S, Vt = plinalg.svd(X.to(svd_device), full_matrices=False)
             U = U.to(self.device)
             S = S.to(self.device)
             Vt = Vt.to(self.device)

@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.denoise.nordic import (
     NordicConfig,
     _build_patch_starts,
@@ -110,7 +111,7 @@ def _cache_patch_svds(
         mats = data[xi_all[b0:b1], yi_all[b0:b1], zi_all[b0:b1], :]  # (B, M, N)
         if data_dev != device:
             mats = mats.to(device)
-        _, s, vh = torch.linalg.svd(mats, full_matrices=False)
+        _, s, vh = plinalg.svd(mats, full_matrices=False)
         s_out[b0:b1] = s.abs().to(torch.float32)
         vh_out[b0:b1] = vh
         del mats, s, vh

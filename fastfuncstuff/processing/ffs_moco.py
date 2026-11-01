@@ -49,6 +49,8 @@ try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
     from .shear_triton import shear_resample_triton
 except Exception:  # pragma: no cover - triton not installed
     shear_resample_triton = None
+from fastfuncstuff import policy_linalg as plinalg
+
 from .weight import compute_weight_image  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -386,9 +388,9 @@ def _prepare_normal_solve(
     eps = 1e-6 * JtWJ.diagonal().mean()
     reg = JtWJ + eps * torch.eye(6, device=JtWJ.device, dtype=JtWJ.dtype)
     if device.type == "cpu":
-        lu, pivots = torch.linalg.lu_factor(reg)
+        lu, pivots = plinalg.lu_factor(reg)
         return lu, pivots
-    inv = torch.linalg.solve(reg, torch.eye(6, dtype=torch.float64))
+    inv = plinalg.solve(reg, torch.eye(6, dtype=torch.float64))
     return inv.to(device=device, dtype=dtype), None
 
 
@@ -399,8 +401,8 @@ def _normal_solve(prepared: tuple[Tensor, Tensor | None], rhs: Tensor) -> Tensor
         return factor @ rhs.to(factor.dtype)
     rhs_work = rhs.to(factor.dtype)
     if rhs_work.ndim == 1:
-        return torch.linalg.lu_solve(factor, pivots, rhs_work.unsqueeze(1)).squeeze(1)
-    return torch.linalg.lu_solve(factor, pivots, rhs_work)
+        return plinalg.lu_solve(factor, pivots, rhs_work.unsqueeze(1)).squeeze(1)
+    return plinalg.lu_solve(factor, pivots, rhs_work)
 
 
 def gauss_newton_rigid(
@@ -1180,7 +1182,7 @@ def resample_timeseries(
         # its shifts and drops the scale. det tests that whatever the voxel sizes
         # (a rigid motion in anisotropic voxel indices is D^-1 R D: not orthogonal,
         # det still 1).
-        det = torch.linalg.det(matrices_batch[:, :3, :3].cpu().double())
+        det = plinalg.det(matrices_batch[:, :3, :3].cpu().double())
         rigid = (det - 1).abs() < 1e-6
         use_triton = (
             config.use_shear and device.type == "cuda" and shear_resample_triton is not None

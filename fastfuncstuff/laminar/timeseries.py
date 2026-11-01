@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.laminar.forward import build_cache, g_obs, rhs
 from fastfuncstuff.laminar.params import ModelSpec, zero_params
 from fastfuncstuff.memory import estimate_chunk_size
@@ -84,7 +85,7 @@ def vascular_transfer(
     A, B = system.A, system.B
     freq = frequencies.to(device=A.device, dtype=A.dtype)
     eye = torch.eye(A.shape[0], device=A.device, dtype=torch.complex128)
-    states = torch.linalg.solve(
+    states = plinalg.solve(
         2j * torch.pi * freq[:, None, None] * eye - A,
         B.to(torch.complex128).expand(freq.numel(), -1, -1),
     )
@@ -172,7 +173,7 @@ def design_crossval(
         Xf = torch.fft.rfft(X.to(device=dev, dtype=dtype), n=n_fft, dim=0)
         Z = torch.fft.irfft(H[..., None] * Xf[:, None, None, :], n=n_fft, dim=0)[:T]
         Z = Z.reshape(T, K, -1)  # (time, physiological depth, source depth x condition)
-        q, _ = torch.linalg.qr(nuis.to(device=dev, dtype=dtype))
+        q, _ = plinalg.qr(nuis.to(device=dev, dtype=dtype))
         Z = Z - (q @ (q.T @ Z.reshape(T, -1))).reshape(Z.shape)
         zs.append(Z)
         grams.append(torch.einsum("tjp,tkq->jkpq", Z, Z))
@@ -197,7 +198,7 @@ def design_crossval(
             else noise_cov[start:stop].to(device=dev, dtype=dtype)
         )
         cw = torch.cholesky_inverse(
-            torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky")))
+            plinalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky")))
         ).to(dev)
         metric = S.mT @ cw @ S  # whitened fit, in physiological depths
         G = torch.stack([torch.einsum("bjk,jkpq->bpq", metric, g) for g in grams])
@@ -209,7 +210,7 @@ def design_crossval(
         for r in range(R):
             g_tr, b_tr = G.sum(0) - G[r], rhs_.sum(0) - rhs_[r]
             eps = 1e-6 * g_tr.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-30)
-            beta = torch.linalg.solve(
+            beta = plinalg.solve(
                 (g_tr + eps[:, None, None] * eye_p).to(solve_device),
                 b_tr[..., None].to(solve_device),
             ).to(dev)[..., 0]
@@ -259,7 +260,7 @@ def loro_prior_ridge(
 
     def solve(a, b, lam):
         d = lam[:, None] * scale[:, None] * pen + floor[:, None]
-        return torch.linalg.solve(
+        return plinalg.solve(
             (a + torch.diag_embed(d)).to(solve_device), (b + d * mu)[..., None].to(solve_device)
         ).to(dev)[..., 0]
 
@@ -304,8 +305,8 @@ def _inverse_operators(H, b, sampling, noise_cov, strengths, penalty, dev, dtype
     eye = torch.eye(K, device=dev, dtype=cdtype)
     S = eye.real.expand(b, -1, -1) if sampling is None else sampling.to(device=dev, dtype=dtype)
     cov = eye.real.expand(b, -1, -1) if noise_cov is None else noise_cov.to(device=dev, dtype=dtype)
-    chol = torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky"))).to(dev)
-    whiten = torch.linalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(cdtype)
+    chol = plinalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky"))).to(dev)
+    whiten = plinalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(cdtype)
     Sc = S.to(cdtype)[:, None]
     hs = Sc @ H
     hw = whiten[:, None] @ hs
@@ -314,7 +315,7 @@ def _inverse_operators(H, b, sampling, noise_cov, strengths, penalty, dev, dtype
     solve_device = cpu_if_mps(dev, "solve")
     rhs_solve = (hw.mH @ whiten[:, None]).to(solve_device)
     inverses = [
-        torch.linalg.solve(
+        plinalg.solve(
             (gram + st * scale[:, None, None, None] * penalty[None, :, None, None] * eye).to(
                 solve_device
             ),
@@ -444,12 +445,16 @@ def dynamic_inverse(
         correction[:, start:stop], predicted[:, start:stop] = crop(transported), crop(fit)
         grid_correction[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", (H - G) @ inv, yf))
         grid_predicted[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", H @ inv, yf))
-        chosen[start:stop] = torch.tensor(strengths, device=dev, dtype=dtype)[best].to(chosen)
-        cv[start:stop] = scores_t[best, torch.arange(b, device=dev)].to(cv)
+        chosen[start:stop] = (
+            torch.tensor(strengths, device=dev, dtype=dtype)[best]
+            .to(chosen.device)
+            .to(chosen.dtype)
+        )
+        cv[start:stop] = scores_t[best, torch.arange(b, device=dev)].to(cv.device).to(cv.dtype)
         filt = eye - remove
         # Integrated white-noise gain; this is a conditional diagnostic, not a CI.
         ng = (filt.abs().square().sum((-1, -2)) * weights_f).sum(-1) / (K * weights_f.sum())
-        gain[start:stop] = ng.sqrt().to(gain)
+        gain[start:stop] = ng.sqrt().to(gain.device).to(gain.dtype)
     return DynamicResult(correction, predicted, grid_correction, grid_predicted, chosen, cv, gain)
 
 

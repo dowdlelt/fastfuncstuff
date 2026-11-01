@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.dynamics.bsds.vb import ALPHA_A, ALPHA_PI, PA, PB, VBState
 
 _DTYPE = torch.float64
@@ -65,7 +66,7 @@ def lower_bound(state: VBState, y: torch.Tensor) -> torch.Tensor:
 
     # Row 3: latent entropy / prior cross term (batched over states).
     xcov_lat = state.xcov[:, 1:, 1:]  # (K, ldim, ldim)
-    chol = torch.linalg.cholesky(xcov_lat)  # (K, ldim, ldim)
+    chol = plinalg.cholesky(xcov_lat)  # (K, ldim, ldim)
     logdet_half = torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)  # (K,)
     f3 = (
         0.5 * neff * (kt - 1)
@@ -100,7 +101,7 @@ def lower_bound(state: VBState, y: torch.Tensor) -> torch.Tensor:
     priornum = torch.empty(s, p, kt, dtype=_DTYPE, device=y.device)
     priornum[:, :, 0] = state.nu_mcl
     priornum[:, :, 1:] = a_over_b.unsqueeze(1)
-    _sign, logabsdet = torch.linalg.slogdet(state.lcov)  # (K, D)
+    _sign, logabsdet = plinalg.slogdet(state.lcov)  # (K, D)
     diag_lcov = torch.diagonal(state.lcov, dim1=2, dim2=3)  # (K, D, kt)
     f1 = priorln + (logabsdet - kt).sum(dim=1)  # (K,)
     f1 = f1 - ((diag_lcov + state.lm**2) * priornum).sum(dim=(1, 2))

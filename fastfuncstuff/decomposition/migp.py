@@ -20,6 +20,7 @@ from collections.abc import Iterable
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import to_linalg_f64
 
 
@@ -126,7 +127,7 @@ def _reduce_to_topk(data: torch.Tensor, k: int) -> torch.Tensor:
     d64 = to_linalg_f64(data)
     row_mean = d64.mean(dim=1, keepdim=True)
     cov = (d64 @ d64.T - V * (row_mean @ row_mean.T)) / float(V)
-    evals, evecs = torch.linalg.eigh(cov)
+    evals, evecs = plinalg.eigh(cov)
     evecs = evecs.flip(1)[:, :k_eff]
     max_idx = evecs.abs().argmax(dim=0)
     signs = torch.sign(evecs[max_idx, torch.arange(k_eff, device=evecs.device)])

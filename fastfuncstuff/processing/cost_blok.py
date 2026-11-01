@@ -40,6 +40,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import widest_float_dtype
 
 # Max correlation allowed before the Fisher stretch blows up (mri_genalign.c).
@@ -231,7 +232,7 @@ def _assign_xyz_to_bloks(
     cdt = _coord_dtype(device)  # matches xyz dtype (float32 on MPS, float64 else)
     lat_list, siz = _lattice(bloktype, blokrad)
     lat = torch.tensor(lat_list, dtype=cdt, device=device)  # (3,3)
-    invlat = torch.linalg.inv(lat)
+    invlat = plinalg.inv(lat)
 
     # Nearest integer lattice index (AFNI: floor(pqr + 0.499)).
     pqr = xyz @ invlat.T  # (N, 3)
@@ -257,7 +258,7 @@ def _assign_xyz_to_bloks(
 
     # Map chosen lattice triples to contiguous blok ids.
     chosen = best_lat.round().to(torch.int64)  # (N, 3)
-    _, inverse = torch.unique(chosen, dim=0, return_inverse=True)
+    _, inverse = plinalg.unique_rows(chosen, return_inverse=True)
     index = inverse.clone()
     index[~found] = -1
     if valid_mask is not None:

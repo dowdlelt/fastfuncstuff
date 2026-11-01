@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image
@@ -167,7 +168,7 @@ def main(argv: list[str] | None = None) -> None:
             q = min(20, max(2, round(nt / 30)))
         p_np = legendre_polynomials(nt, q, normalize=False)
         P = torch.from_numpy(p_np).to(device=device, dtype=torch.float32)
-        Q, _ = torch.linalg.qr(P)  # orthonormal basis for the polynomial span
+        Q, _ = plinalg.qr(P)  # orthonormal basis for the polynomial span
         rd = resid.to(device)
         resid = (rd - (rd @ Q) @ Q.T).cpu()
         if verb >= 1:

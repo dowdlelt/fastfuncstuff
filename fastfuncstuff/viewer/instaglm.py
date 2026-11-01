@@ -46,6 +46,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 #: ``progress(fraction, message)`` -- called from a worker thread.
 ProgressFn = Callable[[float, str], None]
 
@@ -752,13 +754,13 @@ def fit_model(
     # U is orthonormal, so the one big matmul stays perfectly conditioned even in
     # float32, and every ill-conditioned step is (k, k) and done in float64. The
     # cost is identical: the same two matmuls of the same two shapes.
-    u64, sv64, vh64 = torch.linalg.svd(x64, full_matrices=False)
+    u64, sv64, vh64 = plinalg.svd(x64, full_matrices=False)
     keep = sv64 > sv64.max().clamp(min=1e-300) * RANK_TOL
     u64, sv64, vh64 = u64[:, keep], sv64[keep], vh64[keep]
 
     gram = x64.T @ x64
     ginv64 = pinv_f64(gram).to(device=x64.device)
-    rank = int(torch.linalg.matrix_rank(gram, rtol=RANK_TOL))
+    rank = int(plinalg.matrix_rank(gram, rtol=RANK_TOL))
     dof = max(int(n_time - rank), 1)
     ginv_diag = torch.diagonal(ginv64).clamp(min=1e-12).to(device=home, dtype=x.dtype)
 

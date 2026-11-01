@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 
 @dataclass
 class LagStats:
@@ -308,17 +310,17 @@ def _solve_structured(u: Tensor, c: _Crit):
     gS = torch.einsum("vf,vfk->vk", u, c.g_shared)
     rw2 = (u * c.a_r).sum(-1)
 
-    LD, infoD = torch.linalg.cholesky_ex(Dm)
+    LD, infoD = plinalg.cholesky_ex(Dm)
     bad = (infoD != 0).any(-1)
     LD = torch.where((infoD != 0)[..., None, None], torch.eye(k, dtype=dt, device=u.device), LD)
-    Y = torch.cholesky_solve(Bm, LD)  # D⁻¹B  (N, R, k, ks)
-    zD = torch.cholesky_solve(gD.unsqueeze(-1), LD).squeeze(-1)  # D⁻¹gD
+    Y = plinalg.cholesky_solve(Bm, LD)  # D⁻¹B  (N, R, k, ks)
+    zD = plinalg.cholesky_solve(gD.unsqueeze(-1), LD).squeeze(-1)  # D⁻¹gD
     Sig = Sm - torch.einsum("vrki,vrkj->vij", Bm, Y)
-    LS, infoS = torch.linalg.cholesky_ex(Sig)
+    LS, infoS = plinalg.cholesky_ex(Sig)
     bad = bad | (infoS != 0)
     LS = torch.where((infoS != 0)[:, None, None], torch.eye(ks, dtype=dt, device=u.device), LS)
     rhs = gS - torch.einsum("vrki,vrk->vi", Bm, zD)
-    aS = torch.cholesky_solve(rhs.unsqueeze(-1), LS).squeeze(-1)
+    aS = plinalg.cholesky_solve(rhs.unsqueeze(-1), LS).squeeze(-1)
     aD = zD - torch.einsum("vrki,vi->vrk", Y, aS)
     ga = (gD * aD).sum((-1, -2)) + (gS * aS).sum(-1)
     logdetM = 2 * torch.log(torch.diagonal(LD, dim1=-2, dim2=-1)).sum((-1, -2)) + 2 * torch.log(
@@ -582,7 +584,7 @@ def _hessian(theta: Tensor, st: Stats, h: float = 1e-4) -> Tensor:
 def theta_covariance(theta: Tensor, st: Stats) -> Tensor:
     """Asymptotic covariance of θ̂ per voxel: the criterion is −2·log-likelihood
     (up to a constant), so the information is half its Hessian."""
-    cov, info = torch.linalg.inv_ex(0.5 * _hessian(theta, st))
+    cov, info = plinalg.inv_ex(0.5 * _hessian(theta, st))
     # A voxel whose fit never left a non-finite point has a zero Hessian: no
     # information, so no covariance — NaN rather than failing the batch.
     return torch.where((info != 0)[:, None, None], torch.full_like(cov, float("nan")), cov)
@@ -624,10 +626,10 @@ def fit_ar_reml(
     for _ in range(n_iter):
         if not bool(active.any()):
             break
-        lam_min = torch.linalg.eigvalsh(B)[:, 0]
+        lam_min = plinalg.eigvalsh(B)[:, 0]
         damp = (1e-6 - lam_min).clamp(min=0) + 1e-9
         Bd = B + damp[:, None, None] * eye
-        step = torch.linalg.solve(Bd, gr.unsqueeze(-1)).squeeze(-1)
+        step = plinalg.solve(Bd, gr.unsqueeze(-1)).squeeze(-1)
         step = step / step.norm(dim=-1, keepdim=True).clamp(min=1.0)
         step = torch.where(active[:, None], step, torch.zeros_like(step))
         scale = torch.ones_like(crit)
@@ -664,7 +666,7 @@ def fit_ar_reml(
         # units, −2·log-likelihood); a relative-change test stops BFGS while it is
         # still creeping along a shallow valley.
         pred = 0.5 * (
-            gr * torch.linalg.solve(B + damp[:, None, None] * eye, gr.unsqueeze(-1)).squeeze(-1)
+            gr * plinalg.solve(B + damp[:, None, None] * eye, gr.unsqueeze(-1)).squeeze(-1)
         ).sum(-1)
         failed = active & ~accepted
         # A stale BFGS model can point nowhere useful: give those items an exact

@@ -59,6 +59,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.denoise.nordic import _build_patch_starts, _default_kernel_size_pca
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import get_available_memory
@@ -131,7 +132,7 @@ def build_nuisance_basis(
     if not cols:
         return None
     z = torch.cat(cols, dim=1)  # (T, p)
-    q, r = torch.linalg.qr(z)
+    q, r = plinalg.qr(z)
     # Drop columns whose pivot is tiny (rank-deficient / duplicated nuisance).
     keep = torch.abs(torch.diagonal(r)) > 1e-6 * float(torch.abs(r).max().clamp(min=1e-30))
     q = q[:, keep]
@@ -236,7 +237,7 @@ def _pcpatch_project(
         # --- (2) temporal Gram eigendecomposition ---
         G = R.mT @ R  # (B, T, T) real symmetric
         del R
-        eigvals, V = torch.linalg.eigh(G)  # ascending
+        eigvals, V = plinalg.eigh(G)  # ascending
         del G
         s2 = eigvals.flip(1).clamp(min=0)  # (B, T) descending variances
         V = V.flip(2)  # columns match descending order

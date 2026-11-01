@@ -27,6 +27,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .interp import trilinear_interpolate
 
 # ── Boundary + normal extraction ─────────────────────────────────────────────
@@ -194,7 +196,7 @@ def apply_transform(points: Tensor, normals: Tensor, mat: Tensor) -> tuple[Tenso
     """
     M3 = mat[:3, :3]
     pts = points @ M3.T + mat[:3, 3]
-    nrm = normals @ torch.linalg.inv(M3)  # n' = (M3^{-T} n) → row-vec: n @ M3^{-1}
+    nrm = normals @ plinalg.inv(M3)  # n' = (M3^{-T} n) → row-vec: n @ M3^{-1}
     nrm = nrm / nrm.norm(dim=1, keepdim=True).clamp_min(1e-12)
     return pts, nrm
 

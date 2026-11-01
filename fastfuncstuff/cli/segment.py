@@ -27,6 +27,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 # What -pe_axis accepts: a voxel axis or an anatomical direction code. Offered
 # rather than enforced, since resolve_pe_axis is case- and sign-tolerant.
 PE_AXIS_WORDS = ("x", "y", "z", "i", "j", "k", "AP", "PA", "LR", "RL", "IS", "SI")
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.io.dsetinfo import obliquity_deg, read_info
 from fastfuncstuff.processing.affine import load_matrix_chain, save_matrix_1D
@@ -914,14 +915,18 @@ def main(argv: list[str] | None = None) -> int:
                 "dataset that matrix's -base was>, or -matrix_base <the -tpm> if it really "
                 "was fitted on the TPM grid."
             )
-        tpm_to_input = load_matrix_chain(
-            args.matrix,
-            base_affine=tpm_affine_np,
-            source_affine=fit_affine_np,
-            fitted_base_affine=matrix_base_np,
-            fitted_source_affine=np.asarray(hdr["affine"], dtype=np.float64),
-        ).to(device=device).to(torch.float64)
-        vox2vox = torch.linalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
+        tpm_to_input = (
+            load_matrix_chain(
+                args.matrix,
+                base_affine=tpm_affine_np,
+                source_affine=fit_affine_np,
+                fitted_base_affine=matrix_base_np,
+                fitted_source_affine=np.asarray(hdr["affine"], dtype=np.float64),
+            )
+            .to(device=device)
+            .to(torch.float64)
+        )
+        vox2vox = plinalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
     elif world_affine is None:
         world_affine = torch.eye(4, dtype=torch.float64, device=device)
 

@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.decomposition.ica import FastICA, create_ica
 from fastfuncstuff.decomposition.icasso import (
     cluster_components,
@@ -134,7 +135,7 @@ def spatial_regression(
     k = gram.shape[0]
     gram = gram + ridge * torch.eye(k, device=device, dtype=gram.dtype)
     rhs = group_maps @ run_data  # (K, T)
-    tc = torch.linalg.solve(gram, rhs)  # (K, T)
+    tc = plinalg.solve(gram, rhs)  # (K, T)
     return tc.T.contiguous()  # (T, K)
 
 
@@ -345,7 +346,7 @@ def temporal_ica(
 
     # PCA whitening of the channel covariance; keep the top n_components dims.
     cov = (x @ x.T) / float(t_total)  # (K_sica, K_sica)
-    evals, evecs = torch.linalg.eigh(to_factor_f64(cov))
+    evals, evecs = plinalg.eigh(to_factor_f64(cov))
     evals = evals.flip(0).to(x.dtype)
     evecs = evecs.flip(1).to(x.dtype)
     evals = torch.clamp(evals[:n_components], min=1e-12)
@@ -361,7 +362,7 @@ def temporal_ica(
     sources, stability, n_iter = _solve_temporal(
         whitened, n_components, method, fun, max_iter, tol, seed, icasso_runs, device, verbose
     )
-    mixing = x @ torch.linalg.pinv(sources)  # (K_sica, K_tica)
+    mixing = x @ plinalg.pinv(sources)  # (K_sica, K_tica)
 
     # tICA spatial maps: each temporal source's spatial footprint is the
     # mixing-weighted sum of the group sICA maps.

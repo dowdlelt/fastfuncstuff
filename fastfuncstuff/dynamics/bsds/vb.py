@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 # Fixed hyperparameters (BSDS defaults): Gamma prior on loading precisions, and
 # symmetric Dirichlet priors on the HMM transition/initial distributions.
 PA = 1.0
@@ -80,7 +82,7 @@ def update_qx(state: VBState, y: torch.Tensor) -> None:
     term2 = torch.einsum("kqi,q,kqj->kij", lam, psii, lam)
     t1 = term1 + term2  # (K, ldim, ldim)
     eye = torch.eye(state.ldim, dtype=_DTYPE, device=y.device)
-    inner = torch.linalg.inv(eye + t1)  # (K, ldim, ldim)
+    inner = plinalg.inv(eye + t1)  # (K, ldim, ldim)
     state.xcov = torch.zeros(state.n_states, state.kt, state.kt, dtype=_DTYPE, device=y.device)
     state.xcov[:, 1:, 1:] = inner
     # Xm[1:] = Xcov[1:,1:] Lambda' diag(psii) (Y - mean)
@@ -113,7 +115,7 @@ def update_ql(state: VBState, y: torch.Tensor) -> None:
     num[:, :, 1:] = a_over_b.unsqueeze(1)
     # A_q = diag(num) + psii * T2  ->  (K, D, kt, kt)
     a_q = torch.diag_embed(num) + psii.view(1, -1, 1, 1) * t2.unsqueeze(1)
-    lcov = torch.linalg.inv(a_q)  # (K, D, kt, kt)
+    lcov = plinalg.inv(a_q)  # (K, D, kt, kt)
     rhs = t3.clone()  # (K, D, kt)
     rhs[:, :, 0] = rhs[:, :, 0] + (state.mean_mcl * state.nu_mcl).unsqueeze(0)
     state.lm = torch.einsum("kdi,kdij->kdj", rhs, lcov)  # (K, D, kt)
@@ -201,7 +203,7 @@ def compute_log_out_probs(state: VBState, sessions: list[torch.Tensor]) -> list[
     b_term = (temp_all * state.xcov).sum(dim=(1, 2))  # (K,)
     xcov_lat = state.xcov[:, 1:, 1:]  # (K, ldim, ldim)
     d_term = torch.diagonal(xcov_lat, dim1=1, dim2=2).sum(dim=1)  # (K,)
-    chol = torch.linalg.cholesky(
+    chol = plinalg.cholesky(
         xcov_lat + eye_eps * torch.eye(ldim, dtype=_DTYPE, device=psii.device)
     )  # (K, ldim, ldim)
     f_term = -2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)  # (K,)

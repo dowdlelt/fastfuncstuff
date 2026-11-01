@@ -32,6 +32,8 @@ import numpy as np
 import torch
 from scipy import stats
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .noise import ou_to_arma11
 
 
@@ -93,7 +95,7 @@ def _run_correlation(n: int, a: float, b: float) -> tuple[torch.Tensor, torch.Te
     R = build_arma11_covariance(a, b, n, torch.device("cpu"), torch.float64)
     if R is None:
         raise ValueError(f"noise ARMA a={a:.3f}, b={b:.3f} is not a valid correlation")
-    return R, torch.linalg.cholesky(R)
+    return R, plinalg.cholesky(R)
 
 
 def _noise_correlation(
@@ -187,7 +189,7 @@ def _glm_setup(
     n_t, n_cond = X_task.shape
     if sum(run_lengths) != n_t:
         raise ValueError(f"run lengths sum to {sum(run_lengths)}, design has {n_t} rows")
-    X_true = X_task if true_design is None else torch.as_tensor(true_design, dtype=torch.float64)
+    X_true = X_task if true_design is None else torch.as_tensor(true_design).cpu().to(torch.float64)
     if X_true.shape != X_task.shape:
         raise ValueError(f"true_design {tuple(X_true.shape)} must match design {(n_t, n_cond)}")
     pattern = torch.ones(n_cond, dtype=torch.float64)
@@ -199,9 +201,9 @@ def _glm_setup(
 
     X = torch.cat([X_task, _nuisance(run_lengths, poly_degree)], dim=1)
     n_p = X.shape[1]
-    if torch.linalg.matrix_rank(X) < n_p:
+    if plinalg.matrix_rank(X) < n_p:
         raise ValueError("design + drift polynomials are rank-deficient; check the conditions")
-    XtX_inv = torch.linalg.inv(X.T @ X)
+    XtX_inv = plinalg.inv(X.T @ X)
     P = XtX_inv @ X.T  # (n_p, n_t)
 
     names = list(contrasts)
@@ -639,7 +641,7 @@ class RealizationScorer:
             else auto_polort_per_run(lengths, self.tr)
         )
         X = torch.cat([X_task, _nuisance(lengths, pdeg)], dim=1)
-        if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+        if int(plinalg.matrix_rank(X)) < X.shape[1]:
             return None
         need = _contrast_needed(X, lengths, self.tr, self.W, self.noise, self.alpha, self.target)
         out: dict[str, Any] = {
@@ -846,8 +848,8 @@ def design_quality(
     D = _nuisance(run_lengths, poly_degree)
     X = torch.cat([X_task, D], dim=1)
     n_p = X.shape[1]
-    rank = int(torch.linalg.matrix_rank(X))
-    Q, _ = torch.linalg.qr(D)
+    rank = int(plinalg.matrix_rank(X))
+    Q, _ = plinalg.qr(D)
     Xt = X_task - Q @ (Q.T @ X_task)  # drift removed
     norms = Xt.norm(dim=0)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -861,14 +863,14 @@ def design_quality(
         "corr": corr,
     }
     if rank < n_p:
-        v = torch.linalg.svd(X)[2][-1, :n_cond]
+        v = plinalg.svd(X)[2][-1, :n_cond]
         out["null_weights"] = (v / v.abs().max()).numpy() if v.abs().max() > 0 else v.numpy()
         out["vif"] = np.full(n_cond, np.inf)
         out["needed"] = {}
         return out
 
     G = Xt.T @ Xt
-    out["vif"] = (torch.diag(torch.linalg.inv(G)) * torch.diag(G)).numpy()
+    out["vif"] = (torch.diag(plinalg.inv(G)) * torch.diag(G)).numpy()
     pairs = [(i, j) for i in range(n_cond) for j in range(i + 1)]
     W = np.zeros((len(pairs), n_cond))
     for k, (i, j) in enumerate(pairs):
@@ -901,7 +903,7 @@ def _contrast_needed(
     simulation finds. One value per row of W, per noise label.
     """
     n_p = X.shape[1]
-    P = torch.linalg.inv(X.T @ X) @ X.T
+    P = plinalg.inv(X.T @ X) @ X.T
     C = torch.zeros(W.shape[0], n_p, dtype=torch.float64)
     C[:, : W.shape[1]] = torch.as_tensor(W, dtype=torch.float64)
     out: dict[str, np.ndarray] = {}
@@ -1058,13 +1060,13 @@ def estimation_quality(
     h0 = hrfs_from_spec(hrf, tr, torch.device("cpu"))[0][1][0].numpy()[:k]
     det = compute_detection_power(pat, h0, n_cond, poly_degree=-1, nuisance=D.numpy())
     liu = {"xi": float(eff["total_normalized"]), "liu_power": float(det["total_normalized"])}
-    if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
+    if int(plinalg.matrix_rank(X)) < X.shape[1]:
         out["shape_sd"] = {
             str(c.get("label", f"noise{i}")): np.full(n_cond, np.inf) for i, c in enumerate(noise)
         }
         out.update(liu)
         return out
-    P = torch.linalg.inv(X.T @ X) @ X.T
+    P = plinalg.inv(X.T @ X) @ X.T
     shape: dict[str, np.ndarray] = {}
     cache: dict[tuple[float, float] | None, np.ndarray] = {}
     for i, cond in enumerate(noise):
@@ -1122,7 +1124,7 @@ def lss_rows(Xt: torch.Tensor, cond: np.ndarray, D: torch.Tensor) -> torch.Tenso
     A = torch.empty(n_tr, n_t, dtype=torch.float64)
     for q in range(n_cond):
         O = torch.cat([S[:, [k for k in range(n_cond) if k != q]], D], dim=1)
-        Q, _ = torch.linalg.qr(O)
+        Q, _ = plinalg.qr(O)
         idx = np.flatnonzero(cond == q)
         U = Xt[:, idx] - Q @ (Q.T @ Xt[:, idx])  # (n_t, m)
         sc = S[:, q] - Q @ (Q.T @ S[:, q])
@@ -1200,9 +1202,9 @@ def single_trial_quality(
     # shrink the drift), through one SVD Xp = U S V'. LSA is estimable iff Xp has
     # full column rank, and its per-trial variance is diag(V S^-1 B S^-1 V') with
     # B = U'RU -- no second SVD for the rank, no separate solve.
-    Qd, _ = torch.linalg.qr(D)
+    Qd, _ = plinalg.qr(D)
     Xp = Xt - Qd @ (Qd.T @ Xt)
-    Ux, sx, Vh = torch.linalg.svd(Xp, full_matrices=False)
+    Ux, sx, Vh = plinalg.svd(Xp, full_matrices=False)
     V = Vh.T
     lsa_ok = float(sx.min()) > 1e-8 * float(sx.max())
     Vs = V / sx
@@ -1382,7 +1384,7 @@ def tent_estimate(
         blocks.append(torch.cat(cols, dim=1))
     T = torch.cat(blocks, dim=0)  # (n_t, sum(ks)), condition-major
     X = torch.cat([T, _nuisance(lengths, poly_degree)], dim=1)
-    P = torch.linalg.pinv(X)
+    P = plinalg.pinv(X)
     edges = np.cumsum([0, *ks])
 
     dt = default_microtime_dt(tr)
@@ -1458,7 +1460,7 @@ def single_trial_example(
     bases = hrfs_from_spec(hrf, dt, torch.device("cpu"))[0][1]
     Xt, cond = trial_regressors(realization, tr, bases, dt)
     D = _nuisance(lengths, poly_degree)
-    Qd, _ = torch.linalg.qr(D)
+    Qd, _ = plinalg.qr(D)
     Xp = Xt - Qd @ (Qd.T @ Xt)
     q = single_trial_quality(realization, tr, [noise], hrf, poly_degree, mean_response, trial_sd)
     rel = q["reliability"][label]
@@ -1473,11 +1475,11 @@ def single_trial_example(
     yp = y - Qd @ (Qd.T @ y)
     eye = torch.eye(n_tr, dtype=torch.float64)
     lsa = (
-        torch.linalg.lstsq(Xp, yp[:, None]).solution[:, 0]
+        plinalg.lstsq(Xp, yp[:, None]).solution[:, 0]
         if rel["lsa"] > 0
         else torch.full((n_tr,), float("nan"), dtype=torch.float64)
     )
-    ridge = torch.linalg.solve(Xp.T @ Xp + rel["ridge_lambda"] * eye, Xp.T @ yp)
+    ridge = plinalg.solve(Xp.T @ Xp + rel["ridge_lambda"] * eye, Xp.T @ yp)
     curve: dict[str, list[float]] = {"lss": [], "lsa": [], "ridge": []}
     for t_sd in sd_grid:
         r_t = single_trial_quality(realization, tr, [noise], hrf, poly_degree, mean_response, t_sd)[
@@ -1701,7 +1703,7 @@ def shape_steps(
             ee = [[[] for _ in range(max_step)] for _ in range(n_cond)]
             eRe = [[[] for _ in range(max_step)] for _ in range(n_cond)]
             for k in range(n_lib):
-                Q, _ = torch.linalg.qr(torch.cat([Xs[k], D], dim=1))
+                Q, _ = plinalg.qr(torch.cat([Xs[k], D], dim=1))
                 for q in range(n_cond):
                     others = [k + s for s in range(-max_step, max_step + 1)
                               if s and 0 <= k + s < n_lib]  # fmt: skip
@@ -1867,7 +1869,7 @@ def hrf_robustness(
 
     def fit(X_task: torch.Tensor) -> tuple[Any, ...]:
         X = torch.cat([X_task, nuisance], dim=1)
-        P = torch.linalg.inv(X.T @ X) @ X.T
+        P = plinalg.inv(X.T @ X) @ X.T
         if R is None:
             PRPt, tr_MR, dof = P @ P.T, float(n_t - X.shape[1]), float(n_t - X.shape[1])
         else:

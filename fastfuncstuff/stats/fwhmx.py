@@ -39,6 +39,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.stats.localstat import (
     build_neighborhood,
@@ -305,7 +306,7 @@ def estimate_fwhmx_run(
         if order > 0 and 2 * order + 3 < n_v:
             ref = _trigref(order, n_v, resid_2d.device)
             # Least-squares projection: r <- r - (r @ ref) @ pinv(ref'ref) @ ref'.
-            q, _ = torch.linalg.qr(ref.to(torch.float32))
+            q, _ = plinalg.qr(ref.to(torch.float32))
             resid_2d = resid_2d - (resid_2d @ q) @ q.T
             unif = True
             demed = True

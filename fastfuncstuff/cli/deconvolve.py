@@ -55,6 +55,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
@@ -790,7 +791,7 @@ def _loro_r2_per_voxel(
         # Pre-factor X'X once per fold (design is tiny: n_regs × n_regs)
         XtX = train_design.T @ train_design
         try:
-            L_fold = torch.linalg.cholesky(XtX)
+            L_fold = plinalg.cholesky(XtX)
         except torch.linalg.LinAlgError:
             L_fold = None  # fall back to solve() below
 
@@ -801,9 +802,9 @@ def _loro_r2_per_voxel(
             )
             XtY = train_design.T @ train_c.T  # (n_regs, chunk)
             if L_fold is not None:
-                betas = torch.cholesky_solve(XtY, L_fold)  # (n_regs, chunk)
+                betas = plinalg.cholesky_solve(XtY, L_fold)  # (n_regs, chunk)
             else:
-                betas = torch.linalg.solve(XtX, XtY)
+                betas = plinalg.solve(XtX, XtY)
             test_c = data_clean[held_out][i : i + chunk, :].to(device)
             pred = (test_design @ betas).T
             r2_parts.append(compute_r2_metric(test_c, pred, "cod").cpu())
@@ -885,7 +886,7 @@ def _compute_loro_r2_matrix(
         if degrees[run_idx] >= 0:
             poly_np = legendre_polynomials(n_tp, degrees[run_idx])
             poly_r = torch.tensor(poly_np, dtype=torch.float32, device=device)
-            Q, _ = torch.linalg.qr(poly_r)
+            Q, _ = plinalg.qr(poly_r)
             Q_per_run.append(Q)
             data_r = data_r - (Q @ (Q.T @ data_r.T)).T
         else:

@@ -43,6 +43,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 
@@ -499,7 +500,7 @@ def cross_validate_denoising_for_hrf(
 
             if run_nuisance.shape[1] > 0:
                 XtX = run_nuisance.T @ run_nuisance
-                XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=proj_device))
+                XtX_inv = plinalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=proj_device))
                 P_nuisance = run_nuisance @ XtX_inv @ run_nuisance.T
                 projection = torch.eye(run_length, device=proj_device) - P_nuisance
                 run_data_proj = (projection @ run_data.T).T
@@ -538,7 +539,7 @@ def cross_validate_denoising_for_hrf(
 
             if run_nuisance.shape[1] > 0:
                 XtX_test = run_nuisance.T @ run_nuisance
-                XtX_test_inv = torch.linalg.inv(
+                XtX_test_inv = plinalg.inv(
                     XtX_test + 1e-6 * torch.eye(XtX_test.shape[0], device=proj_device)
                 )
                 P_nuisance_test = run_nuisance @ XtX_test_inv @ run_nuisance.T
@@ -567,7 +568,7 @@ def cross_validate_denoising_for_hrf(
 
             if run_nuisance.shape[1] > 0:
                 XtX = run_nuisance.T @ run_nuisance
-                XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+                XtX_inv = plinalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
                 P_nuisance = run_nuisance @ XtX_inv @ run_nuisance.T
                 projection = torch.eye(run_length, device=device) - P_nuisance
                 pcs_projected = projection @ pcs_this_run.to(device)
@@ -601,7 +602,7 @@ def cross_validate_denoising_for_hrf(
 
             x_full = torch.cat(components, dim=1)
             xtx = x_full.T @ x_full
-            xtx_inv = torch.linalg.pinv(xtx)
+            xtx_inv = plinalg.pinv(xtx)
             pinv_full = xtx_inv @ x_full.T
             pinv_task = pinv_full[:n_task_regs, :]
             pinv_task_gpu.append(pinv_task)

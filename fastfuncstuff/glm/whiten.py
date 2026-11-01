@@ -21,6 +21,8 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 
 def run_bounds(n: int, run_starts: Sequence[int] | Tensor | None) -> list[tuple[int, int]]:
     """``[(start, stop), ...]`` for each run of an ``n``-timepoint series."""
@@ -216,15 +218,13 @@ def arma11_whiteners(
     eye_cache: dict[int, Tensor] = {}
 
     def factor(R: Tensor) -> tuple[Tensor, Tensor]:
-        L = torch.linalg.cholesky(R)
+        L = plinalg.cholesky(R)
         # +1e-10 as everywhere else in the REML code, so logdets match the dense path.
         logdiag = torch.log(torch.diagonal(L, dim1=1, dim2=2) + 1e-10)
         m = R.shape[-1]
         if m not in eye_cache:
             eye_cache[m] = torch.eye(m, device=R.device, dtype=R.dtype)
-        L_inv = torch.linalg.solve_triangular(
-            L, eye_cache[m].expand(R.shape[0], -1, -1), upper=False
-        )
+        L_inv = plinalg.solve_triangular(L, eye_cache[m].expand(R.shape[0], -1, -1), upper=False)
         return L_inv, logdiag
 
     if tau is None:

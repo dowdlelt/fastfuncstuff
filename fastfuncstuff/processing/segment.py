@@ -29,6 +29,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 try:
     from tqdm import tqdm as _tqdm
 except ImportError:  # tqdm optional
@@ -182,7 +184,7 @@ def gaussian_log_density(corrected: Tensor, means: Tensor, covs: Tensor, mix: Te
     # into ONE call each — a Python loop of 1×1 Cholesky/triangular-solves was pure
     # LAPACK-dispatch overhead (dominant on CPU, launch-bound on GPU).
     covs_b = covs.to(torch.float64).permute(2, 0, 1)  # (n_gauss, n_chan, n_chan)
-    chol = torch.linalg.cholesky(covs_b)  # M-step keeps covs PD
+    chol = plinalg.cholesky(covs_b)  # M-step keeps covs PD
     logdet = (2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)).to(wdt)
     prec = torch.cholesky_inverse(chol).to(wdt)  # (n_gauss, n_chan, n_chan) = cov⁻¹
     centred = corrected[:, :, None] - means.to(wdt)[None, :, :]  # (n_vox, n_chan, n_gauss)
@@ -375,7 +377,7 @@ def compose_vox2vox(subj_affine: Tensor, tpm_affine: Tensor, world_affine: Tenso
     index ``(x,y,z)`` to a TPM voxel index.
     """
     dtype = torch.float64
-    return torch.linalg.inv(tpm_affine.to(dtype)) @ world_affine.to(dtype) @ subj_affine.to(dtype)
+    return plinalg.inv(tpm_affine.to(dtype)) @ world_affine.to(dtype) @ subj_affine.to(dtype)
 
 
 def apply_affine_pts(coords: Tensor, mat: Tensor) -> Tensor:
@@ -1431,7 +1433,7 @@ def split_gaussians(
         kk = cols.numel()
         w = 1.0 / (1.0 + torch.exp(torch.tensor(-(kk - 1) * 0.25))) - 0.5  # 0 when kk==1
         vr_t = covs1[:, :, t].to(torch.float64)
-        chol = torch.linalg.cholesky(vr_t)  # sqrtm's role: a factor with chol·cholᵀ = vr_t
+        chol = plinalg.cholesky(vr_t)  # sqrtm's role: a factor with chol·cholᵀ = vr_t
         jitter = torch.randn(n_chan, kk, generator=gen).to(device=device).to(torch.float64)
         means[:, cols] = (chol @ jitter) * w + means1[:, t : t + 1].to(torch.float64)
         covs[:, :, cols] = (vr_t * (1.0 - w))[:, :, None]
@@ -2075,7 +2077,7 @@ def fit_segment(
         coef_val = coef_val.detach().clone()
         # per-Gaussian precisions covⁿ¹ (n_gauss, n_chan, n_chan), float64 for conditioning
         prec = torch.cholesky_inverse(
-            torch.linalg.cholesky(covs.to(torch.float64).permute(2, 0, 1)),
+            plinalg.cholesky(covs.to(torch.float64).permute(2, 0, 1)),
         )
         c_diag = bias_prec.reshape(-1).to(torch.float64)  # diagonal DCT precision (d3,)
         # Assemble in the working dtype (float32): the (chunk × d3) DCT design matrix `Phi`
@@ -2111,7 +2113,7 @@ def fit_segment(
                 )
             t_flat = coef_val[c].reshape(-1).to(torch.float64)
             update = (
-                torch.linalg.solve(alpha + torch.diag(c_diag), beta + c_diag * t_flat)
+                plinalg.solve(alpha + torch.diag(c_diag), beta + c_diag * t_flat)
                 .reshape(coef_val[c].shape)
                 .to(wdt)
             )
@@ -3192,7 +3194,7 @@ def input_in_template(
 
     device = torch.device(device) if device is not None else volume.device
     src = undistort_input(volume, fit, device=device) if use_warp else volume.to(device)
-    tpm_to_input = torch.linalg.inv(fit["vox2vox"].to(torch.float64)).to(device)
+    tpm_to_input = plinalg.inv(fit["vox2vox"].to(torch.float64)).to(device)
     x, y, z = _fullres_grid(out_shape, device)
     coords = apply_affine_pts(torch.stack([x, y, z], dim=1), tpm_to_input)  # input voxel coords
     xs, ys, zs = coords[:, 0], coords[:, 1], coords[:, 2]
@@ -3240,7 +3242,7 @@ def cast_template_to_input(
     else:
         coords = torch.stack([x, y, z], dim=1)
     tpm_c = apply_affine_pts(coords, fit["vox2vox"].to(device))
-    tpm_to_src = torch.linalg.inv(source_affine.to(torch.float64)) @ tpm_affine.to(torch.float64)
+    tpm_to_src = plinalg.inv(source_affine.to(torch.float64)) @ tpm_affine.to(torch.float64)
     src_c = apply_affine_pts(tpm_c, tpm_to_src.to(device))
     xs, ys, zs = src_c[:, 0], src_c[:, 1], src_c[:, 2]
     out = torch.stack(

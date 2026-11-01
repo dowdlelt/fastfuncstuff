@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import bytes_per_voxel_arma, get_available_memory, make_vram_debugger
 from fastfuncstuff.utils import accum_dtype as _accum_dtype_of
 from fastfuncstuff.utils import (
@@ -1134,27 +1135,27 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
         # Cholesky decomposition: R = L L'. Factor where cpu_if_mps routes it
         # (the CPU on Metal) and bring the factor back.
         factor_dev = cpu_if_mps(device, "cholesky")
-        L = torch.linalg.cholesky(R.to(factor_dev)).to(device)
+        L = plinalg.cholesky(R.to(factor_dev)).to(device)
 
         # Term 1: log(det(R)) = 2 * sum(log(diag(L)))
         term1 = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
 
         # Prewhiten design and data via triangular solve
-        X_w = torch.linalg.solve_triangular(L, X, upper=False)
-        Y_w = torch.linalg.solve_triangular(L, Y_2d, upper=False)
+        X_w = plinalg.solve_triangular(L, X, upper=False)
+        Y_w = plinalg.solve_triangular(L, Y_2d, upper=False)
 
         # Term 2: log(det(X' R^(-1) X)) = log(det(X_w' X_w))
         XwTXw = X_w.T @ X_w
         XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device, dtype=XwTXw.dtype)
 
         # Use logdet for numerical stability
-        sign, logdet_val = torch.linalg.slogdet(XwTXw_reg)
+        sign, logdet_val = plinalg.slogdet(XwTXw_reg)
         term2 = logdet_val if sign > 0 else 1e10  # Large penalty if singular
 
         # Term 3: (n-m) log(Y' P Y)
         # P = R^(-1) - R^(-1)X(X'R^(-1)X)^(-1)X'R^(-1)
         # Simplified via prewhitening: Y'PY = ||Y_w - X_w β_w||²
-        beta_w = torch.linalg.solve(XwTXw_reg, X_w.T @ Y_w)
+        beta_w = plinalg.solve(XwTXw_reg, X_w.T @ Y_w)
         residuals_w = Y_w - X_w @ beta_w
         rss = torch.sum(residuals_w**2)
 
@@ -1476,14 +1477,12 @@ def precompute_reml_grid(
         c1 = min(c0 + chunk, n_valid)
         Xw = stack_cols(whiteners[c0:c1], X_work)  # (c, T, K)
         try:
-            L_xtx = torch.linalg.cholesky(torch.bmm(Xw.transpose(1, 2), Xw))
-            Q = torch.linalg.solve_triangular(L_xtx, Xw.transpose(1, 2), upper=False).transpose(
-                1, 2
-            )
+            L_xtx = plinalg.cholesky(torch.bmm(Xw.transpose(1, 2), Xw))
+            Q = plinalg.solve_triangular(L_xtx, Xw.transpose(1, 2), upper=False).transpose(1, 2)
             diag = torch.diagonal(L_xtx, dim1=1, dim2=2)
         except torch.linalg.LinAlgError:
             used_qr = True
-            Q, R_qr = torch.linalg.qr(Xw)
+            Q, R_qr = plinalg.qr(Xw)
             diag = torch.diagonal(R_qr, dim1=1, dim2=2)
         logdet_XwTXw_batch[c0:c1] = (2 * torch.sum(torch.log(torch.abs(diag) + 1e-10), dim=1)).to(
             storage
@@ -1530,7 +1529,7 @@ def _unique_rows_2col(
     (lexicographic) order, with the same inverse indices.
     """
     if x.ndim != 2 or x.shape[1] != 2 or x.shape[0] == 0 or bool(torch.isnan(x).any()):
-        return torch.unique(x, dim=0, return_inverse=return_inverse)
+        return plinalg.unique_rows(x, return_inverse=return_inverse)
     ua, ia = torch.unique(x[:, 0], return_inverse=True)
     ub, ib = torch.unique(x[:, 1], return_inverse=True)
     key_unique, inverse = torch.unique(ia * len(ub) + ib, return_inverse=True)
@@ -2389,7 +2388,7 @@ def prewhiten_with_arma11(
 
         # Move R to GPU temporarily for fast Cholesky
         R_gpu = R.to(device)
-        L = torch.linalg.cholesky(R_gpu)
+        L = plinalg.cholesky(R_gpu)
         del R_gpu
 
     except (RuntimeError, torch.cuda.OutOfMemoryError):
@@ -2400,7 +2399,7 @@ def prewhiten_with_arma11(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        L = torch.linalg.cholesky(R).to(device)
+        L = plinalg.cholesky(R).to(device)
 
     # R is bound on both branches here; free the CPU covariance before the solves.
     del R
@@ -2411,8 +2410,8 @@ def prewhiten_with_arma11(
     # Prewhiten via triangular solve: X* = L^{-1} X, Y* = L^{-1} Y
     # This is mathematically identical to forming L_inv and multiplying,
     # but avoids the O(n^3) explicit inverse and exploits triangular structure.
-    X_white = torch.linalg.solve_triangular(L, X, upper=False)
-    Y_white = torch.linalg.solve_triangular(L, Y, upper=False)
+    X_white = plinalg.solve_triangular(L, X, upper=False)
+    Y_white = plinalg.solve_triangular(L, Y, upper=False)
 
     if Y_white.shape[1] == 1:
         Y_white = Y_white.squeeze(1)
@@ -2713,7 +2712,7 @@ def reml_grid_search_batched(
 
                 # Log determinants for REML
                 logdet_R = logdets[0].to(device)
-                logdet_XwTXw = torch.logdet(XwTXw_reg)
+                logdet_XwTXw = plinalg.logdet(XwTXw_reg)
 
                 # Process voxels (either all at once or in batches)
                 if load_all_data:
@@ -2723,7 +2722,7 @@ def reml_grid_search_batched(
 
                     # Solve for ALL voxels: beta = (X'X)^-1 X'y
                     XwTy_w = X_w.T @ y_w.T  # (n_reg, n_voxels)
-                    betas = torch.linalg.solve(XwTXw_reg, XwTy_w).T  # (n_voxels, n_reg)
+                    betas = plinalg.solve(XwTXw_reg, XwTy_w).T  # (n_voxels, n_reg)
 
                     # Compute residuals and SSE
                     resid_w = y_w - (betas @ X_w.T)  # (n_voxels, n_tp)
@@ -2770,7 +2769,7 @@ def reml_grid_search_batched(
 
                         # Solve for this batch: beta = (X'X)^-1 X'y
                         XwTy_w = X_w.T @ y_w.T  # (n_reg, batch_voxels)
-                        betas = torch.linalg.solve(XwTXw_reg, XwTy_w).T  # (batch_voxels, n_reg)
+                        betas = plinalg.solve(XwTXw_reg, XwTy_w).T  # (batch_voxels, n_reg)
 
                         # Compute residuals and SSE
                         resid_w = y_w - (betas @ X_w.T)  # (batch_voxels, n_tp)
@@ -3393,11 +3392,11 @@ def _fit_dsort_gls_pass(
             Xty = X_ext.transpose(1, 2) @ Yw_b  # (B, p_ext, 1)
             eye = torch.eye(p_ext, device=device, dtype=dtype)
             try:
-                Lc = torch.linalg.cholesky(XtX + 1e-8 * eye)
-                betas = torch.cholesky_solve(Xty, Lc)  # (B, p_ext, 1)
+                Lc = plinalg.cholesky(XtX + 1e-8 * eye)
+                betas = plinalg.cholesky_solve(Xty, Lc)  # (B, p_ext, 1)
                 XtX_inv = torch.cholesky_inverse(Lc)  # (B, p_ext, p_ext)
             except torch.linalg.LinAlgError:
-                XtX_inv = torch.linalg.pinv(XtX)
+                XtX_inv = plinalg.pinv(XtX)
                 betas = XtX_inv @ Xty
             betas = betas.squeeze(2)  # (B, p_ext)
 
@@ -3427,7 +3426,7 @@ def _fit_dsort_gls_pass(
                 A = XtX_inv[:, :p, :p]
                 beta_t = betas_base
                 p_f = p
-            A_inv = torch.linalg.inv(A + 1e-8 * torch.eye(p_f, device=device, dtype=dtype))
+            A_inv = plinalg.inv(A + 1e-8 * torch.eye(p_f, device=device, dtype=dtype))
             quad = torch.einsum("bi,bij,bj->b", beta_t, A_inv, beta_t)
             fstats = quad / (sigma2 * p_f + 1e-30)
 
@@ -4752,10 +4751,10 @@ def fit_glm_arma11(
             t_qr_start = time.time()
             if use_qr:
                 # QR path: Precompute Q and R
-                Q_group, R_qr_group = torch.linalg.qr(X_w)  # Q: (n_time, n_reg), R: (n_reg, n_reg)
+                Q_group, R_qr_group = plinalg.qr(X_w)  # Q: (n_time, n_reg), R: (n_reg, n_reg)
                 # Precompute R^{-1} for variance computation (same for all voxels)
                 eye = torch.eye(n_regressors, device=device, dtype=dtype)
-                R_inv_group = torch.linalg.solve_triangular(R_qr_group, eye, upper=True)
+                R_inv_group = plinalg.solve_triangular(R_qr_group, eye, upper=True)
                 XwTXw_inv_group = R_inv_group @ R_inv_group.T  # (R'R)^{-1}
                 del eye
             else:
@@ -4764,12 +4763,12 @@ def fit_glm_arma11(
                 XwTXw_group = X_w.T @ X_w  # (n_reg, n_reg) - only 12.5 MB for 1771 regressors!
 
                 try:
-                    L_group = torch.linalg.cholesky(XwTXw_group)
+                    L_group = plinalg.cholesky(XwTXw_group)
                     XwTXw_inv_group = torch.cholesky_inverse(L_group)
                     cholesky_success_group = True
                     del L_group
                 except torch.linalg.LinAlgError:
-                    XwTXw_inv_group = torch.linalg.inv(XwTXw_group)
+                    XwTXw_inv_group = plinalg.inv(XwTXw_group)
                     cholesky_success_group = False
 
                 # For diagonal-only path (no GLTs), extract diagonal once
@@ -4791,7 +4790,7 @@ def fit_glm_arma11(
                 )
                 _A_task = XwTXw_inv_group.index_select(0, _fci_tensor).index_select(1, _fci_tensor)
                 _eye_task = torch.eye(len(fitted_column_indices), device=device, dtype=dtype)
-                A_task_inv_group = torch.linalg.inv(_A_task + 1e-8 * _eye_task)
+                A_task_inv_group = plinalg.inv(_A_task + 1e-8 * _eye_task)
                 del _A_task, _eye_task
                 A_full_inv_group = None
             else:
@@ -4894,7 +4893,7 @@ def fit_glm_arma11(
                     # Solve R β = Q'y using triangular solve
                     # Expand R_qr_group to batch for solve_triangular
                     R_qr_batch = R_qr_group.unsqueeze(0).expand(batch_voxels, -1, -1)
-                    betas_batch = torch.linalg.solve_triangular(
+                    betas_batch = plinalg.solve_triangular(
                         R_qr_batch, QTy_batch.unsqueeze(2), upper=True
                     ).squeeze(2)  # (batch_voxels, n_regressors)
                     del QTy_batch, R_qr_batch
@@ -5545,12 +5544,12 @@ def fit_glm_arma11(
 
             # Prewhiten data via triangular solve (reuse L from global estimation)
             y_v_col = y_v_dev.unsqueeze(1) if y_v_dev.ndim == 1 else y_v_dev
-            y_w = torch.linalg.solve_triangular(L_global, y_v_col, upper=False)
+            y_w = plinalg.solve_triangular(L_global, y_v_col, upper=False)
             if y_w.shape[-1] == 1:
                 y_w = y_w.squeeze(-1)
 
             # GLS fit
-            beta = torch.linalg.solve(XwTXw_reg, X_w.T @ y_w)
+            beta = plinalg.solve(XwTXw_reg, X_w.T @ y_w)
             beta_cpu = beta.cpu()
             results.betas[v] = beta_cpu
 
@@ -5568,7 +5567,7 @@ def fit_glm_arma11(
             results.sigma2[v] = sigma2_cpu
 
             # t-statistics
-            var_beta = sigma2 * torch.linalg.inv(XwTXw_reg)
+            var_beta = sigma2 * plinalg.inv(XwTXw_reg)
             se_beta = torch.sqrt(torch.diag(var_beta))
             tstats = beta / (se_beta + 1e-10)
             results.tstats[v] = tstats.cpu()
@@ -5620,7 +5619,7 @@ def fit_glm_arma11(
                 var_task = var_beta[fitted_column_indices, :][:, fitted_column_indices]
 
                 # Invert variance block: Var_task^{-1}
-                var_task_inv = torch.linalg.inv(
+                var_task_inv = plinalg.inv(
                     var_task + 1e-8 * torch.eye(n_task_params, device=device, dtype=dtype)
                 )
 
@@ -5629,7 +5628,7 @@ def fit_glm_arma11(
                 fstat = quad / n_task_params
             else:
                 # No filtering - test all regressors
-                var_inv = torch.linalg.inv(
+                var_inv = plinalg.inv(
                     var_beta + 1e-8 * torch.eye(n_regressors, device=device, dtype=dtype)
                 )
                 quad = torch.dot(beta, var_inv @ beta)

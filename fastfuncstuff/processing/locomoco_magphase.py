@@ -38,6 +38,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
+
 MAG_NUISANCE_CHOICES = ("none", "s0", "s0r2")
 
 
@@ -99,7 +101,7 @@ def _weighted_design(
         ridge = 1e-6 * nwn.diagonal(dim1=1, dim2=2).sum(1).clamp_min(1e-30)
         nwn = nwn + ridge[:, None, None] * torch.eye(q, device=device, dtype=x.dtype)
         nwx = torch.einsum("eq,ce->cq", n, wv * xv)
-        c = torch.linalg.solve(nwn, nwx[..., None])[..., 0]
+        c = plinalg.solve(nwn, nwx[..., None])[..., 0]
         mx[:, s : s + chunk] = (wv * xv - torch.einsum("ceq,cq->ce", wn, c)).T
     return mx, (x * mx).sum(0)
 
@@ -307,7 +309,7 @@ def estimate_partition_flow_magphase(
     weights = {}
     for ch in chans:
         n = nuisance_columns(kinds[ch], te).to(device)
-        proj = torch.eye(e, device=device) - (n @ torch.linalg.pinv(n) if n.shape[1] else 0)
+        proj = torch.eye(e, device=device) - (n @ plinalg.pinv(n) if n.shape[1] else 0)
         acc = torch.zeros(e, v, device=device)
         prev = frame(ch, 0, None)[:, brain]
         for t in range(1, nt):

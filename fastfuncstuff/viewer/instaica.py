@@ -27,6 +27,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import accum_dtype
 from fastfuncstuff.viewer.instapca import Decomposition
 
 
@@ -51,7 +52,7 @@ def rotate_to_ica(
     n_vox, k = pca.correlation.shape
     if k < 2:
         raise ValueError("ICA needs at least two dimensions")
-    f64 = torch.float64
+    f64 = accum_dtype(dev)  # two-pass reductions below; Metal has no float64
 
     corr = torch.as_tensor(np.ascontiguousarray(pca.correlation), dtype=torch.float32).to(dev)
     # Whitened spatial components: each projection column at unit variance.

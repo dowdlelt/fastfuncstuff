@@ -50,6 +50,8 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from ..utils import get_device, linalg_device, to_linalg_f64
 
 if TYPE_CHECKING:
@@ -2872,7 +2874,7 @@ def estimate_residual_flow_rotaware(
         )
 
     Mv = matrices_vox.to(device=device, dtype=torch.float32)  # (T,4,4) ref→raw
-    Mv_inv = torch.linalg.inv(to_linalg_f64(Mv)).float().to(device)  # raw→ref
+    Mv_inv = plinalg.inv(to_linalg_f64(Mv)).float().to(device)  # raw→ref
 
     flow_fn = _build_flow_fn(
         backend,
@@ -4246,7 +4248,7 @@ def refine_fwhm(
     # degree a monomial basis is badly conditioned and the "detrended" series would
     # carry the conditioning error into the ACF.
     poly = construct_polynomial_matrix(nt, min(polort, nt - 1), device=device)
-    q, _ = torch.linalg.qr(poly)
+    q, _ = plinalg.qr(poly)
     rows = rows - (rows @ q) @ q.T
     return estimate_fwhmx_run(
         rows,
@@ -7342,7 +7344,7 @@ def _affine_in_te_r2(disps: torch.Tensor, te: torch.Tensor) -> float:
     if e < 3:
         return 1.0  # two echoes always fit a 2-parameter model exactly
     x = torch.stack([torch.ones_like(te), te], dim=1).double()  # (E, 2)
-    resid_op = torch.eye(e, dtype=torch.float64) - x @ torch.linalg.pinv(x.T @ x) @ x.T
+    resid_op = torch.eye(e, dtype=torch.float64) - x @ plinalg.pinv(x.T @ x) @ x.T
     centre = torch.eye(e, dtype=torch.float64) - 1.0 / e
     ss_res = ss_tot = 0.0
     for t in range(disps.shape[-1]):  # per frame: bounds the temporary to one volume
@@ -7813,7 +7815,7 @@ def _top_eigh(gram, k):
     each component's largest-magnitude frame makes the basis reproducible run to run,
     which the SVD it replaces never guaranteed.
     """
-    ev, vec = torch.linalg.eigh(gram)
+    ev, vec = plinalg.eigh(gram)
     ev = ev.flip(0).clamp(min=0.0)
     vec = vec.flip(1)
     k = max(1, min(int(k), ev.numel()))
@@ -7894,7 +7896,7 @@ def warp_project_out(components, bad_timecourses, device=None):
         dev = linalg_device(device if device is not None else disp.device)
         a = bad.to(device=dev).to(torch.float64)
         # The basis is (T, m) with m tiny, so the QR is free and hoists out of the loop.
-        q, _ = torch.linalg.qr(a - a.mean(dim=0, keepdim=True))
+        q, _ = plinalg.qr(a - a.mean(dim=0, keepdim=True))
 
         # CHUNKED over voxels. The whole field is (T, S) and S is the full FoV: on a
         # 160x160x114x225 run that is 5.2 GB in float64 for `x` alone, and the

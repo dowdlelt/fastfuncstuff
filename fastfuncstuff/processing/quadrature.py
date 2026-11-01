@@ -20,6 +20,8 @@ import math
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .affine import (
     params_to_matrix,
     resample_affine_fast,
@@ -400,7 +402,7 @@ def quadrature_gn_rigid(
             certainty = certainty * weight_flat
 
         A, h = build_phase_normal_equations(phase_diff, certainty, coords, vol_shape)
-        dp = torch.linalg.solve(A + reg, h)
+        dp = plinalg.solve(A + reg, h)
 
         params[:6] += dp
 
@@ -459,7 +461,7 @@ def quadrature_gn_rigid_fixed(
             certainty = certainty * weight_flat
 
         A, h = build_phase_normal_equations(phase_diff, certainty, coords, vol_shape)
-        dp = torch.linalg.solve(A + reg, h)
+        dp = plinalg.solve(A + reg, h)
 
         params[:6] += dp
 

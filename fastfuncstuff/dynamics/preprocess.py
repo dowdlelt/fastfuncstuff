@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.utils import to_tensor
 
@@ -91,7 +92,7 @@ def detrend_session(
     basis = torch.cat(cols, dim=1)  # (N, degree+1+K)
     # QR gives an orthonormal Q so the projection is numerically clean even when
     # drift and motion columns are correlated.
-    q, _ = torch.linalg.qr(basis, mode="reduced")
+    q, _ = plinalg.qr(basis, mode="reduced")
     yt = y.transpose(0, 1)  # (N, D)
     resid = yt - q @ (q.transpose(0, 1) @ yt)
     return resid.transpose(0, 1).contiguous()

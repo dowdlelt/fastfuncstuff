@@ -28,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 
+from fastfuncstuff import policy_linalg as plinalg
+
 # Modifiers applied to the raw vector, per run, BEFORE convolution. The
 # derivative arms delegate to cli_utils.apply_nuisance_transform so AFNI's
 # 1d_tool.py definition is not forked into a second implementation.
@@ -664,7 +666,7 @@ def residualize_stim_vecs(
     vec = torch.as_tensor(vec_design)
     if device is not None:
         vec = vec.to(device)
-    q, r = torch.linalg.qr(vec.to(torch.float32))
+    q, r = plinalg.qr(vec.to(torch.float32))
 
     design_t = torch.as_tensor(design).to(q.device)
     design_r = design_t - q @ (q.T @ design_t)
@@ -710,5 +712,5 @@ def recover_stim_vec_betas(data, design, betas, q, r, *, chunk_size: int | None 
         b = torch.as_tensor(betas[c0:c1]).to(q.device)  # (chunk, n_cols)
         resid = y - b @ design_dev.T
         coef_q = q.T @ resid.T  # (k, chunk), in the orthonormal basis
-        out[c0:c1] = torch.linalg.solve_triangular(r, coef_q, upper=True).T.cpu()
+        out[c0:c1] = plinalg.solve_triangular(r, coef_q, upper=True).T.cpu()
     return out

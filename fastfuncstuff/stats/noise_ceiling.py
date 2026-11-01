@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.xval import _compute_projection_matrix
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.utils import linalg_device, to_linalg_f64
@@ -634,7 +635,7 @@ def loro_two_half_ceiling(
         for _, half_stim, _ in half_fits:
             shared = half_stim[:, present]
             gram = shared.T @ shared
-            gram_inv = torch.linalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
+            gram_inv = plinalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
             pseudo_inverses.append(gram_inv @ shared.T)
 
         for batch_start in range(0, n_voxels, batch_size):

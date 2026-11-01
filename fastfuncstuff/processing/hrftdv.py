@@ -43,6 +43,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device, parabolic_peak_offset
 
 DEFAULT_WIDTHS = (0.6, 0.75, 0.875, 1.0, 1.15, 1.3, 1.5)
@@ -140,7 +141,7 @@ def orthonormal_nuisance(nuisance_per_run: Sequence[Tensor], device: torch.devic
         if n.shape[1] == 0:
             out.append(n)
             continue
-        u, s, _ = torch.linalg.svd(n, full_matrices=False)
+        u, s, _ = plinalg.svd(n, full_matrices=False)
         out.append(u[:, s > 1e-8 * s[0]])
     return out
 
@@ -164,7 +165,7 @@ def project_runs(x: Tensor, q_runs: Sequence[Tensor], run_starts: Sequence[int])
 
 def bank_q(designs: Tensor) -> Tensor:
     """Orthonormal bases of each projected candidate design, ``(C, T, P)``."""
-    q, _ = torch.linalg.qr(designs.double())
+    q, _ = plinalg.qr(designs.double())
     return q.float()
 
 
@@ -192,10 +193,10 @@ def screen_responsive(
     T, V = y.shape
     P = design.shape[1]
     x = design.to(device=device).to(torch.float64)
-    pinv = torch.linalg.pinv(x)
+    pinv = plinalg.pinv(x)
     if sign_cols is not None:
         pinv = pinv[torch.as_tensor(sign_cols, device=device)]
-    q, _ = torch.linalg.qr(x)
+    q, _ = plinalg.qr(x)
     chunk = chunk_size or estimate_chunk_size(V, T, P, device, operation="glm")
     r2 = np.empty(V)
     mean_beta = np.empty(V)
@@ -237,8 +238,8 @@ def screen_library(
     T, V = y.shape
     S, _, P = designs.shape
     x = designs.to(device=device).to(torch.float64)
-    q = torch.linalg.qr(x)[0].float()
-    pinv = torch.linalg.pinv(x).float()  # (S, P, T)
+    q = plinalg.qr(x)[0].float()
+    pinv = plinalg.pinv(x).float()  # (S, P, T)
     chunk = chunk_size or estimate_chunk_size(
         V, T, P, device, operation="lag_bank", n_designs=S, empty_cache=False
     )
@@ -294,6 +295,7 @@ def fit_lag_width(
     candidates' Q factors ``(grid.n, T, P)`` on ``device``.  R² of a candidate
     is ``||Q^T y||² / ||y||²``: the projection is the whole fit.
     """
+    device = linalg_device(device)
     from fastfuncstuff.memory import estimate_chunk_size
 
     T, V = y.shape
@@ -663,7 +665,7 @@ def pooled_late_patterns(
         if units.size == 0:
             continue
         x = project(design_for(library.curves[e]))  # (T, 2P): early, late per condition
-        beta = torch.linalg.lstsq(x, means[:, torch.as_tensor(units, device=device)]).solution
+        beta = plinalg.lstsq(x, means[:, torch.as_tensor(units, device=device)]).solution
         late = beta[1::2].T.cpu().numpy()  # (n, P)
         if pattern.shape[1] == 0:
             pattern = np.full((U, late.shape[1]), np.nan)

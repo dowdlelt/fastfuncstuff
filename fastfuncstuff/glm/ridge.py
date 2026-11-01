@@ -34,6 +34,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 # Import for R² metric computation
 from fastfuncstuff.glm.xval import compute_r2_metric
 from fastfuncstuff.memory import estimate_chunk_size
@@ -121,7 +123,7 @@ def _fit_ridge_multiple_fracs(
     # sizes (see utils._MPS_CPU_OPS). Factor the shared design on CPU, then copy
     # its reusable factors once; all voxel-scale products remain on Metal.
     factor_device = cpu_if_mps(device, "svd")
-    U, S, Vt = torch.linalg.svd(X.to(factor_device), full_matrices=False)
+    U, S, Vt = plinalg.svd(X.to(factor_device), full_matrices=False)
 
     # Handle rank-deficiency: Filter out zero/tiny singular values
     # This prevents 0/0 = NaN when computing sclg with alpha=0
@@ -840,7 +842,7 @@ def _fit_ridge_chunk(
             XtX = XtX + 1e-10 * torch.eye(2, device=device).unsqueeze(0)
 
             # Solve all systems at once
-            scale_offset_batch = torch.linalg.solve(XtX, Xty)  # (n_scale, 2)
+            scale_offset_batch = plinalg.solve(XtX, Xty)  # (n_scale, 2)
             scales = scale_offset_batch[:, 0]  # (n_scale,)
             offsets = scale_offset_batch[:, 1]  # (n_scale,)
 
@@ -901,7 +903,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     # Group voxels by exactly equal designs. A cheaper key (the design's sum)
     # let two different HRFs with equal mass share one fit.
     designs_stacked = torch.stack(design_per_voxel, dim=0)  # (chunk_voxels, n_timepoints, n_trials)
-    _, design_ids = torch.unique(designs_stacked.flatten(1), dim=0, return_inverse=True)
+    _, design_ids = plinalg.unique_rows(designs_stacked.flatten(1), return_inverse=True)
     groups: dict[int, list[int]] = {}
     for i, gid in enumerate(design_ids.tolist()):
         groups.setdefault(gid, []).append(i)
@@ -1071,7 +1073,7 @@ def fit_ridge_single_trial(
             n_trials = design_matrix.shape[2]
             design_per_voxel_list = [design_matrix[i, :, :] for i in range(n_voxels)]
             if verbose:
-                n_unique_hrfs = len(torch.unique(design_matrix[:100].flatten(1), dim=0))
+                n_unique_hrfs = len(plinalg.unique_rows(design_matrix[:100].flatten(1)))
                 print(
                     f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)"
                 )

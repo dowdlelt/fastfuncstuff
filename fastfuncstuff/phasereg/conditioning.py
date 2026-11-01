@@ -24,6 +24,8 @@ import itertools
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 
 def _segments(n_tp: int, run_lengths: list[int] | None) -> list[tuple[int, int]]:
     lengths = run_lengths if run_lengths else [n_tp]
@@ -86,7 +88,7 @@ def _fit_term(centred: torch.Tensor, keep: torch.Tensor, order: int, coords) -> 
         g = centred[:, keep].median(dim=1).values
         return g.unsqueeze(1).expand_as(centred)
     basis = _legendre_basis(coords, order).to(centred.device)
-    coef = torch.linalg.lstsq(basis[keep], centred[:, keep].T.double()).solution
+    coef = plinalg.lstsq(basis[keep], centred[:, keep].T.double()).solution
     return (basis @ coef).T.to(centred.dtype)
 
 

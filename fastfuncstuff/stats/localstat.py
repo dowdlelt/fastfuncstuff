@@ -46,6 +46,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.utils import linalg_lstsq, warn_mps_float32_precision, widest_float_dtype
 
@@ -457,7 +458,7 @@ def fit_acf_batched(
             aug[:, idx, idx] += lam.view(-1, 1) * diag.clamp_min(1e-12)
 
             try:
-                delta = torch.linalg.solve(aug, -g.unsqueeze(-1)).squeeze(-1)
+                delta = plinalg.solve(aug, -g.unsqueeze(-1)).squeeze(-1)
             except RuntimeError:
                 delta = linalg_lstsq(aug, -g.unsqueeze(-1)).solution.squeeze(-1)
 

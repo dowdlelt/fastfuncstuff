@@ -66,6 +66,7 @@ from typing import Literal
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.decomposition.ica import FastICA
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.glm.core import fit_glm
@@ -91,7 +92,7 @@ from fastfuncstuff.utils import (
 def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
     """QR on a native backend, returning the reusable projector in place."""
     qr_device = cpu_if_mps(matrix.device, "qr")
-    Q, _ = torch.linalg.qr(matrix.to(qr_device))
+    Q, _ = plinalg.qr(matrix.to(qr_device))
     return Q.to(matrix.device)
 
 
@@ -174,7 +175,7 @@ def _invert_fold_gram(gram: torch.Tensor, rcond: float = 1e-6) -> torch.Tensor:
       the measurements and for when the rule does not hold.
     """
     gram_f64 = gram.to(device=factor_device(gram.device)).to(torch.float64)
-    eigvals, eigvecs = torch.linalg.eigh(gram_f64)
+    eigvals, eigvecs = plinalg.eigh(gram_f64)
     # rcond is relative to the largest singular value, which for a PSD matrix is
     # the largest eigenvalue. Round-off can push a null direction slightly
     # negative; ">" drops those along with the truly small ones.
@@ -692,7 +693,7 @@ def estimate_noise_model_order_per_run(
         run_data = run_data / torch.clamp(torch.norm(run_data, dim=1, keepdim=True), min=1e-10)
         # (T, T) Gram of the wide (V, T) matrix: the full spectrum, never a truncation.
         gram = (run_data.T @ run_data).cpu().double() / float(run_data.shape[0])
-        ev = torch.linalg.eigvalsh(gram).flip(0).clamp_min(0).numpy()
+        ev = plinalg.eigvalsh(gram).flip(0).clamp_min(0).numpy()
         n_t = int(ev.shape[0])
         n_eff = effective_sample_size_from_resels(n_pool, float(resels_per_run[run_idx]), floor=n_t)
         res = select_model_order(ev, n_samples=n_eff, k_min=min_components, k_max=max_components)

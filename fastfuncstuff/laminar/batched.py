@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.laminar.integrate import batch_bucket, integrate
 from fastfuncstuff.laminar.inversion import (
     FINDIFF_STEP,
@@ -53,12 +54,12 @@ def logdet_b(C: torch.Tensor) -> torch.Tensor:
     """
     zero_diag = (torch.diagonal(C, dim1=-2, dim2=-1) == 0).any(-1)
     sym = ((C - C.mT).abs() <= _TOL + 1e-5 * C.mT.abs()).all(-1).all(-1)
-    chol, info = torch.linalg.cholesky_ex(C)
+    chol, info = plinalg.cholesky_ex(C)
     use_chol = sym & (info == 0)
     ld_chol = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(-1)
     out = ld_chol
     if not bool(use_chol.all()):
-        s = torch.linalg.svdvals(C)
+        s = plinalg.svdvals(C)
         keep = (s > _TOL) & (s < 1.0 / _TOL)
         ld_svd = torch.where(keep, torch.log(torch.where(keep, s, 1.0)), 0.0).sum(-1)
         out = torch.where(use_chol, ld_chol, ld_svd)
@@ -77,7 +78,7 @@ def inv_b(A: torch.Tensor) -> torch.Tensor:
     eps = torch.finfo(A.dtype).eps * torch.clamp(norm_inf, min=1.0)
     tol = torch.clamp(eps * n, min=math.exp(-32))
     eye = torch.eye(n, dtype=A.dtype, device=A.device)
-    return torch.linalg.inv(A + eye * tol[:, None, None])
+    return plinalg.inv(A + eye * tol[:, None, None])
 
 
 def dx_b(dfdx: torch.Tensor, f: torch.Tensor, v: torch.Tensor | float) -> torch.Tensor:
@@ -96,7 +97,7 @@ def dx_b(dfdx: torch.Tensor, f: torch.Tensor, v: torch.Tensor | float) -> torch.
         aug[:, 1:, 1:] = ts[:, None, None] * dfdx[small]
         out[small] = torch.linalg.matrix_exp(aug)[:, 1:, 0]
     if bool(big.any()):
-        out[big] = -(torch.linalg.pinv(dfdx[big]) @ f[big][..., None])[..., 0]
+        out[big] = -(plinalg.pinv(dfdx[big]) @ f[big][..., None])[..., 0]
     return out
 
 
@@ -562,8 +563,8 @@ def reduce_batched(
         Css = C[:, s][:, :, s]
         Csk = C[:, s][:, :, k]
         d = q[:, s] - rE[:, s]
-        L = torch.linalg.cholesky(Css)
-        alpha = torch.cholesky_solve(d[..., None], L)[..., 0]
+        L = plinalg.cholesky(Css)
+        alpha = plinalg.cholesky_solve(d[..., None], L)[..., 0]
         logdet_ss = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
         ns = int(s.sum())
         log_q = -0.5 * ((d * alpha).sum(-1) + logdet_ss + ns * _LOG2PI)
@@ -571,7 +572,7 @@ def reduce_batched(
         log_p = -0.5 * ((dp * dp / pC[s]).sum(-1) + torch.log(pC[s]).sum() + ns * _LOG2PI)
         dF = dF + log_q - log_p
         qk = qk - (Csk.mT @ alpha[..., None])[..., 0]
-        Ck = Ck - Csk.mT @ torch.cholesky_solve(Csk, L)
+        Ck = Ck - Csk.mT @ plinalg.cholesky_solve(Csk, L)
     pEk, pCk, rEk, rCk = pE[k], pC[k], rE[:, k], rC[:, k]
     if not (bool((rEk == pEk).all()) and bool((rCk == pCk).all())):
         qP = inv_b(Ck)

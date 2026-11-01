@@ -39,6 +39,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 # fastfuncstuff imports
@@ -1937,7 +1938,7 @@ def _run_concat_ica(
     row_mean = data_tv.mean(dim=1, keepdim=True)
     data_centered = data_tv - row_mean
     cov_t = (data_centered @ data_centered.T) / float(n_vox_masked)
-    evals_t, evecs_t = torch.linalg.eigh(cov_t)
+    evals_t, evecs_t = plinalg.eigh(cov_t)
     _trace_cov = cov_t.cpu().numpy() if getattr(args, "trace", None) else None
     del cov_t
     idx = torch.argsort(evals_t, descending=True)
@@ -3270,7 +3271,7 @@ def _run_tensorial_ica(
     row_mean = data_tv.mean(dim=1, keepdim=True)
     data_centered = data_tv - row_mean
     cov_t = (data_centered @ data_centered.T) / float(V_total)
-    evals_t, evecs_t = torch.linalg.eigh(cov_t)
+    evals_t, evecs_t = plinalg.eigh(cov_t)
     del cov_t
     idx = torch.argsort(evals_t, descending=True)
     evals_t = torch.clamp(evals_t[idx][:order], min=1e-12)

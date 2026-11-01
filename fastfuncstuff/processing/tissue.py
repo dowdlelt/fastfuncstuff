@@ -28,6 +28,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .bbr import rst_matrix
 from .interp import trilinear_interpolate
 
@@ -88,7 +90,7 @@ def tissue_projector(F: Tensor) -> Tensor:
     is still unique and correct; only the individual means are non-identifiable,
     which does not matter for the residual cost.
     """
-    return torch.linalg.pinv(F)  # (K, P)
+    return plinalg.pinv(F)  # (K, P)
 
 
 def _sample_zero_outside(vol: Tensor, pts: Tensor) -> tuple[Tensor, Tensor]:

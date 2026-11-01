@@ -14,6 +14,8 @@ import torch
 from scipy.stats import spearmanr
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from . import postprocess as ica_postprocess
 from .tools import apply_high_pass_fft, apply_polort_projection
 from .varnorm import apply_noise_std_map, noise_std_map
@@ -177,7 +179,7 @@ def apply_melodic_noise_normalization(
     """Apply MELODIC-style IC noise normalization and return status message."""
     try:
         tdim, kdim = mixing.shape
-        unmix = torch.linalg.pinv(mixing)
+        unmix = plinalg.pinv(mixing)
         diagvals = 1.0 / torch.sqrt(torch.clamp(torch.diag(unmix @ unmix.T), min=1e-12))
         # Chunked residual std to avoid materializing full (T, V) tensor
         from fastfuncstuff.memory import estimate_chunk_size

@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import get_available_memory
 
 from .interp import _grid_sample_3d, _separable_resample_3d, wsinc5_resample_3d
@@ -287,10 +288,10 @@ def matrix_to_params(mat: Tensor) -> Tensor:
 
     # Polar decomposition: M3 = U @ P where U is rotation, P is symmetric
     # Use SVD: M3 = U @ S @ Vh, rotation = U @ Vh, scale+shear = Vh.T @ S @ Vh
-    U_svd, S_svd, Vh = torch.linalg.svd(M3)
+    U_svd, S_svd, Vh = plinalg.svd(M3)
 
     # Handle reflections (det < 0)
-    det = torch.det(U_svd @ Vh)
+    det = plinalg.det(U_svd @ Vh)
     if det < 0:
         U_svd[:, -1] *= -1
         S_svd[-1] *= -1
@@ -1245,7 +1246,7 @@ def voxel_matrix_to_dicom(
     source_affine = compute_cardinal_affine(np.asarray(source_affine, dtype=np.float64))
     base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
     source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
-    base_ras2ijk = torch.linalg.inv(base_ijk2ras)
+    base_ras2ijk = plinalg.inv(base_ijk2ras)
 
     # Step 1: voxel → RAS
     M_ras = source_ijk2ras @ M_ijk @ base_ras2ijk
@@ -1286,7 +1287,7 @@ def dicom_matrix_to_voxel(
     source_affine = compute_cardinal_affine(np.asarray(source_affine, dtype=np.float64))
     base_ijk2ras = _ijk2ras_matrix(base_affine).to(device)
     source_ijk2ras = _ijk2ras_matrix(source_affine).to(device)
-    source_ras2ijk = torch.linalg.inv(source_ijk2ras)
+    source_ras2ijk = plinalg.inv(source_ijk2ras)
 
     if M_dicom.ndim == 2:
         # DICOM → RAS → voxel
@@ -1519,7 +1520,7 @@ def resample_to_base_grid(
     # Matrix that maps base voxel indices to source voxel indices:
     # base_ijk → xyz → source_ijk
     base_ijk2xyz = torch.from_numpy(base_affine.astype(np.float64)).to(dtype=dtype, device=device)
-    source_xyz2ijk = torch.linalg.inv(
+    source_xyz2ijk = plinalg.inv(
         torch.from_numpy(source_affine.astype(np.float64)).to(dtype=dtype, device=device)
     )
     M = source_xyz2ijk @ base_ijk2xyz  # (4, 4): base voxel → source voxel
@@ -1551,7 +1552,7 @@ def base_into_source_frame(
     (the source's, since that is now the grid everything lives on).
     """
     m_b2s = load_matrix_1D(matrix_path, base_info["affine"], source_info["affine"])
-    m_s2b = torch.linalg.inv(m_b2s.double()).float().to(device)
+    m_s2b = plinalg.inv(m_b2s.double()).float().to(device)
     resampled = apply_affine_interp(
         base.float().to(device),
         m_s2b,

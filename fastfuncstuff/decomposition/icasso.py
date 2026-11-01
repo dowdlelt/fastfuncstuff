@@ -34,6 +34,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, to_tensor
@@ -57,7 +58,7 @@ def _recover_W_and_D(
     """
     comp = ica.components_  # (k, V)
     pca_comp = ica.pca_.components_[: comp.shape[0]]  # (k, V)
-    W = comp @ torch.linalg.pinv(pca_comp)  # (k, k)
+    W = comp @ plinalg.pinv(pca_comp)  # (k, k)
     return W, pca_comp
 
 

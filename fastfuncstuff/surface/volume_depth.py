@@ -337,6 +337,8 @@ def column_quantile(
 ) -> torch.Tensor:
     """Equivolume depth of points at equidistant depth ``rho`` with white feet
     ``face``/``bary``: their column CDF (:func:`column_depth_cdf`) read there."""
+    home = rho.device
+    rho, face, bary = rho.to(cdf.device), face.to(cdf.device), bary.to(cdf.device)
     bins = cdf.shape[1] - 1
     f = torch.as_tensor(faces, device=rho.device)[face]
     b = torch.clamp((rho * bins).long(), max=bins - 1)
@@ -345,7 +347,7 @@ def column_quantile(
     for k in range(3):
         v = f[:, k]
         q += bary[:, k] * (cdf[v, b] * (1 - frac) + cdf[v, b + 1] * frac)
-    return q.clamp_(0.0, 1.0)
+    return q.clamp_(0.0, 1.0).to(home)
 
 
 def _neighbours(idx, shape: tuple[int, int, int]) -> Iterator[tuple]:

@@ -33,6 +33,7 @@ import torch
 from scipy.signal.windows import tukey
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
@@ -41,7 +42,7 @@ from fastfuncstuff.memory import (
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
-from fastfuncstuff.utils import linalg_device, on_policy_device
+from fastfuncstuff.utils import linalg_device
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -593,7 +594,7 @@ def task_null_frames(
     blocks = [q_x]
     for _ in range(n_null):
         g = torch.randn(n_t, k_design, generator=gen, dtype=torch.float64).to(device)
-        blocks.append(torch.linalg.qr(_drift_free(g))[0])
+        blocks.append(plinalg.qr(_drift_free(g))[0])
     return torch.cat(blocks, dim=1).to(torch.float32), k_design
 
 
@@ -810,11 +811,11 @@ def _llr_denoise(
             # because the Gram is only (N×N) vs the (M×N) patch matrix.
             G = mats.mH @ mats  # (B, N, N) — cuBLAS batched matmul
             if return_recon:
-                eigvals, V = torch.linalg.eigh(G)  # ascending
+                eigvals, V = plinalg.eigh(G)  # ascending
                 del G
                 # Keep mats alive for projection-based reconstruction
             else:
-                eigvals = torch.linalg.eigvalsh(G)  # ascending, no eigvecs
+                eigvals = plinalg.eigvalsh(G)  # ascending, no eigvecs
                 del G, mats
             # Flip to descending order (SVD convention)
             s0 = torch.sqrt(torch.clamp(eigvals.flip(1), min=0))  # (B, K)
@@ -824,14 +825,12 @@ def _llr_denoise(
         else:
             if return_recon:
                 # Full SVD needed for reconstruction
-                u, s, vh = on_policy_device(
-                    "svd_batched", torch.linalg.svd, mats, full_matrices=False
-                )
+                u, s, vh = plinalg.svd(mats, full_matrices=False)
                 del mats
                 s0 = s.abs()  # (B, K)
             else:
                 # G-factor pass: only need singular values → ~2× faster
-                s0 = on_policy_device("svd_batched", torch.linalg.svdvals, mats).abs()  # (B, K)
+                s0 = plinalg.svdvals(mats).abs()  # (B, K)
                 del mats
 
         # ---- Threshold / weight computation (fully vectorized) ----
@@ -1099,11 +1098,11 @@ def _rescue_null_threshold(
         b = min(chunk, n_trials - done)
         # Haar-orthonormal candidate columns: QR of complex Gaussian.
         cg = torch.randn(b, n_time, k, dtype=torch.complex64, generator=gen)
-        cq, _ = torch.linalg.qr(cg)  # (b, n_time, k)
+        cq, _ = plinalg.qr(cg)  # (b, n_time, k)
         best = torch.zeros(b, k)
         for _ in range(n_other):
             qg = torch.randn(b, n_time, d, dtype=torch.complex64, generator=gen)
-            qq, _ = torch.linalg.qr(qg)  # (b, n_time, d)
+            qq, _ = plinalg.qr(qg)  # (b, n_time, d)
             proj = qq.mH @ cq  # (b, d, k)
             pn = (proj.abs() ** 2).sum(dim=1).sqrt()  # (b, k) per-candidate proj norm
             best = torch.maximum(best, pn)
@@ -1438,7 +1437,7 @@ def _llr_denoise_multiecho(
                 mats = mats.to(device)
             # Right singular vectors (rows of vh) carry the temporal structure;
             # U is not needed — reconstruction uses the projection X V V^H.
-            _, s, vh = torch.linalg.svd(mats, full_matrices=False)
+            _, s, vh = plinalg.svd(mats, full_matrices=False)
             del mats
             s0 = s.abs()
             if threshold_mode == "mp":
@@ -1611,9 +1610,7 @@ def _estimate_nordic_lambda(
     n_patch = int(np.prod(kernel_size))
     # Batched: (10, n_patch, n_timepoints)
     rnd = torch.randn((10, n_patch, n_timepoints), dtype=torch.float32, device=device)
-    svals = on_policy_device(
-        "svd_batched", torch.linalg.svdvals, rnd
-    )  # (10, min(n_patch, n_timepoints))
+    svals = plinalg.svdvals(rnd)  # (10, min(n_patch, n_timepoints))
     base = float(svals[:, 0].mean().item())
     if is_complex:
         return base * math.sqrt(2.0) * measured_noise * factor_error

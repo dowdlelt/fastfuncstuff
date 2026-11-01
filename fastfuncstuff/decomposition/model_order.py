@@ -55,6 +55,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from fastfuncstuff import policy_linalg as plinalg
+
 __all__ = [
     "ModelOrderResult",
     "effective_sample_size",
@@ -544,7 +546,7 @@ def parallel_analysis_order(
     hi = (T - 2) if k_max is None else min(int(k_max), T - 2)
 
     G = (X.T @ X).cpu().double() / V
-    w, U = torch.linalg.eigh(G)
+    w, U = plinalg.eigh(G)
     observed = w.flip(0).clamp_min(0).numpy()
     U = U.flip(1).to(device, torch.float32)  # (T, T) temporal eigenvectors
     F_U = torch.fft.rfft(U.T, dim=1)  # (T, F): spectrum of each eigenvector
@@ -580,7 +582,7 @@ def parallel_analysis_order(
             if remove_timepoint_mean:
                 S = S - S.mean(dim=0, keepdim=True)
             S = S * (row_sq.sqrt() / S.norm(dim=1).clamp_min(1e-12))[:, None]
-            tops.append(float(torch.linalg.eigvalsh((S.T @ S).cpu().double() / n)[-1]))
+            tops.append(float(plinalg.eigvalsh((S.T @ S).cpu().double() / n)[-1]))
         cache[k] = max(tops) if rule == "edge" else float(np.mean(tops))
         return cache[k]
 

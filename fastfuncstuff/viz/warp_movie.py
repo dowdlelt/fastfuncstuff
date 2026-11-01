@@ -44,6 +44,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .compose import compose_frame, display_edges, edge_range, intensity_window, panel_sizes
 from .encode import movie_path, write_movie
 from .slices import SlicePlanes
@@ -286,7 +288,7 @@ class WarpMovieRecorder:
                 )
                 / 2.0
             )
-        return torch.linalg.det(torch.stack(cols, dim=-1))
+        return plinalg.det(torch.stack(cols, dim=-1))
 
     def capture(
         self,

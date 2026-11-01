@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.design.matrices import build_task_design
 from fastfuncstuff.memory import bytes_per_voxel_glm, estimate_chunk_size, make_vram_debugger
@@ -202,7 +203,7 @@ def orthogonalize_design(X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
     # Project out Z from X: X_orth = X - Z * (Z'Z)^-1 * Z'X
     # Using QR for numerical stability
     qr_device = cpu_if_mps(Z.device, "qr")
-    Q, _ = torch.linalg.qr(Z.to(qr_device))
+    Q, _ = plinalg.qr(Z.to(qr_device))
     Q = Q.to(Z.device)
     X_orth = X - Q @ (Q.T @ X)
 
@@ -226,7 +227,7 @@ def design_cholesky(design: torch.Tensor) -> torch.Tensor | None:
     """
     ld = _linalg_device(design.device)
     try:
-        return torch.linalg.cholesky(design.to(ld).T @ design.to(ld))
+        return plinalg.cholesky(design.to(ld).T @ design.to(ld))
     except torch.linalg.LinAlgError:
         return None
 
@@ -249,7 +250,7 @@ def design_pinv(design: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     duplicates differ at ~1e-7 and a float64 tolerance would keep them.
     """
     X = to_factor_f64(design)
-    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    U, S, Vh = plinalg.svd(X, full_matrices=False)
     tol = max(X.shape) * torch.finfo(design.dtype).eps * S[0]
     rank = int((S > tol).sum().item())
     V = Vh[:rank].T
@@ -273,7 +274,7 @@ def ols_betas(
     ld = _linalg_device(data.device)
     if cholesky_L is not None:
         xty = design.to(ld).T @ data.to(ld).T  # (n_regressors, n_voxels)
-        return torch.cholesky_solve(xty, cholesky_L.to(ld)).to(data.device).T
+        return plinalg.cholesky_solve(xty, cholesky_L.to(ld)).to(data.device).T
     return linalg_lstsq(design.to(ld), data.T.to(ld)).solution.T.to(data.device)
 
 
@@ -337,15 +338,15 @@ def fit_glm_chunk(
         # Fast path: X'X = L L' already factored — one matmul + triangular solve.
         # Compute xty on ld directly to avoid an extra MPS→CPU transfer when ld=cpu.
         xty = design.to(ld).T @ data.to(ld).T  # (n_regressors, n_voxels)
-        betas = torch.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
+        betas = plinalg.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
     elif pinv_design is not None:
         betas = data @ pinv_design.T
     else:
         try:
             betas = linalg_lstsq(design.to(ld), data.T.to(ld)).solution.T.to(device)
         except RuntimeError:
-            Q, R = torch.linalg.qr(design.to(ld))
-            betas = torch.linalg.solve_triangular(R, Q.T @ data.T.to(ld), upper=True).T.to(device)
+            Q, R = plinalg.qr(design.to(ld))
+            betas = plinalg.solve_triangular(R, Q.T @ data.T.to(ld), upper=True).T.to(device)
 
     # Compute predictions and residuals
     # NOTE: design @ betas.T gives (n_timepoints, n_regressors) @ (n_regressors, n_voxels) = (n_timepoints, n_voxels)
@@ -443,7 +444,7 @@ def inspect_design(
     # SVD of X is cheaper than eigendecomp of X.T @ X and gives us
     # both singular values and right-singular vectors in one call.
     try:
-        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+        U, S, Vh = plinalg.svd(X, full_matrices=False)
     except Exception as e:  # noqa: BLE001
         print(f"  inspect_design: SVD failed: {e}", file=file)
         return {"rank": None, "error": str(e)}
@@ -737,13 +738,13 @@ def fit_glm(
     L = None
     pinv_design = None
     try:
-        L = torch.linalg.cholesky(xtx_ld)
+        L = plinalg.cholesky(xtx_ld)
         xtx_inv = torch.cholesky_inverse(L).to(design_concat.device)
     except torch.linalg.LinAlgError:
         # Cholesky requires positive-definite; fall through to inv.
         L = None
         try:
-            xtx_inv = torch.linalg.inv(xtx_ld).to(design_concat.device)
+            xtx_inv = plinalg.inv(xtx_ld).to(design_concat.device)
         except torch.linalg.LinAlgError as exc:
             # Genuinely singular — at least one design column is a
             # linear combination of the others.  Common causes:
@@ -832,13 +833,13 @@ def fit_glm(
     # stability) and skip noisy intermediate warnings.
     def _safe_invert(M, ld_dev, target_dev):
         try:
-            L_ = torch.linalg.cholesky(M.to(ld_dev))
+            L_ = plinalg.cholesky(M.to(ld_dev))
             return torch.cholesky_inverse(L_).to(target_dev)
         except torch.linalg.LinAlgError:
             try:
-                return torch.linalg.inv(M.to(ld_dev)).to(target_dev)
+                return plinalg.inv(M.to(ld_dev)).to(target_dev)
             except torch.linalg.LinAlgError:
-                return torch.linalg.pinv(M.to(ld_dev).to(torch.float64)).to(M.dtype).to(target_dev)
+                return plinalg.pinv(M.to(ld_dev).to(torch.float64)).to(M.dtype).to(target_dev)
 
     _xtx_inv_full_inv = _safe_invert(xtx_inv, ld, device)
     xtx_inv_task_inv = _safe_invert(xtx_inv_task, ld, device)

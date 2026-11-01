@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device
 
 
@@ -105,7 +106,7 @@ def _baseline_nuisance(
     for degree in range(1, poly_degree + 1):
         columns.append(t**degree)
     basis = torch.stack(columns, dim=1)
-    q, _ = torch.linalg.qr(basis)
+    q, _ = plinalg.qr(basis)
     return q
 
 
@@ -156,7 +157,7 @@ def _whitened_detrended(
     Xw = _ar1_whiten(X, rho)
     if S is None or S.shape[1] == 0:
         return Xw
-    q, _ = torch.linalg.qr(_ar1_whiten(S, rho))
+    q, _ = plinalg.qr(_ar1_whiten(S, rho))
     return Xw - q @ (q.T @ Xw)
 
 
@@ -170,7 +171,7 @@ def _contrast_variances(
     apart -- scored the same power as a well-separated pair. Estimability is
     decided instead: L is estimable iff it lies in the row space of F.
     """
-    evals, evecs = torch.linalg.eigh(fisher)
+    evals, evecs = plinalg.eigh(fisher)
     keep = evals > rtol * evals.abs().max().clamp_min(1e-300)
     V = evecs[:, keep]
     inv = (V / evals[keep]) @ V.T
@@ -855,8 +856,8 @@ def design_contrast_variance(
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
     cpu = torch.device("cpu")
-    X = torch.as_tensor(design, dtype=torch.float64, device=cpu)
-    C = torch.as_tensor(contrasts, dtype=torch.float64, device=cpu)
+    X = torch.as_tensor(design).to(cpu).to(torch.float64)
+    C = torch.as_tensor(contrasts).to(cpu).to(torch.float64)
     if C.ndim == 1:
         C = C.unsqueeze(0)
     n_t, n_task = X.shape
@@ -881,8 +882,8 @@ def design_contrast_variance(
         R = build_arma11_covariance(arma_a, arma_b, n_t, cpu, torch.float64, run_starts=run_starts)
         if R is None:
             raise ValueError(f"ARMA(1,1) a={arma_a}, b={arma_b} is not a valid correlation")
-        L = torch.linalg.cholesky(R)
-        whitened = torch.linalg.solve_triangular(L, full, upper=False)
+        L = plinalg.cholesky(R)
+        whitened = plinalg.solve_triangular(L, full, upper=False)
 
     fisher = whitened.T @ whitened
     L_full = torch.cat([C, torch.zeros(C.shape[0], nuisance.shape[1], dtype=torch.float64)], dim=1)

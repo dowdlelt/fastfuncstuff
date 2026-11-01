@@ -42,6 +42,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
+
 # Reuse phase stabilization and LLR infrastructure from NORDIC
 from fastfuncstuff.denoise.nordic import (
     _apply_temporal_phase_correction,
@@ -549,7 +551,7 @@ def _fit_polynomial_gfactor(
     diag_mean = XtX_64.diagonal().mean()
     XtX_64.diagonal().add_(1e-8 * diag_mean)
 
-    beta = torch.linalg.solve(XtX_64, Xty_64).to(device=dev, dtype=torch.float32)  # (n_terms,)
+    beta = plinalg.solve(XtX_64, Xty_64).to(device=dev, dtype=torch.float32)  # (n_terms,)
 
     # ------------------------------------------------------------------
     # Evaluate fitted = exp(poly), contracting the coefficient cube axis by axis
@@ -711,7 +713,7 @@ def _poly_gfactor_multi_degree(
         # Add ridge to sub-system too
         diag_d = XtX_d.diagonal().mean()
         XtX_d.diagonal().add_(1e-8 * diag_d)
-        beta_d = torch.linalg.solve(XtX_d, Xty_d).to(device=dev, dtype=torch.float32)
+        beta_d = plinalg.solve(XtX_d, Xty_d).to(device=dev, dtype=torch.float32)
         betas_padded[idx_t.to(dev), ci] = beta_d
 
     # ------------------------------------------------------------------

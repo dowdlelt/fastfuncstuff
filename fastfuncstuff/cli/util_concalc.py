@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli.design_spec import _do_compile as _design_spec_compile
 from fastfuncstuff.cli.design_spec import _resolve_spec_path
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
@@ -515,14 +516,14 @@ def _xtxinv_per_bin(
         if R is None:
             continue
         try:
-            L = torch.linalg.cholesky(R)
+            L = plinalg.cholesky(R)
         except RuntimeError:
             continue
         # Whitened design: solve L · X̃ = X (i.e. X̃ = L⁻¹ X). M = X̃ᵀ X̃.
-        X_white = torch.linalg.solve_triangular(L, X, upper=False)
+        X_white = plinalg.solve_triangular(L, X, upper=False)
         M = X_white.T @ X_white
         try:
-            M_inv[i] = torch.linalg.inv(M)
+            M_inv[i] = plinalg.inv(M)
         except RuntimeError:
             continue
         keep[i] = True
@@ -978,7 +979,7 @@ def main() -> int:
     # ── 6) Build (X̃ᵀX̃)⁻¹ per bin (REML) or a single global (XᵀX)⁻¹ (OLS)
     if args.ols:
         # OLS: covariance is I, so M = XᵀX and M_inv applies to every voxel.
-        XtX_inv_global = torch.linalg.inv(X.T @ X)  # (n_reg, n_reg)
+        XtX_inv_global = plinalg.inv(X.T @ X)  # (n_reg, n_reg)
         M_inv = XtX_inv_global.unsqueeze(0)  # (1, n_reg, n_reg)
         bin_keep = np.array([True])
 
@@ -1081,7 +1082,7 @@ def main() -> int:
                 C,
             )  # (n_bins, r, r)
             try:
-                CMC_bins_inv = torch.linalg.inv(CMC_bins)
+                CMC_bins_inv = plinalg.inv(CMC_bins)
             except RuntimeError as exc:
                 print(
                     f"WARN: contrast {label!r}: CMᵢⱼC inversion failed ({exc}). Skipping.",

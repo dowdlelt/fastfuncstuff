@@ -54,6 +54,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .cost import _separable_smooth_3d
 
 if TYPE_CHECKING:
@@ -472,7 +474,7 @@ def refit_coeff(field: Tensor, basis: SplineFieldBasis) -> Tensor:
         BtB = BtB + 1e-6 * eye
         xm = x.movedim(axis, -1)
         rhs = torch.einsum("vk,...v->...k", B, xm)
-        sol = torch.linalg.solve(BtB, rhs.movedim(-1, -1).unsqueeze(-1)).squeeze(-1)
+        sol = plinalg.solve(BtB, rhs.movedim(-1, -1).unsqueeze(-1)).squeeze(-1)
         return sol.movedim(-1, axis)
 
     c = _axis_solve(basis.Bz, field, 0)  # (n_kz, ny, nx)

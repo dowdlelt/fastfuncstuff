@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from fastfuncstuff import policy_linalg as plinalg
+
 if TYPE_CHECKING:
     import torch
 
@@ -240,12 +242,12 @@ def l1_detrend(
     b_rhs = 0.5 * X.sum(dim=0)  # (p,)
 
     def solve(Q: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        return torch.linalg.solve((Q.T @ XX).reshape(-1, p, p), rhs.T @ X).T  # (p, V)
+        return plinalg.solve((Q.T @ XX).reshape(-1, p, p), rhs.T @ X).T  # (p, V)
 
     c = -y
     x = torch.full_like(y, 0.5)  # dual variable a, feasible: X'a = 0.5 X'1
     s = 1.0 - x
-    yd = torch.linalg.lstsq(X, c).solution  # (p, V)
+    yd = plinalg.lstsq(X, c).solution  # (p, V)
     r = c - X @ yd
     z = r.clamp_min(0.0)
     w = z - r

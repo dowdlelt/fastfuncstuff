@@ -47,6 +47,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 # A run whose relative std falls below this carries no usable signal. Compared
 # against the run's own level so it is scale-invariant (raw counts or percent
 # signal change both work).
@@ -431,7 +433,7 @@ def censored_design_is_full_rank(design: torch.Tensor, good_list: list[int]) -> 
     sub, _ = censor_design(design, good_list)
     if sub.numel() == 0 or sub.shape[1] == 0:
         return False
-    return int(torch.linalg.matrix_rank(sub.double())) == int(sub.shape[1])
+    return int(plinalg.matrix_rank(sub.double())) == int(sub.shape[1])
 
 
 def build_families(
@@ -509,7 +511,7 @@ def build_families(
 
     # Same primitive glm/arma.py uses to group voxels by (a, b): unique rows plus
     # an inverse index. Not a list of lists -- a (n_patterns, n_runs) bool tensor.
-    patterns, inverse = torch.unique(validity.valid[cand_idx], dim=0, return_inverse=True)
+    patterns, inverse = plinalg.unique_rows(validity.valid[cand_idx], return_inverse=True)
 
     order = sorted(
         range(int(patterns.shape[0])),

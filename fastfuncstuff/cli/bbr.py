@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain, save_matrix_1D
@@ -372,7 +373,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
-    A_inv = torch.linalg.inv(A)  # epi→anat voxel map
+    A_inv = plinalg.inv(A)  # epi→anat voxel map
 
     def anat_to_epi(vol: torch.Tensor, mat_inv: torch.Tensor) -> torch.Tensor:
         # apply_affine(source, M, out_shape): M maps out(base) voxel → source voxel.
@@ -509,7 +510,7 @@ def main(argv: list[str] | None = None) -> None:
     # ── Compose refined affine: A' = T @ A (refine in EPI voxel space) ──
     # Keep the compose/inverse in float64 for accuracy; save_matrix_1D wants f32.
     A_new = T @ A
-    A_new_inv = torch.linalg.inv(A_new)
+    A_new_inv = plinalg.inv(A_new)
 
     prefix = args.prefix
     save_matrix_1D(

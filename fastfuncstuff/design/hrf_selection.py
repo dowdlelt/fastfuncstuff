@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import GLMResults, fit_glm
 from fastfuncstuff.glm.xval import (
     _cod_ratio,
@@ -248,7 +249,7 @@ def _pinv_for_compute(design: torch.Tensor, device: torch.device) -> torch.Tenso
     """
     # cpu_if_mps, not factor_device: these designs are float32, and pulling a
     # float32 pinv off CUDA would be a pessimization (see factor_device's table).
-    return torch.linalg.pinv(design.to(cpu_if_mps(device, "pinv"))).to(device)
+    return plinalg.pinv(design.to(cpu_if_mps(device, "pinv"))).to(device)
 
 
 def _evaluate_hrfs_batched(
@@ -402,7 +403,7 @@ def _evaluate_hrfs_batched(
                     xtx_train -= xtx_by_run[r]
                 # Small enough that CPU float64 is both fast and the most robust
                 # place to factor (also sidesteps the MPS pinv fallback).
-                pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
+                pinv_xtx = plinalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
                 test_stack = torch.cat(
                     [designs_stack_by_run[r] for r in test_runs], dim=1
                 )  # (n_designs, n_test_tps, n_reg)
@@ -547,7 +548,7 @@ def _evaluate_hrfs_batched(
     xtx_train = torch.einsum("fr,rdpq->fdpq", train_membership, xtx_by_run)
     train_membership = train_membership.to(device=device, dtype=wide)
     # These matrices are tiny; CPU float64 is robust and avoids MPS fallback.
-    pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
+    pinv_xtx = plinalg.pinv(xtx_train.cpu()).to(device=device, dtype=wide)
     del xtx_train
 
     test_count_by_run = test_membership.sum(dim=0)

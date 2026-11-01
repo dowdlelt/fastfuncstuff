@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import to_factor_f64
 from fastfuncstuff.viewer.chroma import Look, paint, srgb_to_oklab, unit_coords
 
@@ -146,7 +147,7 @@ def _lda_start(za: Tensor, zb: Tensor, W0: Tensor) -> Tensor:
     diff = za.mean(0) - zb.mean(0)
     pooled = torch.cov(za.T) + torch.cov(zb.T)
     pooled = pooled + 1e-3 * torch.eye(pooled.shape[0], device=za.device) * pooled.diagonal().mean()
-    w = torch.linalg.solve(to_factor_f64(pooled), to_factor_f64(diff)).float().to(za.device)
+    w = plinalg.solve(to_factor_f64(pooled), to_factor_f64(diff)).float().to(za.device)
     w = w / w.norm().clamp(min=1e-12)
     gaps = ((W0 @ za.T).mean(1) - (W0 @ zb.T).mean(1)).abs() / (W0 @ torch.cat([za, zb]).T).std(1)
     row = 1 + int(gaps[1:].argmin())  # a chroma row; lightness stays anatomy-like

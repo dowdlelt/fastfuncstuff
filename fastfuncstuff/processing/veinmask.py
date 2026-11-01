@@ -24,6 +24,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.stats.smooth3d import _gaussian_kernel_1d, blur_axis
 from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import to_linalg_f64
@@ -65,7 +66,7 @@ def tissue_darkness(
     m = mean.to(dt)
     c = tissue.to(dt)
     flat_c = c.reshape(3, -1)
-    use = fit_mask & (m > 0) & (c.sum(0) > 0.5)
+    use = fit_mask.to(m.device) & (m > 0) & (c.sum(0) > 0.5)
     w = use.clone()
     bias = torch.ones_like(m)
     levels = torch.zeros(3, dtype=dt, device=m.device)
@@ -75,7 +76,7 @@ def tissue_darkness(
         sel = w.reshape(-1)
         a = flat_c[:, sel].T
         b = (m / bias).reshape(-1)[sel]
-        levels = torch.linalg.lstsq(a, b[:, None]).solution[:, 0].clamp_min(0)
+        levels = plinalg.lstsq(a, b[:, None]).solution[:, 0].clamp_min(0)
         pred = torch.einsum("k,k...->...", levels, c).clamp_min(1e-6)
         wf = w.to(dt)
         bias = masked_blur(m * pred, wf, sigma_vox) / masked_blur(
@@ -146,9 +147,9 @@ def local_tissue_darkness(
     ``fit_mask``), and a vein in bright CSF with CSF. Returns ``(ratio, expected)``."""
     dt = torch.float64
     m, c = to_linalg_f64(mean), to_linalg_f64(tissue)
-    use = fit_mask & (m > 0) & (c.sum(0) > 0.5)
+    use = fit_mask.to(m.device) & (m > 0) & (c.sum(0) > 0.5)
     sel = use.reshape(-1)
-    glob = torch.linalg.lstsq(c.reshape(3, -1)[:, sel].T, m.reshape(-1)[sel][:, None]).solution
+    glob = plinalg.lstsq(c.reshape(3, -1)[:, sel].T, m.reshape(-1)[sel][:, None]).solution
     glob = glob[:, 0].clamp_min(0)
     eye = torch.eye(3, dtype=dt, device=m.device)
     w = use.clone()
@@ -165,9 +166,9 @@ def local_tissue_darkness(
         )
         b = torch.stack([masked_blur(c[k] * m, wf, sigma_vox) for k in range(3)], -1)
         lam = prior * a.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(1e-12) / 3
-        lev = torch.linalg.solve(
-            a + lam[..., None, None] * eye, (b + lam[..., None] * glob)[..., None]
-        )[..., 0]
+        lev = plinalg.solve(a + lam[..., None, None] * eye, (b + lam[..., None] * glob)[..., None])[
+            ..., 0
+        ]
         expected = (lev.movedim(-1, 0) * c).sum(0).clamp_min(1e-6)
         lr = torch.log(m.clamp_min(1e-6) / expected)
         r = lr[use]
@@ -225,7 +226,7 @@ def dark_shapes(
         h = _hessian(ds, zooms) * (s * s)
         for lo in range(0, len(idx), chunk):
             p = idx[lo : lo + chunk]
-            ev, vec = torch.linalg.eigh(h[p[:, 0], p[:, 1], p[:, 2]].double())
+            ev, vec = plinalg.eigh(h[p[:, 0], p[:, 1], p[:, 2]].double())
             order = ev.abs().argsort(-1)
             ev = ev.gather(-1, order)
             v3 = vec.gather(-1, order[:, None, 2:3].expand(-1, 3, 1))[..., 0]

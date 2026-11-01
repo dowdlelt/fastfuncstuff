@@ -27,6 +27,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .affine import dicom_matrix_to_voxel
 
 # The paper's model names, and what a bare -motsim means.
@@ -269,7 +271,7 @@ def run_forward_sim(
     else:
         cfg = MocoConfig(final_interp=interp, device=str(device), verb=max(verb - 1, 0))
 
-    inv = torch.linalg.inv(matrices_vox.double()).to(matrices_vox.dtype)
+    inv = plinalg.inv(matrices_vox.double()).to(matrices_vox.dtype)
 
     # One volume resampled nt ways: expand rather than repeat, so the source costs
     # nothing, and let the batched Pass-2 resampler do the chunking and (on CUDA)

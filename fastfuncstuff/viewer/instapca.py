@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import accum_dtype, linalg_device
 
 ProgressFn = Callable[[float, str], None]
@@ -177,7 +178,7 @@ def decompose(
         if progress is not None:
             progress(0.5, "eigh")
         gram_cpu = gram.to(factor_device(device))
-        evals, evecs = torch.linalg.eigh(gram_cpu)
+        evals, evecs = plinalg.eigh(gram_cpu)
         order = torch.argsort(evals, descending=True)[:k]
         u = evecs[:, order]
         explained = (evals[order] / torch.trace(gram_cpu).clamp(min=1e-30)).cpu().numpy()

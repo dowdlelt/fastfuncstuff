@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.laminar.integrate import batch_bucket, integrate
 from fastfuncstuff.laminar.params import PARAM_SHAPES, ModelSpec, zero_params
 
@@ -100,10 +101,10 @@ def spm_logdet(C: torch.Tensor) -> torch.Tensor:
         return torch.zeros((), dtype=C.dtype, device=C.device)
     C = C[keep][:, keep]
     if torch.allclose(C, C.mT, atol=TOL):
-        chol, info = torch.linalg.cholesky_ex(C)
+        chol, info = plinalg.cholesky_ex(C)
         if int(info) == 0:
             return 2.0 * torch.log(torch.diagonal(chol)).sum()
-    s = torch.linalg.svdvals(C)
+    s = plinalg.svdvals(C)
     s = s[(s > TOL) & (s < 1.0 / TOL)]
     return torch.log(s).sum()
 
@@ -114,7 +115,7 @@ def spm_inv(A: torch.Tensor) -> torch.Tensor:
     norm_inf = A.abs().sum(dim=-1).max()
     eps = torch.finfo(A.dtype).eps * torch.clamp(norm_inf, min=1.0)
     tol = torch.clamp(eps * n, min=math.exp(-32))
-    return torch.linalg.inv(A + torch.eye(A.shape[0], dtype=A.dtype, device=A.device) * tol)
+    return plinalg.inv(A + torch.eye(A.shape[0], dtype=A.dtype, device=A.device) * tol)
 
 
 def spm_dx(dfdx: torch.Tensor, f: torch.Tensor, v: float) -> torch.Tensor:
@@ -132,7 +133,7 @@ def spm_dx(dfdx: torch.Tensor, f: torch.Tensor, v: float) -> torch.Tensor:
     n = f.shape[0]
     t = torch.exp(torch.as_tensor(v, dtype=f.dtype, device=f.device) - spm_logdet(dfdx) / n)
     if float(t) > math.exp(16):
-        return -torch.linalg.pinv(dfdx) @ f
+        return -plinalg.pinv(dfdx) @ f
     aug = torch.zeros(n + 1, n + 1, dtype=f.dtype, device=f.device)
     aug[1:, 0] = t * f
     aug[1:, 1:] = t * dfdx

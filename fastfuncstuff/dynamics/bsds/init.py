@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.dynamics.bsds.vb import ALPHA_A, ALPHA_PI, PA, VBState
 
 _DTYPE = torch.float64
@@ -110,7 +111,7 @@ def _project_top_pcs(x: torch.Tensor, n_components: int) -> torch.Tensor:
     if n_components < 1:
         return x
     centered = x - x.mean(dim=0, keepdim=True)
-    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    _, _, vh = plinalg.svd(centered, full_matrices=False)
     return centered @ vh[:n_components].T
 
 
@@ -121,7 +122,7 @@ def _project_top_pcs_batched(x: torch.Tensor, n_components: int) -> torch.Tensor
     if n_components < 1:
         return x
     centered = x - x.mean(dim=1, keepdim=True)
-    _, _, vh = torch.linalg.svd(centered, full_matrices=False)  # vh: (B, min(N,D), D)
+    _, _, vh = plinalg.svd(centered, full_matrices=False)  # vh: (B, min(N,D), D)
     return centered @ vh[:, :n_components].transpose(1, 2)  # (B, N, n_components)
 
 

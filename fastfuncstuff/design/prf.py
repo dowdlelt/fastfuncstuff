@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 import torch
 import torch.nn.functional as F
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import orthogonalize_design
 from fastfuncstuff.utils import cpu_if_mps, linalg_device, shape_bucket, widest_float_dtype
 
@@ -598,7 +599,7 @@ def _nuisance_bases(
         if nuisance.shape[1] == 0:
             bases.append(None)
             continue
-        q, _ = torch.linalg.qr(nuisance.to(cpu_if_mps(device, "qr")))
+        q, _ = plinalg.qr(nuisance.to(cpu_if_mps(device, "qr")))
         bases.append(q.to(device))
     return _NuisanceBases(tuple(bases))
 
@@ -711,7 +712,7 @@ def _compress_aperture_runs(
             )
         # On the CPU whatever the compute device: Metal's unique(dim=0) took
         # ~360 ms per call on a 306 x 10,000 run, against milliseconds here.
-        frames, inverse = torch.unique(stimulus.cpu(), dim=0, return_inverse=True)
+        frames, inverse = plinalg.unique_rows(stimulus.cpu(), return_inverse=True)
         compressed.append(
             _ApertureRun(
                 frames=frames.reshape(-1, columns).to(stimulus.device).contiguous(),
@@ -1092,11 +1093,9 @@ def _refine_css_batch(
         diagonal_scale = jtj.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12)
         normal = jtj + identity * (damping.to(solve_dtype) * diagonal_scale).view(-1, 1, 1)
         try:
-            free_step = torch.linalg.solve(normal, rhs.unsqueeze(-1)).squeeze(-1).to(current.dtype)
+            free_step = plinalg.solve(normal, rhs.unsqueeze(-1)).squeeze(-1).to(current.dtype)
         except torch.linalg.LinAlgError:
-            free_step = (
-                (torch.linalg.pinv(normal) @ rhs.unsqueeze(-1)).squeeze(-1).to(current.dtype)
-            )
+            free_step = (plinalg.pinv(normal) @ rhs.unsqueeze(-1)).squeeze(-1).to(current.dtype)
         step = torch.zeros_like(current)
         step[:, :n_free] = free_step
 
@@ -2359,7 +2358,7 @@ def screen_voxels_ridge(
         normal = gram + torch.eye(n_tiles, device=solve_device, dtype=gram.dtype) * penalty
         hat = (
             test_design.to(solve_device).double()
-            @ torch.cholesky_solve(train_f64.T, torch.linalg.cholesky(normal))
+            @ plinalg.cholesky_solve(train_f64.T, plinalg.cholesky(normal))
         ).to(device=device, dtype=data.dtype)
 
         for start in range(0, n_voxels, voxel_chunk_size):

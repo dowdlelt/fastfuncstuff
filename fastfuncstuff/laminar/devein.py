@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.laminar.forward import neuronal_to_vascular
 from fastfuncstuff.laminar.integrate import batch_bucket, integrate
 from fastfuncstuff.laminar.params import ModelSpec
@@ -188,7 +189,7 @@ def static_deveining_matrix(
         W = impulse_response.sum(dim=-1)
     else:
         raise ValueError(f"mode must be 'peak' or 'auc', got {mode!r}")
-    return W, torch.linalg.pinv(W, rcond=rcond)
+    return W, plinalg.pinv(W, rcond=rcond)
 
 
 def apply_deveining(values: torch.Tensor, W_inv: torch.Tensor) -> torch.Tensor:

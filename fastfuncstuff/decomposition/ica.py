@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import get_device, to_factor_f64, to_tensor
 
 
@@ -199,7 +200,7 @@ class FastICA:
         # float64 eigh on the CPU: the (T,T) covariance is small and float64
         # runs at 1/64 rate on a consumer card.  Results return to the device.
         _dev = cov_t.device
-        eigenvalues, eigenvectors = torch.linalg.eigh(to_factor_f64(cov_t))
+        eigenvalues, eigenvectors = plinalg.eigh(to_factor_f64(cov_t))
         del cov_t
         eigenvalues = eigenvalues.float().flip(0).to(_dev)
         eigenvectors = eigenvectors.float().flip(1).to(_dev)
@@ -314,7 +315,7 @@ class FastICA:
 
         # ICA mixing (get timeseries)
         # Reconstruct unmixing matrix from components
-        W = self.components_ @ torch.linalg.pinv(self.pca_.components_)
+        W = self.components_ @ plinalg.pinv(self.pca_.components_)
         S = X_pca @ W.T
 
         return S
@@ -498,7 +499,7 @@ class FastICA:
         # CUDA card against well under a millisecond here, so the round trip of
         # a matrix this small pays for itself many times over.
         orig_dtype = W.dtype
-        U, S, Vt = torch.linalg.svd(to_factor_f64(W), full_matrices=False)
+        U, S, Vt = plinalg.svd(to_factor_f64(W), full_matrices=False)
         return (U @ Vt).to(device=W.device, dtype=orig_dtype)
 
     @staticmethod
@@ -841,7 +842,7 @@ class InfoMaxICA:
         # float64 eigh on the CPU: the (T,T) covariance is small and float64
         # runs at 1/64 rate on a consumer card.  Results return to the device.
         _dev = cov_t.device
-        eigenvalues, eigenvectors = torch.linalg.eigh(to_factor_f64(cov_t))
+        eigenvalues, eigenvectors = plinalg.eigh(to_factor_f64(cov_t))
         del cov_t
         eigenvalues = eigenvalues.float().flip(0).to(_dev)
         eigenvectors = eigenvectors.float().flip(1).to(_dev)
@@ -883,7 +884,7 @@ class InfoMaxICA:
 
         # Extract spatial maps and mixing matrix (same as FastICA)
         self.components_ = W @ pca_components
-        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
+        self.mixing_ = dewhite[:, :n_components] @ plinalg.pinv(W)
 
         self.pca_ = _RowCenteredPCAState(
             components=pca_components_all,
@@ -1093,7 +1094,7 @@ class InfoMaxICA:
             raise RuntimeError("ICA must be fitted before transform()")
         X = to_tensor(X, device=self.device)
         X_pca = self.pca_.transform(X)
-        W = self.components_ @ torch.linalg.pinv(self.pca_.components_)
+        W = self.components_ @ plinalg.pinv(self.pca_.components_)
         return X_pca @ W.T
 
     def fit_transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -1409,7 +1410,7 @@ def _symmetric_decorrelation_batch(W: torch.Tensor) -> torch.Tensor:
     that the round trip costs less than the float64 CUDA factorisation would.
     """
     orig_dtype, orig_device = W.dtype, W.device
-    U, _, Vt = torch.linalg.svd(W.detach().to(device='cpu').to(torch.float64), full_matrices=False)
+    U, _, Vt = plinalg.svd(W.detach().to(device="cpu").to(torch.float64), full_matrices=False)
     return (U @ Vt).to(device=orig_device, dtype=orig_dtype)
 
 

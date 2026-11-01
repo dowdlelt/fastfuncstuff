@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from scipy.linalg import toeplitz
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_lstsq
 
 
@@ -190,15 +191,15 @@ def gls_fit(
     # Compute Σ^(-1) via Cholesky decomposition
     # Σ = L L', Σ^(-1) = L'^(-1) L^(-1)
     try:
-        L = torch.linalg.cholesky(sigma)
-        L_inv = torch.linalg.inv(L)
+        L = plinalg.cholesky(sigma)
+        L_inv = plinalg.inv(L)
         sigma_inv = L_inv.T @ L_inv
         sigma_inv_sqrt = L_inv.T  # For whitening
     except Exception:
         # Fallback: direct inversion with regularization
         sigma_reg = sigma + 1e-6 * torch.eye(n_timepoints, device=device)
-        sigma_inv = torch.linalg.inv(sigma_reg)
-        sigma_inv_sqrt = torch.linalg.cholesky(sigma_inv).T
+        sigma_inv = plinalg.inv(sigma_reg)
+        sigma_inv_sqrt = plinalg.cholesky(sigma_inv).T
 
     # GLS estimates: β = (X' Σ^(-1) X)^(-1) X' Σ^(-1) Y
     XtSX = X.T @ sigma_inv @ X
@@ -207,7 +208,7 @@ def gls_fit(
     # Add regularization for numerical stability
     XtSX_reg = XtSX + 1e-6 * torch.eye(n_regressors, device=device)
 
-    betas = torch.linalg.solve(XtSX_reg, XtSY)
+    betas = plinalg.solve(XtSX_reg, XtSY)
 
     # (X' Σ^(-1) X)^(-1) is Var(β) only up to the noise variance, because `sigma`
     # here is the AR(1) *correlation* matrix (unit diagonal). Returning it as
@@ -215,7 +216,7 @@ def gls_fit(
     # against 400 simulations at sigma=2, where the empirical SD was 1.91x the
     # reported one. Anything forming a t-statistic from it would have been
     # roughly twice as significant as the data warranted.
-    var_betas_unit = torch.linalg.inv(XtSX_reg)
+    var_betas_unit = plinalg.inv(XtSX_reg)
 
     # Residuals
     residuals = Y - X @ betas

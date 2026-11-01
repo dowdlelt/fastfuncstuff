@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import estimate_chunk_size
 
 
@@ -61,7 +62,7 @@ def _detrend_basis(n_t: int, polort: int, device: torch.device) -> torch.Tensor:
     if polort < 0:
         return torch.zeros(n_t, 0, device=device)
     poly = construct_polynomial_matrix(n_t, polort, torch.device("cpu"), dtype=torch.float64)
-    q, _ = torch.linalg.qr(poly)
+    q, _ = plinalg.qr(poly)
     return q.float().to(device)
 
 

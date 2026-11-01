@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import to_linalg_f64
 
 __all__ = ["RunMoments", "compute_run_moments", "solve_from_moments", "run_bounds"]
@@ -172,5 +173,5 @@ def solve_from_moments(
     # genuinely rank-deficient for a condition no contributing run sampled.
     n_cols = xtx.shape[0]
     xtx = xtx + ridge * torch.eye(n_cols, device=xtx.device, dtype=xtx.dtype)
-    solved = torch.linalg.solve(xtx, xty.to(xtx.device).double())
+    solved = plinalg.solve(xtx, xty.to(xtx.device).double())
     return solved.to(out_dtype).to(device)

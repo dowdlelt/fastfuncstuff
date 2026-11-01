@@ -25,6 +25,8 @@ import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 
+from fastfuncstuff import policy_linalg as plinalg
+
 _DTYPE = torch.float64
 
 
@@ -40,8 +42,8 @@ def gaussian_symmetric_kl(
     cov_a = cov_a.to(_DTYPE)
     cov_b = cov_b.to(_DTYPE)
     d = mean_a.shape[0]
-    inv_a = torch.linalg.inv(cov_a)
-    inv_b = torch.linalg.inv(cov_b)
+    inv_a = plinalg.inv(cov_a)
+    inv_b = plinalg.inv(cov_b)
     diff = (mean_b - mean_a).unsqueeze(1)  # (D, 1)
     kl_ab = 0.5 * (torch.trace(inv_b @ cov_a) + (diff.T @ inv_b @ diff).squeeze() - d)
     diff2 = (mean_a - mean_b).unsqueeze(1)

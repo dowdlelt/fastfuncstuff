@@ -33,6 +33,7 @@ import torch
 from scipy.linalg import block_diag
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.xval import cod_from_ss_residual
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.unique import sorted_unique
@@ -804,10 +805,10 @@ def fit_smooth_arma(
         chol = (
             torch.eye(n_t, dtype=torch.float64)
             if cov is None or (a == 0.0 and b == 0.0)
-            else torch.linalg.cholesky(cov)
+            else plinalg.cholesky(cov)
         )
-        design_w = torch.linalg.solve_triangular(chol, design64, upper=False)
-        sub_w = torch.linalg.solve_triangular(chol, data[idx].double().T, upper=False).T
+        design_w = plinalg.solve_triangular(chol, design64, upper=False)
+        sub_w = plinalg.solve_triangular(chol, data[idx].double().T, upper=False).T
         sel = fit_smooth_selected(
             sub_w.float(),
             design_w,
@@ -892,10 +893,8 @@ def _run_blocks(design64, n_task, penalty, bounds, a, b, device) -> list[_RunBlo
         if a != 0.0 or b != 0.0:
             cov = build_arma11_covariance(a, b, rows.size, torch.device("cpu"), torch.float64)
             if cov is not None:
-                chol = torch.linalg.cholesky(cov)
-                d_fit = torch.linalg.solve_triangular(
-                    chol, torch.as_tensor(d_raw), upper=False
-                ).numpy()
+                chol = plinalg.cholesky(cov)
+                d_fit = plinalg.solve_triangular(chol, torch.as_tensor(d_raw), upper=False).numpy()
         q_raw = _nuisance_basis(d_raw[:, n_task:])
         x_raw = d_raw[:, :n_task] - q_raw @ (q_raw.T @ d_raw[:, :n_task])
         q_fit = _nuisance_basis(d_fit[:, n_task:])
@@ -1096,7 +1095,7 @@ def fit_smooth_per_run(
                 yy_raw.append((y_s * y_s).sum(dim=1))
                 sum_raw.append(y_s.sum(dim=1))
                 if blk.chol is not None:
-                    y_r = torch.linalg.solve_triangular(blk.chol, y_r.T, upper=False).T
+                    y_r = plinalg.solve_triangular(blk.chol, y_r.T, upper=False).T
                 y_f = y_r - (y_r @ blk.q_fit) @ blk.q_fit.T if blk.q_fit.shape[1] else y_r
                 c_fit.append(y_f @ blk.x_fit)
                 yy_fit.append((y_f * y_f).sum(dim=1))
@@ -1135,7 +1134,7 @@ def fit_smooth_per_run(
                 ss_ols = torch.zeros(nv, dtype=torch.float64, device=device)
                 for r, blk in enumerate(blocks):
                     g_fit = blk.x_fit.T @ blk.x_fit
-                    beta_ols = c_fit[r] @ torch.linalg.pinv(g_fit, hermitian=True)
+                    beta_ols = c_fit[r] @ plinalg.pinv(g_fit, hermitian=True)
                     ss_ols += _target_ss(
                         beta_ols,
                         yy_sum - yy_raw[r],

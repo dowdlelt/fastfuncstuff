@@ -61,6 +61,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import widest_float_dtype
 
 __all__ = [
@@ -185,7 +186,7 @@ def noise_std_map(
         cov_t += xc @ xc.T
         del xc
     cov_t /= float(n_vox)  # (T, T)
-    evals, evecs = torch.linalg.eigh(cov_t)
+    evals, evecs = plinalg.eigh(cov_t)
     del cov_t
     order = torch.argsort(evals, descending=True)
     basis = evecs[:, order][:, :r]  # (T, r), orthonormal

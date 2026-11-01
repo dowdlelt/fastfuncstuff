@@ -59,7 +59,7 @@ from fastfuncstuff.stats.cluster import (
     _null_worker_chunk,
     _null_worker_init,
 )
-from fastfuncstuff.utils import widest_float_dtype
+from fastfuncstuff.utils import linalg_device
 
 # 3dClustSim's own defaults (pthr_init / athr_init in 3dClustSim.c).
 DEFAULT_CS_PTHR = (0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001)
@@ -233,15 +233,16 @@ def make_radial_weight(
     Nyquist planes are zeroed in real space and the DC bin is zeroed in the
     weight, which is what makes the generated field zero-mean.
     """
+    work = linalg_device(device)  # the spectrum is complex128; Metal has none
     nx, ny, nz = grid
     dx, dy, dz = voxmm
     # Wrapped coordinate: distance to the nearest periodic image of the origin.
     ax = [
         torch.where(
-            torch.arange(n, device=device) < n // 2,
-            torch.arange(n, device=device),
-            n - torch.arange(n, device=device),
-        ).to(widest_float_dtype(device))
+            torch.arange(n, device=work) < n // 2,
+            torch.arange(n, device=work),
+            n - torch.arange(n, device=work),
+        ).to(torch.float64)
         * d
         for n, d in ((nx, dx), (ny, dy), (nz, dz))
     ]
@@ -259,7 +260,7 @@ def make_radial_weight(
     spec = torch.where(spec < ftop, torch.zeros_like(spec), spec)
     weight = torch.sqrt(spec)
     weight[0, 0, 0] = 0.0  # zero mean
-    return weight.to(dtype)
+    return weight.to(dtype).to(device)
 
 
 # ---------------------------------------------------------------------------

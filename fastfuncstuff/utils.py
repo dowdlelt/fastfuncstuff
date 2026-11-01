@@ -200,7 +200,8 @@ _MPS_CPU_OPS: dict[str, str] = {
     # 2.14's Jacobi QR is a catastrophe at the tall-skinny shapes every nuisance
     # projector in this codebase uses. Not a typo: a (2000,300) QR takes over
     # nine minutes on Metal against 5.8 ms on the CPU.
-    "qr": "torch 2.14: (1000,60) 7166 ms vs 0.60 ms CPU (12000x slower)",
+    "qr": "torch 2.14: (1000,60) 7166 ms vs 0.60 ms CPU (12000x slower); (300,12) 35 ms vs "
+    "0.04 ms (800x); batched (64,300,12) 166x",
     # Registered but broken -- these abort inside the Metal shader compiler
     # ("Failed to created pipeline state object"), which is a runtime error
     # rather than a missing op, so PYTORCH_ENABLE_MPS_FALLBACK does not catch
@@ -210,9 +211,12 @@ _MPS_CPU_OPS: dict[str, str] = {
     # These all work correctly on Metal now; they are simply slower than Apple's
     # CPU LAPACK at the matrix sizes we hand them (designs, folds, projectors).
     "svd": "torch 2.14: (1000,200) 6.2 ms vs 4.3 ms CPU (1.5x slower)",
-    "cholesky": "torch 2.14: (500,500) 1.97 ms vs 0.20 ms CPU (10x slower)",
-    "solve": "torch 2.14: (500,500) 2.45 ms vs 0.56 ms CPU (4.3x slower)",
-    "pinv": "torch 2.14: (1000,150) 4.4 ms vs 3.0 ms CPU (1.5x slower)",
+    # The batched case is a tie (1.17x to Metal at (2000,32,32)), and what follows a
+    # Cholesky is a triangular solve, which loses 200x; so it goes with them.
+    "cholesky": "torch 2.14: (500,500) 1.97 ms vs 0.20 ms CPU (10x slower); (60,60) 3.6x",
+    "solve": "torch 2.14: (500,500) 2.45 ms vs 0.56 ms CPU (4.3x slower); (12,12)x(12,5000) "
+    "3.4x; batched (5000,6,6) 3.2x",
+    "pinv": "torch 2.14: (1000,150) 4.4 ms vs 3.0 ms CPU (1.5x slower); batched (50,150,150) 141x",
     "eigh": "torch 2.14: (500,500) 9.0 ms vs 7.9 ms CPU (1.15x slower); the "
     "*batched* case is 3.2x faster on MPS -- use op 'eigh_batched' for that",
     # The hand-rolled separable gather (wsinc5/cubic/quintic/heptic), not
@@ -232,6 +236,17 @@ _MPS_CPU_OPS: dict[str, str] = {
     # against the user's next click. Routing the repaint to the CPU leaves the
     # worker as the only thread on the GPU -- and it is faster anyway, because a
     # slice-sized array is all copy and no arithmetic.
+    # Measured 2026-11-01, same machine, the shapes these actually arrive in. Metal
+    # lost every one. See fastfuncstuff/policy_linalg.py, which is how they get used.
+    "inv": "torch 2.14: (100,100) 0.60 ms vs 0.04 ms CPU (14x); (4,4) 33x; batched (1000,12,12) 1.5x",
+    "solve_triangular": "torch 2.14: (300,300)x(300,5000) 1.18 ms vs 0.74 ms CPU (1.6x); "
+    "batched (2000,32,8) 95.8 ms vs 0.48 ms (200x)",
+    "cholesky_solve": "torch 2.14: batched (2000,32,8) 182 ms vs 1.12 ms CPU (163x)",
+    "svdvals": "torch 2.14: (1000,200) 5.37 ms vs 1.99 ms CPU (2.7x)",
+    "det": "torch 2.14: slogdet (300,300) 0.78 ms vs 0.16 ms CPU (4.9x); batched (300,3,3) 5x",
+    "lu": "unmeasured: the same LAPACK-shaped work as inv and det, which both lose",
+    "unique_rows": "torch 2.14: unique(dim=0) (300,10000) 316 ms vs 0.41 ms CPU (770x); "
+    "plain 1-D unique stays on Metal, 5x faster",
     "viewer_compose": "torch 2.14: slice-sized host->device copies, 1.77 ms vs 1.29 ms "
     "CPU per 3-plane repaint (104x94x57) -- and Metal aborts outright if the GUI "
     "thread enters it while a worker is already inside it",
@@ -424,23 +439,6 @@ def linalg_lstsq(a: torch.Tensor, b: torch.Tensor, **kwargs):
     # every call site reads, but residuals/rank/singular_values must survive too.
     # torch's return_types are structseqs: they take one sequence, not *args.
     return type(result)([x.to(a.device) if isinstance(x, torch.Tensor) else x for x in result])
-
-
-def on_policy_device(op: str, fn, *tensors: torch.Tensor, **kwargs):
-    """Run ``fn(*tensors, **kwargs)`` where :func:`cpu_if_mps` says, return on the input device.
-
-    The general form of :func:`linalg_lstsq`, for the ops in :data:`_MPS_CPU_OPS`: a
-    direct ``torch.linalg.svd`` of a batch aborts inside Metal's shader compiler, and a
-    direct ``torch.linalg.qr`` of a tall matrix takes minutes. A no-op off Metal.
-    """
-    home = tensors[0].device
-    work = cpu_if_mps(home, op)
-    if work == home:
-        return fn(*tensors, **kwargs)
-    result = fn(*(t.to(work) for t in tensors), **kwargs)
-    if isinstance(result, torch.Tensor):
-        return result.to(home)
-    return type(result)([x.to(home) if isinstance(x, torch.Tensor) else x for x in result])
 
 
 def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:

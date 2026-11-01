@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 # Import fastfuncstuff modules
@@ -1123,7 +1124,7 @@ def main():
                     _group_vec_clean = design_clean_group[:, n_trial_cols:]
                     design_clean_group = design_clean_group[:, :n_trial_cols]
                     _group_design_pre_vec = design_clean_group
-                    _group_q, _group_r = torch.linalg.qr(_group_vec_clean.to(device).float())
+                    _group_q, _group_r = plinalg.qr(_group_vec_clean.to(device).float())
                     design_clean_group = design_clean_group - _group_q @ (
                         _group_q.T @ design_clean_group
                     )
@@ -1207,7 +1208,7 @@ def main():
                         if stim_vec_betas is None:
                             stim_vec_betas = torch.zeros(n_voxels, _group_q.shape[1], device="cpu")
                         _resid = _chunk_pre_vec - chunk_final_betas @ _group_design_pre_vec.T
-                        stim_vec_betas[chunk_voxel_idx] = torch.linalg.solve_triangular(
+                        stim_vec_betas[chunk_voxel_idx] = plinalg.solve_triangular(
                             _group_r, _group_q.T @ _resid.T, upper=True
                         ).T.cpu()
 

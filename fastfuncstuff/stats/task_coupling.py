@@ -73,6 +73,7 @@ from dataclasses import field as dc_field
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device
 
 __all__ = [
@@ -141,7 +142,7 @@ def _orthonormal_basis(
     """
     if mat.numel() == 0 or mat.shape[1] == 0:
         return mat.new_zeros((mat.shape[0], 0))
-    u, s, _ = torch.linalg.svd(mat, full_matrices=False)
+    u, s, _ = plinalg.svd(mat, full_matrices=False)
     ref = float(s[0]) if scale is None else scale
     keep = s > tol * ref if ref > 0 else s > 0
     return u[:, keep].contiguous()
@@ -406,7 +407,7 @@ def task_coupling(
     # column space the joint fit projects onto.
     n_fit = int(q_x.shape[1])
     dof_joint = max(1, n_t - q_n.shape[1] - n_fit)
-    g_inv = torch.linalg.pinv(x_d.T @ x_d)
+    g_inv = plinalg.pinv(x_d.T @ x_d)
     beta_joint = (dots * x_norm[None, :]) @ g_inv.T
     ss_res = (ss_tot - ss_task).clamp(min=0.0)
     # Var(beta_k) = sigma^2 * (X'X)^-1_kk. Two different things make that zero and they

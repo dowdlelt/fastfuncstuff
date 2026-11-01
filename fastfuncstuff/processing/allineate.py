@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from scipy.optimize import minimize
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import compute_registration_candidate_batch_size
 from fastfuncstuff.utils import widest_float_dtype
 
@@ -1272,7 +1273,7 @@ def _cmass_translation(base: Tensor, source: Tensor, grid_matrix: Tensor | None 
     c_src = _center_of_mass(source)
     if grid_matrix is not None:
         c_h = torch.cat([c_src, c_src.new_ones(1)])
-        c_src = (torch.linalg.inv(grid_matrix) @ c_h)[:3]
+        c_src = (plinalg.inv(grid_matrix) @ c_h)[:3]
     return c_src - c_base
 
 
@@ -2051,7 +2052,7 @@ def _refine_cmaes_batched(
     for gi in pbar:
         # C is symmetric PSD; eigh gives C = B diag(d2) B^T, so the sampling
         # transform is B @ diag(sqrt(d2)).
-        d2, Bm = torch.linalg.eigh(C)
+        d2, Bm = plinalg.eigh(C)
         d = d2.clamp_min(1e-20).sqrt()  # (T, n)
 
         z = torch.randn(T, lam, n, generator=gen, dtype=dt, device=device)
@@ -2947,7 +2948,7 @@ def _compute_grid_matrix(
 ) -> Tensor:
     """Compute the voxel grid transform: base voxel → source voxel."""
     base_ijk2xyz = torch.from_numpy(base_affine.astype(np.float64)).float().to(device)
-    source_xyz2ijk = torch.linalg.inv(
+    source_xyz2ijk = plinalg.inv(
         torch.from_numpy(source_affine.astype(np.float64)).float().to(device)
     )
     return source_xyz2ijk @ base_ijk2xyz
@@ -3718,7 +3719,7 @@ def _align(
             movie.set_map(lambda m, stp=setup: _residual_to_final(m, stp, None))
             movie.set_prefix("base grid")
         residual_f = _crop_conj(
-            torch.linalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
+            plinalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
         )
         # The hand-off is a matrix, so it re-reads as params about the NEW grid's
         # centre -- a fit means the same transform on either side.
@@ -3817,7 +3818,7 @@ def _align(
                 if full_to_work is None
                 else apply_affine(
                     source_native,
-                    final_matrix @ torch.linalg.inv(full_to_work),
+                    final_matrix @ plinalg.inv(full_to_work),
                     base.shape,
                     zero_outside=True,
                 )

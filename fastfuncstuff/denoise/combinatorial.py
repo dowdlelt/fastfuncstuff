@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.denoise.sequential import _compute_local_run_starts
 from fastfuncstuff.glm.xval import (
@@ -36,7 +37,7 @@ from fastfuncstuff.glm.xval import (
     slice_by_runs,
 )
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory, get_memory_config
-from fastfuncstuff.utils import accum_dtype
+from fastfuncstuff.utils import accum_dtype, linalg_device
 
 
 def _combination_work_chunks(
@@ -182,7 +183,7 @@ def extract_pcs_single_run_with_variance(
     nonzero_cols = col_norms > 1e-10
     if nonzero_cols.any():
         nuis_clean = nuis[:, nonzero_cols]
-        Q, _ = torch.linalg.qr(nuis_clean)
+        Q, _ = plinalg.qr(nuis_clean)
         # Project: noise_data = noise_data - noise_data @ Q @ Q.T
         noise_data = noise_data - (noise_data @ Q) @ Q.T
 
@@ -315,7 +316,7 @@ def evaluate_all_combinations_for_run(
     # FFS_COMBO_LEGACY=1 restores the explicit-projector implementation.
     if os.environ.get("FFS_COMBO_LEGACY", "") != "1":
         if poly_nuis_clean.shape[1] > 0:
-            q_poly, _ = torch.linalg.qr(poly_nuis_clean)
+            q_poly, _ = plinalg.qr(poly_nuis_clean)
         else:
             q_poly = None
 
@@ -346,7 +347,7 @@ def evaluate_all_combinations_for_run(
             )  # (n_group, size)
             sub = pcs_poly[:, cols.reshape(-1)].T.reshape(len(combo_ids), size, T)
             sub = sub.transpose(1, 2)  # (n_group, T, size)
-            q_group, _ = torch.linalg.qr(sub)
+            q_group, _ = plinalg.qr(sub)
             idx = torch.tensor(combo_ids, dtype=torch.long, device=device)
             q_by_combo[idx, :, :size] = q_group
 
@@ -382,6 +383,8 @@ def evaluate_all_combinations_for_run(
             ss_e = (resid_poly * resid_poly).sum(dim=0, dtype=accum_dtype(resid_poly.device))
             ss_dp = (dp * dp).sum(dim=0, dtype=accum_dtype(dp.device))
             sum_dp = dp.sum(dim=0, dtype=accum_dtype(dp.device))
+            sum_dev = linalg_device(dp.device)
+            ss_e, ss_dp, sum_dp = (x.to(sum_dev).to(torch.float64) for x in (ss_e, ss_dp, sum_dp))
 
             for combo_batch_start in range(0, n_combos, combo_batch_size):
                 combo_batch_end = min(combo_batch_start + combo_batch_size, n_combos)
@@ -396,9 +399,12 @@ def evaluate_all_combinations_for_run(
                 # the short sum, and float64 reductions over the (B, k, V)
                 # tensors run at a small fraction of float32 rate on consumer
                 # cards -- which is where the remaining time was going.
-                ss_res = ss_e - (e_proj * e_proj).sum(dim=1).double()
-                ss_clean = ss_dp - (a_proj * a_proj).sum(dim=1).double()
-                mean_clean = (sum_dp - (q_col_sums.unsqueeze(-1) * a_proj).sum(dim=1).double()) / T
+                ss_res = ss_e - (e_proj * e_proj).sum(dim=1).to(sum_dev).to(torch.float64)
+                ss_clean = ss_dp - (a_proj * a_proj).sum(dim=1).to(sum_dev).to(torch.float64)
+                mean_clean = (
+                    sum_dp
+                    - (q_col_sums.unsqueeze(-1) * a_proj).sum(dim=1).to(sum_dev).to(torch.float64)
+                ) / T
                 ss_tot = ss_clean - T * mean_clean * mean_clean
                 cod_chunk = _cod_ratio(ss_res, ss_tot).float()
 
@@ -448,7 +454,7 @@ def evaluate_all_combinations_for_run(
             if nuisance_c.shape[1] == 0:
                 P_batch[bi] = I_T
             else:
-                Q, _ = torch.linalg.qr(nuisance_c)
+                Q, _ = plinalg.qr(nuisance_c)
                 P_batch[bi] = I_T - Q @ Q.T
 
         # Project design for this batch
@@ -673,7 +679,7 @@ def evaluate_combinations_cross_run(
         multi_extra: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for ci in multi_slot:
             block = pcs_proj[:, list(combinations[ci])]
-            q_block, r_block = torch.linalg.qr(block)
+            q_block, r_block = plinalg.qr(block)
             # QR normalises every column it returns, including the ones it
             # manufactured for a rank-deficient block, so the Q norms carry no
             # information. The R diagonal is what says whether a column added
@@ -736,9 +742,7 @@ def evaluate_combinations_cross_run(
             # measurable now that the candidate axis carries the batch.
             for slot, h in enumerate(other_runs):
                 actual = d_by_run[h].double()
-                beta = torch.linalg.solve(
-                    a_stack[:, slot], sum_xty_other - xty_by_run[h] + xty_cand
-                )
+                beta = plinalg.solve(a_stack[:, slot], sum_xty_other - xty_by_run[h] + xty_cand)
                 # |y - Xb|^2 = |y|^2 - 2 b'X'y + b'X'Xb, entirely in condition
                 # space: no (n_combos, run_length, chunk) prediction is ever built,
                 # which is what keeps the batch affordable.
@@ -1294,7 +1298,7 @@ def fit_combinatorial_denoising(
                 # OLS fit for this HRF group
                 X = group_design_clean.to(device)
                 XtX = X.T @ X + 1e-6 * torch.eye(n_conds, device=device)
-                pinv = torch.linalg.inv(XtX) @ X.T
+                pinv = plinalg.inv(XtX) @ X.T
 
                 group_indices = torch.where(voxel_mask_hrf)[0]
                 n_group = group_data.shape[0]
@@ -1322,7 +1326,7 @@ def fit_combinatorial_denoising(
             X = train_design_clean.to(device)
             XtX = X.T @ X
             XtX_reg = XtX + 1e-6 * torch.eye(XtX.shape[0], device=device)
-            XtX_inv = torch.linalg.inv(XtX_reg)
+            XtX_inv = plinalg.inv(XtX_reg)
             pinv = XtX_inv @ X.T
 
             for vs in range(0, n_voxels, chunk_size):

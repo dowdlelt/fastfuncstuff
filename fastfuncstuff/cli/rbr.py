@@ -44,6 +44,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli.bbr import _normalize_targets, _ribbon_wm
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
@@ -336,7 +337,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
-    A_inv = torch.linalg.inv(A)
+    A_inv = plinalg.inv(A)
 
     def anat_to_epi(vol: torch.Tensor) -> torch.Tensor:
         return apply_affine(vol, A_inv.to(torch.float32), tuple(epi.shape), zero_outside=True)

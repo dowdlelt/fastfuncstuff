@@ -32,6 +32,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, linalg_device, to_tensor
 
@@ -110,6 +111,7 @@ def _synthesise_from_spectrum(
     scale -- without it, a component's amplitude would depend on the grid it
     happened to be built on rather than on the strength the caller asked for.
     """
+    device = linalg_device(device)
     amplitude = torch.sqrt(power_spectrum)
     n_freqs = power_spectrum.shape[0]
 
@@ -242,6 +244,7 @@ def generate_fmri_noise(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     n_voxels = matrix_size[0] * matrix_size[1]
     n_trs = int(duration_s / tr)
@@ -337,6 +340,7 @@ def generate_fmri_noise_batch(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     noise_list = []
     for _i in range(n_batches):
@@ -374,6 +378,7 @@ def add_drift(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     data = to_tensor(data, device=device)
     n_timepoints = data.shape[0]
@@ -439,6 +444,7 @@ def add_motion_artifacts(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     data = to_tensor(data, device=device)
     n_timepoints = data.shape[0]
@@ -554,6 +560,7 @@ def generate_ar1_noise(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     # Validate rho
     if not (-1 < rho < 1):
@@ -626,6 +633,8 @@ def generate_ar_noise(
     - Worsley & Friston (1995): AR models in fMRI
     """
     # AR(p) is ARMA(p, 0): one recursion, one burn-in, one stationarity check.
+    if device is not None:
+        device = linalg_device(device)
     return generate_arma_noise(
         rho_coeffs,
         [],
@@ -691,6 +700,7 @@ def generate_arma_noise(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     # Convert coefficients to tensors
     if not torch.is_tensor(ar_coeffs):
@@ -821,6 +831,7 @@ def estimate_noise_parameters_from_data(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     # Convert to tensor
     if not torch.is_tensor(data):
@@ -892,7 +903,7 @@ def estimate_noise_parameters_from_data(
         XtX = design.T @ design
         XtX_reg = XtX + 1e-6 * torch.eye(XtX.shape[0], device=device)
         XtY = design.T @ data
-        betas = torch.linalg.solve(XtX_reg, XtY)
+        betas = plinalg.solve(XtX_reg, XtY)
         residuals = data - design @ betas
     else:
         # Just detrend (remove mean and linear trend)
@@ -905,7 +916,7 @@ def estimate_noise_parameters_from_data(
 
         XtX = design_detrend.T @ design_detrend
         XtY = design_detrend.T @ data
-        betas = torch.linalg.solve(XtX, XtY)
+        betas = plinalg.solve(XtX, XtY)
         residuals = data - design_detrend @ betas
 
     # Estimate AR coefficients per voxel using Yule-Walker equations
@@ -943,7 +954,7 @@ def estimate_noise_parameters_from_data(
 
             # Solve R * φ = r
             try:
-                phi = torch.linalg.solve(R, r)
+                phi = plinalg.solve(R, r)
                 ar_coeffs_per_voxel.append(phi.cpu().numpy().tolist())
             except Exception:
                 # Singular matrix - use zeros
@@ -1020,6 +1031,7 @@ def estimate_sfnr(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
 
     if not torch.is_tensor(data):
         data = torch.tensor(data, dtype=torch.float32, device=device)
@@ -1051,7 +1063,7 @@ def estimate_sfnr(
         t = torch.arange(n_t, dtype=data_flat.dtype, device=device)
         t = (t - t.mean()) / (t.std() + 1e-10)
         basis = torch.stack([torch.ones_like(t), t, t**2], dim=1)  # (n_t, 3)
-        pinv = torch.linalg.pinv(basis)
+        pinv = plinalg.pinv(basis)
         fluctuation = data_flat - (data_flat @ pinv.T) @ basis.T
         std_signal = fluctuation.std(dim=1)
     else:
@@ -1225,6 +1237,7 @@ def generate_thermal_physio_noise(
     """
     if device is None:
         device = get_device()
+    device = linalg_device(device)
     sizes = [
         torch.as_tensor(v).numel()
         for v in (tsnr, phys_fraction, tau)

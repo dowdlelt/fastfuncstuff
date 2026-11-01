@@ -40,6 +40,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
 from fastfuncstuff.design.polort import (
     max_polort,
@@ -100,8 +101,8 @@ def _concat_runs_for_compute(
 
 def _solve_from_cholesky(L: Tensor, rhs: Tensor) -> Tensor:
     """Solve ``L Lᵀ x = rhs`` with kernels native to CUDA, MPS, and CPU."""
-    tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
-    return torch.linalg.solve_triangular(L.T, tmp, upper=True)
+    tmp = plinalg.solve_triangular(L, rhs, upper=False)
+    return plinalg.solve_triangular(L.T, tmp, upper=True)
 
 
 # ----------------------------------------------------------------------------
@@ -733,7 +734,7 @@ def fit_basis_constrained_ridge(
 
     # Pre-factor for the OLS path (shared across chunks).
     try:
-        L0 = torch.linalg.cholesky(XtX).to(device=device, dtype=compute_dtype)
+        L0 = plinalg.cholesky(XtX).to(device=device, dtype=compute_dtype)
         use_chol_ols = True
     except torch.linalg.LinAlgError:
         L0 = None
@@ -863,7 +864,7 @@ def fit_basis_constrained_ridge(
         A = XtX + effective_weight * P
         Pm = (effective_weight * Pm_unit).to(device=device, dtype=compute_dtype)
         try:
-            L_A = torch.linalg.cholesky(A).to(device=device, dtype=compute_dtype)
+            L_A = plinalg.cholesky(A).to(device=device, dtype=compute_dtype)
             use_chol_A = True
         except torch.linalg.LinAlgError:
             L_A = None
@@ -889,7 +890,7 @@ def fit_basis_constrained_ridge(
             if use_chol_A:
                 beta_chunk = _solve_from_cholesky(L_A, rhs_chunk)
             else:
-                beta_chunk = torch.linalg.solve(A.to(device=device, dtype=compute_dtype), rhs_chunk)
+                beta_chunk = plinalg.solve(A.to(device=device, dtype=compute_dtype), rhs_chunk)
             pred = (X_full @ beta_chunk).T
             resid = y_chunk - pred
             ss_res_chunk = (resid**2).sum(dim=1)
@@ -953,7 +954,7 @@ def fit_basis_constrained_ridge(
             lam = float(bin_lambda[b].item())
             A_b = XtX + lam * P
             try:
-                chol_factors[b] = torch.linalg.cholesky(A_b).to(device=device, dtype=compute_dtype)
+                chol_factors[b] = plinalg.cholesky(A_b).to(device=device, dtype=compute_dtype)
             except torch.linalg.LinAlgError:
                 chol_factors[b] = None
         # Pm shared computation per bin too — Pm_b = λ_b · P · m̄.
@@ -996,7 +997,7 @@ def fit_basis_constrained_ridge(
                     beta_b = _solve_from_cholesky(L_b, rhs_b)
                 else:
                     lam = float(bin_lambda[b].item())
-                    beta_b = torch.linalg.solve(
+                    beta_b = plinalg.solve(
                         (XtX + lam * P).to(device=device, dtype=compute_dtype), rhs_b
                     )
                 beta_chunk[:, idx_in_chunk] = beta_b
@@ -1149,7 +1150,7 @@ def _cg_solve_batched(
     def precond(r: Tensor) -> Tensor:
         if L_pre is None:
             return r
-        return torch.cholesky_solve(r.T, L_pre).T
+        return plinalg.cholesky_solve(r.T, L_pre).T
 
     x = torch.zeros_like(rhs)
     r = rhs - A_mv(x)
@@ -1349,7 +1350,7 @@ def fit_basis_cone_prior(
 
     XtX = X_full.T @ X_full
     try:
-        L0 = torch.linalg.cholesky(XtX)
+        L0 = plinalg.cholesky(XtX)
         use_chol_ols = True
     except torch.linalg.LinAlgError:
         L0 = None
@@ -1388,7 +1389,7 @@ def fit_basis_cone_prior(
         y_chunk = y[start:end].to(device=device, non_blocking=True).to(torch.float64)
         Xty = X_full.T @ y_chunk.T
         b = (
-            torch.cholesky_solve(Xty, L0)
+            plinalg.cholesky_solve(Xty, L0)
             if use_chol_ols
             else linalg_lstsq(X_full, y_chunk.T).solution
         )
@@ -1453,7 +1454,7 @@ def fit_basis_cone_prior(
                     sl = slice(blk_i * n_basis, (blk_i + 1) * n_basis)
                     P_rep[sl, sl] = P0
                 try:
-                    L_pre = torch.linalg.cholesky(XtX + lam_med * gam_med * P_rep)
+                    L_pre = plinalg.cholesky(XtX + lam_med * gam_med * P_rep)
                 except torch.linalg.LinAlgError:
                     L_pre = None
                 del P_rep
@@ -1790,7 +1791,7 @@ def cv_basis_constrained_ridge(
                 # internally but we cast back here.
                 XtX = X_train.T @ X_train
                 try:
-                    L0 = torch.linalg.cholesky(XtX)
+                    L0 = plinalg.cholesky(XtX)
                 except torch.linalg.LinAlgError:
                     L0 = None
             else:
@@ -1818,7 +1819,7 @@ def cv_basis_constrained_ridge(
                     y_train = data_clean[v0:v1][:, train_rows_d].to(device)
                     Xty = X_train.T @ y_train.T
                     if L0 is not None:
-                        beta_chunk = torch.cholesky_solve(Xty, L0)
+                        beta_chunk = plinalg.cholesky_solve(Xty, L0)
                     else:
                         beta_chunk = linalg_lstsq(X_train, y_train.T).solution
                     # beta_chunk: (n_task_cols, n_voxels)
@@ -2277,7 +2278,7 @@ def fit_basis_lss(
         for b_idx in range(n_bins_eff):
             A_bin = A_batch_base + float(bin_lambdas[b_idx]) * P_trial
             try:
-                L_per_bin.append(torch.linalg.cholesky(A_bin))
+                L_per_bin.append(plinalg.cholesky(A_bin))
             except torch.linalg.LinAlgError:
                 # Singular: fall back to pseudo-inverse.  Rare with
                 # any positive λ; possible for -reg none + degenerate
@@ -2339,13 +2340,13 @@ def fit_basis_lss(
                 # Batched solve.
                 L_b = L_per_bin[b_idx]
                 if L_b is not None:
-                    beta_batch = torch.cholesky_solve(Xty, L_b.to(torch.float64))
+                    beta_batch = plinalg.cholesky_solve(Xty, L_b.to(torch.float64))
                 else:
                     # Fall back to direct solve (slower; only on singular A).
                     A_bin_64 = (A_batch_base + float(bin_lambdas[b_idx]) * P_trial).to(
                         torch.float64
                     )
-                    beta_batch = torch.linalg.solve(A_bin_64, Xty)
+                    beta_batch = plinalg.solve(A_bin_64, Xty)
                 # Extract trial betas (first K rows): (N_c, K, V_b).
                 trial_betas = beta_batch[:, :n_basis, :].cpu().numpy()
                 # Scatter into betas_full at each trial's column block.
@@ -3076,7 +3077,7 @@ def bin_and_whiten_arma11(
                 )
             R_stack[ci] = R_r
         # Batched Cholesky on device — one kernel launch.
-        L_stack = torch.linalg.cholesky(R_stack)
+        L_stack = plinalg.cholesky(R_stack)
         del R_stack, R_one_grid, R_select_idx_t, valid_mask
         # Cache: keyed by run length, then (a, b) → L tensor.
         R_by_length[n_t] = (L_stack, [k for k in unique_keys])
@@ -3109,11 +3110,11 @@ def bin_and_whiten_arma11(
 
             # Whiten task design (shared across all voxels in cell).
             X_task_r = design_task_per_run_dev[r]
-            task_w_runs.append(torch.linalg.solve_triangular(L_r, X_task_r, upper=False))
+            task_w_runs.append(plinalg.solve_triangular(L_r, X_task_r, upper=False))
 
             # Whiten polynomial nuisance (shared too).
             if polys_raw_per_run is not None:
-                Z_w = torch.linalg.solve_triangular(
+                Z_w = plinalg.solve_triangular(
                     L_r,
                     polys_raw_per_run[r],
                     upper=False,
@@ -3122,7 +3123,7 @@ def bin_and_whiten_arma11(
 
             # Whiten this cell's voxels' data.
             y_cell_r = per_run_data[r][cell_vox].to(device).float()  # (n_vox_cell, n_tp_r)
-            y_cell_w = torch.linalg.solve_triangular(
+            y_cell_w = plinalg.solve_triangular(
                 L_r,
                 y_cell_r.T,
                 upper=False,
@@ -3256,17 +3257,17 @@ def compute_vb_block_trace(
     for start in batches:
         end = min(start + batch_size, len(active_bins))
         A = XtX + lambdas[start:end, None, None] * P
-        L, info = torch.linalg.cholesky_ex(A)
+        L, info = plinalg.cholesky_ex(A)
         # Failed factors must not enter the solve (they can contain NaNs). Their
         # traces are replaced by the original per-bin pinv path below.
         safe_L = torch.where((info == 0)[:, None, None], L, eye)
-        inverse = torch.cholesky_solve(eye.expand(end - start, -1, -1), safe_L)
+        inverse = plinalg.cholesky_solve(eye.expand(end - start, -1, -1), safe_L)
         traces = _vb_block_traces(inverse, C_inv, n_blocks, n_basis)
         # Common path: one host transfer carries both the traces and status.
         host = torch.stack((traces, info.to(torch.float64)), dim=1).detach().cpu().numpy()
         for local, b in enumerate(active_bins[start:end]):
             if host[local, 1] != 0:
-                fallback = torch.linalg.pinv(A[local])
+                fallback = plinalg.pinv(A[local])
                 host[local, 0] = _vb_block_traces(fallback.unsqueeze(0), C_inv, n_blocks, n_basis)[
                     0
                 ].item()
@@ -3557,7 +3558,7 @@ def compute_xval_r2_per_voxel(
                 Z_r = torch.from_numpy(
                     legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
                 ).to(device=device, dtype=torch.float32)
-                Q_z, _ = torch.linalg.qr(Z_r)
+                Q_z, _ = plinalg.qr(Z_r)
                 test_data_proj = test_data - (test_data @ Q_z) @ Q_z.T
                 X_test_proj = X_test_cond - Q_z @ (Q_z.T @ X_test_cond)
             else:
@@ -3743,8 +3744,8 @@ def estimate_and_apply_arma11_prewhitening(
         XtX = X_full.T @ X_full
         Xty = X_full.T @ y_dev.T
         try:
-            L0 = torch.linalg.cholesky(XtX)
-            beta = torch.cholesky_solve(Xty, L0)
+            L0 = plinalg.cholesky(XtX)
+            beta = plinalg.cholesky_solve(Xty, L0)
         except torch.linalg.LinAlgError:
             beta = linalg_lstsq(X_full, y_dev.T).solution
 
@@ -3790,15 +3791,15 @@ def estimate_and_apply_arma11_prewhitening(
             raise ValueError(
                 f"build_arma11_covariance returned None for run {r} with a={a_opt}, b={b_opt}"
             )
-        L_r = torch.linalg.cholesky(R_r).to(device)
+        L_r = plinalg.cholesky(R_r).to(device)
 
         # Whiten design: L⁻¹ X (apply along time axis = dim 0).
         X_r = per_run_task_designs[r].to(device).float()
-        X_r_white = torch.linalg.solve_triangular(L_r, X_r, upper=False)
+        X_r_white = plinalg.solve_triangular(L_r, X_r, upper=False)
 
         # Whiten data: per voxel, treat as (n_tp_r, n_voxels) = data.T.
         y_r = per_run_data[r].to(device).float()
-        y_r_white = torch.linalg.solve_triangular(L_r, y_r.T, upper=False).T
+        y_r_white = plinalg.solve_triangular(L_r, y_r.T, upper=False).T
 
         per_run_data_white.append(y_r_white)
         per_run_design_white.append(X_r_white)

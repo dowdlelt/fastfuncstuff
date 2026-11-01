@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli.task_events import (
     psc_betas,
     save_labelled_map,
@@ -2358,7 +2359,7 @@ def _pc_task_correlation(components, design, polort) -> float:
     keep = m.norm(dim=1) > 0
     if not bool(keep.any()):
         return 0.0
-    pc = torch.linalg.svd(m[keep], full_matrices=False)[2][0]
+    pc = plinalg.svd(m[keep], full_matrices=False)[2][0]
     q_n = _orthonormal_basis(
         construct_polynomial_matrix(n_t, polort, device=pc.device, dtype=torch.float64)
     )

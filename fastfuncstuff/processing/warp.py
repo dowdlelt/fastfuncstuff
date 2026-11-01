@@ -43,6 +43,8 @@ try:
 except ImportError:
     _tqdm = None
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .basis import (
     build_3d_basis_cubic,
     build_3d_basis_quintic,
@@ -4162,7 +4164,7 @@ def _improve_warp_batched_mescaled(
             hmat, grad = _gn_normal_eqs(w, g, a4hw, bt, omega, wsum, base_hat)
             diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-9)
             amat = hmat + lam[:, None, None] * torch.diag_embed(diag)
-            delta = torch.linalg.solve(amat, -grad.unsqueeze(-1)).squeeze(-1)
+            delta = plinalg.solve(amat, -grad.unsqueeze(-1)).squeeze(-1)
             p_new = (best_p + delta).clamp(-param_max, param_max)
             wn, *_ = _forward(p_new)
             cost_new = _cost(wn)

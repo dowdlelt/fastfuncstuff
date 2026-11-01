@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.utils import (
     linalg_device,
@@ -96,7 +97,7 @@ def compute_residual_reweight(
         ],
         dtype=torch.float64,
     )
-    mats64 = global_matrices.to(device='cpu').to(torch.float64)
+    mats64 = global_matrices.to(device="cpu").to(torch.float64)
     moved = torch.einsum("tij,cj->tci", mats64, corners)[..., :3] - corners[None, :, :3]
     motion_amp = float(moved.std(dim=0).max())
     if motion_amp < min_motion:
@@ -283,7 +284,7 @@ def _estimate_motion(
             residual = weight_v * (base_v - warped)  # (Nv,)
             rhs = torch.zeros(P, ndof, dtype=solve_dtype, device=device)
             rhs.index_add_(0, bi, (WJ_v * residual[None]).t().to(solve_dtype))  # (P, ndof)
-            dp = torch.linalg.solve(JtWJ_reg, rhs)  # (P, ndof)
+            dp = plinalg.solve(JtWJ_reg, rhs)  # (P, ndof)
             params[:, :ndof] += dp.to(dtype)
         # .cpu() before .double(): MPS has no float64.
         out[t] = params[:, :ndof].detach().cpu().double()
@@ -428,7 +429,7 @@ def compute_reweight(
 
     # Displacement the GLOBAL motion implies at each patch centre, per TR
     # (Mg maps base->source; displacement = transformed - original, x/y/z).
-    Mg = global_matrices.to(device='cpu').to(torch.float64)  # (nt, 4, 4)
+    Mg = global_matrices.to(device="cpu").to(torch.float64)  # (nt, 4, 4)
     dpred = torch.einsum("tij,pj->tpi", Mg, xp)[:, :, :3] - xp[None, :, :3]  # (nt, P, 3)
 
     # Low-motion guard: if the head barely moved, the predicted displacement has

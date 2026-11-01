@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.utils import linalg_device
 
@@ -66,7 +67,7 @@ def _top_components(X: Tensor, k: int, chunk: int) -> Tensor:
     for s in range(0, V, chunk):
         xc = X[:, s : s + chunk]
         G += (xc @ xc.T).to(device=G.device).to(torch.float64)
-    _, U = torch.linalg.eigh(G)
+    _, U = plinalg.eigh(G)
     return U[:, -k:].flip(1).to(torch.float32)
 
 
@@ -112,7 +113,7 @@ def dictionary_learning(
     for it in range(1, n_iter + 1):
         # ---- sparse coding (FISTA), warm start
         Gm = D.T @ D
-        L = float(torch.linalg.eigvalsh(Gm).max().clamp_min(1e-8))
+        L = float(plinalg.eigvalsh(Gm).max().clamp_min(1e-8))
         A = torch.zeros(K, K, device=device)
         B = torch.zeros(T, K, device=device)
         sq_err = 0.0
@@ -144,7 +145,7 @@ def dictionary_learning(
             break
     # Final codes for the final dictionary, then order atoms by reconstruction energy.
     Gm = D.T @ D
-    L = float(torch.linalg.eigvalsh(Gm).max().clamp_min(1e-8))
+    L = float(plinalg.eigvalsh(Gm).max().clamp_min(1e-8))
     for s, xc in chunks():
         S[:, s : s + xc.shape[1]] = _fista(D, Gm, L, xc, S[:, s : s + xc.shape[1]], lam, fista_iter)
     norms = D.norm(dim=0).clamp_min(1e-8)

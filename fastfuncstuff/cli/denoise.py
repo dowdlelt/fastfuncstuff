@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
@@ -1666,7 +1667,7 @@ def compute_bootstrap_se(
 
     # Compute original fit once
     design_gpu = design.to(device)
-    _XtX_inv = torch.linalg.inv(
+    _XtX_inv = plinalg.inv(
         design_gpu.T @ design_gpu + 1e-6 * torch.eye(n_regressors, device=device)
     )
 
@@ -1682,7 +1683,7 @@ def compute_bootstrap_se(
         resample_idx = torch.randint(0, n_timepoints, (n_timepoints,), device=device)
 
         design_boot = design_gpu[resample_idx, :]
-        XtX_inv_boot = torch.linalg.inv(
+        XtX_inv_boot = plinalg.inv(
             design_boot.T @ design_boot + 1e-6 * torch.eye(n_regressors, device=device)
         )
 
@@ -3466,7 +3467,7 @@ def main():
 
                 # Diagnostic for first HRF group
                 if i_hrf == 0:
-                    cond_num = torch.linalg.cond(full_design_final).item()
+                    cond_num = plinalg.cond(full_design_final).item()
                     print(f"  Design: {full_design_final.shape}, cond#={cond_num:.1f}")
                     # Per-run nuisance shape (verify polynomials present)
                     print(

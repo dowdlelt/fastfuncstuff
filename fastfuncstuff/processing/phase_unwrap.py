@@ -51,6 +51,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device
 
 from ..memory import get_available_memory
@@ -466,12 +467,12 @@ def _fit_frame_field(
     captures the frame-wide field (breathing, breath-holds, drift) even where it
     moves by more than half a period; slab views as in :func:`unwrap_timeseries`.
     """
-    device = linalg_device(device)  # float64 throughout; Metal has none
     d0, d1, d2 = pv.shape[:3]
     nt = pv.shape[-1]
     k = _poly_basis(torch.zeros(1, 3), order).shape[1]
-    xtx = torch.zeros(k, k, dtype=torch.float64, device=device)
-    xty = torch.zeros(k, nt, dtype=torch.float64, device=device)
+    normal_dev = linalg_device(device)  # small and float64; Metal has none
+    xtx = torch.zeros(k, k, dtype=torch.float64, device=normal_dev)
+    xty = torch.zeros(k, nt, dtype=torch.float64, device=normal_dev)
     for a in range(0, d0, sx):
         b = min(d0, a + sx)
         n = (b - a) * d1 * d2
@@ -486,16 +487,16 @@ def _fit_frame_field(
             - _gather(uv[a:b, :, :, 0], (n,), idx)[:, None]
         )
         u, smooth = _time_path(c, rough_max)
-        y = (u - u.median(1, keepdim=True).values)[smooth].to(device).to(torch.float64)
+        y = (u - u.median(1, keepdim=True).values)[smooth].to(normal_dev).to(torch.float64)
         x = (
             _poly_basis(_slab_coords(a, b, (d0, d1, d2), idx[smooth]), order)
-            .to(device)
+            .to(normal_dev)
             .to(torch.float64)
         )
         xtx += x.T @ x
         xty += x.T @ y
-    ridge = 1e-6 * torch.trace(xtx) / k * torch.eye(k, dtype=xtx.dtype, device=device)
-    return torch.linalg.solve(xtx + ridge, xty).float()
+    ridge = 1e-6 * torch.trace(xtx) / k * torch.eye(k, dtype=xtx.dtype, device=normal_dev)
+    return plinalg.solve(xtx + ridge, xty).float().to(device)
 
 
 def unwrap_timeseries(
@@ -647,10 +648,12 @@ def _gaussian_symmetric(vols: Tensor, sigma: float) -> Tensor:
 
 def _low_rank(a: Tensor, k: int) -> Tensor:
     """Rank-``k`` reconstruction of a tall (V, T) matrix via its T x T Gram matrix."""
-    from ..utils import to_factor_f64
+    from ..utils import factor_device, to_linalg_f64
 
-    g = to_factor_f64(a.T @ a)
-    _, vecs = torch.linalg.eigh(g)
+    # float64 before the product: forming the Gram in float32 squares the conditioning.
+    wide = to_linalg_f64(a)
+    g = (wide.T @ wide).to(factor_device(a.device))
+    _, vecs = plinalg.eigh(g)
     v = vecs[:, -k:].to(a.device, a.dtype)
     return (a @ v) @ v.T
 
@@ -742,7 +745,7 @@ def remove_offset_drift(
         b = basis[a : a + chunk]
         xtx += (b.T @ b).double()
         xty += (b.T @ icpt).double()
-    coef = torch.linalg.solve(xtx, xty).float()  # 4, t
+    coef = plinalg.solve(xtx, xty).float()  # 4, t
     # subtract the fitted drift from every echo, plane by plane along x (cheap, in place)
     gx, gy, gz = (torch.linspace(-1, 1, n, device=device) for n in shape)
     for i in range(shape[0]):

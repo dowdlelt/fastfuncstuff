@@ -108,6 +108,8 @@ def derive_phase_output_path(prefix: str) -> str:
     return entity_path(prefix, phase=True)
 
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from ..io.afni import get_afni_space_info, set_afni_space_info  # noqa: E402
 
 
@@ -397,7 +399,7 @@ def load_affine_1D(
         # In mm, before the grid conversion below: that conversion is a similarity
         # (C^-1 F M F C), so this is exactly the inverse on any output grid. float64
         # so a near-identity matrix does not come back with float32 noise doubled.
-        matrices = torch.linalg.inv(matrices.double()).float()
+        matrices = plinalg.inv(matrices.double()).float()
 
     if debug:
         m = matrices[0].cpu().numpy()
@@ -423,7 +425,7 @@ def load_affine_1D(
         dtype=torch.float32,
     )
     output_ijk2xyz = torch.from_numpy(cardinal.astype(np.float32)).float()
-    output_xyz2ijk = torch.linalg.inv(output_ijk2xyz)
+    output_xyz2ijk = plinalg.inv(output_ijk2xyz)
 
     if debug:
         print("[DEBUG] load_affine_1D: output_affine (NIfTI sform):")

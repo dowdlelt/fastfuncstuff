@@ -15,6 +15,7 @@ from math import comb
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff._compile import compile_after_eager_time
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
 from fastfuncstuff.utils import accum_dtype, cpu_if_mps, factor_device
@@ -72,7 +73,7 @@ def compute_qr_projectors(
             # shapes (see utils._MPS_CPU_OPS). Factor on CPU and copy the
             # reusable projector once.
             qr_device = cpu_if_mps(device, "qr")
-            Q, _ = torch.linalg.qr(run_nuisance_clean.to(qr_device))
+            Q, _ = plinalg.qr(run_nuisance_clean.to(qr_device))
             Q = Q.to(device)
             q_factors.append(Q)
         else:
@@ -536,7 +537,7 @@ def project_out_nuisance(
     # Q is (n_timepoints, n_nuisance) with orthonormal columns
     # Projection: y_proj = y - Q @ (Q.T @ y)
     try:
-        Q, _ = torch.linalg.qr(X_nuis)
+        Q, _ = plinalg.qr(X_nuis)
 
         # Project out from data: data_clean = data - Q @ (Q.T @ data.T).T
         # Equivalent to: data_clean = data - (Q @ Q.T) @ data.T, then transpose
@@ -549,7 +550,7 @@ def project_out_nuisance(
         # Fallback to (X'X)^-1 approach if QR fails (should be rare)
         XtX = X_nuis.T @ X_nuis
         XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
-        XtX_inv = torch.linalg.inv(XtX_reg)
+        XtX_inv = plinalg.inv(XtX_reg)
         P = X_nuis @ XtX_inv @ X_nuis.T
 
         data_cleaned = data - (P @ data.T).T
@@ -818,13 +819,13 @@ def _compute_projection_matrix(
     # Q is (n_timepoints, n_nuisance) with orthonormal columns
     # Projection: y_proj = y - Q @ (Q.T @ y)
     try:
-        Q, _ = torch.linalg.qr(X_nuis)
+        Q, _ = plinalg.qr(X_nuis)
         return Q
     except RuntimeError:
         # Fallback to (X'X)^-1 approach if QR fails (should be rare)
         XtX = X_nuis.T @ X_nuis
         XtX_reg = XtX + ridge * torch.eye(XtX.shape[0], device=XtX.device, dtype=XtX.dtype)
-        XtX_inv = torch.linalg.inv(XtX_reg)
+        XtX_inv = plinalg.inv(XtX_reg)
         P = X_nuis @ XtX_inv @ X_nuis.T
         # Return P for fallback (legacy behavior)
         # Note: P is (n, n) while Q is (n, p), but callers handle both via same API
@@ -910,7 +911,7 @@ def _unpredictable_basis(
     if cols.shape[1] == 0:
         return None
     work = factor_device(cols.device)
-    u, sv, _ = torch.linalg.svd(cols.to(device=work).to(torch.float64), full_matrices=False)
+    u, sv, _ = plinalg.svd(cols.to(device=work).to(torch.float64), full_matrices=False)
     keep = sv > rcond * sv[0]
     if not bool(keep.any()):
         return None
@@ -1454,9 +1455,7 @@ def compute_xval_r2(
 
             xtx_train = xtx_all - test_stim_design.T @ test_stim_design
             xtx_fit = xtx_train[fit_mask][:, fit_mask]
-            xtx_fit_inv = torch.linalg.inv(
-                xtx_fit + 1e-6 * torch.eye(xtx_fit.shape[0], device=device)
-            )
+            xtx_fit_inv = plinalg.inv(xtx_fit + 1e-6 * torch.eye(xtx_fit.shape[0], device=device))
 
             plan.update(
                 {
@@ -1614,7 +1613,7 @@ def compute_xval_r2(
         # Computing (X'X)^-1 X' once saves N_batches matrix inversions
         # Dimensions: (n_stim_fit, n_train_tps) - tiny matrix, stays on device
         XtX = train_stim_design_fit.T @ train_stim_design_fit
-        XtX_inv = torch.linalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
+        XtX_inv = plinalg.inv(XtX + 1e-6 * torch.eye(XtX.shape[0], device=device))
         ols_pseudoinverse = XtX_inv @ train_stim_design_fit.T  # (n_stim_fit, n_train_tps)
 
         # =========================================================================
