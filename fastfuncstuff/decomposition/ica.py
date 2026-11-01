@@ -1409,7 +1409,7 @@ def _symmetric_decorrelation_batch(W: torch.Tensor) -> torch.Tensor:
     that the round trip costs less than the float64 CUDA factorisation would.
     """
     orig_dtype, orig_device = W.dtype, W.device
-    U, _, Vt = torch.linalg.svd(W.detach().to("cpu", torch.float64), full_matrices=False)
+    U, _, Vt = torch.linalg.svd(W.detach().to(device='cpu').to(torch.float64), full_matrices=False)
     return (U @ Vt).to(device=orig_device, dtype=orig_dtype)
 
 

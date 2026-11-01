@@ -173,7 +173,7 @@ def _invert_fold_gram(gram: torch.Tensor, rcond: float = 1e-6) -> torch.Tensor:
       CPU eigh -- 98% of this function's entire runtime. See that function for
       the measurements and for when the rule does not hold.
     """
-    gram_f64 = gram.to(device=factor_device(gram.device), dtype=torch.float64)
+    gram_f64 = gram.to(device=factor_device(gram.device)).to(torch.float64)
     eigvals, eigvecs = torch.linalg.eigh(gram_f64)
     # rcond is relative to the largest singular value, which for a PSD matrix is
     # the largest eigenvalue. Round-off can push a null direction slightly

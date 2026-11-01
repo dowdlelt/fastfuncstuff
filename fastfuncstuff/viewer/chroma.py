@@ -407,14 +407,14 @@ def fit_map(
         mu_t = x.mean(0)
         sd_t = x.std(0)
         sd_t = torch.where(sd_t > 0, sd_t, torch.ones_like(sd_t))
-        mu, sd = mu_t.double().cpu().numpy(), sd_t.double().cpu().numpy()
+        mu, sd = mu_t.cpu().double().numpy(), sd_t.cpu().double().numpy()
         if spec.basis == "pick":
             W = pick
         elif spec.basis == "custom":
             W = spec.custom_weights(n)
         else:
             z = (x - mu_t) / sd_t
-            cov = (z.T @ z / max(z.shape[0] - 1, 1)).double().cpu().numpy()
+            cov = (z.T @ z / max(z.shape[0] - 1, 1)).cpu().double().numpy()
             lam, E = _eig(cov, spec.floor)
             if spec.basis == "dstretch":
                 W = pick @ (E @ np.diag(lam**-0.5) @ E.T)

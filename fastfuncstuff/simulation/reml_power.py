@@ -131,8 +131,8 @@ def validate_reml_power(
             y = sigma * y + s
             fitted = fit_glm_arma11(y, X, tr, **fit_kw)
             assert fitted.contrast_betas is not None and fitted.contrast_tstats is not None
-            estimates.append(fitted.contrast_betas.double().cpu())
-            ts.append(fitted.contrast_tstats.double().cpu())
+            estimates.append(fitted.contrast_betas.cpu().double())
+            ts.append(fitted.contrast_tstats.cpu().double())
         return torch.cat(estimates), torch.cat(ts), fitted.dof
 
     for ni, cond in enumerate(noise):

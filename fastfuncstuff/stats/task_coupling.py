@@ -100,7 +100,7 @@ def _design_tensor(
     through numpy: np.asarray raises on a CUDA tensor, and callers build designs on
     the fitting device."""
     if isinstance(design, torch.Tensor):
-        return design.to(device=device, dtype=torch.float64)
+        return design.to(device=device).to(torch.float64)
     return torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
 
 
@@ -362,7 +362,7 @@ def task_coupling(
     )
     flat = f.reshape(n_vox, n_t)
     for start in range(0, n_vox, chunk):
-        y = flat[start : start + chunk].to(device=device, dtype=torch.float64)
+        y = flat[start : start + chunk].to(device=device).to(torch.float64)
         stop = start + y.shape[0]
         ss_raw[start:stop] = (y * y).sum(dim=1)
         # Residualize against drift explicitly rather than differencing sums of
@@ -585,7 +585,7 @@ def project_task_out(
     )
     for start in range(0, n_vox, chunk):
         stop = min(start + chunk, n_vox)
-        y = flat[start:stop].to(dtype=torch.float64, device=device)
+        y = flat[start:stop].to(device=device).to(torch.float64)
         r = (y @ q_x) @ q_x.T
         removed[start:stop] = r.to(f.dtype)
         cleaned[start:stop] = (y - r).to(f.dtype)
@@ -826,7 +826,7 @@ def filter_task_band(
         raise ValueError(f"basis has {basis.shape[0]} rows but the series has {n_t} frames")
     if device is None:
         device = f.device
-    q = basis.to(device=device, dtype=torch.float64)
+    q = basis.to(device=device).to(torch.float64)
     spatial = tuple(f.shape[:3])
     n_vox = int(np.prod(spatial))
     flat = f.reshape(n_vox, n_t)
@@ -835,7 +835,7 @@ def filter_task_band(
         n_vox, n_t, q.shape[1] + 2, device, operation="glm", use_double=True
     )
     for start in range(0, n_vox, chunk):
-        y = flat[start : start + chunk].to(device=device, dtype=torch.float64)
+        y = flat[start : start + chunk].to(device=device).to(torch.float64)
         y = y - (y @ q) @ q.T
         out[start : start + y.shape[0]] = y.to(dtype=out.dtype, device=out.device)
         del y
@@ -970,9 +970,9 @@ def component_variance_in_data(
             sel = keep[start:stop]
             if not bool(sel.any()):
                 continue
-            y = flat[start:stop][sel].to(device=device, dtype=torch.float64).T  # (T, v)
+            y = flat[start:stop][sel].to(device=device).to(torch.float64).T  # (T, v)
         else:
-            y = flat[start:stop].to(device=device, dtype=torch.float64).T
+            y = flat[start:stop].to(device=device).to(torch.float64).T
         y = y - q_n @ (q_n.T @ y)
         ss_tot += (y * y).sum()
         ss_pc += (u_d.T @ y).pow(2).sum(dim=1)

@@ -1484,7 +1484,7 @@ def load_matrix_chain(
     post = np.linalg.inv(np.asarray(source_affine, dtype=np.float64)) @ np.asarray(
         fit_src, dtype=np.float64
     )
-    out = torch.from_numpy(post) @ m.to(torch.float64).cpu() @ torch.from_numpy(pre)
+    out = torch.from_numpy(post) @ m.cpu().to(torch.float64) @ torch.from_numpy(pre)
     return out.to(m.dtype).to(m.device)
 
 

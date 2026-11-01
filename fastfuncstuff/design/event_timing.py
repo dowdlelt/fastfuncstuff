@@ -125,7 +125,7 @@ def design_gain(
     for design, run_polort in zip(
         per_run_designs, polort_per_run(polort, len(per_run_designs)), strict=True
     ):
-        x = design.detach().to("cpu", torch.float64).numpy()
+        x = design.detach().to(device='cpu').to(torch.float64).numpy()
         if run_polort >= 0 and x.shape[0] > run_polort + 1:
             q, _ = np.linalg.qr(legendre_polynomials(x.shape[0], run_polort))
             x = x - q @ (q.T @ x)

@@ -166,8 +166,8 @@ def decompose(
                 progress(0.05 + 0.45 * i / n_vox, "gram")
             c, norm, mean = prepared(i)
             gram += (c.T @ c).double()
-            norms[i : i + step] = norm.double().cpu().numpy()
-            means[i : i + step] = mean.double().cpu().numpy()
+            norms[i : i + step] = norm.cpu().double().numpy()
+            means[i : i + step] = mean.cpu().double().numpy()
             if step >= n_vox:
                 kept = c
             del c

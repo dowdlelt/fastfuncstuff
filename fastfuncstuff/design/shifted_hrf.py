@@ -553,7 +553,7 @@ def fit_shifted_hrf(
         Z = (
             torch.as_tensor(nuisance, dtype=torch.float64, device=device)
             if not isinstance(nuisance, torch.Tensor)
-            else nuisance.to(device=device, dtype=torch.float64)
+            else nuisance.to(device=device).to(torch.float64)
         )
         if Z.ndim != 2 or Z.shape[0] != n_t:
             raise ValueError(f"nuisance must be (n_t, n_nuisance) with n_t={n_t}; got {Z.shape}")
@@ -716,7 +716,7 @@ def fit_shifted_hrf(
     ):
         end = min(start + chunk_size, n_voxels)
         nv = end - start
-        y_raw = y_src[start:end].to(device=device, dtype=torch.float64, non_blocking=True)
+        y_raw = y_src[start:end].to(device=device, non_blocking=True).to(torch.float64)
         y = _project_out(y_raw, Z)
         ss_tot = ((y_raw - y_raw.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
         # proj[b, g, v] = <C[b,g], y_v>
@@ -1274,7 +1274,7 @@ def xval_shifted_hrf(
             Z_test = build_blockdiag_polys([n_tp_r], [degrees[r]], device)
             if extra_regs_per_run is not None:
                 Z_test = append_blockdiag_extras(Z_test, [extra_regs_per_run[r]], [n_tp_r], device)
-            y_test = per_run_data[r].to(device=device, dtype=torch.float64)
+            y_test = per_run_data[r].to(device=device).to(torch.float64)
             y_p = _project_out(y_test, Z_test)
             ss_tot = ((y_p - y_p.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
             ar_c = torch.arange(n_cond, device=device)
@@ -1562,7 +1562,7 @@ def select_shape_per_voxel(
         for s in range(0, n_voxels, chunk_size):
             e = min(s + chunk_size, n_voxels)
             y = _project_out(
-                y_src[s:e].to(device=device, dtype=torch.float64, non_blocking=True), nuisance
+                y_src[s:e].to(device=device, non_blocking=True).to(torch.float64), nuisance
             )
             beta = torch.cholesky_solve(X.T @ y.T, L)  # (NB, nv)
             # SSE = ||y||^2 - beta' X'y  (exact for the OLS solution)

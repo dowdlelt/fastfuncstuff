@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> None:
     # masks/PVEs into EPI space.
     A = load_matrix_chain(
         args.matrix, base_affine=anat_ref_hdr["affine"], source_affine=epi_hdr["affine"]
-    ).to(device=device, dtype=torch.float64)
+    ).to(device=device).to(torch.float64)
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
     A_inv = torch.linalg.inv(A)

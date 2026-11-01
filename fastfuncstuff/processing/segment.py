@@ -1432,7 +1432,7 @@ def split_gaussians(
         w = 1.0 / (1.0 + torch.exp(torch.tensor(-(kk - 1) * 0.25))) - 0.5  # 0 when kk==1
         vr_t = covs1[:, :, t].to(torch.float64)
         chol = torch.linalg.cholesky(vr_t)  # sqrtm's role: a factor with chol·cholᵀ = vr_t
-        jitter = torch.randn(n_chan, kk, generator=gen).to(device=device, dtype=torch.float64)
+        jitter = torch.randn(n_chan, kk, generator=gen).to(device=device).to(torch.float64)
         means[:, cols] = (chol @ jitter) * w + means1[:, t : t + 1].to(torch.float64)
         covs[:, :, cols] = (vr_t * (1.0 - w))[:, :, None]
         mix[cols] = 1.0 / kk
@@ -1685,7 +1685,7 @@ def fit_segment(
             subj_affine.to(device), tpm_affine.to(device), world_affine.to(device)
         )
     else:
-        vox2vox = vox2vox.to(device=device, dtype=torch.float64)
+        vox2vox = vox2vox.to(device=device).to(torch.float64)
 
     # Reject samples the affine places outside the template's usable field: SPM's
     # inferior-only `bottom_mm` rule, plus the optional full-box `fov_mm` rule. Uses the

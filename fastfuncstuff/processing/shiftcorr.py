@@ -507,8 +507,8 @@ def estimate_pair_shift(
         r = ref[start:stop].to(device=device, dtype=torch.float32)
         m = mov[start:stop].to(device=device, dtype=torch.float32)
         s, c = _search_chunk(r, m, dim, lo, hi, coarse_step, fine_step, weight, extent)
-        shifts[start:stop] = s.double().cpu().numpy()
-        corrs[start:stop] = c.double().cpu().numpy()
+        shifts[start:stop] = s.cpu().double().numpy()
+        corrs[start:stop] = c.cpu().double().numpy()
         # No per-chunk empty_cache: every chunk but the last is the same
         # shape, so the caching allocator hands the same blocks straight back.
         del r, m, s, c

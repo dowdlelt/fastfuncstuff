@@ -218,8 +218,8 @@ def design_crossval(
                 - 2 * (beta * rhs_[r]).sum(-1)
                 + (beta[:, None] @ G[r] @ beta[..., None])[:, 0, 0]
             )
-        sse[start:stop] = err.double().cpu()
-        total[start:stop] = yy.sum(0).double().cpu()
+        sse[start:stop] = err.cpu().double()
+        total[start:stop] = yy.sum(0).cpu().double()
     return sse, total
 
 

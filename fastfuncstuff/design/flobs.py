@@ -702,7 +702,7 @@ def fit_basis_constrained_ridge(
     # ``n_blocks`` times (one block per condition OR per trial,
     # depending on caller's design).  Remaining n_nuisance rows/cols:
     # zeros (nuisance is unpenalised — no prior on polynomial drift).
-    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=factor_device, dtype=torch.float64)
+    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=factor_device).to(torch.float64)
     P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=factor_device)
     for c in range(n_blocks):
         s = c * n_basis
@@ -710,7 +710,7 @@ def fit_basis_constrained_ridge(
 
     # Prior mean vector m̄ (size n_cols): stacked ``prior_mean`` for
     # each block (condition/trial), zeros for nuisance.
-    m_torch = torch.from_numpy(prior_mean).to(device=factor_device, dtype=torch.float64)
+    m_torch = torch.from_numpy(prior_mean).to(device=factor_device).to(torch.float64)
     m_bar = torch.zeros(n_cols, dtype=torch.float64, device=factor_device)
     for c in range(n_blocks):
         m_bar[c * n_basis : (c + 1) * n_basis] = m_torch
@@ -1299,7 +1299,7 @@ def fit_basis_cone_prior(
     X = (
         torch.as_tensor(design_task, dtype=torch.float64, device=device)
         if not isinstance(design_task, torch.Tensor)
-        else design_task.to(device=device, dtype=torch.float64)
+        else design_task.to(device=device).to(torch.float64)
     )
     if y.ndim != 2:
         raise ValueError(f"data must be 2-D (n_voxels, n_t); got {y.shape}")
@@ -1319,7 +1319,7 @@ def fit_basis_cone_prior(
         Z = (
             torch.as_tensor(nuisance, dtype=torch.float64, device=device)
             if not isinstance(nuisance, torch.Tensor)
-            else nuisance.to(device=device, dtype=torch.float64)
+            else nuisance.to(device=device).to(torch.float64)
         )
         X_full = torch.cat([X, Z], dim=1)
     else:
@@ -1327,7 +1327,7 @@ def fit_basis_cone_prior(
     n_cols = X_full.shape[1]
     n_task_cols = n_blocks * n_basis
 
-    P0 = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=device, dtype=torch.float64)
+    P0 = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=device).to(torch.float64)
     m_t = torch.from_numpy(np.asarray(prior_mean, dtype=np.float64)).to(device=device)
     P0m = P0 @ m_t  # (K,)
     # The angular penalty has magnitude mᵀP₀m, so the guard has to be
@@ -1385,7 +1385,7 @@ def fit_basis_cone_prior(
         disable=n_chunks <= 1,
     ):
         end = min(start + chunk_size, n_voxels)
-        y_chunk = y[start:end].to(device=device, dtype=torch.float64, non_blocking=True)
+        y_chunk = y[start:end].to(device=device, non_blocking=True).to(torch.float64)
         Xty = X_full.T @ y_chunk.T
         b = (
             torch.cholesky_solve(Xty, L0)
@@ -1426,7 +1426,7 @@ def fit_basis_cone_prior(
         disable=n_chunks <= 1,
     ):
         end = min(start + chunk_size, n_voxels)
-        y_chunk = y[start:end].to(device=device, dtype=torch.float64, non_blocking=True)
+        y_chunk = y[start:end].to(device=device, non_blocking=True).to(torch.float64)
         Xty = (X_full.T @ y_chunk.T).T  # (chunk, n_cols)
         lam_chunk = lambda_pv[start:end].to(device)
         beta = beta_ols_full[start:end].to(device)
@@ -3184,7 +3184,7 @@ def compute_vb_block_trace(
         device = get_device()
     device, design = _float64_solver_device(device, "FLOBS VB block-trace", design)
 
-    X = design.to(device=device, dtype=torch.float64)
+    X = design.to(device=device).to(torch.float64)
     n_cols = X.shape[1]
     n_task_cols = n_blocks * n_basis
     if n_task_cols > n_cols:
@@ -3200,10 +3200,7 @@ def compute_vb_block_trace(
         )
 
     # Build P matching the solver: block-diag(C⁻¹) on task cols.
-    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(
-        device=device,
-        dtype=torch.float64,
-    )
+    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=device).to(torch.float64)
     P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
     for c in range(n_blocks):
         s = c * n_basis

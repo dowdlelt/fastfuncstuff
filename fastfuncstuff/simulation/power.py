@@ -489,10 +489,10 @@ def _unit_noise_fit(
             L = _run_correlation(int(n), *ab)[1].to(device, torch.float32)
             y[start : start + n] = L @ Z[start : start + n]
             start += n
-    est = (CP_dev @ y).double().cpu()  # (n_contrasts, n_reps)
+    est = (CP_dev @ y).cpu().double()  # (n_contrasts, n_reps)
     resid = y - X_dev @ (P_dev @ y)
-    rss = (resid * resid).sum(dim=0).double().cpu()
-    cross = (mis_dev.T @ resid).double().cpu()  # (2, n_reps): base, unit
+    rss = (resid * resid).sum(dim=0).cpu().double()
+    cross = (mis_dev.T @ resid).cpu().double()  # (2, n_reps): base, unit
     return v_true, tr_MR, dof, est, rss, cross
 
 

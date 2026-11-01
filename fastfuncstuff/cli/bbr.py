@@ -365,9 +365,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── Affine: anat→epi in voxel space (A), composing the -1Dmatrix stack.
     #    Invert to cast anat masks into EPI space. ──
-    A = load_matrix_chain(args.matrix, base_affine=anat_aff, source_affine=epi_aff).to(
-        device=device, dtype=torch.float64
-    )
+    A = load_matrix_chain(args.matrix, base_affine=anat_aff, source_affine=epi_aff).to(device=device).to(torch.float64)
     if verb and len(args.matrix) > 1:
         print(f"composed {len(args.matrix)} affines (base-side→source-side)")
     A_inv = torch.linalg.inv(A)  # epi→anat voxel map

@@ -470,7 +470,7 @@ class AlignMode(Mode):
             base_header={"affine": base_aff},
             source_header={"affine": native},
         )
-        voxel = matrix.detach().to("cpu", torch.float64).numpy()
+        voxel = matrix.detach().to(device='cpu').to(torch.float64).numpy()
         xform = base_aff @ np.linalg.inv(voxel) @ np.linalg.inv(native)
         if progress is not None:
             progress(1.0, "done")

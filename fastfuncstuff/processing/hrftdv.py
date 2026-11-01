@@ -135,7 +135,7 @@ def orthonormal_nuisance(nuisance_per_run: Sequence[Tensor], device: torch.devic
     """Per-run orthonormal bases of the nuisance column space (rank-safe)."""
     out = []
     for n in nuisance_per_run:
-        n = n.to(device=device, dtype=torch.float64)
+        n = n.to(device=device).to(torch.float64)
         if n.shape[1] == 0:
             out.append(n)
             continue
@@ -189,7 +189,7 @@ def screen_responsive(
 
     T, V = y.shape
     P = design.shape[1]
-    x = design.to(device=device, dtype=torch.float64)
+    x = design.to(device=device).to(torch.float64)
     pinv = torch.linalg.pinv(x)
     if sign_cols is not None:
         pinv = pinv[torch.as_tensor(sign_cols, device=device)]
@@ -198,7 +198,7 @@ def screen_responsive(
     r2 = np.empty(V)
     mean_beta = np.empty(V)
     for a in range(0, V, chunk):
-        yc = y[:, a : a + chunk].to(device=device, dtype=torch.float64)
+        yc = y[:, a : a + chunk].to(device=device).to(torch.float64)
         ss = ((q.T @ yc) ** 2).sum(0)
         r2[a : a + chunk] = (ss / (yc**2).sum(0).clamp_min(1e-12)).cpu().numpy()
         mean_beta[a : a + chunk] = (pinv @ yc).mean(0).cpu().numpy()
@@ -233,7 +233,7 @@ def screen_library(
 
     T, V = y.shape
     S, _, P = designs.shape
-    x = designs.to(device=device, dtype=torch.float64)
+    x = designs.to(device=device).to(torch.float64)
     q = torch.linalg.qr(x)[0].float()
     pinv = torch.linalg.pinv(x).float()  # (S, P, T)
     chunk = chunk_size or estimate_chunk_size(
@@ -651,7 +651,7 @@ def pooled_late_patterns(
     idx = np.flatnonzero(responsive)
     for a in range(0, idx.size, 50000):
         sel = idx[a : a + 50000]
-        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu())
+        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].cpu().double())
     means = (sums / torch.as_tensor(np.clip(counts, 1, None))).to(device)
     pattern = np.full((U, 0), np.nan)
     for e in range(library.curves.shape[0]):
@@ -682,7 +682,7 @@ def late_regressors(
         units = np.flatnonzero(library.index == e)
         if units.size == 0:
             continue
-        x = design_for(library.curves[e][1]).double().cpu().numpy()  # (T, P)
+        x = design_for(library.curves[e][1]).cpu().double().numpy()  # (T, P)
         if out is None:
             out = np.zeros((x.shape[0], U), np.float32)
         out[:, units] = x @ pattern[units].T
@@ -753,7 +753,7 @@ def fit_hrftdv(
     for a in range(0, resp_idx.size, 50000):
         sel = resp_idx[a : a + 50000]
         wt = torch.as_tensor(w[sel])
-        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu() * wt)
+        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].cpu().double() * wt)
     means = (sums / torch.as_tensor(np.where(counts > 0, counts, 1.0))).float()
     best, _ = unit_shapes(means, q_lib)
     del q_lib

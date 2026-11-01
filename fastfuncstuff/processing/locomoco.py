@@ -7775,7 +7775,7 @@ def _warp_grams(blocks, device=None, want_means=False):
                 c = staged - m
                 g += (c.T @ c).double()
                 if mu is not None:
-                    mu[i : i + step] = m[:, 0].double().cpu()
+                    mu[i : i + step] = m[:, 0].cpu().double()
                 del staged, c, m
             grams.append(g.cpu())
             means.append(mu)
@@ -7800,7 +7800,7 @@ def _warp_loadings(blocks, u, device=None):
             for i in range(0, n_vox, step):
                 staged = mat[i : i + step].to(dev, torch.float32)
                 c = staged - staged.mean(dim=1, keepdim=True)  # see _warp_grams
-                load[i : i + step] = (c @ u_dev).double().cpu()
+                load[i : i + step] = (c @ u_dev).cpu().double()
                 del staged, c
             out.append(load.reshape(*shape, k).contiguous())
     return out
@@ -7892,7 +7892,7 @@ def warp_project_out(components, bad_timecourses, device=None):
         n_t = disp.shape[-1]
         n_vox = int(np.prod(shape))
         dev = device if device is not None else disp.device
-        a = bad.to(dtype=torch.float64, device=dev)
+        a = bad.to(device=dev).to(torch.float64)
         # The basis is (T, m) with m tiny, so the QR is free and hoists out of the loop.
         q, _ = torch.linalg.qr(a - a.mean(dim=0, keepdim=True))
 
@@ -7910,7 +7910,7 @@ def warp_project_out(components, bad_timecourses, device=None):
             n_vox, n_t, q.shape[1] + 4, dev, operation="glm", use_double=True, empty_cache=False
         )
         for start in range(0, n_vox, chunk):
-            y = flat[start : start + chunk].to(device=dev, dtype=torch.float64).T  # (T, c)
+            y = flat[start : start + chunk].to(device=dev).to(torch.float64).T  # (T, c)
             # Centre before projecting and restore after: the per-voxel temporal mean is
             # not part of any component, and a time course with any DC left in it would
             # otherwise drag the mean displacement with it.
@@ -7959,10 +7959,10 @@ def warp_ica_basis(components, n_components=None, pca_components=0.95, device=No
     ica.fit_transform(x)
     if ica.components_ is None or ica.mixing_ is None:
         raise RuntimeError("FastICA returned no components for the warp field")
-    load = ica.components_.to(torch.float64).cpu()  # (k, S) independent spatial maps
-    mixing = ica.mixing_.to(torch.float64).cpu()  # (T, k) their time courses
+    load = ica.components_.cpu().to(torch.float64)  # (k, S) independent spatial maps
+    mixing = ica.mixing_.cpu().to(torch.float64)  # (T, k) their time courses
     k = load.shape[0]
-    loadings, means = _split_loadings(load, mean.double().cpu(), shapes, axes, widths, k)
+    loadings, means = _split_loadings(load, mean.cpu().double(), shapes, axes, widths, k)
     # ICA components are not variance-ordered and carry no eigenvalue, so the share of
     # the field each one explains is measured directly rather than read off a spectrum.
     energy = (load**2).sum(dim=1) * (mixing**2).sum(dim=0)

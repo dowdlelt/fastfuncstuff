@@ -62,7 +62,7 @@ def _top_components(X: Tensor, k: int, chunk: int) -> Tensor:
     G = torch.zeros(T, T, dtype=torch.float64, device=X.device if chunk >= V else "cpu")
     for s in range(0, V, chunk):
         xc = X[:, s : s + chunk]
-        G += (xc @ xc.T).to(G.device, torch.float64)
+        G += (xc @ xc.T).to(device=G.device).to(torch.float64)
     _, U = torch.linalg.eigh(G)
     return U[:, -k:].flip(1).to(torch.float32)
 

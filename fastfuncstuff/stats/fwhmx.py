@@ -526,8 +526,8 @@ def fit_acf_curve(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, f
     """Fit ACF(r)=a e^{-r²/2b²}+(1-a)e^{-r/c} and return (a, b, c, FWHM)."""
     if bin_r.numel() < 5:
         return -1.0, -1.0, -1.0, -1.0
-    radii = bin_r.to(device=device, dtype=torch.float64)
-    y = bin_y.to(device=device, dtype=torch.float64).view(1, -1)
+    radii = bin_r.to(device=device).to(torch.float64)
+    y = bin_y.to(device=device).to(torch.float64).view(1, -1)
     w = torch.ones_like(y)
     a, b, c, _ok = fit_acf_batched(radii, y, w)
     af, bf, cf = float(a.item()), float(b.item()), float(c.item())

@@ -910,7 +910,7 @@ def _unpredictable_basis(
     if cols.shape[1] == 0:
         return None
     work = factor_device(cols.device)
-    u, sv, _ = torch.linalg.svd(cols.to(device=work, dtype=torch.float64), full_matrices=False)
+    u, sv, _ = torch.linalg.svd(cols.to(device=work).to(torch.float64), full_matrices=False)
     keep = sv > rcond * sv[0]
     if not bool(keep.any()):
         return None

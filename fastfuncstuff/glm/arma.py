@@ -5933,10 +5933,11 @@ def _ljung_box_batched(
     not a Pearson autocorrelation — LB is scale-invariant (``c_k`` is a ratio) so
     per-voxel normalisation upstream cannot shift it, but re-centring would.
 
-    Returns ``(n_voxels,)`` float64 on *resid*'s device. Zero marks "could not be
-    computed" exactly as AFNI does: fewer than 10 points, an all-zero residual,
-    or a bin with too few pairs.
+    Returns ``(n_voxels,)`` float64 on *resid*'s :func:`linalg_device` (the CPU on
+    MPS). Zero marks "could not be computed" exactly as AFNI does: fewer than 10
+    points, an all-zero residual, or a bin with too few pairs.
     """
+    resid = resid.to(device=linalg_device(resid.device))
     n_vox, n_time = resid.shape
     zeros = torch.zeros(n_vox, dtype=torch.float64, device=resid.device)
     if n_time < 10:

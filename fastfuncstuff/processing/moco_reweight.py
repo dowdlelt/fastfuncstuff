@@ -96,7 +96,7 @@ def compute_residual_reweight(
         ],
         dtype=torch.float64,
     )
-    mats64 = global_matrices.to(dtype=torch.float64, device="cpu")
+    mats64 = global_matrices.to(device='cpu').to(torch.float64)
     moved = torch.einsum("tij,cj->tci", mats64, corners)[..., :3] - corners[None, :, :3]
     motion_amp = float(moved.std(dim=0).max())
     if motion_amp < min_motion:
@@ -428,7 +428,7 @@ def compute_reweight(
 
     # Displacement the GLOBAL motion implies at each patch centre, per TR
     # (Mg maps base->source; displacement = transformed - original, x/y/z).
-    Mg = global_matrices.to(dtype=torch.float64, device="cpu")  # (nt, 4, 4)
+    Mg = global_matrices.to(device='cpu').to(torch.float64)  # (nt, 4, 4)
     dpred = torch.einsum("tij,pj->tpi", Mg, xp)[:, :, :3] - xp[None, :, :3]  # (nt, P, 3)
 
     # Low-motion guard: if the head barely moved, the predicted displacement has

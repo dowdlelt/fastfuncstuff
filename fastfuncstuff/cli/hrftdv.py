@@ -737,7 +737,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     def project(x: torch.Tensor) -> torch.Tensor:
-        return tdv.project_runs(x.to(device=device, dtype=torch.float64), q_runs, run_starts)
+        return tdv.project_runs(x.to(device=device).to(torch.float64), q_runs, run_starts)
 
     # Data projected once, kept (T, V) on the host; the GPU sees it in chunks.
     V = data.shape[0]

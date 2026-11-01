@@ -444,8 +444,8 @@ def fit_smooth_selected(
         total = torch.zeros(b - a, dtype=torch.float64, device=device)
         total_sq = torch.zeros(b - a, dtype=torch.float64, device=device)
         n_test = 0
-        y_all = data[a:b].to(device=device, dtype=torch.float64)
-        y_score = y_all if score_data is None else score_src[a:b].to(device, torch.float64)
+        y_all = data[a:b].to(device=device).to(torch.float64)
+        y_score = y_all if score_data is None else score_src[a:b].to(device=device).to(torch.float64)
         for fold in folds:
             y_te = y_score[:, fold[0].test.to(device)]
             if fold[0].q_test.shape[1]:
@@ -609,7 +609,7 @@ def choose_global_lambda(
         disable=not verbose or len(starts) < 2,
     ):
         b = min(a + chunk, n_vox)
-        y = data[a:b].to(device=device, dtype=torch.float64)
+        y = data[a:b].to(device=device).to(torch.float64)
         ss = torch.zeros((b - a, n_lam), dtype=torch.float64, device=device)
         ss_ols = torch.zeros(b - a, dtype=torch.float64, device=device)
         ss_rule = torch.zeros(b - a, dtype=torch.float64, device=device)
@@ -698,8 +698,8 @@ def _residual_autocorr(
     chunk = estimate_chunk_size(n_vox, n_t, n_task, device, operation="glm")
     for a in range(0, n_vox, chunk):
         b = min(a + chunk, n_vox)
-        y = data[a:b].to(device=device, dtype=torch.float64)
-        res = y - betas[a:b].to(device, torch.float64) @ x_t.T
+        y = data[a:b].to(device=device).to(torch.float64)
+        res = y - betas[a:b].to(device=device).to(torch.float64) @ x_t.T
         if q_t.shape[1]:
             res = res - (res @ q_t) @ q_t.T
         var = (res * res).sum(dim=1).clamp_min(1e-30)
@@ -1068,8 +1068,8 @@ def fit_smooth_per_run(
         idx_all = torch.as_tensor(np.nonzero(which == gi)[0])
         for c0 in range(0, idx_all.numel(), chunk):
             idx = idx_all[c0 : c0 + chunk]
-            y = data[idx].to(device=device, dtype=torch.float64)
-            y_sc = y if score_data is None else score_data[idx].to(device, torch.float64)
+            y = data[idx].to(device=device).to(torch.float64)
+            y_sc = y if score_data is None else score_data[idx].to(device=device).to(torch.float64)
             nv = y.shape[0]
             c_fit, yy_fit, c_raw, yy_raw, sum_raw = [], [], [], [], []
             for blk in blocks:

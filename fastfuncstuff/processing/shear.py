@@ -765,7 +765,7 @@ def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
     (folding it in halved the error vs separate translation passes); only a shift
     along the rotation axis costs a pass of its own.
     """
-    M = matrix.detach().to("cpu", torch.float64).reshape(-1, 4, 4)[0]
+    M = matrix.detach().to(device='cpu').to(torch.float64).reshape(-1, 4, 4)[0]
     A, t = M[:3, :3], M[:3, 3]
     nz, ny, nx = shape
     c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
