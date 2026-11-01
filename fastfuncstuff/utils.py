@@ -236,6 +236,10 @@ _MPS_CPU_OPS: dict[str, str] = {
     # against the user's next click. Routing the repaint to the CPU leaves the
     # worker as the only thread on the GPU -- and it is faster anyway, because a
     # slice-sized array is all copy and no arithmetic.
+    # The whole tool, not one op: patch optimisation plus float64 coverage tables, with
+    # 3-D sampling too small a share of the work for Metal to pay for the rest.
+    "qwarp_registration": "torch 2.14: 88x105x88 EPI pair, interleaved, three rounds: "
+    "285 s MPS vs 247 s CPU (1.15x); 2x at 32^3 and 64^3",
     # Measured 2026-11-01, same machine, the shapes these actually arrive in. Metal
     # lost every one. See fastfuncstuff/policy_linalg.py, which is how they get used.
     "inv": "torch 2.14: (100,100) 0.60 ms vs 0.04 ms CPU (14x); (4,4) 33x; batched (1000,12,12) 1.5x",

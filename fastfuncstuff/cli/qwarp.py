@@ -73,7 +73,7 @@ from fastfuncstuff.processing.warp import (
     qwarp,
 )
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
-from fastfuncstuff.utils import REGISTRATION_TF32
+from fastfuncstuff.utils import REGISTRATION_TF32, cpu_if_mps
 
 _EPILOG = """\
 WHICH NONLINEAR BACKEND
@@ -1627,16 +1627,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _select_device(args: argparse.Namespace) -> torch.device:
-    """Device for a run or a whole batch (prefer CUDA > CPU; explicit MPS honoured)."""
+    """Device for a run or a whole batch: CUDA, else the CPU, which beats Metal here."""
     device_spec = args.device
     if (
         device_spec is None or str(device_spec).lower() == "auto"
     ) and not torch.cuda.is_available():
         device_spec = "cpu"
     device = setup_device(device_spec, tf32=REGISTRATION_TF32)
+    if cpu_if_mps(device, "qwarp_registration") != device:
+        print("ffs_qwarp: the CPU beats Metal on this tool; running there.")
+        device = setup_device("cpu", tf32=REGISTRATION_TF32)
     if device.type == "cpu" and args.device is None and args.verb >= 1:
         note = (
-            " (recommended on Mac: MPS qwarp autograd falls back to CPU)"
+            " (faster than Metal for this tool)"
             if torch.backends.mps.is_available()
             else ""
         )
