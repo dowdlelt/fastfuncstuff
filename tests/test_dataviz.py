@@ -176,3 +176,38 @@ def test_clicking_a_drawn_voxel_picks_it(run, scene):
     assert sc.locate(got) is not None
     gx, gy = sc.locate(got)
     assert abs(gx - at[0]) < 0.75 and abs(gy - at[1]) < 0.75
+
+
+def test_family_count_changes_live(run):
+    import copy
+
+    feats = copy.deepcopy(run[0])
+    vis = Visualizer(feats, 48, 32)
+    assert vis.p["families"] == feats.family_tcs.shape[1]
+    vis.set_param("families", 3)
+    assert feats.family_tcs.shape[1] == 3 and int(feats.family.max()) <= 2
+    assert vis.drives.n_fam == 3 and vis.drives.family_salience.numel() == 3
+    for scene in SCENE_NAMES:
+        vis.set_param("scene", SCENE_NAMES.index(scene))
+        vis.step(1 / 30)
+        assert vis.render_tensor().shape == (32, 48, 3), scene
+
+
+def test_flow_twist_does_not_collapse(run):
+    feats, _, _ = run
+    vis = Visualizer(feats, 64, 36)
+    vis.set_param("scene", SCENE_NAMES.index("flow"))
+    vis.set_param("stir", 6.0)
+    sc = vis.scene
+
+    def peak() -> float:
+        # Coarse bins: the synthetic voxels are a lattice, and rotating a
+        # lattice moves fine-bin coincidences around without compressing it.
+        cell = ((sc.pos * 4).round().long() + 8).clamp(0, 15)
+        return float(torch.bincount(cell[:, 0] * 16 + cell[:, 1], minlength=256).max())
+
+    start = peak()
+    for _ in range(120):
+        vis.step(1 / 30)
+    # A twist preserves area; the old vortex-plus-spring piled points 6-12x.
+    assert peak() < start * 1.6

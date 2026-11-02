@@ -52,6 +52,11 @@ class Features:
     dvars: torch.Tensor  # (T,) robust z of the frame-to-frame RMS change
     extras: dict = field(default_factory=dict)
 
+    def refit_families(self, n_families: int, seed: int = 0) -> None:
+        """Recompute the families in place for a new family count."""
+        for k, v in assign_families(self.loadings, self.z, self.anat, n_families, seed).items():
+            setattr(self, k, v)
+
     @property
     def n_voxels(self) -> int:
         return int(self.z.shape[1])
@@ -228,6 +233,34 @@ def _family_ica(loadings: torch.Tensor, n_families: int, seed: int) -> torch.Ten
     return maps * torch.sign(skew + 1e-12)
 
 
+def assign_families(
+    loadings: torch.Tensor, z_tn: torch.Tensor, anat: torch.Tensor, n_families: int, seed: int
+) -> dict[str, torch.Tensor]:
+    """Spatial ICA of the loadings into families, and what each family does.
+
+    Returns the Features fields ``family`` (argmax of the z-scored ICA maps),
+    ``family_weight`` ((max z - 1) / 3 in [0, 1]), ``family_tcs`` (membership-
+    weighted mean of the members' z, unit variance) and ``family_center``.
+    Cheap enough (~0.5 s) to rerun live when the family count changes.
+    """
+    n_fam = max(2, min(n_families, loadings.shape[1]))
+    ica_maps = _family_ica(loadings, n_fam, seed)  # (N, F)
+    zmaps = ica_maps / ica_maps.std(0, keepdim=True).clamp_min(1e-12)
+    best = zmaps.max(1)
+    family = best.indices
+    member_w = zmaps.clamp_min(0) ** 2
+    tcs = (z_tn.float() @ member_w) / member_w.sum(0).clamp_min(1e-12)
+    tcs = (tcs - tcs.mean(0)) / tcs.std(0).clamp_min(1e-12)
+    centre = torch.zeros(n_fam, 3, device=anat.device).index_add_(0, family, anat)
+    centre /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    return {
+        "family": family,
+        "family_weight": ((best.values - 1.0) / 3.0).clamp(0, 1),
+        "family_tcs": tcs,
+        "family_center": centre,
+    }
+
+
 def compute_features(
     data: torch.Tensor,
     mask: np.ndarray,
@@ -277,24 +310,12 @@ def compute_features(
     loadings_unit = loadings / math.sqrt(n_time)
     steps.update()
 
-    n_fam = min(n_families, k)
-    ica_maps = _family_ica(loadings, n_fam, seed)  # (N, F)
-    zmaps = ica_maps / ica_maps.std(0, keepdim=True).clamp_min(1e-12)
-    best = zmaps.max(1)
-    family = best.indices
-    family_weight = ((best.values - 1.0) / 3.0).clamp(0, 1)
-    # Family time course: membership-weighted mean of the members' z.
-    member_w = zmaps.clamp_min(0) ** 2
-    family_tcs = (zf.T @ member_w) / member_w.sum(0).clamp_min(1e-12)
-    family_tcs = (family_tcs - family_tcs.mean(0)) / family_tcs.std(0).clamp_min(1e-12)
-    steps.update()
-
     world = torch.as_tensor(
         affine[:3, :3] @ ijk.T + affine[:3, 3:4], device=device, dtype=torch.float32
     ).T
     anat = _centre_scale(world)
-    family_center = torch.zeros(n_fam, 3, device=device).index_add_(0, family, anat)
-    family_center /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    fams = assign_families(loadings, zf.T, anat, n_families, seed)
+    steps.update()
 
     # Functional layout: each voxel's direction in correlation space. Two voxels
     # whose rows of the row-normalised loading matrix agree are correlated, so
@@ -342,10 +363,7 @@ def compute_features(
         loadings=loadings_unit,
         tcs=tcs_unit,
         pc_var=pc_var,
-        family=family,
-        family_weight=family_weight,
-        family_tcs=family_tcs,
-        family_center=family_center,
+        **fams,
         mean=_robust_unit(raw_mean),
         tsnr=_robust_unit(tsnr),
         coherence=coherence,

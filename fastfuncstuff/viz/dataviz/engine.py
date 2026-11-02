@@ -34,6 +34,7 @@ class Visualizer:
     def __init__(self, feats: Features, width: int = 640, height: int = 360, seed: int = 0):
         self.f = feats
         self.p = default_params()
+        self.p["families"] = float(feats.family_tcs.shape[1])
         self.drives = Drives(feats, self.p)
         self.width, self.height = width, height
         self.seed = seed
@@ -69,6 +70,15 @@ class Visualizer:
     def set_param(self, name: str, value: float) -> None:
         if name not in self.p:
             raise KeyError(name)
+        if name == "families":
+            n = max(2, min(int(value), int(self.f.loadings.shape[1])))
+            if n != self.drives.n_fam:
+                self.f.refit_families(n, self.seed)
+                self.drives.refresh_families()
+                # Every scene caches family-shaped state; rebuilding is cheap.
+                self._scenes.clear()
+            self.p[name] = float(n)
+            return
         self.p[name] = float(value)
         for sc in self._scenes.values():
             if any(prm.name == name for prm in sc.PARAMS):

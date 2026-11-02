@@ -461,6 +461,12 @@ class Viz(QtWidgets.QMainWindow):
 
     def set_param(self, name: str, value: float, from_ui: bool = False) -> None:
         self.vis.set_param(name, value)
+        if name == "families":
+            # New families, new voices; the inspector's family line follows.
+            gate, vol = self.son.gate, self.son.volume
+            self.son = Sonifier(self.feats)
+            self.son.gate, self.son.volume = gate, vol
+            self.inspector.set_probe(self.inspector.probe)
         if not from_ui:
             self.controls.refresh(name)
         if name == "scene":

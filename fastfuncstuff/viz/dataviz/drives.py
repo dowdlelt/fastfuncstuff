@@ -174,23 +174,31 @@ class Drives:
         self.live = torch.zeros(feats.n_voxels, device=self.device)
         self.g = 0.0
         self.d = 0.0
-        self.fam = torch.zeros(feats.family_tcs.shape[1], device=self.device)
-        self.n_fam = int(feats.family_tcs.shape[1])
         dz = (feats.z[1:].float() - feats.z[:-1].float()).square().mean(0).sqrt()
         # Per-voxel innovation: how much of the variance is frame-to-frame
         # change. Smooth signal glides, noise fizzes.
         self.innovation = (dz / 2**0.5).clamp(0, 1.5)
         self._color_key: tuple | None = None
         self._gate_key: float | None = None
-        counts = torch.bincount(feats.family, minlength=self.n_fam).float()
-        sal = torch.zeros(self.n_fam, device=self.device).index_add_(
-            0, feats.family, feats.salience
-        )
-        self.family_salience = sal / counts.clamp_min(1)
-        self.family_size = counts / counts.sum()
+        self.refresh_families()
         nb = feats.extras["neighbours"][:, 0]
         #: Voxel spacing in the normalised anatomical frame.
         self.spacing = float((feats.anat - feats.anat[nb]).norm(dim=1).median().clamp_min(1e-4))
+
+    def refresh_families(self) -> None:
+        """Per-family statistics; rerun after ``Features.refit_families``."""
+        f = self.f
+        self.n_fam = int(f.family_tcs.shape[1])
+        self.fam = (
+            interp_rows(f.family_tcs, self.t)
+            if hasattr(self, "t")
+            else torch.zeros(self.n_fam, device=self.device)
+        )
+        counts = torch.bincount(f.family, minlength=self.n_fam).float()
+        sal = torch.zeros(self.n_fam, device=self.device).index_add_(0, f.family, f.salience)
+        self.family_salience = sal / counts.clamp_min(1)
+        self.family_size = counts / counts.sum()
+        self._color_key = None
 
     @property
     def n_time(self) -> int:
