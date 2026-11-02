@@ -1,4 +1,4 @@
-"""ffs_dataviz — watch a 4-D run play out as a data-driven particle swarm.
+"""ffs_dataviz — watch a 4-D run play out as data-driven pixel art (and sound).
 
 Thin by design: parse, load and compute features, then either open the window
 or render a movie headless.
@@ -15,15 +15,24 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
-every masked voxel becomes particles. nothing is fitted -- no events, no
-model -- the swarm replays the series and the eye finds what is there.
+every masked voxel becomes a point (or several). nothing is fitted -- no
+events, no model -- the run is replayed and the eye finds what is there. the
+same drives feed every scene; a scene is only a way of drawing them:
 
-  dust     one per voxel, on its anatomical home, lit by the mean image's
-           local contrast: the scaffold that tells you where you are.
-  sparks   lit by the voxel's live (detrended, z-scored) value. they bloom
-           outward as the voxel rises, drift with their ICA family as the
-           family swings (correlated voxels move together), align with their
-           neighbours, and shimmer with frame-to-frame unpredictability.
+  mandala   ICA families as concentric rings in N-fold mirrored symmetry.
+            a ring spins and sprouts petals while its family is active, the
+            figure breathes with the global signal, DVARS spikes scatter it.
+  milkdrop  a feedback tunnel: the last frame is zoomed, swirled and
+            recoloured, then this frame's voxels are drawn on top. the zoom
+            pumps with the global signal; each family twists its own radial
+            band; DVARS spikes jolt the warp.
+  flow      ink in water: voxels laid out in correlation space, stirred by
+            one vortex per family that spins with the family's time course.
+  sand      falling sand: each family pours grains from its own lane while
+            active; pile heights are cumulative activity, strata are time.
+            the global signal is wind, DVARS spikes are quakes.
+  brain     the anatomical 3-D swarm: dust on the anatomy, sparks lit by the
+            live signal that bloom, flock with their family and shimmer.
 
 most of the brain carries no task signal, so sparks are pooled before they are
 shown: across space (each voxel blended with its neighbourhood: pool, reach)
@@ -37,19 +46,19 @@ sound follows the same drives: each ICA family is a voice on a pentatonic
 scale (pitch from its height in the head, pan from its side), a drone opens up
 with the global signal, and DVARS spikes are a soft swell.
 
-keys: space play/pause, tab or m controls, h timeline, f fullscreen, s sound,
-c colour source, l animate anatomy <-> correlation layout, [ ] speed,
-arrows step, drag orbit, wheel zoom, q quit.
+keys: 1-5 scene, space play/pause, tab or m controls, h timeline, f fullscreen,
+s sound, c colour source, [ ] speed, arrows step, wheel zoom, q quit;
+in brain: drag orbits, l animates anatomy <-> correlation layout.
 
 examples
   ffs_dataviz -input run1.nii.zst
-  ffs_dataviz -input run1.nii.zst run2.nii.zst -set speed=4 color=sign
-  ffs_dataviz -input run1.nii.zst -movie swarm.mp4 -duration 60
+  ffs_dataviz -input run1.nii.zst run2.nii.zst -set scene=sand speed=4
+  ffs_dataviz -input run1.nii.zst -movie tunnel.mp4 -duration 60 -set scene=milkdrop
 """
 
 
 def build_parser() -> FfsArgumentParser:
-    from fastfuncstuff.viz.dataviz.swarm import PARAMS
+    from fastfuncstuff.viz.dataviz.engine import PARAMS
 
     params = ", ".join(f"{p.name}" for p in PARAMS)
     parser = FfsArgumentParser(
@@ -97,7 +106,7 @@ def build_parser() -> FfsArgumentParser:
         default=[],
         metavar="NAME=VALUE",
         help=f"starting parameter values; names: {params}. choice parameters "
-        "(color, layout) also take their names",
+        "(scene, color, inject) also take their names",
     )
     parser.add_argument("-no_sound", action="store_true", help="start without audio")
     parser.add_argument(
@@ -116,7 +125,7 @@ def build_parser() -> FfsArgumentParser:
 
 
 def parse_sets(items: list[str]) -> dict[str, float]:
-    from fastfuncstuff.viz.dataviz.swarm import PARAM_BY_NAME
+    from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME
 
     out: dict[str, float] = {}
     for item in items:
@@ -151,14 +160,14 @@ def render_movie(
     import numpy as np
     from tqdm.auto import tqdm
 
+    from fastfuncstuff.viz.dataviz.engine import Visualizer
     from fastfuncstuff.viz.dataviz.sound import render_track
-    from fastfuncstuff.viz.dataviz.swarm import Swarm
     from fastfuncstuff.viz.encode import find_ffmpeg
 
     ffmpeg = find_ffmpeg()
     if ffmpeg is None:
         raise SystemExit("ffs_dataviz: -movie needs ffmpeg on PATH")
-    sw = Swarm(feats, *size)
+    sw = Visualizer(feats, *size)
     for k, v in params.items():
         sw.set_param(k, v)
     speed = sw.p["speed"]

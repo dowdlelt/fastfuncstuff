@@ -1,0 +1,316 @@
+"""The shared data clock every scene reads, and the pixel helpers they share.
+
+A scene is only a way of *drawing* the drives. The drives themselves -- each
+voxel's pooled live value, each family's time course, the global signal and
+DVARS -- are computed once per frame here, so switching scene never changes
+what the data is saying, only how it is shown.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+
+from .features import Features
+
+
+@dataclass(frozen=True)
+class Param:
+    name: str
+    default: float
+    lo: float
+    hi: float
+    group: str
+    help: str
+    choices: tuple[str, ...] = ()
+    scene: str | None = None  # None: shared by every scene
+
+    @property
+    def integer(self) -> bool:
+        return bool(self.choices) or (
+            float(self.default).is_integer()
+            and float(self.lo).is_integer()
+            and float(self.hi).is_integer()
+            and self.hi - self.lo <= 12
+        )
+
+
+COLOR_SOURCES = ("family", "wave", "sign", "tsnr", "coherence", "mean")
+
+SHARED_PARAMS: tuple[Param, ...] = (
+    Param("speed", 2.0, 0.1, 20.0, "time", "TRs played per second"),
+    Param(
+        "smooth", 0.25, 0.0, 0.95, "time", "temporal smoothing of the live value (EMA per frame)"
+    ),
+    Param(
+        "clarity",
+        0.35,
+        0.0,
+        1.0,
+        "pool",
+        "pool across correlation: mix toward the low-rank reconstruction",
+    ),
+    Param(
+        "pool", 0.5, 0.0, 1.0, "pool", "pool across space: mix each voxel with its neighbourhood"
+    ),
+    Param("reach", 2, 1, 6, "pool", "neighbourhood size (passes of face-neighbour averaging)"),
+    Param("gate", 2.0, 0.0, 6.0, "pool", "dim voxels whose variance is not shared (salience)"),
+    Param("color", 0, 0, len(COLOR_SOURCES) - 1, "color", "colour source", COLOR_SOURCES),
+    Param("wave", 0, 0, 3, "color", "which complex-PCA wave the 'wave' colour reads"),
+    Param("gain", 6.0, 0.0, 30.0, "color", "brightness per unit z"),
+    Param("threshold", 0.6, 0.0, 3.0, "color", "z below which voxels stay dark"),
+    Param("negative", 0.35, 0.0, 1.0, "color", "how much falling voxels glow (cool) vs. stay dark"),
+    Param("tint", 0.5, 0.0, 2.0, "color", "global-signal colour temperature shift"),
+    Param("flash", 0.4, 0.0, 2.0, "color", "global brightening on DVARS spikes"),
+    Param("trails", 0.82, 0.0, 0.995, "render", "fraction of the previous frame kept"),
+    Param("exposure", 1.0, 0.1, 8.0, "render", "tone curve exposure"),
+    Param(
+        "saturation",
+        1.5,
+        0.0,
+        3.0,
+        "render",
+        "colour saturation after mixing (many hues summed go grey)",
+    ),
+)
+
+
+def hsv_to_rgb(h: torch.Tensor, s: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    h = (h % 1.0) * 6.0
+    k = torch.stack([(5 + h) % 6, (3 + h) % 6, (1 + h) % 6], -1)
+    return v[..., None] - v[..., None] * s[..., None] * (torch.minimum(k, 4 - k).clamp(0, 1))
+
+
+def ramp(x: torch.Tensor, stops: list[tuple[float, float, float]]) -> torch.Tensor:
+    """Piecewise-linear colour ramp over [0, 1]."""
+    c = torch.tensor(stops, device=x.device, dtype=torch.float32)
+    pos = x.clamp(0, 1) * (len(stops) - 1)
+    i = pos.floor().long().clamp(max=len(stops) - 2)
+    f = (pos - i)[:, None]
+    return c[i] * (1 - f) + c[i + 1] * f
+
+
+EMBER = [
+    (0.10, 0.05, 0.25),
+    (0.55, 0.10, 0.45),
+    (0.95, 0.40, 0.25),
+    (1.0, 0.85, 0.45),
+    (1.0, 1.0, 0.9),
+]
+GLACIER = [(0.05, 0.10, 0.25), (0.10, 0.35, 0.60), (0.30, 0.75, 0.85), (0.85, 0.98, 1.0)]
+
+
+def family_hues(n: int) -> torch.Tensor:
+    """Golden-ratio hue per family: neighbours in index never share a colour."""
+    return (torch.arange(n, dtype=torch.float32) * 0.618034 + 0.08) % 1.0
+
+
+def interp_rows(mat: torch.Tensor, t: float) -> torch.Tensor:
+    """Catmull-Rom interpolation of rows of a (T, ...) tensor at fractional t."""
+    n = mat.shape[0]
+    i = math.floor(t)
+    u = t - i
+    idx = [min(max(i + k, 0), n - 1) for k in (-1, 0, 1, 2)]
+    p0, p1, p2, p3 = (mat[j].float() for j in idx)
+    u2, u3 = u * u, u * u * u
+    return 0.5 * (
+        2 * p1
+        + (-p0 + p2) * u
+        + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2
+        + (-p0 + 3 * p1 - 3 * p2 + p3) * u3
+    )
+
+
+def splat(
+    frame: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, rgb: torch.Tensor, w: int, h: int
+) -> None:
+    """Bilinear additive splat of points into an (h*w, 3) buffer.
+
+    Four index_adds with sub-pixel weights: motion stays continuous even on a
+    coarse buffer, which is what keeps chunky pixels from crawling.
+    """
+    x0 = sx.floor()
+    y0 = sy.floor()
+    fx = (sx - x0)[:, None]
+    fy = (sy - y0)[:, None]
+    x0 = x0.long()
+    y0 = y0.long()
+    for dx, dy, wt in (
+        (0, 0, (1 - fx) * (1 - fy)),
+        (1, 0, fx * (1 - fy)),
+        (0, 1, (1 - fx) * fy),
+        (1, 1, fx * fy),
+    ):
+        xi = x0 + dx
+        yi = y0 + dy
+        ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        frame.index_add_(0, (yi * w + xi)[ok], (rgb * wt)[ok])
+
+
+def uniform_disc(xy: torch.Tensor) -> torch.Tensor:
+    """Keep each point's angle, replace its radius by sqrt(rank) -- a uniform disc.
+
+    The correlation-space embedding piles noise voxels (tiny loadings) at the
+    origin, so drawn as-is it is one bright blob. Ranking the radius spreads
+    the cloud evenly while keeping who sits near whom by angle and by order.
+    """
+    r = xy.norm(dim=1)
+    rank = torch.empty_like(r)
+    rank[torch.argsort(r)] = torch.linspace(0, 1, r.numel(), device=r.device)
+    return xy / r.clamp_min(1e-9)[:, None] * rank.sqrt()[:, None]
+
+
+class Drives:
+    """Data time, the live per-voxel value, and everything derived per frame."""
+
+    def __init__(self, feats: Features, params: dict[str, float]):
+        self.f = feats
+        self.p = params
+        self.device = feats.z.device
+        self.t = 0.0  # data time, TRs
+        self.wall = 0.0  # seconds since start, for motion that runs while paused
+        self.live = torch.zeros(feats.n_voxels, device=self.device)
+        self.g = 0.0
+        self.d = 0.0
+        self.fam = torch.zeros(feats.family_tcs.shape[1], device=self.device)
+        self.n_fam = int(feats.family_tcs.shape[1])
+        dz = (feats.z[1:].float() - feats.z[:-1].float()).square().mean(0).sqrt()
+        # Per-voxel innovation: how much of the variance is frame-to-frame
+        # change. Smooth signal glides, noise fizzes.
+        self.innovation = (dz / 2**0.5).clamp(0, 1.5)
+        self._color_key: tuple | None = None
+        self._gate_key: float | None = None
+        counts = torch.bincount(feats.family, minlength=self.n_fam).float()
+        sal = torch.zeros(self.n_fam, device=self.device).index_add_(
+            0, feats.family, feats.salience
+        )
+        self.family_salience = sal / counts.clamp_min(1)
+        self.family_size = counts / counts.sum()
+
+    @property
+    def n_time(self) -> int:
+        return self.f.n_time
+
+    def seek(self, t: float) -> None:
+        self.t = float(t) % (self.n_time - 1)
+
+    def activity(self, t: float) -> torch.Tensor:
+        """Raw z blended toward the low-rank part (correlation pooling)."""
+        raw = interp_rows(self.f.z, t)
+        c = self.p["clarity"]
+        if c <= 0:
+            return raw
+        # Unscaled on purpose: a voxel's low-rank part keeps the variance its
+        # correlated partners vouch for and loses the rest.
+        recon = self.f.loadings @ interp_rows(self.f.tcs, t)
+        return raw * (1 - c) + recon * c
+
+    def pooled(self, x: torch.Tensor) -> torch.Tensor:
+        """Blend each voxel's value with its neighbourhood's (``reach`` passes)."""
+        mix = self.p["pool"]
+        if mix <= 0:
+            return x
+        nb = self.f.extras["neighbours"]
+        local = x
+        for _ in range(int(self.p["reach"])):
+            local = (local + local[nb].sum(1)) / 7.0
+        # No rescale: averaging shrinks independent noise and leaves a spatially
+        # coherent response at full size, and that contrast is the point -- most
+        # of the brain carries no task signal.
+        return x * (1 - mix) + local * mix
+
+    def advance(self, dt: float, playing: bool = True) -> None:
+        self.wall += dt
+        if playing:
+            self.t = (self.t + self.p["speed"] * dt) % (self.n_time - 1)
+        a = self.pooled(self.activity(self.t))
+        k = self.p["smooth"]
+        self.live = self.live * k + a * (1 - k)
+        self.g = float(interp_rows(self.f.global_signal[:, None], self.t)[0])
+        self.d = float(interp_rows(self.f.dvars[:, None], self.t)[0])
+        self.fam = interp_rows(self.f.family_tcs, self.t)
+
+    # --------------------------------------------------------------- shading
+
+    def gate(self) -> torch.Tensor:
+        key = self.p["gate"]
+        if key != self._gate_key:
+            self._gate_w = self.f.salience**key
+            self._gate_key = key
+        return self._gate_w
+
+    def brightness(self, lv: torch.Tensor | None = None) -> torch.Tensor:
+        """Per-voxel glow from the live value: threshold, gain, salience gate."""
+        p = self.p
+        lv = self.live if lv is None else lv
+        thr = p["threshold"]
+        up = (lv - thr).clamp_min(0)
+        down = (-lv - thr).clamp_min(0) * p["negative"]
+        out = (up + down) * p["gain"]
+        if p["gate"] > 0:
+            out = out * self.gate()
+        return out
+
+    def base_colors(self) -> torch.Tensor:
+        """(N, 3) per-voxel colour from the chosen source, luminance-normalised."""
+        p = self.p
+        src = COLOR_SOURCES[int(p["color"])]
+        key = (src, int(p["wave"]))
+        if key != self._color_key:
+            f = self.f
+            n = f.n_voxels
+            one = torch.ones(n, device=self.device)
+            if src == "family":
+                hue = family_hues(self.n_fam).to(self.device)[f.family]
+                rgb = hsv_to_rgb(hue, 0.35 + 0.5 * f.family_weight, one)
+            elif src == "wave":
+                w = min(int(p["wave"]), f.phase.shape[1] - 1)
+                hue = (f.phase[:, w] + math.pi) / (2 * math.pi)
+                rgb = hsv_to_rgb(hue, 0.15 + 0.8 * f.phase_power[:, w], one)
+            elif src == "tsnr":
+                rgb = ramp(f.tsnr, GLACIER)
+            elif src == "coherence":
+                rgb = ramp(f.coherence.clamp(0, 0.6) / 0.6, EMBER)
+            elif src == "mean":
+                rgb = ramp(f.mean, GLACIER)
+            else:
+                rgb = torch.ones(n, 3, device=self.device)
+            lum = (rgb * torch.tensor([0.30, 0.59, 0.11], device=self.device)).sum(1, keepdim=True)
+            self._color = rgb / lum.clamp_min(0.15) * 0.7
+            self._color_key = key
+        return self._color
+
+    def colors(self, lv: torch.Tensor | None = None) -> torch.Tensor:
+        """Per-voxel colour for this frame: rising voxels warm, falling cool."""
+        lv = self.live if lv is None else lv
+        base = self.base_colors()
+        if COLOR_SOURCES[int(self.p["color"])] == "sign":
+            warm = torch.tensor([1.0, 0.55, 0.2], device=self.device)
+            cool = torch.tensor([0.25, 0.55, 1.0], device=self.device)
+            return torch.where((lv >= 0)[:, None], warm, cool)
+        cool = base * torch.tensor([0.45, 0.7, 1.3], device=self.device)
+        return torch.where((lv >= 0)[:, None], base, cool)
+
+    def family_rgb(self) -> torch.Tensor:
+        """(F, 3) one colour per family, matching ``colors`` under 'family'."""
+        hue = family_hues(self.n_fam).to(self.device)
+        rgb = hsv_to_rgb(hue, torch.full_like(hue, 0.7), torch.ones_like(hue))
+        lum = (rgb * torch.tensor([0.30, 0.59, 0.11], device=self.device)).sum(1, keepdim=True)
+        return rgb / lum.clamp_min(0.15) * 0.7
+
+    def finish(self, accum: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Tone-map an (h*w, 3) linear buffer to (h, w, 3) uint8 with the global effects."""
+        p = self.p
+        # Global signal shifts colour temperature; DVARS spikes flash.
+        tint = math.tanh(self.g * 0.5) * p["tint"] * 0.25
+        tint_v = torch.tensor([1 + tint, 1.0, 1 - tint], device=self.device).clamp_min(0)
+        flash = 1.0 + max(0.0, self.d - 2.0) * p["flash"] * 0.25
+        x = accum * tint_v * (p["exposure"] * flash)
+        out = 1.0 - torch.exp(-x)
+        if p["saturation"] != 1.0:
+            lum = (out * torch.tensor([0.30, 0.59, 0.11], device=self.device)).sum(1, keepdim=True)
+            out = lum + (out - lum) * p["saturation"]
+        out = out.clamp(0, 1) ** (1 / 1.8)
+        return (out.reshape(h, w, 3) * 255).to(torch.uint8)
