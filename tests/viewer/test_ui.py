@@ -495,6 +495,8 @@ def test_the_bar_follows_a_threshold_change(win, qapp):
     qapp.processEvents()
     assert win.colorbar._threshold == pytest.approx(1.25)
     assert win.thr_spin.value() == pytest.approx(1.25)
+    assert win.thr_spin.lineEdit().width() > 1
+    assert win.thr_spin.mapTo(win, win.thr_spin.rect().topRight()).x() < win.width()
 
 
 def test_the_bar_follows_a_range_change(win, qapp):
