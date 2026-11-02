@@ -2,14 +2,22 @@
 
 Each voxel starts at its place in the 2-D correlation-space layout, where
 correlated voxels sit together. Each ICA family owns a vortex at its members'
-centroid; the vortex spins with the family's time course (signed, so a falling
-network turns back) and its reach scales with the family's spread. Particles
-are carried around by the sum of all vortices, eased back home by a weak
-spring, and nudged by a curl field scaled by frame-to-frame unpredictability.
-Long trails turn the paths into ink.
+centroid; the vortex winds up with the family's time course (signed, so a
+falling network turns back) and its reach scales with the family's spread.
+
+The motion is a twist map, not forces: each vortex rotates points about its
+centre by an angle that depends only on distance from it, and the angles relax
+back to zero, so ink untwists home when its family goes quiet. A twist
+preserves area exactly. The force version (vortex plus a spring home) did not:
+its equilibria all shrink toward the vortex centre by tether/sqrt(tether^2 +
+spin^2), which drew as a white core swallowing the picture. A divergence-free
+curl offset scaled by frame-to-frame unpredictability adds eddies. Long trails
+turn the paths into ink.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -24,8 +32,18 @@ class FlowScene(Scene):
     name = S
     blurb = "ink: correlation space stirred by one vortex per family"
     PARAMS = (
-        Param("stir", 1.0, 0.0, 5.0, S, "vortex speed per unit of family activity", scene=S),
-        Param("tether", 0.6, 0.0, 5.0, S, "pull back toward the correlation-space home", scene=S),
+        Param(
+            "stir",
+            1.5,
+            0.0,
+            6.0,
+            S,
+            "twist (radians per second) per unit of family activity",
+            scene=S,
+        ),
+        Param(
+            "tether", 0.6, 0.0, 5.0, S, "how fast a twist relaxes back home (per second)", scene=S
+        ),
         Param("eddies", 0.3, 0.0, 3.0, S, "curl noise scaled by unpredictability", scene=S),
         Param(
             "ink", 0.12, 0.0, 1.5, S, "faint glow of every voxel, so the ink shows at rest", scene=S
@@ -75,19 +93,22 @@ class FlowScene(Scene):
 
     def step(self, dt: float) -> None:
         p, dr = self.p, self.dr
+        if not hasattr(self, "phi") or self.phi.numel() != dr.n_fam:
+            self.phi = torch.zeros(dr.n_fam, device=self.device)
         sal = dr.family_salience / dr.family_salience.max().clamp_min(1e-6)
-        strength = dr.fam.clamp(-3, 3) * sal * p["stir"]  # (F,)
-        x = self.pos
-        vel = torch.zeros_like(x)
-        # Vortices in voxel chunks of all families at once would be (N, F, 2);
-        # F is small, so loop it instead and keep memory at (N, 2).
+        self.phi = (self.phi + dr.fam.clamp(-3, 3) * sal * p["stir"] * dt) * math.exp(
+            -p["tether"] * dt
+        )
+        x = self.home.clone()
         for k in range(dr.n_fam):
             rel = x - self.centre[k]
-            fall = torch.exp(-rel.square().sum(1) / self.sigma2[k])
-            perp = torch.stack([-rel[:, 1], rel[:, 0]], 1)
-            vel = vel + perp * (strength[k] * fall)[:, None]
-        vel = vel + (self.home - x) * p["tether"]
+            ang = self.phi[k] * torch.exp(-rel.square().sum(1) / self.sigma2[k])
+            c, s = torch.cos(ang), torch.sin(ang)
+            x = self.centre[k] + torch.stack(
+                [rel[:, 0] * c - rel[:, 1] * s, rel[:, 0] * s + rel[:, 1] * c], 1
+            )
         if p["eddies"] > 0:
+            # Each component depends only on the other coordinate: divergence-free.
             q = x * 6.0
             wt = dr.wall * 0.5
             curl = torch.stack(
@@ -97,8 +118,8 @@ class FlowScene(Scene):
                 ],
                 1,
             )
-            vel = vel + curl * (dr.innovation * p["eddies"] * 0.2)[:, None]
-        self.pos = x + vel * dt
+            x = x + curl * (dr.innovation * p["eddies"] * 0.02)[:, None]
+        self.pos = x
 
     def render(self) -> torch.Tensor:
         p, dr, f = self.p, self.dr, self.f
