@@ -102,7 +102,7 @@ class FlowScene(Scene):
         x = self.home.clone()
         for k in range(dr.n_fam):
             rel = x - self.centre[k]
-            ang = self.phi[k] * torch.exp(-rel.square().sum(1) / self.sigma2[k])
+            ang = self.phi[k] * torch.exp(-(rel[:, 0] ** 2 + rel[:, 1] ** 2) / self.sigma2[k])
             c, s = torch.cos(ang), torch.sin(ang)
             x = self.centre[k] + torch.stack(
                 [rel[:, 0] * c - rel[:, 1] * s, rel[:, 0] * s + rel[:, 1] * c], 1

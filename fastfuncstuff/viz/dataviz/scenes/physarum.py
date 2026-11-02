@@ -125,8 +125,9 @@ class PhysarumScene(Scene):
         dr = self.dr
         # Each species against its own bright end, so a sparse network and a
         # dense one both read; veins, not a uniform glow.
-        ref = torch.quantile(self.trail.reshape(self.dr.n_fam, -1)[:, ::7], 0.995, dim=1).clamp_min(
-            1e-3
+        sample = self.trail.reshape(self.dr.n_fam, -1)[:, ::7]
+        ref = (
+            torch.topk(sample, max(1, sample.shape[1] // 200), dim=1).values[:, -1].clamp_min(1e-3)
         )
         tr = (self.trail / ref[:, None, None]).clamp(0, 1.5) ** 1.5
         img = torch.einsum("fc,fhw->chw", dr.family_rgb(), tr)

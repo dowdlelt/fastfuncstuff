@@ -71,23 +71,26 @@ class AttractorScene(Scene):
         target[:k] = torch.tanh(interp_rows(self.f.tcs, dr.t)[:k] * 0.6)
         self.steer = self.steer + (target - self.steer) * min(1.0, dt / max(p["ease"], 1e-3))
 
-    def _params(self) -> tuple[float, float, float, float]:
-        base = _BASE[MAPS[int(self.p["map"])]]
-        s = self.steer.tolist()
-        return tuple(b + self.p["steer"] * v for b, v in zip(base, s, strict=True))  # type: ignore[return-value]
+    def _params(self) -> torch.Tensor:
+        """(4,) map parameters on the device: base plus steering (no read-back)."""
+        base = self.dr._const(MAPS[int(self.p["map"])], _BASE[MAPS[int(self.p["map"])]])
+        return base + self.p["steer"] * self.steer
 
     def render(self) -> torch.Tensor:
         p, dr, f = self.p, self.dr, self.f
         h, w = self.height, self.width
-        a, b, c, d = self._params()
+        par = self._params()
         # Per-point parameters: the shared map plus the family's peel.
         fam = f.family
         if self.offset.shape[0] != dr.n_fam:
             self.offset = torch.nn.functional.normalize(self.randn(dr.n_fam, 4), dim=1)
         peel = self.offset * (p["peel"] * (0.15 + dr.fam.clamp(0, 3)))[:, None]  # (F, 4)
-        pa, pb, pc, pd = (v + peel[fam, i] for i, v in enumerate((a, b, c, d)))
+        pa, pb, pc, pd = (par[i] + peel[fam, i] for i in range(4))
         mode = MAPS[int(p["map"])]
-        reach = 2.0 if mode == "dejong" else 1.0 + max(abs(c), abs(d))
+        # Framing from the base parameters: steering moves them by at most
+        # `steer`, so the host can fit the view without reading the device.
+        base = _BASE[mode]
+        reach = 2.0 if mode == "dejong" else 1.0 + max(abs(base[2]), abs(base[3])) + self.p["steer"]
         scale = 0.48 * min(w, h) * p["azoom"] / reach
         hops = int(p["hops"])
         glow = (0.2 + p["burn"] * dr.brightness() / max(p["gain"], 1e-3)) * self.density / hops

@@ -18,7 +18,7 @@ import math
 import torch
 
 from ..drives import Param, splat
-from .base import Scene
+from .base import Scene, orbit_project
 
 
 def golden_directions(n: int, device: torch.device) -> torch.Tensor:
@@ -102,6 +102,7 @@ class BrainScene(Scene):
         self._build(int(self.p["sparks"]))
 
     def _build(self, sparks_per_voxel: int) -> None:
+        self.n_sparks = sparks_per_voxel  # _rep reads it while building
         n = self.f.n_voxels
         ar = torch.arange(n, device=self.device)
         self.vox = ar.repeat(1 + sparks_per_voxel)
@@ -117,6 +118,14 @@ class BrainScene(Scene):
         self.vel = torch.zeros(m, 3, device=self.device)
         self.n_sparks = sparks_per_voxel
 
+    def _rep(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-voxel values onto the particles (dust, then each spark copy).
+
+        The particles are the voxels repeated, so a repeat does what a gather
+        by ``vox`` did, at a fraction of the cost on the CPU.
+        """
+        return x.repeat(1 + self.n_sparks, *([1] * (x.ndim - 1)))
+
     def on_param(self, name, value):
         if name == "sparks" and int(value) != self.n_sparks:
             self._build(int(value))
@@ -125,18 +134,17 @@ class BrainScene(Scene):
         f = self.f
         m = self.p["morph"]
         base = f.anat if m <= 0 else f.anat * (1 - m) + f.func * m
-        return base[self.vox]
+        return self._rep(base)
 
     def step(self, dt: float) -> None:
         p, f, dr = self.p, self.f, self.dr
         spark = self.is_spark
-        vox = self.vox
-        lv = dr.live[vox]
+        lv = self._rep(dr.live)
 
         target = self._home() + self.jitter
-        lift = (lv.clamp_min(0) * p["bloom"])[:, None] * self.radial[vox]
+        lift = (lv.clamp_min(0) * p["bloom"])[:, None] * self._rep(self.radial)
         drift_v = (dr.fam[:, None] * self.fam_dir) * p["flock"]  # (F, 3)
-        drift = drift_v[f.family[vox]] * f.family_weight[vox][:, None]
+        drift = self._rep(drift_v[f.family] * f.family_weight[:, None])
         target = target + (lift + drift) * spark[:, None]
         force = (target - self.pos) * p["spring"]
 
@@ -153,13 +161,13 @@ class BrainScene(Scene):
                 ],
                 1,
             )
-            amp = dr.innovation[vox] * (0.3 + lv.abs().clamp(max=3)) * spark
+            amp = self._rep(dr.innovation) * (0.3 + lv.abs().clamp(max=3)) * spark
             force = force + flow * (amp * p["shimmer"] * 0.6)[:, None]
 
         # Everything gets a radial kick on a DVARS spike: motion and other
         # whole-brain events become a visible jolt.
         if p["shudder"] > 0 and dr.d > 2.5:
-            force = force + self.radial[vox] * ((dr.d - 2.5) * p["shudder"] * 0.8)
+            force = force + self._rep(self.radial) * ((dr.d - 2.5) * p["shudder"] * 0.8)
 
         self.vel = self.vel + force * dt
         if p["align"] > 0:
@@ -179,16 +187,14 @@ class BrainScene(Scene):
 
     def _project(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         p = self.p
-        yaw = p["yaw"] + self.dr.wall * p["orbit"]
-        cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(p["pitch"]), math.sin(p["pitch"])
-        # World is RAS. The camera looks along +y (from behind the head) with z
-        # up, then yaws about z and pitches about x.
-        rot_yaw = torch.tensor([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], device=self.device)
-        rot_pitch = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], device=self.device)
-        q = self.pos @ (rot_pitch @ rot_yaw).T
-        depth = q[:, 1] + 3.2
-        scale = p["zoom"] * self.height * 1.05 / depth
-        return self.width * 0.5 + q[:, 0] * scale, self.height * 0.5 - q[:, 2] * scale, depth
+        return orbit_project(
+            self.pos,
+            p["yaw"] + self.dr.wall * p["orbit"],
+            p["pitch"],
+            p["zoom"],
+            self.width,
+            self.height,
+        )
 
     def render(self) -> torch.Tensor:
         p, dr = self.p, self.dr
@@ -196,15 +202,14 @@ class BrainScene(Scene):
         sx, sy, depth = self._project()
         n = self.f.n_voxels
         self.remember(sx[:n], sy[:n])  # the dust: one particle per voxel, on its home
-        vox = self.vox
         spark = self.is_spark
         dens = self.density
-        spark_i = dr.brightness()[vox] * dens / max(1, self.n_sparks)
-        dust_i = p["dust"] * (0.05 + self.dust_w[vox]) * dens * 1.5
+        spark_i = self._rep(dr.brightness()) * dens / max(1, self.n_sparks)
+        dust_i = p["dust"] * (0.05 + self._rep(self.dust_w)) * dens * 1.5
         inten = torch.where(spark, spark_i, dust_i)
         inten = inten * torch.exp(-(depth - 3.2).clamp_min(-1.5) * p["fog"] * 1.2)
-        dust_rgb = torch.tensor([0.55, 0.65, 0.9], device=self.device)
-        rgb = torch.where(spark[:, None], dr.colors()[vox], dust_rgb) * inten[:, None]
+        dust_rgb = dr._const("dust", (0.55, 0.65, 0.9))
+        rgb = torch.where(spark[:, None], self._rep(dr.colors()), dust_rgb) * inten[:, None]
         frame = torch.zeros(h * w, 3, device=self.device)
         splat(frame, sx, sy, rgb, w, h)
         self.fade_in(frame)

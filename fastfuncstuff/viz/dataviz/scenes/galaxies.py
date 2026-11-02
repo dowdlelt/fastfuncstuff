@@ -101,28 +101,31 @@ class GalaxiesScene(Scene):
         self._corr_key = None
         self._spawn(torch.ones(f.n_voxels, dtype=torch.bool, device=dev))
 
-    def _spawn(self, which: torch.Tensor) -> None:
+    def _disc(self, which: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Disc positions and orbital velocities for the stars selected by ``which``."""
         f = self.f
         fam = f.family[which]
         rad = self.radius[fam] * ((1 - self.q[which]) ** 0.8 + 0.03)
         th = self.az[which] + self.p["winding"] * torch.log(rad / self.radius[fam] + 0.05)
         rel = torch.stack([torch.cos(th), torch.sin(th)], 1) * rad[:, None]
+        return self.c[fam] + rel, self.u[fam] + self._circular(rel, fam)
+
+    def _spawn(self, which: torch.Tensor) -> None:
         if not hasattr(self, "pos"):
-            self.pos = torch.zeros(f.n_voxels, 2, device=self.device)
-            self.vel = torch.zeros(f.n_voxels, 2, device=self.device)
-        self.pos[which] = self.c[fam] + rel
-        self.vel[which] = self.u[fam] + self._circular(rel, fam)
+            self.pos = torch.zeros(self.f.n_voxels, 2, device=self.device)
+            self.vel = torch.zeros(self.f.n_voxels, 2, device=self.device)
+        self.pos[which], self.vel[which] = self._disc(which)
 
     def _circular(self, rel: torch.Tensor, fam: torch.Tensor) -> torch.Tensor:
         """Circular-orbit velocity about the own galaxy's centre (Plummer)."""
-        r2 = rel.square().sum(1)
+        r2 = rel[:, 0] ** 2 + rel[:, 1] ** 2
         eps2 = (0.4 * self.radius[fam]) ** 2
         g = (
             self.p["gravity"] * self.mass[fam]
             if hasattr(self, "mass")
             else self.p["gravity"] * self.base_mass[fam]
         )
-        speed = (g * r2 / (r2 + eps2) ** 1.5).sqrt()
+        speed = (g * r2 / ((r2 + eps2) * (r2 + eps2).sqrt())).sqrt()
         perp = torch.stack([-rel[:, 1], rel[:, 0]], 1) / r2.sqrt().clamp_min(1e-6)[:, None]
         return perp * (speed * self.spin[fam])[:, None]
 
@@ -150,9 +153,9 @@ class GalaxiesScene(Scene):
             # Softened by the two galaxies' sizes: extended bodies, not points.
             soft = self.radius[:, None] + self.radius[None, :]
             r2 = d.square().sum(-1) + soft**2
-            acc_c = (G * self.mass[None, :, None] * k[:, :, None] * d / r2[:, :, None] ** 1.5).sum(
-                1
-            )
+            acc_c = (
+                G * self.mass[None, :, None] * k[:, :, None] * d / (r2 * r2.sqrt())[:, :, None]
+            ).sum(1)
             # A soft core: galaxies pass through and tear at each other but do
             # not merge into one blob for good.
             core = (self.radius[:, None] + self.radius[None, :]) * 0.8
@@ -169,9 +172,11 @@ class GalaxiesScene(Scene):
             # Stars: every galaxy's pull (restricted N-body: tides for free).
             acc = torch.zeros_like(self.pos)
             for g in range(dr.n_fam):
-                rel = self.c[g] - self.pos
-                r2s = rel.square().sum(1) + (0.4 * self.radius[g]) ** 2
-                acc = acc + rel * (G * self.mass[g] / r2s**1.5)[:, None]
+                # Per component: a reduction over a size-2 axis is slow on the CPU.
+                rx, ry = self.c[g, 0] - self.pos[:, 0], self.c[g, 1] - self.pos[:, 1]
+                r2s = rx * rx + ry * ry + (0.4 * self.radius[g]) ** 2
+                pull = G * self.mass[g] / (r2s * r2s.sqrt())
+                acc = acc + torch.stack([rx * pull, ry * pull], 1)
             self.vel = self.vel + acc * h
             # Near a core the softened pull is huge; cap speed so a close pass
             # tears a tail instead of firing stars off the screen.
@@ -185,9 +190,14 @@ class GalaxiesScene(Scene):
         if p["nova"] > 0 and dr.d > 2.5:
             self.vel = self.vel + self.randn(f.n_voxels, 2) * (dr.d - 2.5) * p["nova"] * 0.03
         # Strays that wander off for good are reborn in their disc.
-        lost = (self.pos - self.c[fam]).norm(dim=1) > 1.2
-        if bool(lost.any()):
-            self._spawn(lost)
+        # Strays reborn in their disc, by where over every star (no mask, no
+        # sync) -- every 15 frames, since it recomputes every star's disc place.
+        self._tick = getattr(self, "_tick", 0) + 1
+        if self._tick % 15 == 0:
+            lost = ((self.pos - self.c[fam]).norm(dim=1) > 1.2)[:, None]
+            home_pos, home_vel = self._disc(slice(None))
+            self.pos = torch.where(lost, home_pos, self.pos)
+            self.vel = torch.where(lost, home_vel, self.vel)
 
     def render(self) -> torch.Tensor:
         p, dr, f = self.p, self.dr, self.f
@@ -195,11 +205,12 @@ class GalaxiesScene(Scene):
         wts = self.mass / self.mass.sum()
         centre = (self.c * wts[:, None]).sum(0)
         # The camera follows the system and frames its spread, smoothly.
-        reach = float((self.c - centre).norm(dim=1).max()) + float(self.radius.max()) * 1.5
+        # Camera fit kept on the device: reading the spread back cost a sync.
+        reach = ((self.c - centre).norm(dim=1).max() + self.radius.max() * 1.5).clamp_min(0.6)
         if not hasattr(self, "_cam"):
             self._cam, self._reach = centre.clone(), reach
         self._cam = self._cam + (centre - self._cam) * 0.04
-        self._reach += (max(reach, 0.6) - self._reach) * 0.02
+        self._reach = self._reach + (reach - self._reach) * 0.02
         scale = 0.48 * min(w, h) * p["gzoom"] / self._reach
         sx = w * 0.5 + (self.pos[:, 0] - self._cam[0]) * scale
         sy = h * 0.5 + (self.pos[:, 1] - self._cam[1]) * scale

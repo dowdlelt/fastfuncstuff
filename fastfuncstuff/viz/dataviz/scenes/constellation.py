@@ -75,6 +75,7 @@ class ConstellationScene(Scene):
         pairs = pairs[pairs[:, 0] != pairs[:, 1]]
         strength = sim[pairs[:, 0], pairs[:, 1]]
         self.star = star
+        self._cold = torch.tensor([[0.55, 0.45, 1.0]], device=self.device)
         self.ea, self.eb = pairs[:, 0], pairs[:, 1]
         self.esign = torch.sign(strength)
         self.estrength = strength.abs()
@@ -101,7 +102,7 @@ class ConstellationScene(Scene):
         rest = p["web"] * self.estrength * 0.05
         col = dr.colors()[star]
         warm = 0.5 * (col[ea] + col[eb])
-        cold = torch.tensor([0.55, 0.45, 1.0], device=self.device).expand_as(warm)
+        cold = self._cold.expand_as(warm)
         ecol = torch.where((self.esign > 0)[:, None], warm, cold)
         efog = (fog[ea] * fog[eb]).sqrt()[:, None]
         frame = torch.zeros(h * w, 3, device=self.device)
@@ -109,12 +110,12 @@ class ConstellationScene(Scene):
             frame, sx[ea], sy[ea], sx[eb], sy[eb], ecol * ((co + rest)[:, None]) * efog, w, h, 20
         )
         # Pulses: a bright bead running along every lit link.
-        lit = co > 1e-3
-        if bool(lit.any()):
-            u = (self.phase[lit] + dr.wall * p["pulse"]) % 1.0
-            px = sx[ea[lit]] + (sx[eb[lit]] - sx[ea[lit]]) * u
-            py = sy[ea[lit]] + (sy[eb[lit]] - sy[ea[lit]]) * u
-            splat(frame, px, py, ecol[lit] * (co[lit] * 3.0)[:, None] * efog[lit], w, h)
+        # Every link carries a bead weighted by its co-activation, so unlit
+        # links add nothing: fixed shapes, no mask, no sync.
+        u = (self.phase + dr.wall * p["pulse"]) % 1.0
+        px = sx[ea] + (sx[eb] - sx[ea]) * u
+        py = sy[ea] + (sy[eb] - sy[ea]) * u
+        splat(frame, px, py, ecol * (co * 3.0)[:, None] * efog, w, h)
         glow = (dr.brightness()[star] * 0.05 + 0.04) * fog
         splat(frame, sx, sy, col * glow[:, None], w, h)
         self.fade_in(frame)

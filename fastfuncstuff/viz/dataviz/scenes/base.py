@@ -105,10 +105,14 @@ class Scene:
         """
         flat = x.reshape(-1)
         sample = flat if flat.numel() <= 200_000 else flat[:: flat.numel() // 200_000 + 1]
-        peak = float(torch.quantile(sample, 0.98).clamp_min(1e-6))
-        ref = self.__dict__.setdefault("_peaks", {}).get(key, peak)
-        ref += (max(peak, ref * 0.5) - ref) * 0.01
-        self._peaks[key] = ref
+        # topk, not quantile: Metal has no quantile kernel, and the reference
+        # stays on the device so the frame needs no sync.
+        k = max(1, sample.numel() // 50)
+        peak = torch.topk(sample, k).values[-1].clamp_min(1e-6)
+        peaks = self.__dict__.setdefault("_peaks", {})
+        ref = peaks.get(key)
+        ref = peak if ref is None else ref + (torch.maximum(peak, ref * 0.5) - ref) * 0.01
+        peaks[key] = ref
         return (x / ref).clamp(0, 1)
 
     def grid_cells(self, gh: int, gw: int) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -168,12 +172,16 @@ def orbit_project(
     Returns screen x, screen y and depth (distance from the camera).
     """
     cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
-    rot_yaw = torch.tensor([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], device=pos.device)
-    rot_pitch = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], device=pos.device)
-    q = pos @ (rot_pitch @ rot_yaw).T
-    depth = q[:, 1] + 3.2
+    # Yaw about z, then pitch about x, with host scalars: building rotation
+    # matrices as device tensors cost two blocking copies a frame.
+    x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+    qx = cy * x - sy * y
+    qy0 = sy * x + cy * y
+    qy = cp * qy0 - sp * z
+    qz = sp * qy0 + cp * z
+    depth = qy + 3.2
     scale = zoom * height * 1.05 / depth
-    return width * 0.5 + q[:, 0] * scale, height * 0.5 - q[:, 2] * scale, depth
+    return width * 0.5 + qx * scale, height * 0.5 - qz * scale, depth
 
 
 def axial_cells(

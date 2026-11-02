@@ -76,6 +76,11 @@ class GlassScene(Scene):
         self.grid = torch.stack([xs.reshape(-1), ys.reshape(-1)], 1)
         self.inside_flat = self.inside.reshape(-1)
         self.texture = 0.85 + 0.15 * self.rand(self.gh * self.gw)
+        # The canvas never changes between allocations, so index it once: a
+        # boolean mask a frame was a sync on CUDA and a recompile on Metal.
+        self.inside_idx = torch.nonzero(self.inside_flat).squeeze(1)
+        self.pts = self.grid[self.inside_idx]
+        self.texture_in = self.texture[self.inside_idx]
 
     def step(self, dt: float) -> None:
         pass
@@ -90,20 +95,18 @@ class GlassScene(Scene):
         )
         act = self.relative(act)
         centres = self.home + self.drift_dir * (act * p["sway"])[:, None]
-        pts = self.grid[self.inside_flat]
+        pts = self.pts
         d, idx = torch.cdist(pts, centres).topk(2, dim=1, largest=False)
         pane = idx[:, 0]
         # Brighter toward the pane's centre, like light through thick glass.
         depth = 1 - 0.35 * d[:, 0] / (d[:, 0] + d[:, 1]).clamp_min(1e-3)
-        light = (p["ember"] + act[pane] ** 1.5 * 2.2) * depth * self.texture[self.inside_flat]
+        light = (p["ember"] + act[pane] ** 1.5 * 2.2) * depth * self.texture_in
         rgb = self.pane_rgb[pane] * light[:, None]
         lead = (d[:, 1] - d[:, 0]) < p["lead"]
         flash = max(0.0, dr.d - 2.5) * 0.3
-        rgb = torch.where(
-            lead[:, None], torch.tensor([0.9, 0.75, 0.45], device=self.device) * (0.04 + flash), rgb
-        )
+        rgb = torch.where(lead[:, None], dr._const("lead", (0.9, 0.75, 0.45)) * (0.04 + flash), rgb)
         img = torch.zeros(self.gh * self.gw, 3, device=self.device)
-        img[self.inside_flat] = rgb
+        img.index_copy_(0, self.inside_idx, rgb)
         img = img.T.reshape(3, self.gh, self.gw)
         img = F.interpolate(img[None], size=(self.height, self.width), mode="nearest")[0]
         cw, ch = self.width / self.gw, self.height / self.gh

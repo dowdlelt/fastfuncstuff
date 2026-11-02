@@ -113,21 +113,23 @@ class RidgelineScene(Scene):
         else:
             col = self.bin_rgb[i0]
         rgb = col * ((0.35 + val.clamp(max=2.0)) * fade * 0.5)[..., None]
-        r_idx, x_idx = torch.nonzero(seg, as_tuple=True)
+        # Every segment is drawn, hidden ones at zero weight: selecting the
+        # visible ones with nonzero was a sync a frame.
         frame = torch.zeros(h * w, 3, device=self.device)
+        xa = xs[:-1].expand(rows, -1)
         splat_lines(
             frame,
-            x_idx.float(),
-            y[r_idx, x_idx],
-            x_idx.float() + 1,
-            y[r_idx, x_idx + 1],
-            rgb[r_idx, x_idx],
+            xa.reshape(-1),
+            y[:, :-1].reshape(-1),
+            (xa + 1).reshape(-1),
+            y[:, 1:].reshape(-1),
+            (rgb[:, :-1] * seg[..., None]).reshape(-1, 3),
             w,
             h,
             3,
         )
-        centres = (torch.arange(b, device=self.device).float() / (b - 1)) * 2 * float(half[0]) + (
-            w * 0.5 - float(half[0])
-        )
-        self.remember(centres, torch.full_like(centres, float(y0[0])), self.rep)
+        half0 = 0.39 * w / (1.0 + frac * p["depth"])
+        y00 = h * 0.93 - frac * (0.62 * h / rows)
+        centres = torch.linspace(w * 0.5 - half0, w * 0.5 + half0, b, device=self.device)
+        self.remember(centres, torch.full_like(centres, y00), self.rep)
         return dr.finish(frame * 3.0, h, w)
