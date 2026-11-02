@@ -11,6 +11,7 @@ about what the data is doing.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -586,6 +587,13 @@ def compute_features(
     return feats
 
 
+def _release_cache(device: torch.device) -> None:
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def load_features(
     paths: list[str | Path],
     device: torch.device,
@@ -646,17 +654,28 @@ def load_features(
         drop = rng.choice(len(keep), len(keep) - max_voxels, replace=False)
         mask[tuple(keep[drop].T)] = False
 
-    shape = tuple(data.shape[1:])
-    feats = compute_features(
-        data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, device=device, **kwargs
-    )
-    del data
+    def run_on(dev: torch.device) -> Features:
+        return compute_features(
+            data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, device=dev, **kwargs
+        )
+
+    feats = None
+    try:
+        feats = run_on(device)
+    except RuntimeError as exc:
+        if device.type == "cpu" or "out of memory" not in str(exc).lower():
+            raise
+        print(f"ffs_dataviz: {device} ran out of memory, continuing on the CPU", file=sys.stderr)
+    # Out here because the exception's traceback pins the tensors it is reporting.
+    if feats is None:
+        _release_cache(device)
+        feats = run_on(torch.device("cpu"))
+    # Metal keeps every freed buffer: 24 GB held for 8.7 GB live on a 1.1M voxel
+    # run, on a machine that also has to draw the window.
     if device.type == "mps":
-        # Metal keeps every freed buffer: 24 GB held for 8.7 GB live on a 1.1M
-        # voxel run, on a machine that also has to draw the window.
-        torch.mps.empty_cache()
+        _release_cache(device)
     info = {
-        "shape": shape,
+        "shape": tuple(data.shape[1:]),
         "affine": affine,
         "tr": run_tr,
         "names": [Path(p).name for p in paths],

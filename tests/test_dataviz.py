@@ -110,6 +110,48 @@ def test_a_clipped_voxel_does_not_look_salient(fwhm):
         assert feats.salience[v] < feats.salience.median()
 
 
+def test_load_features_falls_back_to_the_cpu_when_the_device_runs_out(
+    tmp_path, monkeypatch, capsys
+):
+    import nibabel as nib
+
+    import fastfuncstuff.viz.dataviz.features as features
+
+    data = 100.0 + np.random.default_rng(2).standard_normal((*SHAPE, 40)).astype(np.float32)
+    path = tmp_path / "run.nii.gz"
+    nib.save(nib.Nifti1Image(data, np.eye(4)), path)
+    real = features.compute_features
+    tried = []
+
+    def fake(*args, device, **kwargs):
+        tried.append(device.type)
+        if device.type != "cpu":
+            raise RuntimeError("MPS backend out of memory (MPS allocated: 8 GiB)")
+        return real(*args, device=device, **kwargs)
+
+    monkeypatch.setattr(features, "compute_features", fake)
+    monkeypatch.setattr(features, "_release_cache", lambda _device: None)
+    feats, _ = features.load_features(
+        [path],
+        torch.device("meta"),
+        tr=1.0,
+        verbose=False,
+        n_components=4,
+        n_families=2,
+        fwhm_mm=0.0,
+    )
+    assert tried == ["meta", "cpu"]
+    assert feats.z.device.type == "cpu"
+    assert "continuing on the CPU" in capsys.readouterr().err
+
+    def other_failure(*_args, **_kwargs):
+        raise RuntimeError("shape mismatch")
+
+    monkeypatch.setattr(features, "compute_features", other_failure)
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        features.load_features([path], torch.device("meta"), tr=1.0, verbose=False)
+
+
 def test_top_two_agrees_with_topk():
     sim = torch.randn(500, 40)
     expect = sim.topk(2, dim=1).indices

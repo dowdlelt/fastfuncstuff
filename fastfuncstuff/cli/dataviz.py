@@ -357,7 +357,8 @@ def main(argv: list[str] | None = None) -> int:
         remove_global=not args.keep_global,
     )
     print(
-        f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) on {device}"
+        f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) "
+        f"on {feats.z.device}"
     )
 
     if args.movie:
