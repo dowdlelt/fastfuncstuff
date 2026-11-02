@@ -37,6 +37,7 @@ def _bins(cells, k):
     return vol, np.bincount(b, cells.volume[cell] * share * r, k) / vol
 
 
+@pytest.mark.slow  # 9-11s per case, 4 cases
 @pytest.mark.parametrize("slide", [0.0, 0.08])  # 0.08 rad: 1.7 mm at the pial sphere
 @pytest.mark.parametrize("method", ["equidistant", "equivolume"])
 def test_cells_tile_the_ribbon_and_bins_are_the_shells(method, slide):

@@ -309,6 +309,7 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
     assert fmap.shape == shape and np.median(fmap[mask]) == pytest.approx(6.0, rel=0.1)
 
 
+@pytest.mark.slow  # 11s
 def test_local_blur_to_evens_out_a_volume_that_is_rough_on_one_side():
     import torch
 

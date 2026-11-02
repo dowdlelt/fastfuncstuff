@@ -197,6 +197,7 @@ def _make_folding_pair():
     return scans, ro, pe_tdim
 
 
+@pytest.mark.slow  # 11s
 def test_antifold_barrier_removes_fold():
     # A field steep enough to fold one polarity: the barrier must drive the min Jacobian
     # back positive, while leaving the field almost unchanged where it was already safe.
@@ -660,6 +661,7 @@ def test_mask_frames_only_the_phase_encode_axis():
     assert m[:, :, 0].any() and m[:, :, -1].any(), "readout edges must stay in the cost"
 
 
+@pytest.mark.slow  # 14s
 def test_estmov_takes_moved_out_of_slab_voxels_out_of_the_cost():
     # A through-plane move leaves one end of the moved scan with no measured data; the
     # border-clamped resample fills it with a copy of the edge slice, which must not
@@ -721,6 +723,7 @@ def test_declared_empty_positions_are_scored_as_zeros():
     assert scored[7] is False
 
 
+@pytest.mark.slow  # 14s
 def test_level_stops_when_the_field_stops_moving():
     # The displacement stop must end a level before miter and report why. Mechanism only:
     # on this phantom the sub-0.1-vox steps it cuts still added up to ~0.6 vox, so how

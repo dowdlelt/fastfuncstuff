@@ -145,6 +145,7 @@ def test_joint_scaling_aligns_both_echoes():
     assert _corr(field, w_true, big) > 0.85
 
 
+@pytest.mark.slow  # 10s
 def test_wrong_alpha_leaves_long_echo_misaligned():
     """Guard: treating both echoes as alpha=1 must fail to align the 2x echo.
 
@@ -381,6 +382,7 @@ def test_slicewise_axis_must_differ_from_pe_axis():
         _build_mescaled_plan(base[None], 1, None, None, cfg, torch.device("cpu"), 2, True, 1)
 
 
+@pytest.mark.slow  # 11s
 def test_slicewise_single_echo_untouched_by_te_scaling():
     """E=1 must not pick up anything from the multi-echo machinery it borrows.
 

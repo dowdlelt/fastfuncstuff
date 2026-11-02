@@ -147,6 +147,7 @@ def test_apply_deveining_rejects_a_depth_mismatch(impulse):
         apply_deveining(torch.zeros(SPEC.K + 1, dtype=W_inv.dtype), W_inv)
 
 
+@pytest.mark.slow  # 19s
 def test_deveined_timecourses_returns_aligned_axes():
     P = zero_params(SPEC)
     P["C"] = torch.tensor([[0.0, 1.0]] * SPEC.N, dtype=SPEC.dtype)

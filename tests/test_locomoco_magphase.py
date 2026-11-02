@@ -418,6 +418,7 @@ def test_cli_two_axis_with_phase_writes_both_components(tmp_path):
     assert (tmp_path / "out.echo-4.part-phase_locomoco.nii.gz").exists()
 
 
+@pytest.mark.slow  # 11s
 def test_cli_detask_fit_cuts_mag_and_phase_alike_and_outputs_stay_raw(tmp_path, monkeypatch):
     """-detask fit with -phase: the estimator sees the task projected out of BOTH channels
     with one basis (else task-locked change re-enters through the uncut one), the phase

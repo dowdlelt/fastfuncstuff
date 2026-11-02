@@ -165,6 +165,7 @@ def test_sample_indices_match_spm_int_it():
     assert np.array_equal(idx.numpy(), expected)
 
 
+@pytest.mark.slow  # 13s
 def test_laminar_bold_increases_toward_surface():
     """End-to-end: a brief stimulus gives a depth profile peaking superficially.
 
