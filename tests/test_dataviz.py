@@ -223,3 +223,62 @@ def test_weave_puts_the_correlated_patch_together(run):
     spread_all = torch.cdist(xy, xy).mean()
     # The patch shares one signal; the SOM must gather it, not scatter it.
     assert spread_patch < 0.6 * spread_all
+
+
+def test_remix_stays_in_range_and_in_scene(run):
+    import copy
+
+    vis = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    vis.set_param("scene", SCENE_NAMES.index("mandala"))
+    before = vis.remix(seed=1)
+    for name, value in vis.p.items():
+        prm = PARAM_BY_NAME[name]
+        assert prm.lo <= value <= prm.hi, name
+        if prm.scene not in (None, "mandala"):
+            assert value == before[name], f"remix touched {name} of another scene"
+    assert vis.p["speed"] == before["speed"] and vis.p["families"] == before["families"]
+    vis.restore(before)
+    assert vis.p == before
+
+
+def test_config_round_trip(run, tmp_path):
+    import copy
+    import json
+
+    vis = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    vis.set_param("scene", SCENE_NAMES.index("glass"))
+    vis.set_param("color", PARAM_BY_NAME["color"].choices.index("spectrum"))
+    vis.set_param("panes", 40)
+    vis.set_mute(1, True)
+    path = tmp_path / "look.json"
+    path.write_text(json.dumps(vis.to_config()))
+    other = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    other.from_config(json.loads(path.read_text()))
+    assert other.scene_name == "glass"
+    assert other.p == vis.p
+    assert bool(other.drives.mute[1]) and int(other.drives.mute.sum()) == 1
+
+
+def test_components_and_mute(run):
+    import copy
+
+    feats = copy.deepcopy(run[0])
+    vis = Visualizer(feats, 48, 32)
+    assert feats.loadings_all.shape[1] > feats.k_active >= 2
+    vis.set_param("components", 4)
+    assert feats.loadings.shape[1] == 4 and feats.family_tcs.shape[1] <= 4
+    assert len(feats.extras["family_flags"]) == feats.family_tcs.shape[1]
+    for scene in SCENE_NAMES:
+        vis.set_param("scene", SCENE_NAMES.index(scene))
+        vis.step(1 / 30)
+        assert vis.render_tensor().shape == (32, 48, 3), scene
+    # A muted family's voxels go dark and its drive stops.
+    vis.step(1 / 30)
+    k = int(feats.family[torch.argmax(vis.drives.brightness())])
+    vis.set_mute(k, True)
+    vis.step(1 / 30)
+    members = feats.family == k
+    assert torch.all(vis.drives.voxel_mute()[members] < 0.1) and torch.all(
+        vis.drives.voxel_mute()[~members] == 1
+    )
+    assert float(vis.drives.fam[k]) == 0.0 and float(vis.drives.fam_amp[k]) == 0.0

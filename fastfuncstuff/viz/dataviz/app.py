@@ -38,6 +38,7 @@ space  play / pause        ← →  step 5 TRs (shift: 25)
 tab m  controls            h    hide everything but the picture (again: back)
 f      fullscreen          s    sound on / off
 c      next colour source  [ ]  slower / faster
+x      remix the look      z  undo remix   ctrl+s save config   ctrl+o load
 click  probe a voxel       i inspector  p z/PSC  o raw/pooled
 l      brain: anatomy ↔ correlation space (animated)
 r      reset view          drag orbit (brain)   wheel zoom
@@ -82,7 +83,18 @@ class Canvas(QtWidgets.QWidget):
             self._draw_probe(p)
         if self.show_hud:
             self._draw_hud(p)
+        self._draw_toast(p)
         p.end()
+
+    def _draw_toast(self, p: QtGui.QPainter) -> None:
+        msg, until = getattr(self.viz, "_toast", ("", 0.0))
+        if not msg or time.perf_counter() > until:
+            return
+        p.setPen(QtGui.QColor(235, 215, 160, 220))
+        font = p.font()
+        font.setPointSizeF(9.5)
+        p.setFont(font)
+        p.drawText(QtCore.QPointF(16, 24), msg)
 
     def _draw_hud(self, p: QtGui.QPainter) -> None:
         viz = self.viz
@@ -257,6 +269,28 @@ class Controls(QtWidgets.QScrollArea):
                     form.addRow(self.blurb)
             self._add(groups[prm.group], prm)
 
+        mix = QtWidgets.QGroupBox("remix and configs")
+        grid = QtWidgets.QGridLayout(mix)
+        for i, (label, fn) in enumerate(
+            (
+                ("remix (x)", viz.remix),
+                ("undo (z)", viz.undo_remix),
+                ("save… (ctrl+s)", viz.save_config_as),
+                ("load… (ctrl+o)", viz.load_config_dialog),
+            )
+        ):
+            b = QtWidgets.QPushButton(label)
+            b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(fn)
+            grid.addWidget(b, i // 2, i % 2)
+        lay.addWidget(mix)
+
+        self.fam_box = QtWidgets.QGroupBox("families: flags and mutes")
+        self.fam_layout = QtWidgets.QVBoxLayout(self.fam_box)
+        self.fam_layout.setContentsMargins(6, 4, 6, 4)
+        lay.addWidget(self.fam_box)
+        self.rebuild_families()
+
         sound = QtWidgets.QGroupBox("sound")
         form = QtWidgets.QFormLayout(sound)
         for name, lo, hi in (
@@ -322,6 +356,38 @@ class Controls(QtWidgets.QScrollArea):
         self.widgets[prm.name] = (sl, val)
         self.refresh(prm.name)
 
+    def rebuild_families(self) -> None:
+        """One row per family: its colour, its noise flags, a mute box."""
+        while self.fam_layout.count():
+            item = self.fam_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        vis = self.viz.vis
+        f = vis.f
+        flags = f.extras.get("family_flags", [])
+        rgb = (vis.drives.family_rgb().clamp(0, 1) * 255).int().tolist()
+        note = QtWidgets.QLabel(
+            f"{f.k_active} of {f.loadings_all.shape[1]} components in use "
+            f"(Marchenko-Pastur ceiling {f.k_suggested}). Flags are hints: "
+            "fast = power above 0.1 Hz, global / motion = tracks the global signal / DVARS, "
+            "edge = sits on the brain's boundary."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #8890a8; font-size: 8pt;")
+        self.fam_layout.addWidget(note)
+        for k in range(vis.drives.n_fam):
+            box = QtWidgets.QCheckBox(
+                f"family {k}  " + (", ".join(flags[k]) if k < len(flags) and flags[k] else "--")
+            )
+            r, g, b = rgb[k]
+            box.setStyleSheet(f"QCheckBox {{ color: rgb({r},{g},{b}); }}")
+            box.setChecked(bool(vis.drives.mute[k]))
+            box.setToolTip(
+                "mute: the family's voxels sink to an ember, its motion stops, its voice falls silent"
+            )
+            box.toggled.connect(lambda on, k=k: vis.set_mute(k, on))
+            self.fam_layout.addWidget(box)
+
     def show_scene(self) -> None:
         from .scenes import SCENES
 
@@ -339,6 +405,12 @@ class Controls(QtWidgets.QScrollArea):
         label = self.widgets[name][1]
         if label is not None:
             label.setText(f"{value:.3g}")
+
+    def refresh_all(self) -> None:
+        for name in self.widgets:
+            self.refresh(name)
+        self.show_scene()
+        self.rebuild_families()
 
     def refresh(self, name: str) -> None:
         if name not in self.widgets:
@@ -366,12 +438,15 @@ class Viz(QtWidgets.QMainWindow):
         params: dict | None = None,
         sound: bool = True,
         start: float = 0.0,
+        config: dict | None = None,
     ):
         super().__init__()
         self.feats = feats
         self.vis = Visualizer(feats, *size)
+        if config is not None:
+            self.vis.from_config(config)
         for k, v in (params or {}).items():
-            self.vis.set_param(k, v)
+            self.vis.set_param(k, v)  # -set wins over -config
         self.vis.seek(start)
         self.son = Sonifier(feats)
         self.gs_np = feats.global_signal.float().cpu().numpy()
@@ -382,6 +457,8 @@ class Viz(QtWidgets.QMainWindow):
         )
         self._set_memory = {i: names[0] for i, (_, names) in enumerate(SETS)}
         self._hidden: dict | None = None
+        self._remix_history: list[dict[str, float]] = []
+        self._toast = ("", 0.0)
         self.setWindowTitle(f"ffs_dataviz — {title}")
         self.setStyleSheet(
             "QMainWindow, QScrollArea, QWidget { background: #07080e; color: #b8c0d8; }"
@@ -441,6 +518,9 @@ class Viz(QtWidgets.QMainWindow):
         if free < 256:
             return
         self.son.gate = 1.0 if (self.playing and self.sound_on) else 0.0
+        mute = self.vis.drives.mute.cpu().numpy()
+        if mute.shape == self.son.mute.shape:
+            self.son.mute = mute
         self.audio_io.write(self.son.render(free, self.vis.t).tobytes())
 
     # ------------------------------------------------------------------- loop
@@ -468,6 +548,57 @@ class Viz(QtWidgets.QMainWindow):
     def seek(self, t: float) -> None:
         self.vis.seek(t)
         self.canvas.update()
+
+    def toast(self, msg: str, seconds: float = 2.5) -> None:
+        self._toast = (msg, time.perf_counter() + seconds)
+
+    def remix(self) -> None:
+        self._remix_history.append(self.vis.remix())
+        self._after_bulk_change()
+        self.toast(f"remix ({len(self._remix_history)} deep; z undoes)")
+
+    def undo_remix(self) -> None:
+        if not self._remix_history:
+            self.toast("nothing to undo")
+            return
+        self.vis.restore(self._remix_history.pop())
+        self._after_bulk_change()
+        self.toast("remix undone")
+
+    def _after_bulk_change(self) -> None:
+        scene = self.vis.scene_name
+        for i, (_, names) in enumerate(SETS):
+            if scene in names:
+                self.scene_set = i
+        self.controls.refresh_all()
+
+    def save_config(self, path: str) -> None:
+        import json
+
+        with open(path, "w") as fh:
+            json.dump(self.vis.to_config(), fh, indent=1)
+        self.toast(f"saved {path}")
+
+    def save_config_as(self) -> None:
+        default = f"ffs_dataviz_{self.vis.scene_name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "save config", default, "configs (*.json)"
+        )
+        if path:
+            self.save_config(path)
+
+    def load_config(self, path: str) -> None:
+        import json
+
+        with open(path) as fh:
+            self.vis.from_config(json.load(fh))
+        self._after_bulk_change()
+        self.toast(f"loaded {path}")
+
+    def load_config_dialog(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "load config", "", "configs (*.json)")
+        if path:
+            self.load_config(path)
 
     def select_scene(self, name: str) -> None:
         self.set_param("scene", float(SCENE_NAMES.index(name)))
@@ -502,12 +633,17 @@ class Viz(QtWidgets.QMainWindow):
 
     def set_param(self, name: str, value: float, from_ui: bool = False) -> None:
         self.vis.set_param(name, value)
-        if name == "families":
+        if name in ("families", "components"):
             # New families, new voices; the inspector's family line follows.
             gate, vol = self.son.gate, self.son.volume
             self.son = Sonifier(self.feats)
             self.son.gate, self.son.volume = gate, vol
             self.inspector.set_probe(self.inspector.probe)
+            self.controls.refresh("families")
+            self.controls.refresh("components")
+            self.controls.rebuild_families()
+        if name == "mute_noise":
+            self.controls.rebuild_families()
         if not from_ui:
             self.controls.refresh(name)
         if name == "scene":
@@ -530,6 +666,18 @@ class Viz(QtWidgets.QMainWindow):
             i = (k - K.Key_1) % 10
             if i < len(names):
                 self.select_scene(names[i])
+        elif k == K.Key_S and e.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+S saves straight to the working directory; the panel's
+            # button asks where.
+            self.save_config(
+                f"ffs_dataviz_{self.vis.scene_name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            )
+        elif k == K.Key_O and e.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            self.load_config_dialog()
+        elif k == K.Key_X:
+            self.remix()
+        elif k == K.Key_Z:
+            self.undo_remix()
         elif k == K.Key_G:
             self.scene_set = (self.scene_set + 1) % len(SETS)
             self.select_scene(self._set_memory[self.scene_set])

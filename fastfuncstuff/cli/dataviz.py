@@ -129,7 +129,13 @@ def build_parser() -> FfsArgumentParser:
         metavar="N",
         help="Legendre drift degree per run (default: AFNI's 1 + duration/150 s)",
     )
-    parser.add_argument("-ncomp", type=int, default=16, metavar="K", help="PCA components kept")
+    parser.add_argument(
+        "-ncomp",
+        type=int,
+        metavar="K",
+        help="PCA components in use at start (default: the Marchenko-Pastur count, at most 32; "
+        "up to 64 are kept and the 'components' slider moves between them)",
+    )
     parser.add_argument(
         "-nfam", type=int, default=10, metavar="F", help="ICA families (voices, flocks)"
     )
@@ -153,6 +159,11 @@ def build_parser() -> FfsArgumentParser:
         metavar="NAME=VALUE",
         help=f"starting parameter values; names: {params}. choice parameters "
         "(scene, color, inject) also take their names",
+    )
+    parser.add_argument(
+        "-config",
+        metavar="JSON",
+        help="a saved look (ctrl+s or the panel's save button); -set values override it",
     )
     parser.add_argument("-no_sound", action="store_true", help="start without audio")
     parser.add_argument(
@@ -210,6 +221,7 @@ def render_movie(
     fps: int,
     sound: bool,
     start: float = 0.0,
+    config: dict | None = None,
 ) -> None:
     import numpy as np
     from tqdm.auto import tqdm
@@ -222,6 +234,8 @@ def render_movie(
     if ffmpeg is None:
         raise SystemExit("ffs_dataviz: -movie needs ffmpeg on PATH")
     sw = Visualizer(feats, *size)
+    if config is not None:
+        sw.from_config(config)
     for k, v in params.items():
         sw.set_param(k, v)
     sw.seek(start)
@@ -303,6 +317,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         raise SystemExit(f"ffs_dataviz: -size wants WxH, got {args.size!r}") from None
     params = parse_sets(args.set)
+    config = None
+    if args.config:
+        import json
+
+        with open(args.config) as fh:
+            config = json.load(fh)
 
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.viz.dataviz.features import load_features
@@ -334,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             start=args.start,
             fps=args.fps,
             sound=not args.no_sound,
+            config=config,
         )
         print(f"ffs_dataviz: wrote {args.movie}")
         return 0
@@ -353,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         params=params,
         sound=not args.no_sound,
         start=args.start,
+        config=config,
     )
 
 

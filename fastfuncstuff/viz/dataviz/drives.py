@@ -191,7 +191,7 @@ class Drives:
         # change. Smooth signal glides, noise fizzes.
         self.innovation = (dz / 2**0.5).clamp(0, 1.5)
         self._color_key: tuple | None = None
-        self._gate_key: float | None = None
+        self._gate_key: tuple | None = None
         self.refresh_families()
         nb = feats.extras["neighbours"][:, 0]
         #: Voxel spacing in the normalised anatomical frame.
@@ -211,6 +211,7 @@ class Drives:
         self.family_salience = sal / counts.clamp_min(1)
         self.family_size = counts / counts.sum()
         self._color_key = None
+        self.mute = torch.zeros(self.n_fam, dtype=torch.bool, device=self.device)
         # Each family as an oscillator: the analytic signal of its time course
         # (periods under 6 s removed), for an instantaneous phase and envelope.
         from .features import analytic_band
@@ -220,6 +221,15 @@ class Drives:
         self.fam_phase = torch.zeros(self.n_fam, device=self.device)
         self.fam_amp = torch.zeros(self.n_fam, device=self.device)
         self.sync = 0.0
+
+    def auto_mute(self, on: bool) -> None:
+        """Mute (or unmute) every family flagged as noise-like."""
+        flags = self.f.extras.get("family_flags", [[]] * self.n_fam)
+        self.mute = torch.tensor([bool(on and fl) for fl in flags], device=self.device)
+
+    def voxel_mute(self) -> torch.Tensor:
+        """(N,) brightness factor: muted families' voxels sink to a faint ember."""
+        return torch.where(self.mute[self.f.family], 0.08, 1.0)
 
     @property
     def n_time(self) -> int:
@@ -354,9 +364,13 @@ class Drives:
         self.g = float(interp_rows(self.f.global_signal[:, None], self.t)[0])
         self.d = float(interp_rows(self.f.dvars[:, None], self.t)[0])
         self.fam = interp_rows(self.f.family_tcs, self.t)
+        if bool(self.mute.any()):
+            self.fam = torch.where(self.mute, torch.zeros_like(self.fam), self.fam)
         re, im = interp_rows(self._fam_re, self.t), interp_rows(self._fam_im, self.t)
         self.fam_phase = torch.atan2(im, re)
         self.fam_amp = (re**2 + im**2).sqrt()
+        if bool(self.mute.any()):
+            self.fam_amp = torch.where(self.mute, torch.zeros_like(self.fam_amp), self.fam_amp)
         # Kuramoto order parameter, envelope-weighted: 1 when the families
         # swing in step, near 0 when their phases are scattered.
         w = self.fam_amp / self.fam_amp.sum().clamp_min(1e-6)
@@ -370,9 +384,10 @@ class Drives:
     # --------------------------------------------------------------- shading
 
     def gate(self) -> torch.Tensor:
-        key = self.p["gate"]
+        # Keyed on the salience tensor too: the components slider replaces it.
+        key = (self.p["gate"], id(self.f.salience))
         if key != self._gate_key:
-            self._gate_w = self.f.salience**key
+            self._gate_w = self.f.salience ** key[0]
             self._gate_key = key
         return self._gate_w
 
@@ -386,6 +401,8 @@ class Drives:
         out = (up + down) * p["gain"]
         if p["gate"] > 0:
             out = out * self.gate()
+        if bool(self.mute.any()):
+            out = out * self.voxel_mute()
         return out
 
     def base_colors(self) -> torch.Tensor:

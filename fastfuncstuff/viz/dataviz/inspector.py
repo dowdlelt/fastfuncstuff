@@ -135,10 +135,12 @@ class Inspector(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(170, 180, 210))
         ijk = f.ijk[v]
         fam = int(f.family[v])
+        flags = f.extras.get("family_flags", [])
+        flag = f" [{', '.join(flags[fam])}]" if fam < len(flags) and flags[fam] else ""
         p.drawText(
             8,
             14,
-            f"voxel {ijk[0]},{ijk[1]},{ijk[2]}   family {fam} (w {float(f.family_weight[v]):.2f})   "
+            f"voxel {ijk[0]},{ijk[1]},{ijk[2]}   family {fam}{flag} (w {float(f.family_weight[v]):.2f})   "
             f"salience {float(f.salience[v]):.2f}   [{self.unit()}, {'pooled' if self.overlay_shown else 'raw'}]"
             "   p z/PSC · o raw/pooled",
         )

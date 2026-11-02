@@ -34,9 +34,11 @@ class Features:
     anat: torch.Tensor  # (N, 3) world position, centred, ~unit radius
     func: torch.Tensor  # (N, 3) functional embedding, ~unit radius
     z: torch.Tensor  # (T, N) float16 detrended z-scores
-    loadings: torch.Tensor  # (N, K) PCA spatial loadings (z = loadings @ tcs.T)
-    tcs: torch.Tensor  # (T, K) PCA time courses, unit variance
-    pc_var: torch.Tensor  # (K,) fraction of variance each component explains
+    loadings_all: torch.Tensor  # (N, Kmax) PCA spatial loadings (z = loadings @ tcs.T)
+    tcs_all: torch.Tensor  # (T, Kmax) PCA time courses, unit variance
+    pc_var_all: torch.Tensor  # (Kmax,) fraction of variance each component explains
+    k_active: int  # components in use (the rest are kept for the slider)
+    k_suggested: int  # Marchenko-Pastur count, the default's ceiling
     family: torch.Tensor  # (N,) int ICA family index
     family_weight: torch.Tensor  # (N,) membership strength in [0, 1]
     family_tcs: torch.Tensor  # (T, F) ICA family time courses, unit variance
@@ -52,10 +54,86 @@ class Features:
     dvars: torch.Tensor  # (T,) robust z of the frame-to-frame RMS change
     extras: dict = field(default_factory=dict)
 
+    @property
+    def loadings(self) -> torch.Tensor:
+        return self.loadings_all[:, : self.k_active]
+
+    @property
+    def tcs(self) -> torch.Tensor:
+        return self.tcs_all[:, : self.k_active]
+
+    @property
+    def pc_var(self) -> torch.Tensor:
+        return self.pc_var_all[: self.k_active]
+
     def refit_families(self, n_families: int, seed: int = 0) -> None:
         """Recompute the families in place for a new family count."""
         for k, v in assign_families(self.loadings, self.z, self.anat, n_families, seed).items():
             setattr(self, k, v)
+        self.flag_families()
+
+    def set_components(self, k: int, n_families: int, seed: int = 0) -> None:
+        """Use the top ``k`` components: communality, salience and families follow."""
+        self.k_active = max(2, min(int(k), self.loadings_all.shape[1]))
+        self.communality = self.loadings.square().sum(1).clamp(0, 1)
+        self.salience = (_rank_unit(self.communality) * _rank_unit(self.coherence)).sqrt()
+        self.refit_families(min(n_families, self.k_active), seed)
+
+    def flag_families(self) -> None:
+        """Mark families that look like noise rather than signal, without a model.
+
+        Hints, not verdicts, so they are shown and offered for muting, never
+        acted on silently. ``extras["family_noise"]`` keeps the numbers:
+
+        * ``fast``   fraction of the family's power above 0.1 Hz (aliased
+          cardiac/respiratory, thermal) -- flagged over 0.45;
+        * ``global`` |r| with the global signal -- flagged over 0.75;
+        * ``motion`` |r| between the family's frame-to-frame change and
+          DVARS -- flagged over 0.45;
+        * ``edge``   members' share of brain-boundary voxels relative to the
+          brain's -- flagged over 2x (edge and ghosting components).
+        """
+        tcs = self.family_tcs.float()
+        n_time, n_fam = tcs.shape
+        freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
+        pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
+        fast = (
+            pw[freqs > 0.1].sum(0) / pw.sum(0).clamp_min(1e-12)
+            if bool((freqs > 0.1).any())
+            else torch.zeros(n_fam, device=tcs.device)
+        )
+
+        def corr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            a = a - a.mean(0)
+            b = (b - b.mean())[:, None]
+            return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
+
+        r_gs = corr(tcs, self.global_signal.float()).abs()
+        change = torch.zeros_like(tcs)
+        change[1:] = (tcs[1:] - tcs[:-1]).abs()
+        r_dv = corr(change, self.dvars.float()).abs()
+        nb = self.extras["neighbours"]
+        boundary = (nb == torch.arange(len(nb), device=nb.device)[:, None]).any(1).float()
+        w = self.family_weight.clamp_min(0.05)
+        share = torch.zeros(n_fam, device=w.device).index_add_(0, self.family, w * boundary)
+        share = share / torch.zeros(n_fam, device=w.device).index_add_(0, self.family, w).clamp_min(
+            1e-9
+        )
+        edge = share / boundary.mean().clamp_min(1e-6)
+        self.extras["family_noise"] = {"fast": fast, "global": r_gs, "motion": r_dv, "edge": edge}
+        flags = []
+        for i in range(n_fam):
+            f = []
+            if fast[i] > 0.45:
+                f.append("fast")
+            if r_gs[i] > 0.75:
+                f.append("global")
+            if r_dv[i] > 0.45:
+                f.append("motion")
+            if edge[i] > 2.0:
+                f.append("edge")
+            flags.append(f)
+        self.extras["family_flags"] = flags
 
     @property
     def n_voxels(self) -> int:
@@ -286,6 +364,23 @@ def assign_families(
     }
 
 
+def suggest_components(evals_desc: np.ndarray, n_voxels: int) -> int:
+    """How many components stand above the Marchenko-Pastur noise edge.
+
+    Each voxel is an observation of a T-dimensional series; the number of
+    independent observations is fewer than the voxel count by however much the
+    data is spatially smooth, but this count is used as a ceiling for a
+    default, so the voxel count is fine -- it errs toward more components,
+    which the pooling and the salience gate are there to tolerate.
+    """
+    from fastfuncstuff.decomposition.model_order import mp_signal_count
+
+    ev = np.asarray(evals_desc, dtype=np.float64)
+    ev = ev[ev > 0]
+    count, _, _ = mp_signal_count(ev, max(1, int(n_voxels)))
+    return max(2, int(count))
+
+
 def compute_features(
     data: torch.Tensor,
     mask: np.ndarray,
@@ -293,8 +388,9 @@ def compute_features(
     tr: float,
     run_starts: list[int],
     *,
-    n_components: int = 16,
+    n_components: int | None = None,
     n_families: int = 10,
+    max_components: int = 64,
     period_s: float | None = None,
     polort: int | None = None,
     seed: int = 0,
@@ -323,30 +419,35 @@ def compute_features(
     steps.update()
 
     # Low rank through the (T, T) Gram: T is hundreds, N is hundreds of thousands.
+    # The eigendecomposition gives every component for free, so keep up to
+    # ``max_components`` and let a slider choose how many are in use.
     gram = zf.T @ zf
-    evals, evecs = plinalg.eigh(gram.double())
-    order = torch.argsort(evals, descending=True)
-    k = min(n_components, n_time - 1)
-    evals = evals[order[:k]].float().clamp_min(1e-12)
-    tcs = evecs[:, order[:k]].float()  # (T, K), orthonormal columns
-    loadings = zf @ tcs  # (N, K): z ≈ loadings @ tcs.T
+    evals_all, evecs = plinalg.eigh(gram.double())
+    order = torch.argsort(evals_all, descending=True)
+    k_max = min(max_components, n_time - 1)
+    evals = evals_all[order[:k_max]].float().clamp_min(1e-12)
+    tcs = evecs[:, order[:k_max]].float()  # (T, Kmax), orthonormal columns
+    loadings = zf @ tcs  # (N, Kmax): z ≈ loadings @ tcs.T
     pc_var = evals / gram.diagonal().sum()
     tcs_unit = tcs * math.sqrt(n_time)
     loadings_unit = loadings / math.sqrt(n_time)
+    k_suggested = suggest_components(evals_all[order].cpu().numpy(), n)
+    k_active = min(k_max, n_components if n_components is not None else min(k_suggested, 32))
     steps.update()
 
     world = torch.as_tensor(
         affine[:3, :3] @ ijk.T + affine[:3, 3:4], device=device, dtype=torch.float32
     ).T
     anat = _centre_scale(world)
-    fams = assign_families(loadings, zf.T, anat, n_families, seed)
+    fams = assign_families(loadings[:, :k_active], zf.T, anat, min(n_families, k_active), seed)
     steps.update()
 
     # Functional layout: each voxel's direction in correlation space. Two voxels
     # whose rows of the row-normalised loading matrix agree are correlated, so
     # projecting those rows onto their own top three axes puts correlated voxels
     # side by side regardless of where they sit in the head.
-    rows = loadings_unit / loadings_unit.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    rows = loadings_unit[:, :k_active]
+    rows = rows / rows.norm(dim=1, keepdim=True).clamp_min(1e-12)
     rows = rows - rows.mean(0, keepdim=True)
     _, _, vh = plinalg.svd(rows[:: max(1, n // 200_000)].double(), full_matrices=False)
     func = _centre_scale(rows @ vh[:3].T.float())
@@ -360,7 +461,7 @@ def compute_features(
     # (coherence). Task cortex and networks score high; white matter, whose
     # fluctuation is mostly independent thermal noise however high its tSNR,
     # scores low. Ranks, so neither measure's scale dominates.
-    communality = (loadings_unit.square().sum(1)).clamp(0, 1)
+    communality = (loadings_unit[:, :k_active].square().sum(1)).clamp(0, 1)
     salience = (_rank_unit(communality) * _rank_unit(coherence)).sqrt()
     steps.update()
 
@@ -379,16 +480,18 @@ def compute_features(
     steps.update()
     steps.close()
 
-    return Features(
+    feats = Features(
         tr=tr,
         run_starts=list(run_starts),
         ijk=ijk,
         anat=anat,
         func=func,
         z=zt.half(),
-        loadings=loadings_unit,
-        tcs=tcs_unit,
-        pc_var=pc_var,
+        loadings_all=loadings_unit,
+        tcs_all=tcs_unit,
+        pc_var_all=pc_var,
+        k_active=k_active,
+        k_suggested=k_suggested,
         **fams,
         mean=_robust_unit(raw_mean),
         tsnr=_robust_unit(tsnr),
@@ -411,6 +514,8 @@ def compute_features(
             "bands": bands,
         },
     )
+    feats.flag_families()
+    return feats
 
 
 def load_features(

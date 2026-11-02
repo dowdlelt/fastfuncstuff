@@ -64,6 +64,7 @@ class Sonifier:
         self.whoosh = 0.6
         self.reverb = 0.35
         self.gate = 1.0  # 0 fades everything out (pause) without a click
+        self.mute = np.zeros(n_fam, dtype=bool)  # muted families fall silent
         self._gate_now = 1.0
         self._reverb = _Reverb(sample_rate)
 
@@ -82,7 +83,7 @@ class Sonifier:
 
         # Voices.
         tc = self._at(self.fam_tcs, t1)
-        target = np.clip(tc - 0.3, 0, 3) / 3.0 * self.voice_gain * self.voices
+        target = np.clip(tc - 0.3, 0, 3) / 3.0 * self.voice_gain * self.voices * ~self.mute
         amp = self.amp[None, :] * (1 - ramp) + target[None, :] * ramp  # (n, F)
         inc = 2 * math.pi * self.freqs / sr
         ph = self.phase[None, :] + inc[None, :] * np.arange(1, n + 1)[:, None]

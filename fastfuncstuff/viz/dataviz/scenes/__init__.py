@@ -54,7 +54,7 @@ SCENE_NAMES = tuple(SCENES)
 #: Number-key sets (g cycles them; 1-9 then 0 pick within the current set).
 SETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
-        "fields",
+        "particles",
         ("mandala", "milkdrop", "galaxies", "constellation", "flow", "sand", "ridgeline", "brain"),
     ),
     ("growth", ("life", "lenia", "turing", "coral", "physarum", "glass", "attractor")),
