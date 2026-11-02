@@ -46,6 +46,14 @@ same drives feed every scene; a scene is only a way of drawing them:
             a nutrient released by active cortex) in its own territory while
             active; quiet reefs recede; growth rings are time.
   ridgeline space across, time into depth: one ridge per moment, receding.
+  life      cellular automata (Life, HighLife, Day & Night, Seeds, Brian's
+            Brain) seen from far away, seeded with soup where cortex is active.
+  lenia     a continuous automaton; activity opens its growth band locally, so
+            living patterns appear, divide and die back where the data is.
+  physarum  slime moulds, one species per family, foraging on activity.
+  glass     a Voronoi window over the head; each pane glows with its voxels.
+  attractor a Clifford/de Jong attractor as a flame; four PC time courses steer
+            it, and each active family peels into its own coloured copy.
 
 most of the brain carries no task signal, so sparks are pooled before they are
 shown: across space (each voxel blended with its neighbourhood: pool, reach)
@@ -59,7 +67,10 @@ sound follows the same drives: each ICA family is a voice on a pentatonic
 scale (pitch from its height in the head, pan from its side), a drone opens up
 with the global signal, and DVARS spikes are a soft swell.
 
-keys: 1-9 0 scene, space play/pause, tab or m controls, h timeline, f fullscreen,
+scenes come in sets (g cycles them; the bottom bar lists the current one).
+
+keys: 1-9 0 scene in set, g next set, space play/pause, tab or m controls,
+h hide everything but the picture, f fullscreen,
 s sound, c colour source, [ ] speed, arrows step, wheel zoom, q quit;
 in brain: drag orbits, l animates anatomy <-> correlation layout.
 

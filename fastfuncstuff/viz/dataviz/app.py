@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .engine import PARAM_BY_NAME, PARAMS, Visualizer
 from .features import Features
-from .scenes import SCENE_NAMES
+from .scenes import SCENE_NAMES, SETS
 from .sound import Sonifier
 
 RESOLUTIONS = ((320, 180), (480, 270), (640, 360), (960, 540), (1280, 720), (1920, 1080))
@@ -32,20 +32,16 @@ ZOOM_PARAM = {
     "constellation": "czoom",
 }
 
-KEYS_HELP = (
-    """\
-1-9 0  scene: """
-    + "  ".join(f"{(i + 1) % 10} {n}" for i, n in enumerate(SCENE_NAMES))
-    + """
+KEYS_HELP = """\
+1-9 0  scene in the current set   g  next set
 space  play / pause        ← →  step 5 TRs (shift: 25)
-tab m  controls            h    timeline
+tab m  controls            h    hide everything but the picture (again: back)
 f      fullscreen          s    sound on / off
 c      next colour source  [ ]  slower / faster
 click  probe a voxel       i inspector  p z/PSC  o raw/pooled
 l      brain: anatomy ↔ correlation space (animated)
 r      reset view          drag orbit (brain)   wheel zoom
 q esc  quit"""
-)
 
 
 class Canvas(QtWidgets.QWidget):
@@ -122,6 +118,7 @@ class Canvas(QtWidgets.QWidget):
         font = p.font()
         font.setPointSizeF(8.5)
         p.setFont(font)
+        self._draw_sets(p, x0, y0 - 22)
         status = "" if viz.playing else "  ❚❚"
         sound = "  ♪" if viz.sound_on else ""
         t = viz.vis.t
@@ -157,6 +154,22 @@ class Canvas(QtWidgets.QWidget):
     def resizeEvent(self, e) -> None:
         self.viz.place_inspector()
         super().resizeEvent(e)
+
+    def _draw_sets(self, p: QtGui.QPainter, x: float, y: float) -> None:
+        """The current set's scenes with their keys, the current one lit."""
+        viz = self.viz
+        name, names = SETS[viz.scene_set]
+        fm = p.fontMetrics()
+        p.setPen(QtGui.QColor(120, 128, 160, 150))
+        label = f"set {viz.scene_set + 1}/{len(SETS)} {name} (g)  "
+        p.drawText(QtCore.QPointF(x, y), label)
+        x += fm.horizontalAdvance(label)
+        for i, scene in enumerate(names):
+            text = f"{(i + 1) % 10} {scene}"
+            lit = scene == viz.vis.scene_name
+            p.setPen(QtGui.QColor(235, 215, 160, 230) if lit else QtGui.QColor(150, 158, 190, 140))
+            p.drawText(QtCore.QPointF(x, y), text)
+            x += fm.horizontalAdvance(text + "   ")
 
     def _in_hud(self, y: float) -> bool:
         return self.show_hud and y > self.height() - 50
@@ -364,6 +377,11 @@ class Viz(QtWidgets.QMainWindow):
         self.gs_np = feats.global_signal.float().cpu().numpy()
         self.dv_np = feats.dvars.float().cpu().numpy()
         self.playing = True
+        self.scene_set = next(
+            i for i, (_, names) in enumerate(SETS) if self.vis.scene_name in names
+        )
+        self._set_memory = {i: names[0] for i, (_, names) in enumerate(SETS)}
+        self._hidden: dict | None = None
         self.setWindowTitle(f"ffs_dataviz — {title}")
         self.setStyleSheet(
             "QMainWindow, QScrollArea, QWidget { background: #07080e; color: #b8c0d8; }"
@@ -451,6 +469,29 @@ class Viz(QtWidgets.QMainWindow):
         self.vis.seek(t)
         self.canvas.update()
 
+    def select_scene(self, name: str) -> None:
+        self.set_param("scene", float(SCENE_NAMES.index(name)))
+
+    def toggle_hidden(self) -> None:
+        """Hide everything but the picture; the second press restores it."""
+        if self._hidden is None:
+            self._hidden = {
+                "hud": self.canvas.show_hud,
+                "inspector": self.inspector.isVisible(),
+                "dock": self.dock.isVisible(),
+            }
+            self.canvas.show_hud = False
+            self.inspector.hide()
+            self.dock.hide()
+            self.canvas.setCursor(QtCore.Qt.CursorShape.BlankCursor)
+        else:
+            self.canvas.show_hud = self._hidden["hud"]
+            self.inspector.setVisible(self._hidden["inspector"])
+            self.dock.setVisible(self._hidden["dock"])
+            self.canvas.unsetCursor()
+            self._hidden = None
+        self.canvas.setFocus()
+
     def place_inspector(self) -> None:
         if not hasattr(self, "inspector"):
             return
@@ -471,6 +512,11 @@ class Viz(QtWidgets.QMainWindow):
             self.controls.refresh(name)
         if name == "scene":
             self.controls.show_scene()
+            scene = SCENE_NAMES[int(value)]
+            for i, (_, names) in enumerate(SETS):
+                if scene in names:
+                    self.scene_set = i
+                    self._set_memory[i] = scene
 
     # ------------------------------------------------------------------- keys
 
@@ -479,15 +525,21 @@ class Viz(QtWidgets.QMainWindow):
         K = QtCore.Qt.Key
         shift = bool(e.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier)
         vis = self.vis
-        if K.Key_0 <= k <= K.Key_9 and (k - K.Key_1) % 10 < len(SCENE_NAMES):
-            self.set_param("scene", float((k - K.Key_1) % 10))
+        if K.Key_0 <= k <= K.Key_9:
+            names = SETS[self.scene_set][1]
+            i = (k - K.Key_1) % 10
+            if i < len(names):
+                self.select_scene(names[i])
+        elif k == K.Key_G:
+            self.scene_set = (self.scene_set + 1) % len(SETS)
+            self.select_scene(self._set_memory[self.scene_set])
         elif k == K.Key_Space:
             self.playing = not self.playing
         elif k in (K.Key_Tab, K.Key_M):
             self.dock.setVisible(not self.dock.isVisible())
             self.canvas.setFocus()
         elif k == K.Key_H:
-            self.canvas.show_hud = not self.canvas.show_hud
+            self.toggle_hidden()
         elif k == K.Key_I:
             self.place_inspector()
             self.inspector.setVisible(not self.inspector.isVisible())

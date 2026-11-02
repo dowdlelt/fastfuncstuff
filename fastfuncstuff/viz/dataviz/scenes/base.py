@@ -74,6 +74,21 @@ class Scene:
     def randn(self, *shape: int) -> torch.Tensor:
         return torch.randn(*shape, generator=self.gen).to(self.device)
 
+    def relative(self, x: torch.Tensor, key: str = "act") -> torch.Tensor:
+        """``x`` over its own recent peak (98th percentile, ~5 s memory), in [0, 1].
+
+        Absolute activity is small almost everywhere (most of the brain sits
+        below threshold), so thresholds on it never trip; relative to what this
+        run has recently reached, the active places read as active.
+        """
+        flat = x.reshape(-1)
+        sample = flat if flat.numel() <= 200_000 else flat[:: flat.numel() // 200_000 + 1]
+        peak = float(torch.quantile(sample, 0.98).clamp_min(1e-6))
+        ref = self.__dict__.setdefault("_peaks", {}).get(key, peak)
+        ref += (max(peak, ref * 0.5) - ref) * 0.01
+        self._peaks[key] = ref
+        return (x / ref).clamp(0, 1)
+
     def resize(self, width: int, height: int) -> None:
         if (width, height) != (self.width, self.height):
             self.width, self.height = int(width), int(height)
@@ -195,6 +210,15 @@ def filled_field(
     cnt = blur(cnt.reshape(gh, gw), passes)
     out = tot / cnt.clamp_min(1e-3)
     return out if values.ndim == 2 else out[0]
+
+
+def disks(spots: torch.Tensor, r: int) -> torch.Tensor:
+    """Grow each True cell of an (H, W) mask into a disk of radius r (round, not square)."""
+    import torch.nn.functional as F
+
+    y = torch.arange(-r, r + 1, device=spots.device, dtype=torch.float32)
+    k = ((y[:, None] ** 2 + y[None, :] ** 2) <= r * r + 0.5).float()[None, None]
+    return F.conv2d(F.pad(spots.float()[None, None], (r, r, r, r)), k)[0, 0] > 0
 
 
 def blur(img: torch.Tensor, passes: int = 1) -> torch.Tensor:

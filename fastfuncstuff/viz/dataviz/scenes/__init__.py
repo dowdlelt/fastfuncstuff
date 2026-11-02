@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+from .attractor import AttractorScene
 from .base import Scene
 from .brain import BrainScene
 from .constellation import ConstellationScene
 from .coral import CoralScene
 from .flow import FlowScene
 from .galaxies import GalaxiesScene
+from .glass import GlassScene
+from .lenia import LeniaScene
+from .life import LifeScene
 from .mandala import MandalaScene
 from .milkdrop import MilkdropScene
+from .physarum import PhysarumScene
 from .ridgeline import RidgelineScene
 from .sand import SandScene
 from .turing import TuringScene
 
-# Order is the number keys: 1-9, then 0.
 SCENES: dict[str, type[Scene]] = {
     cls.name: cls
     for cls in (
@@ -28,8 +32,26 @@ SCENES: dict[str, type[Scene]] = {
         SandScene,
         RidgelineScene,
         BrainScene,
+        LifeScene,
+        LeniaScene,
+        PhysarumScene,
+        GlassScene,
+        AttractorScene,
     )
 }
 SCENE_NAMES = tuple(SCENES)
 
-__all__ = ["SCENES", "SCENE_NAMES", "Scene"]
+#: Number-key sets (g cycles them; 1-9 then 0 pick within the current set).
+SETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "fields",
+        ("mandala", "milkdrop", "galaxies", "constellation", "flow", "sand", "ridgeline", "brain"),
+    ),
+    ("growth", ("life", "lenia", "turing", "coral", "physarum", "glass", "attractor")),
+)
+assert all(name in SCENES for _, names in SETS for name in names)
+assert sorted(n for _, names in SETS for n in names) == sorted(SCENES), (
+    "every scene in exactly one set"
+)
+
+__all__ = ["SCENES", "SCENE_NAMES", "SETS", "Scene"]
