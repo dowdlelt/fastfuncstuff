@@ -195,7 +195,7 @@ def wave_phase(
     for a in range(0, n, chunk):
         za = analytic_band(z[:, a : a + chunk], tr)
         gram += za @ za.conj().T
-    evals, evecs = torch.linalg.eigh(gram.cpu().to(torch.complex128))
+    evals, evecs = plinalg.eigh(gram.cpu().to(torch.complex128))
     order = torch.argsort(evals, descending=True)[:n_waves]
     u = evecs[:, order].to(device=z.device, dtype=torch.complex64)  # (T, W)
     phase = torch.empty(n, u.shape[1], device=z.device)
