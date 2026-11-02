@@ -215,6 +215,12 @@ class HRFSelectionResults:
     oso_gain: torch.Tensor | None = None
 
 
+def _gram_f64(stack: torch.Tensor) -> torch.Tensor:
+    """``X'X`` of a ``(..., T, k)`` stack in float64, converting the stack once."""
+    wide = to_linalg_f64(stack)
+    return torch.matmul(wide.transpose(-2, -1), wide)
+
+
 def _project_design_with_q_factors(
     design: torch.Tensor,
     q_factors: list,
@@ -390,10 +396,7 @@ def _evaluate_hrfs_batched(
             # condition number, and these matrices are tiny, so the promotion is
             # free insurance. Rank-deficient designs (missing events) still get
             # the minimum-norm solution via pinv, as pinv(X) == (X'X)^+ X'.
-            xtx_by_run = [
-                torch.matmul(to_linalg_f64(stack).transpose(1, 2), to_linalg_f64(stack))
-                for stack in designs_stack_by_run
-            ]
+            xtx_by_run = [_gram_f64(stack) for stack in designs_stack_by_run]
             xtx_total = torch.stack(xtx_by_run, dim=0).sum(dim=0)  # (n_designs, n_reg, n_reg)
 
             fold_plans = []
@@ -532,10 +535,7 @@ def _evaluate_hrfs_batched(
         for r in range(n_runs)
     ]
     xtx_by_run = torch.stack(
-        [
-            torch.matmul(to_linalg_f64(stack).transpose(1, 2), to_linalg_f64(stack))
-            for stack in designs_stack_by_run
-        ],
+        [_gram_f64(stack) for stack in designs_stack_by_run],
         dim=0,
     )  # (run, design, reg, reg)
 

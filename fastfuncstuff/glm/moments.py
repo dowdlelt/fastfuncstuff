@@ -138,7 +138,8 @@ def compute_run_moments(
             device=device,
         )
         X = design_proj.to(device)
-        xtx_blocks.append(to_linalg_f64(X).T @ to_linalg_f64(X))
+        X64 = to_linalg_f64(X)
+        xtx_blocks.append(X64.T @ X64)
 
         n_vox = data_proj.shape[0]
         xty = torch.zeros(n_cols, n_vox, device=store_device, dtype=X.dtype)
