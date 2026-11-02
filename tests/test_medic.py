@@ -587,9 +587,8 @@ def test_medic_fieldmaps_gpu_unwrap_recovers_field():
     import pytest
 
     pytest.importorskip("warpkit")
-    from test_phase_unwrap import _scene
-
     from fastfuncstuff.processing.medic import medic_fieldmaps
+    from tests.test_phase_unwrap import _scene
 
     tes = [5.0, 12.0, 19.0]
     ph, mag, field, head, _blob = _scene(tes)

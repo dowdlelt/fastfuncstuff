@@ -7,7 +7,6 @@ check that the two-value forms actually do something different in the right dire
 
 import pytest
 import torch
-from test_locomoco_dual_axes import _blobby
 
 from fastfuncstuff.processing.locomoco import (
     _shift3d_axes,
@@ -17,6 +16,7 @@ from fastfuncstuff.processing.locomoco import (
     xcorr_search_flow_3d_axes,
 )
 from fastfuncstuff.processing.warp import QwarpConfig, _build_mescaled_plan
+from tests.test_locomoco_dual_axes import _blobby
 
 
 def test_axis_params_broadcast_and_length_check():

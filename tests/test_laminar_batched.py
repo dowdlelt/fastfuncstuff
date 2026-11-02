@@ -80,7 +80,7 @@ def test_per_fit_kernels_must_match_the_batch():
 
 
 def _oracle_problem():
-    from test_laminar_modelspace import _oracle, _spec
+    from tests.test_laminar_modelspace import _oracle, _spec
 
     o = _oracle()
     block = o["per_k"][1]

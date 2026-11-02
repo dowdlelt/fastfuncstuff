@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_moco_multiecho import _blob, _shifted_series
 
 from fastfuncstuff.cli.moco import main
 from fastfuncstuff.processing.io import load_image, save_image
+from tests.test_moco_multiecho import _blob, _shifted_series
 
 # 400 Hz across the blob: wider than one wrap period at TE 4 ms (250 Hz) even inside the
 # automask, while neighbour steps stay far below half a period.
