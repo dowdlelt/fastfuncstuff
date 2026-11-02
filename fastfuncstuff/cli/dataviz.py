@@ -118,6 +118,13 @@ def build_parser() -> FfsArgumentParser:
         metavar="S",
         help="movie length in seconds (default: one pass through the run)",
     )
+    parser.add_argument(
+        "-start",
+        type=float,
+        default=0.0,
+        metavar="TR",
+        help="data time to start playing from (TRs)",
+    )
     parser.add_argument("-fps", type=int, default=30, help="movie frame rate (default 30)")
     parser.add_argument("-seed", type=int, default=0, help="random seed (ICA, particle jitter)")
     add_device_arg(parser)
@@ -156,6 +163,7 @@ def render_movie(
     duration: float | None,
     fps: int,
     sound: bool,
+    start: float = 0.0,
 ) -> None:
     import numpy as np
     from tqdm.auto import tqdm
@@ -170,6 +178,7 @@ def render_movie(
     sw = Visualizer(feats, *size)
     for k, v in params.items():
         sw.set_param(k, v)
+    sw.seek(start)
     speed = sw.p["speed"]
     if duration is None:
         duration = (feats.n_time - 1) / speed
@@ -216,7 +225,7 @@ def render_movie(
             return
         import scipy.io.wavfile
 
-        audio = render_track(feats, n_frames, fps, speed)
+        audio = render_track(feats, n_frames, fps, speed, start=start)
         wav = str(Path(tmp) / "audio.wav")
         scipy.io.wavfile.write(wav, 44100, (audio * 32767).astype(np.int16))
         mux = [
@@ -276,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
             size=(w, h),
             params=params,
             duration=args.duration,
+            start=args.start,
             fps=args.fps,
             sound=not args.no_sound,
         )
@@ -291,7 +301,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     return launch(
-        feats, " + ".join(info["names"]), size=(w, h), params=params, sound=not args.no_sound
+        feats,
+        " + ".join(info["names"]),
+        size=(w, h),
+        params=params,
+        sound=not args.no_sound,
+        start=args.start,
     )
 
 

@@ -302,12 +302,14 @@ class Viz(QtWidgets.QMainWindow):
         size: tuple[int, int] = (640, 360),
         params: dict | None = None,
         sound: bool = True,
+        start: float = 0.0,
     ):
         super().__init__()
         self.feats = feats
         self.vis = Visualizer(feats, *size)
         for k, v in (params or {}).items():
             self.vis.set_param(k, v)
+        self.vis.seek(start)
         self.son = Sonifier(feats)
         self.gs_np = feats.global_signal.float().cpu().numpy()
         self.dv_np = feats.dvars.float().cpu().numpy()

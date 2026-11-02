@@ -191,13 +191,18 @@ class _Delay:
 
 
 def render_track(
-    feats: Features, n_frames: int, fps: float, speed: float, sample_rate: int = 44100
+    feats: Features,
+    n_frames: int,
+    fps: float,
+    speed: float,
+    sample_rate: int = 44100,
+    start: float = 0.0,
 ) -> np.ndarray:
     """Offline audio for a movie: (samples, 2) float32 matching ``n_frames``."""
     son = Sonifier(feats, sample_rate)
     per = sample_rate / fps
     chunks = []
-    t = 0.0
+    t = float(start)
     made = 0
     period = feats.n_time - 1
     for i in range(n_frames):
