@@ -56,12 +56,12 @@ class RidgelineScene(Scene):
         )
         self.bin_rgb = famc / self.cnt[:, None]
         # Most salient voxel per bin, for clicking a ridge.
-        best = torch.full((b,), -1.0, device=self.device).scatter_reduce_(
-            0, self.bin_of, f.salience, reduce="amax", include_self=True
-        )
-        hit = f.salience >= best[self.bin_of] - 1e-9
-        self.rep = torch.zeros(b, dtype=torch.long, device=self.device)
-        self.rep[self.bin_of[hit]] = torch.nonzero(hit).squeeze(1)
+        # Most salient voxel per bin by one sort (bin-major, salience-minor):
+        # the last voxel of each bin's run. Avoids scatter_reduce (patchy on Metal).
+        order = torch.argsort(f.salience)
+        order = order[torch.sort(self.bin_of[order], stable=True).indices]
+        last = torch.cumsum(torch.bincount(self.bin_of, minlength=b), 0) - 1
+        self.rep = order[last.clamp_min(0)]
         self.hist = torch.zeros(int(self.p["rows"]), b, device=self.device)
         self.next_t = None
 

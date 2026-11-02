@@ -222,21 +222,6 @@ def axial_cells(
     return cell, shrunk[0, 0] > 0.5, passes
 
 
-def field(
-    values: torch.Tensor, cell: torch.Tensor, n_cells: int, how: str = "mean"
-) -> torch.Tensor:
-    """Per-cell mean (or max) of per-voxel values, (n_cells,) or (n_cells, C)."""
-    if how == "max":
-        out = torch.zeros(n_cells, *values.shape[1:], device=values.device)
-        idx = cell if values.ndim == 1 else cell[:, None].expand_as(values)
-        return out.scatter_reduce_(0, idx, values, reduce="amax", include_self=True)
-    tot = torch.zeros(n_cells, *values.shape[1:], device=values.device).index_add_(0, cell, values)
-    cnt = torch.zeros(n_cells, device=values.device).index_add_(
-        0, cell, torch.ones_like(cell, dtype=torch.float32)
-    )
-    return tot / cnt.clamp_min(1).reshape(-1, *([1] * (values.ndim - 1)))
-
-
 def filled_field(
     values: torch.Tensor, cell: torch.Tensor, gh: int, gw: int, passes: int = 2
 ) -> torch.Tensor:
@@ -339,12 +324,17 @@ def family_ring_sites(scene: Scene, radius: float = 0.3) -> torch.Tensor:
 
 
 def representative(scene: Scene) -> torch.Tensor:
-    """(F,) the most salient member voxel of each family, for picking a source."""
+    """(F,) the most salient member voxel of each family, for picking a source.
+
+    A one-time loop on the CPU rather than scatter_reduce, whose Metal coverage
+    varies by release.
+    """
     f, dr = scene.f, scene.dr
-    best = torch.full((dr.n_fam,), -1.0, device=scene.device).scatter_reduce_(
-        0, f.family, f.salience, reduce="amax", include_self=True
-    )
-    hit = f.salience >= best[f.family] - 1e-9
-    rep = torch.zeros(dr.n_fam, dtype=torch.long, device=scene.device)
-    rep[f.family[hit]] = torch.nonzero(hit).squeeze(1)
-    return rep
+    sal = f.salience.cpu()
+    fam = f.family.cpu()
+    rep = torch.zeros(dr.n_fam, dtype=torch.long)
+    for k in range(dr.n_fam):
+        members = torch.nonzero(fam == k).squeeze(1)
+        if members.numel():
+            rep[k] = members[torch.argmax(sal[members])]
+    return rep.to(scene.device)

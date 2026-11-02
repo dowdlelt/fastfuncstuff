@@ -140,12 +140,12 @@ class SandScene(Scene):
         new = torch.cat([fam_rgb * tone[None], heat[None]], 0)  # (4, n_f*c)
         col_flat = self.col.reshape(4, -1)
         col_flat[:, idx] = torch.where(drop[None], new, col_flat[:, idx])
-        # amax, so a candidate that lands on an already-claimed cell cannot
-        # clear it when two candidates share a cell.
-        occ_u8 = occ_flat.to(torch.uint8).scatter_reduce_(
-            0, idx, drop.to(torch.uint8), reduce="amax"
-        )
-        self.occ = occ_u8.bool().reshape(self.occ.shape)
+        # Counted, so a candidate that lands on an already-claimed cell cannot
+        # clear it when two candidates share a cell (an accumulating
+        # index_put, which every backend has; scatter_reduce is patchier).
+        hits = torch.zeros(occ_flat.numel(), dtype=torch.int32, device=self.device)
+        hits.index_put_((idx,), drop.to(torch.int32), accumulate=True)
+        self.occ = (occ_flat | (hits > 0)).reshape(self.occ.shape)
 
         wind = math.tanh(dr.g * 0.7) * p["wind"]
         quake = dr.d > 2.5 and p["quake"] > 0

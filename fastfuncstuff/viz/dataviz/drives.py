@@ -326,10 +326,13 @@ class Drives:
         self._dv_np = f.dvars.float().cpu().numpy()
         # Each family as an oscillator: the analytic signal of its time course
         # (periods under 6 s removed), for an instantaneous phase and envelope.
+        from fastfuncstuff.utils import cpu_if_mps
+
         from .features import analytic_band
 
-        an = analytic_band(f.family_tcs, f.tr)
-        self._fam_re, self._fam_im = an.real.contiguous(), an.imag.contiguous()
+        an = analytic_band(f.family_tcs.to(cpu_if_mps(self.device, "complex_spectral")), f.tr)
+        self._fam_re = an.real.contiguous().to(self.device)
+        self._fam_im = an.imag.contiguous().to(self.device)
         self.fam_phase = torch.zeros(self.n_fam, device=self.device)
         self.fam_amp = torch.zeros(self.n_fam, device=self.device)
         self.sync = 0.0
@@ -418,10 +421,12 @@ class Drives:
             order = torch.argsort(xy[:, 0])
             col = torch.empty(n, dtype=torch.long, device=self.device)
             col[order] = torch.arange(n, device=self.device) // rows
-            span = (xy[:, 1].max() - xy[:, 1].min()).clamp_min(1e-9)
-            key2 = col.double() * 4 + ((xy[:, 1] - xy[:, 1].min()) / span).double()
+            # Within each column, rank by the second axis: sort by it, then a
+            # stable sort by column (a float64 composite key raises on Metal).
+            by_y = torch.argsort(xy[:, 1])
+            o2 = by_y[torch.sort(col[by_y], stable=True).indices]
             row = torch.empty(n, dtype=torch.long, device=self.device)
-            row[torch.argsort(key2)] = torch.arange(n, device=self.device) % rows
+            row[o2] = torch.arange(n, device=self.device) % rows
             self._weave = ((row.float() + 0.5) / rows, (col.float() + 0.5) / cols, rows, cols)
             self._weave_key = key
         return self._weave
@@ -501,27 +506,34 @@ class Drives:
         only corrupts the shell after the first pass, which ``v`` never reads.
         """
         p, f = self.p, self.f
+        # The ball is a few hundred indices: built on the CPU (unique and
+        # searchsorted need no Metal question), then the data is read on-device.
         nb = f.extras["neighbours"]
+        nb_cpu = getattr(self, "_nb_cpu", None)
+        if nb_cpu is None or nb_cpu.shape != nb.shape:
+            nb_cpu = self._nb_cpu = nb.cpu()
         reach = int(p["reach"]) if p["pool"] > 0 else 0
-        ball = torch.tensor([int(v)], device=self.device)
+        ball = torch.tensor([int(v)])
         for _ in range(reach):
-            ball = torch.unique(torch.cat([ball, nb[ball].reshape(-1)]))
-        act = f.z[:, ball].float()  # (T, B)
+            ball = torch.unique(torch.cat([ball, nb_cpu[ball].reshape(-1)]))
+        centre = int((ball == v).nonzero()[0, 0])
+        ball_dev = ball.to(self.device)
+        act = f.z[:, ball_dev].float()  # (T, B)
         c = p["clarity"]
         if c > 0:
-            act = act * (1 - c) + (f.tcs @ f.loadings[ball].T) * c
+            act = act * (1 - c) + (f.tcs @ f.loadings[ball_dev].T) * c
         if reach == 0:
-            return act[:, (ball == v).nonzero()[0, 0]]
+            return act[:, centre]
         # Neighbour table in ball-local indices; outside the ball -> itself.
-        pos = torch.searchsorted(ball, nb[ball])
-        pos = pos.clamp(max=len(ball) - 1)
-        inside = ball[pos] == nb[ball]
-        local_nb = torch.where(inside, pos, torch.arange(len(ball), device=self.device)[:, None])
+        nbb = nb_cpu[ball]
+        pos = torch.searchsorted(ball, nbb).clamp(max=len(ball) - 1)
+        inside = ball[pos] == nbb
+        local_nb = torch.where(inside, pos, torch.arange(len(ball))[:, None]).to(self.device)
         loc = act
         for _ in range(reach):
             loc = (loc + loc[:, local_nb].sum(-1)) / 7.0
         out = act * (1 - p["pool"]) + loc * p["pool"]
-        return out[:, (ball == v).nonzero()[0, 0]]
+        return out[:, centre]
 
     def advance(self, dt: float, playing: bool = True) -> None:
         self.wall += dt
@@ -546,7 +558,10 @@ class Drives:
         # swing in step, near 0 when their phases are scattered.
         w = self.fam_amp / self.fam_amp.sum().clamp_min(1e-6)
         # Stays on the device: scenes only multiply by it.
-        self.sync = (w * torch.exp(1j * self.fam_phase)).sum().abs()
+        # Real arithmetic, not exp(1j*phase): no complex tensor every frame.
+        self.sync = (
+            (w * torch.cos(self.fam_phase)).sum() ** 2 + (w * torch.sin(self.fam_phase)).sum() ** 2
+        ).sqrt()
         # A slow shadow of the live value: live minus shadow is the trend, and
         # (live, trend) is a voxel's own instantaneous phase.
         if not hasattr(self, "shadow"):

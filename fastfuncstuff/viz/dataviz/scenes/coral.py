@@ -116,7 +116,8 @@ class CoralScene(Scene):
         # families both claim. (A Python loop over families was most of the
         # frame at 1080p.)
         n_f = dr.n_fam
-        mine = F.one_hot(self.label, n_f + 1)[:, 1:].T.float().reshape(1, n_f, self.gh, self.gw)
+        fams = torch.arange(1, n_f + 1, device=self.device)[:, None]
+        mine = (self.label[None] == fams).float().reshape(1, n_f, self.gh, self.gw)
         k = self.kernel.expand(n_f, 1, 3, 3)
         nb = (F.conv2d(F.pad(mine, (1, 1, 1, 1)), k, groups=n_f) - mine).reshape(n_f, -1)
         frontier = empty[None] & (nb > 0) & (act_t > 0)[:, None]

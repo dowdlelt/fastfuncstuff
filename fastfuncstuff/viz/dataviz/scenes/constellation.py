@@ -71,7 +71,11 @@ class ConstellationScene(Scene):
         a = torch.arange(m, device=self.device)[:, None].expand(-1, k).reshape(-1)
         b = top.indices.reshape(-1)
         # Each pair once, whichever side chose it; sim is symmetric.
-        pairs = torch.unique(torch.stack([torch.minimum(a, b), torch.maximum(a, b)], 1), dim=0)
+        # unique(dim=0) on the CPU: a one-time build, and Metal's coverage of it varies.
+        pairs = torch.unique(
+            torch.stack([torch.minimum(a, b), torch.maximum(a, b)], 1).cpu(), dim=0
+        )
+        pairs = pairs.to(self.device)
         pairs = pairs[pairs[:, 0] != pairs[:, 1]]
         strength = sim[pairs[:, 0], pairs[:, 1]]
         self.star = star
