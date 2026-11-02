@@ -649,6 +649,23 @@ def bytes_per_voxel_lag_bank(n_timepoints: int, n_cols: int, n_candidates: int) 
     return 4 * (2 * n_timepoints + 2 * n_candidates * n_cols + 2 * n_candidates)
 
 
+def bytes_per_voxel_spectral(n_timepoints: int) -> int:
+    """Per-voxel peak of a full-length FFT pass (ffs_dataviz features).
+
+    The float32 input slice, its complex64 spectrum, the analytic-signal copy
+    and a float32 power array: about 4 + 8 + 8 + 4 bytes per sample, with a
+    1.5x allowance for cuFFT workspace.
+    """
+    return int(n_timepoints * (4 + 8 + 8 + 4) * 1.5)
+
+
+def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device) -> int:
+    """Voxels per chunk for :func:`bytes_per_voxel_spectral` passes."""
+    avail = get_available_memory(device, empty_cache=False)
+    chunk = avail // max(1, bytes_per_voxel_spectral(n_timepoints))
+    return int(max(1024, min(n_voxels, chunk)))
+
+
 def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
     """
     Estimate memory per voxel for the batched L1 detrend (outlier counting).

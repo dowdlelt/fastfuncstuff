@@ -356,6 +356,7 @@ class Drives:
 
     def advance(self, dt: float, playing: bool = True) -> None:
         self.wall += dt
+        self._frame = getattr(self, "_frame", 0) + 1
         if playing:
             self.t = (self.t + self.p["speed"] * dt) % (self.n_time - 1)
         a = self.pooled(self.activity(self.t))
@@ -391,10 +392,25 @@ class Drives:
             self._gate_key = key
         return self._gate_w
 
+    def _frame_key(self, *names: str) -> tuple:
+        return (getattr(self, "_frame", 0), int(self.mute.sum()), *(self.p[n] for n in names))
+
     def brightness(self, lv: torch.Tensor | None = None) -> torch.Tensor:
-        """Per-voxel glow from the live value: threshold, gain, salience gate."""
+        """Per-voxel glow from the live value: threshold, gain, salience gate.
+
+        Cached per frame: most scenes ask several times (picking weights,
+        fields, splats), and each ask was a handful of full-length kernels.
+        """
+        if lv is None:
+            key = self._frame_key("threshold", "negative", "gain", "gate")
+            if getattr(self, "_bright_key", None) != key:
+                self._bright = self._brightness(self.live)
+                self._bright_key = key
+            return self._bright
+        return self._brightness(lv)
+
+    def _brightness(self, lv: torch.Tensor) -> torch.Tensor:
         p = self.p
-        lv = self.live if lv is None else lv
         thr = p["threshold"]
         up = (lv - thr).clamp_min(0)
         down = (-lv - thr).clamp_min(0) * p["negative"]
@@ -439,8 +455,16 @@ class Drives:
         return self._color
 
     def colors(self, lv: torch.Tensor | None = None) -> torch.Tensor:
-        """Per-voxel colour for this frame: rising voxels warm, falling cool."""
-        lv = self.live if lv is None else lv
+        """Per-voxel colour for this frame: rising voxels warm, falling cool (cached per frame)."""
+        if lv is None:
+            key = self._frame_key("color", "wave")
+            if getattr(self, "_colors_key", None) != key:
+                self._colors = self._colors_for(self.live)
+                self._colors_key = key
+            return self._colors
+        return self._colors_for(lv)
+
+    def _colors_for(self, lv: torch.Tensor) -> torch.Tensor:
         src = COLOR_SOURCES[int(self.p["color"])]
         if src == "phase":
             # Hue = angle of (live, trend): rising, peak, falling, trough go

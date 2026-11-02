@@ -19,6 +19,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.memory import spectral_voxel_chunk
 
 
 @dataclass
@@ -260,7 +261,7 @@ def wave_phase(
     where power is the fraction of each voxel's band power the wave explains.
     """
     n_time, n = z.shape
-    chunk = max(1, int(2**26 // max(n_time, 1)))
+    chunk = spectral_voxel_chunk(n, n_time, z.device)
     if period_s is not None:
         freqs = torch.fft.rfftfreq(n_time, d=tr).to(z.device)
         k = max(1, int((freqs - 1.0 / period_s).abs().argmin()))
@@ -309,7 +310,7 @@ def band_powers(z: torch.Tensor, tr: float) -> torch.Tensor:
     lo, hi = BAND_EDGES_HZ
     sel = [freqs < lo, (freqs >= lo) & (freqs < hi), freqs >= hi]
     out = torch.empty(n, 3, device=z.device)
-    chunk = max(1, int(2**26 // max(n_time, 1)))
+    chunk = spectral_voxel_chunk(n, n_time, z.device)
     for a in range(0, n, chunk):
         pw = torch.fft.rfft(z[:, a : a + chunk].float(), dim=0).abs().square()[1:]
         tot = pw.sum(0).clamp_min(1e-12)

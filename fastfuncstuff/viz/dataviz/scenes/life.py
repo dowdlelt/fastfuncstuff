@@ -68,11 +68,15 @@ class LifeScene(Scene):
             0.05
         )
         terr = filled_field(onehot, self.cell_of, self.gh, self.gw, self.passes + 2)
-        self.home_rgb = blur(dr.family_rgb()[terr.argmax(0)].permute(2, 0, 1), 1)  # (3, gh, gw)
+        # Cells carry a family label, not a colour: lineage is one max-pool per
+        # generation instead of a three-channel convolution.
+        self.home_lab = terr.argmax(0) + 1  # (gh, gw), 1..F
+        self.palette = torch.cat([torch.zeros(1, 3, device=self.device), dr.family_rgb()])
+        self.home_rgb = blur(self.palette[self.home_lab].permute(2, 0, 1), 1)  # backdrop only
         self.state = torch.zeros(
             self.gh, self.gw, dtype=torch.uint8, device=self.device
         )  # 0 off 1 on 2 dying
-        self.rgb = torch.zeros(3, self.gh, self.gw, device=self.device)
+        self.lab = torch.zeros(self.gh, self.gw, dtype=torch.long, device=self.device)
         self.glow = torch.zeros(3, self.gh, self.gw, device=self.device)
         self.k = torch.ones(1, 1, 3, 3, device=self.device)
         self.k[0, 0, 1, 1] = 0
@@ -87,11 +91,9 @@ class LifeScene(Scene):
         for b in _BIRTH[rule]:
             birth |= n == b
         birth &= (self.state == 0) & self.inside
-        # Newborns inherit the mean colour of the live neighbours that made them.
-        mix = F.conv2d(
-            F.pad((self.rgb * on)[None], (1, 1, 1, 1)), self.k.expand(3, 1, 3, 3), groups=3
-        )[0]
-        mix = mix / n.clamp_min(1).float()
+        # Newborns take a family from the live neighbours that made them (the
+        # highest label among them), so lineages spread and meet at borders.
+        mix = F.max_pool2d((self.lab.float() * on)[None, None], 3, stride=1, padding=1)[0, 0].long()
         if rule == "brain":
             new = torch.zeros_like(self.state)
             new[self.state == 1] = 2  # on -> dying
@@ -102,7 +104,7 @@ class LifeScene(Scene):
                 keep |= n == s
             keep &= self.state == 1
             new = (keep | birth).to(torch.uint8)
-        self.rgb = torch.where(birth[None], mix, self.rgb)
+        self.lab = torch.where(birth, mix, self.lab)
         self.state = new
 
     def step(self, dt: float) -> None:
@@ -119,7 +121,7 @@ class LifeScene(Scene):
         patch = disks(spots, 3) & (self.rand(self.gh, self.gw) < 0.45)
         sown = patch & self.inside & (self.state == 0)
         self.state[sown] = 1
-        self.rgb = torch.where(sown[None], self.home_rgb, self.rgb)
+        self.lab = torch.where(sown, self.home_lab, self.lab)
         for _ in range(int(p["gens"])):
             self._generation(rule)
 
@@ -127,7 +129,7 @@ class LifeScene(Scene):
         p, dr = self.p, self.dr
         lit = (self.state == 1).float() + 0.35 * (self.state == 2).float()
         k = p["smoke"]
-        self.glow = self.glow * k + self.rgb * lit * (1 - k) * 3.0
+        self.glow = self.glow * k + self.palette[self.lab].permute(2, 0, 1) * lit * (1 - k) * 3.0
         img = self.glow + 0.006 * self.inside * self.home_rgb
         img = F.interpolate(img[None], size=(self.height, self.width), mode="nearest")[0]
         cw, ch = self.width / self.gw, self.height / self.gh

@@ -69,10 +69,32 @@ class Scene:
         return float(sx[i]), float(sy[i])
 
     def rand(self, *shape: int) -> torch.Tensor:
-        return torch.rand(*shape, generator=self.gen).to(self.device)
+        gen = self._device_gen()
+        if gen.device.type == self.device.type:
+            return torch.rand(*shape, generator=gen, device=self.device)
+        return torch.rand(*shape, generator=gen).to(self.device)
 
     def randn(self, *shape: int) -> torch.Tensor:
-        return torch.randn(*shape, generator=self.gen).to(self.device)
+        gen = self._device_gen()
+        if gen.device.type == self.device.type:
+            return torch.randn(*shape, generator=gen, device=self.device)
+        return torch.randn(*shape, generator=gen).to(self.device)
+
+    def _device_gen(self) -> torch.Generator:
+        """A generator on the scene's own device.
+
+        Drawing on the CPU and copying was two thirds of the frame for the grid
+        automata at 1080p (aten::uniform_ on two million cells, then a memcpy).
+        """
+        gen = self.__dict__.get("_dgen")
+        if gen is None:
+            try:
+                gen = torch.Generator(device=self.device)
+            except RuntimeError:  # a backend without device generators
+                gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=self.gen)))
+            self._dgen = gen
+        return gen
 
     def relative(self, x: torch.Tensor, key: str = "act") -> torch.Tensor:
         """``x`` over its own recent peak (98th percentile, ~5 s memory), in [0, 1].
