@@ -94,10 +94,7 @@ class Features:
         * ``edge``   members' share of brain-boundary voxels relative to the
           brain's -- flagged over 2x (edge and ghosting components).
         """
-        from fastfuncstuff.utils import cpu_if_mps
-
-        home = self.family_tcs.device
-        tcs = self.family_tcs.float().to(cpu_if_mps(home, "complex_spectral"))
+        tcs = self.family_tcs.float()
         n_time, n_fam = tcs.shape
         freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
         pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
@@ -112,8 +109,6 @@ class Features:
             b = (b - b.mean())[:, None]
             return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
 
-        fast = fast.to(home)
-        tcs = tcs.to(home)
         r_gs = corr(tcs, self.global_signal.float()).abs()
         change = torch.zeros_like(tcs)
         change[1:] = (tcs[1:] - tcs[:-1]).abs()
@@ -520,14 +515,8 @@ def compute_features(
     salience = (_rank_unit(communality) * _rank_unit(coherence)).sqrt()
     steps.update()
 
-    from fastfuncstuff.utils import cpu_if_mps
-
-    spec_dev = cpu_if_mps(device, "complex_spectral")
-    zs = zt if spec_dev == device else zt.to(spec_dev)
-    phase, phase_power, wave_tcs = wave_phase(zs, tr, period_s)
-    bands = band_powers(zs, tr).to(device)
-    phase, phase_power, wave_tcs = phase.to(device), phase_power.to(device), wave_tcs.to(device)
-    del zs
+    phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
+    bands = band_powers(zt, tr)
     steps.update()
 
     g = (g - g.mean()) / g.std().clamp_min(1e-12)

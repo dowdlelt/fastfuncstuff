@@ -326,13 +326,11 @@ class Drives:
         self._dv_np = f.dvars.float().cpu().numpy()
         # Each family as an oscillator: the analytic signal of its time course
         # (periods under 6 s removed), for an instantaneous phase and envelope.
-        from fastfuncstuff.utils import cpu_if_mps
-
         from .features import analytic_band
 
-        an = analytic_band(f.family_tcs.to(cpu_if_mps(self.device, "complex_spectral")), f.tr)
-        self._fam_re = an.real.contiguous().to(self.device)
-        self._fam_im = an.imag.contiguous().to(self.device)
+        an = analytic_band(f.family_tcs, f.tr)
+        self._fam_re = an.real.contiguous()
+        self._fam_im = an.imag.contiguous()
         self.fam_phase = torch.zeros(self.n_fam, device=self.device)
         self.fam_amp = torch.zeros(self.n_fam, device=self.device)
         self.sync = 0.0
