@@ -130,6 +130,20 @@ def build_parser() -> FfsArgumentParser:
         help="Legendre drift degree per run (default: AFNI's 1 + duration/150 s)",
     )
     parser.add_argument(
+        "-fwhm",
+        type=float,
+        default=6.0,
+        metavar="MM",
+        help="Gaussian smoothing inside the mask before anything is estimated (0: none). Raw "
+        "data needs it: unsmoothed, the leading components and families are mostly noise",
+    )
+    parser.add_argument(
+        "-keep_global",
+        action="store_true",
+        help="keep the global signal in the families and live values (default: regress it out "
+        "and show it as colour, flashes and jolts instead)",
+    )
+    parser.add_argument(
         "-ncomp",
         type=int,
         metavar="K",
@@ -339,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         n_families=args.nfam,
         period_s=args.period,
         polort=args.polort,
+        fwhm_mm=args.fwhm,
+        remove_global=not args.keep_global,
     )
     print(
         f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) on {device}"

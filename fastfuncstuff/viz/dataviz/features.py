@@ -392,6 +392,8 @@ def compute_features(
     n_components: int | None = None,
     n_families: int = 10,
     max_components: int = 64,
+    fwhm_mm: float = 6.0,
+    remove_global: bool = True,
     period_s: float | None = None,
     polort: int | None = None,
     seed: int = 0,
@@ -410,13 +412,56 @@ def compute_features(
     flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float()  # (N, T)
     n, n_time = flat.shape
 
-    raw_mean = flat.mean(1)
+    raw_mean = flat.mean(1)  # the anatomy (dust, slices) stays sharp
+    coherence = neighbours = None
+    if fwhm_mm > 0:
+        # Neighbour coherence from the unsmoothed series: after a 6 mm blur every
+        # neighbour pair correlates at ~0.9 (dynaloc median 0.93) and the measure
+        # only reports the kernel, which would flatten salience.
+        raw = _detrend(flat, run_starts, tr, polort)
+        raw = (raw / raw.std(1, keepdim=True).clamp_min(1e-6)).T.contiguous()
+        coherence, neighbours = neighbour_coherence(raw, ijk, shape)
+        del raw
+        # Smooth inside the mask before anything is estimated: on raw data the
+        # leading components and families are largely thermal and physiological
+        # noise, and a few mm of shared signal is what ICA needs to find
+        # networks. Normalised by the blurred mask, so edge voxels are not pulled
+        # toward zero.
+        from fastfuncstuff.cli_utils import blur_masked_data
+
+        zooms = tuple(float(v) for v in np.linalg.norm(np.asarray(affine)[:3, :3], axis=0))
+        flat = blur_masked_data(
+            flat,
+            fwhm_mm=fwhm_mm,
+            volume_shape=shape,
+            voxel_sizes=zooms,
+            mask_flat=mask.reshape(-1),
+            run_starts=run_starts,
+            device=device,
+            verbose=False,
+        )
     resid = _detrend(flat, run_starts, tr, polort)
     del flat
     sd = resid.std(1).clamp_min(1e-6)
     tsnr = raw_mean.abs() / sd
     zf = resid / sd[:, None]  # (N, T)
     del resid
+    # The whole-brain signals, taken before anything is removed: they are what
+    # tints, flashes and jolts every scene.
+    g = zf.mean(0)
+    dv = torch.zeros(n_time, device=device)
+    dv[1:] = (zf[:, 1:] - zf[:, :-1]).square().mean(0).sqrt()
+    dv[0] = dv[1]
+    if remove_global:
+        # Families and live values come from what the global signal leaves.
+        # On unprocessed data -- smoothed especially, once thermal noise is
+        # gone -- every family otherwise rides the global signal (all ten
+        # flagged on dynaloc); "things that affect all voxels" are drawn as
+        # colour and motion instead, from g and DVARS above.
+        gn = g - g.mean()
+        beta = (zf @ gn) / (gn @ gn).clamp_min(1e-12)
+        zf = zf - beta[:, None] * gn[None]
+        zf = zf / zf.std(1, keepdim=True).clamp_min(1e-6)
     steps.update()
 
     # Low rank through the (T, T) Gram: T is hundreds, N is hundreds of thousands.
@@ -456,7 +501,8 @@ def compute_features(
 
     zt = zf.T.contiguous()  # (T, N)
     del zf
-    coherence, neighbours = neighbour_coherence(zt, ijk, shape)
+    if coherence is None:
+        coherence, neighbours = neighbour_coherence(zt, ijk, shape)
     # Salience: what fraction of a voxel's variance is *shared* -- with its
     # correlated partners anywhere (communality) and with its neighbours
     # (coherence). Task cortex and networks score high; white matter, whose
@@ -470,11 +516,7 @@ def compute_features(
     bands = band_powers(zt, tr)
     steps.update()
 
-    g = zt.float().mean(1)
     g = (g - g.mean()) / g.std().clamp_min(1e-12)
-    dv = torch.zeros(n_time, device=device)
-    dv[1:] = (zt[1:].float() - zt[:-1].float()).square().mean(1).sqrt()
-    dv[0] = dv[1]
     med = dv.median()
     mad = (dv - med).abs().median().clamp_min(1e-6) * 1.4826
     dv = (dv - med) / mad

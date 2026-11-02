@@ -40,6 +40,11 @@ def run():
         [0],
         n_components=8,
         n_families=4,
+        # Explicit: these tests check pooling and families on known data. 6 mm
+        # on a 14-voxel grid would swamp the patch, and the patch is a sizeable
+        # part of this tiny brain's global mean.
+        fwhm_mm=0.0,
+        remove_global=False,
         verbose=False,
     )
     in_patch = np.zeros(SHAPE, dtype=bool)
@@ -282,3 +287,29 @@ def test_components_and_mute(run):
         vis.drives.voxel_mute()[~members] == 1
     )
     assert float(vis.drives.fam[k]) == 0.0 and float(vis.drives.fam_amp[k]) == 0.0
+
+
+def test_smoothing_keeps_coherence_and_global_comes_out():
+    rng = np.random.default_rng(3)
+    block = (np.arange(N_TIME) // 10) % 2 * 2.0 - 1.0
+    glob = rng.standard_normal(N_TIME).astype(np.float32) * 2
+    data = rng.standard_normal((N_TIME, *SHAPE)).astype(np.float32) + glob[:, None, None, None]
+    data[(slice(None), *PATCH)] += 1.5 * block[:, None, None, None]
+    data += 100.0
+    mask = np.ones(SHAPE, dtype=bool)
+    kw = dict(n_components=8, n_families=4, verbose=False)
+    plain = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0], fwhm_mm=0.0, remove_global=False, **kw
+    )
+    smooth = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0], fwhm_mm=3.0, remove_global=True, **kw
+    )
+    # Coherence is measured before smoothing, or it would only report the kernel.
+    assert torch.allclose(plain.coherence, smooth.coherence, atol=1e-4)
+    # With the global signal regressed out, no family rides it...
+    g = smooth.global_signal
+    fam = smooth.family_tcs
+    r = ((fam - fam.mean(0)) * (g - g.mean())[:, None]).mean(0) / (fam.std(0) * g.std())
+    assert float(r.abs().max()) < 0.3
+    # ...but the whole-brain series is still there to drive tint and flashes.
+    assert abs(float(np.corrcoef(g.numpy(), glob)[0, 1])) > 0.9
