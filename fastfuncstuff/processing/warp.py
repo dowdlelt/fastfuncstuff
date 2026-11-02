@@ -36,7 +36,7 @@ from torch import Tensor
 
 from .._compile import safe_compile
 from ..memory import gn_normal_eqs_voxel_chunk, plan_nonlinear_memory
-from ..utils import _prefers_cuda_batching, linalg_device, mps_is_good_for
+from ..utils import _prefers_cuda_batching, cpu_if_mps, linalg_device
 
 try:
     from tqdm import tqdm as _tqdm
@@ -1312,7 +1312,7 @@ def _warpomatic(
         # rather than hardcoded so the serial path comes back if a future torch
         # regresses grid_sample and it lands in utils._MPS_CPU_OPS.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
-        use_batched_lev0 = device.type != "mps" or mps_is_good_for("grid_sample")
+        use_batched_lev0 = cpu_if_mps(device, "grid_sample") == device
 
         if use_batched_lev0:
             lev0_patch = PatchSpec(

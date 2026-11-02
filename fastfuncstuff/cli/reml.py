@@ -70,6 +70,7 @@ try:
         resolve_microtime_dt,
         resolve_microtime_offset,
         resolve_polort,
+        setup_device,
         trim_spec_from_args,
         xmat_nuisance_per_run,
     )
@@ -100,7 +101,6 @@ try:
     from fastfuncstuff.processing.roi_collapse import add_roi_args
     from fastfuncstuff.surface.ribbon_args import add_depth_args, depth_requested
     from fastfuncstuff.utils import (
-        configure_torch_backends,
         gaussian_blur_3d,
         scale_to_percent_signal,
     )
@@ -2668,21 +2668,10 @@ def main():
     # Parse device specification using shared utility
     import os
 
-    device, cpu_threads_override, cuda_device_id = parse_device_arg(args.device)
-
-    # MPS does not support float64. ARMA(1,1) requires float64 for numerical
-    # stability (see CLAUDE.md §8), so fall back to CPU automatically.
-    if device.type == "mps" and args.use_double:
-        import warnings
-
-        warnings.warn(
-            "MPS does not support float64. -use_double requires CPU; "
-            "switching to device=cpu. Use -device cpu to suppress this warning.",
-            stacklevel=1,
-        )
-        device = torch.device("cpu")
-
-    configure_torch_backends(device, n_threads=cpu_threads_override)
+    _, cpu_threads_override, _ = parse_device_arg(args.device)
+    device = setup_device(
+        args.device, float64_only="ffs_reml -use_double" if args.use_double else None
+    )
 
     if device.type == "cpu":
         from fastfuncstuff.utils import resolve_cpu_threads
