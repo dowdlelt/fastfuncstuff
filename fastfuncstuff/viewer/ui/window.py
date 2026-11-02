@@ -948,7 +948,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._sync_directories(reread=True)
 
     def _read_dialog(self) -> None:
-        start = str(self.session.catalog_dir or Path.cwd())
+        start = str(self.session.work_dir or Path.cwd())
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Read directory", start)
         if directory:
             self.read_directory(directory)
@@ -1381,7 +1381,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         layer = self.session.state.layers.get(key)
         stem = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in layer.name)
         stem = stem.removesuffix(".nii.gz").removesuffix(".nii").strip("_") or key
-        start = str((self.session.catalog_dir or Path.cwd()) / f"{stem}.nii.gz")
+        start = str((self.session.work_dir or Path.cwd()) / f"{stem}.nii.gz")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, f"Save {layer.name}", start, "NIfTI (*.nii.gz *.nii);;All (*)"
         )
@@ -2483,7 +2483,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         name = f"ffs_viewer_state_{stamp}.txt"
-        directory = self.session.catalog_dir
+        directory = self.session.work_dir
         out = Path(directory) / name if directory else Path(tempfile.gettempdir()) / name
         try:
             out.write_text(self.debug_report())
@@ -3147,16 +3147,14 @@ def launch(
     win = ViewerWindow(session)
     quit_on_interrupt(app, win)
 
-    # What -read named, or the directory the first dataset lives in, so the
-    # pickers are populated before anyone reaches for Read.
+    # Named paths only. Reading a dataset's directory uninvited can fetch every
+    # file in it on a synced folder, and the dropdown is one click from it.
     if files:
         win.read_files(files)
     elif directories:
         win.read_directory(directories[0])
         session.offer_directories(directories[1:])
         win._sync_layer_list()
-    elif paths:
-        win.read_directory(str(Path(paths[0]).parent))
     for p in paths:
         win.open_path(p)
     if surfaces:

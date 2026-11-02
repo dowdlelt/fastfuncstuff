@@ -143,9 +143,7 @@ class ICAMode(Mode):
         chosen = str(self.params.get("folder") or "").strip()
         if chosen:
             return Path(chosen).expanduser()
-        if self.session is not None and self.session.catalog_dir is not None:
-            return Path(self.session.catalog_dir)
-        return None
+        return self.session.work_dir if self.session is not None else None
 
     def prepare(self, progress: ProgressFn | None = None) -> bool:
         """Read the decomposition. On the worker: a component stack is a big file."""

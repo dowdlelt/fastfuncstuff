@@ -740,6 +740,16 @@ class ViewerSession:
         """Whether the catalog is the file list rather than a directory."""
         return self.catalog_dir is None and bool(self.file_list)
 
+    @property
+    def work_dir(self) -> Path | None:
+        """Where this session's data is, for starting a dialog or placing a file.
+
+        The directory read, else the first listed file's. Naming it lists nothing.
+        """
+        if self.catalog_dir is not None:
+            return Path(self.catalog_dir)
+        return self.file_list[0].parent if self.file_list else None
+
     def _keep_catalog(self) -> None:
         if self.catalog_dir is not None:
             self._catalogs[(self.catalog_dir, self.catalog_recursive)] = self.catalog
@@ -1998,8 +2008,6 @@ class ViewerSession:
                 str(d) for d in self.directories if d != current and d not in loaded and d.is_dir()
             ]
             args += ["-read", str(current), *others]
-        elif self.file_list:
-            args += ["-read", *(full(p) for p in self.file_list)]
         surfaces = self.surfaces
         surf_dir = None
         if surfaces.subject is not None:
@@ -2018,6 +2026,10 @@ class ViewerSession:
                 surf_data += ["-surf_data", full(layer.path)]
             else:
                 skipped.append(layer.name)
+        # A list that is just the stack is what bare files already mean.
+        listed = [full(p) for p in self.file_list] if self.reading_files else []
+        if set(listed) != set(files):
+            args += ["-read", *listed] if listed else []
         line = shlex.join(["ffs_viewer", *files, *args, *surf_data])
         return line + (f"  # not reloaded: {', '.join(skipped)}" if skipped else "")
 

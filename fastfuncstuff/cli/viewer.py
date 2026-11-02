@@ -99,7 +99,8 @@ examples
   ffs_viewer -read results.subj01/
   ffs_viewer -read run1.nii.gz run2.nii.gz stats.nii.gz
   ffs_viewer -read results.subj01/ results.subj02/
-  ffs_viewer anat.nii.gz stats.nii.gz
+  ffs_viewer anat.nii.gz stats.nii.gz        (those two, loaded; nothing else listed)
+  ffs_viewer results.subj01/
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
   ffs_viewer -surfaces $SUBJECTS_DIR/subj subj/SUMA/brain.nii.gz stats.nii.gz
@@ -116,7 +117,10 @@ def build_parser() -> FfsArgumentParser:
     p.add_argument(
         "datasets",
         nargs="*",
-        help="Datasets to load, bottom layer first (anatomy, then overlays).",
+        metavar="PATH",
+        help="Datasets to load, bottom layer first (anatomy, then overlays). With no "
+        "-read, these are all the pickers list: their directories are not scanned. A "
+        "directory here is read, as with -read.",
     )
     p.add_argument(
         "-read",
@@ -223,21 +227,29 @@ def _mesh_commands(paths: list[str]):
 
 
 def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
-    """``-read`` sorted out: directories to offer, files to list, datasets to load.
+    """The paths sorted out: directories to offer, files to list, datasets to load.
 
     Files named beside a directory load as layers, which keeps ``-read DIR a b``
-    (the form ctrl+P used to print) meaning what it always has.
+    (the form ctrl+P used to print) meaning what it always has. Bare files with
+    no ``-read`` are both loaded and listed, so the picker holds what was asked
+    for and nothing beside it.
     """
+    from pathlib import Path
+
     from fastfuncstuff.viewer.catalog import split_read_targets
 
     try:
         directories, files = split_read_targets(args.read or [])
     except (OSError, ValueError) as exc:
         raise SystemExit(f"ffs_viewer: -read {exc}") from exc
-    dirs, named = [str(d) for d in directories], [str(f) for f in files]
+    # Only directories are picked out here. Anything else goes to the loader as
+    # always, which knows more dataset spellings than the picker's suffix list.
+    bare_dirs = [p for p in args.datasets if Path(p).is_dir()]
+    bare = [p for p in args.datasets if p not in bare_dirs]
+    dirs, named = [*bare_dirs, *(str(d) for d in directories)], [str(f) for f in files]
     if dirs:
-        return dirs, [], [*args.datasets, *named]
-    return [], named, list(args.datasets)
+        return dirs, [], [*bare, *named]
+    return [], named or bare, bare
 
 
 def main(argv: list[str] | None = None) -> int:

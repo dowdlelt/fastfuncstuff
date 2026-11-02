@@ -885,7 +885,7 @@ class GraphWindow(QtWidgets.QWidget):
 
     # -- design regressors ---------------------------------------------
     def _load_design(self) -> None:
-        start = str(self.session.catalog_dir or "")
+        start = str(self.session.work_dir or "")
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Design matrix or 1D file", start, "1D files (*.1D *.txt *.tsv);;All files (*)"
         )

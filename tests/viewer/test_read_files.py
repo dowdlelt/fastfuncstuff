@@ -162,6 +162,73 @@ def test_cli_files_beside_a_directory_still_load(tmp_path, monkeypatch):
     assert [ly.name for ly in layers] == ["a.nii.gz"]
 
 
+def test_cli_bare_files_load_and_list_nothing_else(tmp_path, monkeypatch, no_listing):
+    a, b = _vol(tmp_path / "a.nii.gz"), _vol(tmp_path / "b.nii.gz")
+    _vol(tmp_path / "sibling.nii.gz")
+    catalog_dir, file_list, _, layers = _replay(monkeypatch, [str(a), str(b)])
+    assert catalog_dir is None and file_list == (a, b)
+    assert [ly.name for ly in layers] == ["a.nii.gz", "b.nii.gz"]
+
+
+def test_cli_a_bare_directory_is_read(tmp_path, monkeypatch):
+    a = _vol(tmp_path / "a.nii.gz")
+    catalog_dir, _, _, layers = _replay(monkeypatch, [str(tmp_path)])
+    assert catalog_dir == tmp_path and layers == []
+    catalog_dir, _, _, layers = _replay(monkeypatch, [str(tmp_path), str(a)])
+    assert catalog_dir == tmp_path and [ly.name for ly in layers] == ["a.nii.gz"]
+
+
+def test_the_window_opens_bare_files_without_reading_their_directory(
+    tmp_path, monkeypatch, no_listing
+):
+    """launch() is where the parent directory used to get read."""
+    import signal
+
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")  # noqa: N806
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    a = _vol(tmp_path / "a.nii.gz")
+    _vol(tmp_path / "sibling.nii.gz")
+    from fastfuncstuff.viewer.ui import window
+
+    built = []
+    real_init = window.ViewerWindow.__init__
+
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        built.append(self)
+
+    seen = {}
+
+    def run(_self=None):
+        w = built[0]
+        seen.update(
+            catalog=[e.path for e in w.session.catalog],
+            layers=[ly.name for ly in w.session.state.layers],
+            box=w.dir_box.currentText(),
+            line=w.session.launch_command(),
+        )
+        w.close()
+        w.session.close()
+        return 0
+
+    monkeypatch.setattr(window.ViewerWindow, "__init__", init)
+    monkeypatch.setattr(QtWidgets.QApplication, "exec", run)
+    handler = signal.getsignal(signal.SIGINT)
+    try:
+        assert main(["-device", "cpu", str(a)]) == 0
+    finally:
+        signal.signal(signal.SIGINT, handler)
+    assert seen["catalog"] == [a] and seen["layers"] == ["a.nii.gz"]
+    assert seen["box"] == "list  1 file"
+    assert "-read" not in seen["line"]  # reopening it needs only the file
+
+
+def test_work_dir_names_a_listed_files_folder_without_listing_it(tmp_path, session, no_listing):
+    assert session.work_dir is None
+    session.read_files([_vol(tmp_path / "x" / "a.nii.gz")])
+    assert session.work_dir == tmp_path / "x"
+
+
 def test_launch_command_reopens_a_file_list(tmp_path, session):
     listed = _vol(tmp_path / "listed.nii.gz")
     layer = _vol(tmp_path / "layer.nii.gz")
