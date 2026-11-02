@@ -129,6 +129,15 @@ def test_routed_solvers_come_home_to_metal(name, args):
     assert first.device.type == "mps"
 
 
+@pytest.mark.gpu
+@_mps
+def test_routed_solver_takes_a_factor_on_metal_with_a_rhs_on_the_cpu():
+    factor = (torch.eye(4) * 2).to("mps")
+    x = plinalg.cholesky_solve(torch.ones(4, 1), factor)
+    assert x.device.type == "mps"
+    torch.testing.assert_close(x.cpu(), torch.full((4, 1), 0.25))
+
+
 def test_every_device_source_hands_out_the_indexed_mps_device():
     """A tensor reports mps:0, and torch.device("mps") != torch.device("mps:0")."""
     assert MPS_DEVICE == torch.device("mps:0")
