@@ -15,7 +15,7 @@ import torch
 
 from fastfuncstuff import policy_linalg as plinalg
 
-from .features import Features
+from .features import Features, member_counts
 
 
 @dataclass(frozen=True)
@@ -259,6 +259,17 @@ def _compile_splat():
     return splat_nb
 
 
+def top_two(sim: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Column of each row's largest and second-largest value; overwrites ``sim``.
+
+    ``topk(2)`` is the slowest thing in the weave on Metal: 79 ms against 13 on
+    the CPU at (65536, 2400), where two ``max`` passes take a few ms on both.
+    """
+    first = sim.argmax(1)
+    sim.scatter_(1, first[:, None], -math.inf)
+    return first, sim.argmax(1)
+
+
 def uniform_disc(xy: torch.Tensor) -> torch.Tensor:
     """Keep each point's angle, replace its radius by sqrt(rank) -- a uniform disc.
 
@@ -312,7 +323,7 @@ class Drives:
             if hasattr(self, "t")
             else torch.zeros(self.n_fam, device=self.device)
         )
-        counts = torch.bincount(f.family, minlength=self.n_fam).float()
+        counts = member_counts(f.family, self.n_fam)
         sal = torch.zeros(self.n_fam, device=self.device).index_add_(0, f.family, f.salience)
         self.family_salience = sal / counts.clamp_min(1)
         self.family_size = counts / counts.sum()
@@ -469,8 +480,8 @@ class Drives:
         out = torch.empty(len(data), 2, device=self.device)
         for a in range(0, len(data), 65536):
             sim = data[a : a + 65536] @ w.T
-            top = sim.topk(2, dim=1)
-            p1, p2 = pos[top.indices[:, 0]], pos[top.indices[:, 1]]
+            first, second = top_two(sim)
+            p1, p2 = pos[first], pos[second]
             # A third of the way toward the runner-up: order inside a node.
             out[a : a + 65536] = p1 + (p2 - p1) * 0.33
         return out

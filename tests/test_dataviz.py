@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.viz.dataviz.drives import Drives, uniform_disc
+from fastfuncstuff.viz.dataviz.drives import Drives, top_two, uniform_disc
 from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
-from fastfuncstuff.viz.dataviz.features import compute_features
+from fastfuncstuff.viz.dataviz.features import compute_features, member_counts
 from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
 from fastfuncstuff.viz.dataviz.sound import Sonifier
 
@@ -86,6 +86,18 @@ def test_pooling_shrinks_noise_more_than_signal(run):
     signal_ratio = pooled[:, keep].std() / raw[:, keep].std()
     assert noise_ratio < 0.6
     assert signal_ratio > noise_ratio + 0.2
+
+
+def test_top_two_agrees_with_topk():
+    sim = torch.randn(500, 40)
+    expect = sim.topk(2, dim=1).indices
+    first, second = top_two(sim.clone())
+    assert torch.equal(first, expect[:, 0]) and torch.equal(second, expect[:, 1])
+
+
+def test_member_counts_are_exact():
+    family = torch.tensor([0, 2, 2, 3, 3, 3])
+    assert member_counts(family, 5).tolist() == [1, 0, 2, 3, 0]
 
 
 def test_uniform_disc_spreads_radii_evenly():

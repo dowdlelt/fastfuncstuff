@@ -186,6 +186,15 @@ def _rank_unit(x: torch.Tensor) -> torch.Tensor:
     return r / max(1, x.numel() - 1)
 
 
+def member_counts(family: torch.Tensor, n_families: int) -> torch.Tensor:
+    """(F,) float voxels per family.
+
+    Weighted on purpose: Metal's plain ``bincount`` contends when many values
+    land in few bins, 324 ms against 0.6 ms for 1.1M voxels in 10 families.
+    """
+    return torch.bincount(family, weights=torch.ones_like(family).float(), minlength=n_families)
+
+
 def _centre_scale(xyz: torch.Tensor) -> torch.Tensor:
     xyz = xyz - xyz.mean(0, keepdim=True)
     r = xyz.norm(dim=1)
@@ -356,7 +365,7 @@ def assign_families(
     tcs = (z_tn.float() @ member_w) / member_w.sum(0).clamp_min(1e-12)
     tcs = (tcs - tcs.mean(0)) / tcs.std(0).clamp_min(1e-12)
     centre = torch.zeros(n_fam, 3, device=anat.device).index_add_(0, family, anat)
-    centre /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    centre /= member_counts(family, n_fam).clamp_min(1)[:, None]
     return {
         "family": family,
         "family_weight": ((best.values - 1.0) / 3.0).clamp(0, 1),
