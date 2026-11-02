@@ -484,6 +484,17 @@ class Read(Command):
 
 @command
 @dataclass(frozen=True)
+class ReadFiles(Command):
+    """Fill the catalog from named files, without opening their directories."""
+
+    name = "READ_FILES"
+    aspects = Aspect.NOTHING
+    major = True
+    paths: tuple[str, ...]
+
+
+@command
+@dataclass(frozen=True)
 class Load(Command):
     """Read a dataset into the stack, on top.
 
@@ -1793,6 +1804,14 @@ def install(
         if session is None:
             raise RuntimeError("READ needs a session")
         session.read_directory(cmd.directory, recursive=bool(cmd.recursive))
+        return Aspect.NOTHING
+
+    @bus.handle(ReadFiles.name)
+    def _read_files(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, ReadFiles)
+        if session is None:
+            raise RuntimeError("READ_FILES needs a session")
+        session.read_files(cmd.paths)
         return Aspect.NOTHING
 
     @bus.handle(ReloadLayer.name)

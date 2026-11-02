@@ -83,6 +83,7 @@ from fastfuncstuff.viewer.vocab import (
     ModeAction,
     MoveLayer,
     Read,
+    ReadFiles,
     RemoveLayer,
     SaveSurfaces,
     SelectLayer,
@@ -333,6 +334,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             session.do(SetTheme(source.state.theme))
         if source.catalog_dir is not None:
             session.do(Read(str(source.catalog_dir)))
+        elif source.reading_files:
+            session.do(ReadFiles(tuple(str(p) for p in source.file_list)))
         ctl = self._add_controller(session)
         self.tabs.blockSignals(True)
         self.tabs.addTab(ctl.letter)
@@ -888,7 +891,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         box = self.dir_box
         box.blockSignals(True)
         box.clear()
-        if current is None:
+        if session.file_list:
+            n_files = len(session.file_list)
+            box.addItem(f"list  {n_files} file{'s' * (n_files != 1)}", userData=(None, False))
+            tip = "\n".join(str(p) for p in session.file_list)
+            box.setItemData(box.count() - 1, tip, QtCore.Qt.ItemDataRole.ToolTipRole)
+        elif current is None:
             box.addItem("no directory", userData=None)
         for n, (d, recursive) in enumerate(session.directories.items(), start=1):
             star = "  ★" if d in favs else ""
@@ -901,7 +909,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 box.addItem(f"★  {f.name or f}", userData=(str(f), False))
                 box.setItemData(box.count() - 1, str(f), QtCore.Qt.ItemDataRole.ToolTipRole)
         rows = [box.itemData(r) for r in range(box.count())]
-        here = [r for r, data in enumerate(rows) if data and data[0] == str(current)]
+        wanted = None if current is None else str(current)
+        here = [r for r, data in enumerate(rows) if data and data[0] == wanted]
         box.setCurrentIndex(here[0] if here else 0)
         box.blockSignals(False)
         self.fav_button.setEnabled(current is not None)
@@ -913,6 +922,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if not data:
             return
         directory, recursive = data
+        if directory is None:
+            if not self.session.reading_files:
+                self.read_files(self.session.file_list)
+            return
         current = self.session.catalog_dir
         if current is not None and current.expanduser().resolve() == Path(directory):
             return
@@ -1052,9 +1065,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"read {len(self.session.catalog)} datasets from {directory}", 5000
         )
 
+    def read_files(self, paths) -> None:
+        self.session.do(ReadFiles(tuple(str(p) for p in paths)))
+        self._sync_catalog()
+        self._sync_layer_list()
+        listed = {e.path for e in self.session.catalog}
+        bad = [p.name for p in self.session.file_list if p not in listed]
+        tail = f"; could not read {', '.join(bad)}" if bad else ""
+        self.statusBar().showMessage(f"listed {len(listed)} datasets{tail}", 8000)
+
     # -- rescanning ------------------------------------------------------
     def _watch(self) -> None:
-        """Watch the catalog's directory and every loaded file.
+        """Watch the catalog's directory, or its listed files, and every loaded file.
 
         Files as well as the directory: an overwrite in place changes a file
         without necessarily touching its directory. Re-armed after every
@@ -1064,6 +1086,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         wanted: set[str] = set()
         if self.session.catalog_dir is not None:
             wanted.add(str(self.session.catalog_dir))
+        elif self.session.reading_files:
+            wanted.update(str(p) for p in self.session.file_list)
+        if wanted:
             wanted.update(ly.path for ly in self.session.state.layers if ly.source == "file")
         wanted = {p for p in wanted if Path(p).exists()}
         current = set(self._watcher.directories()) | set(self._watcher.files())
@@ -1073,24 +1098,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._watcher.addPaths(sorted(wanted - current))
 
     def _schedule_rescan(self) -> None:
-        if self.session.catalog_dir is not None:
+        if self.session.catalog_dir is not None or self.session.reading_files:
             self._rescan_timer.start()
 
     def _start_rescan(self, manual: bool = False) -> None:
         """Stat the directory on a worker and header-read only what changed."""
         session = self.session
-        if session.catalog_dir is None:
+        if session.catalog_dir is None and not session.reading_files:
             return
         if self._rescan_busy:
             self._rescan_again = True
             return
         self._rescan_busy = True
-        future = self._rescan_pool.submit(
-            catalog_mod.rescan,
-            session.catalog_dir,
-            list(session.catalog),
-            recursive=session.catalog_recursive,
-        )
+        if session.catalog_dir is None:
+            future = self._rescan_pool.submit(
+                catalog_mod.rescan_files, session.file_list, list(session.catalog)
+            )
+        else:
+            future = self._rescan_pool.submit(
+                catalog_mod.rescan,
+                session.catalog_dir,
+                list(session.catalog),
+                recursive=session.catalog_recursive,
+            )
         future.add_done_callback(lambda f, s=session, m=manual: self._rescanned.emit((s, f, m)))
 
     def _on_rescanned(self, payload) -> None:
@@ -3095,7 +3125,8 @@ def launch(
     *,
     device: str | None = None,
     script: str | None = None,
-    directory: str | None = None,
+    directories: list[str] | None = None,
+    files: list[str] | None = None,
     surfaces: str | None = None,
     meshes: list[str] | None = None,
     surf_space: str | None = None,
@@ -3116,11 +3147,16 @@ def launch(
     win = ViewerWindow(session)
     quit_on_interrupt(app, win)
 
-    # A directory, or the one the first dataset lives in, so the pickers are
-    # populated before anyone reaches for Read.
-    start = directory or (str(Path(paths[0]).parent) if paths else None)
-    if start:
-        win.read_directory(start)
+    # What -read named, or the directory the first dataset lives in, so the
+    # pickers are populated before anyone reaches for Read.
+    if files:
+        win.read_files(files)
+    elif directories:
+        win.read_directory(directories[0])
+        session.offer_directories(directories[1:])
+        win._sync_layer_list()
+    elif paths:
+        win.read_directory(str(Path(paths[0]).parent))
     for p in paths:
         win.open_path(p)
     if surfaces:

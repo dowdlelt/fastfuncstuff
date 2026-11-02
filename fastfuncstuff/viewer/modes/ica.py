@@ -348,7 +348,7 @@ class ICAMode(Mode):
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
         # A new directory means a different decomposition -- unless a folder
         # was chosen, which READ does not change.
-        if cmd.name == "READ" and not str(self.params.get("folder") or "").strip():
+        if cmd.name in ("READ", "READ_FILES") and not str(self.params.get("folder") or "").strip():
             self._maps = None
             self.invalidate()
             return self.refresh()

@@ -13,8 +13,8 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
-the core is the data selector: READ a directory, pick an UNDERLAY and an
-OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
+the core is the data selector: READ a directory (or -read a list of files), pick
+an UNDERLAY and an OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
 (View / InstaCorr / InstaGLM / InstaPCA / ICA / Denoise / Preproc). the main window is a
 controller -- every image and every graph is a companion window you open,
 arrange and close.
@@ -97,6 +97,8 @@ keys (carpet window)
 
 examples
   ffs_viewer -read results.subj01/
+  ffs_viewer -read run1.nii.gz run2.nii.gz stats.nii.gz
+  ffs_viewer -read results.subj01/ results.subj02/
   ffs_viewer anat.nii.gz stats.nii.gz
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
@@ -118,8 +120,15 @@ def build_parser() -> FfsArgumentParser:
     )
     p.add_argument(
         "-read",
-        metavar="DIR",
-        help="Read this directory into the underlay/overlay pickers on startup.",
+        metavar="PATH",
+        nargs="+",
+        help="What to put in the underlay/overlay pickers on startup. A directory is "
+        "read as usual. Several directories are all on the directory list, with only "
+        "the first read until another is picked. Files are listed as they are, and "
+        "their directories are never scanned: the safe choice on a synced folder "
+        "(Dropbox), where a scan can fetch every file. Given both, the directories are "
+        "read and the files load as layers. Takes every path after it, so put datasets "
+        "to load before -read.",
     )
     p.add_argument(
         "-script",
@@ -213,8 +222,27 @@ def _mesh_commands(paths: list[str]):
     return out
 
 
+def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
+    """``-read`` sorted out: directories to offer, files to list, datasets to load.
+
+    Files named beside a directory load as layers, which keeps ``-read DIR a b``
+    (the form ctrl+P used to print) meaning what it always has.
+    """
+    from fastfuncstuff.viewer.catalog import split_read_targets
+
+    try:
+        directories, files = split_read_targets(args.read or [])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ffs_viewer: -read {exc}") from exc
+    dirs, named = [str(d) for d in directories], [str(f) for f in files]
+    if dirs:
+        return dirs, [], [*args.datasets, *named]
+    return [], named, list(args.datasets)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    directories, files, datasets = _read_targets(args)
 
     if args.no_window:
         # Headless replay shares the session and command path the GUI uses, so
@@ -226,9 +254,12 @@ def main(argv: list[str] | None = None) -> int:
         session = ViewerSession(device=setup_device(args.device))
         apply_vram_budget(args.vram_budget, session.store.device)
         try:
-            if args.read:
-                session.read_directory(args.read)
-            for path in args.datasets:
+            if files:
+                session.read_files(files)
+            elif directories:
+                session.read_directory(directories[0])
+                session.offer_directories(directories[1:])
+            for path in datasets:
                 session.load(path)
             if args.surfaces:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
@@ -253,10 +284,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return launch(
-        args.datasets,
+        datasets,
         device=args.device,
         script=args.script,
-        directory=args.read,
+        directories=directories,
+        files=files,
         surfaces=args.surfaces,
         surf_space=args.surf_space,
         meshes=args.mesh,
