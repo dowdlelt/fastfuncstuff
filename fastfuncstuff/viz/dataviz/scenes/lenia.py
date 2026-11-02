@@ -89,12 +89,7 @@ class LeniaScene(Scene):
         ring = torch.where(
             (r > 0) & (r < 1), torch.exp(4 - 1 / (r * (1 - r)).clamp_min(1e-6)), torch.zeros_like(r)
         )
-        # The FFT runs where complex maths is trusted (cpu_if_mps): on a Mac
-        # that is the CPU, at two small copies a frame.
-        from fastfuncstuff.utils import cpu_if_mps
-
-        self.fft_dev = cpu_if_mps(self.device, "complex_spectral")
-        self.kf = torch.fft.rfft2((ring / ring.sum()).to(self.fft_dev))
+        self.kf = torch.fft.rfft2(ring / ring.sum())
         self.A = torch.zeros(self.gh, self.gw, device=self.device)
         self._sow(torch.full_like(self.A, 0.02) * self.inside)
 
@@ -114,8 +109,7 @@ class LeniaScene(Scene):
         sigma = p["sigma"] + p["fertile"] * act**3
         mu = p["mu"] + 0.01 * math.tanh(dr.g * 0.5)
         for _ in range(2):
-            a = self.A.to(self.fft_dev)
-            u = torch.fft.irfft2(torch.fft.rfft2(a) * self.kf, s=a.shape).to(self.device)
+            u = torch.fft.irfft2(torch.fft.rfft2(self.A) * self.kf, s=self.A.shape)
             growth = 2 * torch.exp(-((u - mu) ** 2) / (2 * sigma**2)) - 1
             self.A = (self.A + p["lstep"] * growth).clamp(0, 1) * self.inside
         # Keep active tissue from going barren: sow where active and empty.

@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.viz.dataviz.drives import Drives, uniform_disc
+from fastfuncstuff.viz.dataviz.drives import Drives, top_two, uniform_disc
 from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
-from fastfuncstuff.viz.dataviz.features import compute_features
+from fastfuncstuff.viz.dataviz.features import compute_features, member_counts
 from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
 from fastfuncstuff.viz.dataviz.sound import Sonifier
 
@@ -86,6 +86,82 @@ def test_pooling_shrinks_noise_more_than_signal(run):
     signal_ratio = pooled[:, keep].std() / raw[:, keep].std()
     assert noise_ratio < 0.6
     assert signal_ratio > noise_ratio + 0.2
+
+
+@pytest.mark.parametrize("fwhm", [0.0, 6.0])
+def test_a_clipped_voxel_does_not_look_salient(fwhm):
+    # Found on real data: voxels stuck at the 12-bit ceiling detrend to round-off,
+    # which unit variance turned into noise that ranked near the top for salience.
+    rng = np.random.default_rng(1)
+    data = 1000.0 + 20.0 * rng.standard_normal((N_TIME, *SHAPE)).astype(np.float32)
+    data += 15.0 * rng.standard_normal((N_TIME, 1, 1, 1)).astype(np.float32)
+    clipped = (slice(None), 7, 7, 5)
+    data[clipped] = 4095.0
+    mask = np.ones(SHAPE, dtype=bool)
+    feats = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0],
+        n_components=8, n_families=4, fwhm_mm=fwhm, remove_global=False, verbose=False,
+    )  # fmt: skip
+    v = int(np.flatnonzero((feats.ijk == (7, 7, 5)).all(1))[0])
+    assert feats.coherence.abs().max() <= 1.0
+    assert feats.coherence[v] == 0.0
+    if fwhm == 0.0:
+        assert feats.z[:, v].abs().max() == 0.0
+        assert feats.salience[v] < feats.salience.median()
+
+
+def test_load_features_falls_back_to_the_cpu_when_the_device_runs_out(
+    tmp_path, monkeypatch, capsys
+):
+    import nibabel as nib
+
+    import fastfuncstuff.viz.dataviz.features as features
+
+    data = 100.0 + np.random.default_rng(2).standard_normal((*SHAPE, 40)).astype(np.float32)
+    path = tmp_path / "run.nii.gz"
+    nib.save(nib.Nifti1Image(data, np.eye(4)), path)
+    real = features.compute_features
+    tried = []
+
+    def fake(*args, device, **kwargs):
+        tried.append(device.type)
+        if device.type != "cpu":
+            raise RuntimeError("MPS backend out of memory (MPS allocated: 8 GiB)")
+        return real(*args, device=device, **kwargs)
+
+    monkeypatch.setattr(features, "compute_features", fake)
+    monkeypatch.setattr(features, "_release_cache", lambda _device: None)
+    feats, _ = features.load_features(
+        [path],
+        torch.device("meta"),
+        tr=1.0,
+        verbose=False,
+        n_components=4,
+        n_families=2,
+        fwhm_mm=0.0,
+    )
+    assert tried == ["meta", "cpu"]
+    assert feats.z.device.type == "cpu"
+    assert "continuing on the CPU" in capsys.readouterr().err
+
+    def other_failure(*_args, **_kwargs):
+        raise RuntimeError("shape mismatch")
+
+    monkeypatch.setattr(features, "compute_features", other_failure)
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        features.load_features([path], torch.device("meta"), tr=1.0, verbose=False)
+
+
+def test_top_two_agrees_with_topk():
+    sim = torch.randn(500, 40)
+    expect = sim.topk(2, dim=1).indices
+    first, second = top_two(sim.clone())
+    assert torch.equal(first, expect[:, 0]) and torch.equal(second, expect[:, 1])
+
+
+def test_member_counts_are_exact():
+    family = torch.tensor([0, 2, 2, 3, 3, 3])
+    assert member_counts(family, 5).tolist() == [1, 0, 2, 3, 0]
 
 
 def test_uniform_disc_spreads_radii_evenly():

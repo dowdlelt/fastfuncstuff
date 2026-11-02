@@ -11,6 +11,7 @@ about what the data is doing.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -94,10 +95,7 @@ class Features:
         * ``edge``   members' share of brain-boundary voxels relative to the
           brain's -- flagged over 2x (edge and ghosting components).
         """
-        from fastfuncstuff.utils import cpu_if_mps
-
-        home = self.family_tcs.device
-        tcs = self.family_tcs.float().to(cpu_if_mps(home, "complex_spectral"))
+        tcs = self.family_tcs.float()
         n_time, n_fam = tcs.shape
         freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
         pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
@@ -112,8 +110,6 @@ class Features:
             b = (b - b.mean())[:, None]
             return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
 
-        fast = fast.to(home)
-        tcs = tcs.to(home)
         r_gs = corr(tcs, self.global_signal.float()).abs()
         change = torch.zeros_like(tcs)
         change[1:] = (tcs[1:] - tcs[:-1]).abs()
@@ -173,6 +169,19 @@ def _detrend(
     return clean
 
 
+def _unit_variance(resid: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+    """(N, T) residuals over their SD, with constant voxels exactly zero.
+
+    A voxel clipped at the scanner's ceiling (4095 throughout: 1007 voxels on a
+    9.4 T run) detrends to float32 round-off, SD ~1e-3. Scaled to unit variance
+    that is pure noise which differs by device and, with its leftover mean,
+    reaches a "correlation" of 8.6, so those voxels topped the salience ranks.
+    The floor is relative, a tSNR of 1e5; the highest real voxel there was 66000.
+    """
+    sd = resid.std(1, keepdim=True)
+    return torch.where(sd > 1e-5 * mean.abs()[:, None], resid / sd.clamp_min(1e-12), 0.0)
+
+
 def _robust_unit(x: torch.Tensor) -> torch.Tensor:
     """Map to [0, 1] between the 2nd and 98th percentiles."""
     xs = x.float()
@@ -189,6 +198,15 @@ def _rank_unit(x: torch.Tensor) -> torch.Tensor:
     r = torch.empty_like(x)
     r[torch.argsort(x)] = torch.arange(x.numel(), device=x.device, dtype=x.dtype)
     return r / max(1, x.numel() - 1)
+
+
+def member_counts(family: torch.Tensor, n_families: int) -> torch.Tensor:
+    """(F,) float voxels per family.
+
+    Weighted on purpose: Metal's plain ``bincount`` contends when many values
+    land in few bins, 324 ms against 0.6 ms for 1.1M voxels in 10 families.
+    """
+    return torch.bincount(family, weights=torch.ones_like(family).float(), minlength=n_families)
 
 
 def _centre_scale(xyz: torch.Tensor) -> torch.Tensor:
@@ -361,7 +379,7 @@ def assign_families(
     tcs = (z_tn.float() @ member_w) / member_w.sum(0).clamp_min(1e-12)
     tcs = (tcs - tcs.mean(0)) / tcs.std(0).clamp_min(1e-12)
     centre = torch.zeros(n_fam, 3, device=anat.device).index_add_(0, family, anat)
-    centre /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    centre /= member_counts(family, n_fam).clamp_min(1)[:, None]
     return {
         "family": family,
         "family_weight": ((best.values - 1.0) / 3.0).clamp(0, 1),
@@ -403,18 +421,19 @@ def compute_features(
     polort: int | None = None,
     seed: int = 0,
     verbose: bool = True,
+    device: torch.device | None = None,
 ) -> Features:
     """Traits and drives from ``data`` (T, X, Y, Z) restricted to ``mask``.
 
-    ``data`` may live on the CPU; the masked matrix goes to ``mask``'s compute
-    device in one copy and everything after is on-device.
+    ``data`` may live on the CPU: only the masked matrix goes to ``device``
+    (default: ``data``'s), in one copy, and everything after is on-device.
     """
-    device = data.device
+    device = data.device if device is None else device
     steps = tqdm(total=7, desc="dataviz features", leave=True, disable=not verbose)
     shape = tuple(int(s) for s in data.shape[1:])
     ijk = np.argwhere(mask)
-    flat_idx = torch.as_tensor(np.ravel_multi_index(ijk.T, shape), device=device)
-    flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float()  # (N, T)
+    flat_idx = torch.as_tensor(np.ravel_multi_index(ijk.T, shape), device=data.device)
+    flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float().to(device)  # (N, T)
     n, n_time = flat.shape
 
     raw_mean = flat.mean(1)  # the anatomy (dust, slices) stays sharp
@@ -424,7 +443,7 @@ def compute_features(
         # neighbour pair correlates at ~0.9 (dynaloc median 0.93) and the measure
         # only reports the kernel, which would flatten salience.
         raw = _detrend(flat, run_starts, tr, polort)
-        raw = (raw / raw.std(1, keepdim=True).clamp_min(1e-6)).T.contiguous()
+        raw = _unit_variance(raw, raw_mean).T.contiguous()
         coherence, neighbours = neighbour_coherence(raw, ijk, shape)
         del raw
         # Smooth inside the mask before anything is estimated: on raw data the
@@ -446,11 +465,10 @@ def compute_features(
             verbose=False,
         )
     resid = _detrend(flat, run_starts, tr, polort)
-    del flat
     sd = resid.std(1).clamp_min(1e-6)
     tsnr = raw_mean.abs() / sd
-    zf = resid / sd[:, None]  # (N, T)
-    del resid
+    zf = _unit_variance(resid, flat.mean(1))  # (N, T)
+    del flat, resid
     # The whole-brain signals, taken before anything is removed: they are what
     # tints, flashes and jolts every scene.
     g = zf.mean(0)
@@ -520,14 +538,8 @@ def compute_features(
     salience = (_rank_unit(communality) * _rank_unit(coherence)).sqrt()
     steps.update()
 
-    from fastfuncstuff.utils import cpu_if_mps
-
-    spec_dev = cpu_if_mps(device, "complex_spectral")
-    zs = zt if spec_dev == device else zt.to(spec_dev)
-    phase, phase_power, wave_tcs = wave_phase(zs, tr, period_s)
-    bands = band_powers(zs, tr).to(device)
-    phase, phase_power, wave_tcs = phase.to(device), phase_power.to(device), wave_tcs.to(device)
-    del zs
+    phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
+    bands = band_powers(zt, tr)
     steps.update()
 
     g = (g - g.mean()) / g.std().clamp_min(1e-12)
@@ -573,6 +585,13 @@ def compute_features(
     )
     feats.flag_families()
     return feats
+
+
+def _release_cache(device: torch.device) -> None:
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def load_features(
@@ -635,10 +654,26 @@ def load_features(
         drop = rng.choice(len(keep), len(keep) - max_voxels, replace=False)
         mask[tuple(keep[drop].T)] = False
 
-    data = data.to(device)
-    feats = compute_features(
-        data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, **kwargs
-    )
+    def run_on(dev: torch.device) -> Features:
+        return compute_features(
+            data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, device=dev, **kwargs
+        )
+
+    feats = None
+    try:
+        feats = run_on(device)
+    except RuntimeError as exc:
+        if device.type == "cpu" or "out of memory" not in str(exc).lower():
+            raise
+        print(f"ffs_dataviz: {device} ran out of memory, continuing on the CPU", file=sys.stderr)
+    # Out here because the exception's traceback pins the tensors it is reporting.
+    if feats is None:
+        _release_cache(device)
+        feats = run_on(torch.device("cpu"))
+    # Metal keeps every freed buffer: 24 GB held for 8.7 GB live on a 1.1M voxel
+    # run, on a machine that also has to draw the window.
+    if device.type == "mps":
+        _release_cache(device)
     info = {
         "shape": tuple(data.shape[1:]),
         "affine": affine,

@@ -241,6 +241,16 @@ CASES: dict[str, tuple[str, object]] = {
         "rfft (100k,256)",
         lambda d, t: lambda A=_build((100000, 256), d, t): torch.fft.rfft(A, dim=-1),
     ),
+    "complex_fft": (
+        "complex64 fft+ifft (300,100k) -- analytic signal",
+        lambda d, t: lambda A=_build((300, 100000), d, t): torch.fft.ifft(
+            torch.fft.fft(A, dim=0), dim=0
+        ),
+    ),
+    "complex_matmul": (
+        "complex64 Z@Z^H (300,20k) -- complex PCA Gram",
+        lambda d, t: lambda Z=torch.fft.fft(_build((300, 20000), d, t), dim=0): Z @ Z.conj().T,
+    ),
     "conv3d": (
         "conv3d 64^3 x 7^3",
         lambda d, t: (

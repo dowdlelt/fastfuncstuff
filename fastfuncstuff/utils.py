@@ -197,10 +197,6 @@ _MPS_CPU_OPS: dict[str, str] = {
     # MPS is patchy across releases, and the surface fold is one small product a
     # frame. Re-measure with scripts/bench_mps_policy.py before moving it.
     "sparse_csr_mm": "unmeasured: CSR @ dense support on Metal not verified (surface fold)",
-    # Unmeasured, routed off Metal conservatively: complex64 FFT and complex
-    # matmul coverage on MPS varies by release, and the work is one-time
-    # feature extraction (analytic signal, band powers, wave phase).
-    "complex_spectral": "unmeasured: complex64 FFT/matmul on Metal not verified (ffs_dataviz features)",
     # 2.14's Jacobi QR is a catastrophe at the tall-skinny shapes every nuisance
     # projector in this codebase uses. Not a typo: a (2000,300) QR takes over
     # nine minutes on Metal against 5.8 ms on the CPU.
@@ -270,6 +266,9 @@ _MPS_CPU_OPS: dict[str, str] = {
 #                     2.14 this fell back to the CPU and *lost* (0.68x).
 #   eigh (batched)    3.2x on (200,64,64)
 #   rfft              13x        elementwise   3.8x
+#   complex64 fft+ifft  5-12x at (300,20k-100k), matches the CPU to 6e-7; complex
+#                     matmul 1.6-6x there, and loses only below ~(300,2000), a
+#                     size nothing whole-brain reaches
 #   matmul (large)    3.6x       conv3d        1.7x (was 1.03x in 2.8)
 _MPS_KEEP_OPS: frozenset[str] = frozenset(
     {"eigh_batched", "grid_sample", "fft", "conv3d", "matmul", "reduce"}
