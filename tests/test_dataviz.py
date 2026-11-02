@@ -211,3 +211,15 @@ def test_flow_twist_does_not_collapse(run):
         vis.step(1 / 30)
     # A twist preserves area; the old vortex-plus-spring piled points 6-12x.
     assert peak() < start * 1.6
+
+
+def test_weave_puts_the_correlated_patch_together(run):
+    feats, in_patch, _ = run
+    dr = Drives(feats, default_params())
+    row, col, _, _ = dr.weave(16 / 9)
+    xy = torch.stack([col, row], 1)
+    keep = torch.from_numpy(in_patch)
+    spread_patch = torch.cdist(xy[keep], xy[keep]).mean()
+    spread_all = torch.cdist(xy, xy).mean()
+    # The patch shares one signal; the SOM must gather it, not scatter it.
+    assert spread_patch < 0.6 * spread_all

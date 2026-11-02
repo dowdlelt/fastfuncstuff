@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from .features import Features
 
 
@@ -254,35 +256,79 @@ class Drives:
     def weave(self, aspect: float) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         """Every voxel on a full rectangular grid, correlated voxels adjacent.
 
-        A rank grid on the correlation-space embedding: sort by its first axis
-        into equal columns, sort each column by the second. The grid is exactly
-        full -- no brain outline -- and its neighbourhoods are correlation
-        neighbourhoods, so a scene drawn on it has the data's structure in
-        place of anatomy. Returns (row, col) fractions in [0, 1) and the grid's
-        (rows, cols).
+        A batch self-organising map (Kohonen) is trained on each voxel's
+        correlation profile (its row of the PCA loadings, unit length) over a
+        small grid of nodes with the screen's aspect; each voxel takes its
+        best-matching node plus a sub-node offset toward its second best, and a
+        rank grid over those coordinates tiles the screen exactly. A SOM keeps
+        topology locally, which a 2-D linear projection cannot: ranking the
+        first two PCA axes of the profiles put uncorrelated voxels side by side
+        and drew the weave as salt-and-pepper noise. Returns (row, col)
+        fractions in [0, 1) and the grid's (rows, cols).
         """
         key = round(aspect, 3)
         if getattr(self, "_weave_key", None) != key:
             f = self.f
             n = f.n_voxels
+            xy = self._som_coords(aspect)
             cols = max(1, round(math.sqrt(n * aspect)))
             rows = math.ceil(n / cols)
-            xy = f.func[:, :2]
             order = torch.argsort(xy[:, 0])
             col = torch.empty(n, dtype=torch.long, device=self.device)
             col[order] = torch.arange(n, device=self.device) // rows
+            span = (xy[:, 1].max() - xy[:, 1].min()).clamp_min(1e-9)
+            key2 = col.double() * 4 + ((xy[:, 1] - xy[:, 1].min()) / span).double()
             row = torch.empty(n, dtype=torch.long, device=self.device)
-            # Within each column, rank by the second axis (stable lexsort).
-            key2 = (
-                col.double() * 4
-                + (xy[:, 1].double() - xy[:, 1].min().double())
-                / (xy[:, 1].max() - xy[:, 1].min()).clamp_min(1e-9).double()
-            )
-            o2 = torch.argsort(key2)
-            row[o2] = torch.arange(n, device=self.device) % rows
+            row[torch.argsort(key2)] = torch.arange(n, device=self.device) % rows
             self._weave = ((row.float() + 0.5) / rows, (col.float() + 0.5) / cols, rows, cols)
             self._weave_key = key
         return self._weave
+
+    def _som_coords(self, aspect: float, nodes: int = 2400, epochs: int = 12) -> torch.Tensor:
+        """(N, 2) continuous SOM coordinates (x across, y down) of every voxel."""
+        f = self.f
+        data = f.loadings / f.loadings.norm(dim=1, keepdim=True).clamp_min(1e-9)
+        gw = max(2, round(math.sqrt(nodes * aspect)))
+        gh = max(2, round(nodes / gw))
+        gy, gx = torch.meshgrid(
+            torch.arange(gh, device=self.device, dtype=torch.float32),
+            torch.arange(gw, device=self.device, dtype=torch.float32),
+            indexing="ij",
+        )
+        pos = torch.stack([gx.reshape(-1), gy.reshape(-1)], 1)  # (M, 2)
+        # Initialise on the profiles' top two axes, so the map starts unfolded.
+        sub = data[torch.randperm(len(data), device=self.device)[: min(len(data), 60000)]]
+        mean = sub.mean(0)
+        _, _, vh = plinalg.svd(sub - mean, full_matrices=False)
+        score = (sub - mean) @ vh[:2].T
+        sd = score.std(0)
+        w = (
+            mean
+            + ((pos[:, :1] / (gw - 1) - 0.5) * 4 * sd[0]) * vh[0]
+            + ((pos[:, 1:] / (gh - 1) - 0.5) * 4 * sd[1]) * vh[1]
+        )
+        # Batch SOM: neighbourhood shrinks geometrically from a third of the map
+        # to under a node.
+        s0, s1 = max(gw, gh) / 3, 0.7
+        dist2 = torch.cdist(pos, pos).square()
+        for e in range(epochs):
+            sigma = s0 * (s1 / s0) ** (e / max(1, epochs - 1))
+            bmu = (sub @ w.T).argmax(1)  # unit vectors: max cosine = nearest
+            # Exactly the batch update, through per-node sums: (M, M) @ (M, K)
+            # instead of an (M, n_samples) neighbourhood matrix (~0.6 GB).
+            sums = torch.zeros_like(w).index_add_(0, bmu, sub)
+            counts = torch.bincount(bmu, minlength=len(w)).float()
+            h = torch.exp(-dist2 / (2 * sigma**2))
+            w = (h @ sums) / (h @ counts).clamp_min(1e-9)[:, None]
+            w = w / w.norm(dim=1, keepdim=True).clamp_min(1e-9)
+        out = torch.empty(len(data), 2, device=self.device)
+        for a in range(0, len(data), 65536):
+            sim = data[a : a + 65536] @ w.T
+            top = sim.topk(2, dim=1)
+            p1, p2 = pos[top.indices[:, 0]], pos[top.indices[:, 1]]
+            # A third of the way toward the runner-up: order inside a node.
+            out[a : a + 65536] = p1 + (p2 - p1) * 0.33
+        return out
 
     def shown_series(self) -> torch.Tensor:
         """(T, N) what the scenes draw at each TR: correlation- and space-pooled.

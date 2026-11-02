@@ -54,6 +54,23 @@ same drives feed every scene; a scene is only a way of drawing them:
   glass     a Voronoi window over the head; each pane glows with its voxels.
   attractor a Clifford/de Jong attractor as a flame; four PC time courses steer
             it, and each active family peels into its own coloured copy.
+  fluid     full-screen stable fluids: one ink jet per family, pointing along
+            the family's Hilbert phase and pushing with its envelope.
+  interference  every family a source of ripples (its envelope, phase and own
+            wavelength); the moire locks into a standing figure when families
+            synchronise. op-art mode cuts it into black and white.
+  statespace  the brain's path through PC1-3 (PC4-6 as colour) as a ribbon,
+            through the cloud of voxels placed by their loadings (a biplot);
+            recurrence arcs join the present to past visits of the same state.
+  spectrum  a Winamp analyser: one group of bars per family, with a waterfall.
+  tapestry  the weave itself: every voxel a stitch, the live field rippling it.
+
+the weave (canvas=weave) tiles every voxel over the full screen with correlated
+voxels adjacent -- a self-organising map trained on each voxel's correlation
+profile -- and turns the grid scenes (turing, coral, life, lenia, physarum,
+glass) into full-field pieces whose geography is correlation, not anatomy.
+colour sources include 'phase' (each voxel's own oscillation phase, so waves
+sweep across as rainbows) and 'spectrum' (slow/mid/fast band power as RGB).
 
 most of the brain carries no task signal, so sparks are pooled before they are
 shown: across space (each voxel blended with its neighbourhood: pool, reach)

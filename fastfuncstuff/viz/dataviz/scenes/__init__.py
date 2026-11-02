@@ -8,8 +8,10 @@ from .brain import BrainScene
 from .constellation import ConstellationScene
 from .coral import CoralScene
 from .flow import FlowScene
+from .fluid import FluidScene
 from .galaxies import GalaxiesScene
 from .glass import GlassScene
+from .interference import InterferenceScene
 from .lenia import LeniaScene
 from .life import LifeScene
 from .mandala import MandalaScene
@@ -17,6 +19,9 @@ from .milkdrop import MilkdropScene
 from .physarum import PhysarumScene
 from .ridgeline import RidgelineScene
 from .sand import SandScene
+from .spectrum import SpectrumScene
+from .statespace import StatespaceScene
+from .tapestry import TapestryScene
 from .turing import TuringScene
 
 SCENES: dict[str, type[Scene]] = {
@@ -37,6 +42,11 @@ SCENES: dict[str, type[Scene]] = {
         PhysarumScene,
         GlassScene,
         AttractorScene,
+        FluidScene,
+        InterferenceScene,
+        StatespaceScene,
+        SpectrumScene,
+        TapestryScene,
     )
 }
 SCENE_NAMES = tuple(SCENES)
@@ -48,6 +58,7 @@ SETS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("mandala", "milkdrop", "galaxies", "constellation", "flow", "sand", "ridgeline", "brain"),
     ),
     ("growth", ("life", "lenia", "turing", "coral", "physarum", "glass", "attractor")),
+    ("full field", ("fluid", "interference", "statespace", "spectrum", "tapestry")),
 )
 assert all(name in SCENES for _, names in SETS for name in names)
 assert sorted(n for _, names in SETS for n in names) == sorted(SCENES), (

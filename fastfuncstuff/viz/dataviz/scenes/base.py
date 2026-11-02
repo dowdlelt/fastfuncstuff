@@ -273,3 +273,48 @@ def splat_lines(
     length = ((x1 - x0) ** 2 + (y1 - y0) ** 2).sqrt().clamp_min(1.0)
     per = rgb * (length / samples).clamp(max=1.0)[:, None]
     splat(frame, xs.reshape(-1), ys.reshape(-1), per.repeat_interleave(samples, 0), w, h)
+
+
+def family_weave_sites(scene: Scene) -> torch.Tensor:
+    """(F, 2) each family's centre on the weave, as (x, y) fractions of the field.
+
+    Full-field scenes place one source per family; putting it where the
+    family's voxels sit on the weave keeps every full-field scene in the same
+    correlation geography as the weave canvas.
+    """
+    dr, f = scene.dr, scene.f
+    row, col, _, _ = dr.weave(scene.width / scene.height)
+    w = f.family_weight.clamp_min(0.05)
+    tot = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, w).clamp_min(1e-6)
+    x = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, col * w) / tot
+    y = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, row * w) / tot
+    return torch.stack([x, y], 1)
+
+
+def family_ring_sites(scene: Scene, radius: float = 0.3) -> torch.Tensor:
+    """(F, 2) one source per family, evenly round an ellipse, ordered by where
+    the families sit on the weave. Weave centroids cluster near the middle (most
+    families span the map), which made every source nearly concentric; the
+    ring keeps the weave's order but spreads the sources out.
+    """
+    site = family_weave_sites(scene) - 0.5
+    order = torch.argsort(torch.atan2(site[:, 1], site[:, 0]))
+    n = len(order)
+    ang = torch.empty(n, device=scene.device)
+    ang[order] = torch.arange(n, device=scene.device, dtype=torch.float32) / n * 2 * math.pi
+    aspect = scene.width / scene.height
+    return torch.stack(
+        [0.5 + radius / aspect * torch.cos(ang) * 1.6, 0.5 + radius * torch.sin(ang)], 1
+    )
+
+
+def representative(scene: Scene) -> torch.Tensor:
+    """(F,) the most salient member voxel of each family, for picking a source."""
+    f, dr = scene.f, scene.dr
+    best = torch.full((dr.n_fam,), -1.0, device=scene.device).scatter_reduce_(
+        0, f.family, f.salience, reduce="amax", include_self=True
+    )
+    hit = f.salience >= best[f.family] - 1e-9
+    rep = torch.zeros(dr.n_fam, dtype=torch.long, device=scene.device)
+    rep[f.family[hit]] = torch.nonzero(hit).squeeze(1)
+    return rep
