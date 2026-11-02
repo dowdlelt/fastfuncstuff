@@ -1638,11 +1638,7 @@ def _select_device(args: argparse.Namespace) -> torch.device:
         print("ffs_qwarp: the CPU beats Metal on this tool; running there.")
         device = setup_device("cpu", tf32=REGISTRATION_TF32)
     if device.type == "cpu" and args.device is None and args.verb >= 1:
-        note = (
-            " (faster than Metal for this tool)"
-            if torch.backends.mps.is_available()
-            else ""
-        )
+        note = " (faster than Metal for this tool)" if torch.backends.mps.is_available() else ""
         print(f"Using CPU{note}")
     if (
         device.type == "cpu"

@@ -49,7 +49,7 @@ try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
     from .shear_triton import shear_resample_triton
 except Exception:  # pragma: no cover - triton not installed
     shear_resample_triton = None
-from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff import policy_linalg as plinalg  # noqa: E402
 
 from .weight import compute_weight_image  # noqa: E402
 

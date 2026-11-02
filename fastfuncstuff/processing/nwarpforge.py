@@ -108,7 +108,7 @@ def derive_phase_output_path(prefix: str) -> str:
     return entity_path(prefix, phase=True)
 
 
-from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff import policy_linalg as plinalg  # noqa: E402
 
 from ..io.afni import get_afni_space_info, set_afni_space_info  # noqa: E402
 
