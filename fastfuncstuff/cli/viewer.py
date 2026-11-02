@@ -8,9 +8,9 @@ through ``-script`` without the GUI in the loop.
 from __future__ import annotations
 
 import sys
+import time
 
 from fastfuncstuff.cli_help import FfsArgumentParser
-from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
@@ -97,7 +97,9 @@ keys (carpet window)
 
 examples
   ffs_viewer -read results.subj01/
-  ffs_viewer anat.nii.gz stats.nii.gz
+  ffs_viewer -read results.subj01/ results.subj02/
+  ffs_viewer anat.nii.gz stats.nii.gz        (those two, loaded; nothing else listed)
+  ffs_viewer results.subj01/
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
   ffs_viewer -surfaces $SUBJECTS_DIR/subj subj/SUMA/brain.nii.gz stats.nii.gz
@@ -105,7 +107,16 @@ examples
 """
 
 
+def _say(text: str) -> None:
+    """One line of what startup is doing. stderr, so ``-no_window``'s script stays clean."""
+    print(f"ffs_viewer: {text}", file=sys.stderr, flush=True)
+
+
 def build_parser() -> FfsArgumentParser:
+    # Here and not at the top of the module: cli_utils imports torch, and the
+    # console script imports this module before main() can say anything.
+    from fastfuncstuff.cli_utils import add_device_arg
+
     p = FfsArgumentParser(
         prog="ffs_viewer",
         description="Interactive GPU-first viewer for volumetric data.",
@@ -114,12 +125,21 @@ def build_parser() -> FfsArgumentParser:
     p.add_argument(
         "datasets",
         nargs="*",
-        help="Datasets to load, bottom layer first (anatomy, then overlays).",
+        metavar="PATH",
+        help="Same as -read: files load as layers, bottom first (anatomy, then "
+        "overlays), and with no directory given they are all the pickers list. A "
+        "directory is read.",
     )
     p.add_argument(
         "-read",
-        metavar="DIR",
-        help="Read this directory into the underlay/overlay pickers on startup.",
+        metavar="PATH",
+        nargs="+",
+        help="What to open on startup. A directory fills the underlay/overlay pickers. "
+        "Several directories all join the directory list, with only the first read until "
+        "another is picked. Files load as layers, and with no directory given they are "
+        "all the pickers list; their directories are never scanned, the safe choice on a "
+        "synced folder (Dropbox), where a scan can fetch every file. Takes every path "
+        "after it.",
     )
     p.add_argument(
         "-script",
@@ -213,8 +233,37 @@ def _mesh_commands(paths: list[str]):
     return out
 
 
+def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
+    """The paths sorted out: directories to offer, files to list, datasets to load.
+
+    A file someone named is a file they want to see, so every one loads, however
+    it was given. With no directory they are also all the picker lists.
+    """
+    from pathlib import Path
+
+    from fastfuncstuff.viewer.catalog import split_read_targets
+
+    try:
+        directories, files = split_read_targets(args.read or [])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ffs_viewer: -read {exc}") from exc
+    # Only directories are picked out here. Anything else goes to the loader as
+    # always, which knows more dataset spellings than the picker's suffix list.
+    bare_dirs = [p for p in args.datasets if Path(p).is_dir()]
+    bare = [p for p in args.datasets if p not in bare_dirs]
+    dirs = [*bare_dirs, *(str(d) for d in directories)]
+    named = list(dict.fromkeys([*bare, *(str(f) for f in files)]))
+    return dirs, [] if dirs else named, named
+
+
 def main(argv: list[str] | None = None) -> int:
+    started = time.perf_counter()
+    if not {"-h", "-help", "--help"} & set(sys.argv[1:] if argv is None else argv):
+        _say("starting, importing torch...")
     args = build_parser().parse_args(argv)
+    directories, files, datasets = _read_targets(args)
+
+    from fastfuncstuff.viewer.catalog import opening
 
     if args.no_window:
         # Headless replay shares the session and command path the GUI uses, so
@@ -225,24 +274,34 @@ def main(argv: list[str] | None = None) -> int:
 
         session = ViewerSession(device=setup_device(args.device))
         apply_vram_budget(args.vram_budget, session.store.device)
+        _say(f"device {session.store.device}")
         try:
-            if args.read:
-                session.read_directory(args.read)
-            for path in args.datasets:
+            if directories:
+                _say(f"reading {directories[0]}")
+                session.read_directory(directories[0])
+                session.offer_directories(directories[1:])
+                _say(f"found {len(session.catalog)} datasets")
+            for path in opening(datasets):
                 session.load(path)
+            if files:
+                session.read_files(files)
             if args.surfaces:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
 
+                _say(f"loading surfaces from {args.surfaces}")
                 session.do(LoadSurfaces(args.surfaces, space=args.surf_space or ""))
             for cmd in [*_mesh_commands(args.mesh), *_surf_data_commands(args.surf_data)]:
                 session.do(cmd)
             if args.script:
+                _say(f"replaying {args.script}")
                 session.run_script(open(args.script).read())
+            _say(f"done in {time.perf_counter() - started:.1f} s")
             print(session.to_script(header="replayed"), end="")
         finally:
             session.close()
         return 0
 
+    _say("importing the viewer window...")
     try:
         from fastfuncstuff.viewer.ui.window import launch
     except ImportError as exc:  # PySide6 is an extra, not a core dependency
@@ -253,15 +312,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return launch(
-        args.datasets,
+        datasets,
         device=args.device,
         script=args.script,
-        directory=args.read,
+        directories=directories,
+        files=files,
         surfaces=args.surfaces,
         surf_space=args.surf_space,
         meshes=args.mesh,
         surf_data=_surf_data_commands(args.surf_data),
         vram_budget=args.vram_budget,
+        say=_say,
+        started=started,
     )
 
 

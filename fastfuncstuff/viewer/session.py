@@ -318,8 +318,11 @@ class ViewerSession:
         self._previewing = False
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
-        #: Catalogs of directories read earlier, by (directory, recursive).
-        self._catalogs: dict[tuple[Path, bool], list[CatalogEntry]] = {}
+        #: The files last listed by name. The catalog is this list while
+        #: ``catalog_dir`` is None; kept after a READ so the list can be gone back to.
+        self.file_list: tuple[Path, ...] = ()
+        #: Catalogs read earlier, by (directory, recursive) or by the file list.
+        self._catalogs: dict[tuple, list[CatalogEntry]] = {}
         self.catalog_recursive = False
         #: Catalog files that appeared or changed since the directory was
         #: read, as ``{path: "new" | "updated"}``. Cleared per file when it is
@@ -700,8 +703,7 @@ class ViewerSession:
         going back to it stats its files rather than re-reading every header
         (0.7 s for 677 datasets, against milliseconds).
         """
-        if self.catalog_dir is not None:
-            self._catalogs[(self.catalog_dir, self.catalog_recursive)] = self.catalog
+        self._keep_catalog()
         known = self._catalogs.get((Path(directory), bool(recursive)))
         if known is None:
             self.catalog = catalog_mod.scan(directory, recursive=recursive)
@@ -712,6 +714,55 @@ class ViewerSession:
         self.catalog_fresh = {}
         self._note_directory(directory, recursive=recursive)
         return self.catalog
+
+    def read_files(self, paths: Iterable[str | Path]) -> list:
+        """Populate the catalog from these files alone, in the order given.
+
+        No directory is listed, now or on a rescan. On a synced folder (Dropbox)
+        a READ's header pass can pull down every file in it; this reads the
+        headers of the files named and only stats them afterwards.
+        """
+        self._keep_catalog()
+        listed = tuple(dict.fromkeys(Path(p).expanduser() for p in paths))
+        known = self._catalogs.get(listed)
+        if known is None:
+            self.catalog = list(catalog_mod.describe(listed))
+        else:
+            self.catalog = catalog_mod.rescan_files(listed, known).entries
+        self.file_list = listed
+        self.catalog_dir = None
+        self.catalog_recursive = False
+        self.catalog_fresh = {}
+        return self.catalog
+
+    @property
+    def reading_files(self) -> bool:
+        """Whether the catalog is the file list rather than a directory."""
+        return self.catalog_dir is None and bool(self.file_list)
+
+    @property
+    def work_dir(self) -> Path | None:
+        """Where this session's data is, for starting a dialog or placing a file.
+
+        The directory read, else the first listed file's. Naming it lists nothing.
+        """
+        if self.catalog_dir is not None:
+            return Path(self.catalog_dir)
+        return self.file_list[0].parent if self.file_list else None
+
+    def _keep_catalog(self) -> None:
+        if self.catalog_dir is not None:
+            self._catalogs[(self.catalog_dir, self.catalog_recursive)] = self.catalog
+        elif self.file_list:
+            self._catalogs[self.file_list] = self.catalog
+
+    def offer_directories(self, directories: Iterable[str | Path]) -> None:
+        """Put directories on the numbered list without reading them.
+
+        Read when picked: pointing at several must not scan them all.
+        """
+        for directory in directories:
+            self._note_directory(directory)
 
     def _note_directory(self, directory: str | Path, *, recursive: bool = False) -> None:
         d = Path(directory).expanduser().resolve()
@@ -1932,20 +1983,33 @@ class ViewerSession:
     def launch_command(self) -> str:
         """The ``ffs_viewer`` command line that opens what is loaded now.
 
-        What is on disk, by absolute path: the directory read, the stack's files
-        bottom first, the subject's surfaces (and any meshes added beside them),
-        and surface results. Not edits, display settings or windows -- that is
-        the session script -- and not layers computed here (a mode's overlay, a
-        DERIVE), which have no file to name; those are listed after a ``#``.
+        What is on disk, by absolute path: the directories read, the stack's
+        files bottom first, the subject's surfaces (and any
+        meshes added beside them), and surface results. Not edits, display
+        settings or windows -- that is the session script -- and not layers
+        computed here (a mode's overlay, a DERIVE), which have no file to name;
+        those are listed after a ``#``.
+
+        The stack's files lead, because ``-read`` takes every path after it.
+        Listed files nobody loaded are left out while anything is loaded: naming
+        one would load it.
         """
         import shlex
 
         def full(p) -> str:
             return str(Path(p).expanduser().resolve())
 
-        args = ["ffs_viewer"]
+        args = []
         if self.catalog_dir is not None:
-            args += ["-read", full(self.catalog_dir)]
+            current = self.catalog_dir.expanduser().resolve()
+            # A loaded file's directory rejoins the list when the file loads.
+            loaded = {
+                Path(ly.path).expanduser().resolve().parent for ly in self.state.layers if ly.path
+            }
+            others = [
+                str(d) for d in self.directories if d != current and d not in loaded and d.is_dir()
+            ]
+            args += ["-read", str(current), *others]
         surfaces = self.surfaces
         surf_dir = None
         if surfaces.subject is not None:
@@ -1964,7 +2028,10 @@ class ViewerSession:
                 surf_data += ["-surf_data", full(layer.path)]
             else:
                 skipped.append(layer.name)
-        line = shlex.join(args + surf_data + files)
+        # Naming a file loads it, so a list with nothing loaded reopens as that list.
+        if self.reading_files and not files:
+            files = [full(p) for p in self.file_list]
+        line = shlex.join(["ffs_viewer", *files, *args, *surf_data])
         return line + (f"  # not reloaded: {', '.join(skipped)}" if skipped else "")
 
     def save_script(self, path: str | Path, *, header: str | None = None) -> Path:

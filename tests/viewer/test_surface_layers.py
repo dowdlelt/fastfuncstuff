@@ -301,7 +301,7 @@ def test_launch_command_reopens_what_is_loaded(world):
     argv = shlex.split(command)
     assert argv[0] == "ffs_viewer"
     args = build_parser().parse_args(argv[1:])
-    assert args.read == str(tmp_path.resolve())
+    assert args.read == [str(tmp_path.resolve())]
     assert args.datasets == [str((tmp_path / "anat.nii.gz").resolve())]
     assert args.surf_data == [str((tmp_path / "s.lh.func.gii").resolve())]
     assert sorted(args.mesh) == sorted(

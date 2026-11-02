@@ -17,9 +17,11 @@ import re
 import shutil
 import subprocess
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+
+from tqdm import tqdm
 
 from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info
 
@@ -156,6 +158,27 @@ def discover(directory: str | Path, *, recursive: bool = False) -> list[Path]:
     return sorted({p for p in paths if _looks_openable(p.name)})
 
 
+def split_read_targets(paths: Iterable[str | Path]) -> tuple[list[Path], list[Path]]:
+    """What a READ was pointed at, as ``(directories, files)``.
+
+    Stats each path and lists nothing, so asking is safe on a synced folder. A
+    named file that cannot be opened raises, unlike one found by :func:`discover`:
+    nobody typed that one, and here silently dropping it hides a typo.
+    """
+    directories, files = [], []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            directories.append(path)
+        elif not path.exists():
+            raise FileNotFoundError(f"{raw}: no such file or directory")
+        elif not _looks_openable(path.name):
+            raise ValueError(f"{raw}: not a dataset the viewer can open")
+        else:
+            files.append(path)
+    return directories, files
+
+
 def describe(paths: Iterable[str | Path]) -> Iterator[CatalogEntry]:
     """Header-read each path, skipping anything that will not open.
 
@@ -236,7 +259,21 @@ class Rescan:
 def rescan(
     directory: str | Path, previous: list[CatalogEntry], *, recursive: bool = False
 ) -> Rescan:
-    """Re-read a directory, reading headers only for files that are new or changed.
+    """Re-read a directory; see :func:`_compare` for what gets read."""
+    found = discover(directory, recursive=recursive)
+    result = _compare(found, previous)
+    return replace(result, entries=sort_entries(result.entries, directory))
+
+
+def rescan_files(paths: Iterable[Path], previous: list[CatalogEntry]) -> Rescan:
+    """Re-read a list of files, in the order given, statting nothing but them."""
+    order = {path: n for n, path in enumerate(paths)}
+    result = _compare([p for p in order if signature(p) is not None], previous)
+    return replace(result, entries=sorted(result.entries, key=lambda e: order[e.path]))
+
+
+def _compare(found: list[Path], previous: list[CatalogEntry]) -> Rescan:
+    """Set what is on disk against what was known, reading only new or changed headers.
 
     A full scan reads every header -- 3.8 s for 277 datasets on one results
     directory -- which is too slow to repeat every time a pipeline stage
@@ -250,7 +287,7 @@ def rescan(
     known = {e.path: e for e in previous}
     kept: list[CatalogEntry] = []
     fresh: list[Path] = []
-    for path in discover(directory, recursive=recursive):
+    for path in found:
         old = known.get(path)
         if old is not None and signature(path) == old.signature:
             kept.append(old)
@@ -270,7 +307,7 @@ def rescan(
     present = {e.path for e in kept}
     removed = frozenset(p for p in known if p not in present)
     return Rescan(
-        entries=sort_entries(kept, directory),
+        entries=kept,
         added=frozenset(added),
         changed=frozenset(changed),
         removed=removed,
@@ -300,7 +337,21 @@ def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry
     blocks, because a stage's mean volume guesses "anat" and its runs "func".
     Relative to the directory, so a recursive scan keeps subfolders together.
     """
-    return sort_entries(list(describe(discover(directory, recursive=recursive))), directory)
+    found = discover(directory, recursive=recursive)
+    bar = tqdm(found, desc="ffs_viewer: reading headers", unit="file", disable=len(found) < 10)
+    return sort_entries(list(describe(bar)), directory)
+
+
+def opening(paths: list[str]) -> Iterator[str]:
+    """Walk the files being opened, with a bar naming the one in hand.
+
+    Shown for a single file too: an online-only file on a synced folder can take
+    minutes to arrive, and the name is what says what is being waited on.
+    """
+    bar = tqdm(paths, desc="ffs_viewer: opening", unit="file", disable=not paths)
+    for path in bar:
+        bar.set_postfix_str(Path(path).name)
+        yield path
 
 
 def suggest_underlay(entries: list[CatalogEntry]) -> CatalogEntry | None:

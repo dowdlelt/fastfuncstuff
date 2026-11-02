@@ -167,7 +167,10 @@ def _build(cls: type[Command], args: Sequence[str]) -> Command:
         if origin is tuple:
             members = typing.get_args(kind)
             if len(members) == 2 and members[1] is Ellipsis:
-                raise TypeError(f"{cls.__name__}.{f.name}: variadic tuples are not supported")
+                # Nothing marks where it ends on a script line, so it takes the rest.
+                values[f.name] = tuple(_decode_scalar(t, members[0]) for t in args[pos:])
+                pos = len(args)
+                continue
             take = args[pos : pos + len(members)]
             if len(take) != len(members):
                 raise ValueError(f"{cls.name} expects {len(members)} values for {f.name}")
