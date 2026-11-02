@@ -23,12 +23,19 @@ from .sound import Sonifier
 RESOLUTIONS = ((320, 180), (480, 270), (640, 360), (960, 540), (1280, 720), (1920, 1080))
 
 #: The wheel's zoom parameter in each scene.
-ZOOM_PARAM = {"brain": "zoom", "mandala": "mzoom", "flow": "fzoom", "milkdrop": "isize"}
+ZOOM_PARAM = {
+    "brain": "zoom",
+    "mandala": "mzoom",
+    "flow": "fzoom",
+    "milkdrop": "isize",
+    "galaxies": "gzoom",
+    "constellation": "czoom",
+}
 
 KEYS_HELP = (
     """\
-1-5    scene: """
-    + "  ".join(f"{i + 1} {n}" for i, n in enumerate(SCENE_NAMES))
+1-9 0  scene: """
+    + "  ".join(f"{(i + 1) % 10} {n}" for i, n in enumerate(SCENE_NAMES))
     + """
 space  play / pause        ← →  step 5 TRs (shift: 25)
 tab m  controls            h    timeline
@@ -466,8 +473,8 @@ class Viz(QtWidgets.QMainWindow):
         K = QtCore.Qt.Key
         shift = bool(e.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier)
         vis = self.vis
-        if K.Key_1 <= k <= K.Key_9 and k - K.Key_1 < len(SCENE_NAMES):
-            self.set_param("scene", float(k - K.Key_1))
+        if K.Key_0 <= k <= K.Key_9 and (k - K.Key_1) % 10 < len(SCENE_NAMES):
+            self.set_param("scene", float((k - K.Key_1) % 10))
         elif k == K.Key_Space:
             self.playing = not self.playing
         elif k in (K.Key_Tab, K.Key_M):
@@ -498,7 +505,9 @@ class Viz(QtWidgets.QMainWindow):
         elif k == K.Key_L:
             self._morph_target = 0.0 if vis.p["morph"] > 0.5 else 1.0
         elif k == K.Key_R:
-            for n in ("yaw", "pitch", "zoom", "orbit", "mzoom", "fzoom", "isize"):
+            for n in ZOOM_PARAM.values():
+                self.set_param(n, PARAM_BY_NAME[n].default)
+            for n in ("yaw", "pitch", "orbit"):
                 self.set_param(n, PARAM_BY_NAME[n].default)
         elif k == K.Key_BracketLeft:
             self.set_param("speed", max(0.1, vis.p["speed"] / 1.25))

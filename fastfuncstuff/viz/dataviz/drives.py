@@ -188,6 +188,9 @@ class Drives:
         )
         self.family_salience = sal / counts.clamp_min(1)
         self.family_size = counts / counts.sum()
+        nb = feats.extras["neighbours"][:, 0]
+        #: Voxel spacing in the normalised anatomical frame.
+        self.spacing = float((feats.anat - feats.anat[nb]).norm(dim=1).median().clamp_min(1e-4))
 
     @property
     def n_time(self) -> int:
