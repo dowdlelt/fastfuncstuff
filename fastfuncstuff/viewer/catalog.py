@@ -21,6 +21,8 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
+from tqdm import tqdm
+
 from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info
 
 #: Extensions the viewer can open. Ordered longest-first so ``.nii.gz`` is
@@ -335,7 +337,21 @@ def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry
     blocks, because a stage's mean volume guesses "anat" and its runs "func".
     Relative to the directory, so a recursive scan keeps subfolders together.
     """
-    return sort_entries(list(describe(discover(directory, recursive=recursive))), directory)
+    found = discover(directory, recursive=recursive)
+    bar = tqdm(found, desc="ffs_viewer: reading headers", unit="file", disable=len(found) < 10)
+    return sort_entries(list(describe(bar)), directory)
+
+
+def opening(paths: list[str]) -> Iterator[str]:
+    """Walk the files being opened, with a bar naming the one in hand.
+
+    Shown for a single file too: an online-only file on a synced folder can take
+    minutes to arrive, and the name is what says what is being waited on.
+    """
+    bar = tqdm(paths, desc="ffs_viewer: opening", unit="file", disable=not paths)
+    for path in bar:
+        bar.set_postfix_str(Path(path).name)
+        yield path
 
 
 def suggest_underlay(entries: list[CatalogEntry]) -> CatalogEntry | None:

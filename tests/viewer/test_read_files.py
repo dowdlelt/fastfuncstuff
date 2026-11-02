@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -227,6 +229,28 @@ def test_the_window_opens_bare_files_without_reading_their_directory(
     assert seen["catalog"] == [a] and seen["layers"] == ["a.nii.gz"]
     assert seen["box"] == "list  1 file"
     assert "-read" not in seen["line"]  # reopening it needs only the file
+
+
+def test_importing_the_cli_does_not_import_torch():
+    """The console script imports the module before main() can print a word, so
+    a torch import at module level is silence for as long as torch takes."""
+    code = "import sys, fastfuncstuff.cli.viewer; sys.exit('torch' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
+
+
+def test_startup_says_what_it_is_doing_on_stderr_only(tmp_path, capsys, no_listing):
+    a = _vol(tmp_path / "a.nii.gz")
+    assert main(["-no_window", "-device", "cpu", str(a)]) == 0
+    out, err = capsys.readouterr()
+    assert err.startswith("ffs_viewer: starting")
+    assert "a.nii.gz" in err and "done in" in err  # the bar names the file
+    assert "ffs_viewer:" not in out  # the replayed script stays clean
+
+
+def test_help_does_not_announce_a_start(capsys):
+    with pytest.raises(SystemExit):
+        main(["-help"])
+    assert "starting" not in capsys.readouterr().err
 
 
 def test_work_dir_names_a_listed_files_folder_without_listing_it(tmp_path, session, no_listing):

@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import os
 import signal
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -3132,8 +3134,10 @@ def launch(
     surf_space: str | None = None,
     surf_data: list | None = None,
     vram_budget: str | None = None,
+    say: Callable[[str], None] = lambda _text: None,
+    started: float | None = None,
 ) -> int:
-    """Open the controller and run the Qt loop."""
+    """Open the controller and run the Qt loop, saying what startup is doing."""
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.viewer.residency import apply_vram_budget
 
@@ -3144,20 +3148,26 @@ def launch(
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     session = ViewerSession(device=setup_device(device))
     apply_vram_budget(vram_budget, session.store.device)
+    say(f"building the window, device {session.store.device}")
     win = ViewerWindow(session)
     quit_on_interrupt(app, win)
 
     # Named paths only. Reading a dataset's directory uninvited can fetch every
     # file in it on a synced folder, and the dropdown is one click from it.
-    if files:
-        win.read_files(files)
-    elif directories:
+    if directories:
+        say(f"reading {directories[0]}")
         win.read_directory(directories[0])
         session.offer_directories(directories[1:])
         win._sync_layer_list()
-    for p in paths:
+        say(f"found {len(session.catalog)} datasets")
+    for p in catalog_mod.opening(paths):
         win.open_path(p)
+    # After the opens: the headers it reads are in hand by now, so all the waiting
+    # on a slow file happens under the bar that names it.
+    if files:
+        win.read_files(files)
     if surfaces:
+        say(f"loading surfaces from {surfaces}")
         win.load_surfaces(surfaces, space=surf_space or "")
     if meshes:
         win._open_meshes()
@@ -3168,10 +3178,13 @@ def launch(
     for cmd in surf_data or []:
         win.refresh(session.do(cmd))
     if script:
+        say(f"replaying {script}")
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
     win.show()
     win._row()
+    took = "" if started is None else f" in {time.perf_counter() - started:.1f} s"
+    say(f"ready{took}")
     return app.exec()
 
 

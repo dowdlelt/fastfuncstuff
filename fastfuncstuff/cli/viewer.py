@@ -8,9 +8,9 @@ through ``-script`` without the GUI in the loop.
 from __future__ import annotations
 
 import sys
+import time
 
 from fastfuncstuff.cli_help import FfsArgumentParser
-from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
@@ -107,7 +107,16 @@ examples
 """
 
 
+def _say(text: str) -> None:
+    """One line of what startup is doing. stderr, so ``-no_window``'s script stays clean."""
+    print(f"ffs_viewer: {text}", file=sys.stderr, flush=True)
+
+
 def build_parser() -> FfsArgumentParser:
+    # Here and not at the top of the module: cli_utils imports torch, and the
+    # console script imports this module before main() can say anything.
+    from fastfuncstuff.cli_utils import add_device_arg
+
     p = FfsArgumentParser(
         prog="ffs_viewer",
         description="Interactive GPU-first viewer for volumetric data.",
@@ -248,8 +257,13 @@ def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    started = time.perf_counter()
+    if not {"-h", "-help", "--help"} & set(sys.argv[1:] if argv is None else argv):
+        _say("starting, importing torch...")
     args = build_parser().parse_args(argv)
     directories, files, datasets = _read_targets(args)
+
+    from fastfuncstuff.viewer.catalog import opening
 
     if args.no_window:
         # Headless replay shares the session and command path the GUI uses, so
@@ -260,27 +274,34 @@ def main(argv: list[str] | None = None) -> int:
 
         session = ViewerSession(device=setup_device(args.device))
         apply_vram_budget(args.vram_budget, session.store.device)
+        _say(f"device {session.store.device}")
         try:
-            if files:
-                session.read_files(files)
-            elif directories:
+            if directories:
+                _say(f"reading {directories[0]}")
                 session.read_directory(directories[0])
                 session.offer_directories(directories[1:])
-            for path in datasets:
+                _say(f"found {len(session.catalog)} datasets")
+            for path in opening(datasets):
                 session.load(path)
+            if files:
+                session.read_files(files)
             if args.surfaces:
                 from fastfuncstuff.viewer.vocab import LoadSurfaces
 
+                _say(f"loading surfaces from {args.surfaces}")
                 session.do(LoadSurfaces(args.surfaces, space=args.surf_space or ""))
             for cmd in [*_mesh_commands(args.mesh), *_surf_data_commands(args.surf_data)]:
                 session.do(cmd)
             if args.script:
+                _say(f"replaying {args.script}")
                 session.run_script(open(args.script).read())
+            _say(f"done in {time.perf_counter() - started:.1f} s")
             print(session.to_script(header="replayed"), end="")
         finally:
             session.close()
         return 0
 
+    _say("importing the viewer window...")
     try:
         from fastfuncstuff.viewer.ui.window import launch
     except ImportError as exc:  # PySide6 is an extra, not a core dependency
@@ -301,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         meshes=args.mesh,
         surf_data=_surf_data_commands(args.surf_data),
         vram_budget=args.vram_budget,
+        say=_say,
+        started=started,
     )
 
 
