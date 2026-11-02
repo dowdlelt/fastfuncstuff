@@ -105,10 +105,12 @@ class FluidScene(Scene):
             cx, cy = self.gw / 2, self.gh / 2
             rx, ry = self.xs - cx, self.ys - cy
             rr = (rx**2 + ry**2).sqrt().clamp_min(1.0)
-            burst = (dr.d - 2.5) * 30.0 * torch.exp(-rr / (0.2 * self.gw))
+            # Velocity only, no ink, and per second rather than per frame. White
+            # ink here whited out the screen for 4 s: this flow diverges and
+            # semi-Lagrangian advection does not dilute, so it spreads undimmed.
+            burst = dt * (dr.d - 2.5) * 600.0 * torch.exp(-rr / (0.2 * self.gw))
             self.vel[0] += burst * rx / rr
             self.vel[1] += burst * ry / rr
-            self.dye += 0.05 * (dr.d - 2.5) * torch.exp(-rr / 6.0)[None]
         if p["curl"] > 0:
             w = self._ddx(self.vel[1]) - self._ddy(self.vel[0])
             gx, gy = self._ddx(w.abs()), self._ddy(w.abs())
