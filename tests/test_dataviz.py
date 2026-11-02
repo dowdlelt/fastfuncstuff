@@ -13,9 +13,17 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.processing.temporal_filter import apply_temporal_filter
 from fastfuncstuff.viz.dataviz.drives import Drives, top_two, uniform_disc
 from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
-from fastfuncstuff.viz.dataviz.features import compute_features, member_counts, spike_score
+from fastfuncstuff.viz.dataviz.features import (
+    DEFAULT_BANDPASS_HZ,
+    band_dof,
+    compute_features,
+    member_counts,
+    resolve_band,
+    spike_score,
+)
 from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
 from fastfuncstuff.viz.dataviz.sound import Sonifier
 
@@ -400,7 +408,10 @@ def test_smoothing_keeps_coherence_and_global_comes_out():
     r = ((fam - fam.mean(0)) * (g - g.mean())[:, None]).mean(0) / (fam.std(0) * g.std())
     assert float(r.abs().max()) < 0.3
     # ...but the whole-brain series is still there to drive tint and flashes.
-    assert abs(float(np.corrcoef(g.numpy(), glob)[0, 1])) > 0.9
+    glob_band = apply_temporal_filter(
+        torch.from_numpy(glob)[None], 1.0, resolve_band(DEFAULT_BANDPASS_HZ, 1.0, [0], N_TIME)
+    )[0]
+    assert abs(float(np.corrcoef(g.numpy(), glob_band.numpy())[0, 1])) > 0.9
 
 
 @pytest.mark.parametrize("reach,clarity", [(0, 0.0), (2, 0.35), (4, 1.0)])
@@ -458,3 +469,126 @@ def test_fluid_survives_a_spike_at_the_ceiling(run, fps):
         viz.step(1.0 / fps)
         white.append(float((viz.render().min(axis=2) > 240).mean()))
     assert max(white) < 0.25
+
+
+def _spiky_block_run(
+    n_time=320, band=DEFAULT_BANDPASS_HZ, tr=1.0, run_starts=(0,), spike=6.0, **kw
+):
+    """A slow block in a patch, fast noise everywhere, and one whole-brain spike."""
+    rng = np.random.default_rng(5)
+    block = (np.arange(n_time) // 10) % 2 * 2.0 - 1.0
+    data = rng.standard_normal((n_time, *SHAPE)).astype(np.float32)
+    data[(slice(None), *PATCH)] += 1.5 * block[:, None, None, None]
+    data[n_time // 2] += spike
+    data += 100.0
+    mask = np.ones(SHAPE, dtype=bool)
+    mask[0], mask[-1] = False, False
+    feats = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), tr, list(run_starts),
+        n_components=8, n_families=4, fwhm_mm=0.0, remove_global=False,
+        bandpass_hz=band, verbose=False, device=CPU, **kw,
+    )  # fmt: skip
+    in_patch = np.zeros(SHAPE, dtype=bool)
+    in_patch[PATCH] = True
+    return feats, in_patch[tuple(feats.ijk.T)], block
+
+
+def test_bandpass_empties_the_drawn_series_but_not_what_reports_on_the_full_band():
+    on, _, _ = _spiky_block_run()
+    off, _, _ = _spiky_block_run(band=None)
+    # On the mirror extension, as the filter sees it: a plain FFT of the run leaks
+    # from its unjoined ends (0.5% here) and would measure that instead.
+    mirrored = torch.cat([on.z.float(), on.z.float().flip(0)])
+    freqs = torch.fft.rfftfreq(mirrored.shape[0], d=on.tr)
+    power = torch.fft.rfft(mirrored, dim=0).abs().square().sum(1)
+    assert float(power[freqs > 0.19].sum() / power.sum()) < 1e-4
+    # The spike must not be filtered away, nor the fast band lost to spectrum colour.
+    assert int(on.dvars.argmax()) in (on.n_time // 2, on.n_time // 2 + 1)
+    assert torch.allclose(on.dvars, off.dvars, atol=1e-3)
+    assert torch.allclose(on.tsnr, off.tsnr, atol=1e-3)
+    assert torch.allclose(on.extras["bands"], off.extras["bands"], atol=1e-3)
+
+
+def test_bandpass_keeps_the_block():
+    feats, in_patch, block = _spiky_block_run(spike=0.0)
+    fam = int(torch.mode(feats.family[torch.from_numpy(in_patch)]).values)
+    # The band keeps a 20 s square wave's first two odd harmonics, which correlate 0.95 with it.
+    assert abs(np.corrcoef(feats.family_tcs[:, fam].numpy(), block)[0, 1]) > 0.9
+
+
+def test_components_stop_at_the_bands_rank():
+    feats, _, _ = _spiky_block_run(n_time=120)
+    dof = band_dof(resolve_band(DEFAULT_BANDPASS_HZ, 1.0, [0], 120), 1.0, [0], 120)
+    assert feats.loadings_all.shape[1] == dof
+    assert np.linalg.matrix_rank(feats.z.float().numpy(), tol=1e-2 * np.sqrt(feats.n_voxels)) <= dof
+
+
+def test_psc_scale_describes_the_filtered_series():
+    # A sine in band loses nothing, so its drawn scale is what the full band says
+    # about the sine alone: amplitude 2 in a mean of 100.
+    n_time = 200
+    wave = 2.0 * np.sin(2 * np.pi * 0.05 * np.arange(n_time))
+    rng = np.random.default_rng(1)
+    data = rng.standard_normal((n_time, *SHAPE)).astype(np.float32) * 0.5
+    data += wave[:, None, None, None].astype(np.float32) + 100.0
+    feats = compute_features(
+        torch.from_numpy(data), np.ones(SHAPE, dtype=bool), np.eye(4), 1.0, [0],
+        n_components=4, n_families=2, fwhm_mm=0.0, remove_global=False, verbose=False,
+    )  # fmt: skip
+    psc = feats.extras["sd"] / feats.extras["raw_mean"] * 100
+    assert float(psc.median()) == pytest.approx(2.0 / np.sqrt(2), rel=0.1)
+
+
+def test_flags_see_through_the_filter():
+    # Family courses carrying a fast rhythm: invisible in band, still the members' signature.
+    n_time = 300
+    rng = np.random.default_rng(2)
+    fast = np.sin(2 * np.pi * 0.2 * np.arange(n_time))
+    slow = np.sin(2 * np.pi * 0.03 * np.arange(n_time))
+    data = rng.standard_normal((n_time, *SHAPE)).astype(np.float32) * 0.3
+    data[(slice(None), *PATCH)] += (6 * fast + slow)[:, None, None, None].astype(np.float32)
+    data += 100.0
+    feats = compute_features(
+        torch.from_numpy(data), np.ones(SHAPE, dtype=bool), np.eye(4), 1.0, [0],
+        n_components=4, n_families=2, fwhm_mm=0.0, remove_global=False, verbose=False,
+    )  # fmt: skip
+    in_patch = np.zeros(SHAPE, dtype=bool)
+    in_patch[PATCH] = True
+    fam = int(torch.mode(feats.family[torch.from_numpy(in_patch[tuple(feats.ijk.T)])]).values)
+    assert "fast" in feats.extras["family_flags"][fam]
+
+
+@pytest.mark.parametrize(
+    "tr, band, want",
+    [
+        (6.0, (0.009, 0.1), "highpass"),  # the top is over Nyquist at a 6 s TR
+        (0.1, (0.009, 0.1), "bandpass"),
+        (1.0, (0.0, 0.1), "lowpass"),
+        (1.0, (0.01, 0.0), "highpass"),
+        (1.0, (0.0, 0.0), None),
+        (1.0, None, None),
+    ],
+)
+def test_resolve_band_handles_any_tr(tr, band, want):
+    filt = resolve_band(band, tr, [0], 2000)
+    assert (filt.kind if filt else None) == want
+
+
+def test_resolve_band_skips_a_run_too_short_to_decompose(capsys):
+    assert resolve_band(DEFAULT_BANDPASS_HZ, 1.0, [0], 20) is None
+    assert "not filtering" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("band", [(0.1, 0.01), (-0.1, 0.1), (0.6, 0.0)])
+def test_resolve_band_rejects_nonsense(band):
+    with pytest.raises(ValueError):
+        resolve_band(band, 1.0, [0], 300)
+
+
+def test_runs_are_filtered_separately():
+    # Two runs at different baselines: one filter across the join would ring there.
+    feats, _, _ = _spiky_block_run(run_starts=(0, 160))
+    dof = sum(
+        band_dof(resolve_band(DEFAULT_BANDPASS_HZ, 1.0, [0], 160), 1.0, [0], 160) for _ in "ab"
+    )
+    assert feats.loadings_all.shape[1] == min(64, dof)

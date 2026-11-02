@@ -105,6 +105,7 @@ examples
 
 def build_parser() -> FfsArgumentParser:
     from fastfuncstuff.viz.dataviz.engine import PARAMS
+    from fastfuncstuff.viz.dataviz.features import DEFAULT_BANDPASS_HZ
 
     params = ", ".join(f"{p.name}" for p in PARAMS)
     parser = FfsArgumentParser(
@@ -136,6 +137,15 @@ def build_parser() -> FfsArgumentParser:
         metavar="MM",
         help="Gaussian smoothing inside the mask before anything is estimated (0: none). Raw "
         "data needs it: unsmoothed, the leading components and families are mostly noise",
+    )
+    parser.add_argument(
+        "-bandpass",
+        type=float,
+        nargs=2,
+        default=list(DEFAULT_BANDPASS_HZ),
+        metavar=("LOW", "HIGH"),
+        help="temporal pass-band in Hz, per run, for everything drawn (0 leaves an edge open, "
+        "0 0 is off). DVARS, tSNR and color=spectrum keep the full band",
     )
     parser.add_argument(
         "-keep_global",
@@ -342,20 +352,24 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.viz.dataviz.features import load_features
 
     device = setup_device(args.device)
-    feats, info = load_features(
-        args.input,
-        device,
-        mask_path=args.mask,
-        tr=args.TR,
-        max_voxels=args.max_voxels,
-        seed=args.seed,
-        n_components=args.ncomp,
-        n_families=args.nfam,
-        period_s=args.period,
-        polort=args.polort,
-        fwhm_mm=args.fwhm,
-        remove_global=not args.keep_global,
-    )
+    try:
+        feats, info = load_features(
+            args.input,
+            device,
+            mask_path=args.mask,
+            tr=args.TR,
+            max_voxels=args.max_voxels,
+            seed=args.seed,
+            n_components=args.ncomp,
+            n_families=args.nfam,
+            period_s=args.period,
+            polort=args.polort,
+            fwhm_mm=args.fwhm,
+            bandpass_hz=tuple(args.bandpass),
+            remove_global=not args.keep_global,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"ffs_dataviz: {exc}") from None
     print(
         f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) "
         f"on {feats.z.device}"
