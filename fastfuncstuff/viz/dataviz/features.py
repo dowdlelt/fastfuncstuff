@@ -168,6 +168,19 @@ def _detrend(
     return clean
 
 
+def _unit_variance(resid: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+    """(N, T) residuals over their SD, with constant voxels exactly zero.
+
+    A voxel clipped at the scanner's ceiling (4095 throughout: 1007 voxels on a
+    9.4 T run) detrends to float32 round-off, SD ~1e-3. Scaled to unit variance
+    that is pure noise which differs by device and, with its leftover mean,
+    reaches a "correlation" of 8.6, so those voxels topped the salience ranks.
+    The floor is relative, a tSNR of 1e5; the highest real voxel there was 66000.
+    """
+    sd = resid.std(1, keepdim=True)
+    return torch.where(sd > 1e-5 * mean.abs()[:, None], resid / sd.clamp_min(1e-12), 0.0)
+
+
 def _robust_unit(x: torch.Tensor) -> torch.Tensor:
     """Map to [0, 1] between the 2nd and 98th percentiles."""
     xs = x.float()
@@ -428,7 +441,7 @@ def compute_features(
         # neighbour pair correlates at ~0.9 (dynaloc median 0.93) and the measure
         # only reports the kernel, which would flatten salience.
         raw = _detrend(flat, run_starts, tr, polort)
-        raw = (raw / raw.std(1, keepdim=True).clamp_min(1e-6)).T.contiguous()
+        raw = _unit_variance(raw, raw_mean).T.contiguous()
         coherence, neighbours = neighbour_coherence(raw, ijk, shape)
         del raw
         # Smooth inside the mask before anything is estimated: on raw data the
@@ -450,11 +463,10 @@ def compute_features(
             verbose=False,
         )
     resid = _detrend(flat, run_starts, tr, polort)
-    del flat
     sd = resid.std(1).clamp_min(1e-6)
     tsnr = raw_mean.abs() / sd
-    zf = resid / sd[:, None]  # (N, T)
-    del resid
+    zf = _unit_variance(resid, flat.mean(1))  # (N, T)
+    del flat, resid
     # The whole-brain signals, taken before anything is removed: they are what
     # tints, flashes and jolts every scene.
     g = zf.mean(0)

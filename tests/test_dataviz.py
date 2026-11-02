@@ -88,6 +88,28 @@ def test_pooling_shrinks_noise_more_than_signal(run):
     assert signal_ratio > noise_ratio + 0.2
 
 
+@pytest.mark.parametrize("fwhm", [0.0, 6.0])
+def test_a_clipped_voxel_does_not_look_salient(fwhm):
+    # Found on real data: voxels stuck at the 12-bit ceiling detrend to round-off,
+    # which unit variance turned into noise that ranked near the top for salience.
+    rng = np.random.default_rng(1)
+    data = 1000.0 + 20.0 * rng.standard_normal((N_TIME, *SHAPE)).astype(np.float32)
+    data += 15.0 * rng.standard_normal((N_TIME, 1, 1, 1)).astype(np.float32)
+    clipped = (slice(None), 7, 7, 5)
+    data[clipped] = 4095.0
+    mask = np.ones(SHAPE, dtype=bool)
+    feats = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0],
+        n_components=8, n_families=4, fwhm_mm=fwhm, remove_global=False, verbose=False,
+    )  # fmt: skip
+    v = int(np.flatnonzero((feats.ijk == (7, 7, 5)).all(1))[0])
+    assert feats.coherence.abs().max() <= 1.0
+    assert feats.coherence[v] == 0.0
+    if fwhm == 0.0:
+        assert feats.z[:, v].abs().max() == 0.0
+        assert feats.salience[v] < feats.salience.median()
+
+
 def test_top_two_agrees_with_topk():
     sim = torch.randn(500, 40)
     expect = sim.topk(2, dim=1).indices
