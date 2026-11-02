@@ -20,6 +20,36 @@ class Scene:
         self.width, self.height = width, height
         self.gen = torch.Generator(device="cpu").manual_seed(seed)
         self.accum = torch.zeros(height * width, 3, device=self.device)
+        # Where each voxel was last drawn, in scene pixels, for picking:
+        # (sx, sy, voxel index or None for 0..N-1). None when not pickable.
+        self._pick: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
+
+    def remember(self, sx: torch.Tensor, sy: torch.Tensor, vox: torch.Tensor | None = None) -> None:
+        self._pick = (sx, sy, vox)
+
+    def pick(self, x: float, y: float, radius: float = 6.0) -> int | None:
+        """Voxel drawn nearest to scene pixel (x, y), within ``radius``."""
+        if self._pick is None:
+            return None
+        sx, sy, vox = self._pick
+        d2 = (sx - x) ** 2 + (sy - y) ** 2
+        i = int(torch.argmin(d2))
+        if float(d2[i]) > radius * radius:
+            return None
+        return int(vox[i]) if vox is not None else i
+
+    def locate(self, v: int) -> tuple[float, float] | None:
+        """Scene pixel where voxel v was last drawn, if it was."""
+        if self._pick is None:
+            return None
+        sx, sy, vox = self._pick
+        if vox is None:
+            return float(sx[v]), float(sy[v])
+        hit = torch.nonzero(vox == v)
+        if hit.numel() == 0:
+            return None
+        i = int(hit[0, 0])
+        return float(sx[i]), float(sy[i])
 
     def rand(self, *shape: int) -> torch.Tensor:
         return torch.rand(*shape, generator=self.gen).to(self.device)

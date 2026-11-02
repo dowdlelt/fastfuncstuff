@@ -123,12 +123,16 @@ class MilkdropScene(Scene):
             # the line is always there and the data decides where it flares.
             glow = (0.15 + dr.brightness()[idx]) * self.density * p["ink_gain"] * 2.0
             rgb = dr.colors()[idx] * glow[:, None]
-            splat(frame, w * 0.5 + r * self.scope_cos, h * 0.5 + r * self.scope_sin, rgb, w, h)
+            sx, sy = w * 0.5 + r * self.scope_cos, h * 0.5 + r * self.scope_sin
+            self.remember(sx, sy, idx)
+            splat(frame, sx, sy, rgb, w, h)
         else:
             pts = self.pts[mode]
             glow = dr.brightness() * self.density * p["ink_gain"]
             rgb = dr.colors() * glow[:, None]
-            splat(frame, w * 0.5 + pts[:, 0] * scale, h * 0.5 + pts[:, 1] * scale, rgb, w, h)
+            sx, sy = w * 0.5 + pts[:, 0] * scale, h * 0.5 + pts[:, 1] * scale
+            self.remember(sx, sy)
+            splat(frame, sx, sy, rgb, w, h)
         self.buf = self.buf + frame.T.reshape(1, 3, h, w)
         return dr.finish(self.buf[0].reshape(3, -1).T, h, w)
 

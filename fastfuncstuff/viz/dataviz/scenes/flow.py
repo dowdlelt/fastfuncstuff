@@ -108,7 +108,9 @@ class FlowScene(Scene):
         rest = p["ink"] * self.density * 0.6 * (0.2 + f.salience)
         rgb = dr.colors() * glow[:, None] + dr.family_rgb()[f.family] * rest[:, None]
         frame = torch.zeros(h * w, 3, device=self.device)
-        splat(frame, w * 0.5 + self.pos[:, 0] * scale, h * 0.5 + self.pos[:, 1] * scale, rgb, w, h)
+        sx, sy = w * 0.5 + self.pos[:, 0] * scale, h * 0.5 + self.pos[:, 1] * scale
+        self.remember(sx, sy)
+        splat(frame, sx, sy, rgb, w, h)
         tr = p["ink_trails"]
         self.accum.mul_(tr).add_(frame * (1 - tr) * 4.0)
         return dr.finish(self.accum, h, w)

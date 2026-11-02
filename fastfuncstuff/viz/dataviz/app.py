@@ -34,6 +34,7 @@ space  play / pause        ← →  step 5 TRs (shift: 25)
 tab m  controls            h    timeline
 f      fullscreen          s    sound on / off
 c      next colour source  [ ]  slower / faster
+click  probe a voxel       i inspector  p z/PSC  o raw/pooled
 l      brain: anatomy ↔ correlation space (animated)
 r      reset view          drag orbit (brain)   wheel zoom
 q esc  quit"""
@@ -48,7 +49,9 @@ class Canvas(QtWidgets.QWidget):
         self._buf: np.ndarray | None = None
         self.show_hud = True
         self._drag: QtCore.QPointF | None = None
+        self._press: QtCore.QPointF | None = None
         self._scrub = False
+        self._target = QtCore.QRectF()
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 180)
 
@@ -70,8 +73,10 @@ class Canvas(QtWidgets.QWidget):
             s = min(self.width() / iw, self.height() / ih)
             w, h = int(iw * s), int(ih * s)
             target = QtCore.QRect((self.width() - w) // 2, (self.height() - h) // 2, w, h)
+            self._target = QtCore.QRectF(target)
             p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, False)
             p.drawImage(target, self.image)
+            self._draw_probe(p)
         if self.show_hud:
             self._draw_hud(p)
         p.end()
@@ -119,6 +124,33 @@ class Canvas(QtWidgets.QWidget):
             f"{viz.vis.scene_name}   {t * f.tr:6.1f} s   TR {t:5.1f}/{n}   ×{viz.vis.p['speed']:.1f}{status}{sound}",
         )
 
+    def to_scene(self, pos: QtCore.QPointF) -> tuple[float, float]:
+        t = self._target
+        vis = self.viz.vis
+        return (pos.x() - t.left()) / max(t.width(), 1) * vis.width, (pos.y() - t.top()) / max(
+            t.height(), 1
+        ) * vis.height
+
+    def _draw_probe(self, p: QtGui.QPainter) -> None:
+        insp = self.viz.inspector
+        if not insp.isVisible():
+            return
+        at = self.viz.vis.scene.locate(insp.probe)
+        if at is None:
+            return
+        t = self._target
+        vis = self.viz.vis
+        x = t.left() + at[0] / vis.width * t.width()
+        y = t.top() + at[1] / vis.height * t.height()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 200), 1.2))
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QtCore.QPointF(x, y), 7, 7)
+
+    def resizeEvent(self, e) -> None:
+        self.viz.place_inspector()
+        super().resizeEvent(e)
+
     def _in_hud(self, y: float) -> bool:
         return self.show_hud and y > self.height() - 50
 
@@ -134,6 +166,7 @@ class Canvas(QtWidgets.QWidget):
             self._seek_to(e.position().x())
         else:
             self._drag = e.position()
+            self._press = e.position()
 
     def mouseMoveEvent(self, e) -> None:
         if self._scrub:
@@ -148,7 +181,17 @@ class Canvas(QtWidgets.QWidget):
             self.viz.set_param("yaw", p["yaw"] + d.x() * 0.008)
             self.viz.set_param("pitch", float(np.clip(p["pitch"] + d.y() * 0.008, -1.5, 1.5)))
 
-    def mouseReleaseEvent(self, _e) -> None:
+    def mouseReleaseEvent(self, e) -> None:
+        # A click that did not drag probes the voxel under it.
+        if self._press is not None and (e.position() - self._press).manhattanLength() < 4:
+            x, y = self.to_scene(e.position())
+            radius = 6.0 * self.viz.vis.width / max(self._target.width(), 1) + 3
+            v = self.viz.vis.scene.pick(x, y, radius)
+            if v is not None:
+                self.viz.place_inspector()
+                self.viz.inspector.set_probe(v)
+                self.viz.inspector.show()
+        self._press = None
         self._drag = None
         self._scrub = False
 
@@ -322,6 +365,10 @@ class Viz(QtWidgets.QMainWindow):
         )
         self.canvas = Canvas(self)
         self.setCentralWidget(self.canvas)
+        from .inspector import Inspector
+
+        self.inspector = Inspector(self, self.canvas)
+        self.inspector.hide()
         self.controls = Controls(self)
         self.dock = QtWidgets.QDockWidget("controls", self)
         self.dock.setWidget(self.controls)
@@ -389,11 +436,21 @@ class Viz(QtWidgets.QMainWindow):
         # the camera orbits, the tunnel keeps flowing.
         self.vis.step(dt, self.playing)
         self.canvas.set_frame(self.vis.render())
+        if self.inspector.isVisible():
+            self.inspector.update()
         self._feed_audio()
 
     def seek(self, t: float) -> None:
         self.vis.seek(t)
         self.canvas.update()
+
+    def place_inspector(self) -> None:
+        if not hasattr(self, "inspector"):
+            return
+        c = self.canvas
+        w = int(min(560, max(360, c.width() * 0.42)))
+        h = int(min(420, max(260, c.height() * 0.5)))
+        self.inspector.setGeometry(c.width() - w - 12, c.height() - h - 60, w, h)
 
     def set_param(self, name: str, value: float, from_ui: bool = False) -> None:
         self.vis.set_param(name, value)
@@ -418,6 +475,15 @@ class Viz(QtWidgets.QMainWindow):
             self.canvas.setFocus()
         elif k == K.Key_H:
             self.canvas.show_hud = not self.canvas.show_hud
+        elif k == K.Key_I:
+            self.place_inspector()
+            self.inspector.setVisible(not self.inspector.isVisible())
+        elif k == K.Key_P:
+            self.inspector.psc = not self.inspector.psc
+            self.inspector.update()
+        elif k == K.Key_O:
+            self.inspector.overlay_shown = not self.inspector.overlay_shown
+            self.inspector.update()
         elif k == K.Key_F:
             self.showNormal() if self.isFullScreen() else self.showFullScreen()
         elif k == K.Key_S:

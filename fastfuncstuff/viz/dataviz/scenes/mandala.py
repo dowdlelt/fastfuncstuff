@@ -109,6 +109,10 @@ class MandalaScene(Scene):
         # columns: angle within the half-sector), keep the trails there, then
         # unfold to the full kaleidoscope with one grid_sample. The cost scales
         # with pixels instead of points x 2*fold copies -- 12x less on the CPU.
+        # Picking compares in the base half-sector: a click anywhere is folded
+        # into it the same way the image was unfolded.
+        self._half = half
+        self.remember(w * 0.5 + rr * torch.cos(theta0), h * 0.5 + rr * torch.sin(theta0))
         n_r, n_th = self._polar_shape(half)
         dth = half / n_th
         # A polar bin covers r * dtheta * dr Cartesian pixels: weight by its
@@ -120,6 +124,19 @@ class MandalaScene(Scene):
             self.accum = torch.zeros(n_r * n_th, 3, device=self.device)
         self.fade_in(frame)
         return dr.finish(self._unfold(half, n_r, n_th), h, w)
+
+    def pick(self, x: float, y: float, radius: float = 6.0) -> int | None:
+        half = getattr(self, "_half", None)
+        if half is None:
+            return None
+        dx, dy = x - self.width * 0.5, y - self.height * 0.5
+        rad = math.hypot(dx, dy)
+        th = math.atan2(dy, dx) % (2 * half)
+        if th > half:
+            th = 2 * half - th
+        return super().pick(
+            self.width * 0.5 + rad * math.cos(th), self.height * 0.5 + rad * math.sin(th), radius
+        )
 
     def _polar_shape(self, half: float) -> tuple[int, int]:
         n_r = int(0.75 * max(self.width, self.height)) + 2

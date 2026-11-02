@@ -355,7 +355,16 @@ def compute_features(
         phase_power=torch.stack([_robust_unit(p) for p in phase_power.T], 1),
         global_signal=g,
         dvars=dv,
-        extras={"wave_tcs": wave_tcs, "neighbours": neighbours},
+        extras={
+            "wave_tcs": wave_tcs,
+            "neighbours": neighbours,
+            # Percent signal change is z * sd / mean * 100; keep both so the
+            # inspector can show either unit.
+            "raw_mean": raw_mean,
+            "sd": sd,
+            "shape": shape,
+            "affine": np.asarray(affine, dtype=np.float64),
+        },
     )
 
 

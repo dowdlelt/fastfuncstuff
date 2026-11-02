@@ -194,6 +194,8 @@ class BrainScene(Scene):
         p, dr = self.p, self.dr
         h, w = self.height, self.width
         sx, sy, depth = self._project()
+        n = self.f.n_voxels
+        self.remember(sx[:n], sy[:n])  # the dust: one particle per voxel, on its home
         vox = self.vox
         spark = self.is_spark
         dens = self.density

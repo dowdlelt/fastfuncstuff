@@ -221,6 +221,20 @@ class Drives:
         # of the brain carries no task signal.
         return x * (1 - mix) + local * mix
 
+    def shown_series(self) -> torch.Tensor:
+        """(T, N) what the scenes draw at each TR: correlation- and space-pooled.
+
+        Cached per pooling setting; the inspector reads one column of it so the
+        bridge from picture to data shows exactly what the picture used (minus
+        the per-frame smoothing, which is a display lag, not a transform).
+        """
+        key = (self.p["clarity"], self.p["pool"], int(self.p["reach"]))
+        if getattr(self, "_shown_key", None) != key:
+            rows = [self.pooled(self.activity(float(t))) for t in range(self.n_time)]
+            self._shown = torch.stack(rows).half()
+            self._shown_key = key
+        return self._shown
+
     def advance(self, dt: float, playing: bool = True) -> None:
         self.wall += dt
         if playing:
