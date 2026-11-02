@@ -9,7 +9,8 @@ raise, and logs each failure as one JSON line keyed by its innermost package lin
     FFS_SWEEP_LOG=/tmp/sweep.jsonl PYTHONPATH=scripts \\
         pytest -p mps_sweep_plugin -m "gpu or not gpu" -n 4 -q
 
-3-5 min on an M4 Max, and it occupies the GPU, so treat it like ``pytest -m gpu``. Plenty
+About 7 min at ``-n 4`` on an M4 Max, and it occupies the GPU, so treat it like ``pytest
+-m gpu``. Keep ``-n 4``: a 12-file subset at ``-n auto`` was still running after 9 min. Plenty
 of what it logs is a test artefact (a test passing ``dtype=float64`` to a helper, half its
 tensors built on the CPU), so read the chain before fixing. ``{log}.ops.{pid}`` counts the
 solver calls that reached Metal. See "MPS traps in torch 2.14" in the wiki.
