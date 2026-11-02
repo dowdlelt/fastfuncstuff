@@ -33,6 +33,19 @@ same drives feed every scene; a scene is only a way of drawing them:
             the global signal is wind, DVARS spikes are quakes.
   brain     the anatomical 3-D swarm: dust on the anatomy, sparks lit by the
             live signal that bloom, flock with their family and shimmer.
+  galaxies  each family a spiral galaxy; windowed correlation between family
+            time courses is gravity (anticorrelation repels), activity is
+            mass. collisions, tidal tails and bridges follow from the data.
+  constellation  the salient voxels as stars in an orbiting head, linked to
+            their long-range correlation partners; links light when both ends
+            rise together, with pulses running along them.
+  turing    Gray-Scott reaction-diffusion inside the head: local activity sets
+            the feed rate, so labyrinths and spots follow the data; the global
+            signal shifts the kill rate, DVARS seeds new growth.
+  coral     each family grows a branching reef (dielectric-breakdown growth on
+            a nutrient released by active cortex) in its own territory while
+            active; quiet reefs recede; growth rings are time.
+  ridgeline space across, time into depth: one ridge per moment, receding.
 
 most of the brain carries no task signal, so sparks are pooled before they are
 shown: across space (each voxel blended with its neighbourhood: pool, reach)
@@ -46,9 +59,14 @@ sound follows the same drives: each ICA family is a voice on a pentatonic
 scale (pitch from its height in the head, pan from its side), a drone opens up
 with the global signal, and DVARS spikes are a soft swell.
 
-keys: 1-5 scene, space play/pause, tab or m controls, h timeline, f fullscreen,
+keys: 1-9 0 scene, space play/pause, tab or m controls, h timeline, f fullscreen,
 s sound, c colour source, [ ] speed, arrows step, wheel zoom, q quit;
 in brain: drag orbits, l animates anatomy <-> correlation layout.
+
+click any point to probe the voxel drawn there: the inspector (i) shows three
+slices through it at the current moment and its whole-run series -- raw, as
+the scene draws it after pooling, and its family -- in z or percent signal
+change (p); o switches the slices between raw and pooled.
 
 examples
   ffs_dataviz -input run1.nii.zst

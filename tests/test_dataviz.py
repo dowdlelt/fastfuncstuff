@@ -126,3 +126,53 @@ def test_cli_sets_take_choice_names():
     assert out == {"scene": float(SCENE_NAMES.index("sand")), "speed": 3.0}
     with pytest.raises(SystemExit):
         parse_sets(["nonsense=1"])
+
+
+def test_voxel_index_orients_slices_to_ras():
+    from fastfuncstuff.viz.dataviz.inspector import VoxelIndex
+
+    shape = (4, 5, 6)
+    ijk = np.argwhere(np.ones(shape, dtype=bool))
+    # i runs left (x flipped), j and k swapped: the RAS grid must undo both.
+    affine = np.array([[-2.0, 0, 0, 0], [0, 0, 2.0, 0], [0, 2.0, 0, 0], [0, 0, 0, 1]])
+    vi = VoxelIndex(ijk, shape, affine)
+    assert vi.shape == (4, 6, 5)
+    world = (affine[:3, :3] @ ijk.T).T
+    # A larger RAS index must mean further right / anterior / superior.
+    for axis in range(3):
+        order = np.argsort(vi.ras[:, axis], kind="stable")
+        assert np.all(np.diff(world[order, axis]) >= -1e-9)
+    assert (vi.lookup >= 0).all()
+
+
+def test_projection_silhouette_has_no_gap_rows(run):
+    from fastfuncstuff.viz.dataviz.scenes.base import axial_cells
+
+    feats, _, _ = run
+    params = default_params()
+    dr = Drives(feats, params)
+    # Many more cells than voxels across: one cell per voxel would leave stripes.
+    _, inside, _ = axial_cells(feats.anat, 120, 120, dr.spacing)
+    rows = inside.any(1)
+    first, last = int(rows.nonzero()[0]), int(rows.nonzero()[-1])
+    assert rows[first : last + 1].all()
+
+
+@pytest.mark.parametrize("scene", ["brain", "mandala", "flow", "galaxies"])
+def test_clicking_a_drawn_voxel_picks_it(run, scene):
+    feats, _, _ = run
+    vis = Visualizer(feats, 160, 90)
+    vis.set_param("scene", SCENE_NAMES.index(scene))
+    for _ in range(3):
+        vis.step(1 / 30)
+    vis.render_tensor()
+    sc = vis.scene
+    v = int(torch.argmax(feats.salience))
+    at = sc.locate(v)
+    assert at is not None
+    got = sc.pick(*at, radius=0.5)
+    # Several voxels can share a pixel; the pick must land on one drawn there.
+    assert got is not None
+    assert sc.locate(got) is not None
+    gx, gy = sc.locate(got)
+    assert abs(gx - at[0]) < 0.75 and abs(gy - at[1]) < 0.75
