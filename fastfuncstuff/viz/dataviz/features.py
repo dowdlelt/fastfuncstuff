@@ -645,12 +645,17 @@ def load_features(
         drop = rng.choice(len(keep), len(keep) - max_voxels, replace=False)
         mask[tuple(keep[drop].T)] = False
 
-    data = data.to(device)
+    shape = tuple(data.shape[1:])
     feats = compute_features(
-        data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, **kwargs
+        data.to(device), mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, **kwargs
     )
+    del data
+    if device.type == "mps":
+        # Metal keeps every freed buffer: 24 GB held for 8.7 GB live on a 1.1M
+        # voxel run, on a machine that also has to draw the window.
+        torch.mps.empty_cache()
     info = {
-        "shape": tuple(data.shape[1:]),
+        "shape": shape,
         "affine": affine,
         "tr": run_tr,
         "names": [Path(p).name for p in paths],
