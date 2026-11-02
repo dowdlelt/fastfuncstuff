@@ -63,7 +63,7 @@ def build_parser() -> FfsArgumentParser:
     params = ", ".join(f"{p.name}" for p in PARAMS)
     parser = FfsArgumentParser(
         prog="ffs_dataviz",
-        description="Data-driven particle visualiser (and sonifier) for 4-D fMRI.",
+        description="Data-driven pixel-art visualiser (and sonifier) for 4-D fMRI.",
         epilog=EPILOG,
     )
     parser.add_argument(
