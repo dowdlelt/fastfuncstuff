@@ -1,4 +1,4 @@
-"""-read with files: the catalog is the list, and no directory gets opened.
+"""Named files: they load, the catalog is the list, and no directory gets opened.
 
 The failure worth pinning is the quiet one. On a synced folder, listing or
 header-reading a directory can fetch every file in it, and a file-list session
@@ -135,11 +135,17 @@ def _replay(monkeypatch, argv):
     return built[0]
 
 
-def test_cli_files_list_without_loading(tmp_path, monkeypatch, no_listing):
+def test_cli_read_files_load_with_nothing_to_click(tmp_path, monkeypatch, no_listing):
     a, b = _vol(tmp_path / "a.nii.gz"), _vol(tmp_path / "b.nii.gz")
-    catalog_dir, file_list, directories, layers = _replay(monkeypatch, ["-read", str(a), str(b)])
+    catalog_dir, file_list, _, layers = _replay(monkeypatch, ["-read", str(a), str(b)])
     assert catalog_dir is None and file_list == (a, b)
-    assert directories == [] and layers == []
+    assert [ly.name for ly in layers] == ["a.nii.gz", "b.nii.gz"]
+
+
+def test_cli_a_file_named_both_ways_loads_once(tmp_path, monkeypatch, no_listing):
+    a, b = _vol(tmp_path / "a.nii.gz"), _vol(tmp_path / "b.nii.gz")
+    _, file_list, _, layers = _replay(monkeypatch, [str(a), "-read", str(a), str(b)])
+    assert file_list == (a, b) and [ly.name for ly in layers] == ["a.nii.gz", "b.nii.gz"]
 
 
 def test_cli_several_directories_read_only_the_first(tmp_path, monkeypatch):
@@ -229,14 +235,16 @@ def test_work_dir_names_a_listed_files_folder_without_listing_it(tmp_path, sessi
     assert session.work_dir == tmp_path / "x"
 
 
-def test_launch_command_reopens_a_file_list(tmp_path, session):
+def test_launch_command_reopens_what_a_file_list_loaded(tmp_path, session):
     listed = _vol(tmp_path / "listed.nii.gz")
     layer = _vol(tmp_path / "layer.nii.gz")
-    session.read_files([listed])
+    session.read_files([listed, layer])
+    args = build_parser().parse_args(shlex.split(session.launch_command())[1:])
+    assert args.read is None
+    assert args.datasets == [str(listed.resolve()), str(layer.resolve())]  # nothing loaded yet
     session.load(layer)
     args = build_parser().parse_args(shlex.split(session.launch_command())[1:])
-    assert args.read == [str(listed.resolve())]
-    assert args.datasets == [str(layer.resolve())]
+    assert args.read is None and args.datasets == [str(layer.resolve())]
 
 
 def test_launch_command_keeps_the_other_directories(tmp_path, session):

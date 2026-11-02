@@ -1983,14 +1983,16 @@ class ViewerSession:
     def launch_command(self) -> str:
         """The ``ffs_viewer`` command line that opens what is loaded now.
 
-        What is on disk, by absolute path: the directories read or the files
-        listed, the stack's files bottom first, the subject's surfaces (and any
+        What is on disk, by absolute path: the directories read, the stack's
+        files bottom first, the subject's surfaces (and any
         meshes added beside them), and surface results. Not edits, display
         settings or windows -- that is the session script -- and not layers
         computed here (a mode's overlay, a DERIVE), which have no file to name;
         those are listed after a ``#``.
 
         The stack's files lead, because ``-read`` takes every path after it.
+        Listed files nobody loaded are left out while anything is loaded: naming
+        one would load it.
         """
         import shlex
 
@@ -2026,10 +2028,9 @@ class ViewerSession:
                 surf_data += ["-surf_data", full(layer.path)]
             else:
                 skipped.append(layer.name)
-        # A list that is just the stack is what bare files already mean.
-        listed = [full(p) for p in self.file_list] if self.reading_files else []
-        if set(listed) != set(files):
-            args += ["-read", *listed] if listed else []
+        # Naming a file loads it, so a list with nothing loaded reopens as that list.
+        if self.reading_files and not files:
+            files = [full(p) for p in self.file_list]
         line = shlex.join(["ffs_viewer", *files, *args, *surf_data])
         return line + (f"  # not reloaded: {', '.join(skipped)}" if skipped else "")
 

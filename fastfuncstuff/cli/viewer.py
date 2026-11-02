@@ -13,8 +13,8 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
-the core is the data selector: READ a directory (or -read a list of files), pick
-an UNDERLAY and an OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
+the core is the data selector: READ a directory, pick an UNDERLAY and an
+OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
 (View / InstaCorr / InstaGLM / InstaPCA / ICA / Denoise / Preproc). the main window is a
 controller -- every image and every graph is a companion window you open,
 arrange and close.
@@ -97,7 +97,6 @@ keys (carpet window)
 
 examples
   ffs_viewer -read results.subj01/
-  ffs_viewer -read run1.nii.gz run2.nii.gz stats.nii.gz
   ffs_viewer -read results.subj01/ results.subj02/
   ffs_viewer anat.nii.gz stats.nii.gz        (those two, loaded; nothing else listed)
   ffs_viewer results.subj01/
@@ -118,21 +117,20 @@ def build_parser() -> FfsArgumentParser:
         "datasets",
         nargs="*",
         metavar="PATH",
-        help="Datasets to load, bottom layer first (anatomy, then overlays). With no "
-        "-read, these are all the pickers list: their directories are not scanned. A "
-        "directory here is read, as with -read.",
+        help="Same as -read: files load as layers, bottom first (anatomy, then "
+        "overlays), and with no directory given they are all the pickers list. A "
+        "directory is read.",
     )
     p.add_argument(
         "-read",
         metavar="PATH",
         nargs="+",
-        help="What to put in the underlay/overlay pickers on startup. A directory is "
-        "read as usual. Several directories are all on the directory list, with only "
-        "the first read until another is picked. Files are listed as they are, and "
-        "their directories are never scanned: the safe choice on a synced folder "
-        "(Dropbox), where a scan can fetch every file. Given both, the directories are "
-        "read and the files load as layers. Takes every path after it, so put datasets "
-        "to load before -read.",
+        help="What to open on startup. A directory fills the underlay/overlay pickers. "
+        "Several directories all join the directory list, with only the first read until "
+        "another is picked. Files load as layers, and with no directory given they are "
+        "all the pickers list; their directories are never scanned, the safe choice on a "
+        "synced folder (Dropbox), where a scan can fetch every file. Takes every path "
+        "after it.",
     )
     p.add_argument(
         "-script",
@@ -229,10 +227,8 @@ def _mesh_commands(paths: list[str]):
 def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
     """The paths sorted out: directories to offer, files to list, datasets to load.
 
-    Files named beside a directory load as layers, which keeps ``-read DIR a b``
-    (the form ctrl+P used to print) meaning what it always has. Bare files with
-    no ``-read`` are both loaded and listed, so the picker holds what was asked
-    for and nothing beside it.
+    A file someone named is a file they want to see, so every one loads, however
+    it was given. With no directory they are also all the picker lists.
     """
     from pathlib import Path
 
@@ -246,10 +242,9 @@ def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
     # always, which knows more dataset spellings than the picker's suffix list.
     bare_dirs = [p for p in args.datasets if Path(p).is_dir()]
     bare = [p for p in args.datasets if p not in bare_dirs]
-    dirs, named = [*bare_dirs, *(str(d) for d in directories)], [str(f) for f in files]
-    if dirs:
-        return dirs, [], [*bare, *named]
-    return [], named or bare, bare
+    dirs = [*bare_dirs, *(str(d) for d in directories)]
+    named = list(dict.fromkeys([*bare, *(str(f) for f in files)]))
+    return dirs, [] if dirs else named, named
 
 
 def main(argv: list[str] | None = None) -> int:
