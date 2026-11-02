@@ -40,6 +40,11 @@ def run():
         [0],
         n_components=8,
         n_families=4,
+        # Explicit: these tests check pooling and families on known data. 6 mm
+        # on a 14-voxel grid would swamp the patch, and the patch is a sizeable
+        # part of this tiny brain's global mean.
+        fwhm_mm=0.0,
+        remove_global=False,
         verbose=False,
     )
     in_patch = np.zeros(SHAPE, dtype=bool)
@@ -176,3 +181,135 @@ def test_clicking_a_drawn_voxel_picks_it(run, scene):
     assert sc.locate(got) is not None
     gx, gy = sc.locate(got)
     assert abs(gx - at[0]) < 0.75 and abs(gy - at[1]) < 0.75
+
+
+def test_family_count_changes_live(run):
+    import copy
+
+    feats = copy.deepcopy(run[0])
+    vis = Visualizer(feats, 48, 32)
+    assert vis.p["families"] == feats.family_tcs.shape[1]
+    vis.set_param("families", 3)
+    assert feats.family_tcs.shape[1] == 3 and int(feats.family.max()) <= 2
+    assert vis.drives.n_fam == 3 and vis.drives.family_salience.numel() == 3
+    for scene in SCENE_NAMES:
+        vis.set_param("scene", SCENE_NAMES.index(scene))
+        vis.step(1 / 30)
+        assert vis.render_tensor().shape == (32, 48, 3), scene
+
+
+def test_flow_twist_does_not_collapse(run):
+    feats, _, _ = run
+    vis = Visualizer(feats, 64, 36)
+    vis.set_param("scene", SCENE_NAMES.index("flow"))
+    vis.set_param("stir", 6.0)
+    sc = vis.scene
+
+    def peak() -> float:
+        # Coarse bins: the synthetic voxels are a lattice, and rotating a
+        # lattice moves fine-bin coincidences around without compressing it.
+        cell = ((sc.pos * 4).round().long() + 8).clamp(0, 15)
+        return float(torch.bincount(cell[:, 0] * 16 + cell[:, 1], minlength=256).max())
+
+    start = peak()
+    for _ in range(120):
+        vis.step(1 / 30)
+    # A twist preserves area; the old vortex-plus-spring piled points 6-12x.
+    assert peak() < start * 1.6
+
+
+def test_weave_puts_the_correlated_patch_together(run):
+    feats, in_patch, _ = run
+    dr = Drives(feats, default_params())
+    row, col, _, _ = dr.weave(16 / 9)
+    xy = torch.stack([col, row], 1)
+    keep = torch.from_numpy(in_patch)
+    spread_patch = torch.cdist(xy[keep], xy[keep]).mean()
+    spread_all = torch.cdist(xy, xy).mean()
+    # The patch shares one signal; the SOM must gather it, not scatter it.
+    assert spread_patch < 0.6 * spread_all
+
+
+def test_remix_stays_in_range_and_in_scene(run):
+    import copy
+
+    vis = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    vis.set_param("scene", SCENE_NAMES.index("mandala"))
+    before = vis.remix(seed=1)
+    for name, value in vis.p.items():
+        prm = PARAM_BY_NAME[name]
+        assert prm.lo <= value <= prm.hi, name
+        if prm.scene not in (None, "mandala"):
+            assert value == before[name], f"remix touched {name} of another scene"
+    assert vis.p["speed"] == before["speed"] and vis.p["families"] == before["families"]
+    vis.restore(before)
+    assert vis.p == before
+
+
+def test_config_round_trip(run, tmp_path):
+    import copy
+    import json
+
+    vis = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    vis.set_param("scene", SCENE_NAMES.index("glass"))
+    vis.set_param("color", PARAM_BY_NAME["color"].choices.index("spectrum"))
+    vis.set_param("panes", 40)
+    vis.set_mute(1, True)
+    path = tmp_path / "look.json"
+    path.write_text(json.dumps(vis.to_config()))
+    other = Visualizer(copy.deepcopy(run[0]), 48, 32)
+    other.from_config(json.loads(path.read_text()))
+    assert other.scene_name == "glass"
+    assert other.p == vis.p
+    assert bool(other.drives.mute[1]) and int(other.drives.mute.sum()) == 1
+
+
+def test_components_and_mute(run):
+    import copy
+
+    feats = copy.deepcopy(run[0])
+    vis = Visualizer(feats, 48, 32)
+    assert feats.loadings_all.shape[1] > feats.k_active >= 2
+    vis.set_param("components", 4)
+    assert feats.loadings.shape[1] == 4 and feats.family_tcs.shape[1] <= 4
+    assert len(feats.extras["family_flags"]) == feats.family_tcs.shape[1]
+    for scene in SCENE_NAMES:
+        vis.set_param("scene", SCENE_NAMES.index(scene))
+        vis.step(1 / 30)
+        assert vis.render_tensor().shape == (32, 48, 3), scene
+    # A muted family's voxels go dark and its drive stops.
+    vis.step(1 / 30)
+    k = int(feats.family[torch.argmax(vis.drives.brightness())])
+    vis.set_mute(k, True)
+    vis.step(1 / 30)
+    members = feats.family == k
+    assert torch.all(vis.drives.voxel_mute()[members] < 0.1) and torch.all(
+        vis.drives.voxel_mute()[~members] == 1
+    )
+    assert float(vis.drives.fam[k]) == 0.0 and float(vis.drives.fam_amp[k]) == 0.0
+
+
+def test_smoothing_keeps_coherence_and_global_comes_out():
+    rng = np.random.default_rng(3)
+    block = (np.arange(N_TIME) // 10) % 2 * 2.0 - 1.0
+    glob = rng.standard_normal(N_TIME).astype(np.float32) * 2
+    data = rng.standard_normal((N_TIME, *SHAPE)).astype(np.float32) + glob[:, None, None, None]
+    data[(slice(None), *PATCH)] += 1.5 * block[:, None, None, None]
+    data += 100.0
+    mask = np.ones(SHAPE, dtype=bool)
+    kw = dict(n_components=8, n_families=4, verbose=False)
+    plain = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0], fwhm_mm=0.0, remove_global=False, **kw
+    )
+    smooth = compute_features(
+        torch.from_numpy(data), mask, np.eye(4), 1.0, [0], fwhm_mm=3.0, remove_global=True, **kw
+    )
+    # Coherence is measured before smoothing, or it would only report the kernel.
+    assert torch.allclose(plain.coherence, smooth.coherence, atol=1e-4)
+    # With the global signal regressed out, no family rides it...
+    g = smooth.global_signal
+    fam = smooth.family_tcs
+    r = ((fam - fam.mean(0)) * (g - g.mean())[:, None]).mean(0) / (fam.std(0) * g.std())
+    assert float(r.abs().max()) < 0.3
+    # ...but the whole-brain series is still there to drive tint and flashes.
+    assert abs(float(np.corrcoef(g.numpy(), glob)[0, 1])) > 0.9

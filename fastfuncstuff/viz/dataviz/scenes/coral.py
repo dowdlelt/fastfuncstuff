@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, filled_field
+from .base import Scene, filled_field
 
 S = "coral"
 
@@ -55,7 +55,7 @@ class CoralScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name == "ccell":
+        if name in ("ccell", "canvas"):
             self._alloc()
 
     def _alloc(self) -> None:
@@ -63,9 +63,7 @@ class CoralScene(Scene):
         c = int(self.p["ccell"])
         self.gh, self.gw = max(16, self.height // c), max(16, self.width // c)
         n = self.gh * self.gw
-        self.cell_of, self.inside, self.passes = axial_cells(
-            f.anat, self.gh, self.gw, self.dr.spacing
-        )
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         self.inside = self.inside.reshape(-1)
         onehot = torch.zeros(f.n_voxels, dr.n_fam, device=self.device)
         onehot[torch.arange(f.n_voxels, device=self.device), f.family] = f.family_weight.clamp_min(
@@ -113,18 +111,25 @@ class CoralScene(Scene):
         self.food = food[0, 0]
         hunger = self.food.reshape(-1) ** p["fractal"]
         empty = (self.label == 0) & self.inside
-        for k in range(dr.n_fam):
-            if act[k] <= 0:
-                continue
-            mine = (self.label == k + 1).float().reshape(1, 1, self.gh, self.gw)
-            nb = F.conv2d(F.pad(mine, (1, 1, 1, 1)), self.kernel).reshape(-1) - mine.reshape(-1)
-            frontier = empty & (nb > 0)
-            prob = (p["growth"] * act[k] * dt * 40.0) * hunger * (0.25 + self.territory[k])
-            claim = frontier & (self.rand(prob.numel()) < prob)
-            self.label[claim] = k + 1
-            self.born[claim] = dr.t
-            self.age[claim] = 0.0
-            empty = empty & ~claim
+        # Every family at once: a one-hot stack, one grouped convolution for the
+        # reef-neighbour counts, and the highest random draw wins a cell two
+        # families both claim. (A Python loop over families was most of the
+        # frame at 1080p.)
+        n_f = dr.n_fam
+        act_t = torch.tensor(act, device=self.device)
+        mine = F.one_hot(self.label, n_f + 1)[:, 1:].T.float().reshape(1, n_f, self.gh, self.gw)
+        k = self.kernel.expand(n_f, 1, 3, 3)
+        nb = (F.conv2d(F.pad(mine, (1, 1, 1, 1)), k, groups=n_f) - mine).reshape(n_f, -1)
+        frontier = empty[None] & (nb > 0) & (act_t > 0)[:, None]
+        prob = (p["growth"] * dt * 40.0) * act_t[:, None] * hunger[None] * (0.25 + self.territory)
+        draw = self.rand(n_f, prob.shape[1])
+        won = frontier & (draw < prob)
+        score = torch.where(won, prob - draw, torch.full_like(prob, -1.0))
+        best = score.max(0)
+        claim = best.values > 0
+        self.label[claim] = best.indices[claim] + 1
+        self.born[claim] = dr.t
+        self.age[claim] = 0.0
         # Die-back: untended cells of quiet families age out, oldest first.
         fam = (self.label - 1).clamp_min(0)
         a = torch.tensor(act, device=self.device)[fam].clamp(0, 1)

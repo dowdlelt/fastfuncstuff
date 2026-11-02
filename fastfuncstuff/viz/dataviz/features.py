@@ -19,6 +19,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.memory import spectral_voxel_chunk
 
 
 @dataclass
@@ -34,9 +35,11 @@ class Features:
     anat: torch.Tensor  # (N, 3) world position, centred, ~unit radius
     func: torch.Tensor  # (N, 3) functional embedding, ~unit radius
     z: torch.Tensor  # (T, N) float16 detrended z-scores
-    loadings: torch.Tensor  # (N, K) PCA spatial loadings (z = loadings @ tcs.T)
-    tcs: torch.Tensor  # (T, K) PCA time courses, unit variance
-    pc_var: torch.Tensor  # (K,) fraction of variance each component explains
+    loadings_all: torch.Tensor  # (N, Kmax) PCA spatial loadings (z = loadings @ tcs.T)
+    tcs_all: torch.Tensor  # (T, Kmax) PCA time courses, unit variance
+    pc_var_all: torch.Tensor  # (Kmax,) fraction of variance each component explains
+    k_active: int  # components in use (the rest are kept for the slider)
+    k_suggested: int  # Marchenko-Pastur count, the default's ceiling
     family: torch.Tensor  # (N,) int ICA family index
     family_weight: torch.Tensor  # (N,) membership strength in [0, 1]
     family_tcs: torch.Tensor  # (T, F) ICA family time courses, unit variance
@@ -51,6 +54,87 @@ class Features:
     global_signal: torch.Tensor  # (T,) mean z, unit variance
     dvars: torch.Tensor  # (T,) robust z of the frame-to-frame RMS change
     extras: dict = field(default_factory=dict)
+
+    @property
+    def loadings(self) -> torch.Tensor:
+        return self.loadings_all[:, : self.k_active]
+
+    @property
+    def tcs(self) -> torch.Tensor:
+        return self.tcs_all[:, : self.k_active]
+
+    @property
+    def pc_var(self) -> torch.Tensor:
+        return self.pc_var_all[: self.k_active]
+
+    def refit_families(self, n_families: int, seed: int = 0) -> None:
+        """Recompute the families in place for a new family count."""
+        for k, v in assign_families(self.loadings, self.z, self.anat, n_families, seed).items():
+            setattr(self, k, v)
+        self.flag_families()
+
+    def set_components(self, k: int, n_families: int, seed: int = 0) -> None:
+        """Use the top ``k`` components: communality, salience and families follow."""
+        self.k_active = max(2, min(int(k), self.loadings_all.shape[1]))
+        self.communality = self.loadings.square().sum(1).clamp(0, 1)
+        self.salience = (_rank_unit(self.communality) * _rank_unit(self.coherence)).sqrt()
+        self.refit_families(min(n_families, self.k_active), seed)
+
+    def flag_families(self) -> None:
+        """Mark families that look like noise rather than signal, without a model.
+
+        Hints, not verdicts, so they are shown and offered for muting, never
+        acted on silently. ``extras["family_noise"]`` keeps the numbers:
+
+        * ``fast``   fraction of the family's power above 0.1 Hz (aliased
+          cardiac/respiratory, thermal) -- flagged over 0.45;
+        * ``global`` |r| with the global signal -- flagged over 0.75;
+        * ``motion`` |r| between the family's frame-to-frame change and
+          DVARS -- flagged over 0.45;
+        * ``edge``   members' share of brain-boundary voxels relative to the
+          brain's -- flagged over 2x (edge and ghosting components).
+        """
+        tcs = self.family_tcs.float()
+        n_time, n_fam = tcs.shape
+        freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
+        pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
+        fast = (
+            pw[freqs > 0.1].sum(0) / pw.sum(0).clamp_min(1e-12)
+            if bool((freqs > 0.1).any())
+            else torch.zeros(n_fam, device=tcs.device)
+        )
+
+        def corr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            a = a - a.mean(0)
+            b = (b - b.mean())[:, None]
+            return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
+
+        r_gs = corr(tcs, self.global_signal.float()).abs()
+        change = torch.zeros_like(tcs)
+        change[1:] = (tcs[1:] - tcs[:-1]).abs()
+        r_dv = corr(change, self.dvars.float()).abs()
+        nb = self.extras["neighbours"]
+        boundary = (nb == torch.arange(len(nb), device=nb.device)[:, None]).any(1).float()
+        w = self.family_weight.clamp_min(0.05)
+        share = torch.zeros(n_fam, device=w.device).index_add_(0, self.family, w * boundary)
+        share = share / torch.zeros(n_fam, device=w.device).index_add_(0, self.family, w).clamp_min(
+            1e-9
+        )
+        edge = share / boundary.mean().clamp_min(1e-6)
+        self.extras["family_noise"] = {"fast": fast, "global": r_gs, "motion": r_dv, "edge": edge}
+        flags = []
+        for i in range(n_fam):
+            f = []
+            if fast[i] > 0.45:
+                f.append("fast")
+            if r_gs[i] > 0.75:
+                f.append("global")
+            if r_dv[i] > 0.45:
+                f.append("motion")
+            if edge[i] > 2.0:
+                f.append("edge")
+            flags.append(f)
+        self.extras["family_flags"] = flags
 
     @property
     def n_voxels(self) -> int:
@@ -177,7 +261,7 @@ def wave_phase(
     where power is the fraction of each voxel's band power the wave explains.
     """
     n_time, n = z.shape
-    chunk = max(1, int(2**26 // max(n_time, 1)))
+    chunk = spectral_voxel_chunk(n, n_time, z.device)
     if period_s is not None:
         freqs = torch.fft.rfftfreq(n_time, d=tr).to(z.device)
         k = max(1, int((freqs - 1.0 / period_s).abs().argmin()))
@@ -210,6 +294,31 @@ def wave_phase(
     return phase, power, u * math.sqrt(n_time)
 
 
+#: Band edges in Hz: slow (drift, slow networks), mid (BOLD task and resting
+#: fluctuations), fast (aliased physiology, thermal noise).
+BAND_EDGES_HZ = (0.03, 0.1)
+
+
+def band_powers(z: torch.Tensor, tr: float) -> torch.Tensor:
+    """(N, 3) fraction of each voxel's power in slow / mid / fast bands.
+
+    A spectral fingerprint: drawn as RGB it separates BOLD-like voxels from
+    drifting ones and from physiology aliased into the fast band, with no model.
+    """
+    n_time, n = z.shape
+    freqs = torch.fft.rfftfreq(n_time, d=tr).to(z.device)[1:]
+    lo, hi = BAND_EDGES_HZ
+    sel = [freqs < lo, (freqs >= lo) & (freqs < hi), freqs >= hi]
+    out = torch.empty(n, 3, device=z.device)
+    chunk = spectral_voxel_chunk(n, n_time, z.device)
+    for a in range(0, n, chunk):
+        pw = torch.fft.rfft(z[:, a : a + chunk].float(), dim=0).abs().square()[1:]
+        tot = pw.sum(0).clamp_min(1e-12)
+        for b, m in enumerate(sel):
+            out[a : a + chunk, b] = pw[m].sum(0) / tot if bool(m.any()) else 0.0
+    return out
+
+
 def _family_ica(loadings: torch.Tensor, n_families: int, seed: int) -> torch.Tensor:
     """Spatial ICA on the PCA loadings: (N, F) independent spatial maps.
 
@@ -228,6 +337,51 @@ def _family_ica(loadings: torch.Tensor, n_families: int, seed: int) -> torch.Ten
     return maps * torch.sign(skew + 1e-12)
 
 
+def assign_families(
+    loadings: torch.Tensor, z_tn: torch.Tensor, anat: torch.Tensor, n_families: int, seed: int
+) -> dict[str, torch.Tensor]:
+    """Spatial ICA of the loadings into families, and what each family does.
+
+    Returns the Features fields ``family`` (argmax of the z-scored ICA maps),
+    ``family_weight`` ((max z - 1) / 3 in [0, 1]), ``family_tcs`` (membership-
+    weighted mean of the members' z, unit variance) and ``family_center``.
+    Cheap enough (~0.5 s) to rerun live when the family count changes.
+    """
+    n_fam = max(2, min(n_families, loadings.shape[1]))
+    ica_maps = _family_ica(loadings, n_fam, seed)  # (N, F)
+    zmaps = ica_maps / ica_maps.std(0, keepdim=True).clamp_min(1e-12)
+    best = zmaps.max(1)
+    family = best.indices
+    member_w = zmaps.clamp_min(0) ** 2
+    tcs = (z_tn.float() @ member_w) / member_w.sum(0).clamp_min(1e-12)
+    tcs = (tcs - tcs.mean(0)) / tcs.std(0).clamp_min(1e-12)
+    centre = torch.zeros(n_fam, 3, device=anat.device).index_add_(0, family, anat)
+    centre /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    return {
+        "family": family,
+        "family_weight": ((best.values - 1.0) / 3.0).clamp(0, 1),
+        "family_tcs": tcs,
+        "family_center": centre,
+    }
+
+
+def suggest_components(evals_desc: np.ndarray, n_voxels: int) -> int:
+    """How many components stand above the Marchenko-Pastur noise edge.
+
+    Each voxel is an observation of a T-dimensional series; the number of
+    independent observations is fewer than the voxel count by however much the
+    data is spatially smooth, but this count is used as a ceiling for a
+    default, so the voxel count is fine -- it errs toward more components,
+    which the pooling and the salience gate are there to tolerate.
+    """
+    from fastfuncstuff.decomposition.model_order import mp_signal_count
+
+    ev = np.asarray(evals_desc, dtype=np.float64)
+    ev = ev[ev > 0]
+    count, _, _ = mp_signal_count(ev, max(1, int(n_voxels)))
+    return max(2, int(count))
+
+
 def compute_features(
     data: torch.Tensor,
     mask: np.ndarray,
@@ -235,8 +389,11 @@ def compute_features(
     tr: float,
     run_starts: list[int],
     *,
-    n_components: int = 16,
+    n_components: int | None = None,
     n_families: int = 10,
+    max_components: int = 64,
+    fwhm_mm: float = 6.0,
+    remove_global: bool = True,
     period_s: float | None = None,
     polort: int | None = None,
     seed: int = 0,
@@ -255,52 +412,88 @@ def compute_features(
     flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float()  # (N, T)
     n, n_time = flat.shape
 
-    raw_mean = flat.mean(1)
+    raw_mean = flat.mean(1)  # the anatomy (dust, slices) stays sharp
+    coherence = neighbours = None
+    if fwhm_mm > 0:
+        # Neighbour coherence from the unsmoothed series: after a 6 mm blur every
+        # neighbour pair correlates at ~0.9 (dynaloc median 0.93) and the measure
+        # only reports the kernel, which would flatten salience.
+        raw = _detrend(flat, run_starts, tr, polort)
+        raw = (raw / raw.std(1, keepdim=True).clamp_min(1e-6)).T.contiguous()
+        coherence, neighbours = neighbour_coherence(raw, ijk, shape)
+        del raw
+        # Smooth inside the mask before anything is estimated: on raw data the
+        # leading components and families are largely thermal and physiological
+        # noise, and a few mm of shared signal is what ICA needs to find
+        # networks. Normalised by the blurred mask, so edge voxels are not pulled
+        # toward zero.
+        from fastfuncstuff.cli_utils import blur_masked_data
+
+        zooms = tuple(float(v) for v in np.linalg.norm(np.asarray(affine)[:3, :3], axis=0))
+        flat = blur_masked_data(
+            flat,
+            fwhm_mm=fwhm_mm,
+            volume_shape=shape,
+            voxel_sizes=zooms,
+            mask_flat=mask.reshape(-1),
+            run_starts=run_starts,
+            device=device,
+            verbose=False,
+        )
     resid = _detrend(flat, run_starts, tr, polort)
     del flat
     sd = resid.std(1).clamp_min(1e-6)
     tsnr = raw_mean.abs() / sd
     zf = resid / sd[:, None]  # (N, T)
     del resid
+    # The whole-brain signals, taken before anything is removed: they are what
+    # tints, flashes and jolts every scene.
+    g = zf.mean(0)
+    dv = torch.zeros(n_time, device=device)
+    dv[1:] = (zf[:, 1:] - zf[:, :-1]).square().mean(0).sqrt()
+    dv[0] = dv[1]
+    if remove_global:
+        # Families and live values come from what the global signal leaves.
+        # On unprocessed data -- smoothed especially, once thermal noise is
+        # gone -- every family otherwise rides the global signal (all ten
+        # flagged on dynaloc); "things that affect all voxels" are drawn as
+        # colour and motion instead, from g and DVARS above.
+        gn = g - g.mean()
+        beta = (zf @ gn) / (gn @ gn).clamp_min(1e-12)
+        zf = zf - beta[:, None] * gn[None]
+        zf = zf / zf.std(1, keepdim=True).clamp_min(1e-6)
     steps.update()
 
     # Low rank through the (T, T) Gram: T is hundreds, N is hundreds of thousands.
+    # The eigendecomposition gives every component for free, so keep up to
+    # ``max_components`` and let a slider choose how many are in use.
     gram = zf.T @ zf
-    evals, evecs = plinalg.eigh(gram.double())
-    order = torch.argsort(evals, descending=True)
-    k = min(n_components, n_time - 1)
-    evals = evals[order[:k]].float().clamp_min(1e-12)
-    tcs = evecs[:, order[:k]].float()  # (T, K), orthonormal columns
-    loadings = zf @ tcs  # (N, K): z ≈ loadings @ tcs.T
+    evals_all, evecs = plinalg.eigh(gram.double())
+    order = torch.argsort(evals_all, descending=True)
+    k_max = min(max_components, n_time - 1)
+    evals = evals_all[order[:k_max]].float().clamp_min(1e-12)
+    tcs = evecs[:, order[:k_max]].float()  # (T, Kmax), orthonormal columns
+    loadings = zf @ tcs  # (N, Kmax): z ≈ loadings @ tcs.T
     pc_var = evals / gram.diagonal().sum()
     tcs_unit = tcs * math.sqrt(n_time)
     loadings_unit = loadings / math.sqrt(n_time)
-    steps.update()
-
-    n_fam = min(n_families, k)
-    ica_maps = _family_ica(loadings, n_fam, seed)  # (N, F)
-    zmaps = ica_maps / ica_maps.std(0, keepdim=True).clamp_min(1e-12)
-    best = zmaps.max(1)
-    family = best.indices
-    family_weight = ((best.values - 1.0) / 3.0).clamp(0, 1)
-    # Family time course: membership-weighted mean of the members' z.
-    member_w = zmaps.clamp_min(0) ** 2
-    family_tcs = (zf.T @ member_w) / member_w.sum(0).clamp_min(1e-12)
-    family_tcs = (family_tcs - family_tcs.mean(0)) / family_tcs.std(0).clamp_min(1e-12)
+    k_suggested = suggest_components(evals_all[order].cpu().numpy(), n)
+    k_active = min(k_max, n_components if n_components is not None else min(k_suggested, 32))
     steps.update()
 
     world = torch.as_tensor(
         affine[:3, :3] @ ijk.T + affine[:3, 3:4], device=device, dtype=torch.float32
     ).T
     anat = _centre_scale(world)
-    family_center = torch.zeros(n_fam, 3, device=device).index_add_(0, family, anat)
-    family_center /= torch.bincount(family, minlength=n_fam).clamp_min(1)[:, None]
+    fams = assign_families(loadings[:, :k_active], zf.T, anat, min(n_families, k_active), seed)
+    steps.update()
 
     # Functional layout: each voxel's direction in correlation space. Two voxels
     # whose rows of the row-normalised loading matrix agree are correlated, so
     # projecting those rows onto their own top three axes puts correlated voxels
     # side by side regardless of where they sit in the head.
-    rows = loadings_unit / loadings_unit.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    rows = loadings_unit[:, :k_active]
+    rows = rows / rows.norm(dim=1, keepdim=True).clamp_min(1e-12)
     rows = rows - rows.mean(0, keepdim=True)
     _, _, vh = plinalg.svd(rows[:: max(1, n // 200_000)].double(), full_matrices=False)
     func = _centre_scale(rows @ vh[:3].T.float())
@@ -308,44 +501,41 @@ def compute_features(
 
     zt = zf.T.contiguous()  # (T, N)
     del zf
-    coherence, neighbours = neighbour_coherence(zt, ijk, shape)
+    if coherence is None:
+        coherence, neighbours = neighbour_coherence(zt, ijk, shape)
     # Salience: what fraction of a voxel's variance is *shared* -- with its
     # correlated partners anywhere (communality) and with its neighbours
     # (coherence). Task cortex and networks score high; white matter, whose
     # fluctuation is mostly independent thermal noise however high its tSNR,
     # scores low. Ranks, so neither measure's scale dominates.
-    communality = (loadings_unit.square().sum(1)).clamp(0, 1)
+    communality = (loadings_unit[:, :k_active].square().sum(1)).clamp(0, 1)
     salience = (_rank_unit(communality) * _rank_unit(coherence)).sqrt()
     steps.update()
 
     phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
+    bands = band_powers(zt, tr)
     steps.update()
 
-    g = zt.float().mean(1)
     g = (g - g.mean()) / g.std().clamp_min(1e-12)
-    dv = torch.zeros(n_time, device=device)
-    dv[1:] = (zt[1:].float() - zt[:-1].float()).square().mean(1).sqrt()
-    dv[0] = dv[1]
     med = dv.median()
     mad = (dv - med).abs().median().clamp_min(1e-6) * 1.4826
     dv = (dv - med) / mad
     steps.update()
     steps.close()
 
-    return Features(
+    feats = Features(
         tr=tr,
         run_starts=list(run_starts),
         ijk=ijk,
         anat=anat,
         func=func,
         z=zt.half(),
-        loadings=loadings_unit,
-        tcs=tcs_unit,
-        pc_var=pc_var,
-        family=family,
-        family_weight=family_weight,
-        family_tcs=family_tcs,
-        family_center=family_center,
+        loadings_all=loadings_unit,
+        tcs_all=tcs_unit,
+        pc_var_all=pc_var,
+        k_active=k_active,
+        k_suggested=k_suggested,
+        **fams,
         mean=_robust_unit(raw_mean),
         tsnr=_robust_unit(tsnr),
         coherence=coherence,
@@ -364,8 +554,11 @@ def compute_features(
             "sd": sd,
             "shape": shape,
             "affine": np.asarray(affine, dtype=np.float64),
+            "bands": bands,
         },
     )
+    feats.flag_families()
+    return feats
 
 
 def load_features(

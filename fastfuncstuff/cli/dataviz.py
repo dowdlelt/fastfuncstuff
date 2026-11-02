@@ -46,6 +46,31 @@ same drives feed every scene; a scene is only a way of drawing them:
             a nutrient released by active cortex) in its own territory while
             active; quiet reefs recede; growth rings are time.
   ridgeline space across, time into depth: one ridge per moment, receding.
+  life      cellular automata (Life, HighLife, Day & Night, Seeds, Brian's
+            Brain) seen from far away, seeded with soup where cortex is active.
+  lenia     a continuous automaton; activity opens its growth band locally, so
+            living patterns appear, divide and die back where the data is.
+  physarum  slime moulds, one species per family, foraging on activity.
+  glass     a Voronoi window over the head; each pane glows with its voxels.
+  attractor a Clifford/de Jong attractor as a flame; four PC time courses steer
+            it, and each active family peels into its own coloured copy.
+  fluid     full-screen stable fluids: one ink jet per family, pointing along
+            the family's Hilbert phase and pushing with its envelope.
+  interference  every family a source of ripples (its envelope, phase and own
+            wavelength); the moire locks into a standing figure when families
+            synchronise. op-art mode cuts it into black and white.
+  statespace  the brain's path through PC1-3 (PC4-6 as colour) as a ribbon,
+            through the cloud of voxels placed by their loadings (a biplot);
+            recurrence arcs join the present to past visits of the same state.
+  spectrum  a Winamp analyser: one group of bars per family, with a waterfall.
+  tapestry  the weave itself: every voxel a stitch, the live field rippling it.
+
+the weave (canvas=weave) tiles every voxel over the full screen with correlated
+voxels adjacent -- a self-organising map trained on each voxel's correlation
+profile -- and turns the grid scenes (turing, coral, life, lenia, physarum,
+glass) into full-field pieces whose geography is correlation, not anatomy.
+colour sources include 'phase' (each voxel's own oscillation phase, so waves
+sweep across as rainbows) and 'spectrum' (slow/mid/fast band power as RGB).
 
 most of the brain carries no task signal, so sparks are pooled before they are
 shown: across space (each voxel blended with its neighbourhood: pool, reach)
@@ -59,7 +84,10 @@ sound follows the same drives: each ICA family is a voice on a pentatonic
 scale (pitch from its height in the head, pan from its side), a drone opens up
 with the global signal, and DVARS spikes are a soft swell.
 
-keys: 1-9 0 scene, space play/pause, tab or m controls, h timeline, f fullscreen,
+scenes come in sets (g cycles them; the bottom bar lists the current one).
+
+keys: 1-9 0 scene in set, g next set, space play/pause, tab or m controls,
+h hide everything but the picture, f fullscreen,
 s sound, c colour source, [ ] speed, arrows step, wheel zoom, q quit;
 in brain: drag orbits, l animates anatomy <-> correlation layout.
 
@@ -101,7 +129,27 @@ def build_parser() -> FfsArgumentParser:
         metavar="N",
         help="Legendre drift degree per run (default: AFNI's 1 + duration/150 s)",
     )
-    parser.add_argument("-ncomp", type=int, default=16, metavar="K", help="PCA components kept")
+    parser.add_argument(
+        "-fwhm",
+        type=float,
+        default=6.0,
+        metavar="MM",
+        help="Gaussian smoothing inside the mask before anything is estimated (0: none). Raw "
+        "data needs it: unsmoothed, the leading components and families are mostly noise",
+    )
+    parser.add_argument(
+        "-keep_global",
+        action="store_true",
+        help="keep the global signal in the families and live values (default: regress it out "
+        "and show it as colour, flashes and jolts instead)",
+    )
+    parser.add_argument(
+        "-ncomp",
+        type=int,
+        metavar="K",
+        help="PCA components in use at start (default: the Marchenko-Pastur count, at most 32; "
+        "up to 64 are kept and the 'components' slider moves between them)",
+    )
     parser.add_argument(
         "-nfam", type=int, default=10, metavar="F", help="ICA families (voices, flocks)"
     )
@@ -125,6 +173,11 @@ def build_parser() -> FfsArgumentParser:
         metavar="NAME=VALUE",
         help=f"starting parameter values; names: {params}. choice parameters "
         "(scene, color, inject) also take their names",
+    )
+    parser.add_argument(
+        "-config",
+        metavar="JSON",
+        help="a saved look (ctrl+s or the panel's save button); -set values override it",
     )
     parser.add_argument("-no_sound", action="store_true", help="start without audio")
     parser.add_argument(
@@ -182,6 +235,7 @@ def render_movie(
     fps: int,
     sound: bool,
     start: float = 0.0,
+    config: dict | None = None,
 ) -> None:
     import numpy as np
     from tqdm.auto import tqdm
@@ -194,6 +248,8 @@ def render_movie(
     if ffmpeg is None:
         raise SystemExit("ffs_dataviz: -movie needs ffmpeg on PATH")
     sw = Visualizer(feats, *size)
+    if config is not None:
+        sw.from_config(config)
     for k, v in params.items():
         sw.set_param(k, v)
     sw.seek(start)
@@ -275,6 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         raise SystemExit(f"ffs_dataviz: -size wants WxH, got {args.size!r}") from None
     params = parse_sets(args.set)
+    config = None
+    if args.config:
+        import json
+
+        with open(args.config) as fh:
+            config = json.load(fh)
 
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.viz.dataviz.features import load_features
@@ -291,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         n_families=args.nfam,
         period_s=args.period,
         polort=args.polort,
+        fwhm_mm=args.fwhm,
+        remove_global=not args.keep_global,
     )
     print(
         f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) on {device}"
@@ -306,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
             start=args.start,
             fps=args.fps,
             sound=not args.no_sound,
+            config=config,
         )
         print(f"ffs_dataviz: wrote {args.movie}")
         return 0
@@ -325,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         params=params,
         sound=not args.no_sound,
         start=args.start,
+        config=config,
     )
 
 

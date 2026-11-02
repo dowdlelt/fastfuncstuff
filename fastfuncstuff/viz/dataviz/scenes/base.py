@@ -69,10 +69,63 @@ class Scene:
         return float(sx[i]), float(sy[i])
 
     def rand(self, *shape: int) -> torch.Tensor:
-        return torch.rand(*shape, generator=self.gen).to(self.device)
+        gen = self._device_gen()
+        if gen.device.type == self.device.type:
+            return torch.rand(*shape, generator=gen, device=self.device)
+        return torch.rand(*shape, generator=gen).to(self.device)
 
     def randn(self, *shape: int) -> torch.Tensor:
-        return torch.randn(*shape, generator=self.gen).to(self.device)
+        gen = self._device_gen()
+        if gen.device.type == self.device.type:
+            return torch.randn(*shape, generator=gen, device=self.device)
+        return torch.randn(*shape, generator=gen).to(self.device)
+
+    def _device_gen(self) -> torch.Generator:
+        """A generator on the scene's own device.
+
+        Drawing on the CPU and copying was two thirds of the frame for the grid
+        automata at 1080p (aten::uniform_ on two million cells, then a memcpy).
+        """
+        gen = self.__dict__.get("_dgen")
+        if gen is None:
+            try:
+                gen = torch.Generator(device=self.device)
+            except RuntimeError:  # a backend without device generators
+                gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=self.gen)))
+            self._dgen = gen
+        return gen
+
+    def relative(self, x: torch.Tensor, key: str = "act") -> torch.Tensor:
+        """``x`` over its own recent peak (98th percentile, ~5 s memory), in [0, 1].
+
+        Absolute activity is small almost everywhere (most of the brain sits
+        below threshold), so thresholds on it never trip; relative to what this
+        run has recently reached, the active places read as active.
+        """
+        flat = x.reshape(-1)
+        sample = flat if flat.numel() <= 200_000 else flat[:: flat.numel() // 200_000 + 1]
+        peak = float(torch.quantile(sample, 0.98).clamp_min(1e-6))
+        ref = self.__dict__.setdefault("_peaks", {}).get(key, peak)
+        ref += (max(peak, ref * 0.5) - ref) * 0.01
+        self._peaks[key] = ref
+        return (x / ref).clamp(0, 1)
+
+    def grid_cells(self, gh: int, gw: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Voxel -> cell on a (gh, gw) grid for the current ``canvas``.
+
+        "head": the axial projection inside the head's outline. "weave": every
+        voxel tiled over the full field by correlation (``Drives.weave``).
+        Returns (flat cell per voxel, (gh, gw) bool canvas, gap-closing passes).
+        """
+        from ..drives import CANVASES
+
+        if CANVASES[int(self.p["canvas"])] == "weave":
+            row, col, rows, cols = self.dr.weave(gw / gh)
+            cell = (row * gh).long().clamp(0, gh - 1) * gw + (col * gw).long().clamp(0, gw - 1)
+            passes = max(1, math.ceil(max(gh / rows, gw / cols)))
+            return cell, torch.ones(gh, gw, dtype=torch.bool, device=self.device), passes
+        return axial_cells(self.f.anat, gh, gw, self.dr.spacing)
 
     def resize(self, width: int, height: int) -> None:
         if (width, height) != (self.width, self.height):
@@ -197,6 +250,15 @@ def filled_field(
     return out if values.ndim == 2 else out[0]
 
 
+def disks(spots: torch.Tensor, r: int) -> torch.Tensor:
+    """Grow each True cell of an (H, W) mask into a disk of radius r (round, not square)."""
+    import torch.nn.functional as F
+
+    y = torch.arange(-r, r + 1, device=spots.device, dtype=torch.float32)
+    k = ((y[:, None] ** 2 + y[None, :] ** 2) <= r * r + 0.5).float()[None, None]
+    return F.conv2d(F.pad(spots.float()[None, None], (r, r, r, r)), k)[0, 0] > 0
+
+
 def blur(img: torch.Tensor, passes: int = 1) -> torch.Tensor:
     """Cheap separable 3-tap box blur of an (H, W) or (C, H, W) image."""
     import torch.nn.functional as F
@@ -233,3 +295,48 @@ def splat_lines(
     length = ((x1 - x0) ** 2 + (y1 - y0) ** 2).sqrt().clamp_min(1.0)
     per = rgb * (length / samples).clamp(max=1.0)[:, None]
     splat(frame, xs.reshape(-1), ys.reshape(-1), per.repeat_interleave(samples, 0), w, h)
+
+
+def family_weave_sites(scene: Scene) -> torch.Tensor:
+    """(F, 2) each family's centre on the weave, as (x, y) fractions of the field.
+
+    Full-field scenes place one source per family; putting it where the
+    family's voxels sit on the weave keeps every full-field scene in the same
+    correlation geography as the weave canvas.
+    """
+    dr, f = scene.dr, scene.f
+    row, col, _, _ = dr.weave(scene.width / scene.height)
+    w = f.family_weight.clamp_min(0.05)
+    tot = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, w).clamp_min(1e-6)
+    x = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, col * w) / tot
+    y = torch.zeros(dr.n_fam, device=scene.device).index_add_(0, f.family, row * w) / tot
+    return torch.stack([x, y], 1)
+
+
+def family_ring_sites(scene: Scene, radius: float = 0.3) -> torch.Tensor:
+    """(F, 2) one source per family, evenly round an ellipse, ordered by where
+    the families sit on the weave. Weave centroids cluster near the middle (most
+    families span the map), which made every source nearly concentric; the
+    ring keeps the weave's order but spreads the sources out.
+    """
+    site = family_weave_sites(scene) - 0.5
+    order = torch.argsort(torch.atan2(site[:, 1], site[:, 0]))
+    n = len(order)
+    ang = torch.empty(n, device=scene.device)
+    ang[order] = torch.arange(n, device=scene.device, dtype=torch.float32) / n * 2 * math.pi
+    aspect = scene.width / scene.height
+    return torch.stack(
+        [0.5 + radius / aspect * torch.cos(ang) * 1.6, 0.5 + radius * torch.sin(ang)], 1
+    )
+
+
+def representative(scene: Scene) -> torch.Tensor:
+    """(F,) the most salient member voxel of each family, for picking a source."""
+    f, dr = scene.f, scene.dr
+    best = torch.full((dr.n_fam,), -1.0, device=scene.device).scatter_reduce_(
+        0, f.family, f.salience, reduce="amax", include_self=True
+    )
+    hit = f.salience >= best[f.family] - 1e-9
+    rep = torch.zeros(dr.n_fam, dtype=torch.long, device=scene.device)
+    rep[f.family[hit]] = torch.nonzero(hit).squeeze(1)
+    return rep
