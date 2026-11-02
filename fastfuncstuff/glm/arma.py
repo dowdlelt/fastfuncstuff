@@ -3394,7 +3394,7 @@ def _fit_dsort_gls_pass(
             try:
                 Lc = plinalg.cholesky(XtX + 1e-8 * eye)
                 betas = plinalg.cholesky_solve(Xty, Lc)  # (B, p_ext, 1)
-                XtX_inv = torch.cholesky_inverse(Lc)  # (B, p_ext, p_ext)
+                XtX_inv = plinalg.cholesky_inverse(Lc)  # (B, p_ext, p_ext)
             except torch.linalg.LinAlgError:
                 XtX_inv = plinalg.pinv(XtX)
                 betas = XtX_inv @ Xty
@@ -4764,7 +4764,7 @@ def fit_glm_arma11(
 
                 try:
                     L_group = plinalg.cholesky(XwTXw_group)
-                    XwTXw_inv_group = torch.cholesky_inverse(L_group)
+                    XwTXw_inv_group = plinalg.cholesky_inverse(L_group)
                     cholesky_success_group = True
                     del L_group
                 except torch.linalg.LinAlgError:

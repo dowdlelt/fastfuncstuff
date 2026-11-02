@@ -739,7 +739,7 @@ def fit_glm(
     pinv_design = None
     try:
         L = plinalg.cholesky(xtx_ld)
-        xtx_inv = torch.cholesky_inverse(L).to(design_concat.device)
+        xtx_inv = plinalg.cholesky_inverse(L).to(design_concat.device)
     except torch.linalg.LinAlgError:
         # Cholesky requires positive-definite; fall through to inv.
         L = None
@@ -834,7 +834,7 @@ def fit_glm(
     def _safe_invert(M, ld_dev, target_dev):
         try:
             L_ = plinalg.cholesky(M.to(ld_dev))
-            return torch.cholesky_inverse(L_).to(target_dev)
+            return plinalg.cholesky_inverse(L_).to(target_dev)
         except torch.linalg.LinAlgError:
             try:
                 return plinalg.inv(M.to(ld_dev)).to(target_dev)

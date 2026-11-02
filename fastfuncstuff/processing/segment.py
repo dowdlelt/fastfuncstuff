@@ -186,7 +186,7 @@ def gaussian_log_density(corrected: Tensor, means: Tensor, covs: Tensor, mix: Te
     covs_b = covs.to(torch.float64).permute(2, 0, 1)  # (n_gauss, n_chan, n_chan)
     chol = plinalg.cholesky(covs_b)  # M-step keeps covs PD
     logdet = (2.0 * torch.log(torch.diagonal(chol, dim1=1, dim2=2)).sum(dim=1)).to(wdt)
-    prec = torch.cholesky_inverse(chol).to(wdt)  # (n_gauss, n_chan, n_chan) = cov⁻¹
+    prec = plinalg.cholesky_inverse(chol).to(wdt)  # (n_gauss, n_chan, n_chan) = cov⁻¹
     centred = corrected[:, :, None] - means.to(wdt)[None, :, :]  # (n_vox, n_chan, n_gauss)
     tmp = torch.einsum("vck,kcd->vdk", centred, prec)
     maha = (tmp * centred).sum(dim=1)  # (n_vox, n_gauss)
@@ -2076,7 +2076,7 @@ def fit_segment(
         assert means is not None and covs is not None  # set by the EM loop before any sweep
         coef_val = coef_val.detach().clone()
         # per-Gaussian precisions covⁿ¹ (n_gauss, n_chan, n_chan), float64 for conditioning
-        prec = torch.cholesky_inverse(
+        prec = plinalg.cholesky_inverse(
             plinalg.cholesky(covs.to(torch.float64).permute(2, 0, 1)),
         )
         c_diag = bias_prec.reshape(-1).to(torch.float64)  # diagonal DCT precision (d3,)

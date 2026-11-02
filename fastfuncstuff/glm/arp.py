@@ -333,10 +333,10 @@ def _solve_structured(u: Tensor, c: _Crit):
 def _minv_blocks(f: dict, c: _Crit) -> tuple[Tensor, Tensor, Tensor]:
     """M⁻¹ on the structured blocks (the only entries any coefficient touches):
     S-block Σ⁻¹, B-block −D⁻¹BΣ⁻¹, D-blocks D⁻¹ + D⁻¹BΣ⁻¹B'D⁻¹. Padding zeroed."""
-    Si = torch.cholesky_inverse(f["LS"])
+    Si = plinalg.cholesky_inverse(f["LS"])
     Y = f["Y"]
     YS = torch.einsum("vrki,vij->vrkj", Y, Si)
-    Md = torch.cholesky_inverse(f["LD"]) + torch.einsum("vrki,vrli->vrkl", YS, Y)
+    Md = plinalg.cholesky_inverse(f["LD"]) + torch.einsum("vrki,vrli->vrkl", YS, Y)
     keep = c.per_item((~c.pad).to(Md.dtype))  # (N, R, k)
     keep_s = c.per_item((~c.pad_s).to(Md.dtype))  # (N, ks)
     Md = Md * (keep[..., :, None] * keep[..., None, :])

@@ -79,6 +79,7 @@ _ROUTED_NAMES = {
     "cholesky", "cholesky_ex", "inv", "inv_ex", "det", "slogdet", "lu_factor", "lu_solve", "eigh",
     "eigvalsh",
 }  # fmt: skip
+_ROUTED_TOP_LEVEL = {"cholesky_solve", "cholesky_inverse"}
 
 
 def test_package_uses_routed_solvers():
@@ -89,10 +90,10 @@ def test_package_uses_routed_solvers():
         if path.name in ("policy_linalg.py", "utils.py"):
             continue
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Attribute) and node.attr in _ROUTED_NAMES | {"cholesky_solve"}:
+            if isinstance(node, ast.Attribute) and node.attr in _ROUTED_NAMES | _ROUTED_TOP_LEVEL:
                 text = ast.unparse(node)
                 if text in {f"torch.linalg.{node.attr}", f"_torch.linalg.{node.attr}"} or (
-                    text == "torch.cholesky_solve"
+                    text in {f"torch.{n}" for n in _ROUTED_TOP_LEVEL}
                 ):
                     found.append(f"{path.relative_to(root)}:{node.lineno}: {text}")
     assert not found, "use fastfuncstuff.policy_linalg:\n" + "\n".join(found)
@@ -104,6 +105,9 @@ def test_routed_solvers_return_what_torch_returns_on_the_cpu():
     torch.testing.assert_close(q @ r, a, rtol=1e-5, atol=1e-5)
     assert plinalg.cholesky_ex(a.T @ a).info.item() == 0
     assert plinalg.svd(a, full_matrices=False).S.shape == (4,)
+    spd = a.T @ a
+    inverse = plinalg.cholesky_inverse(plinalg.cholesky(spd))
+    torch.testing.assert_close(inverse @ spd, torch.eye(4), rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.gpu
@@ -115,6 +119,7 @@ def test_routed_solvers_return_what_torch_returns_on_the_cpu():
         ("svd", (torch.randn(4, 16, 8),)),  # raises inside Metal's compiler if it stays there
         ("svdvals", (torch.randn(4, 16, 8),)),
         ("inv", (torch.eye(4) * 2,)),
+        ("cholesky_inverse", (torch.eye(4) * 2,)),
         ("eigh", (torch.eye(8).expand(3, 8, 8) * 2,)),
     ],
 )

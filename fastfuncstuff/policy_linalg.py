@@ -85,6 +85,10 @@ def cholesky_solve(b, l, **kwargs):  # noqa: E741 -- torch's own name for the fa
     return _routed("cholesky_solve", torch.cholesky_solve, b, l, **kwargs)
 
 
+def cholesky_inverse(l, **kwargs):  # noqa: E741 -- torch's own name for the factor
+    return _routed("cholesky_inverse", torch.cholesky_inverse, l, **kwargs)
+
+
 def inv(a, **kwargs):
     return _routed("inv", torch.linalg.inv, a, **kwargs)
 
