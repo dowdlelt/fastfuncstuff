@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, blur, filled_field
+from .base import Scene, blur, filled_field
 
 S = "physarum"
 
@@ -50,14 +50,14 @@ class PhysarumScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name in ("pcell", "agents"):
+        if name in ("canvas", "pcell", "agents"):
             self._alloc()
 
     def _alloc(self) -> None:
         f, dr = self.f, self.dr
         c = int(self.p["pcell"])
         self.gh, self.gw = max(32, self.height // c), max(32, self.width // c)
-        self.cell_of, self.inside, self.passes = axial_cells(f.anat, self.gh, self.gw, dr.spacing)
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         m = min(int(self.p["agents"]), f.n_voxels)
         self.vox = torch.argsort(f.salience, descending=True)[:m]
         self.species = f.family[self.vox]

@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells
+from .base import Scene
 
 S = "glass"
 
@@ -41,14 +41,14 @@ class GlassScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name in ("gcell", "panes"):
+        if name in ("canvas", "gcell", "panes"):
             self._alloc()
 
     def _alloc(self) -> None:
         f, dr = self.f, self.dr
         c = int(self.p["gcell"])
         self.gh, self.gw = max(32, self.height // c), max(32, self.width // c)
-        self.cell_of, self.inside, _ = axial_cells(f.anat, self.gh, self.gw, dr.spacing)
+        self.cell_of, self.inside, _ = self.grid_cells(self.gh, self.gw)
         vox_xy = torch.stack(
             [(self.cell_of % self.gw).float(), (self.cell_of // self.gw).float()], 1
         )

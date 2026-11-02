@@ -89,6 +89,22 @@ class Scene:
         self._peaks[key] = ref
         return (x / ref).clamp(0, 1)
 
+    def grid_cells(self, gh: int, gw: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Voxel -> cell on a (gh, gw) grid for the current ``canvas``.
+
+        "head": the axial projection inside the head's outline. "weave": every
+        voxel tiled over the full field by correlation (``Drives.weave``).
+        Returns (flat cell per voxel, (gh, gw) bool canvas, gap-closing passes).
+        """
+        from ..drives import CANVASES
+
+        if CANVASES[int(self.p["canvas"])] == "weave":
+            row, col, rows, cols = self.dr.weave(gw / gh)
+            cell = (row * gh).long().clamp(0, gh - 1) * gw + (col * gw).long().clamp(0, gw - 1)
+            passes = max(1, math.ceil(max(gh / rows, gw / cols)))
+            return cell, torch.ones(gh, gw, dtype=torch.bool, device=self.device), passes
+        return axial_cells(self.f.anat, gh, gw, self.dr.spacing)
+
     def resize(self, width: int, height: int) -> None:
         if (width, height) != (self.width, self.height):
             self.width, self.height = int(width), int(height)

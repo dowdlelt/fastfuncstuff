@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, blur, filled_field
+from .base import Scene, blur, filled_field
 
 S = "turing"
 
@@ -49,16 +49,14 @@ class TuringScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name == "cell":
+        if name in ("cell", "canvas"):
             self._alloc()
 
     def _alloc(self) -> None:
         f = self.f
         c = int(self.p["cell"])
         self.gh, self.gw = max(16, self.height // c), max(16, self.width // c)
-        self.cell_of, self.inside, self.passes = axial_cells(
-            f.anat, self.gh, self.gw, self.dr.spacing
-        )
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         self.U = torch.ones(self.gh, self.gw, device=self.device)
         self.V = torch.zeros(self.gh, self.gw, device=self.device)
         # Sparse, isolated blobs: a large uniform patch of V collapses instead of patterning.
@@ -116,7 +114,7 @@ class TuringScene(Scene):
         gx[:, 1:-1] = V[:, 2:] - V[:, :-2]
         gy[1:-1] = V[2:] - V[:-2]
         shade = (1.0 + p["relief"] * 4.0 * (-gx - gy)).clamp(0.3, 2.0)
-        img = self.color * tone * shade + 0.04 * self.color * self.inside
+        img = self.color * tone * shade + 0.015 * self.color * self.inside
         img = F.interpolate(img[None], size=(self.height, self.width), mode="nearest")[0]
         c = self.width / self.gw
         cell = self.cell_of

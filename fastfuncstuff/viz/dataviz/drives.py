@@ -37,7 +37,8 @@ class Param:
         )
 
 
-COLOR_SOURCES = ("family", "wave", "sign", "tsnr", "coherence", "mean")
+CANVASES = ("head", "weave")
+COLOR_SOURCES = ("family", "phase", "spectrum", "wave", "sign", "tsnr", "coherence", "mean")
 
 SHARED_PARAMS: tuple[Param, ...] = (
     Param("speed", 2.0, 0.1, 20.0, "time", "TRs played per second"),
@@ -64,6 +65,15 @@ SHARED_PARAMS: tuple[Param, ...] = (
     Param("negative", 0.35, 0.0, 1.0, "color", "how much falling voxels glow (cool) vs. stay dark"),
     Param("tint", 0.5, 0.0, 2.0, "color", "global-signal colour temperature shift"),
     Param("flash", 0.4, 0.0, 2.0, "color", "global brightening on DVARS spikes"),
+    Param(
+        "canvas",
+        0,
+        0,
+        1,
+        "render",
+        "grid scenes: the head from above, or every voxel woven across the full field by correlation",
+        CANVASES,
+    ),
     Param("trails", 0.82, 0.0, 0.995, "render", "fraction of the previous frame kept"),
     Param("exposure", 1.0, 0.1, 8.0, "render", "tone curve exposure"),
     Param(
@@ -199,6 +209,15 @@ class Drives:
         self.family_salience = sal / counts.clamp_min(1)
         self.family_size = counts / counts.sum()
         self._color_key = None
+        # Each family as an oscillator: the analytic signal of its time course
+        # (periods under 6 s removed), for an instantaneous phase and envelope.
+        from .features import analytic_band
+
+        an = analytic_band(f.family_tcs, f.tr)
+        self._fam_re, self._fam_im = an.real.contiguous(), an.imag.contiguous()
+        self.fam_phase = torch.zeros(self.n_fam, device=self.device)
+        self.fam_amp = torch.zeros(self.n_fam, device=self.device)
+        self.sync = 0.0
 
     @property
     def n_time(self) -> int:
@@ -232,6 +251,39 @@ class Drives:
         # of the brain carries no task signal.
         return x * (1 - mix) + local * mix
 
+    def weave(self, aspect: float) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Every voxel on a full rectangular grid, correlated voxels adjacent.
+
+        A rank grid on the correlation-space embedding: sort by its first axis
+        into equal columns, sort each column by the second. The grid is exactly
+        full -- no brain outline -- and its neighbourhoods are correlation
+        neighbourhoods, so a scene drawn on it has the data's structure in
+        place of anatomy. Returns (row, col) fractions in [0, 1) and the grid's
+        (rows, cols).
+        """
+        key = round(aspect, 3)
+        if getattr(self, "_weave_key", None) != key:
+            f = self.f
+            n = f.n_voxels
+            cols = max(1, round(math.sqrt(n * aspect)))
+            rows = math.ceil(n / cols)
+            xy = f.func[:, :2]
+            order = torch.argsort(xy[:, 0])
+            col = torch.empty(n, dtype=torch.long, device=self.device)
+            col[order] = torch.arange(n, device=self.device) // rows
+            row = torch.empty(n, dtype=torch.long, device=self.device)
+            # Within each column, rank by the second axis (stable lexsort).
+            key2 = (
+                col.double() * 4
+                + (xy[:, 1].double() - xy[:, 1].min().double())
+                / (xy[:, 1].max() - xy[:, 1].min()).clamp_min(1e-9).double()
+            )
+            o2 = torch.argsort(key2)
+            row[o2] = torch.arange(n, device=self.device) % rows
+            self._weave = ((row.float() + 0.5) / rows, (col.float() + 0.5) / cols, rows, cols)
+            self._weave_key = key
+        return self._weave
+
     def shown_series(self) -> torch.Tensor:
         """(T, N) what the scenes draw at each TR: correlation- and space-pooled.
 
@@ -256,6 +308,18 @@ class Drives:
         self.g = float(interp_rows(self.f.global_signal[:, None], self.t)[0])
         self.d = float(interp_rows(self.f.dvars[:, None], self.t)[0])
         self.fam = interp_rows(self.f.family_tcs, self.t)
+        re, im = interp_rows(self._fam_re, self.t), interp_rows(self._fam_im, self.t)
+        self.fam_phase = torch.atan2(im, re)
+        self.fam_amp = (re**2 + im**2).sqrt()
+        # Kuramoto order parameter, envelope-weighted: 1 when the families
+        # swing in step, near 0 when their phases are scattered.
+        w = self.fam_amp / self.fam_amp.sum().clamp_min(1e-6)
+        self.sync = float((w * torch.exp(1j * self.fam_phase)).sum().abs())
+        # A slow shadow of the live value: live minus shadow is the trend, and
+        # (live, trend) is a voxel's own instantaneous phase.
+        if not hasattr(self, "shadow"):
+            self.shadow = self.live.clone()
+        self.shadow = self.shadow + (self.live - self.shadow) * min(1.0, dt * 1.5)
 
     # --------------------------------------------------------------- shading
 
@@ -290,6 +354,10 @@ class Drives:
             if src == "family":
                 hue = family_hues(self.n_fam).to(self.device)[f.family]
                 rgb = hsv_to_rgb(hue, 0.35 + 0.5 * f.family_weight, one)
+            elif src == "spectrum":
+                b = f.extras["bands"]
+                rgb = (b / b.amax(1, keepdim=True).clamp_min(1e-6)) ** 1.5
+                rgb = rgb[:, [2, 1, 0]] * 0.8 + 0.1  # fast -> red, mid -> green, slow -> blue
             elif src == "wave":
                 w = min(int(p["wave"]), f.phase.shape[1] - 1)
                 hue = (f.phase[:, w] + math.pi) / (2 * math.pi)
@@ -310,8 +378,17 @@ class Drives:
     def colors(self, lv: torch.Tensor | None = None) -> torch.Tensor:
         """Per-voxel colour for this frame: rising voxels warm, falling cool."""
         lv = self.live if lv is None else lv
+        src = COLOR_SOURCES[int(self.p["color"])]
+        if src == "phase":
+            # Hue = angle of (live, trend): rising, peak, falling, trough go
+            # round the wheel, so a travelling wave sweeps across as a rainbow.
+            trend = (self.live - getattr(self, "shadow", self.live)) * 3.0
+            hue = (torch.atan2(trend, self.live) / (2 * math.pi)) % 1.0
+            rgb = hsv_to_rgb(hue, torch.full_like(hue, 0.75), torch.ones_like(hue))
+            lum = (rgb * torch.tensor([0.30, 0.59, 0.11], device=self.device)).sum(1, keepdim=True)
+            return rgb / lum.clamp_min(0.15) * 0.7
         base = self.base_colors()
-        if COLOR_SOURCES[int(self.p["color"])] == "sign":
+        if src == "sign":
             warm = torch.tensor([1.0, 0.55, 0.2], device=self.device)
             cool = torch.tensor([0.25, 0.55, 1.0], device=self.device)
             return torch.where((lv >= 0)[:, None], warm, cool)

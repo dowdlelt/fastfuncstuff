@@ -215,6 +215,31 @@ def wave_phase(
     return phase, power, u * math.sqrt(n_time)
 
 
+#: Band edges in Hz: slow (drift, slow networks), mid (BOLD task and resting
+#: fluctuations), fast (aliased physiology, thermal noise).
+BAND_EDGES_HZ = (0.03, 0.1)
+
+
+def band_powers(z: torch.Tensor, tr: float) -> torch.Tensor:
+    """(N, 3) fraction of each voxel's power in slow / mid / fast bands.
+
+    A spectral fingerprint: drawn as RGB it separates BOLD-like voxels from
+    drifting ones and from physiology aliased into the fast band, with no model.
+    """
+    n_time, n = z.shape
+    freqs = torch.fft.rfftfreq(n_time, d=tr).to(z.device)[1:]
+    lo, hi = BAND_EDGES_HZ
+    sel = [freqs < lo, (freqs >= lo) & (freqs < hi), freqs >= hi]
+    out = torch.empty(n, 3, device=z.device)
+    chunk = max(1, int(2**26 // max(n_time, 1)))
+    for a in range(0, n, chunk):
+        pw = torch.fft.rfft(z[:, a : a + chunk].float(), dim=0).abs().square()[1:]
+        tot = pw.sum(0).clamp_min(1e-12)
+        for b, m in enumerate(sel):
+            out[a : a + chunk, b] = pw[m].sum(0) / tot if bool(m.any()) else 0.0
+    return out
+
+
 def _family_ica(loadings: torch.Tensor, n_families: int, seed: int) -> torch.Tensor:
     """Spatial ICA on the PCA loadings: (N, F) independent spatial maps.
 
@@ -340,6 +365,7 @@ def compute_features(
     steps.update()
 
     phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
+    bands = band_powers(zt, tr)
     steps.update()
 
     g = zt.float().mean(1)
@@ -382,6 +408,7 @@ def compute_features(
             "sd": sd,
             "shape": shape,
             "affine": np.asarray(affine, dtype=np.float64),
+            "bands": bands,
         },
     )
 

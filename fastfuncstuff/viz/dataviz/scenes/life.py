@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, blur, disks, filled_field
+from .base import Scene, blur, disks, filled_field
 
 S = "life"
 RULES = ("life", "highlife", "daynight", "seeds", "brain")
@@ -55,14 +55,14 @@ class LifeScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name == "lcell":
+        if name in ("lcell", "canvas"):
             self._alloc()
 
     def _alloc(self) -> None:
         f, dr = self.f, self.dr
         c = int(self.p["lcell"])
         self.gh, self.gw = max(16, self.height // c), max(16, self.width // c)
-        self.cell_of, self.inside, self.passes = axial_cells(f.anat, self.gh, self.gw, dr.spacing)
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         onehot = torch.zeros(f.n_voxels, dr.n_fam, device=self.device)
         onehot[torch.arange(f.n_voxels, device=self.device), f.family] = f.family_weight.clamp_min(
             0.05

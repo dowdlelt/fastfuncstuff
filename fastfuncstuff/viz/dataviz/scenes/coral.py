@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, filled_field
+from .base import Scene, filled_field
 
 S = "coral"
 
@@ -55,7 +55,7 @@ class CoralScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name == "ccell":
+        if name in ("ccell", "canvas"):
             self._alloc()
 
     def _alloc(self) -> None:
@@ -63,9 +63,7 @@ class CoralScene(Scene):
         c = int(self.p["ccell"])
         self.gh, self.gw = max(16, self.height // c), max(16, self.width // c)
         n = self.gh * self.gw
-        self.cell_of, self.inside, self.passes = axial_cells(
-            f.anat, self.gh, self.gw, self.dr.spacing
-        )
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         self.inside = self.inside.reshape(-1)
         onehot = torch.zeros(f.n_voxels, dr.n_fam, device=self.device)
         onehot[torch.arange(f.n_voxels, device=self.device), f.family] = f.family_weight.clamp_min(

@@ -80,9 +80,10 @@ class Visualizer:
             self.p[name] = float(n)
             return
         self.p[name] = float(value)
+        # Shared parameters (canvas) can matter to any scene, so every built
+        # scene hears every change; each ignores what it does not use.
         for sc in self._scenes.values():
-            if any(prm.name == name for prm in sc.PARAMS):
-                sc.on_param(name, float(value))
+            sc.on_param(name, float(value))
 
     def step(self, dt: float, playing: bool = True) -> None:
         dt = float(min(dt, 0.05))

@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from ..drives import Param
-from .base import Scene, axial_cells, blur, disks, filled_field
+from .base import Scene, blur, disks, filled_field
 
 S = "lenia"
 
@@ -67,14 +67,14 @@ class LeniaScene(Scene):
         self._alloc()
 
     def on_param(self, name, value):
-        if name in ("ncell", "radius"):
+        if name in ("canvas", "ncell", "radius"):
             self._alloc()
 
     def _alloc(self) -> None:
         f, dr = self.f, self.dr
         c = int(self.p["ncell"])
         self.gh, self.gw = max(32, self.height // c), max(32, self.width // c)
-        self.cell_of, self.inside, self.passes = axial_cells(f.anat, self.gh, self.gw, dr.spacing)
+        self.cell_of, self.inside, self.passes = self.grid_cells(self.gh, self.gw)
         onehot = torch.zeros(f.n_voxels, dr.n_fam, device=self.device)
         onehot[torch.arange(f.n_voxels, device=self.device), f.family] = f.family_weight.clamp_min(
             0.05
