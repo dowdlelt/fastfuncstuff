@@ -420,18 +420,19 @@ def compute_features(
     polort: int | None = None,
     seed: int = 0,
     verbose: bool = True,
+    device: torch.device | None = None,
 ) -> Features:
     """Traits and drives from ``data`` (T, X, Y, Z) restricted to ``mask``.
 
-    ``data`` may live on the CPU; the masked matrix goes to ``mask``'s compute
-    device in one copy and everything after is on-device.
+    ``data`` may live on the CPU: only the masked matrix goes to ``device``
+    (default: ``data``'s), in one copy, and everything after is on-device.
     """
-    device = data.device
+    device = data.device if device is None else device
     steps = tqdm(total=7, desc="dataviz features", leave=True, disable=not verbose)
     shape = tuple(int(s) for s in data.shape[1:])
     ijk = np.argwhere(mask)
-    flat_idx = torch.as_tensor(np.ravel_multi_index(ijk.T, shape), device=device)
-    flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float()  # (N, T)
+    flat_idx = torch.as_tensor(np.ravel_multi_index(ijk.T, shape), device=data.device)
+    flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float().to(device)  # (N, T)
     n, n_time = flat.shape
 
     raw_mean = flat.mean(1)  # the anatomy (dust, slices) stays sharp
@@ -647,7 +648,7 @@ def load_features(
 
     shape = tuple(data.shape[1:])
     feats = compute_features(
-        data.to(device), mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, **kwargs
+        data, mask, affine, run_tr, run_starts, seed=seed, verbose=verbose, device=device, **kwargs
     )
     del data
     if device.type == "mps":
