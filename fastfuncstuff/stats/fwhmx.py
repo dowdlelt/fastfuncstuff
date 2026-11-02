@@ -306,7 +306,7 @@ def estimate_fwhmx_run(
         if order > 0 and 2 * order + 3 < n_v:
             ref = _trigref(order, n_v, resid_2d.device)
             # Least-squares projection: r <- r - (r @ ref) @ pinv(ref'ref) @ ref'.
-            q, _ = plinalg.qr(ref.to(torch.float32))
+            q = plinalg.qr(ref.to(torch.float32))[0].to(resid_2d.device)
             resid_2d = resid_2d - (resid_2d @ q) @ q.T
             unif = True
             demed = True

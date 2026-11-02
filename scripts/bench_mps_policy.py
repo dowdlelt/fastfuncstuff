@@ -110,6 +110,14 @@ CASES: dict[str, tuple[str, object]] = {
             )
         ),
     ),
+    "cholesky_inverse_batched": (
+        "cholesky_inverse batched (2000,32,32)",
+        lambda d, t: (
+            lambda L=torch.linalg.cholesky(_build((2000, 32, 32), d, t, spd=True)): (
+                torch.cholesky_inverse(L)
+            )
+        ),
+    ),
     "lstsq": (
         "lstsq (1000,60)",
         lambda d, t: (

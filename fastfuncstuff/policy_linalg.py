@@ -20,7 +20,10 @@ from fastfuncstuff.utils import cpu_if_mps, linalg_lstsq
 
 def _routed(op: str, fn, *args, **kwargs):
     """``fn(*args, **kwargs)`` on the device *op* belongs on, returned to the input's."""
-    home = next(a.device for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor))
+    devices = [a.device for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor)]
+    # Not just the first: on a Mac a float64-only helper hands back a CPU tensor, so
+    # solve(b_cpu, L_mps) is a normal thing to arrive here, and Metal is where it goes home to.
+    home = next((d for d in devices if d.type == "mps"), devices[0])
     work = cpu_if_mps(home, op)
     if work == home:
         return fn(*args, **kwargs)
@@ -83,6 +86,10 @@ def cholesky_ex(a, **kwargs):
 
 def cholesky_solve(b, l, **kwargs):  # noqa: E741 -- torch's own name for the factor
     return _routed("cholesky_solve", torch.cholesky_solve, b, l, **kwargs)
+
+
+def cholesky_inverse(l, **kwargs):  # noqa: E741 -- torch's own name for the factor
+    return _routed("cholesky_inverse", torch.cholesky_inverse, l, **kwargs)
 
 
 def inv(a, **kwargs):

@@ -246,6 +246,8 @@ _MPS_CPU_OPS: dict[str, str] = {
     "solve_triangular": "torch 2.14: (300,300)x(300,5000) 1.18 ms vs 0.74 ms CPU (1.6x); "
     "batched (2000,32,8) 95.8 ms vs 0.48 ms (200x)",
     "cholesky_solve": "torch 2.14: batched (2000,32,8) 182 ms vs 1.12 ms CPU (163x)",
+    "cholesky_inverse": "torch 2.14: batched (2000,32,32) 105 ms vs 6.4 ms CPU (16x); "
+    "batched (2000,8,8) 23x; (60,60) 68x; (300,300) 3.6x",
     "svdvals": "torch 2.14: (1000,200) 5.37 ms vs 1.99 ms CPU (2.7x)",
     "det": "torch 2.14: slogdet (300,300) 0.78 ms vs 0.16 ms CPU (4.9x); batched (300,3,3) 5x",
     "lu": "unmeasured: the same LAPACK-shaped work as inv and det, which both lose",

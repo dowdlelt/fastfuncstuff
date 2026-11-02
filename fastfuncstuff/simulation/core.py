@@ -97,6 +97,7 @@ def simulate_fmri_run(
         raise ValueError(f"Betas shape {betas.shape} doesn't match n_voxels {n_voxels}")
 
     # Build design matrix
+    betas = betas.to(device)
     design = build_glm_design(onsets, hrf, n_timepoints, mode="assumed", device=device)
 
     # Generate signal: data = design @ betas.T
@@ -669,6 +670,7 @@ def simulate_bold(
 
     if device is None:
         device = get_device()
+    device = linalg_device(device)  # the noise is float64; Metal has none
     if isinstance(n_timepoints_per_run, int):
         n_timepoints_per_run = [n_timepoints_per_run]
     if microtime_dt is None:

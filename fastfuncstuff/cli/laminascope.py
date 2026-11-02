@@ -228,7 +228,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
 
     say = print if args.verb >= 1 else (lambda *_a, **_k: None)
     modulation = parse_modulation(args.modulation)
-    device = setup_device(args.device)
+    device = setup_device(args.device, float64_only="ffs_laminascope")
 
     files = _iresp_labels(args.iresp_prefix)
     labels = list(files)

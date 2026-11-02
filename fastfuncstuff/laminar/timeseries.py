@@ -197,7 +197,7 @@ def design_crossval(
             if noise_cov is None
             else noise_cov[start:stop].to(device=dev, dtype=dtype)
         )
-        cw = torch.cholesky_inverse(
+        cw = plinalg.cholesky_inverse(
             plinalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky")))
         ).to(dev)
         metric = S.mT @ cw @ S  # whitened fit, in physiological depths
