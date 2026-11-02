@@ -53,7 +53,7 @@ class Features:
     phase: torch.Tensor  # (N, W) radians, relative phase on each leading wave
     phase_power: torch.Tensor  # (N, W) fraction of band power each wave explains, [0, 1]
     global_signal: torch.Tensor  # (T,) mean z, unit variance
-    dvars: torch.Tensor  # (T,) robust z of the frame-to-frame RMS change
+    dvars: torch.Tensor  # (T,) bounded spike score, see spike_score
     extras: dict = field(default_factory=dict)
 
     @property
@@ -192,6 +192,23 @@ def _robust_unit(x: torch.Tensor) -> torch.Tensor:
     )
     lo, hi = torch.quantile(sample, torch.tensor([0.02, 0.98], device=xs.device))
     return ((xs - lo) / (hi - lo).clamp_min(1e-12)).clamp(0, 1)
+
+
+def spike_score(dv: torch.Tensor) -> torch.Tensor:
+    """(T,) frame-to-frame RMS change as a bounded score, where over 2.5 is a spike.
+
+    Plain robust z makes a quiet run's own spread the unit, so the quieter the
+    run the louder its spikes: a 0.67 mm max FD run had a worst frame 2.2x the
+    median, scored z = 7.6, with 41 of 254 frames over the line. So the unit
+    never drops below 35% of the median (a spike is at least ~1.9x a typical
+    frame), and the excess saturates: every scene and the whoosh scale linearly
+    with it, and a 1 mm jump otherwise scores over 100.
+    """
+    med = dv.median()
+    mad = (dv - med).abs().median() * 1.4826
+    d = (dv - med) / torch.maximum(mad, 0.35 * med).clamp_min(1e-6)
+    knee, room = 2.5, 3.5
+    return torch.where(d > knee, knee + room * torch.tanh((d - knee) / room), d)
 
 
 def _rank_unit(x: torch.Tensor) -> torch.Tensor:
@@ -543,9 +560,7 @@ def compute_features(
     steps.update()
 
     g = (g - g.mean()) / g.std().clamp_min(1e-12)
-    med = dv.median()
-    mad = (dv - med).abs().median().clamp_min(1e-6) * 1.4826
-    dv = (dv - med) / mad
+    dv = spike_score(dv)
     steps.update()
     steps.close()
 

@@ -7,13 +7,15 @@ pooling and salience exist for.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
 from fastfuncstuff.viz.dataviz.drives import Drives, top_two, uniform_disc
 from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
-from fastfuncstuff.viz.dataviz.features import compute_features, member_counts
+from fastfuncstuff.viz.dataviz.features import compute_features, member_counts, spike_score
 from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
 from fastfuncstuff.viz.dataviz.sound import Sonifier
 
@@ -420,3 +422,39 @@ def test_interp_many_matches_interp_rows(run):
     many = interp_many(feats.family_tcs, ts)
     each = torch.stack([interp_rows(feats.family_tcs, t) for t in ts])
     assert torch.allclose(many, each, atol=1e-5)
+
+
+def test_spike_score_does_not_inflate_a_quiet_run():
+    # Shaped like a real low-motion run (max FD 0.67 mm): the worst frame is only
+    # 2.2x the median, which plain robust z scored 7.6, with 16% of frames "spikes".
+    dv = torch.from_numpy(np.random.default_rng(0).gamma(40.0, 0.021, 254)).float()
+    dv = dv.clamp_max(1.6)
+    dv[33] = 1.8
+    d = spike_score(dv)
+    assert (d > 2.5).float().mean() < 0.05
+    assert d.max() < 4.0
+
+
+def test_spike_score_is_bounded_and_ordered():
+    dv = torch.ones(100) + torch.linspace(0, 0.1, 100)
+    dv[10], dv[20] = 3.0, 300.0
+    d = spike_score(dv)
+    assert 2.5 < d[10] < d[20] <= 6.0
+
+
+@pytest.mark.parametrize("fps", [60, 30])
+def test_fluid_survives_a_spike_at_the_ceiling(run, fps):
+    # The burst's outward flow spread its white ink at full strength, because
+    # semi-Lagrangian advection does not dilute: the whole screen stayed white
+    # for 4 s of a 3-frame spike.
+    feats, _, _ = run
+    spiked = torch.full((N_TIME,), -1.0)
+    spiked[20:23] = 6.0
+    viz = Visualizer(replace(feats, dvars=spiked), width=160, height=90)
+    viz.set_param("scene", SCENE_NAMES.index("fluid"))
+    viz.seek(15.0)
+    white = []
+    for _ in range(8 * fps):
+        viz.step(1.0 / fps)
+        white.append(float((viz.render().min(axis=2) > 240).mean()))
+    assert max(white) < 0.25
