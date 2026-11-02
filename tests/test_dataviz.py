@@ -55,9 +55,6 @@ def run():
         # part of this tiny brain's global mean.
         fwhm_mm=0.0,
         remove_global=False,
-        # 80 s of tiny brain leaves 18 degrees of freedom in the default band, too
-        # few to isolate one patch; test_bandpass_keeps_the_block has the band.
-        bandpass_hz=None,
         verbose=False,
     )
     in_patch = np.zeros(SHAPE, dtype=bool)
@@ -504,7 +501,7 @@ def test_bandpass_empties_the_drawn_series_but_not_what_reports_on_the_full_band
     mirrored = torch.cat([on.z.float(), on.z.float().flip(0)])
     freqs = torch.fft.rfftfreq(mirrored.shape[0], d=on.tr)
     power = torch.fft.rfft(mirrored, dim=0).abs().square().sum(1)
-    assert float(power[freqs > 0.13].sum() / power.sum()) < 1e-4
+    assert float(power[freqs > 0.19].sum() / power.sum()) < 1e-4
     # The spike must not be filtered away, nor the fast band lost to spectrum colour.
     assert int(on.dvars.argmax()) in (on.n_time // 2, on.n_time // 2 + 1)
     assert torch.allclose(on.dvars, off.dvars, atol=1e-3)
@@ -515,8 +512,8 @@ def test_bandpass_empties_the_drawn_series_but_not_what_reports_on_the_full_band
 def test_bandpass_keeps_the_block():
     feats, in_patch, block = _spiky_block_run(spike=0.0)
     fam = int(torch.mode(feats.family[torch.from_numpy(in_patch)]).values)
-    # A square wave's fundamental alone correlates 0.90 with it; the band keeps only that.
-    assert abs(np.corrcoef(feats.family_tcs[:, fam].numpy(), block)[0, 1]) > 0.85
+    # The band keeps a 20 s square wave's first two odd harmonics, which correlate 0.95 with it.
+    assert abs(np.corrcoef(feats.family_tcs[:, fam].numpy(), block)[0, 1]) > 0.9
 
 
 def test_components_stop_at_the_bands_rank():

@@ -29,7 +29,7 @@ from fastfuncstuff.processing.temporal_filter import (
 
 #: Default pass-band in Hz: the slow BOLD range, wide of the usual resting-state
 #: 0.01-0.08 so block designs and quicker task responses survive.
-DEFAULT_BANDPASS_HZ = (0.009, 0.1)
+DEFAULT_BANDPASS_HZ = (0.009, 0.15)
 
 #: Under this many degrees of freedom a band has no room for a decomposition.
 MIN_BAND_DOF = 8
@@ -112,7 +112,7 @@ class Features:
 
         ``fast`` and ``motion`` ask about the members' full band. A band-pass
         takes both signatures out of the drawn course, so measured on that they
-        always pass: on a real run 0 of 10 were flagged that way, 3 of 10 on the
+        mostly pass: on a real run 1 of 10 was flagged that way, 6 of 10 on the
         members' full band. Those courses come from a voxel sample, since
         families refit live and a second (T, N) copy is too dear to keep for this.
         """
