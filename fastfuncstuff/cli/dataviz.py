@@ -172,7 +172,7 @@ def build_parser() -> FfsArgumentParser:
         default=[],
         metavar="NAME=VALUE",
         help=f"starting parameter values; names: {params}. choice parameters "
-        "(scene, color, inject) also take their names",
+        "(scene, color, canvas, rule, map, inject, home) also take their names",
     )
     parser.add_argument(
         "-config",
