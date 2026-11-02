@@ -255,7 +255,7 @@ def render_movie(
     sw.seek(start)
     speed = sw.p["speed"]
     if duration is None:
-        duration = (feats.n_time - 1) / speed
+        duration = (feats.n_time - 1) * feats.tr / speed
     n_frames = int(round(duration * fps))
     w, h = size
     with tempfile.TemporaryDirectory() as tmp:

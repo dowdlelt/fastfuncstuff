@@ -43,7 +43,9 @@ CANVASES = ("head", "weave")
 COLOR_SOURCES = ("family", "phase", "spectrum", "wave", "sign", "tsnr", "coherence", "mean")
 
 SHARED_PARAMS: tuple[Param, ...] = (
-    Param("speed", 2.0, 0.1, 20.0, "time", "TRs played per second"),
+    Param(
+        "speed", 2.0, 0.1, 20.0, "time", "playback speed: multiple of real time, at the run's TR"
+    ),
     Param(
         "smooth", 0.25, 0.0, 0.95, "time", "temporal smoothing of the live value (EMA per frame)"
     ),
@@ -548,7 +550,7 @@ class Drives:
         self.wall += dt
         self._frame = getattr(self, "_frame", 0) + 1
         if playing:
-            self.t = (self.t + self.p["speed"] * dt) % (self.n_time - 1)
+            self.t = (self.t + self.p["speed"] * dt / self.f.tr) % (self.n_time - 1)
         a = self.pooled(self.activity(self.t))
         k = self.p["smooth"]
         self.live = self.live * k + a * (1 - k)

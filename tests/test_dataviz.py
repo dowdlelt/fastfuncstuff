@@ -186,6 +186,16 @@ def test_every_scene_renders(run, scene):
     assert vis.render_tensor().shape == (32, 48, 3)
 
 
+def test_speed_is_a_multiple_of_real_time(run, monkeypatch):
+    # A 3.2 s TR played at a fixed 2 TRs per second ran 6.4x real time, whatever
+    # the status bar's "x2.0" said.
+    feats, _, _ = run
+    monkeypatch.setattr(feats, "tr", 3.2)
+    dr = Drives(feats, default_params() | {"speed": 2.0})
+    dr.advance(0.05)
+    assert dr.t == pytest.approx(2.0 * 0.05 / 3.2)
+
+
 def test_scene_params_are_unique_and_in_range():
     for prm in PARAM_BY_NAME.values():
         assert prm.lo <= prm.default <= prm.hi, prm.name

@@ -208,7 +208,7 @@ def render_track(
     period = feats.n_time - 1
     for i in range(n_frames):
         want = int(round((i + 1) * per)) - made
-        t1 = (t + speed / fps) % period
+        t1 = (t + speed / feats.tr / fps) % period
         chunks.append(son.render(want, t1))
         made += want
         t = t1

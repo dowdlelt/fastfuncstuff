@@ -35,7 +35,8 @@ ZOOM_PARAM = {
 KEYS_HELP = """\
 1-9 0  scene in the current set   g  next set
 space  play / pause        ← →  step 5 TRs (shift: 25)
-tab m  controls            h    hide everything but the picture (again: back)
+tab m  controls (click a value to type it)
+h      hide everything but the picture (again: back)
 f      fullscreen          s    sound on / off
 c      next colour source  [ ]  slower / faster
 x      remix the look      z  undo remix   ctrl+s save config   ctrl+o load
@@ -251,6 +252,64 @@ class Canvas(QtWidgets.QWidget):
         self.viz.set_param(name, float(np.clip(z, prm.lo, prm.hi)))
 
 
+class ValueEdit(QtWidgets.QLineEdit):
+    """A slider's value: click it and type an exact one.
+
+    Enter or leaving the field applies; Esc cancels. These keys stop here, or the
+    window would act on them: Esc there quits, and a key the field leaves alone
+    goes up as a shortcut. Tab still goes up, so it closes the panel from here too.
+    """
+
+    def __init__(self, apply, canvas: QtWidgets.QWidget, tip: str):
+        super().__init__()
+        self._apply = apply
+        self._canvas = canvas
+        self._shown = ""
+        self.setFixedWidth(56)
+        self.setToolTip(tip)
+        self.setStyleSheet(
+            "QLineEdit { background: transparent; border: 1px solid transparent; }"
+            "QLineEdit:hover { border-color: #2a3048; }"
+            "QLineEdit:focus { background: #141828; border-color: #4a5488; }"
+        )
+        self.editingFinished.connect(self._finish)
+
+    def show_value(self, value: float) -> None:
+        self._shown = f"{value:.4g}"
+        if not self.isModified():  # never over what is being typed
+            self.setText(self._shown)
+
+    def _finish(self) -> None:
+        # Leaving an untouched field applies nothing: it may be the ICA's slider,
+        # or a value remix just changed underneath it.
+        if self.isModified():
+            try:
+                value = float(self.text())
+            except ValueError:
+                value = math.nan
+            if math.isfinite(value):
+                self._apply(value)
+        self.setText(self._shown)
+
+    def focusInEvent(self, e) -> None:
+        super().focusInEvent(e)
+        # Deferred: the click that gave us focus would place a cursor over it.
+        QtCore.QTimer.singleShot(0, self.selectAll)
+
+    def focusNextPrevChild(self, _next: bool) -> bool:
+        return False
+
+    def keyPressEvent(self, e) -> None:
+        k = e.key()
+        K = QtCore.Qt.Key
+        if k in (K.Key_Return, K.Key_Enter, K.Key_Escape):
+            if k == K.Key_Escape:
+                self.setText(self._shown)
+            self._canvas.setFocus()
+            return
+        super().keyPressEvent(e)
+
+
 class Controls(QtWidgets.QScrollArea):
     """Every parameter as a slider (or a combo for a choice), grouped."""
 
@@ -265,7 +324,7 @@ class Controls(QtWidgets.QScrollArea):
         body = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(body)
         lay.setContentsMargins(8, 8, 8, 8)
-        self.widgets: dict[str, tuple[QtWidgets.QWidget, QtWidgets.QLabel | None]] = {}
+        self.widgets: dict[str, tuple[QtWidgets.QWidget, ValueEdit | None]] = {}
         self.scene_boxes: dict[str, QtWidgets.QGroupBox] = {}
         self.blurb = QtWidgets.QLabel()
         self.blurb.setWordWrap(True)
@@ -315,13 +374,7 @@ class Controls(QtWidgets.QScrollArea):
             ("whoosh", 0, 2),
             ("reverb", 0, 1),
         ):
-            sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            sl.setRange(0, self.STEPS)
-            sl.setValue(int((getattr(viz.son, name) - lo) / (hi - lo) * self.STEPS))
-            sl.valueChanged.connect(
-                lambda v, n=name, a=lo, b=hi: setattr(viz.son, n, a + (b - a) * v / self.STEPS)
-            )
-            form.addRow(name, sl)
+            form.addRow(name, self._sound_row(name, lo, hi))
         lay.addWidget(sound)
 
         res = QtWidgets.QComboBox()
@@ -360,8 +413,11 @@ class Controls(QtWidgets.QScrollArea):
         sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         sl.setRange(0, self.STEPS)
         sl.setToolTip(prm.help)
-        val = QtWidgets.QLabel()
-        val.setMinimumWidth(44)
+        val = ValueEdit(
+            lambda v, n=prm.name: self._typed(n, v),
+            viz.canvas,
+            f"click to type a value ({prm.lo:g} to {prm.hi:g})",
+        )
         hl.addWidget(sl, 1)
         hl.addWidget(val)
         sl.valueChanged.connect(lambda v, n=prm.name: self._slid(n, v))
@@ -370,6 +426,34 @@ class Controls(QtWidgets.QScrollArea):
         form.addRow(label, row)
         self.widgets[prm.name] = (sl, val)
         self.refresh(prm.name)
+
+    def _sound_row(self, name: str, lo: float, hi: float) -> QtWidgets.QWidget:
+        viz = self.viz
+        row = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        sl.setRange(0, self.STEPS)
+
+        def typed(value: float) -> None:
+            value = min(hi, max(lo, value))
+            setattr(viz.son, name, value)
+            sl.blockSignals(True)
+            sl.setValue(int(round((value - lo) / (hi - lo) * self.STEPS)))
+            sl.blockSignals(False)
+            val.show_value(value)
+
+        def slid(v: int) -> None:
+            value = lo + (hi - lo) * v / self.STEPS
+            setattr(viz.son, name, value)
+            val.show_value(value)
+
+        val = ValueEdit(typed, viz.canvas, f"click to type a value ({lo:g} to {hi:g})")
+        typed(getattr(viz.son, name))
+        sl.valueChanged.connect(slid)
+        hl.addWidget(sl, 1)
+        hl.addWidget(val)
+        return row
 
     def rebuild_families(self) -> None:
         """One row per family: its colour, its noise flags, a mute box."""
@@ -419,7 +503,12 @@ class Controls(QtWidgets.QScrollArea):
         self.viz.set_param(name, value, from_ui=True)
         label = self.widgets[name][1]
         if label is not None:
-            label.setText(f"{value:.3g}")
+            label.show_value(value)
+
+    def _typed(self, name: str, value: float) -> None:
+        prm = PARAM_BY_NAME[name]
+        value = min(prm.hi, max(prm.lo, value))
+        self.viz.set_param(name, float(round(value)) if prm.integer else value)
 
     def refresh_all(self) -> None:
         for name in self.widgets:
@@ -439,7 +528,7 @@ class Controls(QtWidgets.QScrollArea):
         elif isinstance(w, QtWidgets.QSlider):
             w.setValue(int(round((value - prm.lo) / (prm.hi - prm.lo) * self.STEPS)))
         if label is not None:
-            label.setText(f"{value:.3g}")
+            label.show_value(value)
         w.blockSignals(False)
 
 
