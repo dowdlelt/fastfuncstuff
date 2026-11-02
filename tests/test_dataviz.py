@@ -1,0 +1,128 @@
+"""ffs_dataviz core: features, drives, scenes and sound on a synthetic run.
+
+The run is noise everywhere plus one patch carrying a shared 10 s on / 10 s off
+block response -- the "only a small part of the brain has signal" case the
+pooling and salience exist for.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from fastfuncstuff.viz.dataviz.drives import Drives, uniform_disc
+from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
+from fastfuncstuff.viz.dataviz.features import compute_features
+from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
+from fastfuncstuff.viz.dataviz.sound import Sonifier
+
+CPU = torch.device("cpu")
+SHAPE = (14, 14, 10)
+N_TIME = 80
+PATCH = (slice(3, 7), slice(3, 7), slice(3, 6))
+
+
+@pytest.fixture(scope="module")
+def run():
+    rng = np.random.default_rng(0)
+    block = (np.arange(N_TIME) // 10) % 2 * 2.0 - 1.0
+    data = rng.standard_normal((N_TIME, *SHAPE)).astype(np.float32)
+    data[(slice(None), *PATCH)] += 1.5 * block[:, None, None, None]
+    data += 100.0
+    mask = np.ones(SHAPE, dtype=bool)
+    mask[0], mask[-1] = False, False
+    feats = compute_features(
+        torch.from_numpy(data),
+        mask,
+        np.eye(4),
+        1.0,
+        [0],
+        n_components=8,
+        n_families=4,
+        verbose=False,
+    )
+    in_patch = np.zeros(SHAPE, dtype=bool)
+    in_patch[PATCH] = True
+    return feats, in_patch[tuple(feats.ijk.T)], block
+
+
+def test_salience_ranks_the_signal_patch_above_noise(run):
+    feats, in_patch, _ = run
+    sal = feats.salience.numpy()
+    assert np.median(sal[in_patch]) > np.quantile(sal[~in_patch], 0.9)
+
+
+def test_a_family_recovers_the_block(run):
+    feats, in_patch, block = run
+    patch_family = int(torch.mode(feats.family[torch.from_numpy(in_patch)]).values)
+    tc = feats.family_tcs[:, patch_family].numpy()
+    assert abs(np.corrcoef(tc, block)[0, 1]) > 0.8
+
+
+def test_neighbour_table_points_at_face_neighbours(run):
+    feats, _, _ = run
+    nb = feats.extras["neighbours"].numpy()
+    d = np.abs(feats.ijk[nb] - feats.ijk[:, None, :]).sum(-1)
+    # Each entry is a face neighbour (distance 1) or the voxel itself (0) where
+    # the neighbour is outside the mask.
+    assert set(np.unique(d)) <= {0, 1}
+    assert (d == 1).sum(1).min() >= 3
+
+
+def test_pooling_shrinks_noise_more_than_signal(run):
+    feats, in_patch, _ = run
+    params = default_params() | {"clarity": 0.0, "pool": 1.0, "reach": 2}
+    dr = Drives(feats, params)
+    raw = feats.z.float()
+    pooled = torch.stack([dr.pooled(raw[t]) for t in range(N_TIME)])
+    keep = torch.from_numpy(in_patch)
+    noise_ratio = pooled[:, ~keep].std() / raw[:, ~keep].std()
+    signal_ratio = pooled[:, keep].std() / raw[:, keep].std()
+    assert noise_ratio < 0.6
+    assert signal_ratio > noise_ratio + 0.2
+
+
+def test_uniform_disc_spreads_radii_evenly():
+    xy = torch.randn(10_000, 2) * torch.rand(10_000, 1) ** 4  # piled at the origin
+    r = uniform_disc(xy).norm(dim=1)
+    assert r.max() <= 1.0 + 1e-6
+    # Uniform on the unit disc: P(r < x) = x^2, so the median radius is sqrt(0.5).
+    assert abs(float(r.median()) - 0.5**0.5) < 0.02
+
+
+@pytest.mark.parametrize("scene", SCENE_NAMES)
+def test_every_scene_renders(run, scene):
+    feats, _, _ = run
+    vis = Visualizer(feats, 64, 36)
+    vis.set_param("scene", SCENE_NAMES.index(scene))
+    for _ in range(20):
+        vis.step(1 / 30)
+    img = vis.render_tensor()
+    assert img.shape == (36, 64, 3) and img.dtype == torch.uint8
+    vis.resize(48, 32)
+    vis.step(1 / 30)
+    assert vis.render_tensor().shape == (32, 48, 3)
+
+
+def test_scene_params_are_unique_and_in_range():
+    for prm in PARAM_BY_NAME.values():
+        assert prm.lo <= prm.default <= prm.hi, prm.name
+
+
+def test_sound_is_bounded_and_finite(run):
+    feats, _, _ = run
+    son = Sonifier(feats)
+    out = np.concatenate([son.render(735, t * 0.1) for t in range(60)])
+    assert out.shape == (735 * 60, 2)
+    assert np.isfinite(out).all() and np.abs(out).max() <= 1.0
+    assert np.abs(out).max() > 1e-3  # not silent
+
+
+def test_cli_sets_take_choice_names():
+    from fastfuncstuff.cli.dataviz import parse_sets
+
+    out = parse_sets(["scene=sand", "speed=3"])
+    assert out == {"scene": float(SCENE_NAMES.index("sand")), "speed": 3.0}
+    with pytest.raises(SystemExit):
+        parse_sets(["nonsense=1"])
