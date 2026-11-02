@@ -27,6 +27,7 @@ S = "sand"
 
 
 class SandScene(Scene):
+    CANDIDATES = 16  # grains each lane may drop per frame
     name = S
     blurb = "falling sand: families pour from their lanes; the pile is the history"
     PARAMS = (
@@ -52,12 +53,21 @@ class SandScene(Scene):
         self.lane_edges = edges
         self._alloc()
         self.parity = 0
-        self.pending = torch.zeros(drives.n_fam, device=self.device)
 
     def _alloc(self) -> None:
         g = int(self.p["grain"])
         self.gh, self.gw = max(8, self.height // g), max(8, self.width // g)
         self.occ = torch.zeros(self.gh, self.gw, dtype=torch.bool, device=self.device)
+        # Lane geometry per family, in cells: the nozzle's centre and its
+        # bounds (lane_order maps lane position to family).
+        lo = torch.zeros(self.dr.n_fam, dtype=torch.long, device=self.device)
+        hi = torch.zeros_like(lo)
+        for lane, fam in enumerate(self.lane_order.tolist()):
+            a = int(self.lane_edges[lane] * self.gw)
+            b = max(a + 1, int(self.lane_edges[lane + 1] * self.gw))
+            lo[fam], hi[fam] = min(a, self.gw - 1), min(b - 1, self.gw - 1)
+        self.lane_lo, self.lane_hi = lo, hi
+        self.lane_mid = (lo + hi).float() * 0.5
         self.col = torch.zeros(4, self.gh, self.gw, device=self.device)  # rgb + heat
 
     def on_resize(self):
@@ -107,40 +117,35 @@ class SandScene(Scene):
     def step(self, dt: float) -> None:
         p, dr = self.p, self.dr
         gw = self.gw
-        # Pour: whole grains per lane this frame, carrying fractional remainders.
+        # Pour: a fixed number of candidate grains per lane per frame, each kept
+        # with the probability that gives the lane its rate. Fixed shapes and
+        # no host reads -- the per-lane loop read each lane's count back off the
+        # GPU every frame.
         sal = dr.family_salience / dr.family_salience.max().clamp_min(1e-6)
         act = (dr.fam - p["onset"]).clamp_min(0)
         rate = (act * p["pour"] + p["trickle"]) * sal * dr.family_size.sqrt() * gw * 2.5
-        self.pending = self.pending + rate * dt
-        n_new = self.pending.floor()
-        self.pending = self.pending - n_new
-        fam_rgb = dr.family_rgb()
-        top = 0
-        for lane, fam in enumerate(self.lane_order.tolist()):
-            k = int(n_new[fam])
-            if k <= 0:
-                continue
-            a = int(self.lane_edges[lane] * gw)
-            b = max(a + 1, int(self.lane_edges[lane + 1] * gw))
-            # A narrow nozzle at the lane's centre: streams and cones, like an
-            # hourglass, rather than confetti across the whole lane.
-            centre = 0.5 * (a + b)
-            xs = (
-                (centre + self.randn(k) * p["nozzle"])
-                .round()
-                .long()
-                .clamp(a, b - 1)
-                .clamp(0, gw - 1)
-            )
-            ys = torch.full_like(xs, top) + (self.rand(k) * 2).long()
-            free = ~self.occ[ys, xs]
-            xs, ys = xs[free], ys[free]
-            if xs.numel() == 0:
-                continue
-            tone = 0.75 + 0.25 * self.rand(xs.numel())  # a little grain-to-grain texture
-            self.occ[ys, xs] = True
-            self.col[:3, ys, xs] = fam_rgb[fam][:, None] * tone[None]
-            self.col[3, ys, xs] = float(act[fam]) * p["heat"]
+        n_f, c = dr.n_fam, self.CANDIDATES
+        keep_p = (rate * dt / c).clamp(0, 1)[:, None]
+        xs = (self.lane_mid[:, None] + self.randn(n_f, c) * p["nozzle"]).round().long()
+        xs = torch.maximum(torch.minimum(xs, self.lane_hi[:, None]), self.lane_lo[:, None]).reshape(
+            -1
+        )
+        ys = (self.rand(n_f, c) * 2).long().reshape(-1)
+        idx = ys * gw + xs
+        occ_flat = self.occ.reshape(-1)
+        drop = ((self.rand(n_f, c) < keep_p).reshape(-1)) & ~occ_flat[idx]
+        tone = 0.75 + 0.25 * self.rand(n_f * c)
+        fam_rgb = dr.family_rgb()[:, :, None].expand(n_f, 3, c).permute(1, 0, 2).reshape(3, -1)
+        heat = (act * p["heat"])[:, None].expand(n_f, c).reshape(-1)
+        new = torch.cat([fam_rgb * tone[None], heat[None]], 0)  # (4, n_f*c)
+        col_flat = self.col.reshape(4, -1)
+        col_flat[:, idx] = torch.where(drop[None], new, col_flat[:, idx])
+        # Counted, so a candidate that lands on an already-claimed cell cannot
+        # clear it when two candidates share a cell (an accumulating
+        # index_put, which every backend has; scatter_reduce is patchier).
+        hits = torch.zeros(occ_flat.numel(), dtype=torch.int32, device=self.device)
+        hits.index_put_((idx,), drop.to(torch.int32), accumulate=True)
+        self.occ = (occ_flat | (hits > 0)).reshape(self.occ.shape)
 
         wind = math.tanh(dr.g * 0.7) * p["wind"]
         quake = dr.d > 2.5 and p["quake"] > 0
@@ -163,7 +168,9 @@ class SandScene(Scene):
 
         self.col[3] = self.col[3] * math.exp(-1.5 * dt)
         # Sink when full: drop the bottom row, the strata scroll down.
-        if float(self.occ.float().mean()) > p["sink"]:
+        # The fill check reads the GPU, so only every 15 frames.
+        self._tick = getattr(self, "_tick", 0) + 1
+        if self._tick % 15 == 0 and float(self.occ.float().mean()) > p["sink"]:
             self.occ = torch.roll(self.occ, 1, 0)
             self.occ[0] = False
             self.col = torch.roll(self.col, 1, 1)

@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .drives import interp_rows
+from .drives import interp_cols
 
 
 class VoxelIndex:
@@ -94,6 +94,11 @@ class Inspector(QtWidgets.QWidget):
         self.probe = int(v)
         r = self.vi.ras[self.probe]
         self._slices = [self.vi.slice_members(ax, int(r[ax])) for ax in (2, 1, 0)]
+        # One device index over all three slices, so a frame reads only the
+        # voxels it draws.
+        sels = [sel for sel, _, _ in self._slices]
+        self._slice_idx = torch.as_tensor(np.concatenate(sels), device=self.f.z.device)
+        self._slice_split = np.cumsum([len(sel) for sel in sels])[:-1]
         self._series_key = None
         self.probe_changed.emit(self.probe)
         self.update()
@@ -111,7 +116,7 @@ class Inspector(QtWidgets.QWidget):
             v = self.probe
             s = self._scale(v)
             raw = self.f.z[:, v].float().cpu().numpy() * s
-            shown = dr.shown_series()[:, v].float().cpu().numpy() * s
+            shown = dr.shown_series_voxel(v).float().cpu().numpy() * s
             fam = self.f.family_tcs[:, int(self.f.family[v])].float().cpu().numpy()
             # The family course is unit variance; draw it at the raw series' scale.
             fam = fam * float(np.std(raw))
@@ -153,8 +158,12 @@ class Inspector(QtWidgets.QWidget):
 
     def _draw_slices(self, p: QtGui.QPainter, area: QtCore.QRectF) -> None:
         t = self.viz.vis.t
-        src = self.viz.vis.drives.shown_series() if self.overlay_shown else self.f.z
-        live = interp_rows(src, t).float().cpu().numpy()
+        dr = self.viz.vis.drives
+        if self.overlay_shown:
+            vals = dr.live[self._slice_idx]  # exactly what the scene is drawing
+        else:
+            vals = interp_cols(self.f.z, t, self._slice_idx)
+        per_slice = np.split(vals.float().cpu().numpy(), self._slice_split)
         self._slice_rects = []
         gap = 6
         each_w = (area.width() - 2 * gap) / 3
@@ -162,7 +171,7 @@ class Inspector(QtWidgets.QWidget):
             sh = self.vi.slice_shape(axis)
             img = np.zeros((*sh, 3), dtype=np.float32)
             g = self.mean[sel] * 0.75
-            val = live[sel] * self._scale(sel)
+            val = per_slice[k] * self._scale(sel)
             thr = 1.0 if not self.psc else 0.5
             mag = np.clip((np.abs(val) - thr) / (2.5 * thr), 0, 1)[:, None]
             hot = np.array([1.0, 0.55, 0.15], dtype=np.float32)
@@ -198,42 +207,57 @@ class Inspector(QtWidgets.QWidget):
         return nz - 1 - z, y
 
     def _draw_trace(self, p: QtGui.QPainter, area: QtCore.QRectF) -> None:
-        raw, shown, fam = self._series()
+        """The series, drawn once into a pixmap; a frame adds only the playhead.
+
+        Rebuilding three 262-point paths in Python every frame was ~6 ms on the
+        CPU, enough to drop a CPU-only Mac from smooth to stuttering.
+        """
+        raw, _, _ = self._series()
         n = raw.size
-        lim = max(1e-6, float(np.percentile(np.abs(raw), 99)) * 1.1)
-        xs = area.left() + np.arange(n) / max(n - 1, 1) * area.width()
-
-        def path(y: np.ndarray) -> QtGui.QPainterPath:
-            ys = area.center().y() - np.clip(y / lim, -1, 1) * area.height() / 2
-            pp = QtGui.QPainterPath()
-            pp.moveTo(xs[0], ys[0])
-            for i in range(1, n):
-                pp.lineTo(xs[i], ys[i])
-            return pp
-
-        p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 90), 1))
-        p.drawLine(
-            QtCore.QPointF(area.left(), area.center().y()),
-            QtCore.QPointF(area.right(), area.center().y()),
-        )
-        for start in self.f.run_starts[1:]:
-            p.drawLine(
-                QtCore.QPointF(xs[start], area.top()), QtCore.QPointF(xs[start], area.bottom())
-            )
-        p.setPen(QtGui.QPen(QtGui.QColor(150, 120, 220, 90), 1.2))
-        p.drawPath(path(fam))
-        p.setPen(QtGui.QPen(QtGui.QColor(150, 160, 190, 150), 1))
-        p.drawPath(path(raw))
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 190, 90, 230), 1.6))
-        p.drawPath(path(shown))
+        key = (self._series_key, int(area.width()), int(area.height()))
+        if getattr(self, "_trace_key", None) != key:
+            self._trace_pix = self._render_trace(area)
+            self._trace_key = key
+        p.drawPixmap(area.topLeft(), self._trace_pix)
         px = area.left() + self.viz.vis.t / max(n - 1, 1) * area.width()
         p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 170), 1))
         p.drawLine(QtCore.QPointF(px, area.top()), QtCore.QPointF(px, area.bottom()))
+
+    def _render_trace(self, area: QtCore.QRectF) -> QtGui.QPixmap:
+        raw, shown, fam = self._series()
+        w, h = max(1, int(area.width())), max(1, int(area.height()))
+        pix = QtGui.QPixmap(w, h)
+        pix.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(pix)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        n = raw.size
+        lim = max(1e-6, float(np.percentile(np.abs(raw), 99)) * 1.1)
+        xs = np.arange(n) / max(n - 1, 1) * w
+
+        def poly(y: np.ndarray) -> QtGui.QPolygonF:
+            ys = h / 2 - np.clip(y / lim, -1, 1) * h / 2
+            return QtGui.QPolygonF(
+                [QtCore.QPointF(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
+            )
+
+        p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 90), 1))
+        p.drawLine(QtCore.QPointF(0, h / 2), QtCore.QPointF(w, h / 2))
+        for start in self.f.run_starts[1:]:
+            p.drawLine(QtCore.QPointF(xs[start], 0), QtCore.QPointF(xs[start], h))
+        for series, colour, width in (
+            (fam, (150, 120, 220, 90), 1.2),
+            (raw, (150, 160, 190, 150), 1.0),
+            (shown, (255, 190, 90, 230), 1.6),
+        ):
+            p.setPen(QtGui.QPen(QtGui.QColor(*colour), width))
+            p.drawPolyline(poly(series))
         p.setPen(QtGui.QColor(130, 140, 170))
         p.drawText(
-            QtCore.QPointF(area.left() + 2, area.top() + 10),
+            QtCore.QPointF(2, 10),
             f"±{lim:.2g} {self.unit()}   grey raw · gold shown (pooled) · violet family",
         )
+        p.end()
+        return pix
 
     # -------------------------------------------------------------- input
 

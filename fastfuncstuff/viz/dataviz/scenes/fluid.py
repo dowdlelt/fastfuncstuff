@@ -62,6 +62,7 @@ class FluidScene(Scene):
         # Keep jets off the very edge so their ink has room.
         self.site = torch.stack([site[:, 0] * self.gw, site[:, 1] * self.gh], 1)
         self.rep = representative(self)
+        self._jets_r = None
         self.k_lap = torch.tensor(
             [[0, 1, 0], [1, 0, 1], [0, 1, 0]], device=self.device, dtype=torch.float32
         )[None, None]
@@ -86,16 +87,19 @@ class FluidScene(Scene):
         act = dr.fam.clamp(0, 3)
         push = dr.fam_amp * (0.3 + act) * sal * p["thrust"] * 25.0
         pour = (0.15 + act) * sal * p["pour_f"] * 6.0
-        r2 = p["jet"] ** 2
-        rgb = dr.family_rgb()
-        for k in range(dr.n_fam):
-            g = torch.exp(
-                -((self.xs - self.site[k, 0]) ** 2 + (self.ys - self.site[k, 1]) ** 2) / r2
-            )
-            ang = float(dr.fam_phase[k])
-            self.vel[0] += dt * float(push[k]) * math.cos(ang) * g
-            self.vel[1] += dt * float(push[k]) * math.sin(ang) * g
-            self.dye += dt * float(pour[k]) * rgb[k][:, None, None] * g
+        if self._jets_r != p["jet"]:
+            # (F, gh, gw) jet footprints, built once per radius: the per-family
+            # loop read three floats per family off the GPU every frame.
+            r2 = p["jet"] ** 2
+            dx = self.xs[None] - self.site[:, 0, None, None]
+            dy = self.ys[None] - self.site[:, 1, None, None]
+            self.jets = torch.exp(-(dx**2 + dy**2) / r2)
+            self._jets_r = p["jet"]
+        fx = push * torch.cos(dr.fam_phase)
+        fy = push * torch.sin(dr.fam_phase)
+        self.vel[0] += dt * torch.einsum("f,fhw->hw", fx, self.jets)
+        self.vel[1] += dt * torch.einsum("f,fhw->hw", fy, self.jets)
+        self.dye += dt * torch.einsum("f,fc,fhw->chw", pour, dr.family_rgb(), self.jets)
         self.vel[1] -= dt * 4.0 * math.tanh(dr.g * 0.5)  # the global signal lifts
         if dr.d > 2.5:
             cx, cy = self.gw / 2, self.gh / 2

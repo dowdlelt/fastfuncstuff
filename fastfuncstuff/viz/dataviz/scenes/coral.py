@@ -86,13 +86,13 @@ class CoralScene(Scene):
         )[None, None]
 
     def _plant(self) -> None:
-        for k in range(self.dr.n_fam):
-            self.label[self.seeds[k]] = k + 1
+        fam = torch.arange(1, self.dr.n_fam + 1, device=self.device)[:, None].expand_as(self.seeds)
+        self.label.index_put_((self.seeds.reshape(-1),), fam.reshape(-1))
 
     def step(self, dt: float) -> None:
         p, dr = self.p, self.dr
         sal = dr.family_salience / dr.family_salience.max().clamp_min(1e-6)
-        act = ((dr.fam - p["bud"]).clamp(0, 3) * sal).tolist()
+        act_t = (dr.fam - p["bud"]).clamp(0, 3) * sal  # stays on the device
         self.age = self.age + dt
         # Nutrient: released by active cortex, diffusing, eaten by the reef.
         # Growth goes as nutrient**fractal at the frontier: tips that reach out
@@ -116,8 +116,8 @@ class CoralScene(Scene):
         # families both claim. (A Python loop over families was most of the
         # frame at 1080p.)
         n_f = dr.n_fam
-        act_t = torch.tensor(act, device=self.device)
-        mine = F.one_hot(self.label, n_f + 1)[:, 1:].T.float().reshape(1, n_f, self.gh, self.gw)
+        fams = torch.arange(1, n_f + 1, device=self.device)[:, None]
+        mine = (self.label[None] == fams).float().reshape(1, n_f, self.gh, self.gw)
         k = self.kernel.expand(n_f, 1, 3, 3)
         nb = (F.conv2d(F.pad(mine, (1, 1, 1, 1)), k, groups=n_f) - mine).reshape(n_f, -1)
         frontier = empty[None] & (nb > 0) & (act_t > 0)[:, None]
@@ -127,15 +127,15 @@ class CoralScene(Scene):
         score = torch.where(won, prob - draw, torch.full_like(prob, -1.0))
         best = score.max(0)
         claim = best.values > 0
-        self.label[claim] = best.indices[claim] + 1
-        self.born[claim] = dr.t
-        self.age[claim] = 0.0
+        self.label = torch.where(claim, best.indices + 1, self.label)
+        self.born = torch.where(claim, torch.full_like(self.born, dr.t), self.born)
+        self.age = torch.where(claim, torch.zeros_like(self.age), self.age)
         # Die-back: untended cells of quiet families age out, oldest first.
         fam = (self.label - 1).clamp_min(0)
-        a = torch.tensor(act, device=self.device)[fam].clamp(0, 1)
+        a = act_t[fam].clamp(0, 1)
         risk = (self.age / p["lifespan"]).clamp(0, 3) * (1 - a) * dt / p["lifespan"] * 3.0
         dead = (self.label > 0) & (self.rand(risk.numel()) < risk)
-        self.label[dead] = 0
+        self.label = torch.where(dead, torch.zeros_like(self.label), self.label)
         self._plant()
         # Tended cells stay young.
         self.age = torch.where((self.label > 0) & (a > 0.3), self.age * (1 - 0.5 * dt), self.age)

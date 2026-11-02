@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from ..drives import Param, interp_rows
+from ..drives import Param, interp_many
 from .base import Scene, representative
 
 S = "spectrum"
@@ -45,7 +45,7 @@ class SpectrumScene(Scene):
         n = int(p["span"])
         b = min(int(p["bins"]), n // 2)
         ts = [dr.t - n + 1 + i for i in range(n)]
-        seg = torch.stack([interp_rows(self.f.family_tcs, max(0.0, u)) for u in ts])  # (n, F)
+        seg = interp_many(self.f.family_tcs, [max(0.0, u) for u in ts])  # (n, F)
         seg = (seg - seg.mean(0)) * torch.hann_window(n, device=self.device)[:, None]
         pw = torch.fft.rfft(seg, dim=0).abs()[1 : b + 1].T  # (F, b)
         # Each family against its own recent loudest bar: the spectrum keeps its

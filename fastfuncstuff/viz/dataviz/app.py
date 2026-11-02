@@ -106,23 +106,13 @@ class Canvas(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         gs, dv = viz.gs_np, viz.dv_np
         n = gs.size
-        xs = np.linspace(x0, x1, n)
-        # Global signal as a faint line, DVARS spikes as ticks: the whole-brain
-        # story of the run at a glance, with the playhead on it.
-        mid = y0 + band / 2
-        ys = mid - np.clip(gs, -3, 3) / 3 * (band / 2 - 2)
-        path = QtGui.QPainterPath()
-        path.moveTo(xs[0], ys[0])
-        for i in range(1, n):
-            path.lineTo(xs[i], ys[i])
-        p.setPen(QtGui.QPen(QtGui.QColor(140, 160, 220, 90), 1))
-        p.drawPath(path)
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 120, 120), 1))
-        for i in np.nonzero(dv > 3.0)[0]:
-            p.drawLine(QtCore.QPointF(xs[i], y0 + band), QtCore.QPointF(xs[i], y0 + band - 6))
-        p.setPen(QtGui.QPen(QtGui.QColor(120, 130, 160, 80), 1, QtCore.Qt.PenStyle.DashLine))
-        for start in f.run_starts[1:]:
-            p.drawLine(QtCore.QPointF(xs[start], y0), QtCore.QPointF(xs[start], y0 + band))
+        # The run's whole-brain story is static: drawn once per size, with
+        # only the playhead added each frame.
+        key = (w, h, n)
+        if getattr(self, "_hud_key", None) != key:
+            self._hud_pix = self._render_hud_story(x1 - x0, band, gs, dv, f.run_starts)
+            self._hud_key = key
+        p.drawPixmap(QtCore.QPointF(x0, y0), self._hud_pix)
         px = x0 + (x1 - x0) * viz.vis.t / max(n - 1, 1)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 170), 1))
         p.drawLine(QtCore.QPointF(px, y0 - 2), QtCore.QPointF(px, y0 + band + 2))
@@ -166,6 +156,31 @@ class Canvas(QtWidgets.QWidget):
     def resizeEvent(self, e) -> None:
         self.viz.place_inspector()
         super().resizeEvent(e)
+
+    def _render_hud_story(self, width: float, band: int, gs, dv, run_starts) -> QtGui.QPixmap:
+        """Global signal as a faint line, DVARS spikes as ticks, run breaks dashed."""
+        w = max(1, int(width))
+        pix = QtGui.QPixmap(w, band + 1)
+        pix.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(pix)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        n = gs.size
+        xs = np.linspace(0, w, n)
+        ys = band / 2 - np.clip(gs, -3, 3) / 3 * (band / 2 - 2)
+        p.setPen(QtGui.QPen(QtGui.QColor(140, 160, 220, 90), 1))
+        p.drawPolyline(
+            QtGui.QPolygonF(
+                [QtCore.QPointF(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
+            )
+        )
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 120, 120), 1))
+        for i in np.nonzero(dv > 3.0)[0]:
+            p.drawLine(QtCore.QPointF(xs[i], band), QtCore.QPointF(xs[i], band - 6))
+        p.setPen(QtGui.QPen(QtGui.QColor(120, 130, 160, 80), 1, QtCore.Qt.PenStyle.DashLine))
+        for start in run_starts[1:]:
+            p.drawLine(QtCore.QPointF(xs[start], 0), QtCore.QPointF(xs[start], band))
+        p.end()
+        return pix
 
     def _draw_sets(self, p: QtGui.QPainter, x: float, y: float) -> None:
         """The current set's scenes with their keys, the current one lit."""
@@ -518,7 +533,7 @@ class Viz(QtWidgets.QMainWindow):
         if free < 256:
             return
         self.son.gate = 1.0 if (self.playing and self.sound_on) else 0.0
-        mute = self.vis.drives.mute.cpu().numpy()
+        mute = np.asarray(self.vis.drives.mute_host, dtype=bool)
         if mute.shape == self.son.mute.shape:
             self.son.mute = mute
         self.audio_io.write(self.son.render(free, self.vis.t).tobytes())

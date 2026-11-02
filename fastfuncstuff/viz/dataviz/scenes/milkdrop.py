@@ -104,7 +104,7 @@ class MilkdropScene(Scene):
         )
         # Hue drift: rotate the kept colour about the grey axis, faster when the
         # families are busy.
-        busy = float(dr.fam.abs().mean())
+        busy = dr.fam.abs().mean()  # stays on the device
         self.hue_angle = p["hue"] * dt * (0.3 + busy)
         warped = _hue_rotate(warped, self.hue_angle)
         self.buf = warped * (p["decay"] ** (dt * 60))
@@ -137,19 +137,17 @@ class MilkdropScene(Scene):
         return dr.finish(self.buf[0].reshape(3, -1).T, h, w)
 
 
-def _hue_rotate(img: torch.Tensor, angle: float) -> torch.Tensor:
-    """Rotate colours about the grey axis by ``angle`` radians (Rodrigues)."""
-    if angle == 0:
-        return img
-    c, s = math.cos(angle), math.sin(angle)
+def _hue_rotate(img: torch.Tensor, angle) -> torch.Tensor:
+    """Rotate colours about the grey axis by ``angle`` radians (Rodrigues).
+
+    ``angle`` may be a 0-d device tensor: the matrix is assembled on the
+    device, so the frame does not wait to read it back.
+    """
+    angle = torch.as_tensor(angle, device=img.device, dtype=img.dtype)
+    c, s = torch.cos(angle), torch.sin(angle)
     k = 1 / math.sqrt(3)
-    one_c = 1 - c
-    m = torch.tensor(
-        [
-            [c + one_c / 3, one_c / 3 - k * s, one_c / 3 + k * s],
-            [one_c / 3 + k * s, c + one_c / 3, one_c / 3 - k * s],
-            [one_c / 3 - k * s, one_c / 3 + k * s, c + one_c / 3],
-        ],
-        device=img.device,
-    )
+    a = c + (1 - c) / 3
+    b = (1 - c) / 3 - k * s
+    d = (1 - c) / 3 + k * s
+    m = torch.stack([torch.stack([a, b, d]), torch.stack([d, a, b]), torch.stack([b, d, a])])
     return torch.einsum("ij,bjhw->bihw", m, img).clamp_min(0)

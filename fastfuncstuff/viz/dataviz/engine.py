@@ -61,6 +61,21 @@ REMIX_SKIP = frozenset(
 )  # fmt: skip
 
 
+#: Coarser starting points when the whole thing runs on the CPU: the grid
+#: automata and the many-point scenes cost per cell or per point, and these
+#: halve to quarter that, at the price of chunkier pixels. User settings
+#: (-set, configs, the panel) still win. Measured on a 6-core CPU at 640x360.
+CPU_DEFAULTS = {
+    "lcell": 2,  # life: 51.7 ms at 1 px cells
+    "pcell": 2,  # physarum: 64.8 ms at 1 px cells
+    "agents": 20000,
+    "cell": 3,  # turing: 33.8 ms at 2 px cells
+    "iters": 10,  # turing: half the reaction steps (slower growth)
+    "ccell": 3,  # coral: 30.4 ms at 2 px cells
+    "hops": 2,  # attractor: 39.7 ms at 4 hops
+}
+
+
 def default_params() -> dict[str, float]:
     return {p.name: float(p.default) for p in PARAMS}
 
@@ -69,6 +84,8 @@ class Visualizer:
     def __init__(self, feats: Features, width: int = 640, height: int = 360, seed: int = 0):
         self.f = feats
         self.p = default_params()
+        if feats.z.device.type == "cpu":
+            self.p.update({k: float(v) for k, v in CPU_DEFAULTS.items()})
         self.p["families"] = float(feats.family_tcs.shape[1])
         self.p["components"] = float(feats.k_active)
         self.drives = Drives(feats, self.p)
@@ -139,7 +156,7 @@ class Visualizer:
         self._scenes.clear()
 
     def set_mute(self, family: int, muted: bool) -> None:
-        self.drives.mute[family] = muted
+        self.drives.set_mute(family, muted)
 
     # ------------------------------------------------------------- remix, config
 
@@ -194,7 +211,7 @@ class Visualizer:
             "ffs_dataviz_config": 1,
             "scene": self.scene_name,
             "params": out,
-            "muted": [int(i) for i in torch.nonzero(self.drives.mute).flatten().tolist()],
+            "muted": [i for i, m in enumerate(self.drives.mute_host) if m],
         }
 
     def from_config(self, cfg: dict) -> None:
@@ -209,9 +226,11 @@ class Visualizer:
         if "scene" in cfg and cfg["scene"] in SCENE_NAMES:
             params["scene"] = float(SCENE_NAMES.index(cfg["scene"]))
         self.restore(params)
+        muted = [False] * self.drives.n_fam
         for i in cfg.get("muted", []):
             if 0 <= int(i) < self.drives.n_fam:
-                self.drives.mute[int(i)] = True
+                muted[int(i)] = True
+        self.drives.set_mutes(muted)
 
     def step(self, dt: float, playing: bool = True) -> None:
         dt = float(min(dt, 0.05))

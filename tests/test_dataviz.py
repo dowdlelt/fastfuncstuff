@@ -313,3 +313,24 @@ def test_smoothing_keeps_coherence_and_global_comes_out():
     assert float(r.abs().max()) < 0.3
     # ...but the whole-brain series is still there to drive tint and flashes.
     assert abs(float(np.corrcoef(g.numpy(), glob)[0, 1])) > 0.9
+
+
+@pytest.mark.parametrize("reach,clarity", [(0, 0.0), (2, 0.35), (4, 1.0)])
+def test_shown_series_for_one_voxel_matches_the_whole_field(run, reach, clarity):
+    feats, in_patch, _ = run
+    params = default_params() | {"reach": reach, "clarity": clarity, "pool": 0.7}
+    dr = Drives(feats, params)
+    v = int(np.flatnonzero(in_patch)[3])
+    one = dr.shown_series_voxel(v)
+    whole = torch.stack([dr.pooled(dr.activity(float(t)))[v] for t in range(N_TIME)])
+    assert torch.allclose(one, whole, atol=1e-5)
+
+
+def test_interp_many_matches_interp_rows(run):
+    from fastfuncstuff.viz.dataviz.drives import interp_many, interp_rows
+
+    feats, _, _ = run
+    ts = [0.0, 0.3, 5.5, 41.25, N_TIME - 1.0, N_TIME - 1.4]
+    many = interp_many(feats.family_tcs, ts)
+    each = torch.stack([interp_rows(feats.family_tcs, t) for t in ts])
+    assert torch.allclose(many, each, atol=1e-5)

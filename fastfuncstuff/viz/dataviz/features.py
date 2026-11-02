@@ -94,7 +94,10 @@ class Features:
         * ``edge``   members' share of brain-boundary voxels relative to the
           brain's -- flagged over 2x (edge and ghosting components).
         """
-        tcs = self.family_tcs.float()
+        from fastfuncstuff.utils import cpu_if_mps
+
+        home = self.family_tcs.device
+        tcs = self.family_tcs.float().to(cpu_if_mps(home, "complex_spectral"))
         n_time, n_fam = tcs.shape
         freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
         pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
@@ -109,6 +112,8 @@ class Features:
             b = (b - b.mean())[:, None]
             return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
 
+        fast = fast.to(home)
+        tcs = tcs.to(home)
         r_gs = corr(tcs, self.global_signal.float()).abs()
         change = torch.zeros_like(tcs)
         change[1:] = (tcs[1:] - tcs[:-1]).abs()
@@ -468,13 +473,16 @@ def compute_features(
     # The eigendecomposition gives every component for free, so keep up to
     # ``max_components`` and let a slider choose how many are in use.
     gram = zf.T @ zf
-    evals_all, evecs = plinalg.eigh(gram.double())
+    # Device first, then float64 (on Metal a combined cast returns zeros and
+    # .double() raises); a (T, T) eigh is cheapest on the CPU everywhere.
+    evals_all, evecs = plinalg.eigh(gram.to("cpu").double())
+    evecs = evecs.float().to(device)
     order = torch.argsort(evals_all, descending=True)
     k_max = min(max_components, n_time - 1)
-    evals = evals_all[order[:k_max]].float().clamp_min(1e-12)
+    evals = evals_all[order[:k_max]].float().clamp_min(1e-12)  # on the CPU
     tcs = evecs[:, order[:k_max]].float()  # (T, Kmax), orthonormal columns
     loadings = zf @ tcs  # (N, Kmax): z ≈ loadings @ tcs.T
-    pc_var = evals / gram.diagonal().sum()
+    pc_var = evals.to(device) / gram.diagonal().sum()
     tcs_unit = tcs * math.sqrt(n_time)
     loadings_unit = loadings / math.sqrt(n_time)
     k_suggested = suggest_components(evals_all[order].cpu().numpy(), n)
@@ -495,8 +503,8 @@ def compute_features(
     rows = loadings_unit[:, :k_active]
     rows = rows / rows.norm(dim=1, keepdim=True).clamp_min(1e-12)
     rows = rows - rows.mean(0, keepdim=True)
-    _, _, vh = plinalg.svd(rows[:: max(1, n // 200_000)].double(), full_matrices=False)
-    func = _centre_scale(rows @ vh[:3].T.float())
+    _, _, vh = plinalg.svd(rows[:: max(1, n // 200_000)].to("cpu").double(), full_matrices=False)
+    func = _centre_scale(rows @ vh[:3].T.float().to(rows.device))
     steps.update()
 
     zt = zf.T.contiguous()  # (T, N)
@@ -512,8 +520,14 @@ def compute_features(
     salience = (_rank_unit(communality) * _rank_unit(coherence)).sqrt()
     steps.update()
 
-    phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
-    bands = band_powers(zt, tr)
+    from fastfuncstuff.utils import cpu_if_mps
+
+    spec_dev = cpu_if_mps(device, "complex_spectral")
+    zs = zt if spec_dev == device else zt.to(spec_dev)
+    phase, phase_power, wave_tcs = wave_phase(zs, tr, period_s)
+    bands = band_powers(zs, tr).to(device)
+    phase, phase_power, wave_tcs = phase.to(device), phase_power.to(device), wave_tcs.to(device)
+    del zs
     steps.update()
 
     g = (g - g.mean()) / g.std().clamp_min(1e-12)

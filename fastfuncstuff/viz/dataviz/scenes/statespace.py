@@ -63,6 +63,7 @@ class StatespaceScene(Scene):
         # The path sampled every quarter TR, once, so drawing it is a slice.
         self.fine_state = _catmull_rom(self.state, 4)
         self.fine_hue = _catmull_rom(self.hue, 4)
+        self._arc_rgb = torch.tensor([[0.75, 0.8, 1.0]], device=self.device)
         load = f.loadings[:, : min(3, k)]
         self.cloud_pos = torch.zeros(f.n_voxels, 3, device=self.device)
         self.cloud_pos[:, : load.shape[1]] = load / load.norm(dim=1).quantile(0.98).clamp_min(1e-6)
@@ -100,19 +101,18 @@ class StatespaceScene(Scene):
             splat_lines(frame, sx[:-1], sy[:-1], sx[1:], sy[1:], col[:-1] * bright, w, h, 8)
         now = interp_rows(self.state, t)
         nx, ny, _ = self._proj(now[None])
-        # Recurrence: earlier moments (over 15 TRs back) in nearly the same state.
-        past_t = torch.arange(0, max(0, int(t) - 15), device=self.device)
-        if past_t.numel():
-            d = (self.state[past_t] - now).norm(dim=1)
-            near = d < p["recur"]
-            if bool(near.any()):
-                pp = self.state[past_t[near]]
-                px, py, _ = self._proj(pp)
-                strength = (1 - d[near] / p["recur"]).clamp(0, 1)[:, None] * 0.35
-                arc = torch.tensor([0.75, 0.8, 1.0], device=self.device) * strength
-                splat_lines(frame, nx.expand_as(px), ny.expand_as(py), px, py, arc, w, h, 24)
+        # Recurrence: earlier moments (over 15 TRs back) in nearly the same
+        # state. Every TR is drawn, weighted to zero when too recent or too far:
+        # one fixed shape, no mask, no sync.
+        d = (self.state - now).norm(dim=1)
+        recent = torch.arange(self.f.n_time, device=self.device) > (t - 15)
+        strength = ((1 - d / max(p["recur"], 1e-6)).clamp(0, 1) * ~recent)[:, None] * 0.35
+        px, py, _ = self._proj(self.state)
+        splat_lines(
+            frame, nx.expand_as(px), ny.expand_as(py), px, py, strength * self._arc_rgb, w, h, 24
+        )
         # The comet head.
-        head = torch.tensor([[1.0, 0.95, 0.85]], device=self.device) * (1.5 + dr.sync)
+        head = dr._const("comet", (1.0, 0.95, 0.85))[None] * (1.5 + dr.sync)
         for r in (0.0, 1.0):
             for a in range(0, 360, 90 if r else 360):
                 ox, oy = r * math.cos(math.radians(a)), r * math.sin(math.radians(a))

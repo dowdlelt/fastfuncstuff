@@ -105,10 +105,14 @@ class Scene:
         """
         flat = x.reshape(-1)
         sample = flat if flat.numel() <= 200_000 else flat[:: flat.numel() // 200_000 + 1]
-        peak = float(torch.quantile(sample, 0.98).clamp_min(1e-6))
-        ref = self.__dict__.setdefault("_peaks", {}).get(key, peak)
-        ref += (max(peak, ref * 0.5) - ref) * 0.01
-        self._peaks[key] = ref
+        # topk, not quantile: Metal has no quantile kernel, and the reference
+        # stays on the device so the frame needs no sync.
+        k = max(1, sample.numel() // 50)
+        peak = torch.topk(sample, k).values[-1].clamp_min(1e-6)
+        peaks = self.__dict__.setdefault("_peaks", {})
+        ref = peaks.get(key)
+        ref = peak if ref is None else ref + (torch.maximum(peak, ref * 0.5) - ref) * 0.01
+        peaks[key] = ref
         return (x / ref).clamp(0, 1)
 
     def grid_cells(self, gh: int, gw: int) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -168,12 +172,16 @@ def orbit_project(
     Returns screen x, screen y and depth (distance from the camera).
     """
     cy, sy, cp, sp = math.cos(yaw), math.sin(yaw), math.cos(pitch), math.sin(pitch)
-    rot_yaw = torch.tensor([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], device=pos.device)
-    rot_pitch = torch.tensor([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], device=pos.device)
-    q = pos @ (rot_pitch @ rot_yaw).T
-    depth = q[:, 1] + 3.2
+    # Yaw about z, then pitch about x, with host scalars: building rotation
+    # matrices as device tensors cost two blocking copies a frame.
+    x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+    qx = cy * x - sy * y
+    qy0 = sy * x + cy * y
+    qy = cp * qy0 - sp * z
+    qz = sp * qy0 + cp * z
+    depth = qy + 3.2
     scale = zoom * height * 1.05 / depth
-    return width * 0.5 + q[:, 0] * scale, height * 0.5 - q[:, 2] * scale, depth
+    return width * 0.5 + qx * scale, height * 0.5 - qz * scale, depth
 
 
 def axial_cells(
@@ -212,21 +220,6 @@ def axial_cells(
     grown = F.max_pool2d(F.pad(img, (r, r, r, r)), 2 * r + 1, stride=1)
     shrunk = 1 - F.max_pool2d(F.pad(1 - grown, (r, r, r, r), value=1.0), 2 * r + 1, stride=1)
     return cell, shrunk[0, 0] > 0.5, passes
-
-
-def field(
-    values: torch.Tensor, cell: torch.Tensor, n_cells: int, how: str = "mean"
-) -> torch.Tensor:
-    """Per-cell mean (or max) of per-voxel values, (n_cells,) or (n_cells, C)."""
-    if how == "max":
-        out = torch.zeros(n_cells, *values.shape[1:], device=values.device)
-        idx = cell if values.ndim == 1 else cell[:, None].expand_as(values)
-        return out.scatter_reduce_(0, idx, values, reduce="amax", include_self=True)
-    tot = torch.zeros(n_cells, *values.shape[1:], device=values.device).index_add_(0, cell, values)
-    cnt = torch.zeros(n_cells, device=values.device).index_add_(
-        0, cell, torch.ones_like(cell, dtype=torch.float32)
-    )
-    return tot / cnt.clamp_min(1).reshape(-1, *([1] * (values.ndim - 1)))
 
 
 def filled_field(
@@ -331,12 +324,17 @@ def family_ring_sites(scene: Scene, radius: float = 0.3) -> torch.Tensor:
 
 
 def representative(scene: Scene) -> torch.Tensor:
-    """(F,) the most salient member voxel of each family, for picking a source."""
+    """(F,) the most salient member voxel of each family, for picking a source.
+
+    A one-time loop on the CPU rather than scatter_reduce, whose Metal coverage
+    varies by release.
+    """
     f, dr = scene.f, scene.dr
-    best = torch.full((dr.n_fam,), -1.0, device=scene.device).scatter_reduce_(
-        0, f.family, f.salience, reduce="amax", include_self=True
-    )
-    hit = f.salience >= best[f.family] - 1e-9
-    rep = torch.zeros(dr.n_fam, dtype=torch.long, device=scene.device)
-    rep[f.family[hit]] = torch.nonzero(hit).squeeze(1)
-    return rep
+    sal = f.salience.cpu()
+    fam = f.family.cpu()
+    rep = torch.zeros(dr.n_fam, dtype=torch.long)
+    for k in range(dr.n_fam):
+        members = torch.nonzero(fam == k).squeeze(1)
+        if members.numel():
+            rep[k] = members[torch.argmax(sal[members])]
+    return rep.to(scene.device)
