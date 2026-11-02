@@ -13,7 +13,7 @@ import torch
 
 from fastfuncstuff.viz.dataviz.drives import Drives, top_two, uniform_disc
 from fastfuncstuff.viz.dataviz.engine import PARAM_BY_NAME, Visualizer, default_params
-from fastfuncstuff.viz.dataviz.features import compute_features, member_counts
+from fastfuncstuff.viz.dataviz.features import compute_features, member_counts, spike_score
 from fastfuncstuff.viz.dataviz.scenes import SCENE_NAMES
 from fastfuncstuff.viz.dataviz.sound import Sonifier
 
@@ -420,3 +420,21 @@ def test_interp_many_matches_interp_rows(run):
     many = interp_many(feats.family_tcs, ts)
     each = torch.stack([interp_rows(feats.family_tcs, t) for t in ts])
     assert torch.allclose(many, each, atol=1e-5)
+
+
+def test_spike_score_does_not_inflate_a_quiet_run():
+    # Shaped like a real low-motion run (max FD 0.67 mm): the worst frame is only
+    # 2.2x the median, which plain robust z scored 7.6, with 16% of frames "spikes".
+    dv = torch.from_numpy(np.random.default_rng(0).gamma(40.0, 0.021, 254)).float()
+    dv = dv.clamp_max(1.6)
+    dv[33] = 1.8
+    d = spike_score(dv)
+    assert (d > 2.5).float().mean() < 0.05
+    assert d.max() < 4.0
+
+
+def test_spike_score_is_bounded_and_ordered():
+    dv = torch.ones(100) + torch.linspace(0, 0.1, 100)
+    dv[10], dv[20] = 3.0, 300.0
+    d = spike_score(dv)
+    assert 2.5 < d[10] < d[20] <= 6.0
