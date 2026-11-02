@@ -20,7 +20,8 @@ from fastfuncstuff.cli_utils import parse_device_arg, setup_device
 from fastfuncstuff.glm.arma import _ljung_box_batched
 from fastfuncstuff.utils import MPS_DEVICE, get_device
 
-_F64 = {"torch.float64", "torch.double"}
+_F64 = {"torch.float64", "torch.double", "torch.complex128", "torch.cdouble"}
+_F64_TYPES = {"torch.DoubleTensor", "torch.cuda.DoubleTensor"}
 _mps = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Metal")
 
 
@@ -32,11 +33,13 @@ def _violations(source: str) -> list[tuple[int, str]]:
         kwargs = {k.arg: ast.unparse(k.value) for k in node.keywords}
         args = [ast.unparse(a) for a in node.args]
         if node.func.attr == "to":
-            combined = (kwargs.get("dtype") in _F64 and "device" in kwargs) or (
+            combined = (kwargs.get("dtype") in _F64 and ("device" in kwargs or args)) or (
                 len(args) == 2 and args[1] in _F64
             )
             if combined:
                 out.append((node.lineno, "device and float64 in one .to()"))
+        if node.func.attr == "type" and args and args[0] in _F64 | _F64_TYPES:
+            out.append((node.lineno, "float64 through .type()"))
         moving_off = node.func.attr == "cpu"
         receiver = node.func.value
         if moving_off and isinstance(receiver, ast.Call):
@@ -56,11 +59,21 @@ def test_detector_catches_each_form():
         "x.to('cpu', torch.float64)",
         "x.to(device=d, dtype=torch.float64)",
         "x.to(dtype=torch.double, device=d)",
+        "x.to(d, dtype=torch.float64)",
+        "x.to('cpu', torch.complex128)",
+        "x.type(torch.DoubleTensor)",
+        "x.type(torch.float64)",
         "x.double().cpu()",
         "x.to(torch.float64).cpu()",
     ):
         assert _violations(bad), bad
-    for good in ("x.to(device=d).to(torch.float64)", "x.cpu().double()", "x.to(d, torch.float32)"):
+    for good in (
+        "x.to(device=d).to(torch.float64)",
+        "x.cpu().double()",
+        "x.to(d, torch.float32)",
+        "x.to(d, dtype=torch.float32)",
+        "s.dtype.type(0.5)",
+    ):
         assert not _violations(good), good
 
 
@@ -79,7 +92,12 @@ _ROUTED_NAMES = {
     "cholesky", "cholesky_ex", "inv", "inv_ex", "det", "slogdet", "lu_factor", "lu_solve", "eigh",
     "eigvalsh",
 }  # fmt: skip
-_ROUTED_TOP_LEVEL = {"cholesky_solve", "cholesky_inverse"}
+# The second row is torch's older spellings of the same solvers: nothing routes them,
+# and nothing here calls them yet.
+_ROUTED_TOP_LEVEL = {
+    "cholesky_solve", "cholesky_inverse", "logdet",
+    "svd", "qr", "inverse", "pinverse", "triangular_solve", "det", "slogdet", "lu", "cholesky",
+}  # fmt: skip
 
 
 def test_package_uses_routed_solvers():
