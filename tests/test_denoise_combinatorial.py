@@ -1037,6 +1037,27 @@ def test_evaluate_all_combinations_q_based_matches_legacy(
     assert np.allclose(fast_var, legacy_var)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Metal")
+def test_evaluate_all_combinations_on_metal_matches_cpu():
+    """The Metal path subtracts in float32; it has to land on the CPU's answer anyway."""
+    from fastfuncstuff.denoise.combinatorial import (
+        evaluate_all_combinations_for_run,
+        generate_all_pc_combinations,
+    )
+
+    case = _combo_eval_case(k=4, n_cond=3, n_poly=4, zero_poly=False)
+    combos = generate_all_pc_combinations(4)
+    on = {
+        device: evaluate_all_combinations_for_run(
+            **case, combinations=combos, device=torch.device(device), verbose=False
+        )[0]
+        for device in ("cpu", "mps")
+    }
+    assert np.abs(on["cpu"] - on["mps"]).max() < 1e-4
+    assert on["cpu"].argmax() == on["mps"].argmax()
+
+
 class TestSingletonReportedCoD:
     """The reported CoD must be the selected set's, not some other combination's.
 
