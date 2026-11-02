@@ -99,22 +99,53 @@ class MandalaScene(Scene):
         rgb = dr.colors() * glow[:, None] + dr.family_rgb()[fam] * rest[:, None]
         rgb = rgb / (2 * n_fold) * 6
 
-        # All 2*fold mirrored copies in one splat: one launch instead of 2*fold.
-        k = torch.arange(n_fold, device=self.device, dtype=torch.float32) * 2 * half
-        th = torch.cat([k[:, None] + theta0[None], k[:, None] - theta0[None]]).reshape(-1)
         # Petals: the radius swells fold-fold around the circle in proportion
-        # to the family's activity.
-        petal = (1 + p["petal"] * act.clamp_min(0) * 0.25).repeat(2 * n_fold)
-        rr = r.repeat(2 * n_fold) * (1 + (petal - 1) * torch.cos(n_fold * th) ** 2)
-        frame = torch.zeros(h * w, 3, device=self.device)
-        cx, cy = w * 0.5, h * 0.5
-        splat(
-            frame,
-            cx + rr * scale * torch.cos(th),
-            cy + rr * scale * torch.sin(th),
-            rgb.repeat(2 * n_fold, 1),
-            w,
-            h,
-        )
+        # to the family's activity. cos(fold * theta) is the same in every
+        # mirrored copy, which is what lets the mirroring happen in image space.
+        petal = p["petal"] * act.clamp_min(0) * 0.25
+        rr = r * (1 + petal * torch.cos(n_fold * theta0) ** 2) * scale  # pixels
+
+        # Splat one half-sector into a polar buffer (rows: radius in pixels,
+        # columns: angle within the half-sector), keep the trails there, then
+        # unfold to the full kaleidoscope with one grid_sample. The cost scales
+        # with pixels instead of points x 2*fold copies -- 12x less on the CPU.
+        n_r, n_th = self._polar_shape(half)
+        dth = half / n_th
+        # A polar bin covers r * dtheta * dr Cartesian pixels: weight by its
+        # inverse so brightness matches drawing the points directly.
+        wt = 1.0 / (rr.clamp_min(1.0) * dth)
+        frame = torch.zeros(n_r * n_th, 3, device=self.device)
+        splat(frame, theta0 / dth, rr, rgb * wt[:, None], n_th, n_r)
+        if self.accum.shape[0] != n_r * n_th:
+            self.accum = torch.zeros(n_r * n_th, 3, device=self.device)
         self.fade_in(frame)
-        return dr.finish(self.accum, h, w)
+        return dr.finish(self._unfold(half, n_r, n_th), h, w)
+
+    def _polar_shape(self, half: float) -> tuple[int, int]:
+        n_r = int(0.75 * max(self.width, self.height)) + 2
+        n_th = max(32, int(n_r * half))
+        return n_r, n_th
+
+    def _unfold(self, half: float, n_r: int, n_th: int) -> torch.Tensor:
+        """(h*w, 3) Cartesian image from the polar half-sector buffer."""
+        import torch.nn.functional as F
+
+        h, w = self.height, self.width
+        key = (h, w, half, n_r, n_th)
+        if getattr(self, "_grid_key", None) != key:
+            ys = torch.arange(h, device=self.device, dtype=torch.float32) - h * 0.5 + 0.5
+            xs = torch.arange(w, device=self.device, dtype=torch.float32) - w * 0.5 + 0.5
+            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+            rad = (gx**2 + gy**2).sqrt()
+            th = torch.remainder(torch.atan2(gy, gx), 2 * half)
+            th = torch.where(th > half, 2 * half - th, th)  # the mirror
+            # grid_sample wants [-1, 1] across each axis of the source.
+            u = th / half * 2 - 1
+            v = rad / (n_r - 1) * 2 - 1
+            self._grid = torch.stack([u, v], -1)[None]
+            self._grid_key = key
+        src = self.accum.T.reshape(1, 3, n_r, n_th)
+        out = F.grid_sample(
+            src, self._grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+        return out[0].reshape(3, -1).T
