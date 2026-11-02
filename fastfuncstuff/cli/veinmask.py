@@ -161,7 +161,7 @@ def _tissue_on_grid(paths, epi_shape, epi_affine, device) -> torch.Tensor:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    device = setup_device(args.device)
+    device = setup_device(args.device, float64_only="ffs_veinmask")
     t0 = time.time()
     from fastfuncstuff.processing.io import load_image, save_image
     from fastfuncstuff.processing.veinmask import (
