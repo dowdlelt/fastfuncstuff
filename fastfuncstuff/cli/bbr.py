@@ -528,7 +528,7 @@ def main(argv: list[str] | None = None) -> None:
     # EPI on the anat grid with the ORIGINAL affine (A) — the before/after pair.
     with spinner("Writing initial_epi_in_anat"):
         initial_epi_in_anat = apply_affine(
-            epi, A.to(torch.float32), anat_ref_shape, zero_outside=True
+            epi, A.to(device=epi.device, dtype=torch.float32), anat_ref_shape, zero_outside=True
         )
         save_image(
             initial_epi_in_anat, f"{prefix}_initial_epi_in_anat.nii.gz", header_info=anat_ref_hdr
@@ -537,7 +537,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # EPI resampled onto anat grid with the refined affine (A': anat→epi).
     with spinner("Writing epi_in_anat"):
-        epi_in_anat = apply_affine(epi, A_new.to(torch.float32), anat_ref_shape, zero_outside=True)
+        epi_in_anat = apply_affine(
+            epi, A_new.to(device=epi.device, dtype=torch.float32), anat_ref_shape, zero_outside=True
+        )
         save_image(epi_in_anat, f"{prefix}_epi_in_anat.nii.gz", header_info=anat_ref_hdr)
         saved.append(f"{prefix}_epi_in_anat.nii.gz")
 
@@ -545,7 +547,10 @@ def main(argv: list[str] | None = None) -> None:
     if wm is not None:
         with spinner("Writing wm_in_epi"):
             wm_in_epi = apply_affine(
-                wm, A_new_inv.to(torch.float32), tuple(epi.shape), zero_outside=True
+                wm,
+                A_new_inv.to(device=device, dtype=torch.float32),
+                tuple(epi.shape),
+                zero_outside=True,
             )
             save_image(wm_in_epi, f"{prefix}_wm_in_epi.nii.gz", header_info=epi_hdr)
             saved.append(f"{prefix}_wm_in_epi.nii.gz")
@@ -555,7 +560,10 @@ def main(argv: list[str] | None = None) -> None:
             anat, _ = load_image(args.anat, device=device)
         with spinner("Writing anat_in_epi"):
             anat_in_epi = apply_affine(
-                anat, A_new_inv.to(torch.float32), tuple(epi.shape), zero_outside=True
+                anat,
+                A_new_inv.to(device=device, dtype=torch.float32),
+                tuple(epi.shape),
+                zero_outside=True,
             )
             save_image(anat_in_epi, f"{prefix}_anat_in_epi.nii.gz", header_info=epi_hdr)
             saved.append(f"{prefix}_anat_in_epi.nii.gz")
@@ -567,7 +575,10 @@ def main(argv: list[str] | None = None) -> None:
         with spinner(f"Writing {name}_pve_in_epi"):
             v, _ = load_image(pth, device=device)
             v_epi = apply_affine(
-                v, A_new_inv.to(torch.float32), tuple(epi.shape), zero_outside=True
+                v,
+                A_new_inv.to(device=v.device, dtype=torch.float32),
+                tuple(epi.shape),
+                zero_outside=True,
             )
             save_image(v_epi, f"{prefix}_{name}_pve_in_epi.nii.gz", header_info=epi_hdr)
             saved.append(f"{prefix}_{name}_pve_in_epi.nii.gz")

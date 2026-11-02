@@ -347,8 +347,9 @@ def temporal_ica(
     # PCA whitening of the channel covariance; keep the top n_components dims.
     cov = (x @ x.T) / float(t_total)  # (K_sica, K_sica)
     evals, evecs = plinalg.eigh(to_factor_f64(cov))
-    evals = evals.flip(0).to(x.dtype)
-    evecs = evecs.flip(1).to(x.dtype)
+    # to_factor_f64 lands on the CPU on Metal and on consumer CUDA cards alike.
+    evals = evals.flip(0).to(x)
+    evecs = evecs.flip(1).to(x)
     evals = torch.clamp(evals[:n_components], min=1e-12)
     evecs = evecs[:, :n_components]  # (K_sica, k)
     sqrt_ev = torch.sqrt(evals)

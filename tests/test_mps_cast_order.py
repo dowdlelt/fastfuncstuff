@@ -156,6 +156,42 @@ def test_routed_solver_takes_a_factor_on_metal_with_a_rhs_on_the_cpu():
     torch.testing.assert_close(x.cpu(), torch.full((4, 1), 0.25))
 
 
+@pytest.mark.gpu
+@_mps
+def test_fwhmx_detrend_on_metal_matches_cpu():
+    """_trigref is float64, so it comes back on the CPU beside residuals still on Metal."""
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
+    resid = torch.randn(4096, 40, generator=torch.Generator().manual_seed(0))
+    mask = torch.ones(16, 16, 16, dtype=torch.bool)
+    cpu, metal = (
+        estimate_fwhmx_run(
+            resid.to(d), mask.to(d), (16, 16, 16), (2.0, 2.0, 2.0), corder=1, device=torch.device(d)
+        )
+        for d in ("cpu", "mps")
+    )
+    assert metal.classic_fwhm == pytest.approx(cpu.classic_fwhm, rel=1e-3)
+
+
+@pytest.mark.gpu
+@_mps
+def test_simulated_bold_on_metal_runs_and_lands_on_the_cpu():
+    """Signal built on Metal plus float64 noise on the CPU used to raise on the sum."""
+    from fastfuncstuff.simulation.core import simulate_bold
+
+    out = simulate_bold(
+        onsets=[[[10.0, 30.0]]],
+        durations=[2.0],
+        tr=1.0,
+        n_timepoints_per_run=[60],
+        amplitude_psc=[1.0],
+        tsnr=50.0,
+        n_voxels=8,
+        device=MPS_DEVICE,
+    )
+    assert out["data"].device.type == "cpu"
+
+
 def test_every_device_source_hands_out_the_indexed_mps_device():
     """A tensor reports mps:0, and torch.device("mps") != torch.device("mps:0")."""
     assert MPS_DEVICE == torch.device("mps:0")
