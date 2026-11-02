@@ -3,9 +3,9 @@
 The swarm needs per-voxel *traits* (where it sits, which family it belongs to,
 how coherent it is with its neighbours, its phase at the run's dominant period)
 and per-time *drives* (each voxel's live value, each component's time course,
-the global signal and DVARS). All of it comes from one detrended, z-scored
-matrix and one low-rank decomposition of it, so the picture and the sound agree
-about what the data is doing.
+the global signal and DVARS). All of it comes from one detrended, band-passed,
+z-scored matrix and one low-rank decomposition of it, so the picture and the
+sound agree about what the data is doing.
 """
 
 from __future__ import annotations
@@ -21,6 +21,21 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.memory import spectral_voxel_chunk
+from fastfuncstuff.processing.temporal_filter import (
+    TemporalFilter,
+    apply_temporal_filter,
+    fft_gain,
+)
+
+#: Default pass-band in Hz: the slow BOLD range, wide of the usual resting-state
+#: 0.01-0.08 so block designs and quicker task responses survive.
+DEFAULT_BANDPASS_HZ = (0.009, 0.1)
+
+#: Under this many degrees of freedom a band has no room for a decomposition.
+MIN_BAND_DOF = 8
+
+#: Full-band voxels kept for the noise flags (see Features.flag_families).
+FLAG_SAMPLE_VOXELS = 50_000
 
 
 @dataclass
@@ -94,9 +109,24 @@ class Features:
           DVARS -- flagged over 0.45;
         * ``edge``   members' share of brain-boundary voxels relative to the
           brain's -- flagged over 2x (edge and ghosting components).
+
+        ``fast`` and ``motion`` ask about the members' full band. A band-pass
+        takes both signatures out of the drawn course, so measured on that they
+        always pass: on a real run 0 of 10 were flagged that way, 3 of 10 on the
+        members' full band. Those courses come from a voxel sample, since
+        families refit live and a second (T, N) copy is too dear to keep for this.
         """
         tcs = self.family_tcs.float()
         n_time, n_fam = tcs.shape
+        sample = self.extras.get("flag_sample")
+        drawn = tcs
+        if sample is not None:
+            idx, z_full = sample
+            w = self.family_weight[idx].clamp_min(0.05)
+            members = torch.zeros(len(idx), n_fam, device=w.device)
+            members[torch.arange(len(idx), device=w.device), self.family[idx]] = w
+            tcs = (z_full.float() @ members) / members.sum(0).clamp_min(1e-12)
+            tcs = (tcs - tcs.mean(0)) / tcs.std(0).clamp_min(1e-12)
         freqs = torch.fft.rfftfreq(n_time, d=self.tr).to(tcs.device)[1:]
         pw = torch.fft.rfft(tcs - tcs.mean(0), dim=0).abs().square()[1:]
         fast = (
@@ -110,7 +140,7 @@ class Features:
             b = (b - b.mean())[:, None]
             return (a * b).sum(0) / (a.norm(dim=0) * b.norm()).clamp_min(1e-12)
 
-        r_gs = corr(tcs, self.global_signal.float()).abs()
+        r_gs = corr(drawn, self.global_signal.float()).abs()
         change = torch.zeros_like(tcs)
         change[1:] = (tcs[1:] - tcs[:-1]).abs()
         r_dv = corr(change, self.dvars.float()).abs()
@@ -180,6 +210,69 @@ def _unit_variance(resid: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
     """
     sd = resid.std(1, keepdim=True)
     return torch.where(sd > 1e-5 * mean.abs()[:, None], resid / sd.clamp_min(1e-12), 0.0)
+
+
+def resolve_band(
+    band: tuple[float, float] | None, tr: float, run_starts: list[int], n_time: int
+) -> TemporalFilter | None:
+    """The filter for ``band`` = (low, high) Hz on this run, or None for none.
+
+    A zero edge is open, so (0, 0) is off. A top edge at or above Nyquist does
+    nothing and only drops, because the default has to work at a 6 s TR too.
+    Without room for a decomposition the band is skipped, saying so.
+    """
+    low, high = band if band is not None else (0.0, 0.0)
+    if low < 0 or high < 0 or (high > 0 and low >= high):
+        raise ValueError(f"bandpass wants 0 <= LOW < HIGH (0 leaves an edge open), got {band}")
+    nyquist = 0.5 / tr
+    if low >= nyquist:
+        raise ValueError(f"bandpass low edge {low:g} Hz is at or above Nyquist ({nyquist:g} Hz)")
+    if high >= nyquist:
+        print(
+            f"ffs_dataviz: bandpass top {high:g} Hz is over Nyquist at TR {tr:g} s, leaving it open",
+            file=sys.stderr,
+        )
+        high = 0.0
+    if low <= 0 and high <= 0:
+        return None
+    kind = "bandpass" if low > 0 and high > 0 else "highpass" if low > 0 else "lowpass"
+    filt = TemporalFilter(kind, low_hz=low or None, high_hz=high or None)
+    dof = band_dof(filt, tr, run_starts, n_time)
+    if dof < MIN_BAND_DOF:
+        print(
+            f"ffs_dataviz: {filt.describe()} leaves {dof} degrees of freedom in "
+            f"{n_time * tr:g} s, too few to decompose; not filtering",
+            file=sys.stderr,
+        )
+        return None
+    return filt
+
+
+def band_dof(filt: TemporalFilter, tr: float, run_starts: list[int], n_time: int) -> int:
+    """Rank of the filtered series: the mirror-extended FFT's bins left with any gain.
+
+    Filtering a mirror extension is a DCT in disguise, so each run of length L
+    contributes the bins j / (2 L TR), j < L, and nothing else can be in the output.
+    """
+    bounds = [*run_starts, n_time]
+    dof = 0
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        freqs = torch.arange(b - a, dtype=torch.float64) / (2 * (b - a) * tr)
+        dof += int((fft_gain(freqs, filt.low_hz, filt.high_hz) > 0).sum())
+    return dof
+
+
+def _filter_z(
+    z: torch.Tensor, tr: float, filt: TemporalFilter, run_starts: list[int]
+) -> torch.Tensor:
+    """(N, T) unit-variance series band-limited, zero voxels staying exactly zero."""
+    return apply_temporal_filter(z, tr, filt, run_starts=run_starts, device=z.device)
+
+
+def _regress_out(z: torch.Tensor, series: torch.Tensor) -> torch.Tensor:
+    """(N, T) minus each voxel's fit to the (T,) ``series``."""
+    s = series - series.mean()
+    return z - ((z @ s) / (s @ s).clamp_min(1e-12))[:, None] * s[None]
 
 
 def _robust_unit(x: torch.Tensor) -> torch.Tensor:
@@ -436,6 +529,7 @@ def compute_features(
     remove_global: bool = True,
     period_s: float | None = None,
     polort: int | None = None,
+    bandpass_hz: tuple[float, float] | None = DEFAULT_BANDPASS_HZ,
     seed: int = 0,
     verbose: bool = True,
     device: torch.device | None = None,
@@ -444,6 +538,11 @@ def compute_features(
 
     ``data`` may live on the CPU: only the masked matrix goes to ``device``
     (default: ``data``'s), in one copy, and everything after is on-device.
+
+    ``bandpass_hz`` shapes what is drawn: the voxels, the decomposition, the
+    global signal. DVARS, tSNR and the spectral fingerprint stay on the full
+    band, because a motion spike and the power above the band are what they are
+    there to report.
     """
     device = data.device if device is None else device
     steps = tqdm(total=7, desc="dataviz features", leave=True, disable=not verbose)
@@ -452,6 +551,15 @@ def compute_features(
     flat_idx = torch.as_tensor(np.ravel_multi_index(ijk.T, shape), device=data.device)
     flat = data.reshape(data.shape[0], -1)[:, flat_idx].T.contiguous().float().to(device)  # (N, T)
     n, n_time = flat.shape
+    band = resolve_band(bandpass_hz, tr, run_starts, n_time)
+    if band is not None and period_s is not None:
+        gain = fft_gain(torch.tensor([0.0, 1.0 / period_s]), band.low_hz, band.high_hz)[1]
+        if gain < 0.5:
+            print(
+                f"ffs_dataviz: -period {period_s:g} s is outside {band.describe()}, so its "
+                "phase will be noise; widen -bandpass",
+                file=sys.stderr,
+            )
 
     raw_mean = flat.mean(1)  # the anatomy (dust, slices) stays sharp
     coherence = neighbours = None
@@ -460,7 +568,11 @@ def compute_features(
         # neighbour pair correlates at ~0.9 (dynaloc median 0.93) and the measure
         # only reports the kernel, which would flatten salience.
         raw = _detrend(flat, run_starts, tr, polort)
-        raw = _unit_variance(raw, raw_mean).T.contiguous()
+        raw = _unit_variance(raw, raw_mean)
+        if band is not None:
+            raw = _filter_z(raw, tr, band, run_starts)
+            raw = raw / raw.std(1, keepdim=True).clamp_min(1e-6)
+        raw = raw.T.contiguous()
         coherence, neighbours = neighbour_coherence(raw, ijk, shape)
         del raw
         # Smooth inside the mask before anything is estimated: on raw data the
@@ -498,10 +610,24 @@ def compute_features(
         # gone -- every family otherwise rides the global signal (all ten
         # flagged on dynaloc); "things that affect all voxels" are drawn as
         # colour and motion instead, from g and DVARS above.
-        gn = g - g.mean()
-        beta = (zf @ gn) / (gn @ gn).clamp_min(1e-12)
-        zf = zf - beta[:, None] * gn[None]
-        zf = zf / zf.std(1, keepdim=True).clamp_min(1e-6)
+        zf = _regress_out(zf, g)
+    # Before the filter empties the fast band, or spectrum colour loses a channel.
+    bands = band_powers(zf.T, tr)
+    flag_sample = None
+    if band is not None:
+        idx = torch.arange(0, n, max(1, n // FLAG_SAMPLE_VOXELS), device=device)
+        flag_sample = (idx, zf[idx].T.half())
+        zf = _filter_z(zf, tr, band, run_starts)
+        g = _filter_z(g[None], tr, band, run_starts)[0]
+        if remove_global:
+            # Again in-band: the full-band fit's beta is not the band's, and a
+            # regression after a filter has to use the filtered regressor.
+            zf = _regress_out(zf, g)
+    kept = zf.std(1, keepdim=True).clamp_min(1e-6)
+    zf = zf / kept
+    # Percent signal change must describe the series as drawn, not the full band.
+    shown_sd = sd * kept[:, 0]
+    del kept
     steps.update()
 
     # Low rank through the (T, T) Gram: T is hundreds, N is hundreds of thousands.
@@ -513,14 +639,17 @@ def compute_features(
     evals_all, evecs = plinalg.eigh(gram.to("cpu").double())
     evecs = evecs.float().to(device)
     order = torch.argsort(evals_all, descending=True)
-    k_max = min(max_components, n_time - 1)
+    # A filtered series has no more dimensions than its band: past that the
+    # eigenvectors are round-off, and they would still be offered on the slider.
+    rank = n_time - 1 if band is None else band_dof(band, tr, run_starts, n_time)
+    k_max = min(max_components, n_time - 1, rank)
     evals = evals_all[order[:k_max]].float().clamp_min(1e-12)  # on the CPU
     tcs = evecs[:, order[:k_max]].float()  # (T, Kmax), orthonormal columns
     loadings = zf @ tcs  # (N, Kmax): z ≈ loadings @ tcs.T
     pc_var = evals.to(device) / gram.diagonal().sum()
     tcs_unit = tcs * math.sqrt(n_time)
     loadings_unit = loadings / math.sqrt(n_time)
-    k_suggested = suggest_components(evals_all[order].cpu().numpy(), n)
+    k_suggested = suggest_components(evals_all[order[:rank]].cpu().numpy(), n)
     k_active = min(k_max, n_components if n_components is not None else min(k_suggested, 32))
     steps.update()
 
@@ -556,7 +685,6 @@ def compute_features(
     steps.update()
 
     phase, phase_power, wave_tcs = wave_phase(zt, tr, period_s)
-    bands = band_powers(zt, tr)
     steps.update()
 
     g = (g - g.mean()) / g.std().clamp_min(1e-12)
@@ -592,10 +720,11 @@ def compute_features(
             # Percent signal change is z * sd / mean * 100; keep both so the
             # inspector can show either unit.
             "raw_mean": raw_mean,
-            "sd": sd,
+            "sd": shown_sd,
             "shape": shape,
             "affine": np.asarray(affine, dtype=np.float64),
             "bands": bands,
+            "flag_sample": flag_sample,
         },
     )
     feats.flag_families()
