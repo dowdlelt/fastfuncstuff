@@ -1136,7 +1136,7 @@ def fit_ridge_single_trial(
             regressors_for_run.append(extra_per_run[run_idx])
 
         if regressors_for_run:
-            combined = torch.cat(regressors_for_run, dim=1)
+            combined = torch.cat([r.to(device) for r in regressors_for_run], dim=1)
             nuisance_per_run.append(combined)
         else:
             # No nuisance at all
