@@ -232,3 +232,98 @@ def test_a_sub_brick_selector_declines_pairing_rather_than_dropping_it(tmp_path)
     args = Namespace(prefix="out", fs_subj=None, verb=0, hemi_pair="auto", hemi_dir=None)
     runs = [str(tmp_path / "run-01.native.lh.func.gii") + "[0..$]"]
     assert pair_hemisphere_inputs(args, None, runs, "out") is None
+
+
+# --------------------------------------------------------------------------------
+# Volume and surface fit together: a vector of locations is a vector of locations
+# --------------------------------------------------------------------------------
+
+
+def test_paired_volume_and_surface_fit_together_and_write_both_domains(tmp_path):
+    """-surface_input: voxels and vertices on one location axis, so there is one
+    super-grid, one HRF selection and one noise pool across both -- then every map
+    is written twice, each with its own geometry."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
+    from tests.test_prf import _write_prf_dataset
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    n_vertices = 6
+    surfaces = []
+    for run, volume in enumerate(inputs):
+        series = np.asarray(nib.load(volume).dataobj).reshape(-1, 120)
+        # The responsive voxels' own series, so the vertices have a pRF to find.
+        vertex_series = series[:n_vertices].astype(np.float32)
+        path = tmp_path / f"surf{run}.func.gii"
+        save_gifti_data(
+            path,
+            vertex_series,
+            meta={"mesh_fingerprint": f"V{n_vertices}_F2_test", "TR_seconds": "1"},
+            time_series=True,
+        )
+        surfaces.append(str(path))
+    surf_mask = tmp_path / "surfmask.shape.gii"
+    keep = np.array([1, 1, 1, 1, 0, 0], np.float32)  # a vertex mask that excludes some
+    save_gifti_data(surf_mask, keep, meta={"mesh_fingerprint": f"V{n_vertices}_F2_test"})
+
+    prefix = str(tmp_path / "paired.nii.gz")
+    assert (
+        main(
+            [
+                "-input",
+                *inputs,
+                "-surface_input",
+                *surfaces,
+                "-surface_mask",
+                str(surf_mask),
+                "-stimulus",
+                *stimuli,
+                "-mask",
+                mask_path,
+                "-prefix",
+                prefix,
+                "-device",
+                "cpu",
+                "-verb",
+                "0",
+                "-tr",
+                "1",
+            ]
+        )  # fmt: skip
+        == 0
+    )
+    volume_out = tmp_path / "paired_volume.nii.gz"
+    surface_out = tmp_path / "paired_surface.shape.gii"
+    assert volume_out.is_file() and surface_out.is_file()
+    # Each domain keeps its own geometry, not the other's or the pseudo-grid's.
+    assert nib.load(str(volume_out)).shape[:3] == _shape
+    vertices, meta = load_gifti_data(surface_out)
+    assert vertices.shape[0] == n_vertices
+    assert meta["mesh_fingerprint"] == f"V{n_vertices}_F2_test"
+    # -surface_mask is honoured independently of -mask: the vertices it excludes
+    # are not fit and stay at the fill value, while the ones it keeps are.
+    assert np.all(vertices[4:] == 0)
+    assert np.isfinite(vertices[:4]).any()
+    assert not np.all(vertices[:4] == 0)
+    # Both domains are the same fit, so they carry the same maps in the same order.
+    assert nib.load(str(volume_out)).shape[3] == vertices.shape[1]
+
+
+def test_paired_input_is_refused_when_the_fit_is_already_on_a_surface(tmp_path):
+    """-surface_input pairs with VOLUME runs; with GIfTI -input or -fs_subj there is
+    nothing to pair it to, and silently ignoring it would drop half the data."""
+    from fastfuncstuff.cli.pyrf import main
+    from tests.test_prf import _write_prf_dataset
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    base = [
+        "-stimulus", *stimuli, "-mask", mask_path,
+        "-prefix", str(tmp_path / "x"), "-device", "cpu", "-verb", "0",
+    ]  # fmt: skip
+    with pytest.raises(SystemExit):
+        main(["-input", "a.lh.func.gii", "-surface_input", "b.lh.func.gii", *base])
+    # One surface run per volume run, or the pairing is not positional at all.
+    with pytest.raises(SystemExit):
+        main(["-input", *inputs, "-surface_input", "only-one.func.gii", *base])

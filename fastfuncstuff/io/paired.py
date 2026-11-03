@@ -101,6 +101,34 @@ class PairedRuns:
     def mask(self) -> np.ndarray:
         return self.mask_flat.reshape(self.header.shape)
 
+    @property
+    def as_load_result(self) -> LoadResult:
+        """The paired data as the ``LoadResult`` a single-domain tool already takes.
+
+        The pseudo-grid is the whole trick: locations are a volume grid followed by
+        a mesh, so a tool's masking, screening, chunking and saving code is
+        unchanged -- a vector of locations is a vector of locations, whether the
+        entry is a voxel or a vertex. ``nifti_header`` is the PairedHeader, which
+        ``save_nifti`` recognises and splits into ``<stem>_volume`` and
+        ``<stem>_surface`` with each domain's own geometry. So a tool gains paired
+        input by choosing a loader, not by growing a second output path.
+        """
+        mask_flat = self.mask_flat
+        return replace(
+            self.volume,
+            data=self.data,
+            run_starts=self.run_starts,
+            tr=self.tr,
+            volume_shape=self.header.shape,
+            mask=mask_flat.reshape(self.header.shape),
+            mask_flat=mask_flat,
+            n_voxels=int(self.data.shape[0]),
+            n_timepoints=int(self.data.shape[1]),
+            n_runs=len(self.run_starts),
+            keep_on_cpu=self.keep_on_cpu,
+            nifti_header=self.header,
+        )
+
     def split_map(
         self, values: torch.Tensor | np.ndarray
     ) -> tuple[torch.Tensor | np.ndarray, torch.Tensor | np.ndarray]:

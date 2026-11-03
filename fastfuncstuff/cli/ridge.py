@@ -475,7 +475,9 @@ def main():
             drop_first=args.drop_first,
             drop_last=args.drop_last,
         )
-        load_result = paired.volume
+        # The pseudo-grid presents itself as an ordinary LoadResult, so nothing
+        # below needs to know whether a location is a voxel or a vertex.
+        load_result = paired.as_load_result
     else:
         load_result: LoadResult = load_and_preprocess_runs(
             input_files=input_files,
@@ -506,18 +508,13 @@ def main():
     elif pfx.nifti_ext.endswith(".gii"):
         raise ValueError("GIfTI output requires surface input")
 
-    # Extract loaded data. Paired runs present one pseudo-grid whose header
-    # splits every saved map back into its volume and surface files.
+    # Paired runs are one pseudo-grid whose header splits every saved map back
+    # into its volume and surface files, so there is nothing to branch on here.
     run_starts = load_result.run_starts
     affine = load_result.affine
-    if paired is not None:
-        data = paired.data
-        mask, mask_flat = paired.mask, paired.mask_flat
-        volume_shape = paired.header.shape
-    else:
-        data = load_result.data
-        mask, mask_flat = load_result.mask, load_result.mask_flat
-        volume_shape = load_result.volume_shape
+    data = load_result.data
+    mask, mask_flat = load_result.mask, load_result.mask_flat
+    volume_shape = load_result.volume_shape
     n_voxels = data.shape[0]
     n_timepoints = load_result.n_timepoints
     n_runs = load_result.n_runs
@@ -532,7 +529,7 @@ def main():
     # Every field is unpacked; drop the loader's handle so the full-volume
     # (n_voxels, n_timepoints) tensor has exactly one reference and any later
     # shrink of *data* can actually free the pre-mask copy.
-    nifti_header = paired.header if paired is not None else load_result.nifti_header
+    nifti_header = load_result.nifti_header
     del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
     try:

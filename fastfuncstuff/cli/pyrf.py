@@ -43,6 +43,7 @@ from fastfuncstuff.cli_utils import (
     add_hemi_pairing_args,
     add_load_threads_arg,
     add_ortvec_arguments,
+    add_paired_surface_args,
     add_ribbon_sampling_args,
     add_verbose_arg,
     build_nuisance_per_run,
@@ -57,6 +58,7 @@ from fastfuncstuff.cli_utils import (
     sample_input_to_ribbon,
     setup_device,
     split_ribbon_outputs,
+    validate_paired_surface_args,
 )
 from fastfuncstuff.denoise.sequential import extract_noise_pcs_per_run
 from fastfuncstuff.design.hrf import (
@@ -1006,6 +1008,7 @@ def create_parser() -> argparse.ArgumentParser:
     surface = parser.add_argument_group("cortical surface")
     add_ribbon_sampling_args(surface, tool="the pRF fit")
     add_hemi_pairing_args(surface, tool="the pRF fit")
+    add_paired_surface_args(surface)
 
     processing = parser.add_argument_group("processing")
     processing.add_argument("-mask", default=None, help="Optional brain mask")
@@ -2252,6 +2255,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("-do_blur on surface input needs -mask (the cortex and coverage)")
     if args.fs_subj and args.noise_pool_mask:
         parser.error("-noise_pool_mask is not supported with -fs_subj: the fit is the ribbon")
+    validate_paired_surface_args(parser, args, len(input_files))
+    if args.surface_input and (args.fs_subj or is_gifti(str(input_files[0]).split("[")[0])):
+        parser.error(
+            "-surface_input pairs surface runs with VOLUME -input runs; with -fs_subj or "
+            "GIfTI -input the fit is already on a surface"
+        )
     if args.stim_downsample < 0:
         parser.error("-stim-downsample must be non-negative (0 keeps the native resolution)")
     if args.candidate_chunk < 1 or (args.batch_size is not None and args.batch_size < 1):
@@ -2316,24 +2325,47 @@ def main(argv: list[str] | None = None) -> int:
     # The loaded region is the union of where we fit and where the noise pool may
     # come from; which of the two a loaded voxel belongs to is tracked below.
     fit_mask_flat, pool_mask_flat, load_mask_flat = _resolve_masks(args, input_files[0], parser)
-    loaded = load_and_preprocess_runs(
-        input_files,
-        tr=args.tr,
-        mask_file=None if load_mask_flat is not None else args.mask,
-        mask_array=load_mask_flat,
-        blur_fwhm=args.do_blur,
-        do_scale=args.do_scale,
-        device=device,
-        force_cpu=args.keep_on_cpu,
-        verbose=args.verb > 0,
-        load_threads=args.load_threads,
-        # Screening gathers the voxels it keeps out of place, so at that moment a
-        # second copy of (at most) the whole series is resident beside it. Budget
-        # for it here rather than discovering it as an OOM mid-fit. Everything
-        # else on the way to the fit is in place or chunked, so an unscreened run
-        # gets the whole card for the data.
-        working_copies=1.0 if screens_voxels else 0.0,
-    )
+    if args.surface_input:
+        # Volumes and vertices fit together on one location axis (io/paired.py):
+        # one super-grid, one HRF selection, one noise pool spanning both, and
+        # every map written twice with each domain's own geometry.
+        from fastfuncstuff.io.paired import load_paired_runs
+
+        if load_mask_flat is not None:
+            parser.error(
+                "-screen / -noise_pool_mask gather voxels out of place, which paired "
+                "-surface_input does not support yet; use -mask and -surface_mask"
+            )
+        loaded = load_paired_runs(
+            input_files,
+            args.surface_input,
+            tr=args.tr,
+            volume_mask=args.mask,
+            surface_mask=args.surface_mask,
+            blur_fwhm=args.do_blur,
+            device=device,
+            force_cpu=args.keep_on_cpu,
+            load_threads=args.load_threads,
+        ).as_load_result
+    else:
+        loaded = load_and_preprocess_runs(
+            input_files,
+            tr=args.tr,
+            mask_file=None if load_mask_flat is not None else args.mask,
+            mask_array=load_mask_flat,
+            blur_fwhm=args.do_blur,
+            do_scale=args.do_scale,
+            device=device,
+            force_cpu=args.keep_on_cpu,
+            verbose=args.verb > 0,
+            load_threads=args.load_threads,
+            # Screening gathers the voxels it keeps out of place, so at that moment a
+            # second copy of (at most) the whole series is resident beside it. Budget
+            # for it here rather than discovering it as an OOM mid-fit. Everything
+            # else on the way to the fit is in place or chunked, so an unscreened run
+            # gets the whole card for the data.
+            working_copies=1.0 if screens_voxels else 0.0,
+        )
     run_lengths = compute_run_lengths(loaded.run_starts, loaded.n_timepoints)
     fit_voxels = pool_candidates = None
     if load_mask_flat is not None:
