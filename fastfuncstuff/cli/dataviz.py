@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsArgumentParser
+from fastfuncstuff.cli_help import FfsArgumentParser, suggest
 from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
@@ -208,7 +208,18 @@ def build_parser() -> FfsArgumentParser:
     )
     parser.add_argument("-fps", type=int, default=30, help="movie frame rate (default 30)")
     parser.add_argument("-seed", type=int, default=0, help="random seed (ICA, particle jitter)")
-    add_device_arg(parser)
+    add_device_arg(parser, extra="Used for the feature pass.")
+    suggest(
+        parser.add_argument(
+            "-disp_device",
+            default=None,
+            metavar="SPEC",
+            help="Device that holds the data while it is drawn (default: -device). "
+            "'-device cuda -disp_device cpu' fits on the card and then hands it "
+            "back, keeping the series in host RAM for the window.",
+        ),
+        ("auto", "cpu", "cuda", "mps"),
+    )
     return parser
 
 
@@ -370,10 +381,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         raise SystemExit(f"ffs_dataviz: {exc}") from None
-    print(
-        f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) "
+    fit_device = feats.z.device
+    if args.disp_device is not None:
+        # Reconfigure for the display device only after the feature pass, so a
+        # 'cpu,N' thread cap applies to the draw loop and not to the fit.
+        from fastfuncstuff.viz.dataviz.features import release_cache
+
+        disp = setup_device(args.disp_device)
+        if disp != fit_device:
+            feats.to(disp)
+            release_cache(fit_device)
+    where = (
         f"on {feats.z.device}"
+        if feats.z.device == fit_device
+        else f"fitted on {fit_device}, held on {feats.z.device}"
     )
+    print(f"ffs_dataviz: {feats.n_voxels} voxels x {feats.n_time} TRs (TR {feats.tr:g} s) {where}")
 
     if args.movie:
         render_movie(

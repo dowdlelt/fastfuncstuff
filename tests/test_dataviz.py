@@ -140,7 +140,7 @@ def test_load_features_falls_back_to_the_cpu_when_the_device_runs_out(
         return real(*args, device=device, **kwargs)
 
     monkeypatch.setattr(features, "compute_features", fake)
-    monkeypatch.setattr(features, "_release_cache", lambda _device: None)
+    monkeypatch.setattr(features, "release_cache", lambda _device: None)
     feats, _ = features.load_features(
         [path],
         torch.device("meta"),
@@ -592,3 +592,24 @@ def test_runs_are_filtered_separately():
         band_dof(resolve_band(DEFAULT_BANDPASS_HZ, 1.0, [0], 160), 1.0, [0], 160) for _ in "ab"
     )
     assert feats.loadings_all.shape[1] == min(64, dof)
+
+
+def test_features_to_moves_every_tensor(run):
+    """-disp_device holds the series somewhere other than where it was fitted."""
+    feats, _, _ = run
+    # A fresh wrapper over the module-scoped fixture: .to() rebinds fields, so
+    # the shallow copy keeps the fixture's own tensors where the other tests
+    # expect them. extras is copied because .to() writes into it.
+    moved = replace(feats, extras=dict(feats.extras)).to(torch.device("meta"))
+    for name, value in vars(moved).items():
+        if isinstance(value, torch.Tensor):
+            assert value.device.type == "meta", name
+    for key, value in moved.extras.items():
+        if isinstance(value, torch.Tensor):
+            assert value.device.type == "meta", key
+        elif isinstance(value, dict):
+            for sub, v in value.items():
+                if isinstance(v, torch.Tensor):
+                    assert v.device.type == "meta", f"{key}[{sub}]"
+    assert feats.z.device.type == "cpu"
+    assert moved.extras["affine"].shape == (4, 4)  # numpy entries survive untouched

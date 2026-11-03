@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -82,6 +82,28 @@ class Features:
     @property
     def pc_var(self) -> torch.Tensor:
         return self.pc_var_all[: self.k_active]
+
+    def to(self, device: torch.device) -> Features:
+        """Move every tensor to ``device`` in place and return self.
+
+        Features are computed where the linear algebra is fast and drawn where
+        the memory is cheap, and those need not be the same place: a CUDA fit
+        followed by ``to(cpu)`` hands the card back while the window runs off
+        host RAM. ``z`` is (T, N) and dominates; the rest is per-voxel vectors.
+        """
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if isinstance(v, torch.Tensor):
+                setattr(self, f.name, v.to(device))
+        for k, v in self.extras.items():
+            if isinstance(v, torch.Tensor):
+                self.extras[k] = v.to(device)
+            elif isinstance(v, dict):
+                self.extras[k] = {
+                    kk: vv.to(device) if isinstance(vv, torch.Tensor) else vv
+                    for kk, vv in v.items()
+                }
+        return self
 
     def refit_families(self, n_families: int, seed: int = 0) -> None:
         """Recompute the families in place for a new family count."""
@@ -731,7 +753,7 @@ def compute_features(
     return feats
 
 
-def _release_cache(device: torch.device) -> None:
+def release_cache(device: torch.device) -> None:
     if device.type == "mps":
         torch.mps.empty_cache()
     elif device.type == "cuda":
@@ -812,12 +834,12 @@ def load_features(
         print(f"ffs_dataviz: {device} ran out of memory, continuing on the CPU", file=sys.stderr)
     # Out here because the exception's traceback pins the tensors it is reporting.
     if feats is None:
-        _release_cache(device)
+        release_cache(device)
         feats = run_on(torch.device("cpu"))
     # Metal keeps every freed buffer: 24 GB held for 8.7 GB live on a 1.1M voxel
     # run, on a machine that also has to draw the window.
     if device.type == "mps":
-        _release_cache(device)
+        release_cache(device)
     info = {
         "shape": tuple(data.shape[1:]),
         "affine": affine,
