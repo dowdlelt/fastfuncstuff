@@ -2950,6 +2950,8 @@ def _anat_prep_blocks(opt) -> tuple[list[str], str]:
     the skull strip — and the image ``$ANAT`` ends up naming. EPI-free, so a
     multi-family script runs it once for every family (:func:`_shared_anat_section`)."""
     blocks: list[str] = []
+    if stage := _fs_stage_block(opt):
+        blocks.append(stage)  # the anat itself is one of these: before anything reads it
     anat_ph = (
         opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
     )
@@ -3731,6 +3733,54 @@ ASEG_TPM_LABELS = [
 ]
 
 
+#: Where the staged FreeSurfer volumes land, under the work dir.
+FS_WORK_DIR = "fs_work"
+
+#: What autoproc needs out of a FreeSurfer subject, as (staged NIfTI, mri/ source).
+#: Each is byte-identical to the file @SUMA_Make_Spec_FS writes into SUMA/ -- checked
+#: on a 0.8 mm recon: brain.nii.gz == brain.mgz, aseg.auto.nii.gz == aseg.auto.mgz,
+#: sub_SurfVol.nii == orig.mgz, data and affine both. So -fs_subject and -suma read
+#: the same voxels, and SUMA/ is only ever a NIfTI repackaging of these three.
+FS_STAGED_VOLUMES = (
+    ("brain.nii.gz", "brain.mgz"),  # the anat: FreeSurfer's normalised, stripped T1
+    ("aseg.auto.nii.gz", "aseg.auto.mgz"),  # the 8-class TPM, and phasereg's tissue
+    ("fs_SurfVol.nii.gz", "orig.mgz"),  # the TPM's skull class, and tpm_source
+)
+
+
+def _fs_stage_block(opt) -> str:
+    """FreeSurfer's own volumes as NIfTI, so -fs_subject needs no SUMA directory.
+
+    The conversion exists because of AFNI, not us: ``load_image`` reads .mgz
+    directly, but the subject-TPM build is 3dcalc on aseg label sets and stock
+    AFNI reports NO-DSET for .mgz. Staged once under exists-guards, into the
+    absolute path ``suma_dir`` already names, so every FreeSurfer-priors path
+    downstream -- the TPM, phasereg's tissue maps, the anat itself -- is the
+    -suma path unchanged. Verified bit-identical through 3dcalc's value selector.
+    """
+    if not opt.fs_staged:
+        return ""
+    src = Path(opt.fs_subject) / "mri"
+    out = Path(opt.suma_dir)
+    lines = [
+        "# --- FreeSurfer volumes -> NIfTI (-fs_subject without -suma) ---",
+        f"mkdir -p {shlex.quote(str(out))}",
+    ]
+    for name, mgz in FS_STAGED_VOLUMES:
+        dst = shlex.quote(str(out / name))
+        call = _ffs(
+            "ffs_util_3dmath",
+            [
+                f"-input {shlex.quote(str(src / mgz))}",
+                "-expr a",
+                f"-prefix {dst}",
+                '-device "$DEVICE"',
+            ],
+        )
+        lines.append(f"[ -f {dst} ] || \\\n{call}")
+    return "\n".join(lines)
+
+
 def _fs_tpm_block(opt) -> str:
     """Build a subject-specific 8-class TPM from FreeSurfer (SUMA) outputs using
     AFNI (aseg.auto label sets + a skull class from SurfVol). Hard-edge tissue
@@ -3748,7 +3798,7 @@ if [ ! -f "tpm_work/sub_specific_fsTPM.nii.gz" ]; then
 {calc}
   3dMean -sum -overwrite -prefix sum_sub_tpm.nii.gz tpm[1-7]_*.nii.gz
   # skull class = whatever SurfVol has outside the labelled tissue.
-  3dcalc -overwrite -a sum_sub_tpm.nii.gz -b {suma}/*_SurfVol.nii \\
+  3dcalc -overwrite -a sum_sub_tpm.nii.gz -b {suma}/*_SurfVol.nii* \\
     -expr 'abs(step(a)-1)*b' -prefix skull.nii.gz
   3dAutomask -overwrite -prefix tpm8_skull.nii.gz skull.nii.gz
   3dTcat -overwrite -prefix sub_specific_fsTPM.nii.gz tpm[1-8]_*.nii.gz
@@ -5077,8 +5127,9 @@ def _tissue_files(opt) -> list[str]:
 
 
 def _aseg_tissue(opt) -> bool:
-    """The anat is -suma's brain.nii.gz, so FreeSurfer's aseg.auto sits on it and its
-    labels are the tissue maps (the same anat-derived classes as the -suma TPM)."""
+    """The anat is FreeSurfer's own brain volume -- -suma's brain.nii.gz, or the
+    same voxels staged from mri/brain.mgz by -fs_subject -- so aseg.auto sits on
+    it and its labels are the tissue maps (the -suma TPM's classes)."""
     return bool(
         opt.suma_dir
         and opt.anat_path

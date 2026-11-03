@@ -319,6 +319,11 @@ class Options:
     spm_tpm: str | None = None  # SPM-style group TPM (tpm/TPM.nii) the builds read
     anat_t2: str | None = None  # T2w second channel for the anat_tpm segmentation
     suma_dir: str | None = None  # FreeSurfer SUMA dir (aseg.auto + SurfVol for the TPM)
+    # -fs_subject with neither -suma nor -anat: the anat and the FreeSurfer priors
+    # come from the subject's own mri/ volumes, converted to NIfTI in the work dir
+    # by the anat prep (emit.py:FS_STAGED_VOLUMES). suma_dir then names that staged
+    # folder, so every FreeSurfer-priors path downstream is the -suma path.
+    fs_staged: bool = False
     # -surface_target: also sample every run onto this cortical mesh (ffs_nwarp -surf),
     # same chain minus the MNI links, master = the anat. fs_subject holds surf/.
     surface_target: list[str] | None = None

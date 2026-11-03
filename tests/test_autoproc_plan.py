@@ -4106,3 +4106,133 @@ def test_numbered_folder_moves_on_when_a_settings_file_is_edited(tmp_path: Path)
     (tmp_path / "d.toml").write_text("[meta]\ntr = 2\n# a contrast added\n")
     assert run() == "hrftdv_02"
     assert "# a contrast added" in (tmp_path / "hrftdv_02" / "settings.txt").read_text()
+
+
+# --------------------------------------------------------------------------------
+# -fs_subject without -suma: FreeSurfer's own volumes stand in for a SUMA dir
+# --------------------------------------------------------------------------------
+
+
+def _vol_script(**kw):
+    """A script whose anat comes from a FreeSurfer volume dir rather than a T1w."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
+    return write_script(build_plan(subj, Options(go_to_anat=True, **kw)), "wd", bids_root="/bids")
+
+
+def test_fs_staged_converts_the_recon_volumes_before_anything_reads_them():
+    """The anat IS one of the staged files, so the conversion has to come first.
+
+    AFNI is the reason the conversion exists at all: load_image reads .mgz, but the
+    subject-TPM build is 3dcalc on aseg label sets and stock AFNI reports NO-DSET
+    for .mgz.
+    """
+    s = _vol_script(
+        anat_path="/w/fs_work/brain.nii.gz",
+        suma_dir="/w/fs_work",
+        fs_staged=True,
+        fs_subject="/fs/sub-X",
+        anat_nonlin=True,
+        tpm="tpm_work/sub_specific_fsTPM.nii.gz",
+        fs_tpm=True,
+    )
+    for name, mgz in (
+        ("brain.nii.gz", "brain.mgz"),
+        ("aseg.auto.nii.gz", "aseg.auto.mgz"),
+        ("fs_SurfVol.nii.gz", "orig.mgz"),
+    ):
+        assert f"-input /fs/sub-X/mri/{mgz}" in s
+        assert f"-prefix /w/fs_work/{name}" in s
+        assert f"[ -f /w/fs_work/{name} ] ||" in s  # idempotent across re-runs
+    assert s.index("FreeSurfer volumes -> NIfTI") < s.index('ANAT="/w/fs_work/brain.nii.gz"')
+
+
+def test_the_staged_tpm_build_is_the_suma_one_with_a_different_folder():
+    """The whole point of staging into a SUMA-shaped folder: no second code path.
+
+    The paths must stay absolute -- the build runs inside a subshell that has cd'd
+    into tpm_work, where a work-dir-relative path would resolve nowhere.
+    """
+    kw = dict(anat_nonlin=True, fs_tpm=True, tpm="tpm_work/sub_specific_fsTPM.nii.gz")
+    staged = _vol_script(
+        anat_path="/w/fs_work/brain.nii.gz", suma_dir="/w/fs_work", fs_staged=True,
+        fs_subject="/fs/sub-X", **kw,
+    )  # fmt: skip
+    suma = _vol_script(anat_path="/S/brain.nii.gz", suma_dir="/S", **kw)
+    assert "( cd tpm_work" in staged
+    assert "-a /w/fs_work/aseg.auto.nii.gz'<2,41,28,60,16,252,251,253,254,255>'" in staged
+
+    # Same build, same order, same label sets -- only the folder moved.
+    def tpm(script):
+        body = script[
+            script.index("build subject TPM") : script.index("sub_specific_fsTPM.nii.gz ")
+        ]
+        return body.replace("/w/fs_work", "DIR").replace("/S", "DIR")
+
+    assert tpm(staged) == tpm(suma)
+    # The staged SurfVol is gzipped where SUMA's is not, so the skull class globs both.
+    assert "-b DIR/*_SurfVol.nii* " in tpm(staged)
+
+
+def test_the_staged_brain_is_not_skull_stripped_again():
+    """FreeSurfer's brain.mgz is already stripped, exactly as -suma's brain.nii.gz
+    is -- the -anat_skull auto default has to know that for both."""
+    import argparse
+
+    from fastfuncstuff.cli.autoproc import _resolve_anat_skull
+
+    args = argparse.Namespace(anat_skull="auto", suma=None)
+    assert _resolve_anat_skull(args, presurf=False, fs_anat=True) is False
+    assert _resolve_anat_skull(args, presurf=False, fs_anat=False) is True
+    # An explicit -anat_skull yes still wins: the user may have pointed -anat
+    # somewhere else entirely.
+    assert _resolve_anat_skull(argparse.Namespace(anat_skull="yes", suma=None), False, True) is True
+
+
+def test_no_staging_without_fs_staged():
+    s = _vol_script(suma_dir="/S", anat_path="/S/brain.nii.gz")
+    assert "FreeSurfer volumes -> NIfTI" not in s
+    assert "ffs_util_3dmath \\\n    -input /fs" not in s
+
+
+def test_surface_target_refuses_an_anat_the_surfaces_do_not_sit_on(tmp_path, capsys):
+    """The silent bug: -surface_target with an anat from another scan. Both have a
+    valid scanner RAS, the projection runs, every map comes out of the wrong place.
+    """
+    from fastfuncstuff.cli.autoproc import _check_surface_anat
+    from tests.test_surface_anat_check import _anat, _subject
+
+    subj = _subject(tmp_path)
+    opt = Options(fs_subject=str(subj), surface_target=["native"])
+    assert _check_surface_anat(opt, str(_anat(tmp_path))) == []
+    out = capsys.readouterr().err
+    assert "separability" in out  # the numbers print on the way through, pass or fail
+
+    wrong = str(_anat(tmp_path, shift=(15.0, 0.0, 0.0), name="wrong.nii.gz"))
+    errs = _check_surface_anat(opt, wrong)
+    assert len(errs) == 1
+    assert "do not sit on this anat" in errs[0]
+    assert "recon-all was run on" in errs[0]  # and says what to do about it
+
+
+def test_the_staged_anat_is_checked_against_its_source_not_its_future_path(tmp_path):
+    """With -fs_subject the anat does not exist yet -- the script writes it -- so
+    the check reads FreeSurfer's own copy of the same voxels instead of silently
+    skipping and leaving the projection unverified."""
+    import nibabel as nib
+    import numpy as np
+
+    from fastfuncstuff.cli.autoproc import _check_surface_anat
+    from tests.test_surface_anat_check import _anat, _subject
+
+    subj = _subject(tmp_path)
+    mri = subj / "mri"
+    mri.mkdir()
+    src = nib.load(str(_anat(tmp_path)))
+    nib.save(nib.MGHImage(np.asarray(src.dataobj), src.affine), str(mri / "brain.mgz"))
+    opt = Options(fs_subject=str(subj), surface_target=["native"], fs_staged=True)
+    assert _check_surface_anat(opt, "/w/fs_work/brain.nii.gz") == []
+
+    # And a recon whose brain.mgz is missing or unreadable must not take the whole
+    # plan down with it: the check is advisory, every real error is reported elsewhere.
+    (mri / "brain.mgz").write_bytes(b"not a volume")
+    assert _check_surface_anat(opt, "/w/fs_work/brain.nii.gz") == []

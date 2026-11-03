@@ -28,7 +28,7 @@ from fastfuncstuff.autoproc.bids import (
     parse_entities,
     scan_subject,
 )
-from fastfuncstuff.autoproc.emit import write_script
+from fastfuncstuff.autoproc.emit import FS_WORK_DIR, write_script
 from fastfuncstuff.autoproc.family import family_dir
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
@@ -364,9 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-fs-subject",
         default=None,
         metavar="DIR",
-        help="FreeSurfer subject (a folder with surf/, or a name in $SUBJECTS_DIR) for "
-        "-surface_target; defaults to the parent of -suma. Baked into the script as an "
-        "absolute path, as are the template meshes. Its surfaces must share scanner space with the anat.",
+        help="FreeSurfer subject: a folder with surf/, or a name in $SUBJECTS_DIR; defaults to the parent of -suma. Supplies the surfaces -surface_target reads (?h.white, ?h.pial, ?h.sphere.reg -- SUMA's GIfTIs are never read). On its own, with no -suma and no -anat, it supplies the anat and tissue priors too: brain.mgz, aseg.auto.mgz and orig.mgz are staged to NIfTI in fs_work/ and read exactly as a SUMA dir would be, so a recon needs no @SUMA_Make_Spec_FS step first. The anat is then the recon's own brain in preference to any T1w found in BIDS, that being the space the surfaces live in. With -surface_target the ribbon is read on the anat and the profile printed; a mismatch is refused. Baked in as an absolute path, as are the template meshes.",
     )
     g.add_argument(
         "-do_mni",
@@ -1333,16 +1331,93 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _resolve_anat(args) -> tuple[list[str], str | None]:
-    """Resolve the anat file(s) and a default tpm_source from -anat/-suma.
+def _check_surface_anat(opt, anat_path: str | None) -> list[str]:
+    """Errors on whether -surface_target's anat is the surfaces' own anatomy.
+
+    The one requirement the projection has is that the chain ends in the anatomy
+    the surfaces were built on, and it is the requirement nothing checks. The
+    -fs_subject default makes it true by construction; an explicit -anat does not,
+    and a header cannot tell us -- FreeSurfer's conform keeps the scanner frame,
+    so the recon's volumes and the T1w it ran on are indistinguishable from
+    affines, while another session's T1w has an equally valid frame meaning a
+    differently positioned head. So it is measured on the data instead. The
+    profile prints either way: cheap, and it is the number to look at when a
+    surface result comes out empty.
+    """
+    from fastfuncstuff.processing.surface_projection import check_anat
+
+    if not anat_path:
+        return []
+    # Staged by the script, so read FreeSurfer's own copy of the same voxels.
+    probe = Path(anat_path)
+    if opt.fs_staged:
+        probe = Path(opt.fs_subject or "") / "mri" / "brain.mgz"
+    if not probe.is_file():
+        return []
+    try:
+        chk = check_anat(opt.fs_subject, probe)
+    except Exception as exc:  # noqa: BLE001 - advisory; nibabel raises its own types
+        # A recon we cannot read is reported by the checks that are about the recon.
+        # This one only adds information, so it must never be what fails the plan.
+        print(f"  NOTE: could not check the anat against the surfaces: {exc}", file=sys.stderr)
+        return []
+    if chk.ok:
+        print(
+            f"== surface target: the subject's ribbon read on the anat ==\n{chk.report()}",
+            file=sys.stderr,
+        )
+        return []
+    return [
+        "-surface_target: the surfaces do not sit on this anat, so every run would be "
+        "sampled in the wrong place.\n"
+        f"{chk.report()}\n"
+        "  The chain must end in the anatomy the surfaces were built on. Drop -anat to "
+        "use the recon's own brain (-fs_subject stages it), or point -anat at the volume "
+        "recon-all was run on."
+    ]
+
+
+def _resolve_fs_volumes(args, fs_subject: str | None, work_dir: str) -> tuple[str | None, bool]:
+    """(the directory holding FreeSurfer's NIfTI volumes, whether we stage it).
+
+    -suma names one that already exists. -fs_subject on its own gets the same
+    three volumes out of the subject's ``mri/``, staged into the work dir by the
+    anat prep (:data:`~fastfuncstuff.autoproc.emit.FS_STAGED_VOLUMES`) -- so a
+    recon is all a user needs, with no @SUMA_Make_Spec_FS step first.
+
+    Staging is deliberately limited to the case where this run has no anat of its
+    own choosing. An explicit -anat means the user picked the volume everything
+    aligns to, and FreeSurfer's labels are only priors FOR that volume if they
+    share its grid; rather than resample them and hope, that case keeps today's
+    behaviour and gets :func:`_check_surface_anat`'s measurement instead.
+
+    Absolute, because the TPM build reads it from inside a subshell that has cd'd
+    into tpm_work -- and because -suma's path is baked absolute for the same reason.
+    """
+    if args.suma:
+        return args.suma, False
+    if fs_subject and not args.anat:
+        return str(Path(work_dir) / FS_WORK_DIR), True
+    return None, False
+
+
+def _resolve_anat(args, fs_volumes: str | None, staged: bool) -> tuple[list[str], str | None]:
+    """Resolve the anat file(s) and a default tpm_source from -anat/-suma/-fs_subject.
 
     More than one path means "align these together and average them" (see
     :func:`anat_group` for how the auto-discovered set is chosen)."""
     if args.anat:
         return list(args.anat), args.tpm_source
-    if args.suma:
-        brain = str(Path(args.suma) / "brain.nii.gz")
-        surfvol = sorted(Path(args.suma).glob("*SurfVol*.nii*"))
+    if staged:
+        # -fs_subject: the recon's own brain, which no scan of BIDS can offer --
+        # a T1w off the scanner is a different grid from the one the surfaces
+        # were built on, and the whole point of -fs_subject is to land the data
+        # where those surfaces live. Not on disk yet; the anat prep stages it.
+        d = Path(fs_volumes or "")
+        return [str(d / "brain.nii.gz")], args.tpm_source or str(d / "fs_SurfVol.nii.gz")
+    if fs_volumes:
+        brain = str(Path(fs_volumes) / "brain.nii.gz")
+        surfvol = sorted(Path(fs_volumes).glob("*SurfVol*.nii*"))
         tpm_src = args.tpm_source or (str(surfvol[0]) if surfvol else None)
         return [brain], tpm_src
     return [], args.tpm_source
@@ -1758,6 +1833,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     resolve_mesh(mesh, opt.fs_subject)
                 except FileNotFoundError as exc:
                     errors.append(str(exc).replace("-surf_mesh", "-surface_target"))
+            errors += _check_surface_anat(opt, anat_path)
     if opt.slicetiming_method != "none" and opt.tr is None:
         # Slice timing needs a TR per run; the sidecar is the only source here.
         no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]
@@ -1806,7 +1882,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     if opt.phasereg and opt.phasereg_veins == "auto" and not (opt.tissue or opt.presurf):
         from fastfuncstuff.autoproc.emit import _aseg_tissue
 
-        if _aseg_tissue(opt):
+        if _aseg_tissue(opt) and not opt.fs_staged:
             aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
             if not aseg.is_file():
                 errors.append(f"-phasereg: -suma has no aseg.auto.nii.gz for tissue maps: {aseg}")
@@ -1815,10 +1891,22 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "-phasereg: no anat tissue maps (-tissue, -presurf or -suma), so no vein mask: "
                 "plain phase regression. Give -tissue to restrict -spr to vein candidates."
             )
-    if opt.fs_tpm:  # in-script TPM build needs the FS label volume
+    if opt.fs_tpm and not opt.fs_staged:  # in-script TPM build needs the FS label volume
         aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
         if not aseg.is_file():
             errors.append(f"-suma has no aseg.auto.nii.gz to build a TPM from: {aseg}")
+    if opt.fs_staged:
+        # Nothing is on disk yet -- the script stages these -- so check the sources.
+        from fastfuncstuff.autoproc.emit import FS_STAGED_VOLUMES
+
+        mri = Path(opt.fs_subject or "") / "mri"
+        missing = [m for _, m in FS_STAGED_VOLUMES if not (mri / m).is_file()]
+        if missing:
+            errors.append(
+                f"-fs_subject: {mri} has no {', '.join(missing)}. The anat and the tissue "
+                "priors come from the recon's own volumes; pass -anat FILE (and -suma DIR "
+                "or -tpm FILE) if this subject's recon is incomplete."
+            )
     # File/dir existence for everything the user pointed at.
     for extra in opt.anat_extra:
         if not Path(extra).exists():
@@ -1829,7 +1917,9 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-spm_tpm (or $FFS_TPM)", opt.spm_tpm if opt.anat_tpm else None),
         ("-anat_t2", opt.anat_t2),
         ("-presurf_tpm (or $FFS_TPM)", opt.presurf_tpm),
-        ("-tpm_source", opt.tpm_source),
+        # Staged by the script from the recon, so not on disk at plan time; its
+        # source is checked with the other staged volumes above.
+        ("-tpm_source", None if opt.fs_staged else opt.tpm_source),
         ("-ref_file", opt.ref_file),
         ("-ref_file_anat", opt.ref_file_anat),
         ("-ref_anat", opt.ref_anat),
@@ -2555,18 +2645,19 @@ def _report_fmap_assignment(subject) -> None:
             )
 
 
-def _resolve_anat_skull(args, presurf: bool) -> bool:
+def _resolve_anat_skull(args, presurf: bool, fs_anat: bool = False) -> bool:
     """Strip the anat in-script? A T1w off the scanner has a skull far more often
-    than not, and an unstripped target sends cross-modal lpc to the scalp; -suma's
-    brain.nii.gz is the one input known to be stripped already. presurf's head
-    always has one, whatever -anat_skull says."""
+    than not, and an unstripped target sends cross-modal lpc to the scalp;
+    FreeSurfer's brain volume is the one input known to be stripped already,
+    whether it arrives as -suma's brain.nii.gz or staged from -fs_subject's
+    mri/brain.mgz. presurf's head always has one, whatever -anat_skull says."""
     if presurf or args.anat_skull == "yes":
         return True
-    return args.anat_skull == "auto" and not args.suma
+    return args.anat_skull == "auto" and not (args.suma or fs_anat)
 
 
 def _resolve_tpm(
-    args, *, anat_nonlin: bool, anat_path: str | None, anat_skull: bool
+    args, *, anat_nonlin: bool, anat_path: str | None, anat_skull: bool, fs_anat: bool = False
 ) -> tuple[str | None, bool, bool, str | None, str | None]:
     """(subject tpm, build-from-FreeSurfer, build-from-anat, group tpm, T2 channel).
 
@@ -2574,8 +2665,9 @@ def _resolve_tpm(
     the order they are preferred:
 
     1. ``-tpm`` — a subject TPM in anat space, already built. Nothing to do.
-    2. ``-suma`` — FreeSurfer ran, so aseg.auto's labels are the priors: eight
-       hard-edge classes of this subject's own anatomy, the best of the three.
+    2. ``-suma`` or ``-fs_subject`` — FreeSurfer ran, so aseg.auto's labels are
+       the priors: eight hard-edge classes of this subject's own anatomy, the best
+       of the three.
     3. the anat itself, segmented against an SPM-style group TPM. Softer and
        coarser than aseg's labels, but it needs nothing but the T1w that is
        already here — which is the common case, and used to be a hard error.
@@ -2590,7 +2682,7 @@ def _resolve_tpm(
     ref_seg = bool(args.ref_anat) and args.ref_anat_nonlin_method == "segment"
     if not ((anat_nonlin and args.anat_nonlin_method == "segment") or ref_seg) or tpm:
         return tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2
-    if args.suma:
+    if args.suma or fs_anat:
         fs_tpm = True
         return "tpm_work/sub_specific_fsTPM.nii.gz", fs_tpm, anat_tpm, spm_tpm, anat_t2
     # A borrowed anat link (-ref_file / -grand_reference) never builds this run's
@@ -2891,14 +2983,22 @@ def main(argv: list[str] | None = None) -> int:
     acq_3d = _resolve_acq_3d(args, subject)
     _report_multiecho(subject, acq_3d)
 
-    anat_paths, tpm_source = _resolve_anat(args)
+    # Absolute so OUT is pinned to where the user ran ffs_autoproc — moving the
+    # script and running it elsewhere still writes outputs to the intended dir.
+    work_dir = str(Path(args.work_dir or f"ffs_proc_sub-{subject.subject}.results").resolve())
+    # Before the anat: with -fs_subject and nothing else, the recon IS the anat.
+    fs_subject = _baked_subject(
+        args.fs_subject or (str(Path(args.suma).parent) if args.suma else None)
+    )
+    fs_volumes, fs_staged = _resolve_fs_volumes(args, fs_subject, work_dir)
+    anat_paths, tpm_source = _resolve_anat(args, fs_volumes, fs_staged)
     unused: list[Path] = []
     if not anat_paths:  # fall back to the scanned T1w(s)
         group = anat_group(subject, args.bids_dir)
         anat_paths = [str(p) for p in group]
         unused = [p for p in anat_candidates(subject, args.bids_dir)[1] if p not in group]
     anat_path = anat_paths[0] if anat_paths else None
-    from_bids = not (args.anat or args.suma)
+    from_bids = not (args.anat or fs_volumes)
     presurf, presurf_tpm, presurf_note = _resolve_presurf(args, anat_paths, from_bids)
     used = {Path(p) for t in presurf for p in t[1:] if p}
     unused = [p for p in unused if p not in used]
@@ -2911,9 +3011,6 @@ def main(argv: list[str] | None = None) -> int:
         print(ref_note, file=sys.stderr)
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
-    fs_subject = _baked_subject(
-        args.fs_subject or (str(Path(args.suma).parent) if args.suma else None)
-    )
     anat_nonlin = eff(args.anat_nonlin, "anat_nonlin")
     mni_backend, mni_template = _resolve_mni(args)
     if args.do_mni:
@@ -2933,12 +3030,13 @@ def main(argv: list[str] | None = None) -> int:
         args.round_durations, "-round_durations"
     )
 
-    anat_skull = _resolve_anat_skull(args, bool(presurf and go_to_anat))
+    anat_skull = _resolve_anat_skull(args, bool(presurf and go_to_anat), fs_anat=fs_staged)
     tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2 = _resolve_tpm(
         args,
         anat_nonlin=anat_nonlin,
         anat_path=anat_path if go_to_anat else None,
         anat_skull=anat_skull,
+        fs_anat=fs_staged,
     )
 
     opt = Options(
@@ -3046,7 +3144,8 @@ def main(argv: list[str] | None = None) -> int:
         anat_tpm=anat_tpm,
         spm_tpm=spm_tpm,
         anat_t2=anat_t2,
-        suma_dir=args.suma,
+        suma_dir=fs_volumes,
+        fs_staged=fs_staged,
         surface_target=_baked_meshes(args.surface_target, fs_subject),
         fs_subject=fs_subject,
         surface_qc=args.surface_qc,
@@ -3099,9 +3198,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _report_families(plan)
 
-    # Absolute so OUT is pinned to where the user ran ffs_autoproc — moving the
-    # script and running it elsewhere still writes outputs to the intended dir.
-    work_dir = str(Path(args.work_dir or f"ffs_proc_sub-{subject.subject}.results").resolve())
     out_path = Path(args.out or f"proc_sub-{subject.subject}.sh")
     script = write_script(
         plan,
