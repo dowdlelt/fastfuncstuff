@@ -126,6 +126,31 @@ class PRFRefinedFit:
 
 
 @dataclass
+class PRFTypeGainFit:
+    """Per-stimulus-type response of one fitted pRF.
+
+    The tied model: every type shares the receptive field in ``parameters`` and
+    gets its own gain, so the comparison between types is a comparison of
+    response size at the same location and scale. ``r2`` is the joint fit of all
+    types; ``single_r2`` is the same pRF with one gain for everything, and the
+    difference is the direct answer to whether a voxel distinguishes the types
+    at all.
+    """
+
+    gains: torch.Tensor  # (n_voxels, n_types)
+    amplitude: torch.Tensor  # (n_voxels, n_types), response peak above baseline
+    residual_ss: torch.Tensor
+    total_ss: torch.Tensor
+    r2: torch.Tensor
+    single_r2: torch.Tensor
+
+    @property
+    def delta_r2(self) -> torch.Tensor:
+        """How much separating the types bought, in R2."""
+        return self.r2 - self.single_r2
+
+
+@dataclass
 class PRFCrossValidationFit:
     """Held-out metrics from fold-local leave-one-run-out pRF fitting."""
 
@@ -1910,6 +1935,85 @@ def prf_response_peak(
                 prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
             peak[chunk] = prediction.amax(dim=0) * gain[chunk]
     return peak
+
+
+def fit_prf_type_gains(
+    data: torch.Tensor,
+    stimulus_runs: Sequence[torch.Tensor],
+    parameters: torch.Tensor,
+    hrf_index: torch.Tensor,
+    hrf_library: torch.Tensor,
+    stimulus_shape: tuple[int, int],
+    type_labels: Sequence[torch.Tensor],
+    n_types: int,
+    run_starts: Sequence[int],
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None = None,
+    voxel_chunk_size: int = 20_000,
+) -> PRFTypeGainFit:
+    """Give each stimulus type its own gain on an already-fitted pRF.
+
+    The tied model, evaluated where the combined fit landed: position, size and
+    exponent are shared, and only the response size is free to differ. That is
+    the well-posed half of the question -- it adds one parameter per extra type
+    rather than five, needs no new search, and still answers "does this voxel
+    respond more to one kind of stimulus than another, and by how much".
+
+    Everything is measured the way the fit measures it: the data and every
+    predictor go through the same per-run nuisance projection, ``r2`` is
+    ``1 - rss/tss`` against the centred projected data, and the amplitudes are
+    peaks above the fitted baseline (see :func:`prf_response_peak`).
+
+    ``single_r2`` refits the same pRF with ONE gain shared across types, so
+    ``delta_r2`` isolates what separating them bought and nothing else: same
+    receptive field, same HRF, same nuisance, one parameter per extra type.
+    """
+    if not 1 <= n_types <= MAX_STIMULUS_TYPES:
+        raise ValueError(f"n_types must be between 1 and {MAX_STIMULUS_TYPES}")
+    if voxel_chunk_size < 1:
+        raise ValueError("voxel_chunk_size must be positive")
+    n_voxels = parameters.shape[0]
+    if data.shape[0] != n_voxels:
+        raise ValueError(f"data has {data.shape[0]} voxels but parameters has {n_voxels}")
+    device = parameters.device
+    dtype = parameters.dtype
+    fit = PRFTypeGainFit(
+        gains=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
+        amplitude=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
+        residual_ss=torch.zeros(n_voxels, device=device, dtype=dtype),
+        total_ss=torch.zeros(n_voxels, device=device, dtype=dtype),
+        r2=torch.zeros(n_voxels, device=device, dtype=dtype),
+        single_r2=torch.zeros(n_voxels, device=device, dtype=dtype),
+    )
+    eps = torch.finfo(dtype).eps
+    for selected_hrf in hrf_index.unique(sorted=True).tolist():
+        indices = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
+        for start in range(0, indices.numel(), voxel_chunk_size):
+            chunk = indices[start : start + voxel_chunk_size]
+            predictions = css_prediction_by_type(
+                stimulus_runs,
+                parameters[chunk],
+                hrf_library[selected_hrf],
+                stimulus_shape,
+                type_labels,
+                n_types,
+            )
+            predictions = _project_prf_derivatives(predictions, nuisance_per_run, run_starts)
+            observed = _project_per_run(data[chunk].T, nuisance_per_run, run_starts)
+            gains, residual_ss = variable_projection_sse_by_type(observed, predictions)
+            total_ss = (observed - observed.mean(dim=0, keepdim=True)).square().sum(dim=0)
+            # One gain for everything, on the same pRF: the null this is measured
+            # against. Summing the type predictors IS the combined predictor,
+            # which is what makes delta_r2 a clean one-parameter-per-type test.
+            _, single_ss = variable_projection_sse_by_type(
+                observed, predictions.sum(dim=-1, keepdim=True)
+            )
+            fit.gains[chunk] = gains
+            fit.amplitude[chunk] = predictions.amax(dim=0) * gains
+            fit.residual_ss[chunk] = residual_ss
+            fit.total_ss[chunk] = total_ss
+            fit.r2[chunk] = 1.0 - residual_ss / total_ss.clamp_min(eps)
+            fit.single_r2[chunk] = 1.0 - single_ss / total_ss.clamp_min(eps)
+    return fit
 
 
 def prf_percent_signal_change(

@@ -2410,3 +2410,97 @@ class TestPerTypeGains:
         gains, sse = variable_projection_sse_by_type(data, predictions)
         assert torch.isfinite(gains).all() and torch.isfinite(sse).all()
         assert float(gains[:, 2].abs().max()) < 1e-3
+
+
+class TestFitPerTypeGains:
+    """The tied model: one pRF, a gain per stimulus type."""
+
+    def _problem(self, truth):
+        """Voxels whose per-type gains are *truth*, on a shared pRF."""
+        from fastfuncstuff.design.prf import css_prediction_by_type
+        from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+        torch.manual_seed(0)
+        n_time, shape = 120, (8, 8)
+        runs = [torch.rand(n_time, 64), torch.rand(n_time, 64)]
+        # Blocked: 20 frames of one type, then 20 of the other.
+        labels = [torch.where(torch.arange(n_time) % 40 < 20, 1, 2) for _ in runs]
+        hrf = torch.rand(1, 6)
+        hrf = hrf / hrf.sum()
+        n_voxels = truth.shape[0]
+        parameters = torch.tensor([[4.0, 4.0, 2.0, 1.0]]).expand(n_voxels, -1).contiguous()
+        predictors = css_prediction_by_type(runs, parameters, hrf[0], shape, labels, 2)
+        clean = torch.einsum("tvi,vi->tv", predictors, truth)
+        data = (100.0 + clean + 0.05 * torch.randn(2 * n_time, n_voxels)).T
+        nuisance = [
+            construct_polynomial_matrix(n_time, 1, device=torch.device("cpu")) for _ in runs
+        ]
+        return dict(
+            data=data,
+            stimulus_runs=runs,
+            parameters=parameters,
+            hrf_index=torch.zeros(n_voxels, dtype=torch.long),
+            hrf_library=hrf,
+            stimulus_shape=shape,
+            type_labels=labels,
+            n_types=2,
+            run_starts=[0, n_time],
+            nuisance_per_run=nuisance,
+            voxel_chunk_size=2,
+        )
+
+    def test_recovers_a_type_preference_and_flags_it_in_delta_r2(self):
+        """A voxel that prefers one type, one that does not, and a dead one.
+
+        Measured: gains 9.96/1.89 against a simulated 10/2 with delta_r2 0.94;
+        6.048/6.053 against 6/6 with delta_r2 0.000; zeros for no response.
+        The flat voxel is the one that matters -- where the brain does not
+        distinguish the types, the per-type gains have to come out the same, or
+        every map built on this would show differences that are not there.
+        """
+        from fastfuncstuff.design.prf import fit_prf_type_gains
+
+        truth = torch.tensor([[10.0, 2.0], [6.0, 6.0], [0.0, 0.0]])
+        fit = fit_prf_type_gains(**self._problem(truth))
+
+        assert fit.gains[0, 0] == pytest.approx(10.0, rel=0.05)
+        assert fit.gains[0, 1] == pytest.approx(2.0, rel=0.10)
+        # Doesn't care: the two gains agree to well under a percent.
+        assert fit.gains[1, 0] == pytest.approx(float(fit.gains[1, 1]), rel=0.01)
+        assert float(fit.gains[2].abs().max()) < 0.1
+
+        # Separating the types only buys R2 where there is a difference to find.
+        assert fit.delta_r2[0] > 0.5
+        assert abs(float(fit.delta_r2[1])) < 0.01
+        torch.testing.assert_close(fit.delta_r2, fit.r2 - fit.single_r2)
+
+    def test_single_r2_is_the_one_gain_null_on_the_same_prf(self):
+        """delta_r2 must isolate the type split, not an HRF or pRF difference."""
+        from fastfuncstuff.design.prf import fit_prf_type_gains
+
+        truth = torch.tensor([[5.0, 5.0], [5.0, 5.0]])
+        fit = fit_prf_type_gains(**self._problem(truth))
+        # Equal gains: the extra parameter is free to be useless, and is.
+        torch.testing.assert_close(fit.r2, fit.single_r2, rtol=1e-3, atol=1e-3)
+        assert bool((fit.r2 >= fit.single_r2 - 1e-4).all()), "more freedom cannot fit worse"
+
+    def test_amplitude_is_the_gain_times_its_own_projected_peak(self):
+        from fastfuncstuff.design.prf import fit_prf_type_gains
+
+        truth = torch.tensor([[10.0, 2.0], [6.0, 6.0]])
+        problem = self._problem(truth)
+        fit = fit_prf_type_gains(**problem)
+        assert fit.amplitude.shape == (2, 2)
+        # Ordering follows the gains within a voxel: a bigger gain on the same
+        # pRF is a bigger response.
+        assert (fit.amplitude[0, 0] > fit.amplitude[0, 1]) == (fit.gains[0, 0] > fit.gains[0, 1])
+        assert bool((fit.amplitude >= 0).all())
+
+    def test_rejects_a_voxel_count_mismatch_and_a_bad_type_count(self):
+        from fastfuncstuff.design.prf import MAX_STIMULUS_TYPES, fit_prf_type_gains
+
+        problem = self._problem(torch.tensor([[1.0, 1.0]]))
+        with pytest.raises(ValueError, match="voxels"):
+            fit_prf_type_gains(**{**problem, "data": problem["data"][:0]})
+        with pytest.raises(ValueError, match="n_types must be"):
+            fit_prf_type_gains(**{**problem, "n_types": MAX_STIMULUS_TYPES + 1})

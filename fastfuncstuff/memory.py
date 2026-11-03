@@ -614,6 +614,26 @@ def bytes_per_voxel_prf(
     return (6 * n_pixels + 30 * n_timepoints) * 4
 
 
+def bytes_per_voxel_prf_type_gains(
+    n_timepoints: int,
+    n_pixels: int,
+    n_types: int,
+) -> int:
+    """Per-voxel peak of the per-stimulus-type gain solve at a fixed pRF.
+
+    The resident term is the ``(time, voxels, n_types)`` predictor block, alive
+    twice because the nuisance projection is out of place, plus a third for the
+    projected copy of the data and its own temporaries. The active-set
+    enumeration itself works on ``(voxels, k, k)`` Gram matrices, which at
+    ``n_types <= 6`` is 36 floats a voxel -- nothing beside the temporal term.
+
+    The aperture term matches :func:`bytes_per_voxel_prf`: the separable drive
+    is computed once for the tied model however many types there are, so the
+    types multiply the convolution output, not the drive.
+    """
+    return (6 * n_pixels + (3 * n_types + 4) * n_timepoints + 2 * n_types * n_types) * 4
+
+
 def bytes_per_unit_laminar_dynamic(
     n_timepoints: int, n_depths: int, n_runs: int, n_strengths: int
 ) -> int:
