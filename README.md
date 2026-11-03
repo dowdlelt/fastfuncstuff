@@ -6,68 +6,36 @@ CUDA is preferred where available; see the Apple Silicon guidance below for CPU 
 
 ## Why this exists
 
-I have a slow CPU but I was able to get my hands on a reasonble GPU. 
+I have a slow CPU but I was able to get my hands on a good GPU. 
 The tools I like to use, namely AFNI, are great, but they are really built to take advantage of server CPU setups.
-This project is an ongoing experiment - how well can current models port good code to a pytorch like set up.
+This project started as an experiment - how well can current models port good code to a pytorch like set up? 
+It has since evolved dramatically.
+
+
 Python chosen not because of speed, of course, but because I can at least review the code for sanity.
-It also makes installion much easier - sure, pure CUDA/C++ would be faster but what a nightmare...
+It also makes installion much easier - sure, pure CUDA/C++/Rust would be faster but what a nightmare...
 These are offered as-is, no guarantees.
-I've tested the CLI tools below extensively on real data (my own and some from open neuro), and there is also an (in-progress) CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
+I've tested the CLI tools below extensively on real data (my own and some from openneuro), and there is also an (in-progress) CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
 
 The current validation/benchmark data is in `notebooks/ffs_benchmark_showcase.ipynb` - they you can see how well ffs is able to match the reference implementations. 
 
 ## Install
 
-`pyproject.toml` is a plain PEP 621 spec (setuptools backend), so any of pip,
-uv, or a conda env + pip will work. There is no conda-forge package; the
-"conda" path means "make the env with conda, then `pip install -e .`".
-
-Python: `>=3.11` is required, **3.13 is where it started** (latest with broad PyTorch
-wheel coverage). 3.14 also works and may offer slight speed gains. 
-
 ```bash
 git clone https://github.com/dowdlelt/fastfuncstuff.git
 cd fastfuncstuff
+pip install -e .          # Python >= 3.11; add ".[dev]" for tests + linters
 ```
 
-**conda** (What I used, because I'm used to it):
-
-```bash
-conda create -n ffs python=3.14
-conda activate ffs
-pip install -e .
-```
-
-**pip** (untested):
-
-```bash
-python3.13 -m venv .venv && source .venv/bin/activate
-pip install -e .
-```
-
-**uv** (untested):
-
-```bash
-uv venv --python 3.14
-source .venv/bin/activate
-uv pip install -e .
-```
-
-
-
-Add `".[dev]"` instead of `.` for tests + linters.
-
-`ffs_autoproc` generates scripts that require Bash 4 or newer. macOS ships Bash 3.2;
-install Bash with `brew install bash` and run the script with the installed Bash
-(for example, `/opt/homebrew/bin/bash pipeline.sh` on Apple Silicon).
-
+See **[INSTALL.md](INSTALL.md)** for details about conda / uv,  `zstd` needed for `.nii.zst`, Bash requirements for `ffs_autoproc` scripts, FreeSurfer / AFNI / ROMEO / SPM-template expectations, and a list of the environment variable the tools read.
 
 ### File formats
 
-Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstd) transparently.
-ZSTD support also offers another speedup, I tend to work with large files, and compressing and decompressing is a headache. This helps (but reduces compatability).
-On a 100 run test dataset, load times were cut in half (every load, twice as fast!), and writes were also sped up.
-Default outputs are `.nii.gz` written with `pigz` when available, for compatability.
+Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstd) transparently. ZSTD is a fast option for
+large files that are read many times. AFNI `BRIK/HEAD` support  also included, but not as rigourously  tested. `MGZ` support is limited, lets say minimally functional.
+It needs the `zstd` / `pzstd` (preferred - gets you parallel  deflate) programs installed (see
+[INSTALL.md](INSTALL.md#zstd-niizst-support)) and AFNI cannot read it, so default outputs are
+`.nii.gz`, written with `pigz` when available.
 
 ## What I'm very happy with
 
