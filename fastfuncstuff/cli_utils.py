@@ -5317,7 +5317,7 @@ def add_coverage_args(parser, automask_help: str | None = None) -> None:
 
 
 def sanitize_volume(vol: torch.Tensor, label: str, verb: int) -> torch.Tensor:
-    """Replace non-finite voxels with 0, loudly.
+    """Replace non-finite voxels with 0, loudly. Edits *vol* in place and returns it.
 
     Must happen before anything else touches the volume. ``automask``'s clip level
     comes out NaN on a NaN-bearing image and it returns an *empty* mask; ``!= 0`` is
@@ -5327,14 +5327,17 @@ def sanitize_volume(vol: torch.Tensor, label: str, verb: int) -> torch.Tensor:
     exact-zero background into NaN, leaving a volume with an empty slab and not one
     zero in it -- and every one of those failures is silent.
     """
-    n_bad = int((~torch.isfinite(vol)).sum().item())
-    if n_bad:
-        if verb >= 1:
-            print(
-                f"WARNING: {label} has {n_bad:,} non-finite voxels "
-                f"({100.0 * n_bad / vol.numel():.1f}%) -- treating as no-data (0)"
-            )
-        vol = torch.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
+    # In place and chunked: counting with isfinite and then replacing with an
+    # out-of-place nan_to_num cost three full-width copies of the volume, which
+    # on a 4D series is the dominant resident object.
+    from fastfuncstuff.utils import zero_non_finite_
+
+    n_bad = zero_non_finite_(vol)
+    if n_bad and verb >= 1:
+        print(
+            f"WARNING: {label} has {n_bad:,} non-finite voxels "
+            f"({100.0 * n_bad / vol.numel():.1f}%) -- treating as no-data (0)"
+        )
     return vol
 
 

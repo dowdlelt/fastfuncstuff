@@ -64,7 +64,7 @@ from fastfuncstuff.memory import (
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
-from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64
+from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64, zero_non_finite_
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1272,11 +1272,9 @@ def run_sauna(
     if cfg.verbose:
         print(f"  Noise sigma for shrinkage: {noise_sigma:.6g}")
 
-    # Clean nan/inf
-    nan_mask = ~torch.isfinite(II)
-    if nan_mask.any():
-        II[nan_mask] = 0
-    del nan_mask
+    # Clean nan/inf, chunked: a whole-volume isfinite needs a full-width copy of
+    # II for the abs it is built on, on top of its boolean.
+    zero_non_finite_(II)
 
     KSP2 = II
 
@@ -1383,10 +1381,7 @@ def run_sauna(
     if residual is not None:
         residual *= absolute_scale
 
-    nan_mask = ~torch.isfinite(denoised)
-    if nan_mask.any():
-        denoised[nan_mask] = 0
-    del nan_mask
+    zero_non_finite_(denoised)
 
     # ------------------------------------------------------------------
     # 8. Write outputs

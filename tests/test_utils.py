@@ -664,3 +664,52 @@ class TestInvalidVoxelMask:
         data[2, :] = 0.0
         got = invalid_voxel_mask(data)
         assert not bool(got[1]) and bool(got[2])
+
+
+class TestZeroNonFinite:
+    """In-place chunked replacement for ``x[~torch.isfinite(x)] = 0``."""
+
+    def test_matches_the_boolean_index_form(self):
+        from fastfuncstuff.utils import zero_non_finite_
+
+        torch.manual_seed(0)
+        x = torch.randn(9, 4, 5)
+        x[0, 0, 0] = float("nan")
+        x[3, 2, 1] = float("inf")
+        x[8, 3, 4] = float("-inf")
+        expected = x.clone()
+        expected[~torch.isfinite(expected)] = 0
+        n_bad = zero_non_finite_(x)
+        assert n_bad == 3
+        assert torch.equal(x, expected)
+
+    def test_zeroes_the_whole_complex_value(self):
+        """Unlike ``nan_to_num_``, which would keep a finite component."""
+        from fastfuncstuff.utils import zero_non_finite_
+
+        x = torch.tensor([[complex(float("nan"), 1.0)], [complex(2.0, 3.0)]])
+        assert zero_non_finite_(x) == 1
+        assert x[0, 0] == 0
+        assert x[1, 0] == complex(2.0, 3.0)
+
+    def test_chunking_does_not_change_the_answer(self, monkeypatch):
+        from fastfuncstuff import memory as memory_module
+        from fastfuncstuff.utils import zero_non_finite_
+
+        torch.manual_seed(2)
+        x = torch.randn(500, 7)
+        x[17, 3] = float("nan")
+        x[499, 0] = float("inf")
+        whole = x.clone()
+        assert zero_non_finite_(whole) == 2
+        monkeypatch.setattr(memory_module, "nonfinite_sweep_rows", lambda *a, **k: 3)
+        assert zero_non_finite_(x) == 2
+        assert torch.equal(x, whole)
+
+    def test_empty_and_clean_inputs(self):
+        from fastfuncstuff.utils import zero_non_finite_
+
+        assert zero_non_finite_(torch.empty(0, 4)) == 0
+        clean = torch.ones(5, 3)
+        assert zero_non_finite_(clean) == 0
+        assert torch.equal(clean, torch.ones(5, 3))

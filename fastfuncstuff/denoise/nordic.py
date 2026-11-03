@@ -42,7 +42,7 @@ from fastfuncstuff.memory import (
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
-from fastfuncstuff.utils import linalg_device
+from fastfuncstuff.utils import linalg_device, zero_non_finite_
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1897,10 +1897,9 @@ def _prepare_echo(
     if dd_phase is not None:
         _dd_phase_multiply_inplace(II, dd_phase)
 
-    # Clean nan/inf in-place
-    nan_mask = ~torch.isfinite(II)
-    if nan_mask.any():
-        II[nan_mask] = 0
+    # Clean nan/inf in-place, chunked: a whole-volume isfinite needs a full-width
+    # copy of II for the abs it is built on, on top of its boolean.
+    zero_non_finite_(II)
 
     # II is now ready for main LLR denoising (rename for clarity)
     KSP2 = II

@@ -23,7 +23,7 @@ from fastfuncstuff.laminar.timeseries import (
     vascular_transfer,
 )
 from fastfuncstuff.memory import estimate_chunk_size
-from fastfuncstuff.utils import accum_dtype
+from fastfuncstuff.utils import accum_dtype, invalid_voxel_mask
 
 
 def depth_patches(
@@ -125,7 +125,12 @@ def column_profiles(
     V, T = runs[0].shape
     if len(labels) != V or len(depth) != V or T < 4:
         raise ValueError("depth/labels must match voxels and runs need >=4 samples")
-    if not all(torch.isfinite(r).all() and (r.mean(-1) > 0).all() for r in runs):
+    # Chunked finiteness: a whole-series isfinite allocates a full float copy of
+    # the run for the abs it is built on. The all-zero half of the mask is
+    # implied by the positive-mean test that follows it.
+    if not all(
+        not bool(invalid_voxel_mask(r).any()) and bool((r.mean(-1) > 0).all()) for r in runs
+    ):
         raise ValueError("runs need finite data and positive voxel means")
     R = len(runs)
     read = depth_interpolation(depth, K)

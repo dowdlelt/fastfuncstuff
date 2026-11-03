@@ -693,6 +693,22 @@ def finite_scan_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.devi
     return int(max(1024, min(n_voxels, chunk)))
 
 
+def nonfinite_sweep_rows(
+    n_rows: int, samples_per_row: int, element_size: int, device: torch.device
+) -> int:
+    """Rows per chunk for an in-place non-finite sweep over a leading axis.
+
+    Same accounting as :func:`bytes_per_voxel_finite_scan`: ``torch.isfinite``
+    allocates a full-width copy of its input (it is ``abs() != inf``) before the
+    boolean, so a row costs its own bytes again plus one byte a sample. On a
+    complex input the abs copies of the real and imaginary views come to the same
+    total.
+    """
+    per_row = max(1, samples_per_row * (element_size + 1))
+    avail = min(get_available_memory(device, empty_cache=False), _FINITE_SCAN_MAX_WORKING_BYTES)
+    return int(max(1, min(n_rows, avail // per_row)))
+
+
 def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
     """
     Estimate memory per voxel for the batched L1 detrend (outlier counting).

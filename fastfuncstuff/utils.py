@@ -846,6 +846,38 @@ def invalid_voxel_mask(data: torch.Tensor, run_starts: list[int] | None = None) 
     return invalid
 
 
+def zero_non_finite_(x: torch.Tensor) -> int:
+    """Zero every non-finite sample of *x* **in place**; return how many.
+
+    The straightforward ``x[~torch.isfinite(x)] = 0`` needs a full-width float
+    copy of ``x`` for the ``isfinite`` (it is ``abs() != inf``) plus the boolean,
+    and counting the bad ones first with ``(~torch.isfinite(x)).sum()`` pays it
+    twice. Out-of-place ``torch.nan_to_num`` then adds a third copy of the data.
+    This sweeps the leading axis in chunks instead, so the overhead is bounded
+    whatever the dataset size.
+
+    On a complex input a sample is non-finite when *either* component is, and the
+    whole value is zeroed -- matching the boolean-index form, and unlike
+    ``torch.nan_to_num_``, which would keep a finite component beside a NaN one.
+    """
+    from fastfuncstuff.memory import nonfinite_sweep_rows
+
+    if x.numel() == 0:
+        return 0
+    rows = x.shape[0]
+    samples_per_row = x.numel() // max(1, rows)
+    step = nonfinite_sweep_rows(rows, samples_per_row, x.element_size(), x.device)
+    n_bad = 0
+    for first in range(0, rows, step):
+        block = x[first : first + step]
+        bad = ~torch.isfinite(block)
+        count = int(bad.sum())
+        if count:
+            block[bad] = 0
+            n_bad += count
+    return n_bad
+
+
 def scale_to_percent_signal(
     data: torch.Tensor,
     run_starts: list[int],
