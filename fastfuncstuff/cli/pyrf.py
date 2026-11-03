@@ -286,24 +286,41 @@ HRF CONVENTION
   faster than the TR, which this tool does not currently accept.
 
 SURFACE DATA
-  Two ways in. GIfTI runs (?h.func.gii from ffs_nwarp -surf) are ordinary input:
-  they fit on vertices, -mask takes a .shape.gii on the same mesh, and -do_blur
-  becomes a heat kernel on the mesh. Or hand the tool volumes and a FreeSurfer
-  subject with -fs_subj, and it samples the ribbon itself (the equivolume depth
-  mean) before fitting. That is the cheap lever on cost: the fit is linear in
-  vertices, and the ribbon is a small fraction of a whole-brain voxel grid.
+  Three ways in. GIfTI runs (?h.func.gii from ffs_nwarp -surf) are ordinary
+  input: they fit on vertices, -mask takes a .shape.gii on the same mesh, and
+  -do_blur becomes a heat kernel on the mesh. Or hand the tool volumes and a
+  FreeSurfer subject with -fs_subj, and it samples the ribbon itself (the
+  equivolume depth mean) before fitting. That is the cheap lever on cost: the
+  fit is linear in vertices, and the ribbon is a small fraction of a whole-brain
+  voxel grid. Or pass both domains at once -- see VOLUME AND SURFACE TOGETHER.
 
   -fs_subj assumes -input is already in register with the subject's anatomy --
   the chain is the identity. Data still in EPI space goes through ffs_nwarp -surf
-  with its real warp chain, which writes the same files.
+  with its real warp chain, which writes the same files and is the better route:
+  one interpolation from the native EPI rather than two.
 
   Both hemispheres are fit as ONE dataset on a merged (two-component) mesh, so
   there is one super-grid pass, one HRF selection and one noise pool rather than
   two of each; nothing crosses the midline, because the components are not
   connected. Every output is then split into {prefix}.lh / {prefix}.rh files.
-  One consequence worth knowing: -denoise's noise pool can only see what was
-  sampled, so a ribbon fit draws its nuisance components from cortex alone. A
-  whole-brain pool for a surface fit is not implemented.
+  -fs_subj does this from volumes; -hemi_pair does it for runs already on a
+  surface, finding the partner beside a named hemisphere, or grouping both when
+  both are listed. Neither is a blocker: a dataset with one hemisphere only, or
+  a partner that is not there, is simply fit as it was given.
+
+  A surface fit writes surface results -- the output format follows the input,
+  so a NIfTI -prefix on vertex data is refused rather than written as a
+  (V, 1, 1) volume that nothing can display on the mesh.
+
+VOLUME AND SURFACE TOGETHER
+  -surface_input takes GIfTI runs paired by position with the -input volume runs
+  and fits both on one location axis: a vector of locations is a vector of
+  locations, whether the entry is a voxel or a vertex. One super-grid pass, one
+  HRF selection and one noise pool span both domains -- so unlike a
+  surface-only fit, -denoise here can draw its nuisance components from outside
+  cortex. -mask covers the volume runs and -surface_mask the vertices,
+  independently. Every map is written twice, {prefix}_volume and
+  {prefix}_surface, each with its own geometry.
 
 NOISE CEILING
   Runs with a bit-identical aperture movie have the same expected response, so
