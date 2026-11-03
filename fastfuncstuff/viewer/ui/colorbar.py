@@ -15,6 +15,7 @@ still drawn, just faintly.
 
 from __future__ import annotations
 
+import math
 import re
 
 import numpy as np
@@ -182,6 +183,31 @@ class ColorBar(QtWidgets.QWidget):
         self.clicked.emit(self._hi - frac * (self._hi - self._lo))
 
 
+#: The stops a p is stepped along: 1-2-5 per decade, so 0.05, 0.02, 0.01,
+#: 0.005 are each one click apart and every conventional threshold is a stop.
+#: A p spans three hundred decades, so no fixed step can serve it -- 0.05
+#: walks off the bottom of the range in one click from 0.05, and a step small
+#: enough for 1e-6 would take a thousand clicks to cross the useful part.
+_P_MANTISSAS = (1.0, 2.0, 5.0)
+
+
+def _p_stop(index: int) -> float:
+    """The ``index``-th ladder stop, counting up from 1e0 at index 0."""
+    return _P_MANTISSAS[index % 3] * 10.0 ** (index // 3)
+
+
+def _p_stop_at_or_below(value: float) -> int:
+    """The largest ladder index whose stop is <= ``value``."""
+    index = 3 * math.floor(math.log10(value))
+    # log10 lands within a decade of the answer either way; walk the last step
+    # or two rather than trust a float exponent at the edge of a decade.
+    while _p_stop(index + 1) <= value:
+        index += 1
+    while _p_stop(index) > value:
+        index -= 1
+    return index
+
+
 class PValueSpin(QtWidgets.QDoubleSpinBox):
     """A p box that shows 3e-12 as 3e-12.
 
@@ -196,6 +222,25 @@ class PValueSpin(QtWidgets.QDoubleSpinBox):
         # smallest double for a 1e-300 to survive at all.
         self.setDecimals(323)
         self.setRange(1e-300, 0.999999)
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 (Qt)
+        """Move along the 1-2-5 ladder, not by a fixed amount.
+
+        Qt's default single step of 1.0 is wider than the whole range, so one
+        click of either arrow pinned p to an end of it -- down from 0.001 blanked
+        the overlay at 1e-300, up showed everything at ~1. The arrows were
+        hidden until the macOS fix in #1 made them visible, which is how the
+        keyboard-only version of this had gone unnoticed.
+        """
+        if steps == 0:
+            return
+        value = self.value()
+        index = _p_stop_at_or_below(value)
+        # Off a stop, the first click should reach the neighbouring stop rather
+        # than skip past it: 0.003 steps down to 0.002, not to 0.001.
+        if steps < 0 and _p_stop(index) < value:
+            steps += 1
+        self.setValue(_p_stop(index + steps))
 
     def textFromValue(self, value: float) -> str:  # noqa: N802 (Qt)
         return f"{value:.3g}"

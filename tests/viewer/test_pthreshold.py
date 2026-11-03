@@ -291,3 +291,55 @@ def test_an_overlay_shown_on_a_statistic_starts_at_p_001(anat, bucket):
     s.do(SetVolume(key, 2))  # a fresh load opening on the F behaves the same
     assert s.state.layers.get(key).threshold == pytest.approx(stats.f.isf(1e-3, 3, 120), rel=1e-6)
     s.close()
+
+
+def test_a_p_steps_along_the_conventional_ladder():
+    """An arrow click moves p one notch, not to the end of the range.
+
+    Qt's default step of 1.0 is wider than a p box's whole range, so before
+    this each click pinned p to 1e-300 (a blank overlay) or to ~1 (no
+    threshold at all). The arrows were hidden until PR #1 made them visible,
+    so only the keyboard could reach it and nobody did.
+    """
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.colorbar import PValueSpin
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    spin = PValueSpin()
+    try:
+        # The stops a thresholding convention actually names, in both directions.
+        for start, down, up in (
+            (0.05, 0.02, 0.1),
+            (0.01, 0.005, 0.02),
+            (0.001, 5e-4, 0.002),
+            (1e-6, 5e-7, 2e-6),
+        ):
+            spin.setValue(start)
+            spin.stepBy(-1)
+            assert spin.value() == pytest.approx(down, rel=1e-12)
+            spin.setValue(start)
+            spin.stepBy(1)
+            assert spin.value() == pytest.approx(up, rel=1e-12)
+
+        # A typed value that is not a stop steps to the neighbouring stop
+        # rather than skipping it.
+        spin.setValue(0.003)
+        spin.stepBy(-1)
+        assert spin.value() == pytest.approx(0.002, rel=1e-12)
+        spin.setValue(0.003)
+        spin.stepBy(1)
+        assert spin.value() == pytest.approx(0.005, rel=1e-12)
+
+        # Holding an arrow down walks the ladder instead of falling off it.
+        spin.setValue(0.05)
+        for _ in range(10):
+            spin.stepBy(-1)
+        assert spin.value() == pytest.approx(2e-5, rel=1e-12)
+        assert spin.value() > spin.minimum()
+    finally:
+        spin.deleteLater()
