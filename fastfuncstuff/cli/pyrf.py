@@ -66,6 +66,7 @@ from fastfuncstuff.design.prf import (
     PRFRefinementConfig,
     PRFTypeGainFit,
     balanced_group_halves,
+    decode_aperture_type_labels,
     downsample_aperture,
     fit_prf_folds,
     fit_prf_supergrid,
@@ -159,6 +160,19 @@ OUTPUT
                     not distinguish the types, the gains come out equal and
                     delta_r2 comes out 0, and any difference you see in the maps
                     is noise.
+
+  -stim_types_from_aperture reads the same labels out of the aperture itself --
+  0 where nothing was shown, one pixel value per kind of thing -- so a stimulus
+  that already encodes what it showed needs no label files. The DISTINCT
+  NON-ZERO VALUES are the codes, dimmest first; nothing tries to recover the
+  integer the PNG was written with, because it does not survive the read
+  (8-bit is normalised by 255, 16-bit by 65535, RGB is luma-mixed), while the
+  ordering survives all of them. The aperture is then binarised to presence,
+  since one channel cannot carry both how much and which kind -- so this mode
+  gives up graded contrast, and is refused outright on an aperture with more
+  distinct levels than there could be types. A design showing two types in the
+  SAME frame (different kinds at different screen positions at once) is also
+  refused: that needs a frame table per type, which is not implemented.
     meanvol         each voxel's mean over time, the scale amplitude refers to.
                     A property of the input, so it is kept for every voxel even
                     where the fit is NaN (screened out, or all-zero).
@@ -983,6 +997,18 @@ def create_parser() -> argparse.ArgumentParser:
         "on the SAME receptive field, so the comparison is response size at one "
         "position and scale; delta_r2 says whether separating them bought anything. "
         "Labels must run from 1 with no gaps.",
+    )
+    processing.add_argument(
+        "-stim_types_from_aperture",
+        action="store_true",
+        help="Read the stimulus types out of the aperture itself instead of from "
+        "-stim_types files: 0 where nothing was shown, then one pixel value per kind "
+        "of thing. The DISTINCT NON-ZERO VALUES are the codes, dimmest first, so it "
+        "survives a PNG read however the file was scaled. The aperture is then "
+        "binarised to presence -- one channel cannot carry both how much and which "
+        "kind -- so this mode gives up graded contrast. Refused on an aperture with "
+        "more distinct levels than there could be types, or one showing two types in "
+        "the same frame.",
     )
     processing.add_argument(
         "-do_scale",
@@ -2071,6 +2097,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"-xval {args.xval} requires at least two input runs")
     if args.xval_draws < 1:
         parser.error("-xval_draws must be positive")
+    if args.stim_types and args.stim_types_from_aperture:
+        parser.error(
+            "-stim_types and -stim_types_from_aperture both say what the types are; pass one"
+        )
     if args.stim_types is not None and len(args.stim_types) != len(input_files):
         parser.error(
             f"-stim_types has {len(args.stim_types)} file(s) but -input has "
@@ -2176,6 +2206,21 @@ def main(argv: list[str] | None = None) -> int:
             stimulus_runs.append(stimulus)
             stimulus_shape = shape
         assert stimulus_shape is not None
+    aperture_type_labels = None
+    if args.stim_types_from_aperture:
+        try:
+            stimulus_runs, aperture_type_labels, n_aperture_types, levels = (
+                decode_aperture_type_labels(stimulus_runs)
+            )
+        except ValueError as error:
+            parser.error(f"-stim_types_from_aperture: {error}")
+        if args.verb:
+            coded = ", ".join(f"type {index + 1} = {level:g}" for index, level in enumerate(levels))
+            print(f"Stimulus types read from the aperture ({coded}); apertures binarised")
+            if n_aperture_types == 1:
+                print(
+                    "  only one level, so this is an ordinary single-type fit (no per-type output)"
+                )
     stim_groups = _resolve_stim_groups(args.stim_groups, stimulus_runs, parser)
     if args.verb:
         print(f"Aperture resolution: {stimulus_shape[0]} x {stimulus_shape[1]} pixels")
@@ -2553,8 +2598,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     type_fit = None
-    if args.stim_types:
-        type_labels, n_types = _load_type_labels(args.stim_types, run_lengths, parser)
+    if args.stim_types or (aperture_type_labels is not None and n_aperture_types > 1):
+        if aperture_type_labels is not None:
+            type_labels, n_types = aperture_type_labels, n_aperture_types
+        else:
+            type_labels, n_types = _load_type_labels(args.stim_types, run_lengths, parser)
         type_chunk = args.batch_size or prf_type_gain_voxel_chunk(
             n_fit_voxels,
             loaded.n_timepoints,

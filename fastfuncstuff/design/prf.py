@@ -753,6 +753,79 @@ def _compress_aperture_runs(
     return compressed
 
 
+def decode_aperture_type_labels(
+    stimulus_runs: Sequence[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[torch.Tensor], int, list[float]]:
+    """Read stimulus types out of the aperture's own pixel values.
+
+    An aperture that codes its types in the frames -- 0 where nothing was shown,
+    then one value per kind of thing -- needs no separate label file. Returns
+    ``(binary_runs, type_labels, n_types, levels)``.
+
+    **The distinct non-zero values ARE the codes, taken in ascending order.**
+    Nothing tries to recover the integer a PNG was written with, because that
+    integer does not survive the read: matplotlib normalises 8-bit to ``v/255``
+    and 16-bit to ``v/65535``, and an RGB frame is luma-mixed, so codes 1 and 2
+    arrive as ``0.0039/0.0078``, ``1.5e-5/3.1e-5`` or ``0.0028/0.0056``
+    depending on the file. What survives all three is the ORDER and identity of
+    the levels, so that is what the mapping uses: dimmest non-zero level is type
+    1, next is type 2.
+
+    **The returned apertures are binarised to presence.** They have to be: the
+    neural drive is a sum of the aperture's values against the receptive field,
+    so leaving a type-2 pixel at twice a type-1 pixel's value would give it
+    twice the drive and bias the fitted pRF toward wherever the higher-numbered
+    type appeared. The cost is that this mode cannot also carry graded contrast
+    -- one channel cannot be both "how much" and "which kind".
+
+    Raises when the aperture is really a contrast mask (more distinct levels
+    than there could be types), and when one frame holds two different levels at
+    once -- a type varying across SPACE within a frame, which needs a frame
+    table per type rather than the shared one
+    :func:`split_aperture_by_type` builds.
+    """
+    if not stimulus_runs:
+        raise ValueError("no stimulus runs to decode")
+    present = [torch.unique(run[run > 0]) for run in stimulus_runs if bool((run > 0).any())]
+    if not present:
+        raise ValueError("every aperture frame is blank, so there are no stimulus types to read")
+    levels = torch.unique(torch.cat(present))
+    if levels.numel() > MAX_STIMULUS_TYPES:
+        raise ValueError(
+            f"the aperture holds {levels.numel()} distinct non-zero values, more than the "
+            f"{MAX_STIMULUS_TYPES} a type code could mean -- this looks like a graded "
+            "contrast mask, so pass the types as -stim_types label files instead"
+        )
+    n_types = int(levels.numel())
+    binary_runs, type_labels = [], []
+    for run_index, run in enumerate(stimulus_runs):
+        # Which level each pixel is, 0 for blank: an exact match, because the
+        # levels came out of these very frames.
+        code = torch.zeros(run.shape, dtype=torch.long, device=run.device)
+        for index, level in enumerate(levels.tolist()):
+            code[run == level] = index + 1
+        per_frame = [torch.unique(frame[frame > 0]) for frame in code]
+        clashes = [
+            frame_index for frame_index, present in enumerate(per_frame) if present.numel() > 1
+        ]
+        if clashes:
+            raise ValueError(
+                f"aperture run {run_index} frame {clashes[0]} shows "
+                f"{per_frame[clashes[0]].numel()} stimulus types at once. Types read from the "
+                "aperture must not vary within a frame; a design that shows two kinds of "
+                "stimulus simultaneously in different places needs a frame table per type, "
+                "which is not implemented"
+            )
+        type_labels.append(
+            torch.tensor(
+                [0 if present.numel() == 0 else int(present[0]) for present in per_frame],
+                device=run.device,
+            )
+        )
+        binary_runs.append((run > 0).to(run.dtype))
+    return binary_runs, type_labels, n_types, levels.tolist()
+
+
 def split_aperture_by_type(
     run: _ApertureRun, type_labels: torch.Tensor, n_types: int
 ) -> list[_ApertureRun]:

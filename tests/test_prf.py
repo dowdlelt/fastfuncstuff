@@ -2619,3 +2619,210 @@ def test_stim_types_accepts_a_column_selector(tmp_path):
     labels, n_types = _load_type_labels([f"{path}[1]"], [4], create_parser())
     assert n_types == 2
     assert labels[0].tolist() == [1, 1, 2, 2]
+
+
+class TestApertureTypeDecoding:
+    """Types read from the aperture's own pixel values."""
+
+    def test_levels_map_in_ascending_order_and_the_aperture_is_binarised(self):
+        """The order of the distinct values is the code, not their magnitude.
+
+        Nothing tries to recover the integer a PNG was written with, because it
+        does not survive the read: matplotlib normalises 8-bit by 255 and
+        16-bit by 65535, and luma-mixes RGB, so codes 1 and 2 arrive as
+        0.0039/0.0078, 1.5e-5/3.1e-5 or 0.0028/0.0056. The ordering survives
+        all three.
+        """
+        from fastfuncstuff.design.prf import decode_aperture_type_labels
+
+        # Two frames of type 1 (dim), then two of type 2 (bright), then a blank.
+        run = torch.zeros(5, 4)
+        run[0, :2] = 1.0 / 255.0
+        run[1, 1:3] = 1.0 / 255.0
+        run[2, :2] = 2.0 / 255.0
+        run[3, 2:] = 2.0 / 255.0
+        binary, labels, n_types, levels = decode_aperture_type_labels([run])
+
+        assert n_types == 2
+        assert levels == pytest.approx([1.0 / 255.0, 2.0 / 255.0])
+        assert labels[0].tolist() == [1, 1, 2, 2, 0]
+        # Binarised: a type-2 pixel must not get twice a type-1 pixel's drive.
+        assert set(binary[0].unique().tolist()) == {0.0, 1.0}
+        torch.testing.assert_close(binary[0], (run > 0).float())
+
+    def test_scaling_of_the_levels_does_not_change_the_labels(self):
+        from fastfuncstuff.design.prf import decode_aperture_type_labels
+
+        run = torch.zeros(4, 3)
+        run[0, 0] = 1.0
+        run[1, 1] = 2.0
+        run[2, 2] = 1.0
+        for scale in (1.0, 1.0 / 255.0, 1.0 / 65535.0, 0.7152 / 255.0):
+            _, labels, n_types, _ = decode_aperture_type_labels([run * scale])
+            assert n_types == 2
+            assert labels[0].tolist() == [1, 2, 1, 0]
+
+    def test_a_graded_aperture_is_refused_as_a_contrast_mask(self):
+        from fastfuncstuff.design.prf import MAX_STIMULUS_TYPES, decode_aperture_type_labels
+
+        torch.manual_seed(0)
+        graded = torch.rand(4, 8)  # many distinct values: a contrast mask
+        with pytest.raises(ValueError, match="graded"):
+            decode_aperture_type_labels([graded])
+        # Right at the limit it is still accepted.
+        levels = torch.arange(1, MAX_STIMULUS_TYPES + 1, dtype=torch.float32)
+        at_limit = torch.zeros(MAX_STIMULUS_TYPES, MAX_STIMULUS_TYPES)
+        for index in range(MAX_STIMULUS_TYPES):
+            at_limit[index, index] = levels[index]
+        _, _, n_types, _ = decode_aperture_type_labels([at_limit])
+        assert n_types == MAX_STIMULUS_TYPES
+
+    def test_two_types_in_one_frame_is_refused_by_name(self):
+        """Type varying across SPACE needs a frame table per type, not the shared one."""
+        from fastfuncstuff.design.prf import decode_aperture_type_labels
+
+        run = torch.zeros(3, 4)
+        run[1, 0] = 1.0
+        run[1, 3] = 2.0  # both types on screen at once
+        with pytest.raises(ValueError, match="frame 1 shows 2 stimulus types"):
+            decode_aperture_type_labels([run])
+
+    def test_an_all_blank_aperture_is_refused(self):
+        from fastfuncstuff.design.prf import decode_aperture_type_labels
+
+        with pytest.raises(ValueError, match="blank"):
+            decode_aperture_type_labels([torch.zeros(4, 4)])
+
+    def test_levels_are_shared_across_runs(self):
+        """So type 2 means the same thing in every run."""
+        from fastfuncstuff.design.prf import decode_aperture_type_labels
+
+        first = torch.zeros(2, 3)
+        first[0, 0] = 1.0
+        first[1, 1] = 2.0
+        second = torch.zeros(2, 3)
+        second[0, 2] = 2.0  # only the brighter type appears in run 2
+        second[1, 0] = 2.0
+        _, labels, n_types, _ = decode_aperture_type_labels([first, second])
+        assert n_types == 2
+        assert labels[0].tolist() == [1, 2]
+        assert labels[1].tolist() == [2, 2]
+
+
+def _write_coded_pngs(tmp_path, stimuli, labels):
+    """Each aperture as PNG frames: once value-coded 0/1/2, once binary 0/1."""
+    import nibabel as nib
+    from PIL import Image
+
+    coded_dirs, binary_dirs = [], []
+    for run, stimulus in enumerate(stimuli):
+        frames = nib.load(stimulus).get_fdata()
+        frames = frames.reshape(frames.shape[0], frames.shape[1], -1)
+        coded = tmp_path / f"coded{run}"
+        binary = tmp_path / f"binary{run}"
+        coded.mkdir()
+        binary.mkdir()
+        for frame in range(frames.shape[-1]):
+            on = frames[:, :, frame] > 0
+            Image.fromarray((on * labels[frame]).astype(np.uint8), mode="L").save(
+                coded / f"frame_{frame:04d}.png"
+            )
+            Image.fromarray((on * 1).astype(np.uint8), mode="L").save(
+                binary / f"frame_{frame:04d}.png"
+            )
+        coded_dirs.append(str(coded))
+        binary_dirs.append(str(binary))
+    return coded_dirs, binary_dirs
+
+
+def test_types_from_the_aperture_match_types_from_label_files(tmp_path):
+    """Coding the types in the PNGs must fit the same model as separate labels.
+
+    Same apertures, same labels, two ways of saying so: value-coded frames with
+    -stim_types_from_aperture, against binary frames plus -stim_types files.
+    Every scale-invariant quantity agrees to ~1e-5.
+
+    The exception is gain, and it is instructive. The decoder binarises to
+    exactly 1.0 while a PNG written with the value 1 reads back as 1/255, and
+    the drive is raised to the CSS exponent, so the gains differ by 255**n --
+    measured 160.79 against a predicted 160.80 at n = 0.9168. gain carries the
+    aperture's arbitrary scale; amplitude_psc does not, which is the whole
+    reason amplitude is the reportable quantity. See also the per-type help.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    frame_labels = np.where((np.arange(120) % 40) < 20, 1, 2)
+    coded_dirs, binary_dirs = _write_coded_pngs(tmp_path, stimuli, frame_labels)
+    label_files = _write_type_labels(tmp_path, 120, len(inputs))
+
+    outputs = {}
+    for name, stim_dirs, extra in (
+        ("aperture", coded_dirs, ["-stim_types_from_aperture"]),
+        (
+            "files",
+            binary_dirs,
+            [flag for path in label_files for flag in ("-stim_types", path)],
+        ),
+    ):
+        output = tmp_path / f"{name}.nii.gz"
+        argv = ["-input", *inputs, "-mask", mask_path, "-prefix", str(output)]
+        for directory in stim_dirs:
+            argv += ["-stim_pngs", directory]
+        argv += ["-device", "cpu", "-verb", "0", *extra]
+        assert main(argv) == 0
+        image = nib.load(output)
+        names = read_brick_labels(image)
+        outputs[name] = (names, image.get_fdata().reshape(-1, len(names)))
+
+    names_a, data_a = outputs["aperture"]
+    names_b, data_b = outputs["files"]
+    assert names_a == names_b
+    responsive = slice(0, 24)
+    for name in (
+        "x",
+        "y",
+        "sigma",
+        "exponent",
+        "rfsize",
+        "r2",
+        "amplitude_psc_t1",
+        "amplitude_psc_t2",
+        "r2_types",
+        "r2_single",
+        "delta_r2",
+    ):
+        column = names_a.index(name)
+        np.testing.assert_allclose(
+            data_a[responsive, column], data_b[responsive, column], rtol=1e-3, atol=1e-3
+        )
+    # gain differs by exactly the aperture scale raised to the CSS exponent.
+    exponent = np.nanmedian(data_a[responsive, names_a.index("exponent")])
+    for name in ("gain", "gain_t1", "gain_t2"):
+        column = names_a.index(name)
+        ratio = np.nanmedian(data_b[responsive, column] / data_a[responsive, column])
+        assert ratio == pytest.approx(255.0**exponent, rel=0.02), (name, ratio)
+
+
+def test_stim_types_and_from_aperture_are_mutually_exclusive(tmp_path):
+    from fastfuncstuff.cli.pyrf import main
+
+    path = tmp_path / "types.1D"
+    np.savetxt(path, np.array([1, 2], dtype=float))
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "-input",
+                "a.nii.gz",
+                "-stimulus",
+                "b.nii.gz",
+                "-prefix",
+                "out.nii.gz",
+                "-stim_types",
+                str(path),
+                "-stim_types_from_aperture",
+            ]
+        )
