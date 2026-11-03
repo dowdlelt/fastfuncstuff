@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib.image as mpimg
@@ -63,10 +64,12 @@ from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 from fastfuncstuff.design.prf import (
     PRFRefinedFit,
     PRFRefinementConfig,
+    PRFTypeGainFit,
     balanced_group_halves,
     downsample_aperture,
     fit_prf_folds,
     fit_prf_supergrid,
+    fit_prf_type_gains,
     grid_seeds_as_fit,
     loro_folds,
     make_analyzeprf_grid,
@@ -82,7 +85,7 @@ from fastfuncstuff.design.prf import (
     summarize_hrf_selection,
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
-from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.memory import estimate_chunk_size, prf_type_gain_voxel_chunk
 from fastfuncstuff.stats.reliability import (
     circular_correlation,
     identical_design_groups,
@@ -133,6 +136,29 @@ OUTPUT
                     (see -dont_scale): scaled data divides by a run mean of 100,
                     unscaled divides by the raw mean. NaN where the mean is not
                     positive.
+    gain_tK, amplitude_tK, amplitude_psc_tK
+                    per stimulus type, with -stim_types. The types share one
+                    receptive field and differ only in response size, so
+                    gain_tK is THE quantity to compare between types within a
+                    voxel: same pRF, same drive normalisation, so the ratio of
+                    gains is the voxel's preference.
+                    amplitude_psc_tK is what each type actually elicited,
+                    measured against that type's own predictor baseline -- the
+                    number a separate pRF run of that type alone would report.
+                    It therefore also carries how well that type's frames
+                    happened to cover the pRF, and the per-type amplitudes DO
+                    NOT sum to the combined amplitude (each type is absent for
+                    part of the run, so each has a lower baseline of its own).
+                    Compare them across types and across runs; do not add them.
+    r2_types, r2_single, delta_r2
+                    the nested comparison behind the per-type fit: the same pRF
+                    and HRF with one gain for everything (r2_single) against one
+                    gain per type (r2_types). delta_r2 is what the split bought,
+                    one extra parameter per extra type. THRESHOLD ON THIS before
+                    reading any per-type difference as real -- where a voxel does
+                    not distinguish the types, the gains come out equal and
+                    delta_r2 comes out 0, and any difference you see in the maps
+                    is noise.
     meanvol         each voxel's mean over time, the scale amplitude refers to.
                     A property of the input, so it is kept for every voxel even
                     where the fit is NaN (screened out, or all-zero).
@@ -947,6 +973,18 @@ def create_parser() -> argparse.ArgumentParser:
     # the noise floor gets divided by a small mean and so amplified -- which is
     # why the unscaled fit stays available.
     processing.add_argument(
+        "-stim_types",
+        action="append",
+        metavar="FILE",
+        help="One per-frame stimulus-type vector per run, paired by position with "
+        "-input (a .1D column; AFNI [col] / {row} selectors work). 0 where nothing "
+        "was shown, then 1..N for which KIND of thing it was -- faces vs places "
+        "through the same aperture, say. Each type gets its own gain and amplitude "
+        "on the SAME receptive field, so the comparison is response size at one "
+        "position and scale; delta_r2 says whether separating them bought anything. "
+        "Labels must run from 1 with no gaps.",
+    )
+    processing.add_argument(
         "-do_scale",
         dest="do_scale",
         action="store_true",
@@ -1473,6 +1511,7 @@ def _save_results(
     invalid_voxels: torch.Tensor | None = None,
     mean_volume: torch.Tensor | None = None,
     response_peak: torch.Tensor | None = None,
+    type_fit: PRFTypeGainFit | None = None,
     hrf_r2_map: torch.Tensor | None = None,
     screen_extent: float | None = None,
     noise_ceiling: torch.Tensor | None = None,
@@ -1542,6 +1581,30 @@ def _save_results(
         if mean_volume is not None:
             labels.append("amplitude_psc")
             columns.append(prf_percent_signal_change(response_peak, mean_volume))
+    if type_fit is not None:
+        # One block per stimulus type, suffixed _t1.._tN to match the labels in
+        # -stim_types. gain is the comparable quantity BETWEEN types here: the
+        # types share the receptive field, so they share the drive's
+        # normalisation, and the ratio of gains is the voxel's preference.
+        # amplitude is what each type actually elicited, which also carries how
+        # well that type's frames happened to cover the pRF.
+        for stimulus_type in range(type_fit.gains.shape[1]):
+            suffix = f"_t{stimulus_type + 1}"
+            labels.append(f"gain{suffix}")
+            columns.append(type_fit.gains[:, stimulus_type])
+            labels.append(f"amplitude{suffix}")
+            columns.append(type_fit.amplitude[:, stimulus_type])
+            if mean_volume is not None:
+                labels.append(f"amplitude_psc{suffix}")
+                columns.append(
+                    prf_percent_signal_change(type_fit.amplitude[:, stimulus_type], mean_volume)
+                )
+        # The nested comparison: same pRF and HRF, one gain for everything
+        # (r2_single) against one per type (r2_types). delta_r2 is what the split
+        # bought, so it is the map to threshold on before reading any per-type
+        # difference as real.
+        labels += ["r2_types", "r2_single", "delta_r2"]
+        columns += [type_fit.r2, type_fit.single_r2, type_fit.delta_r2]
     if mean_volume is not None:
         # analyzePRF's results.meanvol - the scale the gain is expressed against,
         # and the reference for turning gain into a percent-signal-change.
@@ -1839,6 +1902,67 @@ def _save_reliability(
     )
 
 
+def _load_type_labels(
+    paths: list[str],
+    run_lengths: Sequence[int],
+    parser: argparse.ArgumentParser,
+) -> tuple[list[torch.Tensor], int]:
+    """Read one per-frame stimulus-type vector per run, paired by position.
+
+    0 means nothing was shown at that frame and drives no type; 1..N say which
+    kind of thing it was. The labels have to be contiguous from 1, because the
+    count of types is what sizes every per-type output -- a file using 1 and 3
+    would otherwise silently produce an empty type 2.
+    """
+    from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.prf import MAX_STIMULUS_TYPES
+
+    if len(paths) != len(run_lengths):
+        parser.error(
+            f"-stim_types has {len(paths)} file(s) but there are {len(run_lengths)} runs; "
+            "pass one per run, paired by position"
+        )
+    labels: list[torch.Tensor] = []
+    present: set[int] = set()
+    for path, expected in zip(paths, run_lengths, strict=True):
+        try:
+            values = load_nuisance_file(path)
+        except (OSError, ValueError) as error:
+            parser.error(f"-stim_types {path}: {error}")
+        if values.shape[1] != 1:
+            parser.error(
+                f"-stim_types {path} has {values.shape[1]} columns; it needs one label per "
+                "frame in a single column (use a [0] selector to pick one)"
+            )
+        flat = values[:, 0]
+        if flat.shape[0] != expected:
+            parser.error(
+                f"-stim_types {path} has {flat.shape[0]} labels but its run has {expected} "
+                "frames; the labels are per frame"
+            )
+        if not np.allclose(flat, np.rint(flat)):
+            parser.error(f"-stim_types {path} must hold whole numbers (0 = nothing shown)")
+        rounded = np.rint(flat).astype(np.int64)
+        if rounded.min() < 0:
+            parser.error(f"-stim_types {path} has a negative label; 0 means nothing shown")
+        present.update(int(value) for value in np.unique(rounded) if value > 0)
+        labels.append(torch.from_numpy(rounded))
+    if not present:
+        parser.error(
+            "-stim_types labels every frame as 0 (nothing shown), so there is nothing to fit"
+        )
+    n_types = max(present)
+    if present != set(range(1, n_types + 1)):
+        missing = sorted(set(range(1, n_types + 1)) - present)
+        parser.error(
+            f"-stim_types labels must run from 1 with no gaps; {missing} never appear "
+            f"but {n_types} does"
+        )
+    if n_types > MAX_STIMULUS_TYPES:
+        parser.error(f"-stim_types has {n_types} types; at most {MAX_STIMULUS_TYPES} are supported")
+    return labels, n_types
+
+
 def _resolve_masks(
     args: argparse.Namespace, reference_file: str, parser: argparse.ArgumentParser
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
@@ -1947,6 +2071,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"-xval {args.xval} requires at least two input runs")
     if args.xval_draws < 1:
         parser.error("-xval_draws must be positive")
+    if args.stim_types is not None and len(args.stim_types) != len(input_files):
+        parser.error(
+            f"-stim_types has {len(args.stim_types)} file(s) but -input has "
+            f"{len(input_files)} runs; pass one per run, paired by position"
+        )
+    for source in args.stim_types or []:
+        from fastfuncstuff.io.headers import parse_1d_selectors
+
+        if not Path(parse_1d_selectors(source)[0]).exists():
+            parser.error(f"-stim_types file does not exist: {source}")
     if args.stim_groups is not None and len(args.stim_groups) != len(input_files):
         parser.error(
             f"-stim_groups has {len(args.stim_groups)} labels but -input has "
@@ -2418,9 +2552,49 @@ def main(argv: list[str] | None = None) -> int:
             run_starts=list(loaded.run_starts),
         )
     )
+    type_fit = None
+    if args.stim_types:
+        type_labels, n_types = _load_type_labels(args.stim_types, run_lengths, parser)
+        type_chunk = args.batch_size or prf_type_gain_voxel_chunk(
+            n_fit_voxels,
+            loaded.n_timepoints,
+            stimulus_shape[0] * stimulus_shape[1],
+            n_types,
+            device,
+        )
+        if args.verb:
+            print(
+                f"Fitting {n_types} stimulus type(s) on the shared receptive field "
+                f"({type_chunk:,} voxels per chunk)"
+            )
+        type_fit = fit_prf_type_gains(
+            analysis_data,
+            stimulus_runs,
+            results.parameters,
+            results.hrf_index,
+            hrf_library,
+            stimulus_shape,
+            type_labels,
+            n_types,
+            list(loaded.run_starts),
+            nuisance_per_run=nuisance_per_run,
+            voxel_chunk_size=max(1, type_chunk),
+        )
+        if args.verb:
+            median_delta = float(type_fit.delta_r2.nanmedian())
+            print(f"  median delta_r2 from separating the types: {median_delta:+.4f}")
     if keep_index is not None:
         results = _expand_fit(results, keep_index, loaded.n_voxels)
         response_peak = _expand_to_all_voxels(response_peak, keep_index, loaded.n_voxels)
+        if type_fit is not None:
+            type_fit = PRFTypeGainFit(
+                **{
+                    name: _expand_to_all_voxels(
+                        getattr(type_fit, name), keep_index, loaded.n_voxels
+                    )
+                    for name in ("gains", "amplitude", "residual_ss", "total_ss", "r2", "single_r2")
+                }
+            )
         if canonical_peak is not None:
             canonical_peak = _expand_to_all_voxels(canonical_peak, keep_index, loaded.n_voxels)
         if hrf_r2_map is not None:
@@ -2454,6 +2628,7 @@ def main(argv: list[str] | None = None) -> int:
         invalid_voxels=invalid_voxels,
         mean_volume=mean_volume,
         response_peak=response_peak,
+        type_fit=type_fit,
         hrf_r2_map=hrf_r2_map,
         screen_extent=args.screen_extent,
         noise_ceiling=noise_ceiling,

@@ -2504,3 +2504,118 @@ class TestFitPerTypeGains:
             fit_prf_type_gains(**{**problem, "data": problem["data"][:0]})
         with pytest.raises(ValueError, match="n_types must be"):
             fit_prf_type_gains(**{**problem, "n_types": MAX_STIMULUS_TYPES + 1})
+
+
+def _write_type_labels(tmp_path, n_timepoints, n_runs, block=20):
+    """Blocked alternation between two stimulus types, one .1D per run."""
+    labels = np.where((np.arange(n_timepoints) % (2 * block)) < block, 1, 2)
+    paths = []
+    for run in range(n_runs):
+        path = tmp_path / f"types{run}.1D"
+        np.savetxt(path, labels, fmt="%d", header="stimulus type per frame")
+        paths.append(str(path))
+    return paths
+
+
+def test_stim_types_writes_a_block_per_type(tmp_path):
+    """-stim_types end to end, on a fixture where the types do NOT differ.
+
+    Both types are driven by the same simulated signal, so the honest answer is
+    "no preference": the per-type gains have to agree and delta_r2 has to be
+    ~0. Measured gain_t1 9.46 against gain_t2 9.59 (1.4% apart) and delta_r2
+    +0.0008. This is the direction that matters -- a tool that invented
+    differences here would make every real map untrustworthy.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    label_files = _write_type_labels(tmp_path, 120, len(inputs))
+    output = tmp_path / "types.nii.gz"
+    argv = [
+        "-input",
+        *inputs,
+        "-stimulus",
+        *stimuli,
+        "-mask",
+        mask_path,
+        "-prefix",
+        str(output),
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    for path in label_files:
+        argv += ["-stim_types", path]
+    assert main(argv) == 0
+
+    image = nib.load(output)
+    labels = read_brick_labels(image)
+    for name in (
+        "gain_t1",
+        "amplitude_t1",
+        "amplitude_psc_t1",
+        "gain_t2",
+        "amplitude_t2",
+        "amplitude_psc_t2",
+        "r2_types",
+        "r2_single",
+        "delta_r2",
+    ):
+        assert name in labels, f"{name} missing from {labels}"
+    assert "gain_t3" not in labels
+
+    data = image.get_fdata().reshape(-1, len(labels))
+    responsive = slice(0, 24)
+    gain_1 = np.nanmedian(data[responsive, labels.index("gain_t1")])
+    gain_2 = np.nanmedian(data[responsive, labels.index("gain_t2")])
+    assert gain_1 == pytest.approx(gain_2, rel=0.10), (gain_1, gain_2)
+    assert abs(np.nanmedian(data[responsive, labels.index("delta_r2")])) < 0.02
+    # More freedom cannot fit worse.
+    assert bool(
+        (
+            data[responsive, labels.index("r2_types")]
+            >= data[responsive, labels.index("r2_single")] - 1e-4
+        ).all()
+    )
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        ([0, 0, 0], "nothing to fit"),
+        ([1, 3, 3], "no gaps"),
+        ([1, -1, 2], "negative"),
+        ([1, 1, 1.5], "whole numbers"),
+    ],
+)
+def test_stim_types_label_validation(tmp_path, labels, message):
+    from fastfuncstuff.cli.pyrf import _load_type_labels, create_parser
+
+    path = tmp_path / "bad.1D"
+    np.savetxt(path, np.asarray(labels, dtype=float))
+    with pytest.raises(SystemExit):
+        _load_type_labels([str(path)], [len(labels)], create_parser())
+
+
+def test_stim_types_length_must_match_the_run(tmp_path):
+    from fastfuncstuff.cli.pyrf import _load_type_labels, create_parser
+
+    path = tmp_path / "short.1D"
+    np.savetxt(path, np.array([1, 1, 2], dtype=float))
+    with pytest.raises(SystemExit):
+        _load_type_labels([str(path)], [10], create_parser())
+
+
+def test_stim_types_accepts_a_column_selector(tmp_path):
+    """AFNI [col] selectors, so a labels column can live in a wider file."""
+    from fastfuncstuff.cli.pyrf import _load_type_labels, create_parser
+
+    path = tmp_path / "wide.1D"
+    np.savetxt(path, np.column_stack([np.zeros(4), np.array([1, 1, 2, 2])]))
+    labels, n_types = _load_type_labels([f"{path}[1]"], [4], create_parser())
+    assert n_types == 2
+    assert labels[0].tolist() == [1, 1, 2, 2]

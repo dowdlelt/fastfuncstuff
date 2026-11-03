@@ -634,6 +634,19 @@ def bytes_per_voxel_prf_type_gains(
     return (6 * n_pixels + (3 * n_types + 4) * n_timepoints + 2 * n_types * n_types) * 4
 
 
+def prf_type_gain_voxel_chunk(
+    n_voxels: int,
+    n_timepoints: int,
+    n_pixels: int,
+    n_types: int,
+    device: torch.device,
+) -> int:
+    """Voxels per chunk for :func:`bytes_per_voxel_prf_type_gains` passes."""
+    avail = get_available_memory(device, empty_cache=False)
+    chunk = avail // max(1, bytes_per_voxel_prf_type_gains(n_timepoints, n_pixels, n_types))
+    return int(max(1, min(n_voxels, chunk)))
+
+
 def bytes_per_unit_laminar_dynamic(
     n_timepoints: int, n_depths: int, n_runs: int, n_strengths: int
 ) -> int:
