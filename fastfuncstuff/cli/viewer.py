@@ -256,8 +256,36 @@ def _read_targets(args) -> tuple[list[str], list[str], list[str]]:
     return dirs, [] if dirs else named, named
 
 
+def _enable_stack_dumps() -> None:
+    """``kill -USR1 <pid>`` prints every thread's Python stack to stderr.
+
+    A GUI freeze is the one bug a user cannot report usefully: by the time it is
+    noticed the only evidence is that the window stopped painting, and "not
+    responding" says nothing about which call is holding the main thread. This
+    makes a frozen viewer answer for itself, on a live process, with no restart
+    and no debugger attached -- the dump goes to the terminal it was started
+    from. Costs nothing until the signal arrives.
+
+    SIGUSR1 because Qt uses none of the standard signals and this one survives a
+    blocked event loop: faulthandler writes from the signal handler itself rather
+    than queueing work the stuck thread would have to come back to run.
+    """
+    import faulthandler
+    import signal
+
+    handler = getattr(signal, "SIGUSR1", None)
+    if handler is None:  # not POSIX
+        return
+    # chain=False deliberately: SIGUSR1's default action is to terminate, so
+    # chaining would dump the stack and then kill the window the dump was meant
+    # to diagnose -- which defeats the point of asking a LIVE process what it is
+    # doing. Measured: with chain=True the process died on the signal.
+    faulthandler.register(handler, all_threads=True, chain=False)
+
+
 def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
+    _enable_stack_dumps()
     if not {"-h", "-help", "--help"} & set(sys.argv[1:] if argv is None else argv):
         _say("starting, importing torch...")
     args = build_parser().parse_args(argv)
