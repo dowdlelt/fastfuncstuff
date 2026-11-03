@@ -202,7 +202,12 @@ def render_plane(
             # Edges of a nearest-sampled coarse layer would trace the voxel
             # staircase rather than the anatomy.
             how = "bilinear"
-        values = extract_plane(volume, grid, layer.affine, plane, pos, view=view, mode=how)
+        # A NaN is "no value here", and interpolating one spreads it over every
+        # neighbour it touches; see slicing.sample_volume.
+        repair = session.display_has_nan(layer.key)
+        values = extract_plane(
+            volume, grid, layer.affine, plane, pos, view=view, mode=how, repair_nan=repair
+        )
 
         if layer.edges:
             inside = plane_coverage(
@@ -224,7 +229,16 @@ def render_plane(
             stat = (
                 values
                 if stat_vol is None
-                else extract_plane(stat_vol, grid, layer.affine, plane, pos, view=view, mode=how)
+                else extract_plane(
+                    stat_vol,
+                    grid,
+                    layer.affine,
+                    plane,
+                    pos,
+                    view=view,
+                    mode=how,
+                    repair_nan=session.display_has_nan(layer.key, index=layer.threshold_index),
+                )
             )
 
         # A label layer is coloured by identity rather than by magnitude, and

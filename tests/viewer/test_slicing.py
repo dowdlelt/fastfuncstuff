@@ -289,6 +289,64 @@ def test_a_layer_on_a_coarser_grid_still_lands_in_the_right_place():
 
 
 # ---------------------------------------------------------------------------
+# NaN holes
+# ---------------------------------------------------------------------------
+
+
+def test_interpolation_spreads_a_nan_over_its_neighbours():
+    """The behaviour repair_nan exists to undo -- pinned so the fix has a baseline.
+
+    Worse than it sounds: the sample does not have to be *between* the hole and
+    its neighbour. Asked for voxel 1 exactly, grid_sample still sums a zero
+    weight against voxel 2, and ``0 * NaN`` is NaN -- so a real voxel beside a
+    hole was drawn as no value at all.
+    """
+    ijk = torch.tensor([[1.0, 1.0, 1.0], [3.0, 1.0, 1.0]])
+    vol = torch.ones(5, 5, 5)
+    vol[2, 1, 1] = float("nan")
+    got = sample_volume(vol, ijk, mode="bilinear")
+    assert bool(torch.isnan(got[0])), "voxel 1 is real, and beside the hole"
+    assert float(got[1]) == pytest.approx(1.0), "two voxels away, out of reach"
+
+
+def test_repair_keeps_a_nan_hole_its_own_size():
+    """A NaN is "no value here"; interpolating must not widen it.
+
+    ffs_pyrf writes NaN outside its screen, and the eight display pixels around
+    each such voxel came back NaN too -- a hole a voxel wider than the data's,
+    eating real values at its rim.
+    """
+    ijk = torch.tensor([[1.0, 1.0, 1.0], [1.4, 1.0, 1.0], [2.0, 1.0, 1.0], [2.4, 1.0, 1.0]])
+    vol = torch.ones(5, 5, 5)
+    vol[2, 1, 1] = float("nan")
+    got = sample_volume(vol, ijk, mode="bilinear", repair_nan=True)
+    # Everything nearer a real voxel than the hole keeps a value...
+    assert torch.allclose(got[:2], torch.ones(2))
+    # ...and the hole is still a hole over its own half-voxel, so it stays
+    # transparent: the edge is nearest-neighbour rather than interpolated.
+    assert bool(torch.isnan(got[2])) and bool(torch.isnan(got[3]))
+
+
+def test_repair_leaves_a_volume_without_nan_untouched():
+    """It is opt-in per sub-brick, and must be a no-op when it is wrong to pay for."""
+    torch.manual_seed(0)
+    ijk = torch.rand(32, 3) * 4.0
+    vol = torch.rand(5, 5, 5)
+    plain = sample_volume(vol, ijk, mode="bilinear")
+    torch.testing.assert_close(sample_volume(vol, ijk, mode="bilinear", repair_nan=True), plain)
+
+
+def test_repair_also_covers_the_wider_cubic_footprint():
+    """Catmull-Rom reaches two voxels, so an unrepaired hole spreads twice as far."""
+    ijk = torch.tensor([[1.0, 1.0, 1.0], [4.0, 1.0, 1.0]])
+    vol = torch.ones(8, 8, 8)
+    vol[2, 1, 1] = float("nan")
+    assert bool(torch.isnan(sample_volume(vol, ijk, mode="cubic")[0]))
+    got = sample_volume(vol, ijk, mode="cubic", repair_nan=True)
+    assert torch.allclose(got, torch.ones(2))
+
+
+# ---------------------------------------------------------------------------
 # readout
 # ---------------------------------------------------------------------------
 

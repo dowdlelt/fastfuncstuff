@@ -341,7 +341,7 @@ class ViewerSession:
         #: are coming back to.
         self._modes: dict[str, Mode] = {self.mode.name: self.mode}
         self.mode.attach(self)
-        self._volume_cache: dict[tuple, torch.Tensor] = {}
+        self._volume_cache: dict[tuple, tuple[torch.Tensor, bool]] = {}
         #: Display transforms of time series, per (layer, hemi, view, generation).
         self._time_views: dict[tuple, object] = {}
         #: Built on demand from a layer's voxels and kept until the flag or the
@@ -2165,6 +2165,22 @@ class ViewerSession:
         layer's data has gone, so a repaint mid-eviction draws nothing rather
         than raising into the paint handler.
         """
+        shown = self._displayed(key, index)
+        return None if shown is None else shown[0]
+
+    def display_has_nan(self, key: str, index: int | None = None) -> bool:
+        """Whether the displayed sub-brick holds a NaN anywhere.
+
+        Scanned once when the sub-brick is cached, not once per pane: it is a
+        whole-volume pass and the answer cannot change while the sub-brick does
+        not. What it buys is :func:`slicing.sample_volume`'s repair -- see there
+        for why interpolation needs to know.
+        """
+        shown = self._displayed(key, index)
+        return bool(shown is not None and shown[1])
+
+    def _displayed(self, key: str, index: int | None = None) -> tuple[torch.Tensor, bool] | None:
+        """The displayed sub-brick and whether it holds a NaN."""
         try:
             res = self.store.get(key)
         except KeyError:
@@ -2197,12 +2213,15 @@ class ViewerSession:
             tensor = torch.from_numpy(_c_order(np.asarray(arr, dtype=np.float32))).to(
                 self.display_device
             )
+        # `x != x` rather than isfinite, which allocates a float copy of its
+        # input; an infinity is a value and needs no repair either way.
+        shown = (tensor, bool((tensor != tensor).any()))
         # One sub-brick per layer is enough: panes share it, and holding more
         # would quietly duplicate what the residency store already owns.
         for stale in [k for k in self._volume_cache if k[0] == key]:
             del self._volume_cache[stale]
-        self._volume_cache[cache_key] = tensor
-        return tensor
+        self._volume_cache[cache_key] = shown
+        return shown
 
     def _device_frame(self, res: Resident, layer: Layer, idx: int) -> torch.Tensor | None:
         """Frame ``idx`` sliced from a device copy something else already made; else None.

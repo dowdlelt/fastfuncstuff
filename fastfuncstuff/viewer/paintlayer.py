@@ -199,7 +199,7 @@ class Painter:
 
     def _touched(self, key: str, flat: np.ndarray, value: int) -> None:
         """Write the change into the on-screen copy too, so nothing re-uploads."""
-        for cache_key, tensor in list(self.session._volume_cache.items()):
+        for cache_key, (tensor, _has_nan) in list(self.session._volume_cache.items()):
             if cache_key[0] != key:
                 continue
             idx = torch.as_tensor(flat, device=tensor.device)

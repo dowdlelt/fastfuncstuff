@@ -419,6 +419,7 @@ def sample_volume(
     *,
     mode: str = "bilinear",
     fill: float = 0.0,
+    repair_nan: bool = False,
 ) -> Tensor:
     """Sample a 3-D volume at fractional voxel indices.
 
@@ -427,9 +428,25 @@ def sample_volume(
     outside the volume come back as ``fill`` rather than edge-clamped, so a
     layer with a smaller field of view shows its actual extent instead of
     smearing its border across the display.
+
+    ``repair_nan`` keeps a hole from growing. Interpolation is a weighted sum,
+    so one NaN voxel makes every sample that touches it NaN -- the 8 neighbours
+    of a linear sample, 64 of a cubic one -- and a map that declines to fit some
+    voxels (ffs_pyrf outside its screen) would be drawn with a hole a voxel
+    wider than it really is, eating the real values around its rim. Where the
+    interpolated sample is NaN this falls back to the nearest voxel, which is
+    NaN only if that voxel is itself one: the hole ends up exactly its own size,
+    with a nearest-neighbour edge. The caller passes
+    :meth:`session.Session.display_has_nan`, so a volume without NaN pays
+    nothing. Not an average over the valid neighbours, which would need a
+    second resident copy of the volume for the weights.
     """
     if volume.ndim not in (3, 4):
         raise ValueError(f"expected a 3-D volume, got shape {tuple(volume.shape)}")
+    if repair_nan and mode != "nearest":
+        sampled = sample_volume(volume, layer_ijk, mode=mode, fill=fill)
+        nearest = sample_volume(volume, layer_ijk, mode="nearest", fill=fill)
+        return torch.where(sampled == sampled, sampled, nearest)
     if mode == "cubic":
         if volume.ndim == 4:
             return torch.stack([_sample_cubic(v, layer_ijk, fill=fill) for v in volume])
@@ -512,16 +529,18 @@ def extract_plane(
     view: PlaneView | None = None,
     mode: str = "bilinear",
     fill: float = 0.0,
+    repair_nan: bool = False,
 ) -> Tensor:
     """One display plane of a layer, resampled into the display grid.
 
     Returns ``(H, W)``. When the layer already sits on the display grid this
     still goes through ``grid_sample``; at 0.08 ms the special case would cost
-    more in divergent code paths than it saves.
+    more in divergent code paths than it saves. ``repair_nan`` stops a NaN hole
+    spreading into its neighbours (see :func:`sample_volume`).
     """
     ijk = plane_indices(grid, plane, position, view=view, device=volume.device, dtype=volume.dtype)
     layer_ijk = display_to_layer(ijk, grid.affine, layer_affine)
-    return sample_volume(volume, layer_ijk, mode=mode, fill=fill)
+    return sample_volume(volume, layer_ijk, mode=mode, fill=fill, repair_nan=repair_nan)
 
 
 def plane_coverage(

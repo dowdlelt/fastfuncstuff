@@ -197,6 +197,47 @@ def test_zero_threshold_still_respects_a_one_sided_mode():
     assert torch.equal(a, torch.tensor([0.0, 1.0]))
 
 
+@pytest.mark.parametrize("mode", list(AlphaMode))
+def test_a_nan_voxel_is_fully_transparent_in_every_alpha_mode(mode):
+    """A NaN is not a zero, and it must not be drawn.
+
+    ffs_pyrf writes NaN where it declined to fit (outside its screen), and under
+    the ramps NaN/thr survived the clamp: the alpha came back NaN, `rgb * NaN`
+    poisoned the composite and the whole plane clamped to black.
+    """
+    a = threshold_alpha(torch.tensor([float("nan"), 3.0, 0.5]), 2.0, mode=mode)
+    assert float(a[0]) == 0.0
+    assert float(a[1]) == 1.0  # a real suprathreshold voxel still draws
+
+
+def test_a_nan_is_transparent_with_no_threshold_set():
+    a = threshold_alpha(torch.tensor([float("nan"), -1.0, 1.0]), 0.0)
+    assert torch.equal(a, torch.tensor([0.0, 1.0, 1.0]))
+
+
+def test_an_infinity_is_suprathreshold_rather_than_dropped():
+    """Only NaN means "no value"; an infinity is a value, and a large one."""
+    a = threshold_alpha(torch.tensor([float("inf"), float("-inf")]), 2.0, mode=AlphaMode.LINEAR)
+    assert torch.equal(a, torch.ones(2))
+
+
+def test_a_nan_colours_to_a_defined_rgb():
+    """The colour is never seen -- its alpha is zero -- but a NaN LUT index is
+    an out-of-bounds gather, so it has to be a real one."""
+    lut = build_lut("hot", 256, device=CPU)
+    rgb = apply_colormap(torch.tensor([float("nan")]), lut=lut, lo=0.0, hi=1.0)
+    assert bool(torch.isfinite(rgb).all())
+    assert torch.allclose(rgb[0], lut[0])
+
+
+def test_a_transparent_layer_cannot_poison_the_stack_with_nan():
+    """Alpha zero contributes nothing, including when its colour is undefined."""
+    red = torch.tensor([[1.0, 0.0, 0.0]])
+    broken = torch.full((1, 3), float("nan"))
+    out = composite([(red, torch.ones(1)), (broken, torch.zeros(1))])
+    assert torch.allclose(out, red, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # boxed outlines
 # ---------------------------------------------------------------------------

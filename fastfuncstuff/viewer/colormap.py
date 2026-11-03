@@ -177,10 +177,16 @@ def apply_colormap(
     sign_mode: SignMode = SignMode.BOTH,
     n_panes: int = 0,
 ) -> Tensor:
-    """Colour a field, returning ``(..., 3)`` RGB in ``[0, 1]``."""
+    """Colour a field, returning ``(..., 3)`` RGB in ``[0, 1]``.
+
+    A NaN gets the bottom of the scale rather than whatever a NaN happens to
+    cast to as an index. The colour is not meant to be seen -- the alpha of a
+    NaN is zero (:func:`threshold_alpha`) -- but it has to be a defined one,
+    because a NaN that reached the LUT index would be an out-of-bounds gather.
+    """
     unit = quantize(normalize(values, lo, hi, sign_mode=sign_mode), n_panes)
-    idx = (unit * (lut.shape[0] - 1)).round().long().clamp(0, lut.shape[0] - 1)
-    return lut[idx]
+    idx = (unit * (lut.shape[0] - 1)).nan_to_num().round().long()
+    return lut[idx.clamp(0, lut.shape[0] - 1)]
 
 
 def apply_label_colors(values: Tensor, palette: Tensor) -> tuple[Tensor, Tensor]:
@@ -227,6 +233,14 @@ def threshold_alpha(
     With ``AlphaMode.OFF`` this is a hard mask -- the classic behaviour where a
     voxel is either drawn or not. The ramps fade what lies below threshold, and
     reach zero only at zero, so nothing is hidden that was merely close.
+
+    **A NaN is fully transparent, in every mode.** "No value here" is what a
+    tool writes where it declined to fit -- outside ffs_pyrf's screen, say --
+    and it is not a zero: the voxel must not darken the image, tint it, or count
+    towards anything drawn over it. The comparisons alone very nearly do this,
+    because every comparison against NaN is false; the ramps are what did not,
+    since ``NaN / thr`` survives the clamp and ``rgb * NaN`` then blacked out
+    the whole plane in the composite.
     """
     if sign_mode is SignMode.POS:
         magnitude = stat.clamp(min=0.0)
@@ -235,12 +249,17 @@ def threshold_alpha(
     else:
         magnitude = stat.abs()
 
+    # NaN only, not every non-finite value: an infinity is suprathreshold and
+    # drawn, and `x == x` costs one boolean against isfinite's float copy of
+    # the input (see ../fmri_wiki, torch.isfinite allocates a float copy).
+    is_number = magnitude == magnitude
+
     thr = abs(float(threshold))
     if thr <= 0.0:
         # No threshold set: everything is fully opaque, but a one-sided mode
         # still hides the side it does not show.
         if sign_mode is SignMode.BOTH:
-            return torch.ones_like(magnitude)
+            return is_number.to(magnitude.dtype)
         return (magnitude > 0).to(magnitude.dtype)
 
     passed = magnitude >= thr
@@ -249,7 +268,8 @@ def threshold_alpha(
     ramp = (magnitude / thr).clamp(0.0, 1.0)
     if mode is AlphaMode.QUADRATIC:
         ramp = ramp * ramp
-    return torch.where(passed, torch.ones_like(ramp), ramp)
+    ramp = torch.where(passed, torch.ones_like(ramp), ramp)
+    return torch.where(is_number, ramp, torch.zeros_like(ramp))
 
 
 def suprathreshold_edges(
@@ -293,7 +313,11 @@ def composite(layers: list[tuple[Tensor, Tensor]], *, background: float = 0.0) -
     out = torch.full_like(rgb0, float(background))
     for rgb, alpha in layers:
         a = alpha.unsqueeze(-1) if alpha.ndim == rgb.ndim - 1 else alpha
-        out = rgb * a + out * (1.0 - a)
+        # Branching on the alpha rather than multiplying by it: the blend is
+        # the same wherever it is zero, but `NaN * 0` is NaN, so a single
+        # undefined colour in a layer that is transparent there would spread
+        # through the rest of the stack and clamp to black.
+        out = torch.where(a > 0, rgb * a + out * (1.0 - a), out)
     return out.clamp(0.0, 1.0)
 
 

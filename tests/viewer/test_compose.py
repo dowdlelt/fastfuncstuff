@@ -179,6 +179,69 @@ def test_alpha_mode_draws_more_than_a_hard_threshold(session, anat, stats):
     assert drawn() > hard
 
 
+@pytest.mark.parametrize("mode", ["off", "linear", "quadratic"])
+def test_a_nan_overlay_is_transparent_rather_than_black(session, anat, tmp_path, mode):
+    """The whole point of NaN: the anatomy below shows through unchanged.
+
+    ffs_pyrf writes NaN for voxels it left out of the fit (outside the screen).
+    Under the ramps the alpha came back NaN, and `rgb * NaN` in the composite
+    blacked out the pane -- not just the holes.
+    """
+    session.load(anat)
+    session.do(SetIJK(5, 6, 4))
+    base = render_plane(session, Plane.AXIAL)
+
+    blob = np.full((12, 14, 10), np.nan, dtype=np.float32)
+    blob[4:7, 5:8, 3:6] = 9.0
+    key = session.load(_write(tmp_path, f"holes_{mode}.nii.gz", blob))
+    session.do(SetThreshold(key, 4.0))
+    session.do(SetAlpha(key, mode))
+    over = render_plane(session, Plane.AXIAL)
+
+    assert bool(torch.isfinite(over.rgba.float()).all())
+    changed = (over.rgba.int() - base.rgba.int()).abs().sum(-1) > 0
+    assert int(changed.sum()) > 0, "the real part of the overlay drew nothing"
+    assert int((~changed).sum()) > 0, "the NaN part was drawn over the anatomy"
+    # Wherever it is NaN the pane is the anatomy, byte for byte.
+    assert torch.equal(over.rgba[~changed], base.rgba[~changed])
+
+
+def test_a_nan_hole_does_not_eat_the_voxels_around_it(session, tmp_path):
+    """Interpolation spreads a NaN (slicing.sample_volume); the hole must not grow.
+
+    Drawn on a finer display grid than the layer, which is when the sampling is
+    interpolated rather than nearest and every pixel in the hole's neighbourhood
+    came back NaN.
+    """
+    # Not round numbers: a volume of integers is taken for a label map, and a
+    # label map is drawn nearest whatever is asked, which would hide the bug.
+    blob = np.zeros((12, 14, 10), dtype=np.float32)
+    blob[2:10, 2:12, 2:8] = 9.25
+
+    def undrawn(volume) -> int:
+        """Pixels the layer leaves at the background, alone over a black pane."""
+        s = ViewerSession(device=CPU)
+        try:
+            key = s.load(_write(tmp_path, "hole.nii.gz", volume))
+            s.do(SetThreshold(key, 4.0))
+            s.do(SetAlpha(key, "linear"))
+            s.do(SetIJK(6, 6, 4))
+            assert s.resample_mode(s.state.layers.find(key)) == "linear"
+            img = render_plane(s, Plane.AXIAL)
+            return int((img.rgba[..., :3].int().sum(-1) == 0).sum())
+        finally:
+            s.close()
+
+    whole = undrawn(blob)
+    blob[6, 6, 4] = np.nan
+    hole = undrawn(blob)
+    # Exactly the hole's own pixel. Measured unrepaired: 4, the in-plane half of
+    # the eight neighbours a trilinear sample touches -- and it happens even on
+    # this identical grid, where every sample sits on a voxel centre, because a
+    # zero weight against NaN is still NaN.
+    assert hole - whole == 1, (hole, whole)
+
+
 def test_boxed_mode_adds_an_outline(session, anat, stats):
     session.load(anat)
     key = session.load(stats)
