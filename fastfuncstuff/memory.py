@@ -634,6 +634,35 @@ def bytes_per_voxel_prf_type_gains(
     return (6 * n_pixels + (3 * n_types + 4) * n_timepoints + 2 * n_types * n_types) * 4
 
 
+def bytes_per_voxel_prf_per_type(
+    n_timepoints: int,
+    n_pixels: int,
+    n_types: int,
+) -> int:
+    """Per-voxel peak of the per-stimulus-type refinement (block coordinate descent).
+
+    Each block step is an ordinary single-pRF refinement, so it carries
+    :func:`bytes_per_voxel_prf` in full. Alongside it live the per-type
+    predictions, the summed contribution of the other types, and the partial
+    residual that block is fitted against -- three temporal blocks plus the
+    per-type stack, doubled for the projection being out of place.
+    """
+    return bytes_per_voxel_prf(n_timepoints, n_pixels) + (2 * n_types + 4) * n_timepoints * 4
+
+
+def prf_per_type_voxel_chunk(
+    n_voxels: int,
+    n_timepoints: int,
+    n_pixels: int,
+    n_types: int,
+    device: torch.device,
+) -> int:
+    """Voxels per chunk for :func:`bytes_per_voxel_prf_per_type` passes."""
+    avail = get_available_memory(device, empty_cache=False)
+    chunk = avail // max(1, bytes_per_voxel_prf_per_type(n_timepoints, n_pixels, n_types))
+    return int(max(1, min(n_voxels, chunk)))
+
+
 def prf_type_gain_voxel_chunk(
     n_voxels: int,
     n_timepoints: int,

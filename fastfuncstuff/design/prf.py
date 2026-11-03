@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import orthogonalize_design
@@ -168,6 +169,25 @@ class PRFTypeGainFit:
     def delta_r2(self) -> torch.Tensor:
         """How much separating the types bought, in R2."""
         return self.r2 - self.single_r2
+
+
+@dataclass
+class PRFPerTypeFit:
+    """A pRF per stimulus type: the fully flexible end of the ladder.
+
+    ``parameters`` is ``(n_voxels, n_types, 4)``. Which of the four a type may
+    move is the caller's choice (``free_parameters``); the rest keep the value
+    the combined fit gave them, identical across types.
+    """
+
+    parameters: torch.Tensor  # (n_voxels, n_types, 4)
+    gains: torch.Tensor  # (n_voxels, n_types)
+    amplitude: torch.Tensor  # (n_voxels, n_types)
+    residual_ss: torch.Tensor
+    total_ss: torch.Tensor
+    r2: torch.Tensor
+    free_parameters: tuple[int, ...] = ()
+    n_sweeps: int = 0
 
 
 @dataclass
@@ -738,6 +758,20 @@ class _ApertureRun:
     rows: int
     key: tuple[int, ...]
 
+    def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        """Move the frame table, so a compressed run passes anywhere a dense one does.
+
+        Callers accept ``Sequence[Tensor] | Sequence[_ApertureRun]`` and some of
+        them move the runs to the compute device first; without this an
+        already-compressed run (the per-type streams, say) could not be handed
+        to them.
+        """
+        frames = self.frames.to(device=device, dtype=dtype)
+        inverse = self.inverse.to(device=device)
+        if frames is self.frames and inverse is self.inverse:
+            return self
+        return replace(self, frames=frames, inverse=inverse)
+
 
 def _compress_aperture_runs(
     stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun],
@@ -892,6 +926,13 @@ def split_aperture_by_type(
             )
         )
     return streams
+
+
+def aperture_timepoints(stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun]) -> int:
+    """Total timepoints over runs given either dense movies or compressed ones."""
+    return sum(
+        run.n_timepoints if isinstance(run, _ApertureRun) else run.shape[0] for run in stimulus_runs
+    )
 
 
 def _frame_blocks(run: _ApertureRun, columns: int) -> list[slice]:
@@ -1978,7 +2019,7 @@ def _predict_selected_prfs(
     voxel_chunk_size: int,
 ) -> torch.Tensor:
     """Predict one selected-HRF CSS response for each voxel."""
-    n_timepoints = sum(run.shape[0] for run in stimulus_runs)
+    n_timepoints = aperture_timepoints(stimulus_runs)
     prediction = torch.empty(
         (n_timepoints, parameters.shape[0]), device=parameters.device, dtype=parameters.dtype
     )
@@ -2117,6 +2158,236 @@ def fit_prf_type_gains(
             fit.total_ss[chunk] = total_ss
             fit.r2[chunk] = 1.0 - residual_ss / total_ss.clamp_min(eps)
             fit.single_r2[chunk] = 1.0 - single_ss / total_ss.clamp_min(eps)
+    return fit
+
+
+def _per_type_predictions(
+    compressed: Sequence[_ApertureRun],
+    parameters: torch.Tensor,
+    hrf_index: torch.Tensor,
+    hrf_library: torch.Tensor,
+    stimulus_shape: tuple[int, int],
+    type_labels: Sequence[torch.Tensor],
+    n_types: int,
+) -> torch.Tensor:
+    """``(time, voxels, n_types)`` unit-gain predictors, each voxel on its OWN HRF.
+
+    Grouped by HRF the way every other path here is. Handing the whole library
+    to the applier instead silently convolves every voxel with library row 0,
+    which is invisible on a single-HRF library and wrong on any real one.
+    """
+    n_timepoints = aperture_timepoints(compressed)
+    out = parameters.new_empty((n_timepoints, parameters.shape[0], n_types))
+    for selected_hrf in hrf_index.unique(sorted=True).tolist():
+        rows = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
+        out[:, rows] = css_prediction_by_type(
+            compressed,
+            parameters[rows],
+            hrf_library[selected_hrf],
+            stimulus_shape,
+            type_labels,
+            n_types,
+            per_type_parameters=True,
+        )
+    return out
+
+
+def refine_prf_per_type(
+    data: torch.Tensor,
+    stimulus_runs: Sequence[torch.Tensor],
+    stimulus_shape: tuple[int, int],
+    parameters: torch.Tensor,
+    hrf_index: torch.Tensor,
+    hrf_library: torch.Tensor,
+    run_starts: Sequence[int],
+    type_labels: Sequence[torch.Tensor],
+    n_types: int,
+    free_parameters: Sequence[int],
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None = None,
+    voxel_chunk_size: int = 20_000,
+    config: PRFRefinementConfig = PRFRefinementConfig(),
+    n_sweeps: int = 3,
+    improvement_tolerance: float = 1e-4,
+    verbose: bool = False,
+) -> PRFPerTypeFit:
+    """Give each stimulus type its own pRF, by block coordinate descent over types.
+
+    Starting from the combined fit, each sweep refines one type at a time
+    against the residual the other types leave, then re-solves every gain
+    jointly. The parameters in ``free_parameters`` are the only ones a type may
+    move; the others stay where the combined fit put them, identical across
+    types, which is what makes a partially tied model well posed.
+
+    **Why coordinate descent and not a joint Gauss-Newton.** A joint step would
+    need a Jacobian over ``n_types * 4`` parameters with the gain vector's own
+    derivative threaded through it -- a second refiner beside the one that
+    already handles shape bucketing, line search, HRF grouping and damping.
+    Coordinate descent reuses that refiner untouched: a block step IS an
+    ordinary single-pRF refinement, of one type's aperture stream against one
+    partial residual. And it costs little here, because the thing that makes
+    the per-type grid tractable also makes the blocks nearly independent --
+    stream ``k`` is zero wherever ``label != k``, so for a blocked design the
+    only coupling is HRF spillover at the boundaries and the shared drift.
+
+    Every step is monotone in the residual: a block step minimises over that
+    type's parameters and gain given the others, and the joint gain re-solve
+    minimises over all gains at fixed parameters. Sweeps stop early when a full
+    sweep improves the summed residual by less than
+    ``improvement_tolerance`` of it.
+
+    The HRF is shared across types. A per-type HRF would be a different and
+    much larger claim -- that the vasculature responds with a different timing
+    to the same location depending on what was shown there.
+    """
+    free_columns = tuple(sorted(set(int(index) for index in free_parameters)))
+    if not free_columns:
+        raise ValueError(
+            "free_parameters is empty: with nothing free per type this is the tied "
+            "model, so call fit_prf_type_gains instead"
+        )
+    if not 1 <= n_types <= MAX_STIMULUS_TYPES:
+        raise ValueError(f"n_types must be between 1 and {MAX_STIMULUS_TYPES}")
+    block_config = replace(config, free_parameters=free_columns)
+    block_config.free_indices()  # validate before any work
+    n_voxels = parameters.shape[0]
+    device, dtype = parameters.device, parameters.dtype
+    eps = torch.finfo(dtype).eps
+
+    fit = PRFPerTypeFit(
+        parameters=parameters.unsqueeze(1).repeat(1, n_types, 1),
+        gains=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
+        amplitude=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
+        residual_ss=torch.zeros(n_voxels, device=device, dtype=dtype),
+        total_ss=torch.zeros(n_voxels, device=device, dtype=dtype),
+        r2=torch.zeros(n_voxels, device=device, dtype=dtype),
+        free_parameters=free_columns,
+        n_sweeps=0,
+    )
+    compressed = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    # One aperture stream per type, shared frame table (see split_aperture_by_type).
+    streams = [
+        split_aperture_by_type(run, labels, n_types)
+        for run, labels in zip(compressed, type_labels, strict=True)
+    ]
+    per_type_runs = [[run_streams[index] for run_streams in streams] for index in range(n_types)]
+
+    sweeps_used = 0
+    for start in tqdm(
+        range(0, n_voxels, voxel_chunk_size),
+        desc="Refining per stimulus type",
+        unit="chunk",
+        disable=not verbose or n_voxels <= voxel_chunk_size,
+        leave=True,
+    ):
+        stop = min(start + voxel_chunk_size, n_voxels)
+        rows = slice(start, stop)
+        chunk_data = data[rows]
+        chunk_hrf = hrf_index[rows]
+        current = fit.parameters[rows].clone()
+        # Start at the TIED solution, parameters and gains both. Leaving the
+        # gains at zero makes the first block step fit its own type against the
+        # whole of the data, including every other type's signal -- which a
+        # stream that is blank half the time cannot explain, so with all four
+        # parameters free it distorts badly to try (measured: the exponent ran
+        # to 12.2 against a simulated 1.0, and later sweeps only crawled back).
+        # Seeded here, sweep one starts from the tied residual and the result
+        # can never be worse than the tied model's.
+        observed = _project_per_run(chunk_data.T, nuisance_per_run, run_starts)
+        tied_predictions = _project_prf_derivatives(
+            _per_type_predictions(
+                compressed,
+                current,
+                chunk_hrf,
+                hrf_library,
+                stimulus_shape,
+                type_labels,
+                n_types,
+            ),
+            nuisance_per_run,
+            run_starts,
+        )
+        gains, tied_ss = variable_projection_sse_by_type(observed, tied_predictions)
+        del tied_predictions
+
+        previous_ss = float(tied_ss.sum())
+        for sweep in range(max(1, n_sweeps)):
+            for stimulus_type in range(n_types):
+                # What the other types already explain, so this block fits only
+                # what is left for it.
+                others = torch.zeros(
+                    (sum(run.n_timepoints for run in compressed), stop - start),
+                    device=device,
+                    dtype=dtype,
+                )
+                for other in range(n_types):
+                    if other == stimulus_type or not bool((gains[:, other] > 0).any()):
+                        continue
+                    others += _predict_selected_prfs(
+                        per_type_runs[other],
+                        current[:, other, :],
+                        chunk_hrf,
+                        gains[:, other],
+                        hrf_library,
+                        stimulus_shape,
+                        stop - start,
+                    )
+                seed = PRFGridFit(
+                    candidate_index=torch.zeros(stop - start, dtype=torch.long, device=device),
+                    hrf_index=chunk_hrf,
+                    parameters=current[:, stimulus_type, :].contiguous(),
+                    gain=gains[:, stimulus_type].clamp_min(eps),
+                    correlation=torch.zeros(stop - start, device=device, dtype=dtype),
+                    r2=torch.zeros(stop - start, device=device, dtype=dtype),
+                )
+                block = refine_prf_supergrid(
+                    chunk_data - others.T,
+                    per_type_runs[stimulus_type],
+                    stimulus_shape,
+                    seed,
+                    hrf_library,
+                    run_starts,
+                    nuisance_per_run=nuisance_per_run,
+                    voxel_chunk_size=stop - start,
+                    config=block_config,
+                )
+                current[:, stimulus_type, :] = block.parameters
+                gains[:, stimulus_type] = block.gain
+                del others
+
+            # Every gain again, at the parameters this sweep reached: the block
+            # steps each saw their own type's residual, not the cross terms.
+            predictions = _project_prf_derivatives(
+                _per_type_predictions(
+                    compressed,
+                    current,
+                    chunk_hrf,
+                    hrf_library,
+                    stimulus_shape,
+                    type_labels,
+                    n_types,
+                ),
+                nuisance_per_run,
+                run_starts,
+            )
+            gains, residual_ss = variable_projection_sse_by_type(observed, predictions)
+            sweeps_used = max(sweeps_used, sweep + 1)
+            summed = float(residual_ss.sum())
+            if previous_ss is not None and previous_ss - summed <= improvement_tolerance * max(
+                previous_ss, eps
+            ):
+                previous_ss = summed
+                break
+            previous_ss = summed
+
+        total_ss = (observed - observed.mean(dim=0, keepdim=True)).square().sum(dim=0)
+        fit.parameters[rows] = current
+        fit.gains[rows] = gains
+        fit.amplitude[rows] = predictions.amax(dim=0) * gains
+        fit.residual_ss[rows] = residual_ss
+        fit.total_ss[rows] = total_ss
+        fit.r2[rows] = 1.0 - residual_ss / total_ss.clamp_min(eps)
+        del predictions, observed
+    fit.n_sweeps = sweeps_used
     return fit
 
 

@@ -2913,3 +2913,182 @@ class TestFreeParameterSelection:
     def test_rejects_an_impossible_free_set(self, kwargs, message):
         with pytest.raises(ValueError, match=message):
             PRFRefinementConfig(**kwargs).free_indices()
+
+
+class TestPerTypeRefinement:
+    """A pRF per stimulus type, by block coordinate descent over types."""
+
+    def _problem(self, n_time=100):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+        from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+        torch.manual_seed(0)
+        shape = (10, 10)
+        runs = [torch.rand(n_time, 100), torch.rand(n_time, 100)]
+        labels = [torch.where(torch.arange(n_time) % 40 < 20, 1, 2) for _ in runs]
+        hrf = torch.rand(1, 6)
+        hrf = hrf / hrf.sum()
+        # Voxel 0's types sit in different places; voxel 1's do not.
+        truth = torch.zeros(2, 2, 4)
+        truth[0, 0] = torch.tensor([3.0, 3.0, 2.0, 1.0])
+        truth[0, 1] = torch.tensor([7.0, 7.0, 2.0, 1.0])
+        truth[1, 0] = torch.tensor([5.0, 5.0, 2.0, 1.0])
+        truth[1, 1] = torch.tensor([5.0, 5.0, 2.0, 1.0])
+        predictors = css_prediction_by_type(
+            runs, truth, hrf[0], shape, labels, 2, per_type_parameters=True
+        )
+        clean = torch.einsum("tvi,vi->tv", predictors, torch.full((2, 2), 8.0))
+        data = (100.0 + clean + 0.05 * torch.randn(2 * n_time, 2)).T
+        # The combined fit lands between the two, which is wrong for voxel 0.
+        start = torch.tensor([[5.0, 5.0, 2.0, 1.0], [5.0, 5.0, 2.0, 1.0]])
+        return dict(
+            data=data,
+            stimulus_runs=runs,
+            stimulus_shape=shape,
+            parameters=start,
+            hrf_index=torch.zeros(2, dtype=torch.long),
+            hrf_library=hrf,
+            run_starts=[0, n_time],
+            type_labels=labels,
+            n_types=2,
+            nuisance_per_run=[
+                construct_polynomial_matrix(n_time, 1, device=torch.device("cpu")) for _ in runs
+            ],
+            voxel_chunk_size=2,
+        ), truth
+
+    def _tied(self, problem):
+        from fastfuncstuff.design.prf import fit_prf_type_gains
+
+        keys = (
+            "data",
+            "stimulus_runs",
+            "parameters",
+            "hrf_index",
+            "hrf_library",
+            "stimulus_shape",
+            "type_labels",
+            "n_types",
+            "run_starts",
+            "nuisance_per_run",
+            "voxel_chunk_size",
+        )
+        return fit_prf_type_gains(**{key: problem[key] for key in keys})
+
+    @pytest.mark.parametrize("free", [(0, 1), (0, 1, 2, 3)])
+    def test_recovers_two_receptive_fields_where_they_differ(self, free):
+        """And leaves them together where they do not.
+
+        Measured with free=(0,1,2,3): voxel 0 comes back (2.97, 3.05, 1.95,
+        0.97) and (6.87, 7.02, 1.93, 0.98) against simulated (3,3,2,1) and
+        (7,7,2,1), while voxel 1's two types stay within 0.14 of each other.
+        R2 rises 0.091 for the voxel that distinguishes the types and 0.0004
+        for the one that does not.
+        """
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, truth = self._problem()
+        fit = refine_prf_per_type(**problem, free_parameters=free, n_sweeps=3)
+
+        # The differing voxel: both positions found, and not swapped.
+        for stimulus_type in (0, 1):
+            np.testing.assert_allclose(
+                fit.parameters[0, stimulus_type, :2].numpy(),
+                truth[0, stimulus_type, :2].numpy(),
+                atol=0.5,
+            )
+        # The flat voxel: the two types stay on top of each other.
+        assert float((fit.parameters[1, 0, :2] - fit.parameters[1, 1, :2]).abs().max()) < 0.4
+
+        tied = self._tied(problem)
+        assert float(fit.r2[0] - tied.r2[0]) > 0.05, "no gain where the types differ"
+        assert abs(float(fit.r2[1] - tied.r2[1])) < 0.01, "gain where there is nothing to find"
+
+    def test_never_fits_worse_than_the_tied_model(self):
+        """The seeding guarantee.
+
+        Coordinate descent starts at the tied solution -- parameters AND
+        per-type gains -- so every step after that can only reduce the
+        residual. Leaving the gains at zero instead made the first block step
+        fit its own type against the whole of the data, every other type's
+        signal included, and with all four parameters free it distorted badly
+        trying: the exponent ran to 12.2 against a simulated 1.0 and the
+        residual started 4x WORSE than tied.
+        """
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, _truth = self._problem()
+        tied = self._tied(problem)
+        for free in ((0, 1), (0, 1, 2, 3)):
+            for sweeps in (1, 2):
+                fit = refine_prf_per_type(
+                    **problem, free_parameters=free, n_sweeps=sweeps, improvement_tolerance=0.0
+                )
+                assert bool((fit.residual_ss <= tied.residual_ss + 1e-3).all()), (
+                    free,
+                    sweeps,
+                    fit.residual_ss,
+                    tied.residual_ss,
+                )
+                # And the exponent stays physical.
+                assert float(fit.parameters[..., 3].max()) < 3.0
+
+    def test_sweeps_do_not_increase_the_residual(self):
+        """Monotone to float noise: measured 0.745 -> 0.727 over two sweeps."""
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, _truth = self._problem()
+        totals = []
+        for sweeps in (1, 2, 3):
+            fit = refine_prf_per_type(
+                **problem,
+                free_parameters=(0, 1, 2, 3),
+                n_sweeps=sweeps,
+                improvement_tolerance=0.0,
+            )
+            totals.append(float(fit.residual_ss.sum()))
+        for earlier, later in zip(totals[:-1], totals[1:], strict=True):
+            # 1e-2 absolute: the block refine has its own convergence tolerance
+            # and the reductions are float32, so the last decimal wanders.
+            assert later <= earlier + 1e-2, totals
+
+    def test_tied_parameters_stay_identical_across_types(self):
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, _truth = self._problem()
+        fit = refine_prf_per_type(**problem, free_parameters=(0, 1), n_sweeps=2)
+        # sigma and exponent were not freed, so they must not have moved apart.
+        torch.testing.assert_close(fit.parameters[:, 0, 2:], fit.parameters[:, 1, 2:])
+        torch.testing.assert_close(fit.parameters[:, 0, 2:], problem["parameters"][:, 2:])
+        assert fit.free_parameters == (0, 1)
+
+    def test_each_voxel_keeps_its_own_hrf(self):
+        """Regression: the gain re-solve used to convolve everyone with library row 0.
+
+        Invisible on a one-HRF library and wrong on any real one, so the test
+        uses two very different HRFs and voxels assigned to different rows.
+        """
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, _truth = self._problem()
+        slow = torch.zeros(6)
+        slow[4] = 1.0
+        fast = torch.zeros(6)
+        fast[0] = 1.0
+        problem["hrf_library"] = torch.stack([fast, slow])
+        problem["hrf_index"] = torch.tensor([0, 1])
+        split = refine_prf_per_type(**problem, free_parameters=(0, 1), n_sweeps=1)
+
+        problem["hrf_index"] = torch.tensor([0, 0])
+        forced = refine_prf_per_type(**problem, free_parameters=(0, 1), n_sweeps=1)
+        # Voxel 1 was simulated on neither HRF, but the two assignments must not
+        # produce the same fit -- that would mean hrf_index was ignored.
+        assert not torch.allclose(split.r2, forced.r2, atol=1e-5)
+        assert float(split.r2[0] - forced.r2[0]) == pytest.approx(0.0, abs=1e-5)
+
+    def test_an_empty_free_set_says_to_use_the_tied_fit(self):
+        from fastfuncstuff.design.prf import refine_prf_per_type
+
+        problem, _truth = self._problem()
+        with pytest.raises(ValueError, match="fit_prf_type_gains"):
+            refine_prf_per_type(**problem, free_parameters=())
