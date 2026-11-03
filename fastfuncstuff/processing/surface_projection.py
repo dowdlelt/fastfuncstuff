@@ -29,8 +29,10 @@ from fastfuncstuff.surface.topology import MeshBundle
 
 __all__ = [
     "DEFAULT_DEPTHS",
+    "AnatCheck",
     "HemiTarget",
     "SurfaceFold",
+    "check_anat",
     "depth_weights",
     "output_paths",
     "project_to_surface",
@@ -497,3 +499,110 @@ def project_to_surface(
             chain_base=nwarp_kwargs.get("chain_base"),
         )  # fmt: skip
     return written
+
+
+#: Depths the anat check reads the ribbon at: just inside white, mid-ribbon, just
+#: inside pial, and beyond it. 0.1/0.9 are the pair the separability is built from.
+_CHECK_DEPTHS = (0.1, 0.5, 0.9, 1.3)
+
+#: Below this, the ribbon is not sitting on the anat's tissue boundary -- the
+#: surfaces and the volume are not the same head in the same frame. Measured on a
+#: 0.8 mm recon: 1.3-2.2 placed correctly (FS brain, FS orig and the raw oblique
+#: T1w alike), 0.07-0.10 at 5 mm of offset, 0.02 at 12 mm. The gap is 20x, so the
+#: threshold is not delicate.
+MIN_RIBBON_SEPARABILITY = 0.4
+
+#: Fraction of ribbon points that must land inside the anat's FOV. Catches a
+#: cropped or differently-sized anat, which separability alone does not: a pure
+#: shift keeps every point in a whole-head FOV.
+MIN_RIBBON_INSIDE = 0.98
+
+
+@dataclass
+class AnatCheck:
+    """How well a subject's cortical ribbon sits on an anatomical volume.
+
+    ``separability`` is the white/pial median split in units of the within-depth
+    IQR: large when the ribbon straddles a real tissue boundary, ~0 when it is
+    reading mush. Deliberately blind to contrast polarity, so a T2w anat passes
+    on the same number as a T1w -- only the ``profile`` says which way up it is.
+    """
+
+    anat: str
+    profile: dict[float, tuple[float, float, float]]  # depth -> (inside, median, iqr)
+    separability: float
+    inside: float  # the ribbon depths' worst in-FOV fraction
+
+    @property
+    def ok(self) -> bool:
+        return self.separability >= MIN_RIBBON_SEPARABILITY and self.inside >= MIN_RIBBON_INSIDE
+
+    def report(self) -> str:
+        rows = "\n".join(
+            f"    depth {d:>4}:  median {m:10.4g}   IQR {q:9.4g}   in FOV {f * 100:5.1f}%"
+            for d, (f, m, q) in self.profile.items()
+        )
+        return (
+            f"  anat: {self.anat}\n{rows}\n"
+            f"    white/pial separability {self.separability:.2f} "
+            f"(>= {MIN_RIBBON_SEPARABILITY} expected; depth 1.3 is beyond the pial)"
+        )
+
+
+def check_anat(
+    subject_dir: str | os.PathLike,
+    anat: str | os.PathLike,
+    hemis=("lh", "rh"),
+    stride: int = 7,
+) -> AnatCheck:
+    """Read ``anat`` along the subject's ribbon and say whether the two agree.
+
+    The projection's one hard requirement is that the chain ends in the anatomy
+    the surfaces were built on (see this module's docstring). Nothing in a header
+    can state that: FreeSurfer's conform keeps the scanner frame, so the recon's
+    volumes and the T1w it ran on have identical scanner RAS and differ only in
+    grid -- while a T1w from another session has a perfectly valid scanner RAS of
+    its own that means a differently positioned head. So the agreement is measured
+    on the data instead: a ribbon in the right place reads white matter at depth
+    0.1 and grey at 0.9, and a ribbon in the wrong place reads the same mixture at
+    both.
+
+    ``stride`` subsamples the vertices; 7 is ~40k points a hemisphere, enough for
+    a median and cheap enough to run inside argument validation.
+    """
+    from fastfuncstuff.io.afni import load_nifti
+
+    subject_dir = resolve_subject(subject_dir)
+    img = load_nifti(str(anat))
+    vol = np.asarray(img.dataobj)
+    if vol.ndim > 3:
+        vol = vol[..., 0]
+    inv = np.linalg.inv(np.asarray(img.affine, np.float64))
+    shape = np.asarray(vol.shape[:3])
+
+    white, pial = [], []
+    for hemi in hemis:
+        w, _ = read_scanner_surface(subject_dir / "surf" / f"{hemi}.white")
+        p, _ = read_scanner_surface(subject_dir / "surf" / f"{hemi}.pial")
+        white.append(w[::stride].astype(np.float64))
+        pial.append(p[::stride].astype(np.float64))
+    w = np.concatenate(white)
+    p = np.concatenate(pial)
+
+    profile: dict[float, tuple[float, float, float]] = {}
+    for depth in _CHECK_DEPTHS:
+        q = w + depth * (p - w)
+        idx = np.rint((inv[:3, :3] @ q.T).T + inv[:3, 3]).astype(np.int64)
+        good = np.all((idx >= 0) & (idx < shape), axis=1)
+        if not good.any():
+            profile[depth] = (0.0, float("nan"), float("nan"))
+            continue
+        s = np.asarray(vol[idx[good, 0], idx[good, 1], idx[good, 2]], np.float64)
+        lo, hi = np.percentile(s, [25, 75])
+        profile[depth] = (float(good.mean()), float(np.median(s)), float(hi - lo))
+
+    (_, wm_med, wm_iqr), (_, gm_med, gm_iqr) = profile[0.1], profile[0.9]
+    spread = 0.5 * (wm_iqr + gm_iqr)
+    sep = 0.0 if not spread > 0 else abs(wm_med - gm_med) / spread
+    inside = min(profile[d][0] for d in _CHECK_DEPTHS if d <= 1.0)
+    return AnatCheck(str(anat), profile, float(np.nan_to_num(sep)), inside)
