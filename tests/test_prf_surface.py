@@ -115,3 +115,74 @@ def test_noise_pool_mask_is_refused_on_surface_input(surface_runs, tmp_path):
 
     with pytest.raises(SystemExit):
         main(argv)
+
+
+# --------------------------------------------------------------------------------
+# A surface fit writes surface results, however the surface data arrived
+# --------------------------------------------------------------------------------
+
+
+def test_domain_prefix_is_one_rule_for_every_tool():
+    """ffs_pyrf, ffs_denoise and ffs_varpart all need it and all need it to agree."""
+    from fastfuncstuff.cli_utils import domain_prefix
+
+    # No extension typed: the right default, silently.
+    assert domain_prefix("out", surface=True).nifti_ext == ".func.gii"
+    assert domain_prefix("out", surface=True, surface_ext=".shape.gii").nifti_ext == ".shape.gii"
+    assert domain_prefix("out", surface=False).nifti_ext == ".nii.gz"
+    # An extension the user typed is a choice, so it is kept where it can be.
+    assert domain_prefix("out.shape.gii", surface=True).nifti_ext == ".shape.gii"
+    assert domain_prefix("out.nii.zst", surface=False).nifti_ext == ".nii.zst"
+    assert domain_prefix("out.nii.gz", surface=False).stem == "out"
+    # Naming the other domain is refused rather than overridden.
+    with pytest.raises(ValueError, match=r"names a NIfTI file.*on a surface"):
+        domain_prefix("out.nii.gz", surface=True)
+    with pytest.raises(ValueError, match=r"names a GIfTI file.*on a volume"):
+        domain_prefix("out.func.gii", surface=False)
+
+
+def test_gifti_input_writes_gifti_without_fs_subj(capsys):
+    """The bug: the promotion was gated on -fs_subj, so GIfTI runs handed straight
+    to -input kept a NIfTI prefix and 40962 vertices were written as a (V, 1, 1)
+    volume that no surface tool will take."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.pyrf import _surface_prefix
+    from fastfuncstuff.cli_utils import parse_prefix
+
+    def resolve(prefix, inputs, fs_subj=None, verb=1):
+        args = Namespace(prefix=prefix, fs_subj=fs_subj, verb=verb)
+        return _surface_prefix(args, None, parse_prefix(prefix), inputs)
+
+    gii = ["run1.lh.func.gii", "run2.lh.func.gii"]
+    assert resolve("out", gii).nifti_ext == ".func.gii"
+    assert "surface -input" in capsys.readouterr().out  # and it says so
+    # A sub-brick selector on the input must not hide the extension.
+    assert resolve("out", ["run1.lh.func.gii[0..$]"]).nifti_ext == ".func.gii"
+    # -fs_subj reaches the same place from volumes.
+    assert resolve("out", ["run1.nii.gz"], fs_subj="/fs/sub-X").nifti_ext == ".func.gii"
+    # Volumes stay volumes, and say nothing.
+    capsys.readouterr()
+    assert resolve("out", ["run1.nii.gz"]).nifti_ext == ".nii.gz"
+    assert capsys.readouterr().out == ""
+
+
+def test_a_nifti_prefix_on_a_surface_fit_is_refused_not_overridden():
+    """-prefix out.nii.gz with GIfTI input is a contradiction the user typed; it
+    used to be ignored for -fs_subj and silently obeyed for GIfTI input."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.pyrf import _surface_prefix
+    from fastfuncstuff.cli_utils import parse_prefix
+
+    errors: list[str] = []
+
+    def fail(message):  # what argparse does: report, then stop
+        errors.append(message)
+        raise SystemExit(2)
+
+    args = Namespace(prefix="out.nii.gz", fs_subj=None, verb=0)
+    with pytest.raises(SystemExit):
+        _surface_prefix(args, Namespace(error=fail), parse_prefix(args.prefix), ["r.lh.func.gii"])
+    assert len(errors) == 1
+    assert "names a NIfTI file" in errors[0] and ".func.gii" in errors[0]

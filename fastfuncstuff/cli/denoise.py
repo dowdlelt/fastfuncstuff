@@ -2022,6 +2022,7 @@ def _denoise_output_extension(
     noise_pool_blur: float = 0.0,
     paired: bool = False,
 ) -> str:
+    from fastfuncstuff.cli_utils import domain_prefix
     from fastfuncstuff.io.gifti import is_gifti
 
     surface = [is_gifti(str(path).split("[")[0]) for path in input_files]
@@ -2046,13 +2047,9 @@ def _denoise_output_extension(
         if ext.endswith(".gii"):
             raise ValueError("Paired outputs take a NIfTI -prefix; the surface half is GIfTI")
         return ext
-    if surface[0]:
-        if prefix.endswith((".nii", ".nii.gz", ".nii.zst")):
-            raise ValueError("Surface outputs require a GIfTI -prefix, not a NIfTI extension")
-        return ".func.gii" if ext == ".nii.gz" else ext
-    if ext.endswith(".gii"):
-        raise ValueError("Volume outputs require a NIfTI -prefix, not a GIfTI extension")
-    return ext
+    # One rule for which domain a -prefix may name, shared with ffs_pyrf and
+    # ffs_varpart; the volume-only flag checks above are this tool's own.
+    return domain_prefix(prefix, surface=surface[0], what="-input").nifti_ext
 
 
 def main():

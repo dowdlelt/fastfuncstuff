@@ -24,7 +24,11 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.unique import sorted_unique
 
 try:
-    from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
+    from fastfuncstuff.cli_utils import (
+        add_device_arg,
+        domain_prefix,
+        setup_device,
+    )
     from fastfuncstuff.design.trial_table import (
         canonicalize_label,
         level_identifier,
@@ -1116,9 +1120,10 @@ def main() -> int:
             maps[f"oneminusp_unc_{base}"] = 1.0 - perm_res.p_uncorrected[key]
             maps[f"oneminusp_fwe_{base}"] = 1.0 - perm_res.p_fwe[key]
 
-    info = parse_prefix(args.prefix, default_ext=".shape.gii" if surface else ".nii.gz")
-    if is_gifti(args.prefix) != surface and args.prefix != info.stem:
-        raise SystemExit("❌ -prefix output domain must match -betas")
+    try:
+        info = domain_prefix(args.prefix, surface=surface, surface_ext=".shape.gii", what="-betas")
+    except ValueError as error:
+        raise SystemExit(f"❌ {error}") from error
     stem = info.stem
 
     assert res.heldout_sst is not None and res.noise_ceiling is not None

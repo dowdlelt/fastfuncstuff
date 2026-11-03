@@ -213,6 +213,53 @@ def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     return PrefixInfo(stem=prefix, nifti_ext=default_ext)
 
 
+#: Prefix extensions that name a volume file, and so cannot hold a surface result.
+VOLUME_PREFIX_EXTS = (".nii", ".nii.gz", ".nii.zst")
+
+
+def domain_prefix(
+    prefix: str,
+    *,
+    surface: bool,
+    surface_ext: str = ".func.gii",
+    volume_ext: str = ".nii.gz",
+    what: str = "this fit",
+) -> PrefixInfo:
+    """A ``-prefix`` for the domain being fit, refusing one that names the other.
+
+    Vertices can only be written per-vertex: a NIfTI prefix on a surface fit
+    produces a (V, 1, 1) volume that nothing displays on the mesh and no surface
+    tool downstream accepts, and a GIfTI prefix on a volume fit is the same
+    mistake the other way. Both are refused rather than overridden, because an
+    extension the user typed is a choice -- but a prefix with no extension at all
+    gets the right default without comment.
+
+    One home for the rule because every tool that takes either domain needs it and
+    needs it to agree: ffs_pyrf, ffs_denoise and ffs_varpart all route here.
+    ``surface_ext`` differs between them (``.func.gii`` for a series or a
+    multi-column bucket, ``.shape.gii`` for single maps), which is the only part
+    that is a tool's own business.
+
+    Raises
+    ------
+    ValueError
+        The prefix names the other domain. Callers map this onto their own
+        reporting (``parser.error``, ``SystemExit``).
+    """
+    info = parse_prefix(prefix, default_ext=surface_ext if surface else volume_ext)
+    if surface and prefix.endswith(VOLUME_PREFIX_EXTS):
+        raise ValueError(
+            f"-prefix {prefix} names a NIfTI file, but {what} is on a surface: "
+            f"give a {surface_ext} prefix, or none and one is used"
+        )
+    if not surface and info.nifti_ext.endswith(".gii"):
+        raise ValueError(
+            f"-prefix {prefix} names a GIfTI file, but {what} is on a volume: "
+            f"give a {volume_ext} prefix, or none and one is used"
+        )
+    return info
+
+
 def output_file(path: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     """An output flag's file: the extension named on it (NIfTI or GIfTI) is kept, and
     an AFNI one (``+orig.HEAD``) or none becomes ``default_ext``. ``.as_file()`` is

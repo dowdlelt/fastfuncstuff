@@ -27,9 +27,11 @@ def test_surface_extension_and_unsupported_volume_operations():
         _denoise_output_extension(files, "fit", automask=True)
     with pytest.raises(ValueError, match="cv_blur"):
         _denoise_output_extension(files, "fit", cv_blur=2.0)
-    with pytest.raises(ValueError, match="GIfTI -prefix"):
+    # The domain rule itself lives in cli_utils.domain_prefix, shared with
+    # ffs_pyrf and ffs_varpart; what is tested here is that denoise routes to it.
+    with pytest.raises(ValueError, match=r"names a NIfTI file.*on a surface"):
         _denoise_output_extension(files, "fit.nii.gz")
-    with pytest.raises(ValueError, match="NIfTI -prefix"):
+    with pytest.raises(ValueError, match=r"names a GIfTI file.*on a volume"):
         _denoise_output_extension(["run.nii.gz"], "fit.func.gii")
 
 

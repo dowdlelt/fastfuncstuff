@@ -47,6 +47,7 @@ from fastfuncstuff.cli_utils import (
     build_nuisance_per_run,
     collect_nuisance_blocks,
     compute_run_lengths,
+    domain_prefix,
     load_and_preprocess_runs,
     parse_input_files,
     parse_prefix,
@@ -2167,17 +2168,36 @@ def _resolve_masks(
     return fit_flat, pool_flat, fit_flat | pool_flat
 
 
+def _surface_prefix(args, parser, prefix_info, input_files):
+    """The prefix for whichever domain is being fit, GIfTI or NIfTI.
+
+    Both ways into a surface fit are covered -- -fs_subj sampling volumes, and
+    GIfTI runs handed straight to -input -- because the output format is a
+    property of what is being fit, not of how it arrived.
+    """
+    from fastfuncstuff.io.gifti import is_gifti
+
+    surface = bool(args.fs_subj) or any(is_gifti(str(path).split("[")[0]) for path in input_files)
+    try:
+        info = domain_prefix(
+            args.prefix,
+            surface=surface,
+            what="-fs_subj" if args.fs_subj else "GIfTI -input",
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.verb and info.nifti_ext != prefix_info.nifti_ext:
+        why = "-fs_subj" if args.fs_subj else "surface -input"
+        print(f"{why} writes surface results: using {info.stem}{info.nifti_ext}")
+    return info
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
     prefix_info = parse_prefix(args.prefix)
     input_files = parse_input_files(args.input)
-    if args.fs_subj and not prefix_info.nifti_ext.endswith(".gii"):
-        # A fit on vertices can only be written per-vertex; say so rather than
-        # writing a (V, 1, 1) volume nobody can display on the mesh.
-        prefix_info = parse_prefix(f"{prefix_info.stem}.func.gii")
-        if args.verb:
-            print(f"-fs_subj writes surface results: using {prefix_info.stem}.func.gii")
+    prefix_info = _surface_prefix(args, parser, prefix_info, input_files)
     if bool(args.stimulus) == bool(args.stim_sources):
         parser.error(
             "Specify exactly one of -stimulus or -stim-pngs/-stim-pngs-multi/"
