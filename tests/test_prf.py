@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -2006,3 +2007,189 @@ def test_shape_bucket_padding_leaves_the_refinement_unchanged(monkeypatch):
     torch.testing.assert_close(padded.r2, unpadded.r2, rtol=1e-9, atol=1e-9)
     assert torch.equal(padded.n_iters, unpadded.n_iters)
     assert torch.equal(padded.converged, unpadded.converged)
+
+
+def test_amplitude_psc_is_the_response_peak_over_the_voxel_mean(tmp_path):
+    """amplitude is the fitted response height; amplitude_psc divides by the mean.
+
+    gain alone is not an amplitude: the drive carries the Gaussian's unit-mass
+    normalisation and then the exponent, so two voxels with the same response
+    height but different sigma report different gains.
+    """
+    import types
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import _save_results
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    results = types.SimpleNamespace(
+        parameters=torch.tensor([[50.0, 50.0, 3.0, 0.5], [50.0, 50.0, 3.0, 0.5]]),
+        gain=torch.ones(2),
+        correlation=torch.ones(2),
+        r2=torch.ones(2),
+        hrf_index=torch.zeros(2, dtype=torch.long),
+        candidate_index=torch.zeros(2, dtype=torch.long),
+        residual_ss=torch.zeros(2),
+        n_iters=torch.ones(2),
+        converged=torch.ones(2),
+    )
+    loaded = types.SimpleNamespace(
+        mask_flat=None, volume_shape=(2, 1, 1), affine=np.eye(4), nifti_header=None
+    )
+    output = tmp_path / "amp.nii.gz"
+    _save_results(
+        results,
+        str(output),
+        loaded,
+        (100, 100),
+        mean_volume=torch.tensor([100.0, 200.0]),
+        response_peak=torch.tensor([2.0, 2.0]),
+    )
+
+    labels = read_brick_labels(nib.load(output))
+    data = nib.load(output).get_fdata().reshape(2, len(labels))
+    assert data[0, labels.index("amplitude")] == pytest.approx(2.0)
+    # Same peak, half the percentage, because the second voxel's mean is twice as big.
+    assert data[0, labels.index("amplitude_psc")] == pytest.approx(2.0)
+    assert data[1, labels.index("amplitude_psc")] == pytest.approx(1.0)
+
+
+def test_percent_signal_change_refuses_a_non_positive_mean():
+    from fastfuncstuff.design.prf import prf_percent_signal_change
+
+    psc = prf_percent_signal_change(torch.tensor([1.0, 1.0, 1.0]), torch.tensor([50.0, 0.0, -3.0]))
+    assert psc[0] == pytest.approx(2.0)
+    assert torch.isnan(psc[1:]).all()
+
+
+def test_response_peak_is_gain_times_its_own_predictor_peak():
+    """And it is taken chunked, so it never holds a (time, voxels) prediction."""
+    from fastfuncstuff.design.prf import _css_prediction, prf_response_peak
+
+    torch.manual_seed(0)
+    stimulus_runs = [torch.rand(24, 64), torch.rand(24, 64)]
+    parameters = torch.tensor([[4.0, 4.0, 2.0, 0.6], [5.0, 3.0, 1.5, 0.4], [4.5, 4.5, 3.0, 1.0]])
+    hrf_library = torch.rand(2, 8)
+    hrf_index = torch.tensor([0, 1, 0])
+    gain = torch.tensor([2.0, 0.5, 3.0])
+
+    peak = prf_response_peak(
+        stimulus_runs, parameters, hrf_index, gain, hrf_library, (8, 8), voxel_chunk_size=1
+    )
+    for voxel in range(3):
+        expected = (
+            _css_prediction(
+                stimulus_runs,
+                parameters[voxel : voxel + 1],
+                hrf_library[hrf_index[voxel]],
+                (8, 8),
+            ).amax()
+            * gain[voxel]
+        )
+        assert peak[voxel] == pytest.approx(float(expected), rel=1e-6)
+    # One chunk or three, same answer.
+    whole = prf_response_peak(
+        stimulus_runs, parameters, hrf_index, gain, hrf_library, (8, 8), voxel_chunk_size=99
+    )
+    torch.testing.assert_close(peak, whole)
+
+
+def test_amplitude_psc_recovers_a_simulated_response_size(tmp_path):
+    """End to end: the amplitude map has to read the response that was simulated.
+
+    The fixture's responsive voxels are ``100 + 10 * conv(frames, hrf)``, whose
+    peak sits 10.3% above the voxel mean (a touch inflated: it is the max of a
+    noisy series). This is the test that catches measuring the peak from zero
+    instead of from the fitted baseline -- the aperture is on for about half of
+    every run, so the predictor carries a large mean that the per-run
+    polynomials absorb, and the unprojected peak read 28.3% here.
+
+    It also pins the two scaling paths together: ``-do_scale`` divides by a run
+    mean of 100 up front, ``-dont_scale`` divides by the voxel's own mean at the
+    end, and amplitude_psc has to come out the same either way.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    recovered = {}
+    for flags, tag in (([], "scaled"), (["-dont_scale"], "unscaled")):
+        output = tmp_path / f"amp_{tag}.nii.gz"
+        assert (
+            main(
+                [
+                    "-input",
+                    *inputs,
+                    "-stimulus",
+                    *stimuli,
+                    "-mask",
+                    mask_path,
+                    "-prefix",
+                    str(output),
+                    "-device",
+                    "cpu",
+                    "-verb",
+                    "0",
+                    *flags,
+                ]
+            )
+            == 0
+        )
+        image = nib.load(output)
+        labels = read_brick_labels(image)
+        assert "amplitude" in labels and "amplitude_psc" in labels
+        data = image.get_fdata().reshape(-1, len(labels))
+        responsive = slice(0, 24)
+        recovered[tag] = float(np.nanmedian(data[responsive, labels.index("amplitude_psc")]))
+        amplitude = float(np.nanmedian(data[responsive, labels.index("amplitude")]))
+        mean_volume = float(np.nanmedian(data[responsive, labels.index("meanvol")]))
+        # amplitude is in the units the fit saw; the percentage is it over the mean.
+        assert recovered[tag] == pytest.approx(100.0 * amplitude / mean_volume, rel=0.02)
+
+    # Measured 9.59% (scaled) and 9.58% (unscaled) against a simulated 10.3%.
+    assert recovered["scaled"] == pytest.approx(recovered["unscaled"], rel=0.02)
+    assert 7.0 < recovered["scaled"] < 13.0, recovered
+
+
+def test_response_peak_measures_above_the_projected_baseline():
+    """Projecting the predictor is what makes the peak an excursion, not a level."""
+    from fastfuncstuff.design.prf import prf_response_peak
+
+    torch.manual_seed(0)
+    # Stimulus on for most of the run, so the predictor carries a big mean.
+    stimulus_runs = [torch.rand(30, 64).clamp_min(0.4)]
+    parameters = torch.tensor([[4.0, 4.0, 2.0, 1.0]])
+    hrf_library = torch.rand(1, 6)
+    kwargs = dict(
+        hrf_index=torch.zeros(1, dtype=torch.long),
+        gain=torch.ones(1),
+        hrf_library=hrf_library,
+        stimulus_shape=(8, 8),
+        voxel_chunk_size=8,
+    )
+    from_zero = prf_response_peak(stimulus_runs, parameters, **kwargs)
+    # An intercept is the baseline the per-run polynomials always carry.
+    intercept = [torch.ones(30, 1) / math.sqrt(30.0)]
+    above_baseline = prf_response_peak(
+        stimulus_runs, parameters, **kwargs, nuisance_per_run=intercept, run_starts=[0]
+    )
+    assert float(above_baseline) < float(from_zero)
+
+
+def test_response_peak_requires_run_starts_with_nuisance():
+    from fastfuncstuff.design.prf import prf_response_peak
+
+    with pytest.raises(ValueError, match="go together"):
+        prf_response_peak(
+            [torch.rand(8, 64)],
+            torch.tensor([[4.0, 4.0, 2.0, 1.0]]),
+            torch.zeros(1, dtype=torch.long),
+            torch.ones(1),
+            torch.rand(1, 4),
+            (8, 8),
+            voxel_chunk_size=4,
+            nuisance_per_run=[torch.ones(8, 1)],
+        )

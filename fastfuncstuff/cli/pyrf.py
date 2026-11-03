@@ -71,6 +71,8 @@ from fastfuncstuff.design.prf import (
     loro_folds,
     make_analyzeprf_grid,
     prf_parameter_maps,
+    prf_percent_signal_change,
+    prf_response_peak,
     refine_prf_all_hrfs,
     refine_prf_hrf_ranked,
     refine_prf_hrf_window,
@@ -114,10 +116,25 @@ OUTPUT
                     valley where growing sigma trades against shrinking n), so
                     validating against raw sigma will look broken when nothing
                     is.
-    gain            amplitude of the fitted response, in the units of the input.
-                    Divide by meanvol for percent signal change.
-    meanvol         each voxel's mean over time, the scale gain refers to. A
-                    property of the input, so it is kept for every voxel even
+    gain            the fitted linear coefficient. NOT a response size and not
+                    comparable between voxels: the drive it multiplies carries
+                    the Gaussian's unit-mass normalisation and then the CSS
+                    exponent, so two voxels with the same response report
+                    different gains. Use amplitude.
+    amplitude       height of the fitted response above its own baseline, in the
+                    units the fit saw -- gain times the peak of that voxel's
+                    predictor after the same per-run nuisance projection the fit
+                    used. Measured from the fitted baseline, not from zero: an
+                    aperture that is on for much of the run gives the predictor
+                    a large mean that the polynomials absorb.
+    amplitude_psc   amplitude as a percentage of the voxel's own mean, which is
+                    what compares across voxels, across stimulus types and
+                    across separate pRF runs. Correct either way on the scaling
+                    (see -dont_scale): scaled data divides by a run mean of 100,
+                    unscaled divides by the raw mean. NaN where the mean is not
+                    positive.
+    meanvol         each voxel's mean over time, the scale amplitude refers to.
+                    A property of the input, so it is kept for every voxel even
                     where the fit is NaN (screened out, or all-zero).
     correlation     correlation between prediction and data after nuisance
                     projection; r2 is the coefficient of determination.
@@ -924,8 +941,28 @@ def create_parser() -> argparse.ArgumentParser:
             "adds to it in quadrature"
         ),
     )
+    # On by default: it is what makes the amplitude maps a percentage rather than
+    # scanner units, and it equalises runs whose mean signal drifts, which a pRF
+    # fit otherwise lets the louder run dominate. The cost is that a voxel near
+    # the noise floor gets divided by a small mean and so amplified -- which is
+    # why the unscaled fit stays available.
     processing.add_argument(
-        "-do-scale", "-do_scale", action="store_true", help="Scale to percent signal"
+        "-do_scale",
+        dest="do_scale",
+        action="store_true",
+        default=True,
+        help="Scale each run to percent signal change before fitting (the default). "
+        "Makes amplitude directly a percentage, and stops a run with a higher mean "
+        "signal from carrying more weight than the others.",
+    )
+    processing.add_argument(
+        "-dont_scale",
+        dest="do_scale",
+        action="store_false",
+        help="Fit the input units instead. gain and amplitude are then betas in "
+        "those units; amplitude_psc is still reported, but referenced to each "
+        "voxel's grand mean rather than its per-run means, so it is approximate "
+        "when the run means differ.",
     )
     add_device_arg(processing, extra="MPS is available for the float32 grid and refinement paths.")
     processing.add_argument(
@@ -1435,6 +1472,7 @@ def _save_results(
     xval_r2: torch.Tensor | None = None,
     invalid_voxels: torch.Tensor | None = None,
     mean_volume: torch.Tensor | None = None,
+    response_peak: torch.Tensor | None = None,
     hrf_r2_map: torch.Tensor | None = None,
     screen_extent: float | None = None,
     noise_ceiling: torch.Tensor | None = None,
@@ -1493,6 +1531,17 @@ def _save_results(
         if xval_r2 is not None:
             labels.append("xval_r2_normalized")
             columns.append(xval_r2 / noise_ceiling.clamp_min(1e-6))
+    if response_peak is not None:
+        # The response height itself, which gain is not: gain carries the drive's
+        # own normalisation, so it is not comparable between voxels of different
+        # sigma or exponent. amplitude is in the units the fit saw; amplitude_psc
+        # turns it into a percentage of the voxel's mean, which is comparable
+        # across voxels, stimulus types and separate pRF runs alike.
+        labels.append("amplitude")
+        columns.append(response_peak)
+        if mean_volume is not None:
+            labels.append("amplitude_psc")
+            columns.append(prf_percent_signal_change(response_peak, mean_volume))
     if mean_volume is not None:
         # analyzePRF's results.meanvol - the scale the gain is expressed against,
         # and the reference for turning gain into a percent-signal-change.
@@ -2340,8 +2389,40 @@ def main(argv: list[str] | None = None) -> int:
                 f"Noise ceiling from {len(repeat_groups)} repeated design(s): "
                 f"median {float(noise_ceiling.nanmedian()):.3f}"
             )
+    # On the fitted voxels, while the parameters and the aperture time axis still
+    # line up; the percentage itself is taken after expansion, against the
+    # full-length mean volume.
+    response_peak = prf_response_peak(
+        stimulus_runs,
+        results.parameters,
+        results.hrf_index,
+        results.gain,
+        hrf_library,
+        stimulus_shape,
+        max(1, refine_chunk_size if refine_chunk_size > 0 else voxel_chunk_size),
+        nuisance_per_run=nuisance_per_run,
+        run_starts=list(loaded.run_starts),
+    )
+    canonical_peak = (
+        None
+        if canonical_results is None
+        else prf_response_peak(
+            stimulus_runs,
+            canonical_results.parameters,
+            canonical_results.hrf_index,
+            canonical_results.gain,
+            hrf_library,
+            stimulus_shape,
+            max(1, refine_chunk_size if refine_chunk_size > 0 else voxel_chunk_size),
+            nuisance_per_run=nuisance_per_run,
+            run_starts=list(loaded.run_starts),
+        )
+    )
     if keep_index is not None:
         results = _expand_fit(results, keep_index, loaded.n_voxels)
+        response_peak = _expand_to_all_voxels(response_peak, keep_index, loaded.n_voxels)
+        if canonical_peak is not None:
+            canonical_peak = _expand_to_all_voxels(canonical_peak, keep_index, loaded.n_voxels)
         if hrf_r2_map is not None:
             hrf_r2_map = _expand_to_all_voxels(hrf_r2_map, keep_index, loaded.n_voxels)
         if xval_r2 is not None:
@@ -2372,6 +2453,7 @@ def main(argv: list[str] | None = None) -> int:
         xval_r2=xval_r2,
         invalid_voxels=invalid_voxels,
         mean_volume=mean_volume,
+        response_peak=response_peak,
         hrf_r2_map=hrf_r2_map,
         screen_extent=args.screen_extent,
         noise_ceiling=noise_ceiling,
@@ -2409,6 +2491,7 @@ def main(argv: list[str] | None = None) -> int:
             stimulus_shape,
             invalid_voxels=invalid_voxels,
             mean_volume=mean_volume,
+            response_peak=canonical_peak,
             screen_extent=args.screen_extent,
         )
         if args.verb:

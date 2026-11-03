@@ -1671,6 +1671,71 @@ def _predict_selected_prfs(
     return prediction
 
 
+def prf_response_peak(
+    stimulus_runs: Sequence[torch.Tensor],
+    parameters: torch.Tensor,
+    hrf_index: torch.Tensor,
+    gain: torch.Tensor,
+    hrf_library: torch.Tensor,
+    stimulus_shape: tuple[int, int],
+    voxel_chunk_size: int,
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None = None,
+    run_starts: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Peak of each voxel's fitted response above its own baseline, in data units.
+
+    The height of the modelled BOLD excursion at the stimulus position that
+    drives the voxel hardest. ``gain`` alone is not that height: the drive
+    carries the Gaussian's unit-mass normalisation and then the ``^n`` exponent,
+    so two voxels with the same response express it as different gains. Dividing
+    that out is what makes an amplitude map comparable across voxels, across
+    stimulus types, and across separate pRF runs.
+
+    **The predictor is projected through the same per-run nuisance the fit used
+    before the peak is taken**, so the peak is measured from the baseline the
+    model actually fitted. Skipping that measures it from zero instead, and a
+    predictor whose stimulus is on for much of the run has a large mean that the
+    per-run polynomials absorb: on a test run whose simulated response was
+    10.3%, the unprojected peak read 28.3%.
+
+    Reduces inside the chunk loop: the full ``(time, voxels)`` prediction is the
+    size of the dataset, and nothing here needs it.
+    """
+    if (nuisance_per_run is None) != (run_starts is None):
+        raise ValueError("nuisance_per_run and run_starts go together")
+    peak = torch.zeros(parameters.shape[0], device=parameters.device, dtype=parameters.dtype)
+    for selected_hrf in hrf_index.unique(sorted=True).tolist():
+        indices = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
+        for start in range(0, indices.numel(), voxel_chunk_size):
+            chunk = indices[start : start + voxel_chunk_size]
+            prediction = _css_prediction(
+                stimulus_runs, parameters[chunk], hrf_library[selected_hrf], stimulus_shape
+            )
+            if run_starts is not None:
+                prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
+            peak[chunk] = prediction.amax(dim=0) * gain[chunk]
+    return peak
+
+
+def prf_percent_signal_change(
+    response_peak: torch.Tensor, mean_volume: torch.Tensor
+) -> torch.Tensor:
+    """Response peak as a percentage of each voxel's own mean signal.
+
+    Works whether or not the fit ran on ``-do_scale`` data: scaling sets every
+    voxel's run mean to 100, so the division is by 100 and the peak is already
+    the percentage; unscaled, it divides by the raw mean and gets there too.
+    That is why this takes the mean volume rather than trusting a flag.
+
+    Voxels with a non-positive mean have no percentage to report and come back
+    NaN rather than as a division artefact.
+    """
+    mean = mean_volume.to(response_peak.dtype)
+    return torch.where(
+        mean > 0, 100.0 * response_peak / mean, torch.full_like(response_peak, torch.nan)
+    )
+
+
 def balanced_group_halves(
     group_labels: Sequence[int],
     *,
