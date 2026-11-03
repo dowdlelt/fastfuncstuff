@@ -495,6 +495,17 @@ def test_the_bar_follows_a_threshold_change(win, qapp):
     qapp.processEvents()
     assert win.colorbar._threshold == pytest.approx(1.25)
     assert win.thr_spin.value() == pytest.approx(1.25)
+
+
+def test_the_threshold_number_is_actually_visible(win):
+    """#1: on macOS the number vanished -- our stylesheet puts a border and
+    padding on QDoubleSpinBox, which hands sizing to QStyleSheetStyle, and with
+    NoButtons QMacStyle then gave the text editor one pixel of width.
+
+    Measured on Linux this passes either way (the editor is ~266 px with the
+    buttons hidden), so it is a macOS tripwire that this platform cannot trip,
+    not a guard on the fix. It is here to fail on the machine that saw the bug.
+    """
     assert win.thr_spin.lineEdit().width() > 1
     assert win.thr_spin.mapTo(win, win.thr_spin.rect().topRight()).x() < win.width()
 

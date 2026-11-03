@@ -401,6 +401,8 @@ class RangeBar(QtWidgets.QWidget):
         self.stat_label.setToolTip("The test this sub-brick carries, from BRICK_STATAUX")
         self.stat_label.setWordWrap(True)
         self.stat_label.setStyleSheet(f"font-size: {theme.FONT_SMALL}px;")
+        # No NoButtons here or on the range boxes: with our stylesheet it
+        # collapses Qt's text editor to 1 px on macOS (#1).
         self.p_spin = PValueSpin()
         self.p_spin.setValue(0.001)
         self.p_spin.setKeyboardTracking(False)
