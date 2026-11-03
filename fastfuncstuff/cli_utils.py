@@ -475,6 +475,7 @@ def estimate_device_strategy(
     device: torch.device,
     force_cpu: bool = False,
     gpu_threshold_gb: float = 4.0,
+    working_copies: float = 0.0,
 ) -> bool:
     """
     Estimate whether to keep data on CPU based on dataset size and GPU memory.
@@ -494,6 +495,9 @@ def estimate_device_strategy(
         Force CPU storage regardless of data size
     gpu_threshold_gb : float, default=4.0
         Size threshold in GB for GPU memory
+    working_copies : float, default=0.0
+        Extra full-size copies of the dataset the caller holds beside it (see
+        :func:`~fastfuncstuff.memory.estimate_keep_on_cpu`).
 
     Returns
     -------
@@ -508,6 +512,7 @@ def estimate_device_strategy(
         device=device,
         force_cpu=force_cpu,
         data_threshold_gb=gpu_threshold_gb,
+        working_copies=working_copies,
     )
 
 
@@ -546,6 +551,7 @@ def load_and_preprocess_runs(
     load_threads: int | None = None,
     drop_first: int = 0,
     drop_last: int = 0,
+    working_copies: float = 0.0,
 ) -> LoadResult:
     """
     Load and preprocess fMRI data from multiple runs.
@@ -593,6 +599,11 @@ def load_and_preprocess_runs(
         percent-signal run means all describe the retained window. Event timing
         must be shifted to match -- pass the same :class:`~fastfuncstuff.design.trim.TrimSpec`
         to :func:`parse_timing_spec`.
+    working_copies : float, default=0.0
+        Extra full-size copies of the loaded matrix the caller will hold beside
+        it, as a multiple of the data size. Raises the bar the data has to clear
+        to be loaded onto the GPU at all, so a tool whose next step needs the
+        dataset over again lands on the CPU instead of OOMing one line later.
 
     Returns
     -------
@@ -808,6 +819,7 @@ def load_and_preprocess_runs(
         n_timepoints_total=total_timepoints,
         device=device,
         force_cpu=force_cpu,
+        working_copies=working_copies,
     )
 
     if verbose and keep_on_cpu:

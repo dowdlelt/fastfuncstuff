@@ -89,6 +89,7 @@ from fastfuncstuff.stats.reliability import (
     spearman_correlation,
     split_half_noise_ceiling,
 )
+from fastfuncstuff.utils import invalid_voxel_mask
 
 _EPILOG = """
 OUTPUT
@@ -1402,15 +1403,6 @@ def _append_components(
     ]
 
 
-def _invalid_voxels(data: torch.Tensor, run_starts: list[int]) -> torch.Tensor:
-    """Match analyzePRF: reject non-finite voxels and voxels zero in any run."""
-    invalid = ~torch.isfinite(data).all(dim=1)
-    run_ends = [*run_starts[1:], data.shape[1]]
-    for start, end in zip(run_starts, run_ends, strict=True):
-        invalid |= data[:, start:end].eq(0).all(dim=1)
-    return invalid
-
-
 def _save_voxel_matrix(
     values: torch.Tensor,
     output_path: str,
@@ -1920,6 +1912,11 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(location).exists():
             parser.error(f"Stimulus source does not exist: {location}")
 
+    # A gather of the kept voxels, out of place, is the one step that needs the
+    # series over again; whether it happens is known before the load.
+    screens_voxels = (
+        args.screen is not None or args.screen_top is not None or bool(args.noise_pool_mask)
+    )
     device = setup_device(args.device)
     ribbon = sample_input_to_ribbon(args, parser, input_files, prefix_info.stem, device=device)
     if ribbon is not None:
@@ -1940,6 +1937,12 @@ def main(argv: list[str] | None = None) -> int:
         force_cpu=args.keep_on_cpu,
         verbose=args.verb > 0,
         load_threads=args.load_threads,
+        # Screening gathers the voxels it keeps out of place, so at that moment a
+        # second copy of (at most) the whole series is resident beside it. Budget
+        # for it here rather than discovering it as an OOM mid-fit. Everything
+        # else on the way to the fit is in place or chunked, so an unscreened run
+        # gets the whole card for the data.
+        working_copies=1.0 if screens_voxels else 0.0,
     )
     run_lengths = compute_run_lengths(loaded.run_starts, loaded.n_timepoints)
     fit_voxels = pool_candidates = None
@@ -1956,8 +1959,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"Loaded {int(selected.sum()):,} voxels: {int(fit_voxels.sum()):,} to fit, "
                 f"{int(pool_candidates.sum()):,} eligible for the noise pool"
             )
-    invalid_voxels = _invalid_voxels(loaded.data, loaded.run_starts)
-    analysis_data = torch.nan_to_num(loaded.data, nan=0.0, posinf=0.0, neginf=0.0)
+    # Match analyzePRF: reject non-finite voxels and voxels zero in any run.
+    invalid_voxels = invalid_voxel_mask(loaded.data, loaded.run_starts)
+    # In place: a whole-dataset nan_to_num is a second copy of the series, and
+    # nothing downstream wants the raw NaNs back -- the mean volume below is
+    # better off without them too.
+    analysis_data = torch.nan_to_num_(loaded.data, nan=0.0, posinf=0.0, neginf=0.0)
+    # Taken now, while every loaded voxel is still present, so the full matrix
+    # can be released once screening has gathered the subset to fit; reading it
+    # at save time instead pinned the whole series through the entire fit.
+    mean_volume = analysis_data.mean(dim=1)
     if args.verb and invalid_voxels.any():
         print(f"Excluding {invalid_voxels.sum().item():,} non-finite or all-zero voxels")
     if args.stim_sources:
@@ -2086,6 +2097,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"screening kept no voxels at threshold {threshold:g}")
         keep_index = torch.nonzero(keep, as_tuple=False).squeeze(1)
         analysis_data = analysis_data[keep_index]
+        loaded.data = analysis_data  # release the full series; mean_volume is already taken
         if args.verb:
             print(
                 f"Screening kept {keep_index.numel():,} of {loaded.n_voxels:,} voxels "
@@ -2097,6 +2109,7 @@ def main(argv: list[str] | None = None) -> int:
         # never fit and come back NaN rather than as a fit of the wrong region.
         keep_index = torch.nonzero(fit_voxels, as_tuple=False).squeeze(1)
         analysis_data = analysis_data[keep_index]
+        loaded.data = analysis_data  # release the full series; mean_volume is already taken
 
     n_fit_voxels = analysis_data.shape[0]
     grid = make_analyzeprf_grid(
@@ -2358,7 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
         stimulus_shape,
         xval_r2=xval_r2,
         invalid_voxels=invalid_voxels,
-        mean_volume=loaded.data.mean(dim=1),
+        mean_volume=mean_volume,
         hrf_r2_map=hrf_r2_map,
         screen_extent=args.screen_extent,
         noise_ceiling=noise_ceiling,
@@ -2395,7 +2408,7 @@ def main(argv: list[str] | None = None) -> int:
             loaded,
             stimulus_shape,
             invalid_voxels=invalid_voxels,
-            mean_volume=loaded.data.mean(dim=1),
+            mean_volume=mean_volume,
             screen_extent=args.screen_extent,
         )
         if args.verb:

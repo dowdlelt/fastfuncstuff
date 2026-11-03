@@ -551,6 +551,86 @@ class TestEstimateKeepOnCpu:
         free_bytes["value"] = int(8.0 * gib)  # neighbour holding 7.5 GiB: 4.8 GiB budget
         assert estimate_keep_on_cpu(**kwargs) is True
 
+    def test_working_copies_raise_the_bar(self, monkeypatch):
+        """A declared working copy must move the decision, on its own.
+
+        The real failure this encodes: ffs_pyrf loaded 6.3 GiB onto a 15.46 GiB
+        card because the data fit, then OOM'd on the very next line building a
+        full-size boolean beside it. Budgeting only where the data *sits* is
+        what made that pass, so the gate has to count what the caller then
+        holds next to it.
+        """
+        gib = 1024**3
+
+        def fake_available(device, safety_factor=None, empty_cache=True):
+            return int(15.46 * gib)
+
+        monkeypatch.setattr(memory_module, "get_available_memory", fake_available)
+        # 1055808 voxels x 1600 TRs x 4 bytes ~ 6.29 GiB; budget 0.6 x 15.46 = 9.28
+        kwargs = dict(
+            n_voxels=1_055_808,
+            n_timepoints_total=1600,
+            device=torch.device("cuda"),
+            gpu_safety_fraction=0.6,
+        )
+        assert estimate_keep_on_cpu(**kwargs) is False
+        assert estimate_keep_on_cpu(**kwargs, working_copies=1.0) is True
+
+    def test_fraction_defaults_to_the_memory_config(self, monkeypatch):
+        """Unset, the fraction is the one knob FFS_GPU_SAFETY_FACTOR turns."""
+        gib = 1024**3
+
+        def fake_available(device, safety_factor=None, empty_cache=True):
+            return int(10.0 * gib)
+
+        monkeypatch.setattr(memory_module, "get_available_memory", fake_available)
+        # 6.0 GiB of data: over the default 0.5 budget (5.0), under a 0.7 one.
+        kwargs = dict(
+            n_voxels=1_572_864,
+            n_timepoints_total=1024,
+            device=torch.device("cuda"),
+        )
+        assert estimate_keep_on_cpu(**kwargs) is True
+        set_memory_config(MemoryConfig(gpu_safety_factor=0.7))
+        assert estimate_keep_on_cpu(**kwargs) is False
+
+
+class TestFiniteScanPlanner:
+    """Sizing for the voxel-validity scan (``utils.invalid_voxel_mask``)."""
+
+    def teardown_method(self):
+        reset_memory_config()
+
+    def test_budgets_the_isfinite_abs_copy(self):
+        """``torch.isfinite`` is ``self.abs() != inf``: a full float copy first.
+
+        Bug of record: a 6.29 GiB series went through a whole-dataset
+        ``~torch.isfinite(data).all(dim=1)``, which reserved 6.29 GiB for the
+        abs copy and then OOM'd on the 1.57 GiB boolean -- with
+        ``memory_allocated`` still reading 6.29 GiB, so only
+        ``memory_reserved`` showed it. A planner that counted the booleans
+        alone (2 bytes/sample) returned a chunk the size of the whole dataset
+        and reproduced the OOM, so the abs copy has to be in the figure.
+        """
+        from fastfuncstuff.memory import bytes_per_voxel_finite_scan
+
+        assert bytes_per_voxel_finite_scan(1600) >= 1600 * (4 + 1 + 1)
+
+    def test_chunk_splits_a_series_that_does_not_fit_whole(self, monkeypatch):
+        from fastfuncstuff.memory import finite_scan_voxel_chunk
+
+        monkeypatch.setattr(memory_module, "get_available_memory", lambda *a, **k: 3 * 1024**3)
+        n_voxels, n_timepoints = 1_055_808, 1600
+        chunk = finite_scan_voxel_chunk(n_voxels, n_timepoints, torch.device("cuda"))
+        assert 0 < chunk < n_voxels
+        assert chunk * memory_module.bytes_per_voxel_finite_scan(n_timepoints) <= 3 * 1024**3
+
+    def test_chunk_is_the_whole_series_when_it_fits(self, monkeypatch):
+        from fastfuncstuff.memory import finite_scan_voxel_chunk
+
+        monkeypatch.setattr(memory_module, "get_available_memory", lambda *a, **k: 64 * 1024**3)
+        assert finite_scan_voxel_chunk(50_000, 100, torch.device("cuda")) == 50_000
+
 
 class TestIntegration:
     """Integration tests for memory module."""

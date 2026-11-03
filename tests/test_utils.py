@@ -615,3 +615,52 @@ def test_pinv_f64_survives_the_mps_float64_cast():
     torch.testing.assert_close(
         pinv_f64(matrix).cpu(), torch.linalg.pinv(matrix.cpu().double()).float()
     )
+
+
+class TestInvalidVoxelMask:
+    """The chunked replacement for ``~isfinite(data).all(dim=1)``."""
+
+    def _reference(self, data, run_starts):
+        invalid = ~torch.isfinite(data).all(dim=1)
+        ends = [*run_starts[1:], data.shape[1]]
+        for start, end in zip(run_starts, ends, strict=True):
+            invalid |= data[:, start:end].eq(0).all(dim=1)
+        return invalid
+
+    def test_matches_the_whole_dataset_expression(self):
+        from fastfuncstuff.utils import invalid_voxel_mask
+
+        torch.manual_seed(0)
+        data = torch.randn(40, 24) + 100.0
+        run_starts = [0, 8, 16]
+        data[3] = float("nan")
+        data[5, 20] = float("inf")
+        data[7, 8:16] = 0.0  # dead in run 2 only: outside that run's coverage
+        data[9, :] = 0.0
+        expected = self._reference(data.clone(), run_starts)
+        got = invalid_voxel_mask(data, run_starts)
+        assert torch.equal(got, expected)
+        assert bool(got[3]) and bool(got[5]) and bool(got[7]) and bool(got[9])
+        assert not bool(got[0])
+
+    def test_chunking_does_not_change_the_answer(self, monkeypatch):
+        """Same mask whether it takes one chunk or many."""
+        from fastfuncstuff import memory as memory_module
+        from fastfuncstuff.utils import invalid_voxel_mask
+
+        torch.manual_seed(1)
+        data = torch.randn(3000, 12) + 50.0
+        data[17] = float("nan")
+        data[2999, :] = 0.0
+        whole = invalid_voxel_mask(data, [0, 6])
+        monkeypatch.setattr(memory_module, "finite_scan_voxel_chunk", lambda *a, **k: 7)
+        assert torch.equal(invalid_voxel_mask(data, [0, 6]), whole)
+
+    def test_without_run_starts_the_zero_test_spans_the_series(self):
+        from fastfuncstuff.utils import invalid_voxel_mask
+
+        data = torch.ones(3, 10)
+        data[1, :5] = 0.0  # zero in a would-be first run, but no runs declared
+        data[2, :] = 0.0
+        got = invalid_voxel_mask(data)
+        assert not bool(got[1]) and bool(got[2])

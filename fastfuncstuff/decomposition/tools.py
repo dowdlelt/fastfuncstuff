@@ -235,9 +235,14 @@ def find_constant_voxels(
     give. See ``../fmri_wiki/concepts/Constant voxels break the mixture model.md``.
     """
     if isinstance(data_vox_t, torch.Tensor):
+        from fastfuncstuff.utils import invalid_voxel_mask
+
         std = data_vox_t.to(torch.float32).std(dim=1, unbiased=True)
         bad = ~torch.isfinite(std) | (std <= tol)
-        bad = bad | ~torch.isfinite(data_vox_t).all(dim=1)
+        # Chunked: a whole-dataset torch.isfinite needs a float copy of the
+        # series (it is abs() != inf) on top of its boolean. The all-zero half
+        # of the mask is already covered by std <= tol.
+        bad = bad | invalid_voxel_mask(data_vox_t)
         return bad.cpu().numpy()
     arr = np.asarray(data_vox_t, dtype=np.float32)
     std = arr.std(axis=1, ddof=1) if arr.shape[1] > 1 else np.zeros(arr.shape[0], np.float32)

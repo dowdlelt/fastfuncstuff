@@ -666,6 +666,33 @@ def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device)
     return int(max(1024, min(n_voxels, chunk)))
 
 
+def bytes_per_voxel_finite_scan(n_timepoints: int) -> int:
+    """Per-voxel peak of a whole-timeseries validity scan (non-finite, all-zero).
+
+    The trap here is ``torch.isfinite``, which for a float tensor is
+    ``self.abs() != inf``: it allocates a **full float32 copy of its input**
+    before the boolean it returns. Measured on a 6.29 GiB series, the call
+    reserved 6.29 GiB more and then OOM'd asking for the 1.57 GiB result, while
+    ``memory_allocated`` still read 6.29 GiB -- so the allocator's own figure
+    hides it and only ``memory_reserved`` shows it. So: 4 bytes for the abs
+    copy, 1 for the isfinite mask, 1 for the all-zero test's equality mask.
+    """
+    return 6 * n_timepoints
+
+
+# One sequential sweep gains nothing from a chunk bigger than this, and on the
+# CPU path the budget is RAM -- where the temporaries are a copy of the series
+# charged against a host that is also holding it.
+_FINITE_SCAN_MAX_WORKING_BYTES = 1024**3
+
+
+def finite_scan_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device) -> int:
+    """Voxels per chunk for :func:`bytes_per_voxel_finite_scan` passes."""
+    avail = min(get_available_memory(device, empty_cache=False), _FINITE_SCAN_MAX_WORKING_BYTES)
+    chunk = avail // max(1, bytes_per_voxel_finite_scan(n_timepoints))
+    return int(max(1024, min(n_voxels, chunk)))
+
+
 def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
     """
     Estimate memory per voxel for the batched L1 detrend (outlier counting).
@@ -2002,7 +2029,8 @@ def estimate_keep_on_cpu(
     device: torch.device,
     force_cpu: bool = False,
     data_threshold_gb: float = DEFAULT_CPU_MEMORY_THRESHOLD_GB,
-    gpu_safety_fraction: float = 0.6,
+    gpu_safety_fraction: float | None = None,
+    working_copies: float = 0.0,
 ) -> bool:
     """
     Estimate whether to keep data on CPU based on dataset size.
@@ -2021,17 +2049,28 @@ def estimate_keep_on_cpu(
         Force CPU storage regardless of data size
     data_threshold_gb : float, default=4.0
         Size threshold in GB for GPU memory
-    gpu_safety_fraction : float, default=0.6
-        Fraction of free GPU memory that the data may occupy. Use lower
-        values when the downstream computation needs significant working
-        memory (e.g., 0.25 for LORO CV which creates train-split copies).
+    gpu_safety_fraction : float, optional
+        Fraction of free GPU memory the resident dataset *and* its declared
+        working copies may occupy together. Defaults to the memory config's
+        ``gpu_safety_factor`` (0.5, overridable with ``FFS_GPU_SAFETY_FACTOR``),
+        so one knob governs both this gate and chunk sizing.
+    working_copies : float, default=0.0
+        Extra full-size copies of the dataset the caller needs resident beside
+        it, as a multiple of the data size. The gate is otherwise blind to them:
+        it used to pass a dataset that fit on its own and then OOM on the very
+        next step, because a whole-dataset ``nan_to_num`` or boolean mask is
+        another copy the budget never saw. Declare what the hot path actually
+        holds; chunked work that goes through :func:`estimate_chunk_size` needs
+        nothing here.
 
     Returns
     -------
     keep_on_cpu : bool
         True if data should be kept on CPU, False if direct GPU loading is safe
     """
-    data_size_gb = (n_voxels * n_timepoints_total * 4) / (1024**3)
+    data_size_gb = (n_voxels * n_timepoints_total * 4) / (1024**3) * (1.0 + working_copies)
+    if gpu_safety_fraction is None:
+        gpu_safety_fraction = get_memory_config().gpu_safety_factor
 
     if force_cpu:
         return True

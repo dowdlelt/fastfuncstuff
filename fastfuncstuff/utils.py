@@ -807,6 +807,45 @@ def calc_memory_usage(shape: tuple, dtype: torch.dtype = torch.float32) -> float
     return (num_elements * bytes_per_element) / 1e9
 
 
+def invalid_voxel_mask(data: torch.Tensor, run_starts: list[int] | None = None) -> torch.Tensor:
+    """Voxels that cannot be fit: non-finite anywhere, or all-zero in some run.
+
+    Chunked over voxels, because the obvious one-liner
+    (``~torch.isfinite(data).all(dim=1)``) materialises a boolean the shape of
+    the whole dataset -- 1.6 GiB beside a 6.3 GiB series, which is what OOM'd
+    ffs_pyrf one line after the load had succeeded.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        ``(n_voxels, n_timepoints)`` series, on any device.
+    run_starts : list of int, optional
+        Start index of each run. A voxel that is identically zero within any one
+        run is invalid even when other runs have signal (it is outside that run's
+        coverage). Without this the all-zero test is applied to the whole series.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(n_voxels,)`` boolean, True where the voxel is unusable.
+    """
+    from fastfuncstuff.memory import finite_scan_voxel_chunk
+
+    n_voxels, n_timepoints = data.shape
+    starts = list(run_starts) if run_starts else [0]
+    ends = [*starts[1:], n_timepoints]
+    invalid = torch.zeros(n_voxels, dtype=torch.bool, device=data.device)
+    chunk = finite_scan_voxel_chunk(n_voxels, n_timepoints, data.device)
+    for first in range(0, n_voxels, chunk):
+        last = min(first + chunk, n_voxels)
+        block = data[first:last]
+        bad = ~torch.isfinite(block).all(dim=1)
+        for start, end in zip(starts, ends, strict=True):
+            bad |= block[:, start:end].eq(0).all(dim=1)
+        invalid[first:last] = bad
+    return invalid
+
+
 def scale_to_percent_signal(
     data: torch.Tensor,
     run_starts: list[int],
