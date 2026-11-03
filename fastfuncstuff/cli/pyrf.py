@@ -2027,6 +2027,12 @@ def _load_type_labels(
     kind of thing it was. The labels have to be contiguous from 1, because the
     count of types is what sizes every per-type output -- a file using 1 and 3
     would otherwise silently produce an empty type 2.
+
+    A file short of its run is padded with 0, exactly as a short aperture is
+    padded with blank frames (:func:`_pad_stimulus_frames`) and for the same
+    reason: the stimulus program writes a row per presented TR while the scan
+    runs a few volumes past it. A surplus is an error -- dropping from either
+    end would be a guess.
     """
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
     from fastfuncstuff.design.prf import MAX_STIMULUS_TYPES
@@ -2049,10 +2055,22 @@ def _load_type_labels(
                 "frame in a single column (use a [0] selector to pick one)"
             )
         flat = values[:, 0]
-        if flat.shape[0] != expected:
+        if flat.shape[0] < expected:
+            # The same shortfall the aperture itself is padded for, and from the
+            # same cause: the stimulus program writes a row per presented TR
+            # while the scan runs a few volumes past it. A 0 label is the exact
+            # analogue of a blank frame -- "no stimulus then" -- so the two stay
+            # in step only if this pads the same way.
+            print(
+                f"  Note: {path} has {flat.shape[0]} labels for a {expected}-TR run; "
+                f"padding the last {expected - flat.shape[0]} TR(s) with 0 (nothing shown)"
+            )
+            flat = np.concatenate([flat, np.zeros(expected - flat.shape[0], dtype=flat.dtype)])
+        elif flat.shape[0] > expected:
             parser.error(
-                f"-stim_types {path} has {flat.shape[0]} labels but its run has {expected} "
-                "frames; the labels are per frame"
+                f"-stim_types {path} has {flat.shape[0]} labels but its run has only "
+                f"{expected} frames; a surplus cannot be padded away and dropping from "
+                "either end would be a guess"
             )
         if not np.allclose(flat, np.rint(flat)):
             parser.error(f"-stim_types {path} must hold whole numbers (0 = nothing shown)")

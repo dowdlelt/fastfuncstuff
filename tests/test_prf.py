@@ -2601,13 +2601,54 @@ def test_stim_types_label_validation(tmp_path, labels, message):
         _load_type_labels([str(path)], [len(labels)], create_parser())
 
 
-def test_stim_types_length_must_match_the_run(tmp_path):
+def test_stim_types_pads_a_short_file_with_zeros(tmp_path):
+    """Same shortfall the aperture is padded for, so it pads the same way.
+
+    The stimulus program writes a row per presented TR while the scan runs a
+    few volumes past it, and a 0 label is the exact analogue of the blank frame
+    `_pad_stimulus_frames` appends. Requiring an exact match here rejected the
+    type file written by the very program whose aperture was just padded.
+    """
     from fastfuncstuff.cli.pyrf import _load_type_labels, create_parser
 
     path = tmp_path / "short.1D"
-    np.savetxt(path, np.array([1, 1, 2], dtype=float))
+    np.savetxt(path, np.array([1, 1, 2, 2], dtype=float))
+    labels, n_types = _load_type_labels([str(path)], [7], create_parser())
+    assert n_types == 2
+    assert labels[0].tolist() == [1, 1, 2, 2, 0, 0, 0]
+
+
+def test_stim_types_refuses_more_labels_than_frames(tmp_path):
+    """A surplus cannot be padded away, and trimming either end would be a guess."""
+    from fastfuncstuff.cli.pyrf import _load_type_labels, create_parser
+
+    path = tmp_path / "long.1D"
+    np.savetxt(path, np.array([1, 1, 2, 2, 2], dtype=float))
     with pytest.raises(SystemExit):
-        _load_type_labels([str(path)], [10], create_parser())
+        _load_type_labels([str(path)], [3], create_parser())
+
+
+def test_padding_keeps_types_and_aperture_the_same_length(tmp_path):
+    """The two padding paths have to agree, or the fit sees a shape mismatch."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import _load_stimulus_sources, _load_type_labels, create_parser
+
+    # An aperture 3 frames short of its 10-TR run, written as a NIfTI movie.
+    frames = np.zeros((4, 4, 1, 7), dtype=np.float32)
+    frames[1:3, 1:3, 0, :] = 1.0
+    aperture = tmp_path / "ap.nii.gz"
+    nib.save(nib.Nifti1Image(frames, np.eye(4)), aperture)
+    runs, _shape = _load_stimulus_sources([str(aperture)], [10])
+
+    path = tmp_path / "types.1D"
+    np.savetxt(path, np.array([1, 1, 1, 2, 2, 2, 2], dtype=float))
+    labels, _n_types = _load_type_labels([str(path)], [10], create_parser())
+
+    assert runs[0].shape[0] == labels[0].shape[0] == 10
+    # Both padded tails mean the same thing: nothing was shown.
+    assert bool((runs[0][7:] == 0).all())
+    assert labels[0][7:].tolist() == [0, 0, 0]
 
 
 def test_stim_types_accepts_a_column_selector(tmp_path):
