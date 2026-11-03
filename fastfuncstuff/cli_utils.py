@@ -3372,6 +3372,87 @@ def sample_input_to_ribbon(args, parser, input_files: list[str], stem: str, devi
         parser.error(f"-fs_subj: {error}")
 
 
+def add_hemi_pairing_args(group, tool: str = "the fit") -> None:
+    """``-hemi_pair``: fit both hemispheres of GIfTI ``-input`` as one dataset.
+
+    The companion to :func:`add_ribbon_sampling_args` for data that is already on
+    a surface: ffs_nwarp -surf writes one file per hemisphere, and a tool that
+    takes them one at a time fits each hemisphere twice over -- two super-grids,
+    two HRF selections, two noise pools -- for no gain, because nothing crosses
+    the midline anyway.
+    """
+    group.add_argument(
+        "-hemi_pair",
+        "-hemi-pair",
+        choices=["auto", "off"],
+        default="auto",
+        help=(
+            f"auto: when -input names one hemisphere (...lh.func.gii), find its partner "
+            f"beside it and run {tool} on both as one dataset, splitting every output back "
+            "into .lh / .rh files -- the same thing -fs_subj does from volumes. Listing "
+            "both hemispheres in -input is grouped the same way. off: fit exactly what was "
+            "given, one hemisphere at a time"
+        ),
+    )
+    group.add_argument(
+        "-hemi_dir",
+        "-hemi-dir",
+        metavar="DIR",
+        default=None,
+        help="Where the merged runs go. Default: {prefix}_hemi.",
+    )
+
+
+def pair_hemisphere_inputs(args, parser, input_files: list[str], stem: str, mask=None):
+    """Run ``-hemi_pair`` grouping, returning the sample (or None when it is off).
+
+    Mirrors :func:`sample_input_to_ribbon` exactly, including the return type, so
+    a tool supports both routes onto a surface with one branch: whichever returns
+    a sample, its ``runs`` are the fit's input and its ``mask`` the fit's mask.
+    """
+    from fastfuncstuff.io.gifti import is_gifti
+    from fastfuncstuff.processing.ribbon_sample import (
+        group_hemisphere_files,
+        merge_hemisphere_runs,
+    )
+
+    if getattr(args, "hemi_pair", "auto") == "off" or getattr(args, "fs_subj", None):
+        return None
+    paths = [str(path) for path in input_files]
+    if not paths or not all(is_gifti(path.split("[")[0]) for path in paths):
+        return None
+    if any("[" in path for path in paths):
+        # The merge reads whole files; a selector would be silently dropped.
+        return None
+    try:
+        grouped = group_hemisphere_files(paths)
+    except FileNotFoundError as error:
+        parser.error(f"-hemi_pair: {error}")
+    if grouped is None:
+        return None
+    runs, hemis = grouped
+    masks = None
+    if mask:
+        # A mask naming a hemisphere is paired like the runs. One that does not is
+        # passed through untouched -- it may already be on the merged mesh -- and
+        # the loader's own size and fingerprint checks catch it if it is neither.
+        found = group_hemisphere_files([str(mask)])
+        if found is not None:
+            if found[1] != hemis:
+                parser.error(f"-mask covers {'+'.join(found[1])} but -input is {'+'.join(hemis)}")
+            masks = found[0][0]
+    try:
+        return merge_hemisphere_runs(
+            runs,
+            hemis,
+            out_dir=getattr(args, "hemi_dir", None) or f"{stem}_hemi",
+            mask=masks,
+            verb=getattr(args, "verb", 1),
+        )
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(f"-hemi_pair: {error}")
+
+
 def split_ribbon_outputs(stem: str, verbose: bool = True) -> list[str]:
     """Split every ``{stem}*`` GIfTI result on a merged mesh into .lh / .rh files.
 

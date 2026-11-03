@@ -40,6 +40,7 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_device_arg,
+    add_hemi_pairing_args,
     add_load_threads_arg,
     add_ortvec_arguments,
     add_ribbon_sampling_args,
@@ -49,6 +50,7 @@ from fastfuncstuff.cli_utils import (
     compute_run_lengths,
     domain_prefix,
     load_and_preprocess_runs,
+    pair_hemisphere_inputs,
     parse_input_files,
     parse_prefix,
     resolve_polort,
@@ -1003,6 +1005,7 @@ def create_parser() -> argparse.ArgumentParser:
 
     surface = parser.add_argument_group("cortical surface")
     add_ribbon_sampling_args(surface, tool="the pRF fit")
+    add_hemi_pairing_args(surface, tool="the pRF fit")
 
     processing = parser.add_argument_group("processing")
     processing.add_argument("-mask", default=None, help="Optional brain mask")
@@ -2298,7 +2301,14 @@ def main(argv: list[str] | None = None) -> int:
         args.screen is not None or args.screen_top is not None or bool(args.noise_pool_mask)
     )
     device = setup_device(args.device)
+    # Two routes onto a surface, one destination: -fs_subj samples volumes onto the
+    # ribbon, -hemi_pair merges runs already sampled there. Both return the same
+    # sample, so everything after this point is the same fit either way.
     ribbon = sample_input_to_ribbon(args, parser, input_files, prefix_info.stem, device=device)
+    if ribbon is None:
+        ribbon = pair_hemisphere_inputs(args, parser, input_files, prefix_info.stem, mask=args.mask)
+        if ribbon is not None and ribbon.mask:
+            args.mask = ribbon.mask  # the merged twin of the mask the user gave
     if ribbon is not None:
         input_files = ribbon.runs
         # Cortex and full coverage in every run: the vertices that have data to fit.

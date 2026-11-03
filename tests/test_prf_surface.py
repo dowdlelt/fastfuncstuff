@@ -186,3 +186,49 @@ def test_a_nifti_prefix_on_a_surface_fit_is_refused_not_overridden():
         _surface_prefix(args, Namespace(error=fail), parse_prefix(args.prefix), ["r.lh.func.gii"])
     assert len(errors) == 1
     assert "names a NIfTI file" in errors[0] and ".func.gii" in errors[0]
+
+
+def test_one_hemisphere_is_fit_as_given_not_refused(tmp_path):
+    """A dataset with no rh (or no lh) happens. Pairing is a convenience, so when
+    there is nothing to pair the fit proceeds on what it was given -- the surface
+    prefix still applies, because it is still a surface fit."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.pyrf import _surface_prefix
+    from fastfuncstuff.cli_utils import pair_hemisphere_inputs, parse_prefix
+
+    lone = tmp_path / "run-01.native.lh.func.gii"
+    lone.write_bytes(b"")  # never opened: the partner is missing before any read
+    args = Namespace(prefix="out", fs_subj=None, verb=0, hemi_pair="auto", hemi_dir=None)
+    assert pair_hemisphere_inputs(args, None, [str(lone)], "out") is None
+    assert _surface_prefix(args, None, parse_prefix("out"), [str(lone)]).nifti_ext == ".func.gii"
+
+
+def test_hemi_pair_off_fits_what_was_given(tmp_path):
+    """The escape hatch has to work even when a partner is sitting right there."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli_utils import pair_hemisphere_inputs
+
+    for hemi in ("lh", "rh"):
+        (tmp_path / f"run-01.native.{hemi}.func.gii").write_bytes(b"")
+    runs = [str(tmp_path / "run-01.native.lh.func.gii")]
+    off = Namespace(prefix="out", fs_subj=None, verb=0, hemi_pair="off", hemi_dir=None)
+    assert pair_hemisphere_inputs(off, None, runs, "out") is None
+    # And -fs_subj owns the surface route when it is given, so pairing stands down.
+    fs = Namespace(prefix="out", fs_subj="/fs/sub-X", verb=0, hemi_pair="auto", hemi_dir=None)
+    assert pair_hemisphere_inputs(fs, None, runs, "out") is None
+
+
+def test_a_sub_brick_selector_declines_pairing_rather_than_dropping_it(tmp_path):
+    """The merge reads whole files, so a selector cannot be honoured; fitting the
+    hemispheres separately keeps it, which is the lesser surprise."""
+    from argparse import Namespace
+
+    from fastfuncstuff.cli_utils import pair_hemisphere_inputs
+
+    for hemi in ("lh", "rh"):
+        (tmp_path / f"run-01.native.{hemi}.func.gii").write_bytes(b"")
+    args = Namespace(prefix="out", fs_subj=None, verb=0, hemi_pair="auto", hemi_dir=None)
+    runs = [str(tmp_path / "run-01.native.lh.func.gii") + "[0..$]"]
+    assert pair_hemisphere_inputs(args, None, runs, "out") is None
