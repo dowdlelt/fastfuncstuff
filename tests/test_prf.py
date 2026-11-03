@@ -2193,3 +2193,116 @@ def test_response_peak_requires_run_starts_with_nuisance():
             voxel_chunk_size=4,
             nuisance_per_run=[torch.ones(8, 1)],
         )
+
+
+class TestPerTypePrediction:
+    """Splitting the aperture by stimulus type has to be an exact decomposition."""
+
+    def _runs(self):
+        torch.manual_seed(0)
+        return (
+            [torch.rand(30, 64), torch.rand(24, 64)],
+            torch.tensor([[4.0, 4.0, 2.0, 0.6], [5.0, 3.0, 1.5, 0.4]]),
+            torch.rand(6),
+            (8, 8),
+        )
+
+    def test_one_type_everywhere_is_the_plain_prediction(self):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.ones(run.shape[0], dtype=torch.long) for run in runs]
+        by_type = css_prediction_by_type(runs, params, hrf, shape, labels, n_types=1)
+        torch.testing.assert_close(by_type[..., 0], _css_prediction(runs, params, hrf, shape))
+
+    def test_types_sum_back_to_the_combined_prediction(self):
+        """The property the whole design rests on: the split is additive.
+
+        Partition the timepoints between two types, give both the same pRF, and
+        the two predictors must add up to the one the combined model makes. If
+        this fails the per-type fit is not a reparametrisation of the old one
+        and no comparison between them means anything.
+
+        Measured at 1.2e-7 (one float32 ULP) -- the streams reduce in a
+        different order than the single pass, so this is not bit-equality.
+        """
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.where(torch.arange(run.shape[0]) % 2 == 0, 1, 2) for run in runs]
+        by_type = css_prediction_by_type(runs, params, hrf, shape, labels, n_types=2)
+        torch.testing.assert_close(
+            by_type.sum(-1), _css_prediction(runs, params, hrf, shape), rtol=1e-6, atol=1e-6
+        )
+
+    def test_label_zero_is_dropped_from_every_stream(self):
+        """0 means nothing was shown, so it drives no type."""
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.where(torch.arange(run.shape[0]) % 3 == 0, 0, 1) for run in runs]
+        blanked = css_prediction_by_type(runs, params, hrf, shape, labels, n_types=1)
+        masked = [
+            run * (label == 1).to(run.dtype).unsqueeze(1)
+            for run, label in zip(runs, labels, strict=True)
+        ]
+        torch.testing.assert_close(blanked[..., 0], _css_prediction(masked, params, hrf, shape))
+
+    def test_free_parameters_match_tied_when_the_sets_are_identical(self):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.where(torch.arange(run.shape[0]) % 2 == 0, 1, 2) for run in runs]
+        tied = css_prediction_by_type(runs, params, hrf, shape, labels, n_types=2)
+        per_type = params.unsqueeze(1).expand(-1, 2, -1).contiguous()
+        free = css_prediction_by_type(
+            runs, per_type, hrf, shape, labels, n_types=2, per_type_parameters=True
+        )
+        torch.testing.assert_close(free, tied)
+
+    def test_a_per_type_parameter_moves_only_its_own_type(self):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.where(torch.arange(run.shape[0]) % 2 == 0, 1, 2) for run in runs]
+        per_type = params.unsqueeze(1).expand(-1, 2, -1).contiguous()
+        before = css_prediction_by_type(
+            runs, per_type, hrf, shape, labels, n_types=2, per_type_parameters=True
+        )
+        moved = per_type.clone()
+        moved[:, 1, 0] = 2.0  # shift type 2's pRF row
+        after = css_prediction_by_type(
+            runs, moved, hrf, shape, labels, n_types=2, per_type_parameters=True
+        )
+        assert not torch.allclose(after[..., 1], before[..., 1])
+        torch.testing.assert_close(after[..., 0], before[..., 0])
+
+    def test_label_length_must_match_the_run(self):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        labels = [torch.ones(5, dtype=torch.long), torch.ones(24, dtype=torch.long)]
+        with pytest.raises(ValueError, match="timepoints"):
+            css_prediction_by_type(runs, params, hrf, shape, labels, n_types=1)
+
+    def test_one_label_vector_per_run(self):
+        from fastfuncstuff.design.prf import css_prediction_by_type
+
+        runs, params, hrf, shape = self._runs()
+        with pytest.raises(ValueError, match="one label vector per run"):
+            css_prediction_by_type(
+                runs, params, hrf, shape, [torch.ones(30, dtype=torch.long)], n_types=1
+            )
+
+    def test_streams_share_one_frame_table(self):
+        """The shared table is what lets the tied drive be computed once."""
+        from fastfuncstuff.design.prf import _compress_aperture_runs, split_aperture_by_type
+
+        runs, _params, _hrf, shape = self._runs()
+        run = _compress_aperture_runs(runs[:1], shape)[0]
+        labels = torch.where(torch.arange(run.n_timepoints) % 2 == 0, 1, 2)
+        streams = split_aperture_by_type(run, labels, 3)
+        assert len({stream.frames.data_ptr() for stream in streams}) == 1
+        assert all(stream.n_frames == run.n_frames + 1 for stream in streams)
+        # Each stream points its off-type timepoints at the appended blank frame.
+        assert int((streams[2].inverse == run.n_frames).sum()) == run.n_timepoints

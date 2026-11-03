@@ -728,6 +728,54 @@ def _compress_aperture_runs(
     return compressed
 
 
+def split_aperture_by_type(
+    run: _ApertureRun, type_labels: torch.Tensor, n_types: int
+) -> list[_ApertureRun]:
+    """One stream per stimulus type, all sharing a single frame table.
+
+    A stimulus type label is per *timepoint*: 0 where nothing was shown, 1..N
+    for which kind of thing it was. Stream ``k`` is the aperture movie with
+    every frame outside type ``k`` blanked, so the per-type responses are
+    additive and a voxel can hold a different pRF for each type.
+
+    The trick is that nothing is blanked by building a masked movie. One blank
+    frame is appended to the run's frame table, and each stream's ``inverse``
+    points its off-type timepoints at that frame instead. Three things follow:
+    the frame table is shared rather than copied N times; the neural drive is
+    computed **once** against it, no matter how many types, because a blank
+    frame drives nothing; and :class:`_HRFApplier` needs no change at all --
+    each stream is an ordinary run with its own expansion, so its operator
+    caches under its own key and the convolution is the only per-type work.
+
+    Note that the frame dedup is untouched: the same bar position shown under
+    two types stays one frame, which is exactly what lets the drive be shared.
+    """
+    if type_labels.shape[0] != run.n_timepoints:
+        raise ValueError(
+            f"type_labels has {type_labels.shape[0]} entries but the run has "
+            f"{run.n_timepoints} timepoints"
+        )
+    if n_types < 1:
+        raise ValueError("n_types must be positive")
+    blank = run.n_frames
+    frames = torch.cat([run.frames, run.frames.new_zeros(run.rows, run.frames.shape[1])], dim=0)
+    labels = type_labels.to(run.inverse.device)
+    streams = []
+    for stimulus_type in range(1, n_types + 1):
+        inverse = torch.where(labels == stimulus_type, run.inverse, blank)
+        streams.append(
+            _ApertureRun(
+                frames=frames,
+                inverse=inverse,
+                n_frames=blank + 1,
+                n_timepoints=run.n_timepoints,
+                rows=run.rows,
+                key=tuple(inverse.tolist()),
+            )
+        )
+    return streams
+
+
 def _frame_blocks(run: _ApertureRun, columns: int) -> list[slice]:
     """Frame ranges whose ``(frames * rows, voxels)`` contraction is at most one aperture.
 
@@ -901,6 +949,80 @@ def _css_prediction(
         neural = (field * normalization.T).clamp_min(0).pow(exponent)
         predictions.append(applier.apply(neural, run=run))
     return torch.cat(predictions, dim=0)
+
+
+def css_prediction_by_type(
+    stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun],
+    parameters: torch.Tensor,
+    hrf: torch.Tensor | _HRFApplier,
+    stimulus_shape: tuple[int, int],
+    type_labels: Sequence[torch.Tensor],
+    n_types: int,
+    per_type_parameters: bool = False,
+) -> torch.Tensor:
+    """``(time, voxels, n_types)`` unit-gain CSS predictors, one per stimulus type.
+
+    With ``per_type_parameters`` False (the tied model) every type shares one
+    pRF and ``parameters`` is ``(voxels, 4)``: the drive is computed once per run
+    and only the expansion-and-convolution is repeated, so N types cost barely
+    more than one. Each type then gets its own gain downstream, which is the
+    "same receptive field, different response size" model.
+
+    With it True, ``parameters`` is ``(voxels, n_types, 4)`` and each type gets
+    its own position, size and exponent -- the full model, at N times the drive.
+
+    The predictors are additive: the fitted response is
+    ``sum_k gain_k * prediction[..., k]``.
+    """
+    runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    if len(type_labels) != len(runs):
+        raise ValueError(
+            f"type_labels must hold one label vector per run: got {len(type_labels)} "
+            f"for {len(runs)} runs"
+        )
+    applier = _as_applier(hrf)
+    eps = torch.finfo(parameters.dtype).eps
+    n_voxels = parameters.shape[0]
+    blocks = []
+    for run, labels in zip(runs, type_labels, strict=True):
+        streams = split_aperture_by_type(run, labels, n_types)
+        block = parameters.new_empty((run.n_timepoints, n_voxels, n_types))
+        if per_type_parameters:
+            for stimulus_type, stream in enumerate(streams):
+                block[..., stimulus_type] = _neural_drive_to_response(
+                    stream, parameters[:, stimulus_type, :], applier, stimulus_shape, eps
+                )
+        else:
+            # The drive is the same for every type -- only which timepoints see
+            # it differs -- so compute it once and expand it N ways.
+            _, _, row_profile, column_profile, _, normalization = _separable_gaussian(
+                parameters, stimulus_shape
+            )
+            exponent = parameters[:, 3].clamp_min(eps)
+            (field,) = _separable_drives(
+                streams[0], column_profile.unsqueeze(0), [(row_profile, 0)]
+            )
+            neural = (field * normalization.T).clamp_min(0).pow(exponent)
+            for stimulus_type, stream in enumerate(streams):
+                block[..., stimulus_type] = applier.apply(neural, run=stream)
+        blocks.append(block)
+    return torch.cat(blocks, dim=0)
+
+
+def _neural_drive_to_response(
+    run: _ApertureRun,
+    parameters: torch.Tensor,
+    applier: _HRFApplier,
+    stimulus_shape: tuple[int, int],
+    eps: float,
+) -> torch.Tensor:
+    """One parameter set's unit-gain response over one aperture stream."""
+    _, _, row_profile, column_profile, _, normalization = _separable_gaussian(
+        parameters, stimulus_shape
+    )
+    (field,) = _separable_drives(run, column_profile.unsqueeze(0), [(row_profile, 0)])
+    neural = (field * normalization.T).clamp_min(0).pow(parameters[:, 3].clamp_min(eps))
+    return applier.apply(neural, run=run)
 
 
 def _bounded_css_parameters(
