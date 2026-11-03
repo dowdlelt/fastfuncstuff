@@ -2723,6 +2723,7 @@ def main(argv: list[str] | None = None) -> int:
         max(1, refine_chunk_size if refine_chunk_size > 0 else voxel_chunk_size),
         nuisance_per_run=nuisance_per_run,
         run_starts=list(loaded.run_starts),
+        device=device,
     )
     canonical_peak = (
         None
@@ -2737,6 +2738,7 @@ def main(argv: list[str] | None = None) -> int:
             max(1, refine_chunk_size if refine_chunk_size > 0 else voxel_chunk_size),
             nuisance_per_run=nuisance_per_run,
             run_starts=list(loaded.run_starts),
+            device=device,
         )
     )
     type_fit = None

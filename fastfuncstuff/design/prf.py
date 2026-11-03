@@ -2055,6 +2055,7 @@ def prf_response_peak(
     voxel_chunk_size: int,
     nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None = None,
     run_starts: Sequence[int] | None = None,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """Peak of each voxel's fitted response above its own baseline, in data units.
 
@@ -2074,20 +2075,39 @@ def prf_response_peak(
 
     Reduces inside the chunk loop: the full ``(time, voxels)`` prediction is the
     size of the dataset, and nothing here needs it.
+
+    ``device`` is where the prediction is computed; the returned map always
+    lands where ``parameters`` live. They differ whenever the fit itself
+    streamed a CPU-resident dataset through the GPU.
     """
     if (nuisance_per_run is None) != (run_starts is None):
         raise ValueError("nuisance_per_run and run_starts go together")
-    peak = torch.zeros(parameters.shape[0], device=parameters.device, dtype=parameters.dtype)
+    # Predict on ``device``, keep the map beside the parameters, as the fit
+    # functions do: a dataset too big for the card leaves its fit on the CPU
+    # while the library and the apertures were built on the compute device.
+    out_device, dtype = parameters.device, parameters.dtype
+    device = device or out_device
+    # Compressed and moved once: the frame table is the same for every chunk,
+    # and deduplicating a run costs a unique() over the whole aperture.
+    runs = [
+        run.to(device=device, dtype=dtype)
+        for run in _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    ]
+    hrf_library = hrf_library.to(device=device, dtype=dtype)
+    peak = torch.zeros(parameters.shape[0], device=out_device, dtype=dtype)
     for selected_hrf in hrf_index.unique(sorted=True).tolist():
         indices = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
+        # One applier per HRF rather than per chunk, so the banded operator the
+        # convolution needs is built once for all of that HRF's voxels.
+        applier = _as_applier(hrf_library[selected_hrf])
         for start in range(0, indices.numel(), voxel_chunk_size):
             chunk = indices[start : start + voxel_chunk_size]
             prediction = _css_prediction(
-                stimulus_runs, parameters[chunk], hrf_library[selected_hrf], stimulus_shape
+                runs, parameters[chunk].to(device), applier, stimulus_shape
             )
             if run_starts is not None:
                 prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
-            peak[chunk] = prediction.amax(dim=0) * gain[chunk]
+            peak[chunk] = (prediction.amax(dim=0) * gain[chunk].to(device)).to(out_device)
     return peak
 
 
@@ -2130,6 +2150,15 @@ def fit_prf_type_gains(
         raise ValueError(f"data has {data.shape[0]} voxels but parameters has {n_voxels}")
     device = parameters.device
     dtype = parameters.dtype
+    # The library was built on the compute device, which is not where the fit's
+    # maps live once a dataset too big for the card streamed through it. Compress
+    # the apertures once here too: css_prediction_by_type would otherwise
+    # deduplicate every run's frames again for every voxel chunk.
+    hrf_library = hrf_library.to(device=device, dtype=dtype)
+    stimulus_runs = [
+        run.to(device=device, dtype=dtype)
+        for run in _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    ]
     fit = PRFTypeGainFit(
         gains=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
         amplitude=torch.zeros((n_voxels, n_types), device=device, dtype=dtype),
@@ -2272,7 +2301,11 @@ def refine_prf_per_type(
         free_parameters=free_columns,
         n_sweeps=0,
     )
-    compressed = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    hrf_library = hrf_library.to(device=device, dtype=dtype)
+    compressed = [
+        run.to(device=device, dtype=dtype)
+        for run in _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    ]
     # One aperture stream per type, shared frame table (see split_aperture_by_type).
     streams = [
         split_aperture_by_type(run, labels, n_types)

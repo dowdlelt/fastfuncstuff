@@ -2179,6 +2179,50 @@ def test_response_peak_measures_above_the_projected_baseline():
     assert float(above_baseline) < float(from_zero)
 
 
+@pytest.mark.gpu
+def test_response_peak_spans_a_cpu_fit_and_a_gpu_library():
+    """The crash when a dataset too big for the card left its fit on the CPU.
+
+    ffs_pyrf builds the HRF library and the nuisance on the compute device but
+    keeps the fit's maps beside the data, so a CPU-resident dataset handed
+    prf_response_peak tensors on two devices and died in the convolution's GEMM.
+    """
+    from fastfuncstuff.design.prf import prf_response_peak
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    gpu = torch.device("cuda")
+    torch.manual_seed(0)
+    stimulus_runs = [torch.rand(24, 64), torch.rand(24, 64)]
+    parameters = torch.tensor([[4.0, 4.0, 2.0, 0.6], [5.0, 3.0, 1.5, 0.4], [4.5, 4.5, 3.0, 1.0]])
+    hrf_library = torch.rand(2, 8)
+    hrf_index = torch.tensor([0, 1, 0])
+    gain = torch.tensor([2.0, 0.5, 3.0])
+    nuisance = [torch.ones(24, 1) / math.sqrt(24.0)] * 2
+
+    kwargs = dict(
+        stimulus_shape=(8, 8),
+        voxel_chunk_size=2,
+        run_starts=[0, 24],
+    )
+    on_cpu = prf_response_peak(
+        stimulus_runs, parameters, hrf_index, gain, hrf_library, nuisance_per_run=nuisance, **kwargs
+    )
+    # The fit's maps on the CPU, the library and the nuisance on the card.
+    mixed = prf_response_peak(
+        stimulus_runs,
+        parameters,
+        hrf_index,
+        gain,
+        hrf_library.to(gpu),
+        nuisance_per_run=[block.to(gpu) for block in nuisance],
+        device=gpu,
+        **kwargs,
+    )
+    assert mixed.device.type == "cpu"
+    torch.testing.assert_close(mixed, on_cpu, rtol=1e-5, atol=1e-5)
+
+
 def test_response_peak_requires_run_starts_with_nuisance():
     from fastfuncstuff.design.prf import prf_response_peak
 
