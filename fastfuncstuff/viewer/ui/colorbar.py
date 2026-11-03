@@ -359,7 +359,6 @@ class RangeBar(QtWidgets.QWidget):
         self.p_spin = PValueSpin()
         self.p_spin.setValue(0.001)
         self.p_spin.setKeyboardTracking(False)
-        self.p_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.p_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._stat_host = QtWidgets.QWidget()
         stat_col = QtWidgets.QVBoxLayout(self._stat_host)
@@ -397,7 +396,7 @@ class RangeBar(QtWidgets.QWidget):
         spin.setRange(-1e9, 1e9)
         spin.setKeyboardTracking(False)  # commit on enter or focus-out
         spin.setToolTip(tip)
-        spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        # With our stylesheet, NoButtons collapses Qt's text editor to 1 px.
         spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         # A spin box sizes itself to the widest number its range allows, and
         # this range allows -1000000000.0000 -- sixteen characters, 157 pixels,
@@ -406,7 +405,7 @@ class RangeBar(QtWidgets.QWidget):
         # clipped the numbers off the other end. Ignored lets the layout size
         # it; the minimum keeps four significant figures legible.
         spin.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
-        spin.setMinimumWidth(64)
+        spin.setMinimumWidth(80)
         return spin
 
     # -- incoming ------------------------------------------------------
