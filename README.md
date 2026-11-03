@@ -367,15 +367,8 @@ Active, single (agent assisted, more honestly just...agent with human sanity che
 
 **GPL-2.0-or-later.** See `LICENSE` for the full text and `PROVENANCE.md` for attribution.
 
-`fastfuncstuff` contains code ported from AFNI and SPM, both GPL-2-or-later, so the
-combined work has to be GPL too. It was distributed under MIT until 2026-09-02; that was
-an error, since MIT purports to grant sublicensing rights the GPL-2 code does not permit
-us to grant. Copies already obtained under MIT keep the terms they were received under.
-
 The FSL-adjacent tools — `ffs_ica`, `ffs_blipflip`, `ffs_util_gmm`, `ffs_fitbasis` — are
 implemented **from the published papers only**, with no FSL source used as a reference.
-FSL is not open source, and its non-commercial terms cannot coexist with the GPL in one
-distributed work. `PROVENANCE.md` lists which module follows which paper.
 
 ## References
 
