@@ -327,3 +327,149 @@ def test_paired_input_is_refused_when_the_fit_is_already_on_a_surface(tmp_path):
     # One surface run per volume run, or the pairing is not positional at all.
     with pytest.raises(SystemExit):
         main(["-input", *inputs, "-surface_input", "only-one.func.gii", *base])
+
+
+def test_screening_is_shared_across_the_volume_and_the_surface(tmp_path):
+    """-screen ranks the whole location axis, so a vertex competes with a voxel on
+    the same R2 and both scatter back into their own domain.
+
+    This is the point of the pseudo-grid: screening is the step that gathers kept
+    locations out of place, and it needs no knowledge of which domain a row is.
+    Without it a paired fit pays for every location -- on the run that prompted
+    this, screening cut 40,962 vertices to 13,535.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
+    from tests.test_prf import _write_prf_dataset
+
+    inputs, stimuli, mask_path, shape = _write_prf_dataset(tmp_path)
+    n_vertices = 8
+    surfaces = []
+    for run, volume in enumerate(inputs):
+        series = np.asarray(nib.load(volume).dataobj).reshape(-1, 120)
+        # Half responsive (copied from the responsive voxels), half not, so
+        # screening has something to reject on the surface side too.
+        vertex_series = np.concatenate([series[:4], series[-4:]]).astype(np.float32)
+        path = tmp_path / f"s{run}.func.gii"
+        save_gifti_data(
+            path, vertex_series, meta={"mesh_fingerprint": "V8_F4", "TR_seconds": "1"},
+            time_series=True,
+        )  # fmt: skip
+        surfaces.append(str(path))
+
+    prefix = str(tmp_path / "scr.nii.gz")
+    assert (
+        main(
+            [
+                "-input",
+                *inputs,
+                "-surface_input",
+                *surfaces,
+                "-stimulus",
+                *stimuli,
+                "-mask",
+                mask_path,
+                "-screen",
+                "0.0",
+                "-prefix",
+                prefix,
+                "-device",
+                "cpu",
+                "-verb",
+                "1",
+                "-tr",
+                "1",
+            ]
+        )  # fmt: skip
+        == 0
+    )
+    volume_out = nib.load(str(tmp_path / "scr_volume.nii.gz"))
+    vertices, _meta = load_gifti_data(tmp_path / "scr_surface.shape.gii")
+    # Both domains come back on their own geometry, not the pseudo-grid.
+    assert volume_out.shape[:3] == shape
+    assert vertices.shape[0] == n_vertices
+    # The responsive vertices were fit; the unresponsive ones were screened out
+    # and come back NaN rather than as a fit of the wrong region -- all but the
+    # one map that is a property of the input (meanvol) and so is kept for every
+    # location whether or not it was fit.
+    finite = np.isfinite(vertices).sum(axis=1)
+    n_maps = vertices.shape[1]
+    assert list(finite[:4]) == [n_maps] * 4, "the responsive vertices were not fit"
+    assert list(finite[4:]) == [1] * 4, "a screened-out vertex kept more than meanvol"
+    # And the volume half still has its fit voxels, so screening did not take one
+    # domain entirely -- which is what a per-domain threshold could do, and the
+    # reason a shared rank over both is the thing being tested.
+    vol = np.asarray(volume_out.dataobj)
+    assert int((np.isfinite(vol[..., 0]) & (vol[..., 0] != 0)).sum()) == 24
+
+
+def test_the_noise_pool_of_a_paired_fit_spans_both_domains(tmp_path):
+    """-denoise picks its pool from the screening scores, which rank the whole
+    location axis -- so a paired fit's nuisance components come from the volume as
+    well as cortex. That is the gap a surface-only fit cannot close: its pool can
+    only see what was sampled onto the mesh.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.gifti import save_gifti_data
+    from tests.test_prf import _write_prf_dataset
+
+    inputs, stimuli, _mask_path, _shape = _write_prf_dataset(tmp_path)
+    surfaces = []
+    for run, volume in enumerate(inputs):
+        series = np.asarray(nib.load(volume).dataobj).reshape(-1, 120)
+        path = tmp_path / f"d{run}.func.gii"
+        save_gifti_data(
+            path, series[:6].astype(np.float32),
+            meta={"mesh_fingerprint": "V6_F2", "TR_seconds": "1"}, time_series=True,
+        )  # fmt: skip
+        surfaces.append(str(path))
+
+    # No -mask on purpose: the pool needs at least 100 locations, and the point
+    # being tested is that it draws them from the volume. The pool comes from the
+    # screen, so no region has to be named -- which is why this works paired.
+    assert (
+        main(
+            [
+                "-input",
+                *inputs,
+                "-surface_input",
+                *surfaces,
+                "-stimulus",
+                *stimuli,
+                "-denoise",
+                "-max_pcs",
+                "2",
+                "-prefix",
+                str(tmp_path / "dn.nii.gz"),
+                "-device",
+                "cpu",
+                "-verb",
+                "0",
+                "-tr",
+                "1",
+            ]
+        )  # fmt: skip
+        == 0
+    )
+    assert (tmp_path / "dn_volume.nii.gz").is_file()
+    assert (tmp_path / "dn_surface.shape.gii").is_file()
+
+
+def test_noise_pool_mask_is_refused_paired_and_says_what_to_use(tmp_path):
+    """It names its region as a volume, so it has no spelling for "these
+    vertices". The refusal has to point at -denoise, which needs no region."""
+    from fastfuncstuff.cli.pyrf import main
+    from tests.test_prf import _write_prf_dataset
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    with pytest.raises(SystemExit):
+        main([
+            "-input", *inputs, "-surface_input", "a.func.gii", "b.func.gii",
+            "-stimulus", *stimuli, "-mask", mask_path,
+            "-denoise", "-noise_pool_mask", "all",
+            "-prefix", str(tmp_path / "x"), "-device", "cpu", "-verb", "0",
+        ])  # fmt: skip

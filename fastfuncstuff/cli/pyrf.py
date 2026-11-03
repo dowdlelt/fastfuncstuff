@@ -315,12 +315,20 @@ SURFACE DATA
 VOLUME AND SURFACE TOGETHER
   -surface_input takes GIfTI runs paired by position with the -input volume runs
   and fits both on one location axis: a vector of locations is a vector of
-  locations, whether the entry is a voxel or a vertex. One super-grid pass, one
-  HRF selection and one noise pool span both domains -- so unlike a
-  surface-only fit, -denoise here can draw its nuisance components from outside
-  cortex. -mask covers the volume runs and -surface_mask the vertices,
-  independently. Every map is written twice, {prefix}_volume and
-  {prefix}_surface, each with its own geometry.
+  locations, whether the entry is a voxel or a vertex. -mask covers the volume
+  runs and -surface_mask the vertices, independently. Every map is written twice,
+  {prefix}_volume and {prefix}_surface, each with its own geometry.
+
+  One super-grid pass, one HRF selection, one screen and one noise pool span both
+  domains. -screen ranks the whole axis, so a vertex competes with a voxel on the
+  same R2 and only the responsive locations of either are fit -- which is what
+  keeps a paired fit affordable. -denoise then takes its pool from those same
+  scores, so unlike a surface-only fit, whose pool can see only what was sampled
+  onto the mesh, its nuisance components come from outside cortex too.
+
+  -noise_pool_mask is the exception: it names its region as a volume, so it has
+  no spelling for "these vertices" and is refused paired. -denoise reaches the
+  same end without naming a region.
 
 NOISE CEILING
   Runs with a bit-identical aperture movie have the same expected response, so
@@ -2278,6 +2286,18 @@ def main(argv: list[str] | None = None) -> int:
             "-surface_input pairs surface runs with VOLUME -input runs; with -fs_subj or "
             "GIfTI -input the fit is already on a surface"
         )
+    if args.surface_input and args.noise_pool_mask:
+        # -screen and -denoise are fine paired (see the comment at the load): they
+        # work on the location axis, which spans both domains. This one does not,
+        # because it names its regions as volumes -- _resolve_masks sizes both
+        # masks from the -input grid, and there is no spelling in it for "these
+        # vertices". -denoise reaches the same end without naming a region: it
+        # takes the pool from the screening pass, which already sees both domains.
+        parser.error(
+            "-noise_pool_mask names a region as a volume, so it cannot cover the "
+            "vertices of a paired fit. Use -denoise (its pool comes from the "
+            "screening pass, across both domains), or fit the volume on its own"
+        )
     if args.stim_downsample < 0:
         parser.error("-stim-downsample must be non-negative (0 keeps the native resolution)")
     if args.candidate_chunk < 1 or (args.batch_size is not None and args.batch_size < 1):
@@ -2346,13 +2366,14 @@ def main(argv: list[str] | None = None) -> int:
         # Volumes and vertices fit together on one location axis (io/paired.py):
         # one super-grid, one HRF selection, one noise pool spanning both, and
         # every map written twice with each domain's own geometry.
+        #
+        # -screen needs nothing special here, which is the point of the pseudo-grid:
+        # it ranks the location axis and gathers the kept rows, so a vertex competes
+        # with a voxel on the same R2 and _expand_fit scatters both back together.
+        # That makes the screen shared across domains for free -- and so is
+        # -denoise's noise pool, which is chosen from the same scores.
         from fastfuncstuff.io.paired import load_paired_runs
 
-        if load_mask_flat is not None:
-            parser.error(
-                "-screen / -noise_pool_mask gather voxels out of place, which paired "
-                "-surface_input does not support yet; use -mask and -surface_mask"
-            )
         loaded = load_paired_runs(
             input_files,
             args.surface_input,
