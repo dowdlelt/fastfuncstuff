@@ -442,6 +442,11 @@ class RangeBar(QtWidgets.QWidget):
         spin.setKeyboardTracking(False)  # commit on enter or focus-out
         spin.setToolTip(tip)
         # With our stylesheet, NoButtons collapses Qt's text editor to 1 px.
+        # The arrows are a mouse target now, so the step has to suit the number
+        # under them: these boxes carry anything from a beta of 3e-4 to an F of
+        # 300, and Qt's fixed 1.0 is meaningless at both ends. Adaptive steps by
+        # the decade the value is already in.
+        spin.setStepType(QtWidgets.QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
         spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         # A spin box sizes itself to the widest number its range allows, and
         # this range allows -1000000000.0000 -- sixteen characters, 157 pixels,
