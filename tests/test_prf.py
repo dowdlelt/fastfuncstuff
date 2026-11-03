@@ -2826,3 +2826,90 @@ def test_stim_types_and_from_aperture_are_mutually_exclusive(tmp_path):
                 "-stim_types_from_aperture",
             ]
         )
+
+
+class TestFreeParameterSelection:
+    """Gauss-Newton over an arbitrary subset of (row, column, sigma, exponent)."""
+
+    def _problem(self):
+        torch.manual_seed(0)
+        shape, n_time = (10, 10), 80
+        runs = [torch.rand(n_time, 100)]
+        hrf = torch.rand(1, 6)
+        hrf = hrf / hrf.sum()
+        truth = torch.tensor([[5.0, 6.0, 2.5, 0.8]])
+        clean = _css_prediction(runs, truth, hrf[0], shape)
+        data = (clean * 3.0 + 0.02 * torch.randn(n_time, 1)).T
+        # Wrong in every parameter, so any freed one has somewhere to go.
+        seed = torch.tensor([[3.0, 4.0, 1.0, 0.5]])
+        return data, runs, shape, hrf, seed, truth
+
+    def _refine(self, free):
+        from fastfuncstuff.design.prf import refine_prf_supergrid
+
+        data, runs, shape, hrf, seed, _ = self._problem()
+        grid_fit = PRFGridFit(
+            candidate_index=torch.zeros(1, dtype=torch.long),
+            hrf_index=torch.zeros(1, dtype=torch.long),
+            parameters=seed.clone(),
+            gain=torch.ones(1),
+            correlation=torch.zeros(1),
+            r2=torch.zeros(1),
+        )
+        fit = refine_prf_supergrid(
+            data,
+            runs,
+            shape,
+            grid_fit,
+            hrf,
+            [0],
+            config=PRFRefinementConfig(max_iter=60, free_parameters=free),
+            voxel_chunk_size=4,
+        )
+        return fit.parameters[0], seed[0], float(fit.residual_ss[0])
+
+    @pytest.mark.parametrize("free", [(2,), (0, 1), (0, 1, 2), (0, 1, 2, 3), (3,)])
+    def test_only_the_chosen_columns_move(self, free):
+        """A non-prefix subset is the point: sigma alone, or the exponent alone.
+
+        The refiner's derivatives are built as a prefix of
+        (row, column, sigma, exponent), so before this the only expressible
+        free sets were prefixes -- which is why the per-type flag could only
+        offer nested levels.
+        """
+        parameters, seed, _ss = self._refine(free)
+        for index in range(4):
+            moved = abs(float(parameters[index] - seed[index])) > 1e-4
+            assert moved == (index in free), (index, free, float(parameters[index]))
+
+    def test_more_freedom_never_fits_worse(self):
+        """Nested free sets must give nested residuals."""
+        _, _, position = self._refine((0, 1))
+        _, _, position_sigma = self._refine((0, 1, 2))
+        _, _, everything = self._refine((0, 1, 2, 3))
+        # Measured 0.1184 -> 0.0443 -> 0.0292.
+        assert everything <= position_sigma + 1e-6
+        assert position_sigma <= position + 1e-6
+
+    def test_all_free_recovers_the_simulated_parameters(self):
+        parameters, _seed, _ss = self._refine((0, 1, 2, 3))
+        _, _, _, _, _, truth = self._problem()
+        np.testing.assert_allclose(parameters.numpy(), truth[0].numpy(), rtol=0.0, atol=0.45)
+
+    def test_default_matches_the_historical_prefix(self):
+        from fastfuncstuff.design.prf import PRFRefinementConfig as Config
+
+        assert Config().free_indices() == (0, 1, 2, 3)
+        assert Config(fix_exponent=True).free_indices() == (0, 1, 2)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"free_parameters": ()}, "non-empty"),
+            ({"free_parameters": (0, 4)}, "subset"),
+            ({"free_parameters": (0, 3), "fix_exponent": True}, "fix_exponent"),
+        ],
+    )
+    def test_rejects_an_impossible_free_set(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            PRFRefinementConfig(**kwargs).free_indices()

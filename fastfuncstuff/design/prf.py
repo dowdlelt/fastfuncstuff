@@ -108,6 +108,26 @@ class PRFRefinementConfig:
     max_line_search: int = 4
     fix_exponent: bool = False
     stagewise_exponent: bool = False
+    # Which of (row, column, sigma, exponent) Gauss-Newton may move, by index.
+    # None means the historical behaviour: a prefix, all four or the first three
+    # under fix_exponent. An explicit set exists for the per-stimulus-type fit,
+    # where a parameter can be tied across types (held at the combined fit's
+    # value) while another is refit per type -- which is not a prefix.
+    free_parameters: tuple[int, ...] | None = None
+
+    def free_indices(self) -> tuple[int, ...]:
+        """The parameter columns Gauss-Newton may move, ascending."""
+        if self.free_parameters is None:
+            return (0, 1, 2) if self.fix_exponent else (0, 1, 2, 3)
+        chosen = tuple(sorted(set(self.free_parameters)))
+        if not chosen or any(index not in (0, 1, 2, 3) for index in chosen):
+            raise ValueError(
+                f"free_parameters must be a non-empty subset of (0, 1, 2, 3), got "
+                f"{self.free_parameters}"
+            )
+        if self.fix_exponent and 3 in chosen:
+            raise ValueError("free_parameters includes the exponent but fix_exponent is set")
+        return chosen
 
 
 @dataclass
@@ -1316,7 +1336,15 @@ def _refine_css_batch(
     projected_data = _project_per_run(data.T, nuisance_per_run, run_starts)
     current = _bounded_css_parameters(parameters, stimulus_shape, config)
     n_voxels = current.shape[0]
-    n_free = 3 if config.fix_exponent else 4
+    free_columns = config.free_indices()
+    n_free = len(free_columns)
+    # The derivative builder forms a prefix (3 or 4 columns); the free set need
+    # not be one, so build the prefix that covers it and keep the chosen
+    # columns. Only the exponent derivative is worth not computing -- the
+    # spatial ones all fall out of a single contraction.
+    n_derivatives = 4 if 3 in free_columns else 3
+    derivative_columns = torch.tensor(free_columns, device=current.device)
+    scatter_columns = derivative_columns
 
     applier = _as_applier(hrf)
     n_groups = applier.hrfs.shape[0]
@@ -1361,15 +1389,18 @@ def _refine_css_batch(
                 current[selected],
                 subset_applier(refresh),
                 stimulus_shape,
-                n_derivatives=n_free,
+                n_derivatives=n_derivatives,
             )
             prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
             derivatives = _project_prf_derivatives(derivatives, nuisance_per_run, run_starts)
+            if n_free != n_derivatives:
+                derivatives = derivatives.index_select(2, derivative_columns)
             _, residual, jacobian, refreshed_ss = _variable_projection_terms(
                 projected_data[:, selected], prediction, derivatives
             )
-            # The Jacobian is already only the free parameters: the fixed-exponent
-            # model never forms the exponent column.
+            # The Jacobian holds only the free parameters: the derivative prefix
+            # is narrowed to the chosen columns above, and the fixed-exponent
+            # model never forms the exponent column at all.
             jtj[selected] = torch.where(
                 refresh_real.view(-1, 1, 1),
                 torch.einsum("tbp,tbq->bpq", jacobian, jacobian).to(solve_dtype),
@@ -1390,7 +1421,7 @@ def _refine_css_batch(
         except torch.linalg.LinAlgError:
             free_step = (plinalg.pinv(normal) @ rhs.unsqueeze(-1)).squeeze(-1).to(current.dtype)
         step = torch.zeros_like(current)
-        step[:, :n_free] = free_step
+        step.index_copy_(1, scatter_columns, free_step)
 
         accepted = torch.zeros_like(active)
         best_parameters = current.clone()
