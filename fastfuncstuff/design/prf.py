@@ -1040,6 +1040,79 @@ def _bounded_css_parameters(
     return bounded
 
 
+# Past this many types the active-set enumeration below stops being the cheap
+# way to get an exact non-negative solution (2**n subsets), and the problem
+# stops being a sensible thing to ask of one pRF run anyway.
+MAX_STIMULUS_TYPES = 6
+
+
+def nonnegative_gains(gram: torch.Tensor, cross: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact per-voxel non-negative least squares for a handful of predictors.
+
+    ``gram`` is ``(voxels, k, k)`` (``P^T P``) and ``cross`` is ``(voxels, k)``
+    (``P^T y``). Returns the non-negative minimiser and the explained term
+    ``2 g.b - g^T G g``, so the caller gets ``SSE = y.y - explained`` without
+    needing the predictors again.
+
+    Exact rather than iterative: the solution's active set is one of the ``2**k``
+    subsets of the coefficients, so every subset is solved at once (clamping the
+    rest to zero) and the feasible candidate with the least error wins. At k <= 6
+    that is at most 64 small batched solves, which is cheaper than running an
+    iterative NNLS to convergence and has no tolerance to tune. Clamping an
+    unconstrained solve instead -- the obvious shortcut -- is simply a different
+    answer: with correlated predictors it can leave error on the table that
+    re-solving without the dropped coefficient recovers.
+
+    The all-zero subset is always a candidate, so a voxel the stimulus does not
+    drive at all gets zero gains rather than an arbitrary tiny fit.
+    """
+    n_voxels, k = cross.shape
+    if k > MAX_STIMULUS_TYPES:
+        raise ValueError(f"nonnegative_gains handles at most {MAX_STIMULUS_TYPES} predictors")
+    gains = torch.zeros_like(cross)
+    # The empty active set: zero gains, nothing explained.
+    best_explained = torch.zeros(n_voxels, device=cross.device, dtype=cross.dtype)
+    for mask in range(1, 1 << k):
+        columns = [index for index in range(k) if mask & (1 << index)]
+        picked = torch.tensor(columns, device=cross.device)
+        sub_gram = gram[:, picked][:, :, picked]
+        sub_cross = cross[:, picked]
+        # A ridge the size of the matrix keeps a voxel whose predictors are
+        # collinear (a type that never appeared, say) from throwing here; its
+        # gain is then pinned near zero, which is the honest answer for it.
+        scale = sub_gram.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12)
+        eye = torch.eye(len(columns), device=cross.device, dtype=cross.dtype)
+        regularized = sub_gram + eye * (1e-9 * scale).view(-1, 1, 1)
+        try:
+            candidate = plinalg.solve(regularized, sub_cross.unsqueeze(-1)).squeeze(-1)
+        except torch.linalg.LinAlgError:
+            candidate = (plinalg.pinv(regularized) @ sub_cross.unsqueeze(-1)).squeeze(-1)
+        feasible = (candidate >= 0).all(dim=1)
+        explained = 2.0 * (candidate * sub_cross).sum(dim=1) - torch.einsum(
+            "vi,vij,vj->v", candidate, sub_gram, candidate
+        )
+        take = feasible & (explained > best_explained)
+        best_explained = torch.where(take, explained, best_explained)
+        full = torch.zeros_like(gains)
+        full[:, picked] = candidate
+        gains = torch.where(take.unsqueeze(1), full, gains)
+    return gains, best_explained
+
+
+def variable_projection_sse_by_type(
+    data: torch.Tensor, predictions: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Profiled residual sum of squares at the optimal per-type non-negative gains.
+
+    ``data`` is ``(time, voxels)`` and ``predictions`` ``(time, voxels, k)``.
+    The one-type case reduces to :func:`_variable_projection_sse` exactly.
+    """
+    gram = torch.einsum("tvi,tvj->vij", predictions, predictions)
+    cross = torch.einsum("tvi,tv->vi", predictions, data)
+    gains, explained = nonnegative_gains(gram, cross)
+    return gains, (data.square().sum(dim=0) - explained).clamp_min(0)
+
+
 def _variable_projection_sse(data: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     """Return the profiled residual sum of squares at the optimal non-negative gain."""
     eps = torch.finfo(data.dtype).eps
