@@ -8,8 +8,8 @@ Two test families, picked automatically from how you specify the data:
 * **2-sample** label-swap between two conditions, or one-vs-all.
 
 Outputs a single 4-D stat dataset with AFNI-style sub-bricks, plus a
-3dClustSim-style cluster table injected into its header (when ``3drefit``
-is on PATH) so AFNI's viewer reports cluster significance interactively.
+3dClustSim-style cluster table injected into its header (in-process; AFNI
+need not be installed) so AFNI's viewer reports cluster significance interactively.
 
 Run-block (within-run) exchangeability is the default whenever events
 files are supplied — single-trial fMRI's repeated-measures structure
@@ -254,8 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="run_refit",
         action="store_false",
         default=True,
-        help="Do not call 3drefit even if available.  Still writes the "
-        "NIML files and a refit.sh script.",
+        help="Do not inject the cluster tables into the stat file's header "
+        "(done in-process, no AFNI needed).  Still writes the NIML files "
+        "and a refit.sh script.",
     )
 
     misc = p.add_argument_group("Misc")

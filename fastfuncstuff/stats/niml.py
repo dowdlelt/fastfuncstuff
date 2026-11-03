@@ -121,33 +121,28 @@ def resolve_mask_idcode(mask_path: Path | str | None) -> str:
 
     Strategy:
 
-    1. If ``3dinfo`` is on PATH and the mask file exists, run
-       ``3dinfo -id <file>`` and return its output (real AFNI IDCODE).
+    1. If the mask's header carries an IDCODE (an AFNI or ffs-written
+       dataset), use it -- read in-process via ``read_info``, so ``.nii.zst``
+       works and AFNI need not be installed.
     2. Otherwise synthesise a deterministic ID from the absolute mask path
        so reruns produce the same code; AFNI accepts any string here, it
        just uses IDCODE for cross-referencing.
     """
     import hashlib
-    import shutil as _shutil
-    import subprocess as _subprocess
 
     if mask_path is None:
         return "AFN_" + hashlib.sha256(b"ffs_perm:no-mask").hexdigest()[:22]
 
     p = Path(mask_path)
-    if _shutil.which("3dinfo") is not None and p.exists():
+    if p.exists():
+        from fastfuncstuff.io.dsetinfo import read_info
+
         try:
-            r = _subprocess.run(
-                ["3dinfo", "-id", str(p)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            idc = r.stdout.strip()
-            if idc and idc.startswith("AFN_"):
-                return idc
-        except (_subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+            idc = read_info(p).idcode
+        except Exception:  # unreadable header: fall through to the synthesised ID
+            idc = ""
+        if idc.startswith("AFN_"):
+            return idc
 
     seed = str(p.resolve() if p.exists() else p).encode()
     digest = hashlib.sha256(seed).digest()[:16]

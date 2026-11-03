@@ -269,7 +269,7 @@ class TestWriteMaskB64:
 
 
 # ---------------------------------------------------------------------------
-# resolve_mask_idcode — deterministic fallback when 3dinfo absent
+# resolve_mask_idcode — header IDCODE, else a deterministic fallback
 # ---------------------------------------------------------------------------
 
 
@@ -281,20 +281,45 @@ class TestResolveMaskIdcode:
         assert a.startswith("AFN_")
         assert len(a) == 4 + 22  # "AFN_" + 22 chars
 
-    def test_nonexistent_path_falls_back_deterministically(self, tmp_path, monkeypatch):
-        # Force 3dinfo to be absent so we exercise the hash path.
-        monkeypatch.setattr("shutil.which", lambda name: None)
+    def test_nonexistent_path_falls_back_deterministically(self, tmp_path):
         p = tmp_path / "ghost.nii.gz"
         a = resolve_mask_idcode(p)
         b = resolve_mask_idcode(p)
         assert a == b
         assert a.startswith("AFN_")
 
-    def test_different_paths_give_different_codes(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("shutil.which", lambda name: None)
+    def test_different_paths_give_different_codes(self, tmp_path):
         a = resolve_mask_idcode(tmp_path / "mask_a.nii.gz")
         b = resolve_mask_idcode(tmp_path / "mask_b.nii.gz")
         assert a != b
+
+    @pytest.mark.parametrize("name", ["mask.nii.gz", "mask.nii.zst"])
+    def test_header_idcode_is_used(self, tmp_path, name):
+        # The IDCODE ffs wrote into the AFNI extension is what comes back, read
+        # in-process: no AFNI needed, and .nii.zst (which 3dinfo cannot open) works.
+        import nibabel as nib
+
+        from fastfuncstuff.io.afni import set_afni_atr
+
+        img = nib.Nifti1Image(np.ones((4, 4, 4), np.uint8), np.eye(4))
+        set_afni_atr(img.header, "SOME_ATTR", "x")  # creates the extension + self_idcode
+        out = tmp_path / name
+        if name.endswith(".zst"):
+            from fastfuncstuff.io.afni import compress_nifti
+
+            plain = tmp_path / "mask.nii"
+            nib.save(img, plain)
+            compress_nifti(str(plain), str(out), remove_original=True)
+        else:
+            nib.save(img, out)
+
+        got = resolve_mask_idcode(out)
+        assert got.startswith("AFN_")
+        # Not the path-hash fallback.
+        assert got != resolve_mask_idcode(tmp_path / "ghost.nii.gz")
+        from fastfuncstuff.io.dsetinfo import read_info
+
+        assert read_info(out).idcode == got
 
 
 # ---------------------------------------------------------------------------

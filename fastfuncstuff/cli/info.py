@@ -94,6 +94,7 @@ _VALUE_FLAGS: dict[str, tuple] = {
         "sub-brick labels",
     ),
     "-history": (lambda i, a: i.history, "processing history"),
+    "-id": (lambda i, a: i.idcode, "AFNI dataset IDCODE (empty if the header has none)"),
     "-dmin": (lambda i, a: data_range(i.iname)[0], "minimum voxel value (reads the data)"),
     "-dmax": (lambda i, a: data_range(i.iname)[1], "maximum voxel value (reads the data)"),
 }

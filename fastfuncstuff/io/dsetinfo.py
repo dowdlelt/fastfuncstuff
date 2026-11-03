@@ -153,6 +153,10 @@ class DatasetInfo:
     #: bucket already says. Empty when the dataset carries no stat metadata.
     stataux: dict[int, tuple[int, tuple[float, ...]]] = field(default_factory=dict)
     history: str = ""
+    #: AFNI's dataset IDCODE (``AFN_...``) when the header carries one, else "".
+    #: NIfTI keeps it as the AFNI extension's ``self_idcode`` (or ``IDCODE_STRING``);
+    #: a file that never passed through AFNI or ffs has none.
+    idcode: str = ""
     #: A GIfTI file's own metadata (mesh fingerprint, subject, mesh, TR...);
     #: empty for a volume.
     surface_meta: dict[str, str] = field(default_factory=dict)
@@ -282,6 +286,17 @@ def _afni_atr(ext_text: str, name: str) -> str | None:
     if not m:
         return None
     return m.group(1).strip().strip('"').strip()
+
+
+def _idcode_from(ext_text: str) -> str:
+    """The dataset IDCODE out of an AFNI NIfTI extension, or "" if it has none."""
+    import re
+
+    val = _afni_atr(ext_text, "IDCODE_STRING")
+    if val:
+        return val
+    m = re.search(r'self_idcode\s*=\s*"([^"]+)"', ext_text)
+    return m.group(1) if m else ""
 
 
 def _decode_history(text: str) -> str:
@@ -487,6 +502,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     info.stataux = read_brick_stataux(hdr)
     info.value_labels = read_value_labels(hdr)
     info.history = _decode_history(_afni_atr(ext_text, "HISTORY_NOTE") or "")
+    info.idcode = _idcode_from(ext_text)
     # scl_slope 0 is the NIfTI spelling of "no scaling", not a zeroing scale factor.
     slope = float(hdr["scl_slope"]) if np.isfinite(hdr["scl_slope"]) else 1.0
     info.scl_slope = slope or 1.0
@@ -570,6 +586,7 @@ def _read_afni_info(p: Path, iname: str, indices: list[int] | None) -> DatasetIn
     elif dtable:
         info.value_labels = parse_dtable(str(dtable))
     info.history = str(hinfo.get("HISTORY_NOTE", "") or "")
+    info.idcode = str(hinfo.get("IDCODE_STRING", "") or "").strip()
     return info
 
 

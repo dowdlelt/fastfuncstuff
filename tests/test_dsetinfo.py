@@ -283,3 +283,21 @@ def test_a_gifti_reports_as_a_surface_and_keeps_its_history(tmp_path, capsys):
     assert "50 vertices × 7 time points" in text and "TR 2 s" in text
     assert "50 vertices × 1 map" in text and "4 vertices · 2 triangles" in text
     assert "history" in text and "orient" not in text
+
+
+def test_info_id_flag_reports_header_idcode(tmp_path, capsys):
+    # -id is 3dinfo's IDCODE query; empty (not a made-up code) when the header has none.
+    from fastfuncstuff.io.afni import set_afni_atr
+
+    bare = nib.Nifti1Image(np.zeros((3, 3, 3), np.float32), np.eye(4))
+    nib.save(bare, tmp_path / "bare.nii.gz")
+    tagged = nib.Nifti1Image(np.zeros((3, 3, 3), np.float32), np.eye(4))
+    set_afni_atr(tagged.header, "X", "y")
+    nib.save(tagged, tmp_path / "tagged.nii.gz")
+
+    assert read_info(tmp_path / "bare.nii.gz").idcode == ""
+    idc = read_info(tmp_path / "tagged.nii.gz").idcode
+    assert idc.startswith("AFN_")
+
+    main(["-id", str(tmp_path / "tagged.nii.gz")])
+    assert capsys.readouterr().out.strip() == idc
