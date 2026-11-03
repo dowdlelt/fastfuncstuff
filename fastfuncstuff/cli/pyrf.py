@@ -388,6 +388,16 @@ CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on your
                   launch-bound, not candidate-bound) and clearly beats
                   analyzePRF's 16. Subdividing sigma or eccentricity instead
                   sharpens the seeds but does NOT change the refined fit.
+  APERTURE LENGTH  every aperture is a per-TR stream, so an aperture SHORT of
+                  its run is zero-padded at the end whichever flag carried it
+                  (-stimulus, -stim_pngs, -stim_nii): the stimulus program
+                  writes a frame per presented TR while the scan usually runs a
+                  few volumes past it, and a blank frame says "no stimulus
+                  then" exactly. A SURPLUS is refused -- dropping frames from
+                  either end would be a guess about which TRs were never
+                  scanned. -stim_types label files follow the same rule, padded
+                  with 0, so the labels and the aperture they describe stay the
+                  same length.
   -stim_downsample
                   refinement cost and memory scale with aperture AREA. A native
                   1080x1080 aperture is ~136x the work of the ~100x100 the
@@ -1160,6 +1170,32 @@ def _pad_stimulus_frames(frames: torch.Tensor, target: int, location: str) -> to
     )
     padding = torch.zeros((n_missing, frames.shape[1]), dtype=frames.dtype)
     return torch.cat((frames, padding), dim=0).contiguous()
+
+
+def _fit_stimulus_to_run(frames: torch.Tensor, run_length: int, location: str) -> torch.Tensor:
+    """One aperture against one run: pad a shortfall, refuse a surplus.
+
+    The rule for every aperture, however it was supplied. An aperture is a
+    per-TR stream, and the stimulus program writes a frame per *presented* TR
+    while the scan usually runs a few volumes past it -- so a shortfall is
+    expected and means "no stimulus then", which a blank frame says exactly.
+    A surplus is not expected and cannot be interpreted: dropping frames from
+    either end would be a guess about which TRs were never scanned.
+
+    ``-stim_pngs``/``-stim_nii`` go through :func:`_load_stimulus_sources`,
+    which applies the same rule plus the multi-run mapping it has to resolve
+    first; this is the single-aperture-per-run spelling of it.
+    """
+    n_frames = frames.shape[0]
+    if n_frames < run_length:
+        return _pad_stimulus_frames(frames, run_length, location)
+    if n_frames > run_length:
+        raise ValueError(
+            f"Stimulus {location} has {n_frames} frames but its run has only {run_length} "
+            "volumes; a surplus cannot be padded away and dropping from either end would "
+            "be a guess"
+        )
+    return frames
 
 
 def _load_stimulus_sources(
@@ -2302,14 +2338,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         stimulus_runs = []
         stimulus_shape: tuple[int, int] | None = None
-        for input_file, stimulus_file, run_length in zip(
-            input_files, args.stimulus, run_lengths, strict=True
-        ):
+        for stimulus_file, run_length in zip(args.stimulus, run_lengths, strict=True):
             stimulus, shape = _load_stimulus_run(stimulus_file, args.stim_downsample)
-            if stimulus.shape[0] != run_length:
-                raise ValueError(
-                    f"Stimulus {stimulus_file} has {stimulus.shape[0]} frames but {input_file} has {run_length} volumes"
-                )
+            stimulus = _fit_stimulus_to_run(stimulus, run_length, str(stimulus_file))
             if stimulus_shape is not None and shape != stimulus_shape:
                 raise ValueError(
                     f"Stimulus {stimulus_file} has shape {shape}; expected {stimulus_shape}"

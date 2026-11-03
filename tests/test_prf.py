@@ -3367,3 +3367,83 @@ def test_stim_types_free_needs_types_and_refuses_a_fixed_exponent(tmp_path):
     types = [flag for path in label_files for flag in ("-stim_types", path)]
     with pytest.raises(SystemExit):
         main([*base, *types, "-model_mode", "3", "-stim_types_free", "exponent"])
+
+
+class TestApertureLengthRule:
+    """Every aperture obeys one rule: pad a shortfall, refuse a surplus."""
+
+    def test_stimulus_flag_pads_like_the_sources_path(self, tmp_path):
+        """-stimulus used to RAISE on the shortfall -stim_pngs pads for.
+
+        Same file, same shortfall, two different answers depending on which
+        flag carried it -- which is a difference in the flag, not in the data.
+        """
+        import nibabel as nib
+
+        from fastfuncstuff.cli.pyrf import _fit_stimulus_to_run, _load_stimulus_sources
+
+        frames = np.zeros((4, 4, 1, 7), dtype=np.float32)
+        frames[1:3, 1:3, 0, :] = 1.0
+        path = tmp_path / "ap.nii.gz"
+        nib.save(nib.Nifti1Image(frames, np.eye(4)), path)
+
+        through_sources, _shape = _load_stimulus_sources([str(path)], [10])
+        from fastfuncstuff.cli.pyrf import _load_stimulus_run
+
+        direct, _shape = _load_stimulus_run(str(path))
+        through_flag = _fit_stimulus_to_run(direct, 10, str(path))
+
+        assert through_flag.shape[0] == through_sources[0].shape[0] == 10
+        torch.testing.assert_close(through_flag, through_sources[0])
+        assert bool((through_flag[7:] == 0).all())
+
+    def test_a_surplus_is_refused(self):
+        from fastfuncstuff.cli.pyrf import _fit_stimulus_to_run
+
+        with pytest.raises(ValueError, match="surplus cannot be padded away"):
+            _fit_stimulus_to_run(torch.ones(12, 16), 10, "too_long.nii.gz")
+
+    def test_an_exact_length_is_returned_untouched(self):
+        from fastfuncstuff.cli.pyrf import _fit_stimulus_to_run
+
+        frames = torch.ones(10, 16)
+        assert _fit_stimulus_to_run(frames, 10, "exact.nii.gz") is frames
+
+    def test_stimulus_flag_runs_end_to_end_with_a_short_aperture(self, tmp_path):
+        """The whole point: a short aperture through -stimulus now fits."""
+        import nibabel as nib
+
+        from fastfuncstuff.cli.pyrf import main
+
+        inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+        # Trim three frames off each aperture, as a stimulus program that
+        # stopped before the scan did would leave them.
+        short = []
+        for index, stimulus in enumerate(stimuli):
+            movie = nib.load(stimulus)
+            data = movie.get_fdata()[..., :-3]
+            path = tmp_path / f"short{index}.nii.gz"
+            nib.save(nib.Nifti1Image(data.astype(np.float32), movie.affine), path)
+            short.append(str(path))
+
+        output = tmp_path / "short.nii.gz"
+        assert (
+            main(
+                [
+                    "-input",
+                    *inputs,
+                    "-stimulus",
+                    *short,
+                    "-mask",
+                    mask_path,
+                    "-prefix",
+                    str(output),
+                    "-device",
+                    "cpu",
+                    "-verb",
+                    "0",
+                ]
+            )
+            == 0
+        )
+        assert output.exists()
