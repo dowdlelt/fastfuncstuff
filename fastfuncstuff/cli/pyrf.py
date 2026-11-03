@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.image as mpimg
@@ -62,6 +63,7 @@ from fastfuncstuff.design.hrf import (
 )
 from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
 from fastfuncstuff.design.prf import (
+    PRFPerTypeFit,
     PRFRefinedFit,
     PRFRefinementConfig,
     PRFTypeGainFit,
@@ -80,13 +82,18 @@ from fastfuncstuff.design.prf import (
     refine_prf_all_hrfs,
     refine_prf_hrf_ranked,
     refine_prf_hrf_window,
+    refine_prf_per_type,
     refine_prf_supergrid,
     screen_voxels_ridge,
     select_noise_pc_count,
     summarize_hrf_selection,
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
-from fastfuncstuff.memory import estimate_chunk_size, prf_type_gain_voxel_chunk
+from fastfuncstuff.memory import (
+    estimate_chunk_size,
+    prf_per_type_voxel_chunk,
+    prf_type_gain_voxel_chunk,
+)
 from fastfuncstuff.stats.reliability import (
     circular_correlation,
     identical_design_groups,
@@ -160,6 +167,29 @@ OUTPUT
                     not distinguish the types, the gains come out equal and
                     delta_r2 comes out 0, and any difference you see in the maps
                     is noise.
+
+  -stim_types_free names the parameters that may DIFFER between types, by the
+  sub-brick they are reported as: x, y, sigma, exponent, or 'all'. Each freed
+  one then gets its own x_tK/y_tK/sigma_tK/exponent_tK (plus angle, eccentricity
+  and rfsize per type, through the same conventions as the shared fit).
+  Parameters left out keep the combined fit's value, identical across types, so
+  a partially tied model stays well posed. The R2 ladder is nested and strictly
+  ordered: r2_single (one gain) <= r2_types (a gain per type) <= r2_free (a
+  receptive field per type), and delta_r2_free is the last step of it. Threshold
+  on delta_r2_free before believing that two types have different receptive
+  fields, because this is where a type that was only ever seen at a few
+  aperture positions produces an x/y that differs by noise rather than biology.
+  The HRF stays shared across types: a per-type HRF would be the much larger
+  claim that the same location responds with different timing depending on what
+  was shown there.
+
+  If each type lives in its OWN runs rather than interleaved, note that fitting
+  them together with everything free is the SAME fit as fitting them
+  separately -- a type's predictor is zero on the other type's runs and the
+  drift is already per-run, so the objective separates exactly (verified to
+  float noise). What joint fitting buys there is what stays tied, the shared
+  HRF above all, and the nested delta_r2 on identical data and identical voxel
+  selection.
 
   -stim_types_from_aperture reads the same labels out of the aperture itself --
   0 where nothing was shown, one pixel value per kind of thing -- so a stimulus
@@ -999,6 +1029,20 @@ def create_parser() -> argparse.ArgumentParser:
         "Labels must run from 1 with no gaps.",
     )
     processing.add_argument(
+        "-stim_types_free",
+        nargs="+",
+        choices=_FREE_PARAMETER_CHOICES,
+        metavar="PARAM",
+        help="Which pRF parameters may DIFFER between stimulus types: any of "
+        "x, y, sigma, exponent, or 'all'. Default none -- the types share one "
+        "receptive field and differ only in gain, which is the well-posed model. "
+        "Freeing a parameter costs one more per type per voxel and needs each type "
+        "to have covered the visual field on its own: a type seen at only a few "
+        "aperture positions has an unconstrained x/y that will differ by noise, not "
+        "biology. Check delta_r2_free before believing any of it. Parameters left "
+        "tied keep the combined fit's value, identical across types.",
+    )
+    processing.add_argument(
         "-stim_types_from_aperture",
         action="store_true",
         help="Read the stimulus types out of the aperture itself instead of from "
@@ -1538,6 +1582,7 @@ def _save_results(
     mean_volume: torch.Tensor | None = None,
     response_peak: torch.Tensor | None = None,
     type_fit: PRFTypeGainFit | None = None,
+    per_type_fit: PRFPerTypeFit | None = None,
     hrf_r2_map: torch.Tensor | None = None,
     screen_extent: float | None = None,
     noise_ceiling: torch.Tensor | None = None,
@@ -1607,6 +1652,28 @@ def _save_results(
         if mean_volume is not None:
             labels.append("amplitude_psc")
             columns.append(prf_percent_signal_change(response_peak, mean_volume))
+    if per_type_fit is not None:
+        # A receptive field per type: the same reported quantities as the shared
+        # fit, through the SAME prf_parameter_maps, so the sign convention
+        # relating y to angle cannot drift between them.
+        for stimulus_type in range(per_type_fit.parameters.shape[1]):
+            suffix = f"_t{stimulus_type + 1}"
+            per_type_maps = prf_parameter_maps(
+                per_type_fit.parameters[:, stimulus_type, :], stimulus_shape, scale
+            )
+            for name in ("x", "y", "sigma", "exponent", "angle", "eccentricity", "rfsize"):
+                labels.append(f"{name}{suffix}")
+                columns.append(per_type_maps[name])
+        # Freeing parameters re-solves every gain, so these supersede the tied
+        # fit's and are what the per-type amplitudes below are built from.
+        labels.append("r2_free")
+        columns.append(per_type_fit.r2)
+        if type_fit is not None:
+            # What freeing the parameters bought BEYOND a gain per type: the
+            # nested step above delta_r2, and the one to threshold on before
+            # believing that two types have different receptive fields.
+            labels.append("delta_r2_free")
+            columns.append(per_type_fit.r2 - type_fit.r2)
     if type_fit is not None:
         # One block per stimulus type, suffixed _t1.._tN to match the labels in
         # -stim_types. gain is the comparable quantity BETWEEN types here: the
@@ -1614,16 +1681,19 @@ def _save_results(
         # normalisation, and the ratio of gains is the voxel's preference.
         # amplitude is what each type actually elicited, which also carries how
         # well that type's frames happened to cover the pRF.
+        # From the free fit when there was one: it re-solved every gain at the
+        # parameters it reached, so the tied fit's are stale by then.
+        final = type_fit if per_type_fit is None else per_type_fit
         for stimulus_type in range(type_fit.gains.shape[1]):
             suffix = f"_t{stimulus_type + 1}"
             labels.append(f"gain{suffix}")
-            columns.append(type_fit.gains[:, stimulus_type])
+            columns.append(final.gains[:, stimulus_type])
             labels.append(f"amplitude{suffix}")
-            columns.append(type_fit.amplitude[:, stimulus_type])
+            columns.append(final.amplitude[:, stimulus_type])
             if mean_volume is not None:
                 labels.append(f"amplitude_psc{suffix}")
                 columns.append(
-                    prf_percent_signal_change(type_fit.amplitude[:, stimulus_type], mean_volume)
+                    prf_percent_signal_change(final.amplitude[:, stimulus_type], mean_volume)
                 )
         # The nested comparison: same pRF and HRF, one gain for everything
         # (r2_single) against one per type (r2_types). delta_r2 is what the split
@@ -1928,6 +1998,24 @@ def _save_reliability(
     )
 
 
+# The optimizer's parameter columns are (row, column, sigma, exponent); row is
+# vertical and column horizontal, so y is column 0 and x is column 1. Naming the
+# flag's values after the SUB-BRICKS rather than after those columns is the
+# point: a user should say which reported quantity may differ, not know the
+# internal order.
+_FREE_PARAMETER_COLUMNS = {"y": 0, "x": 1, "sigma": 2, "exponent": 3}
+_FREE_PARAMETER_CHOICES = ("x", "y", "sigma", "exponent", "all")
+
+
+def _resolve_free_parameters(names: list[str] | None) -> tuple[int, ...]:
+    """Turn -stim_types_free names into optimizer parameter columns."""
+    if not names:
+        return ()
+    if "all" in names:
+        return (0, 1, 2, 3)
+    return tuple(sorted(_FREE_PARAMETER_COLUMNS[name] for name in set(names)))
+
+
 def _load_type_labels(
     paths: list[str],
     run_lengths: Sequence[int],
@@ -2097,6 +2185,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"-xval {args.xval} requires at least two input runs")
     if args.xval_draws < 1:
         parser.error("-xval_draws must be positive")
+    if args.stim_types_free and not (args.stim_types or args.stim_types_from_aperture):
+        parser.error(
+            "-stim_types_free says which parameters may differ between stimulus types, "
+            "but no types were given; add -stim_types or -stim_types_from_aperture"
+        )
     if args.stim_types and args.stim_types_from_aperture:
         parser.error(
             "-stim_types and -stim_types_from_aperture both say what the types are; pass one"
@@ -2598,6 +2691,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     type_fit = None
+    per_type_fit = None
     if args.stim_types or (aperture_type_labels is not None and n_aperture_types > 1):
         if aperture_type_labels is not None:
             type_labels, n_types = aperture_type_labels, n_aperture_types
@@ -2631,6 +2725,58 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb:
             median_delta = float(type_fit.delta_r2.nanmedian())
             print(f"  median delta_r2 from separating the types: {median_delta:+.4f}")
+        free_columns = _resolve_free_parameters(args.stim_types_free)
+        if refinement_config.fix_exponent and 3 in free_columns:
+            if args.stim_types_free and "exponent" in args.stim_types_free:
+                parser.error(
+                    "-stim_types_free exponent, but -model_mode 3 fixes the exponent at 1 "
+                    "for every type; drop one of the two"
+                )
+            # "all" means every parameter THIS model fits, so the fixed
+            # exponent simply is not among them.
+            free_columns = tuple(column for column in free_columns if column != 3)
+        if free_columns:
+            free_chunk = args.batch_size or prf_per_type_voxel_chunk(
+                n_fit_voxels,
+                loaded.n_timepoints,
+                stimulus_shape[0] * stimulus_shape[1],
+                n_types,
+                device,
+            )
+            if args.verb:
+                freed = ", ".join(
+                    name
+                    for name, column in sorted(
+                        _FREE_PARAMETER_COLUMNS.items(), key=lambda item: item[1]
+                    )
+                    if column in free_columns
+                )
+                print(
+                    f"Refining a receptive field per type ({freed} free, "
+                    f"{free_chunk:,} voxels per chunk)"
+                )
+            per_type_fit = refine_prf_per_type(
+                analysis_data,
+                stimulus_runs,
+                stimulus_shape,
+                results.parameters,
+                results.hrf_index,
+                hrf_library,
+                list(loaded.run_starts),
+                type_labels,
+                n_types,
+                free_columns,
+                nuisance_per_run=nuisance_per_run,
+                voxel_chunk_size=max(1, free_chunk),
+                config=refinement_config,
+                verbose=args.verb > 0,
+            )
+            if args.verb:
+                gained = float((per_type_fit.r2 - type_fit.r2).nanmedian())
+                print(
+                    f"  {per_type_fit.n_sweeps} sweep(s); median delta_r2 from freeing "
+                    f"those parameters: {gained:+.4f}"
+                )
     if keep_index is not None:
         results = _expand_fit(results, keep_index, loaded.n_voxels)
         response_peak = _expand_to_all_voxels(response_peak, keep_index, loaded.n_voxels)
@@ -2642,6 +2788,23 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for name in ("gains", "amplitude", "residual_ss", "total_ss", "r2", "single_r2")
                 }
+            )
+        if per_type_fit is not None:
+            per_type_fit = replace(
+                per_type_fit,
+                **{
+                    name: _expand_to_all_voxels(
+                        getattr(per_type_fit, name), keep_index, loaded.n_voxels
+                    )
+                    for name in (
+                        "parameters",
+                        "gains",
+                        "amplitude",
+                        "residual_ss",
+                        "total_ss",
+                        "r2",
+                    )
+                },
             )
         if canonical_peak is not None:
             canonical_peak = _expand_to_all_voxels(canonical_peak, keep_index, loaded.n_voxels)
@@ -2677,6 +2840,7 @@ def main(argv: list[str] | None = None) -> int:
         mean_volume=mean_volume,
         response_peak=response_peak,
         type_fit=type_fit,
+        per_type_fit=per_type_fit,
         hrf_r2_map=hrf_r2_map,
         screen_extent=args.screen_extent,
         noise_ceiling=noise_ceiling,

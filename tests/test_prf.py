@@ -2907,12 +2907,22 @@ class TestFreeParameterSelection:
         [
             ({"free_parameters": ()}, "non-empty"),
             ({"free_parameters": (0, 4)}, "subset"),
-            ({"free_parameters": (0, 3), "fix_exponent": True}, "fix_exponent"),
+            ({"free_parameters": (3,), "fix_exponent": True}, "nothing for"),
         ],
     )
     def test_rejects_an_impossible_free_set(self, kwargs, message):
         with pytest.raises(ValueError, match=message):
             PRFRefinementConfig(**kwargs).free_indices()
+
+    def test_fix_exponent_narrows_a_free_set_rather_than_clashing(self):
+        """The stagewise refinement composes the two: stage one holds the exponent.
+
+        So an explicit free set has to survive fix_exponent being turned on
+        underneath it, or asking for `all` with -model_mode 1 dies inside the
+        first stage.
+        """
+        config = PRFRefinementConfig(free_parameters=(0, 1, 2, 3), fix_exponent=True)
+        assert config.free_indices() == (0, 1, 2)
 
 
 class TestPerTypeRefinement:
@@ -3092,3 +3102,227 @@ class TestPerTypeRefinement:
         problem, _truth = self._problem()
         with pytest.raises(ValueError, match="fit_prf_type_gains"):
             refine_prf_per_type(**problem, free_parameters=())
+
+
+def test_separated_runs_fit_the_same_jointly_as_individually():
+    """With each type in its OWN runs and everything free, joint == separate.
+
+    The objective separates exactly: a type's predictor is zero on the other
+    type's runs, and the drift nuisance is already per-run block-diagonal, so
+    the joint residual sum decomposes into two independent sums with no cross
+    term (the NNLS Gram is diagonal). Measured agreement 5.7e-6 to 5.8e-4 on
+    the parameters and gains, with the joint residual equal to the sum of the
+    separate ones.
+
+    So joint fitting of fully separated runs buys nothing in the point
+    estimates. What it buys is what is TIED -- above all the shared HRF, which
+    separate fits would each choose for themselves, letting a timing
+    difference masquerade as a response difference -- plus the nested
+    delta_r2 on identical data and identical voxel selection. This test exists
+    so that a future change which quietly couples the types (a global
+    normalisation, say) cannot pass unnoticed.
+    """
+    from fastfuncstuff.design.prf import (
+        css_prediction_by_type,
+        refine_prf_per_type,
+        refine_prf_supergrid,
+    )
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    torch.manual_seed(0)
+    shape, n_time, n_voxels = (10, 10), 90, 3
+    runs = [torch.rand(n_time, 100) for _ in range(4)]
+    # Runs 0 and 1 show only type 1; runs 2 and 3 only type 2.
+    labels = [torch.ones(n_time, dtype=torch.long)] * 2 + [
+        torch.full((n_time,), 2, dtype=torch.long)
+    ] * 2
+    hrf = torch.rand(1, 6)
+    hrf = hrf / hrf.sum()
+    nuisance = [construct_polynomial_matrix(n_time, 1, device=torch.device("cpu")) for _ in runs]
+    run_starts = [0, n_time, 2 * n_time, 3 * n_time]
+
+    truth = torch.zeros(n_voxels, 2, 4)
+    truth[:, 0] = torch.tensor([3.0, 4.0, 2.0, 0.9])
+    truth[:, 1] = torch.tensor([7.0, 6.0, 1.5, 0.7])
+    predictors = css_prediction_by_type(
+        runs, truth, hrf[0], shape, labels, 2, per_type_parameters=True
+    )
+    clean = torch.einsum("tvi,vi->tv", predictors, torch.full((n_voxels, 2), 7.0))
+    data = (100.0 + clean + 0.05 * torch.randn(4 * n_time, n_voxels)).T
+    start = torch.tensor([[5.0, 5.0, 1.8, 0.8]]).expand(n_voxels, -1).contiguous()
+    hrf_index = torch.zeros(n_voxels, dtype=torch.long)
+    config = PRFRefinementConfig(max_iter=60)
+
+    joint = refine_prf_per_type(
+        data,
+        runs,
+        shape,
+        start,
+        hrf_index,
+        hrf,
+        run_starts,
+        labels,
+        2,
+        (0, 1, 2, 3),
+        nuisance_per_run=nuisance,
+        voxel_chunk_size=n_voxels,
+        config=config,
+        n_sweeps=3,
+        improvement_tolerance=0.0,
+    )
+
+    def fit_subset(which):
+        columns = torch.cat([torch.arange(index * n_time, (index + 1) * n_time) for index in which])
+        seed = PRFGridFit(
+            candidate_index=torch.zeros(n_voxels, dtype=torch.long),
+            hrf_index=hrf_index,
+            parameters=start.clone(),
+            gain=torch.ones(n_voxels),
+            correlation=torch.zeros(n_voxels),
+            r2=torch.zeros(n_voxels),
+        )
+        return refine_prf_supergrid(
+            data[:, columns],
+            [runs[index] for index in which],
+            shape,
+            seed,
+            hrf,
+            list(range(0, len(which) * n_time, n_time)),
+            nuisance_per_run=[nuisance[index] for index in which],
+            voxel_chunk_size=n_voxels,
+            config=config,
+        )
+
+    separate = [fit_subset([0, 1]), fit_subset([2, 3])]
+    for stimulus_type in (0, 1):
+        torch.testing.assert_close(
+            joint.parameters[:, stimulus_type, :],
+            separate[stimulus_type].parameters,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        torch.testing.assert_close(
+            joint.gains[:, stimulus_type], separate[stimulus_type].gain, rtol=1e-3, atol=1e-3
+        )
+    torch.testing.assert_close(
+        joint.residual_ss,
+        separate[0].residual_ss + separate[1].residual_ss,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_stim_types_free_writes_a_prf_per_type(tmp_path):
+    """-stim_types_free end to end, and the nested R2 ladder it completes.
+
+    r2_single (one gain) <= r2_types (a gain per type) <= r2_free (a receptive
+    field per type), each a strict superset of the last, on this fixture
+    measured 0.9319 <= 0.9327 <= 0.9346 for x,y free and 0.9353 for all.
+    Freeing only x and y must leave sigma identical between types.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    label_files = _write_type_labels(tmp_path, 120, len(inputs))
+
+    def fit(tag, free):
+        output = tmp_path / f"{tag}.nii.gz"
+        argv = [
+            "-input",
+            *inputs,
+            "-stimulus",
+            *stimuli,
+            "-mask",
+            mask_path,
+            "-prefix",
+            str(output),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+        for path in label_files:
+            argv += ["-stim_types", path]
+        if free:
+            argv += ["-stim_types_free", *free]
+        assert main(argv) == 0
+        image = nib.load(output)
+        names = read_brick_labels(image)
+        return names, image.get_fdata().reshape(-1, len(names))
+
+    names, data = fit("free_xy", ["x", "y"])
+    responsive = slice(0, 24)
+    for name in (
+        "x_t1",
+        "y_t1",
+        "sigma_t1",
+        "exponent_t1",
+        "angle_t1",
+        "eccentricity_t1",
+        "rfsize_t1",
+        "x_t2",
+        "r2_free",
+        "delta_r2_free",
+    ):
+        assert name in names, f"{name} missing from {names}"
+
+    def median(label, table=data, header=names):
+        return float(np.nanmedian(table[responsive, header.index(label)]))
+
+    # The nested ladder, in order.
+    assert median("r2_single") <= median("r2_types") + 1e-6
+    assert median("r2_types") <= median("r2_free") + 1e-6
+    assert median("delta_r2_free") == pytest.approx(
+        median("r2_free") - median("r2_types"), abs=1e-3
+    )
+    # sigma was not freed, so the two types must report the same one.
+    np.testing.assert_allclose(
+        data[responsive, names.index("sigma_t1")],
+        data[responsive, names.index("sigma_t2")],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    # Freeing everything can only fit better still, and lets sigma move apart.
+    all_names, all_data = fit("free_all", ["all"])
+    assert (
+        float(np.nanmedian(all_data[responsive, all_names.index("r2_free")]))
+        >= median("r2_free") - 1e-3
+    )
+    assert not np.allclose(
+        all_data[responsive, all_names.index("sigma_t1")],
+        all_data[responsive, all_names.index("sigma_t2")],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_stim_types_free_needs_types_and_refuses_a_fixed_exponent(tmp_path):
+    from fastfuncstuff.cli.pyrf import main
+
+    inputs, stimuli, mask_path, _shape = _write_prf_dataset(tmp_path)
+    label_files = _write_type_labels(tmp_path, 120, len(inputs))
+    base = [
+        "-input",
+        *inputs,
+        "-stimulus",
+        *stimuli,
+        "-mask",
+        mask_path,
+        "-prefix",
+        str(tmp_path / "x.nii.gz"),
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    # Free parameters without any types to free them for.
+    with pytest.raises(SystemExit):
+        main([*base, "-stim_types_free", "x"])
+    # The exponent explicitly, under a model that fixes it.
+    types = [flag for path in label_files for flag in ("-stim_types", path)]
+    with pytest.raises(SystemExit):
+        main([*base, *types, "-model_mode", "3", "-stim_types_free", "exponent"])

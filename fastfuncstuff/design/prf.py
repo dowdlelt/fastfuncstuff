@@ -126,8 +126,17 @@ class PRFRefinementConfig:
                 f"free_parameters must be a non-empty subset of (0, 1, 2, 3), got "
                 f"{self.free_parameters}"
             )
-        if self.fix_exponent and 3 in chosen:
-            raise ValueError("free_parameters includes the exponent but fix_exponent is set")
+        if self.fix_exponent:
+            # fix_exponent NARROWS the set rather than conflicting with it: the
+            # stagewise refinement composes the two by holding the exponent for
+            # its first stage, so a caller's free set has to survive that. A
+            # caller who asked for the exponent and nothing else gets told.
+            chosen = tuple(column for column in chosen if column != 3)
+            if not chosen:
+                raise ValueError(
+                    "free_parameters is the exponent alone but fix_exponent holds it, "
+                    "leaving nothing for Gauss-Newton to move"
+                )
         return chosen
 
 
