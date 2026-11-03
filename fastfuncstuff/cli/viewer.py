@@ -7,6 +7,7 @@ through ``-script`` without the GUI in the loop.
 
 from __future__ import annotations
 
+import io
 import sys
 import time
 
@@ -280,7 +281,13 @@ def _enable_stack_dumps() -> None:
     # chaining would dump the stack and then kill the window the dump was meant
     # to diagnose -- which defeats the point of asking a LIVE process what it is
     # doing. Measured: with chain=True the process died on the signal.
-    faulthandler.register(handler, all_threads=True, chain=False)
+    try:
+        faulthandler.register(handler, all_threads=True, chain=False)
+    except (OSError, RuntimeError, ValueError, io.UnsupportedOperation):
+        # faulthandler writes to a real file descriptor, and stderr does not
+        # always have one -- captured output, or a GUI launched with no console.
+        # This is a diagnostic: it never gets to be the reason startup fails.
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

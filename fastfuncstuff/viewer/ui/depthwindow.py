@@ -22,6 +22,7 @@ which cortex the profile came from.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -167,11 +168,18 @@ class DepthPlot(QtWidgets.QWidget):
         if live:
             assert r is not None
             prof = r.profiles
-            with np.errstate(all="ignore"):
+            # An all-NaN depth (every vertex in the disc unfit, or off the data)
+            # is ordinary, and the empty-slice result is handled by the finite
+            # check below. np.errstate does not cover these: nanmean and nanstd
+            # raise RuntimeWarning through the warnings module, not the floating
+            # point error state, so they printed to the terminal on every repaint.
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
                 mean = np.nanmean(prof, axis=0)
                 sd = np.nanstd(prof, axis=0)
             spans.append((r.fractions, mean - 2 * sd, mean + 2 * sd))
-        with np.errstate(all="ignore"):
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             lo = float(np.nanmin([np.nanmin(s[1]) for s in spans]))
             hi = float(np.nanmax([np.nanmax(s[2]) for s in spans]))
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -578,18 +586,36 @@ class DepthWindow(QtWidgets.QWidget):
         self.detrend_box.blockSignals(False)
         self.roi_box.setEnabled(vp.depth_source == "layer")
 
+    def _is_surface_layer(self, layer) -> bool:
+        """A per-vertex result, which has no depth axis left to profile.
+
+        Surface data is already a ribbon average (or one depth of it), so asking
+        for its profile samples the same number K times. Worse, it is not free:
+        a surface layer's volumes are painted on demand, so every refresh
+        allocates the display grid and scatters the whole ribbon into it just to
+        read a disc of vertices back out.
+        """
+        return layer is not None and layer.key in self.session.surface_layers
+
     def _profiled_layer(self, vp: Viewport):
         st = self.session.state
         if vp.depth_layer:
+            # Named explicitly: returned even if it cannot be profiled, so
+            # refresh() can say why instead of quietly profiling something else.
             return st.layers.find(vp.depth_layer)
         sel = st.layers.find(st.selected) if st.selected else None
         base = st.layers.base
-        if sel is not None and not sel.roi and (base is None or sel.key != base.key):
+        if (
+            sel is not None
+            and not sel.roi
+            and not self._is_surface_layer(sel)
+            and (base is None or sel.key != base.key)
+        ):
             return sel
         for layer in reversed(list(st.layers)[1:]):
-            if layer.visible and not layer.roi:
+            if layer.visible and not layer.roi and not self._is_surface_layer(layer):
                 return layer
-        return base
+        return None if self._is_surface_layer(base) else base
 
     # -- building --------------------------------------------------------------
     def refresh(self, dirty: Aspect) -> None:
@@ -601,8 +627,21 @@ class DepthWindow(QtWidgets.QWidget):
         self._sync_controls(vp)
         layer = self._profiled_layer(vp)
         if not surfaces.hemis or layer is None:
-            self.plot.message = "load surfaces and an overlay"
+            self.plot.message = "load surfaces and a volume overlay"
             self.plot.result = None
+            self.plot.update()
+            return
+        if self._is_surface_layer(layer):
+            self.plot.message = (
+                f"{layer.name} is a per-vertex result: no depth axis to profile.\n"
+                "Profile the volume it was sampled from, or write the depths\n"
+                "separately (ffs_nwarp -surf_depth_combine none)."
+            )
+            self.plot.result = None
+            self.result = None
+            self.time_plot.data = None
+            self.time_plot.setVisible(False)
+            self.detrend_box.setVisible(False)
             self.plot.update()
             return
         mm = st.crosshair_mm

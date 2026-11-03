@@ -306,3 +306,76 @@ def test_window_offers_the_list_and_goes_back_to_it(tmp_path, monkeypatch):
         w.close()
         session.close()
         app.processEvents()
+
+
+def test_stack_dumps_never_break_startup(capsys, monkeypatch):
+    """faulthandler writes to a real file descriptor and stderr does not always
+    have one -- under captured output, or a GUI launched with no console. This is
+    a diagnostic for freezes; it does not get to be why the viewer fails to open.
+    (It was: registering raised io.UnsupportedOperation under pytest's capture.)
+    """
+    import io
+
+    from fastfuncstuff.cli.viewer import _enable_stack_dumps
+
+    _enable_stack_dumps()  # capsys is active, so stderr has no fileno
+
+    class NoFileno(io.StringIO):
+        def fileno(self):
+            raise io.UnsupportedOperation("fileno")
+
+    monkeypatch.setattr("sys.stderr", NoFileno())
+    _enable_stack_dumps()
+
+
+def test_a_frozen_process_prints_its_stack_and_survives():
+    """The whole point, and only checkable by doing it: signal a process that is
+    genuinely stuck and get a stack back, with the process still running.
+
+    Neither faulthandler.is_enabled() nor signal.getsignal() observes
+    register() -- both read the same before and after it -- so a test built on
+    those passes whether or not the hook is armed.
+    """
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("SIGUSR1 is POSIX only")
+    code = (
+        "import sys, time;"
+        "from fastfuncstuff.cli.viewer import _enable_stack_dumps;"
+        "_enable_stack_dumps();"
+        "print('ready', flush=True);"
+        "\ndef a_blocked_gui_thread():\n    time.sleep(30)\n"
+        "a_blocked_gui_thread()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGUSR1)
+        deadline = time.monotonic() + 10
+        dump = ""
+        while time.monotonic() < deadline and "a_blocked_gui_thread" not in dump:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            dump += line
+        # It names the call that is holding the thread, which "not responding" does not.
+        assert "a_blocked_gui_thread" in dump, dump
+        # And SIGUSR1's default action is to terminate, so chain=False matters:
+        # a dump that kills the window cannot diagnose the window. Waited for,
+        # not polled -- the exit races the dump, and poll() right after reading
+        # the stack returns None even when the process is on its way out.
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=2)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
