@@ -77,6 +77,30 @@ column is a neighbourhood, not a vertex), and it means the edge of the coloured
 blob carries no information about where the response was.  The startup line
 reports the factor; threshold the maps, never read their boundary.
 
+If your localiser already exists on the surface, give the .gii instead of the
+volume -- one per hemisphere, matched by metadata, then filename, then vertex
+count.  Nothing is sampled, so the "any of 6 depth reads" rule below does not
+apply and the map you looked at is the map that places the columns.
+
+A cluster filter is the cheap fix, and it is worth using.  From a VOLUME, ONE
+suprathreshold voxel touching the ribbon makes a vertex responsive (the vertex
+passes if ANY of 6 nearest-voxel reads at fracs 0.1-0.85 does), and one
+responsive vertex is enough to place a column.  On the run above, |z| >= 3 gave 5,038 clusters of
+which only 191 held 5 or more voxels -- and those specks accounted for 14% of the
+responsive vertices, 58% of the painted area and 37% of the columns fitted:
+
+    filter        resp vtx   columns   covered vtx
+    none            15,924     1,576        66,062  (4.1x)
+    NN1 >= 2        14,543     1,149        36,834  (2.5x)
+    NN1 >= 5        13,720       990        27,911  (2.0x)
+    NN1 >= 10       13,373       916        25,440  (1.9x)
+
+-responsive_cluster_size 5 -responsive_cluster_nn 1 is the knee.  It is off by
+default so a run stays comparable with earlier ones, and the census is printed
+either way so the cost is visible without running the job twice.  On a surface
+-responsive the size counts VERTICES over mesh edges (NN does not apply) and the
+note reports the kept area in mm2, which is the number worth calibrating on.
+
 Also check which sub-brick -responsive actually read.  Brick 0 of an AFNI stats
 bucket is Full_Fstat and brick 1 is Full_Zstat -- the OMNIBUS, every condition
 against baseline, which is "responded to the experiment" and not the contrast
@@ -278,15 +302,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     c = p.add_argument_group("Columns")
     add_ribbon_args(c)
-    c.add_argument("-responsive", default=None, metavar="FILE",
-                   help="Volume marking responsive cortex: a mask, or a statistic with "
-                   "-responsive_thresh. A column centre goes wherever it marks the ribbon at "
+    c.add_argument("-responsive", nargs="+", default=None, metavar="FILE",
+                   help="Map marking responsive cortex: a mask, or a statistic with "
+                   "-responsive_thresh. Either a VOLUME (file[N] picks a brick) or one .gii "
+                   "per hemisphere, which needs no sampling and is the better input when you "
+                   "have it. A column centre goes wherever it marks the ribbon at "
                    "any depth. Select on something independent of the comparisons (an omnibus "
                    "F, a localiser) -- never on the difference being tested.")  # fmt: skip
     c.add_argument("-responsive_thresh", type=float, default=None, metavar="T",
                    help="Threshold for a statistic -responsive (|value| >= T).")  # fmt: skip
     c.add_argument("-responsive_positive", action="store_true",
                    help="Threshold signed (value >= T) instead of |value|.")  # fmt: skip
+    c.add_argument("-responsive_cluster_size", type=int, default=None, metavar="N",
+                   help="Drop suprathreshold clusters smaller than N voxels before any vertex "
+                   "is read. A lone voxel at |z| >= 3 is mostly a false positive, and ONE "
+                   "responsive vertex is enough to place a column -- which then claims every "
+                   "vertex within -column_radius and costs a model inversion. Measured on a "
+                   "real localiser at |z| >= 3: 5,038 clusters, of which only 191 held 5 or "
+                   "more voxels -- and the specks were 14%% of the responsive vertices but "
+                   "58%% of the painted area and 37%% of the columns fitted. 5 at NN1 is the knee "
+                   "(10 and 20 barely move it). Default: no filter, so a run stays comparable "
+                   "with earlier ones, and the speck census is printed either way.")  # fmt: skip
+    c.add_argument("-responsive_cluster_nn", type=int, default=1, choices=(1, 2, 3),
+                   help="Connectivity for -responsive_cluster_size on a VOLUME -responsive, "
+                   "as AFNI's NN: 1 faces, 2 faces + edges, 3 faces + edges + corners. A "
+                   "surface -responsive ignores it -- mesh adjacency is the only connectivity "
+                   "there, and the size is then counted in vertices (the area kept is "
+                   "reported in mm2).")  # fmt: skip
     c.add_argument("-within", default=None, metavar="FILE",
                    help="Only centre columns inside this region (label, annot or volume ROI): "
                    "for trying a few places before the whole cortex.")  # fmt: skip
@@ -806,6 +848,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         resp_notes: list[str] = []
         resp = col.responsive_vertices(args.responsive, surfaces, threshold=args.responsive_thresh,
                                        absolute=not args.responsive_positive,
+                                       cluster_size=args.responsive_cluster_size,
+                                       cluster_nn=args.responsive_cluster_nn,
                                        notes=resp_notes)  # fmt: skip
         for note in resp_notes:
             say(note)
@@ -1003,6 +1047,9 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             "comparisons": [vars(c) for c in comps], "K": ks, "columns": columns.n_columns,
             "fitted": int(fit_idx.size), "radius_mm": columns.radius_mm,
             "spacing_mm": columns.spacing_mm, "depth_method": opts.method, "psf": args.psf,
+            "responsive": args.responsive, "responsive_thresh": args.responsive_thresh,
+            "responsive_cluster_size": args.responsive_cluster_size,
+            "responsive_cluster_nn": args.responsive_cluster_nn,
             "device": str(device), "modulation": modulation, "model_space": args.model_space, "vascular_prior": args.vascular_prior,
             "vascular_radius_mm": args.vascular_radius, "notes": logs + reads.notes,
             "timing_s": {c: r.timing for c, r in results.items()},

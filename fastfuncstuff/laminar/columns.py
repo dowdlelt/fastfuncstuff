@@ -26,7 +26,10 @@ the fit of the column mean.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from os import PathLike
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
@@ -45,24 +48,61 @@ _KEY = 1 << 40
 
 
 def responsive_vertices(
-    path: str,
+    path: str | Sequence[str],
     surfaces,
     *,
     threshold: float | None = None,
     absolute: bool = True,
     fracs: tuple[float, ...] = (0.1, 0.25, 0.4, 0.55, 0.7, 0.85),
+    cluster_size: int | None = None,
+    cluster_nn: int = 1,
     notes: list[str] | None = None,
 ) -> list[np.ndarray]:
-    """Per surface, the vertices whose column the volume ``path`` marks (``file[N]``
-    picks brick N of a 4-D file).
+    """Per surface, the vertices a responsive-cortex map marks.
 
-    Read nearest-voxel along each column at ``fracs`` (white 0 .. pial 1): a
-    column is responsive if any read passes -- non-zero for a mask, ``|value| >=
-    threshold`` (or ``value >= threshold`` with ``absolute=False``) for a
-    statistic. Any depth, because a responsive patch need not span the ribbon
-    (a thresholded map that peaks by pial). The medial wall never is.
+    ``path`` is either a VOLUME (``file[N]`` picks brick N of a 4-D file) or one
+    or two per-vertex ``.gii`` files, which are matched to the hemispheres by
+    their metadata, then their filename, then their vertex count.
+
+    From a volume, each column is read nearest-voxel at ``fracs`` (white 0 ..
+    pial 1) and passes if ANY read does -- any depth, because a responsive patch
+    need not span the ribbon (a thresholded map that peaks by pial). A surface
+    map already is per vertex, so nothing is sampled and ``fracs`` is unused:
+    that is the reason to prefer one when you have it, since the volume route
+    spends a nearest-voxel read per vertex per depth to recover what the surface
+    map states directly.
+
+    A vertex passes if the value is non-zero (mask) or ``|value| >= threshold``
+    (``value >= threshold`` with ``absolute=False``). The medial wall never does.
+
+    ``cluster_size`` drops suprathreshold clusters smaller than that many
+    SAMPLES before any column is placed -- voxels for a volume, vertices for a
+    surface map, where ``cluster_nn`` does not apply because mesh adjacency is
+    the only connectivity there (the note reports the kept area in mm^2 so the
+    count can be calibrated). For a volume, ``cluster_nn`` 1/2/3 counts faces,
+    faces + edges, or faces + edges + corners, as AFNI's NN does.
+
+    Why it matters: a lone voxel at ``|z| >= 3`` is mostly a false positive, and
+    ONE responsive vertex is enough to place a column -- which then claims every
+    vertex within its radius. An unfiltered threshold therefore lets single noise
+    voxels license whole neighbourhood fits, and the cost is paid in model
+    inversions as well as in interpretation.
     """
     import re
+
+    from fastfuncstuff.io.gifti import is_gifti
+
+    paths = [path] if isinstance(path, (str, PathLike)) else [str(q) for q in path]
+    if all(is_gifti(q) for q in paths):
+        return _responsive_from_surfaces(
+            paths, surfaces, threshold=threshold, absolute=absolute,
+            cluster_size=cluster_size, notes=notes,
+        )  # fmt: skip
+    if any(is_gifti(q) for q in paths):
+        raise ValueError(f"-responsive: mixed surface and volume inputs {paths}")
+    if len(paths) != 1:
+        raise ValueError(f"-responsive: one volume, or one .gii per hemisphere; got {paths}")
+    path = paths[0]
 
     from fastfuncstuff.io.afni import load_nifti
 
@@ -89,6 +129,19 @@ def responsive_vertices(
                 "contrast.  -responsive_positive does nothing on it, and it will mark far "
                 "more cortex than a contrast would.  Check the brick with 3dinfo -label."
             )
+    # Threshold the volume once rather than each vertex read: identical result, and it
+    # is what a cluster filter needs to act on.
+    if threshold is None:
+        keep = arr != 0
+    else:
+        keep = (np.abs(arr) if absolute else arr) >= threshold
+    if cluster_size is not None and cluster_size > 1:
+        keep = _drop_small_clusters(keep, int(cluster_size), int(cluster_nn), notes)
+    elif notes is not None and threshold is not None:
+        # Costs one labelling and answers "would a cluster filter matter here?" without
+        # making the user run the job twice.  On a real localiser the answer was yes:
+        # 96% of the clusters were specks.
+        notes.append(_speck_census(keep))
     inv = np.linalg.inv(np.asarray(img.affine, np.float64))
     out = []
     for s in surfaces:
@@ -97,17 +150,194 @@ def responsive_vertices(
         hit = np.zeros(len(w), bool)
         for frac in fracs:
             ijk = np.rint((w + frac * (p - w)) @ inv[:3, :3].T + inv[:3, 3]).astype(np.int64)
-            inside = np.all((ijk >= 0) & (ijk < np.asarray(arr.shape[:3])), axis=1)
-            v = np.zeros(len(w))
-            v[inside] = arr[ijk[inside, 0], ijk[inside, 1], ijk[inside, 2]]
-            if threshold is None:
-                hit |= v != 0
-            else:
-                hit |= (np.abs(v) if absolute else v) >= threshold
+            inside = np.all((ijk >= 0) & (ijk < np.asarray(keep.shape[:3])), axis=1)
+            v = np.zeros(len(w), bool)
+            v[inside] = keep[ijk[inside, 0], ijk[inside, 1], ijk[inside, 2]]
+            hit |= v
         if s.cortex is not None:
             hit &= np.asarray(s.cortex, bool)
         out.append(hit)
     return out
+
+
+def _responsive_from_surfaces(
+    paths: list[str],
+    surfaces,
+    *,
+    threshold: float | None,
+    absolute: bool,
+    cluster_size: int | None,
+    notes: list[str] | None,
+) -> list[np.ndarray]:
+    """:func:`responsive_vertices` from per-vertex ``.gii`` maps, one per hemisphere."""
+    import re
+
+    from fastfuncstuff.io.gifti import load_gifti_data
+
+    loaded = []
+    for q in paths:
+        data, meta = load_gifti_data(q)
+        data = np.asarray(data, np.float64)
+        if data.ndim > 1:  # a multi-column file: the first column, as a stat map
+            data = data[:, 0]
+        loaded.append((q, data, meta))
+
+    assigned: dict[int, tuple[str, np.ndarray]] = {}
+    for q, data, meta in loaded:
+        primary = str(meta.get("AnatomicalStructurePrimary", "")).lower()
+        name = Path(q).name.lower()
+        want = None
+        if "left" in primary or re.search(r"(^|[^a-z])lh([^a-z]|$)", name):
+            want = "lh"
+        elif "right" in primary or re.search(r"(^|[^a-z])rh([^a-z]|$)", name):
+            want = "rh"
+        hits = [
+            h for h, s in enumerate(surfaces)
+            if len(s.white) == data.size and (want is None or s.name == want)
+        ]  # fmt: skip
+        if not hits:
+            have = ", ".join(f"{s.name} {len(s.white):,}" for s in surfaces)
+            raise ValueError(
+                f"{q}: {data.size:,} values match no surface"
+                + (f" named {want}" if want else "")
+                + f" (have {have})"
+            )
+        if len(hits) > 1:
+            raise ValueError(
+                f"{q}: {data.size:,} values fit several surfaces and the file says which "
+                "hemisphere it is in neither its metadata nor its name; rename it lh/rh"
+            )
+        h = hits[0]
+        if h in assigned:
+            raise ValueError(f"{q} and {assigned[h][0]} are both the {surfaces[h].name} map")
+        assigned[h] = (q, data)
+    if notes is not None:
+        notes.append(
+            "-responsive: surface maps "
+            + ", ".join(f"{surfaces[h].name} {Path(q).name}" for h, (q, _) in sorted(assigned.items()))
+        )  # fmt: skip
+
+    out, census = [], []
+    for h, s in enumerate(surfaces):
+        if h not in assigned:
+            out.append(np.zeros(len(s.white), bool))
+            continue
+        v = assigned[h][1]
+        hit = v != 0 if threshold is None else (np.abs(v) if absolute else v) >= threshold
+        if s.cortex is not None:
+            hit = hit & np.asarray(s.cortex, bool)
+        if cluster_size is not None and cluster_size > 1:
+            hit, note = _drop_small_surface_clusters(hit, s, int(cluster_size))
+        else:
+            note = _surface_speck_census(hit, s)
+        census.append(f"{s.name}: {note}")
+        out.append(hit)
+    if notes is not None and census:
+        notes += [f"    {c}" for c in census]
+    return out
+
+
+def _surface_components(hit: np.ndarray, surf) -> tuple[np.ndarray, int]:
+    """Connected components of the marked vertices over the mesh edges."""
+    import scipy.sparse as sp
+    from scipy.sparse import csgraph
+
+    faces = np.asarray(surf.faces, np.int64)
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    both = np.asarray(hit, bool)[e].all(1)
+    e = e[both]
+    n = len(hit)
+    adj = sp.coo_matrix(
+        (np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)
+    ).tocsr()  # fmt: skip
+    n_comp, labels = csgraph.connected_components(adj + adj.T, directed=False)
+    labels = np.where(hit, labels, -1)
+    return labels, n_comp
+
+
+def _cluster_sizes(labels: np.ndarray) -> np.ndarray:
+    """Vertex count per component label (index 0 is label 0), zero for unmarked."""
+    marked = labels >= 0
+    return np.bincount(labels[marked], minlength=int(labels.max()) + 1 if marked.any() else 1)
+
+
+def _drop_small_surface_clusters(hit, surf, min_vertices: int) -> tuple[np.ndarray, str]:
+    from fastfuncstuff.surface.mesh import vertex_areas
+
+    labels, _ = _surface_components(hit, surf)
+    if not hit.any():
+        return hit, "no suprathreshold vertices"
+    sizes = _cluster_sizes(labels)
+    big = sizes >= min_vertices
+    out = hit & (labels >= 0) & big[np.clip(labels, 0, None)]
+    area = vertex_areas(np.asarray(surf.white, np.float64), np.asarray(surf.faces, np.int64),
+                        len(hit))  # fmt: skip
+    return out, (
+        f"cluster filter (mesh, >= {min_vertices} vertices): kept {int(big.sum()):,} of "
+        f"{int((sizes > 0).sum()):,} clusters, {int(out.sum()):,} of {int(hit.sum()):,} "
+        f"vertices ({area[out].sum():.0f} of {area[hit].sum():.0f} mm2)"
+    )
+
+
+def _surface_speck_census(hit, surf, min_vertices: int = 5) -> str:
+    if not hit.any():
+        return "no suprathreshold vertices"
+    labels, _ = _surface_components(hit, surf)
+    sizes = _cluster_sizes(labels)
+    present = sizes > 0
+    small = int((present & (sizes < min_vertices)).sum())
+    return (
+        f"no cluster filter: {int(hit.sum()):,} suprathreshold vertices in "
+        f"{int(present.sum()):,} clusters, of which {small:,} are under {min_vertices} "
+        "vertices -- see -responsive_cluster_size"
+    )
+
+
+def _drop_small_clusters(
+    keep: np.ndarray, min_voxels: int, nn: int, notes: list[str] | None = None
+) -> np.ndarray:
+    """``keep`` with connected components under ``min_voxels`` voxels removed.
+
+    ``nn`` is AFNI's: 1 = faces (6-connected), 2 = faces + edges (18),
+    3 = faces + edges + corners (26).
+    """
+    from scipy import ndimage
+
+    if nn not in (1, 2, 3):
+        raise ValueError(f"cluster_nn must be 1, 2 or 3 (AFNI's NN), not {nn}")
+    structure = ndimage.generate_binary_structure(3, nn)
+    labels, n = ndimage.label(keep, structure=structure)
+    if n == 0:
+        return keep
+    sizes = np.bincount(labels.reshape(-1))
+    sizes[0] = 0  # background
+    big = sizes >= min_voxels
+    out = big[labels]
+    if notes is not None:
+        notes.append(
+            f"    cluster filter (NN{nn}, >= {min_voxels} voxels): kept "
+            f"{int(big.sum()):,} of {n:,} clusters, {int(out.sum()):,} of "
+            f"{int(keep.sum()):,} suprathreshold voxels"
+        )
+    return out
+
+
+def _speck_census(keep: np.ndarray, min_voxels: int = 5, nn: int = 1) -> str:
+    """How much of a suprathreshold mask is specks, as a one-line note."""
+    from scipy import ndimage
+
+    labels, n = ndimage.label(keep, structure=ndimage.generate_binary_structure(3, nn))
+    if n == 0:
+        return "    no suprathreshold voxels"
+    sizes = np.bincount(labels.reshape(-1))
+    sizes[0] = 0
+    small = int(((sizes < min_voxels) & (sizes > 0)).sum())
+    return (
+        f"    no cluster filter: {int(keep.sum()):,} suprathreshold voxels in {n:,} "
+        f"NN{nn} clusters, of which {small:,} ({100 * small / n:.0f}%) are under "
+        f"{min_voxels} voxels.  Each one that touches the ribbon places a column and "
+        f"claims every vertex within -column_radius -- see -responsive_cluster_size."
+    )
 
 
 @dataclass

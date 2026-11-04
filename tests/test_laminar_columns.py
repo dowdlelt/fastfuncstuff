@@ -169,6 +169,95 @@ def test_responsive_vertices_reads_a_statistic_along_the_column(sphere, tmp_path
     assert not hit[v[:, 0] < -0.2].any()
 
 
+def test_a_cluster_filter_drops_lone_responsive_voxels(sphere, tmp_path):
+    """One suprathreshold voxel is enough to place a column, so it must be filterable.
+
+    The bug this guards: a lone false positive at |z| >= 3 licensed a whole
+    -column_radius neighbourhood fit.
+    """
+    surf, affine, shape, data, v = sphere
+    n = shape[0]
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    xyz = ijk @ affine[:3, :3].T + affine[:3, 3]
+    r = np.linalg.norm(xyz, axis=-1)
+    # A real patch on x > 0, plus ONE isolated voxel in the ribbon on the far side.
+    stat = np.where((xyz[..., 0] > 5.0) & (r > 19.0), 6.0, 0.5)
+    lone = np.argmin(np.where(xyz[..., 0] < -5.0, np.abs(r - 19.5), 1e9).reshape(-1))
+    lone = np.unravel_index(lone, r.shape)
+    stat[lone] = 6.0
+    path = tmp_path / "t.nii.gz"
+    nib.save(nib.Nifti1Image(stat.astype(np.float32), affine), path)
+
+    (unfiltered,) = responsive_vertices(str(path), [surf], threshold=4.0)
+    notes: list[str] = []
+    (filtered,) = responsive_vertices(
+        str(path), [surf], threshold=4.0, cluster_size=5, cluster_nn=1, notes=notes
+    )
+    # The lone voxel reached vertices; the filter removed exactly those and kept the patch.
+    assert unfiltered[v[:, 0] < -0.2].any()
+    assert not filtered[v[:, 0] < -0.2].any()
+    assert filtered[v[:, 0] > 0.5].mean() > 0.95
+    assert any("cluster filter (NN1" in note for note in notes)
+
+    # NN3 is never stricter than NN1: more neighbours can only merge clusters.
+    (nn3,) = responsive_vertices(str(path), [surf], threshold=4.0, cluster_size=5, cluster_nn=3)
+    assert nn3.sum() >= filtered.sum()
+    # size 1 is a no-op, not a filter.
+    (one,) = responsive_vertices(str(path), [surf], threshold=4.0, cluster_size=1)
+    assert np.array_equal(one, unfiltered)
+
+
+def test_responsive_reads_a_surface_map_and_clusters_on_the_mesh(sphere, tmp_path):
+    """A .gii -responsive needs no sampling, and its clusters follow mesh edges.
+
+    The surface route must agree with the volume route on the same pattern, which is
+    the only check that the two are the same question asked two ways.
+    """
+    from fastfuncstuff.io.gifti import save_gifti_data
+
+    surf, affine, shape, data, v = sphere
+    # Mark the x > 0 cap on the surface directly, plus one isolated vertex opposite.
+    stat = np.where(v[:, 0] > 0.3, 6.0, 0.5)
+    lone = int(np.argmin(v[:, 0]))
+    stat[lone] = 6.0
+    path = tmp_path / "resp.lh.func.gii"
+    save_gifti_data(str(path), stat.astype(np.float32), {}, time_series=False)
+
+    notes: list[str] = []
+    (unfiltered,) = responsive_vertices(str(path), [surf], threshold=4.0, notes=notes)
+    assert unfiltered[lone]
+    assert unfiltered[v[:, 0] > 0.5].all()
+    assert any("surface maps" in n for n in notes)
+
+    (filtered,) = responsive_vertices(str(path), [surf], threshold=4.0, cluster_size=5)
+    assert not filtered[lone]
+    assert filtered[v[:, 0] > 0.5].all()
+
+    # Same pattern through the volume route: the two must mark the same cap.
+    n = shape[0]
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    xyz = ijk @ affine[:3, :3].T + affine[:3, 3]
+    r = np.linalg.norm(xyz, axis=-1)
+    unit = xyz / np.maximum(r[..., None], 1e-9)
+    vol = np.where((unit[..., 0] > 0.3) & (r > 17.0) & (r < 22.0), 6.0, 0.5)
+    vpath = tmp_path / "resp.nii.gz"
+    nib.save(nib.Nifti1Image(vol.astype(np.float32), affine), vpath)
+    (from_vol,) = responsive_vertices(str(vpath), [surf], threshold=4.0)
+    core = v[:, 0] > 0.5
+    assert from_vol[core].all()
+    assert np.mean(from_vol == unfiltered) > 0.9
+
+    # A list of one is the same as the bare path; a .gii that fits no surface is refused.
+    (as_list,) = responsive_vertices([str(path)], [surf], threshold=4.0)
+    assert np.array_equal(as_list, unfiltered)
+    bad = tmp_path / "wrong.lh.func.gii"
+    save_gifti_data(str(bad), np.zeros(7, np.float32), {}, time_series=False)
+    with pytest.raises(ValueError, match="match no surface"):
+        responsive_vertices(str(bad), [surf], threshold=4.0)
+    with pytest.raises(ValueError, match="mixed surface and volume"):
+        responsive_vertices([str(path), str(vpath)], [surf], threshold=4.0)
+
+
 def test_regions_from_map_finds_each_surface_cluster(sphere, tmp_path):
     from fastfuncstuff.laminar.columns import regions_from_map
 
