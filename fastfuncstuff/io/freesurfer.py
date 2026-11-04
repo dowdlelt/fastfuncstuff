@@ -74,6 +74,12 @@ def is_triangle_surface(path: str | os.PathLike) -> bool:
         return False
 
 
+def is_subject_dir(path: str | os.PathLike) -> bool:
+    """Whether a folder is a FreeSurfer subject with a surface to load; lists nothing."""
+    surf = Path(path) / "surf"
+    return (surf / "lh.white").exists() or (surf / "rh.white").exists()
+
+
 def read_surface(path: str | os.PathLike) -> SurfaceFile:
     """Read a triangle surface, keeping enough layout to rewrite it in place."""
     import nibabel.freesurfer as nfs

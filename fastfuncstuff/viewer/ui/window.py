@@ -687,7 +687,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.load_button.setToolTip(
             "Put the chosen dataset on top of the stack (ctrl+L).\n"
             "Press it again for a second copy of the same file.\n"
-            "Or drop datasets and meshes on any viewer window."
+            "Or drop datasets, meshes, folders or a FreeSurfer subject on any viewer window."
         )
         self.load_button.clicked.connect(lambda: self._pick(self.data_box, Load))
         row.addWidget(self.load_button)
@@ -2529,10 +2529,35 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.open_dropped(paths)
 
     def open_dropped(self, paths: list[str]) -> None:
-        """Load dropped files on top of the stack, listing their folders unread."""
-        datasets, meshes, skipped = catalog_mod.sort_dropped(paths)
+        """Open a drop: a subject as SURF does, a folder as the command line does.
+
+        Files go on top of the stack, with their own folders listed unread.
+        """
+        dropped = catalog_mod.sort_dropped(paths)
+        datasets, meshes = dropped.datasets, dropped.meshes
         session = self.session
         self._preview_path(None)
+        parts = []
+        if dropped.subjects:
+            # SURF asks first in a dialog; a drop can be a slip, and loading a
+            # subject throws away unsaved edits with no undo.
+            if session.surfaces.edited:
+                parts.append(f"surfaces have unsaved edits: not loading {dropped.subjects[0].name}")
+            else:
+                self.load_surfaces(dropped.subjects[0])
+                parts.append(self.statusBar().currentMessage())
+            if dropped.subjects[1:]:
+                names = ", ".join(s.name for s in dropped.subjects[1:])
+                parts.append(f"one subject at a time, ignored {names}")
+        if dropped.directories:
+            first, *rest = dropped.directories
+            session.offer_directories(rest)
+            try:
+                self.read_directory(first)
+                parts.append(self.statusBar().currentMessage())
+            except OSError as exc:
+                self._sync_directories()
+                parts.append(f"read {first}: {exc}")
         # A LOAD lists its own folder; a mesh's has to be asked for. Same test as
         # a LOAD's: a folder already read recursively covers what is inside it.
         session.offer_directories(m.parent for m in meshes if session.directory_number(m) is None)
@@ -2552,15 +2577,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
             except Exception as exc:
                 failed.append(f"{path.name}: {exc}")
         self._sync_layer_list()
-        parts = []
         if datasets or meshes:
             # A mesh that failed says why in the mesh window, which is open by now.
             took = len(session.surfaces.meshes) - meshes_before + len(datasets) - len(failed)
             parts.append(f"loaded {took} of {len(datasets) + len(meshes)} dropped")
         if failed:
             parts.append("could not load " + "; ".join(failed))
-        if skipped:
-            names = ", ".join(p.name for p in skipped)
+        if dropped.skipped:
+            names = ", ".join(p.name for p in dropped.skipped)
             parts.append(f"not a dataset or mesh: {names}")
         self.statusBar().showMessage("; ".join(parts), 8000)
 

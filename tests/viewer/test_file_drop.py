@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 from fastfuncstuff.viewer import catalog as cat  # noqa: E402
 from fastfuncstuff.viewer.session import ViewerSession  # noqa: E402
 from fastfuncstuff.viewer.ui.window import ViewerWindow  # noqa: E402
+from tests.viewer.test_surfaces import _subject  # noqa: E402
 
 CPU = torch.device("cpu")
 Copy = QtCore.Qt.DropAction.CopyAction
@@ -97,7 +99,7 @@ def test_a_mesh_is_told_by_its_bytes_and_a_brik_stands_for_its_head(tmp_path):
     notes = tmp_path / "notes.txt"
     notes.write_text("hello")
     head, brik = tmp_path / "a+orig.HEAD", tmp_path / "a+orig.BRIK.gz"
-    datasets, meshes, skipped = cat.sort_dropped(
+    dropped = cat.sort_dropped(
         [
             vol,
             named,
@@ -111,9 +113,10 @@ def test_a_mesh_is_told_by_its_bytes_and_a_brik_stands_for_its_head(tmp_path):
             tmp_path / "gone",
         ]
     )
-    assert datasets == [vol, tmp_path / "y.func.gii", head]
-    assert meshes == [named, unnamed, tmp_path / "x.surf.gii"]
-    assert skipped == [notes, tmp_path, tmp_path / "gone"]
+    assert dropped.datasets == [vol, tmp_path / "y.func.gii", head]
+    assert dropped.meshes == [named, unnamed, tmp_path / "x.surf.gii"]
+    assert dropped.directories == [tmp_path]
+    assert dropped.skipped == [notes, tmp_path / "gone"]
 
 
 def test_a_dropped_file_loads_and_lists_its_folder_without_reading_it(
@@ -167,6 +170,54 @@ def test_an_unclaimed_window_keeps_its_own_drags(tmp_path, window):
     # A file dialog's sidebar is one: it takes URL drags for itself.
     _drop(QtWidgets.QLineEdit(), _vol(tmp_path / "anat.nii.gz"))
     assert not len(window.session.state.layers)
+
+
+def test_a_dropped_folder_is_read_and_the_others_listed(tmp_path, window, monkeypatch):
+    vol = _vol(tmp_path / "one" / "anat.nii.gz")
+    other = _vol(tmp_path / "two" / "stats.nii.gz").parent
+    read = []
+    discover = cat.discover
+
+    def spy(directory, **kwargs):
+        read.append(directory)
+        return discover(directory, **kwargs)
+
+    monkeypatch.setattr(cat, "discover", spy)
+    _drop(window, vol.parent, other)
+
+    session = window.session
+    assert session.catalog_dir == vol.parent
+    assert [e.path for e in session.catalog] == [vol]
+    assert not len(session.state.layers)  # read into the pickers, not loaded
+    assert [Path(d) for d in read] == [vol.parent]  # the second is listed, not read
+    assert str(other.resolve()) in [r[0] for r in _dir_rows(window) if r]
+
+
+def test_a_dropped_subject_loads_like_surf_and_is_not_read(tmp_path, window):
+    subject = _subject(tmp_path)
+    _drop(window, subject)
+    session = window.session
+    assert session.surfaces.subject == subject
+    assert set(session.surfaces.hemis) == {"lh"}
+    assert session.catalog_dir is None
+    assert "surfaces: lh" in window.statusBar().currentMessage()
+
+
+def test_a_folder_holding_a_stray_surf_folder_is_just_a_folder(tmp_path, window):
+    (tmp_path / "d" / "surf").mkdir(parents=True)
+    vol = _vol(tmp_path / "d" / "anat.nii.gz")
+    _drop(window, vol.parent)
+    assert window.session.catalog_dir == vol.parent
+    assert not window.session.surfaces.hemis
+
+
+def test_a_dropped_subject_does_not_discard_unsaved_edits(tmp_path, window):
+    first = _subject(tmp_path / "a")
+    window.load_surfaces(first)
+    window.session.surfaces.edited.add(("lh", "white"))
+    _drop(window, _subject(tmp_path / "b"))
+    assert window.session.surfaces.subject == first
+    assert "unsaved edits" in window.statusBar().currentMessage()
 
 
 def test_a_bad_file_is_reported_and_the_rest_still_load(tmp_path, window):
