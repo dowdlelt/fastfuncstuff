@@ -221,3 +221,79 @@ def test_drainage_shift_is_basis_referenced_at_every_k():
         assert float(shift[-1]) == pytest.approx(0.0, abs=1e-3), f"K={K} deepest not clean"
         assert float(shift.argmax()) < K / 2, f"K={K} contamination must peak superficially"
         assert float(shift.min()) > -1e-6, f"K={K} drainage must be one-way"
+
+
+def test_depth_bin_map_groups_vascular_depths_evenly():
+    from fastfuncstuff.laminar.devein import depth_bin_map
+
+    assert list(depth_bin_map(9, 3)) == [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    # K not a multiple of N still covers every bin and stays monotone
+    m = depth_bin_map(7, 3)
+    assert list(m) == sorted(m) and set(m) == {0, 1, 2}
+    assert depth_bin_map(11, 3)[0] == 0 and depth_bin_map(11, 3)[-1] == 2
+
+
+def test_local_contribution_keeps_percent_and_drops_the_drained_part():
+    """The deveined profile is in PERCENT, not a.u., and removes exactly the signal
+    drained in from below -- the claim the profile panel makes on one shared axis."""
+    import numpy as np
+
+    from fastfuncstuff.laminar.devein import depth_bin_map, local_contribution
+
+    k, n = 9, 3
+    own = depth_bin_map(k, n)
+    w = np.zeros((k, n))
+    w[np.arange(k), own] = 1.0  # each depth's own neurons, 1% per unit drive
+    w[:3, 1] = 0.7  # superficial depths also drain the middle ...
+    w[:3, 2] = 0.5  # ... and the deep bin
+    drive = np.ones(n)
+
+    measured = w @ drive  # 2.2 at pial, 1.0 at deep
+    deveined = local_contribution(w, measured)
+
+    assert np.allclose(deveined, 1.0)  # flat: the planted truth
+    assert measured[0] / measured[-1] == pytest.approx(2.2)  # a pial ramp before
+    assert deveined[0] / deveined[-1] == pytest.approx(1.0)  # and none after
+    assert np.allclose(measured - deveined, [1.2, 1.2, 1.2, 0, 0, 0, 0, 0, 0])
+
+
+def test_local_contribution_leaves_the_deepest_depth_alone():
+    """The built-in sanity check, and the one that caught a units bug: the deepest row
+    of W has only its own column, so nothing there can be attributed to draining.
+
+    Scaling W by the fitted NEURONAL STATES instead of the drive broke exactly this --
+    W is BOLD per unit drive, the states are the ODE's response to it in arbitrary
+    units -- and showed 98% of the deepest depth's signal as drained.
+    """
+    import numpy as np
+
+    from fastfuncstuff.laminar.devein import local_contribution
+
+    rng = np.random.default_rng(0)
+    k, n = 9, 3
+    w = np.zeros((k, n))
+    for i in range(k):  # near-triangular, as a real fit's W is
+        for j in range(n):
+            w[i, j] = rng.uniform(0.3, 1.2) if j >= (i * n) // k else 0.0
+    assert w[-1, 0] == 0.0 and w[-1, 1] == 0.0 and w[-1, 2] > 0  # deepest: own only
+
+    measured = w @ np.array([1.0, 1.3, 0.8])
+    deveined = local_contribution(w, measured)
+    assert deveined[-1] == pytest.approx(measured[-1], rel=1e-9)
+
+
+def test_local_contribution_reconstructs_the_measured_profile():
+    """Keeping EVERY column returns the measured profile, which is what makes the
+    own-column part a decomposition rather than an arbitrary rescaling."""
+    import numpy as np
+
+    from fastfuncstuff.laminar.devein import local_contribution
+
+    rng = np.random.default_rng(3)
+    w = np.abs(rng.normal(size=(11, 3))) + 0.1
+    measured = w @ np.array([0.9, 1.4, 1.1])
+    drive = np.linalg.pinv(w) @ measured
+    assert np.allclose(w @ drive, measured, atol=1e-10)
+    # and the own-column part is never more than the whole
+    dev = local_contribution(w, measured)
+    assert np.all(dev <= measured + 1e-9)

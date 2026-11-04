@@ -24,9 +24,11 @@ See ``../fmri_wiki/concepts/Laminar generative model.md``.
 from fastfuncstuff.laminar.devein import (
     DeveinedResult,
     apply_deveining,
+    depth_bin_map,
     deveined_timecourses,
     deveining_fidelity,
     laminar_impulse_response,
+    local_contribution,
     static_deveining_matrix,
 )
 from fastfuncstuff.laminar.experiment import (
@@ -74,9 +76,11 @@ __all__ = [
     "P0",
     "DeveinedResult",
     "apply_deveining",
+    "depth_bin_map",
     "deveined_timecourses",
     "deveining_fidelity",
     "laminar_impulse_response",
+    "local_contribution",
     "static_deveining_matrix",
     "ModelSpec",
     "RecoveryResult",

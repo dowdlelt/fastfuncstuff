@@ -41,7 +41,7 @@ def _table(path):
 
 
 @pytest.mark.slow  # 55s
-def test_the_cli_writes_the_four_tables(reference, tmp_path):
+def test_the_cli_writes_the_five_tables(reference, tmp_path):
     o, a, b, kern = reference
     prefix = str(tmp_path / "quick")
     rc = laminar.main(
@@ -62,6 +62,23 @@ def test_the_cli_writes_the_four_tables(reference, tmp_path):
     assert len(rows) == 3 * 9 and {r[4] for r in rows} == {str(d) for d in range(1, 10)}
     h, rows = _table(f"{prefix}_laminar_neuronal.tsv")
     assert len(rows) == 2 * 7 * 3 and {r[3] for r in rows} == {"1", "2"}
+    # The profile table is per condition per VASCULAR depth (K=9), not per neuronal
+    # depth: it is the measured curve and the part of it each depth made itself, both
+    # in percent, which is what the profile panel draws.
+    h, rows = _table(f"{prefix}_laminar_profiles.tsv")
+    assert h == ["roi", "name", "hemi", "condition", "depth", "depth_frac",
+                 "measured_pct", "deveined_pct", "drained_pct"]  # fmt: skip
+    assert len(rows) == 2 * 9 and {r[3] for r in rows} == {"1", "2"}
+    assert {r[4] for r in rows} == {str(d) for d in range(1, 10)}
+    # depth_frac is 1 at the pial end and 0 at white matter, one row per condition.
+    # The NUMERICS live in test_laminar_devein.py: this fit is -max_iter 2 on purpose,
+    # so its W is not converged and the deep end keeps only 63% of its signal (97% and
+    # 91% on a converged real fit). Asserting the physics here would be asserting that
+    # a two-iteration fit is a good one.
+    deep = [r for r in rows if r[5] == "0"]
+    assert len(deep) == 2 and {r[3] for r in deep} == {"1", "2"}
+    # measured = deveined + drained, to the table's own 6 significant figures
+    assert all(float(r[6]) == pytest.approx(float(r[7]) + float(r[8]), rel=1e-5) for r in rows)
     doc = json.load(open(f"{prefix}_laminar.json"))
     assert doc["psf"] == "kernel" and doc["K"] == [9] and doc["delay_seconds"] == "TR/2"
 

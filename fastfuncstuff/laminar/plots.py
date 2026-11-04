@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.laminar.pipeline import RoiFit, depth_names
+from fastfuncstuff.laminar.pipeline import RoiFit, depth_names, profile_pair
 
 BEST = "#c44e52"
 OTHER = "#4c72b0"
@@ -149,21 +149,31 @@ def panel_neuronal(ax, fit: RoiFit, conditions: tuple[str, str]) -> None:
            title=f"Deveined neuronal response, {conditions[1]}")  # fmt: skip
 
 
-def panel_profiles(ax, fit: RoiFit) -> None:
-    """Peak response by depth: the measured BOLD ramps toward the surface, the inferred
-    neuronal profile is what is left once the draining is explained."""
-    _, sl = _era(fit, 1)
-    meas = _req(fit.y_obs, "data")[sl].max(axis=0)
-    neur = fit.neuronal[sl].max(axis=0)
-    ax.plot(meas, np.linspace(0, 1, len(meas)), "o-", color=BEST, lw=2, label="measured BOLD (%)")
-    ax2 = ax.twiny()
-    ax2.plot(neur, np.linspace(0, 1, len(neur)), "s-", color=GOOD, lw=2, label="neuronal (a.u.)")
-    ax2.grid(False)
-    ax.invert_yaxis()
-    _ends(ax)
-    ax.set(xlabel="peak signal change (%)", title="Depth profile: measured vs deveined")
-    ax2.set_xlabel("peak neuronal activity (a.u.)", color=GOOD)
-    ax.legend(fontsize=7, loc="lower right")
+def _pial_deep(profile: np.ndarray) -> float:
+    """Pial / deep peak, the scale-free summary of the bias. Index 0 is superficial."""
+    return float("nan") if abs(profile[-1]) < 1e-12 else float(profile[0] / profile[-1])
+
+
+def panel_profiles(ax, fit: RoiFit, conditions: tuple[str, str] = ("cond 1", "cond 2")) -> None:
+    """Peak response by depth, measured and deveined, BOTH in percent on one axis.
+
+    The measured profile ramps toward the pial surface; the deveined one is what each
+    depth's own neurons made, so the gap between them at the pial end IS the draining.
+    The deepest depth draws almost nothing from below, so its two values should nearly
+    coincide -- a deep end that moves a lot is a fit problem, not a result.
+    """
+    for which, (label, style) in enumerate(zip(conditions, ("--", "-"), strict=True)):
+        meas, dev = profile_pair(fit, which)
+        x = np.linspace(1, 0, len(meas))  # index 0 is superficial -> plot pial at x=1
+        ax.plot(x, meas, style, color=BEST, lw=2.2, marker="o", ms=4,
+                label=f"{label}: measured  ({_pial_deep(meas):.2f})")  # fmt: skip
+        ax.plot(x, dev, style, color=GOOD, lw=2.2, marker="s", ms=5,
+                label=f"{label}: deveined  ({_pial_deep(dev):.2f})")  # fmt: skip
+    ax.axhline(0, color="0.75", lw=0.8)
+    ax.set_xticks([0, 0.5, 1], ["WM", "mid", "pial"])
+    ax.set(xlabel="cortical depth", ylabel="peak signal change (%)",
+           title="Depth profile: measured vs deveined (pial/deep)")  # fmt: skip
+    ax.legend(fontsize=6.5, loc="best")
 
 
 def panel_operator(ax, fit: RoiFit) -> None:
@@ -314,7 +324,7 @@ def plot_roi(
     panel_model_probability(a[2], fit)
     panel_modulation(a[3], fit)
     panel_fit(a[4], fit, conditions)
-    panel_profiles(a[5], fit)
+    panel_profiles(a[5], fit, conditions)
     panel_measured(a[6], fit, conditions)
     panel_neuronal(a[7], fit, conditions)
     panel_operator(a[8], fit)

@@ -259,6 +259,38 @@ def write_null(prefix: str, fits: list[RoiFit], nulls_by_roi: dict) -> list[str]
     return paths
 
 
+def _peak(values: np.ndarray) -> np.ndarray:
+    """Signed value at each depth's own |peak| over time, ``(n_times, depths) -> (depths,)``.
+
+    Per depth rather than at one shared timepoint, because transit delay moves the
+    peak later toward the pial end -- which is part of what deveining explains --
+    and signed, so a negative response is not reported as a positive one.
+    """
+    idx = np.abs(values).argmax(axis=0)
+    return values[idx, np.arange(values.shape[1])]
+
+
+def profile_pair(fit: RoiFit, which: int) -> tuple[np.ndarray, np.ndarray]:
+    """One condition's ``(measured, deveined)`` peak depth profiles, BOTH in percent.
+
+    ``measured`` is the data, one value per vascular depth. ``deveined`` is the part
+    of it made by each depth's OWN neurons, via :func:`~fastfuncstuff.laminar.devein.
+    local_contribution` -- percent too, on the same scale, with no rescaling, so the
+    gap between the curves is the signal drained in from deeper cortex.
+
+    Both are superficial first, as every array on :class:`RoiFit` is.
+    """
+    from fastfuncstuff.laminar.devein import local_contribution
+
+    block, gap = int(fit.meta["block"]), int(fit.meta["gap"])
+    sl = [slice(1, block), slice(block + gap + 1, block + gap + block)][which]
+    if fit.y_obs is None:
+        raise ValueError("this fit kept no data; profiles need y_obs")
+    measured = _peak(fit.y_obs[sl])
+    deveined = local_contribution(fit.W, measured, fit.W_inv)
+    return measured, deveined
+
+
 def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = None) -> list[str]:
     """Tidy tables, one line per ROI x (model | neuronal depth | measured depth | time):
 
@@ -272,9 +304,13 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
       measured amplitudes (betas, FIR peaks, areas) of matching units;
     * ``{prefix}_laminar_neuronal.tsv`` -- the deveined neuronal time course per
       condition and neuronal depth, from event onset;
+    * ``{prefix}_laminar_profiles.tsv`` -- the peak depth profile per condition, measured
+      and deveined, BOTH in percent signal change: what the figure's profile panel draws;
     * ``{prefix}_laminar.json`` -- how it was run.
     """
-    paths = [f"{prefix}_laminar_{s}.tsv" for s in ("models", "depths", "devein", "neuronal")]
+    paths = [
+        f"{prefix}_laminar_{s}.tsv" for s in ("models", "depths", "devein", "neuronal", "profiles")
+    ]
     Path(paths[0]).parent.mkdir(parents=True, exist_ok=True)
     z90 = 1.6448536269514722
     with open(paths[0], "w") as fh:
@@ -322,6 +358,25 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
                             f"{f.roi}\t{f.name}\t{f.hemi}\t{cond}\t{t * tr:.6g}\t{d}\t"
                             f"{f.neuronal[s0 + t, i]:.6g}\n"
                         )
+    # Peak depth profile, measured and deveined, both in percent -- the eyeball check
+    # that the draining was removed: the measured curve ramps pialward and the deveined
+    # one should not, while their deepest values nearly coincide.
+    with open(paths[4], "w") as fh:
+        fh.write("roi\tname\themi\tcondition\tdepth\tdepth_frac\tmeasured_pct\t"
+                 "deveined_pct\tdrained_pct\n")  # fmt: skip
+        for f in fits:
+            if f.y_obs is None:
+                continue
+            for which in (0, 1):
+                meas, dev = profile_pair(f, which)
+                k = len(meas)
+                for i in range(k):  # array index 0 is superficial; depth K is pial
+                    frac = 1.0 - i / max(k - 1, 1)  # 0 at white matter, 1 at pial
+                    fh.write(
+                        f"{f.roi}\t{f.name}\t{f.hemi}\t{which + 1}\t{k - i}\t{frac:.6g}\t"
+                        f"{meas[i]:.6g}\t{dev[i]:.6g}\t{meas[i] - dev[i]:.6g}\n"
+                    )
+
     doc = {
         "tool": "ffs_laminar",
         "rois": [
@@ -341,4 +396,12 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
     return [*paths, f"{prefix}_laminar.json"]
 
 
-__all__ = ["REFERENCE_P0", "RoiFit", "depth_names", "fit_roi", "reference_p0", "write_results"]
+__all__ = [
+    "REFERENCE_P0",
+    "RoiFit",
+    "depth_names",
+    "fit_roi",
+    "profile_pair",
+    "reference_p0",
+    "write_results",
+]
