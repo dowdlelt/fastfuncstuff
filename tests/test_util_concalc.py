@@ -415,7 +415,12 @@ def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
     import sys
 
     from fastfuncstuff.cli import reml, util_concalc
-    from fastfuncstuff.design.spec import ContrastSpec, build_stub_spec, write_spec
+    from fastfuncstuff.design.spec import (
+        ConjunctionSpec,
+        ContrastSpec,
+        build_stub_spec,
+        write_spec,
+    )
     from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
 
     v, t_n, tr = 400, 80, 2.0
@@ -437,6 +442,9 @@ def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
     spec, _ = build_stub_spec([bold], [tmp_path / "ev.tsv"], tr=tr)
     write_spec(spec, tmp_path / "plain.toml")
     spec.contrasts = [ContrastSpec(label="a_vs_b", sym="SYM: +1*a -1*b")]
+    # A conjunction rides the same surface plumbing as a contrast: the minimum
+    # is taken in label space, before anything knows it is writing a mesh.
+    spec.conjunctions = [ConjunctionSpec(label="aANDb", components=["a_vs_b", "a"])]
     write_spec(spec, tmp_path / "con.toml")
 
     def run(mod, prog, *argv):
@@ -461,16 +469,21 @@ def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
     ref_names = [dict(a.meta)["Name"] for a in nib.load(str(tmp_path / "ref.func.gii")).darrays]
     # Named as ffs_reml and 3dREMLfit name it, so the two buckets read alike.
     assert names == ref_names
-    for lab in ("Coef", "Tstat"):
-        np.testing.assert_allclose(
-            got[:, names.index(f"a_vs_b#0_{lab}")],
-            ref[:, ref_names.index(f"a_vs_b#0_{lab}")],
-            rtol=1e-3,
-            atol=1e-3,
-        )
+    assert not [n for n in names if "__conj__" in n]
+    for con in ("a_vs_b", "aANDb"):
+        for lab in ("Coef", "Tstat"):
+            np.testing.assert_allclose(
+                got[:, names.index(f"{con}#0_{lab}")],
+                ref[:, ref_names.index(f"{con}#0_{lab}")],
+                rtol=1e-3,
+                atol=1e-3,
+            )
     assert meta["mesh_fingerprint"] == "V_test" and "ClustSim_bi-sided" in meta
     t_arr = nib.load(str(out)).darrays[names.index("a_vs_b#0_Tstat")]
     assert t_arr.intent == 3 and dict(t_arr.meta)["StatCode"] == "3"
+    ref_t = nib.load(str(tmp_path / "ref.func.gii")).darrays[ref_names.index("aANDb#0_Tstat")]
+    conj_t = nib.load(str(out)).darrays[names.index("aANDb#0_Tstat")]
+    assert dict(conj_t.meta)["StatParams"] == dict(ref_t.meta)["StatParams"]
 
 
 def test_conjoin_by_label_signed_minimum():
