@@ -209,3 +209,149 @@ def test_per_voxel_lambda_lets_the_noise_gradient_set_the_depth_profile(tmp_path
         f"the noise gradient moved the per-voxel-lambda profile by {spread_reml:.1%} "
         f"and the one-lambda profile by {spread_fixed:.1%}"
     )
+
+
+def _write_runs(tmp_path, n_runs=2, n_tp=60, seed=3):
+    """Synthetic ribbon runs with two conditions, plus their BIDS events."""
+    import nibabel as nib
+
+    surfaces, aff, shape3, xyz, r, (r_w, r_p) = _ribbon(tmp_path)
+    n = shape3[0]
+    depth = np.clip((r - r_w) / (r_p - r_w), 0, 1)
+    in_ribbon = (r > r_w - 2.0) & (r < r_p + 2.0)
+    t = np.arange(N_KNOTS) * TR
+    hrf = (t / 5.0) ** 2 * np.exp(-(t - 5.0) / 1.5) * (t > 0)
+    hrf = hrf / hrf.max()
+    onsets = {"base": np.array([8.0, 44.0, 80.0]), "test": np.array([26.0, 62.0, 98.0])}
+    gain = {"base": 1.0, "test": 1.4}
+    rng = np.random.default_rng(seed)
+    files, rows = [], []
+    for run in range(n_runs):
+        series = np.zeros((*shape3, n_tp), np.float64)
+        for lab, ons in onsets.items():
+            amp = (0.5 + depth) * gain[lab] * in_ribbon
+            for o in ons:
+                for j, h in enumerate(hrf):
+                    tp = int(round((o + j * TR) / TR))
+                    if 0 <= tp < n_tp:
+                        series[..., tp] += amp * h
+            for o in ons:
+                rows.append({"run": run, "onset": float(o), "duration": 1.0, "trial_type": lab})
+        # A mean to scale against, slow drift, and noise.
+        series = 1000.0 * (1.0 + 0.01 * series)
+        series += 5.0 * np.linspace(-1, 1, n_tp) * in_ribbon[..., None]
+        series += 1.0 * rng.standard_normal(series.shape)
+        path = tmp_path / f"run{run + 1}.nii.gz"
+        img = nib.Nifti1Image(series.astype(np.float32), aff)
+        img.header.set_zooms((2.0, 2.0, 2.0, TR))
+        nib.save(img, path)
+        files.append(str(path))
+        ev = tmp_path / f"run{run + 1}_events.tsv"
+        mine = [x for x in rows if x["run"] == run]
+        ev.write_text(
+            "onset\tduration\ttrial_type\n"
+            + "".join(f"{x['onset']}\t{x['duration']}\t{x['trial_type']}\n" for x in mine)
+        )
+    resp = (in_ribbon & (xyz[..., 2] > 0.0)).astype(np.float32)
+    nib.save(nib.Nifti1Image(resp, aff), tmp_path / "resp.nii.gz")
+    return files, [str(tmp_path / f"run{i + 1}_events.tsv") for i in range(n_runs)], n
+
+
+_MESH = ("-white_mesh", "lh.white.surf.gii", "-pial_mesh", "lh.pial.surf.gii")
+
+
+def _common(tmp_path, verb="0"):
+    return [
+        "-white_mesh", str(tmp_path / "lh.white.surf.gii"),
+        "-pial_mesh", str(tmp_path / "lh.pial.surf.gii"),
+        "-responsive", str(tmp_path / "resp.nii.gz"),
+        "-column_radius", "8", "-column_spacing", "6", "-depths", "6",
+        "-compare", "ab", "base", "test",
+        "-models", "null", "superficial", "-max_iter", "3", "-rescue", "0",
+        "-max_columns", "4", "-seed", "0", "-device", "cpu", "-verb", verb,
+    ]  # fmt: skip
+
+
+@pytest.mark.slow  # 150s: two full CLI runs of deconvolve + laminascope
+def test_single_step_matches_deconvolve_then_laminascope(tmp_path):
+    """The whole point of the single-step path: at one fixed lambda it must give the
+    same column x depth curves as fitting voxels with ffs_deconvolve and averaging
+    them, because the fit and the depth mixing commute. This is the end-to-end form
+    of test_mix_then_fit_equals_fit_then_mix_at_one_lambda, through both CLIs."""
+    from fastfuncstuff.cli import deconvolve, laminascope
+
+    runs, events, _ = _write_runs(tmp_path)
+    lam = "3.0"
+    window = ["0", str((N_KNOTS - 1) * TR)]
+
+    # Route A: voxel curves from ffs_deconvolve at a fixed lambda, then the old path.
+    assert deconvolve.main([
+        "-input", *runs, "-events", *events, "-model", "TENT",
+        "-window", f"0,{(N_KNOTS - 1) * TR}", "-tent-smooth", lam, "-polort", "1",
+        "-do_scale", "-prefix", str(tmp_path / "dec"), "-verb", "0", "-device", "cpu",
+    ]) == 0  # fmt: skip
+    a = str(tmp_path / "A")
+    assert laminascope.main([
+        "-iresp_prefix", str(tmp_path / "dec"), "-window", *window, "-duration", "1",
+        *_common(tmp_path), "-prefix", a,
+    ]) == 0  # fmt: skip
+
+    # Route B: one step, same lambda and the same window.
+    b = str(tmp_path / "B")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-window", *window,
+        "-tent_lambda", lam, "-polort", "1", *_common(tmp_path), "-prefix", b,
+    ]) == 0  # fmt: skip
+
+    za, zb = np.load(f"{a}_columns.npz"), np.load(f"{b}_columns.npz")
+    assert np.array_equal(za["fitted"], zb["fitted"]), "the two routes fitted different columns"
+    for key in ("ab_baseline_K6", "ab_test_K6"):
+        ca, cb = za[key], zb[key]
+        assert ca.shape == cb.shape and np.isfinite(ca).all()
+        # Measured 2.4-2.8e-6 relative (max |diff| 4e-6 on a 1.7 peak): the floor is
+        # ffs_deconvolve writing its iresp files as float32, which route B never
+        # round-trips through. Not bit-equality -- both routes chunk.
+        np.testing.assert_allclose(cb, ca, rtol=3e-5, atol=3e-5)
+
+
+@pytest.mark.slow  # 40s: one CLI run
+def test_single_step_chooses_its_own_lambda_and_reports_the_cells(tmp_path, capsys):
+    from fastfuncstuff.cli import laminascope
+
+    runs, events, _ = _write_runs(tmp_path)
+    out = str(tmp_path / "C")
+    argv = [
+        "-input", *runs, "-events", *events,
+        "-window", "0", str((N_KNOTS - 1) * TR), "-polort", "1",
+        *_common(tmp_path, verb="1"), "-prefix", out,
+    ]  # fmt: skip
+    assert laminascope.main(argv) == 0
+    log = capsys.readouterr().out
+    assert "global lambda log10" in log and "column x depth cell" in log
+    import json
+
+    meta = json.load(open(f"{out}.json"))
+    assert any("global lambda" in n for n in meta["notes"])
+    # The duration came from the events, not from a flag the user had to repeat.
+    assert meta["argv"] and "-duration" not in argv
+
+
+def test_differing_event_durations_are_refused_not_averaged(tmp_path):
+    """The model drives baseline and test with one duration, so two conditions with
+    different event lengths cannot be represented; say so instead of picking one."""
+    from fastfuncstuff.cli import laminascope
+
+    runs, events, _ = _write_runs(tmp_path)
+    for ev in events:  # make 'test' events twice as long
+        lines = open(ev).read().splitlines()
+        out = [lines[0]]
+        for ln in lines[1:]:
+            o, d, lab = ln.split("\t")
+            out.append(f"{o}\t{2.0 if lab == 'test' else 1.0}\t{lab}")
+        open(ev, "w").write("\n".join(out) + "\n")
+    rc = laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "0", str((N_KNOTS - 1) * TR),
+        "-tent_lambda", "3.0", "-polort", "1", *_common(tmp_path),
+        "-prefix", str(tmp_path / "D"),
+    ])  # fmt: skip
+    assert rc == 1
