@@ -204,7 +204,10 @@ def fit_columns(
         from tqdm.auto import tqdm
 
         n_chunks = -(-n_cols // chunk)
-        n_inv = n_k * n_chunks * (1 if model_space == "reduce" else n_m)
+        # Reduction is not free: each model's reduce + integrability integration, and the
+        # refits it triggers, were 38% of a comparison's wall time with the bar already at
+        # 100% -- which reads as a hang.  Count that phase too.
+        n_inv = n_k * n_chunks + n_m * n_k if model_space == "reduce" else n_k * n_chunks * n_m
         bar = tqdm(total=n_inv, desc=f"laminar {n_cols} columns", leave=True,
                    disable=n_inv < 2)  # fmt: skip
     full_target = tuple([1] * n)
@@ -231,12 +234,16 @@ def fit_columns(
         if kern is not None and kern.ndim == 3:
             kern = kern[idx.cpu()]
         t0 = time.perf_counter()
+        if bar is not None:  # a refit is a full inversion; say so rather than going quiet
+            bar.set_postfix_str(f"{label}: {int(idx.numel())} col", refresh=True)
         run = variational_laplace_batched(
             d.spec, faes_priors(d.spec, target), d.u, d.y[idx.cpu()], rows=d.rows,
             kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
             device=device, rescue=rescue, **d.integrate_kwargs,
         )  # fmt: skip
         timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
+        if bar is not None:
+            bar.set_postfix_str("", refresh=False)
         return run
 
     def record(m, c0, c1, runs):
@@ -305,7 +312,9 @@ def fit_columns(
                 d = data_for_k[k]
                 full = full_all[k]
                 if tuple(target) == full_target and not overrides[k]:
-                    runs.append(full)
+                    runs.append(full)  # already inverted; nothing to reduce
+                    if bar is not None:
+                        bar.update(1)
                     continue
                 pri = faes_priors(d.spec, target)
                 if overrides[k]:
@@ -332,6 +341,8 @@ def fit_columns(
                         pred[idx] = sub.y_pred.to(pred)
                 run = dataclasses.replace(run, y_pred=pred)
                 runs.append(run)
+                if bar is not None:
+                    bar.update(1)
             record(m, 0, n_cols, runs)
     if bar is not None:
         bar.close()

@@ -65,10 +65,141 @@ and {prefix}_columns.npz (columns, their curves and PSFs, every fit), {prefix}.j
 """
 
 
+_EPILOG = """\
+WHERE THE MAPS EXIST, AND WHERE THEY DO NOT
+
+The painted extent is NOT the -responsive mask.  Centres are placed so every
+responsive vertex is within -column_spacing of one, but each column is a disk of
+-column_radius, so the maps cover the responsive set DILATED by the radius --
+measured on a real run, 15,924 responsive vertices became 66,062 covered ones
+(4.1x) at -column_radius 6, i.e. 35% of the ribbon.  That is the design (a
+column is a neighbourhood, not a vertex), and it means the edge of the coloured
+blob carries no information about where the response was.  The startup line
+reports the factor; threshold the maps, never read their boundary.
+
+Also check which sub-brick -responsive actually read.  Brick 0 of an AFNI stats
+bucket is Full_Fstat and brick 1 is Full_Zstat -- the OMNIBUS, every condition
+against baseline, which is "responded to the experiment" and not the contrast
+you meant to localise.  Both are non-negative, so -responsive_positive silently
+does nothing on them; the tool now warns when the brick it read has no negative
+values.  A signed contrast brick is usually several further along
+(3dinfo -label).
+
+Outside the columns there is no estimate, and the maps say so with NaN rather
+than 0 -- B, p_<depth> and logBF_vs_null are all legitimately near 0 INSIDE a
+column, so a zero fill would make "no column here" unreadable against "no effect
+here".  n_columns is the exception and keeps its 0: that is a real count, and
+n_columns > 0 is the coverage mask if your viewer wants one.
+
+READING THE MAPS
+
+Every map and every line of {prefix}_NAME_columns.tsv is one column's whole model
+space, so there is no one number to threshold.  Gate in this order -- each step
+decides whether the next one is about physiology or about noise.
+
+1. IS THERE A RESPONSE?  baseline_peak (percent, the peak of the depth-averaged
+   baseline curve).  A column with no response gives the model nothing to
+   explain and its B is noise however confidently flagged -- measured: an atlas
+   region with no event response still produced flagged depths.  This is the
+   first gate and the one most worth setting from your own distribution, since
+   it is in percent and therefore interpretable.  Judging a laminar effect in
+   tissue that did not respond is the commonest way to read this tool wrong.
+
+2. WAS THE COLUMN READ?  in_fov, the share of its ribbon inside the mask/FOV.
+   A slab cuts V1 and V2 in half; a cut depth profile is not a shallow profile,
+   it is a different measurement.  -min_coverage already drops the worst (the
+   "cut by the FOV/mask" count on startup); in_fov grades what survived.
+
+3. IS THE FIT SOUND?  Three flags, any of which makes a ranking a report about
+   the optimiser:
+     nesting_nats   a model scoring below one it CONTAINS.  Impossible in
+                    principle (the smaller model is the larger with B pinned at
+                    0), so it is a local optimum.  >10 nats is counted and
+                    warned about.  -model_space reduce (the default) took this
+                    from 23% of real columns to 0%; brute-force -model_space
+                    invert is where the 23% came from.
+     stalled        ended on rejected steps with the predicted gain collapsed.
+                    -rescue cut these from 47% to 9% on real columns; it is
+                    worth having on.
+     failed / r2    no usable inversion at all / how much of the fitted rows the
+                    winner explains.
+
+4. IS THERE ANY MODULATION AT ALL?  logBF_vs_null, the best model's evidence over
+   the null.  The conventional log-Bayes-factor reading applies: ~3 nats is about
+   20:1, the usual floor for interpreting a difference.  Below it the honest
+   statement is "no evidence these conditions differ at any depth", and the depth
+   probabilities are a decomposition of nothing.  This is the closest thing to a
+   statistical threshold the tool has -- and it is a convention, not a
+   calibration measured on this data.
+
+5. ONLY THEN, WHERE.  Prefer p_<depth> -- P(depth modulated), marginalised over
+   the whole model space -- to the winner map.  The winner is one of 2^N
+   hypotheses and p_best says how narrowly it won; a p_best of 0.3 is a near-tie
+   dressed as an answer.  B_<depth> is the WINNER's modulation; the long table's
+   B_bma is model-averaged, which is what a group test should carry, because a
+   depth that some models pin at 0 contributes 0 rather than dropping out.
+
+   B modulates self-inhibition (A_kk = -sigma + u*B_k), so positive B LOWERS
+   inhibition; sigma - B_bma below 0 is net self-excitation while the modulation
+   is on.  P(depth modulated) ignores the sign, so a comparison is
+   non-directional however its sides are ordered.
+
+WHAT NOT TO BELIEVE
+
+  The columns are not independent, by construction.  At the default spacing
+  (half the radius) an interior vertex sits in several columns differing only in
+  where their edges fall.  That redundancy is the point -- agreement and
+  n_columns report the consensus -- but it means no vertex-wise or voxel-wise
+  multiple-comparison correction is valid on these maps.  They are a smoothed,
+  deliberately overlapping summary, not a test image.
+
+  The middle depth is the least identified, everywhere.  Measured across atlas
+  regions and contrasts: P(modulated) near 0.5 with a large posterior sd.  A
+  middle-depth claim needs more than this tool.
+
+  Low s_d is the dangerous direction.  Underestimating the ascending vein's
+  baseline-CBV slope gives qualitatively WRONG laminar profiles; overestimating
+  is safe (Uludag & Havlicek 2021).  Real columns have come out with a 5th
+  percentile near -2.8, i.e. the bad direction.  Look at the s_d map before
+  trusting a depth assignment, and treat 3 mm columns as unlikely to identify it
+  at all -- pooling it was tried (-vascular_prior) and the evidence declined.
+
+  sigma is not comparable across designs and can be bimodal WITHIN a region
+  (~0.1 vs ~3.5 Hz observed in one region).  Check its distribution before any
+  group test on sigma, and never compare a block design's sigma with an event
+  design's.
+
+  Absolute F moves with the padding draw (~1 nat; the model comparison ~0.2)
+  under -hyperprior reference, the parity default.  Rankings within a run are
+  safe; F across runs with different -pad_seed is not.
+
+  -free_energy reference (the default) ranks on the FIRST K only, as
+  spm_dcm_bpa leaves it, while the parameters are averaged over all K.  The
+  per-K evidence is in {prefix}_columns.npz (per_k_F), so this is checkable
+  without refitting.
+
+  Identifiability at this scale is unproven.  The model's own authors declined
+  to explore dynamic invertibility and warned it depends on SNR, ROI size and
+  within-ROI variability; a 6 mm column has far less than a whole ROI.
+
+WHAT REPLICATED, MEASURED
+
+Split-half on one subject at 6 mm columns: a stimulus-contrast comparison
+replicates in the data (profile r 0.63, 0.74 in face patches) and in the model,
+attenuated (P and B r 0.2-0.26 against a null of 0.07).  TASK contrasts did not
+replicate at 6 mm in one subject.  The model tracking the data's own reliability
+is the system working; a single subject's single-run map is not the unit of
+inference.  Inference is ACROSS SUBJECTS, as in the published analysis: use
+{prefix}_NAME_regions_long.tsv (one line per region x depth, with in_fov and
+baseline_peak to gate on) and test B_bma, p_modulated or sigma_test_hz across a
+cohort.
+"""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     from fastfuncstuff.surface.ribbon_args import add_depth_args, add_ribbon_args
 
-    p = FfsArgumentParser(prog="ffs_laminascope", description=_DESCRIPTION)
+    p = FfsArgumentParser(prog="ffs_laminascope", description=_DESCRIPTION, epilog=_EPILOG)
     g = p.add_argument_group("Curves and comparisons")
     g.add_argument("-iresp_prefix", default=None, metavar="PREFIX",
                    help="PREFIX of voxel curve files PREFIX_iresp_<label>.nii[.gz|.zst], from "
@@ -672,8 +803,13 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             raise ValueError(
                 "give -responsive (columns centred on responsive cortex) or -regions_from"
             )
+        resp_notes: list[str] = []
         resp = col.responsive_vertices(args.responsive, surfaces, threshold=args.responsive_thresh,
-                                       absolute=not args.responsive_positive)  # fmt: skip
+                                       absolute=not args.responsive_positive,
+                                       notes=resp_notes)  # fmt: skip
+        for note in resp_notes:
+            say(note)
+        logs += resp_notes
         if args.within:
             notes: list[str] = []
             inside = [np.zeros(len(s.white), bool) for s in surfaces]
@@ -689,9 +825,16 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         columns = col.make_columns(surfaces, resp, radius_mm=args.column_radius,
                                    spacing_mm=args.column_spacing, seed=args.seed)  # fmt: skip
         cover = columns.coverage_count()
+        n_resp = int(sum(int(r.sum()) for r in resp))
+        # A disk of -column_radius around every centre reaches well past the responsive
+        # vertices the centres were placed on, and the painted maps cover all of it.
         say(f"Columns: {columns.n_columns:,} (radius {columns.radius_mm:g} mm, spacing "
             f"{columns.spacing_mm:g} mm) over {columns.vertex_id.size:,} vertices; columns per "
             f"vertex median {np.median(cover):.0f} ({time.time() - t0:.0f} s)")  # fmt: skip
+        if n_resp:
+            say(f"  the maps therefore cover {columns.vertex_id.size / n_resp:.1f}x the "
+                f"{n_resp:,} responsive vertices (every vertex within {columns.radius_mm:g} mm "
+                "of a centre); threshold them, do not read their extent as the mask")  # fmt: skip
 
     ks = depth_list(args)
     opts = options_from_args(args)
@@ -813,12 +956,14 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             f"  fitted in {time.time() - t0:.0f} s ({(time.time() - t0) / fit_idx.size:.3f} s/column)"
         )
         results[cmp.name] = fits
-        _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
-                          depth_names(args.N), device, say)  # fmt: skip
         k_mid = ks[len(ks) // 2]
         base_mid = np.mean([col_curves[k_mid][lab][fit_idx] for lab in cmp.baseline], axis=0)
+        baseline_peak = base_mid.mean(1).max(1)
+        _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
+                          depth_names(args.N), device, say, in_fov=in_fov[fit_idx],
+                          baseline_peak=baseline_peak)  # fmt: skip
         _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say,
-                    in_fov=in_fov[fit_idx], baseline_peak=base_mid.mean(1).max(1))  # fmt: skip
+                    in_fov=in_fov[fit_idx], baseline_peak=baseline_peak)  # fmt: skip
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
                     "stalled", "failed", "nesting", "s_d", "refit"):  # fmt: skip
             out_npz[f"{cmp.name}_{key}"] = getattr(fits, key)
@@ -931,7 +1076,13 @@ def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say, *, in_
 
 
 def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
-                      dnames, device, say) -> None:  # fmt: skip
+                      dnames, device, say, *, in_fov, baseline_peak) -> None:  # fmt: skip
+    """The per-column maps and table.
+
+    ``baseline_peak`` (percent, the depth-averaged baseline curve's peak) and ``in_fov``
+    travel with every map and not only the region table: a column with no response has
+    nothing for the model to explain, and its B is noise however confidently flagged.
+    """
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.io.gifti import mesh_fingerprint, save_gifti_data
     from fastfuncstuff.laminar import columns as col
@@ -953,10 +1104,12 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
               else np.full(n_cols, np.nan))  # fmt: skip
     per_column = np.concatenate(
         [full(fits.p_depth), full(fits.B_mean), full(fits.B_p), p_best[:, None],
-         log_bf[:, None], full(fits.r2.max(1))[:, None]], axis=1,
+         log_bf[:, None], full(fits.r2.max(1))[:, None], full(baseline_peak)[:, None],
+         full(np.asarray(in_fov, float))[:, None], full(fits.nesting)[:, None]], axis=1,
     )  # fmt: skip
     names = ([f"p_{d}" for d in dnames] + [f"B_{d}" for d in dnames]
-             + [f"PB_{d}" for d in dnames] + ["p_best", "logBF_vs_null", "r2"])  # fmt: skip
+             + [f"PB_{d}" for d in dnames]
+             + ["p_best", "logBF_vs_null", "r2", "baseline_peak", "in_fov", "nesting_nats"])  # fmt: skip
     vert, n_cov = col.paint_vertices(columns, per_column, valid)
     winner, agree = col.vertex_winner(columns, best_full, len(fits.models), valid)
     vmaps = np.concatenate([vert, winner[:, None].astype(float), agree[:, None], n_cov[:, None]], 1)
@@ -974,7 +1127,14 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
         save_gifti_data(path, data, meta, time_series=False)
         say(f"  wrote {path}")
     vol = col.paint_ribbon(surfaces, columns, vmaps, affine, shape3, device=device)
-    vol = np.nan_to_num(vol, nan=0.0).reshape(*shape3, -1).astype(np.float32)
+    # Outside the columns there is no estimate, and B / p_depth / logBF are all legitimately
+    # ~0 INSIDE them: zero-filling made "no column here" unreadable against "no effect here",
+    # which is the whole question a thresholded map is asked.  NaN is what the .func.gii
+    # already carries.  n_columns keeps its 0, which is a real count and not a missing value.
+    vol = vol.reshape(*shape3, -1).astype(np.float32)
+    if "n_columns" in vnames:
+        j = vnames.index("n_columns")
+        vol[..., j] = np.nan_to_num(vol[..., j], nan=0.0)
     path = f"{prefix}_{cmp.name}_ribbon.nii.gz"
     save_nifti(vol, output_path=path, reference_img=None, affine=affine, brick_labels=vnames)
     say(f"  wrote {path}")
@@ -984,7 +1144,8 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
         fh.write("column\themi\tcentre_vertex\tbest\tp_best\t"
                  + "\t".join(f"p_{mm}" for mm in fits.models) + "\t"
                  + "\t".join(f"p_mod_{d}\tB_{d}\tB_sd_{d}\tPB_{d}" for d in dnames)
-                 + "\tr2_best\ts_d\tstalled\tfailed\tnesting_nats\n")  # fmt: skip
+                 + "\tr2_best\ts_d\tbaseline_peak\tin_fov\tlogBF_vs_null"
+                 + "\tstalled\tfailed\tnesting_nats\n")  # fmt: skip
         for j, c in enumerate(fit_idx):
             b = int(fits.best[j])
             fh.write(
@@ -993,7 +1154,9 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
                 + "\t".join(f"{v:.4g}" for v in fits.p_model[j]) + "\t"
                 + "\t".join(f"{fits.p_depth[j, i]:.4g}\t{fits.B_mean[j, i]:.4g}\t"
                             f"{fits.B_sd[j, i]:.4g}\t{fits.B_p[j, i]:.4g}" for i in range(n_d))
-                + f"\t{fits.r2[j, max(b, 0)]:.4g}\t{fits.s_d[j]:.4g}\t{int(fits.stalled[j].any())}\t"
+                + f"\t{fits.r2[j, max(b, 0)]:.4g}\t{fits.s_d[j]:.4g}\t"
+                f"{baseline_peak[j]:.4g}\t{in_fov[j]:.4g}\t{log_bf[c]:.4g}\t"
+                f"{int(fits.stalled[j].any())}\t"
                 f"{int(fits.failed[j].any())}\t{fits.nesting[j]:.3g}\n"
             )  # fmt: skip
     say(f"  wrote {tsv}")

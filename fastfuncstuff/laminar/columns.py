@@ -51,6 +51,7 @@ def responsive_vertices(
     threshold: float | None = None,
     absolute: bool = True,
     fracs: tuple[float, ...] = (0.1, 0.25, 0.4, 0.55, 0.7, 0.85),
+    notes: list[str] | None = None,
 ) -> list[np.ndarray]:
     """Per surface, the vertices whose column the volume ``path`` marks (``file[N]``
     picks brick N of a 4-D file).
@@ -74,6 +75,20 @@ def responsive_vertices(
     elif brick:
         raise ValueError(f"{path}: a 3-D volume has no brick {brick}")
     arr = np.asarray(arr, np.float64)
+    if notes is not None and threshold is not None:
+        notes.append(f"-responsive: brick {brick} of {path}")
+        # An omnibus Full_Fstat / Full_Zstat is non-negative by construction, so asking for
+        # the positive side of one is a no-op -- and such a brick marks every condition's
+        # response, not the contrast people mean to localise with.  Brick 0 of an AFNI
+        # stats bucket IS the omnibus, which is what a forgotten selector lands on.
+        finite = arr[np.isfinite(arr)]
+        if finite.size and finite.min() >= 0:
+            notes.append(
+                f"    WARNING: brick {brick} has no negative values, so it looks like an "
+                "omnibus F/Z (every condition against baseline) rather than a signed "
+                "contrast.  -responsive_positive does nothing on it, and it will mark far "
+                "more cortex than a contrast would.  Check the brick with 3dinfo -label."
+            )
     inv = np.linalg.inv(np.asarray(img.affine, np.float64))
     out = []
     for s in surfaces:

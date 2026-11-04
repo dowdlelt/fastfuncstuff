@@ -65,8 +65,110 @@ across -workers processes.
 """
 
 
+_EPILOG = """\
+READING THE OUTPUT
+
+Read the tables in this order; each step decides whether the next one means anything.
+
+1. Is the fit sound?  {prefix}_laminar_models.tsv carries per-model F and the
+   per-K evidence, and the tool warns on two conditions that make a ranking
+   worthless:
+     stalled      the run ended on rejected steps.  SPM's rule calls a fit
+                  converged when the predicted gain is under 0.1 four times
+                  running, and after a rejected step the damping can collapse so
+                  far that the gain vanishes hundreds of nats short -- measured
+                  once at 480 nats.  -rescue 2 restarts from the best point.
+     nesting      a model scoring below a model it CONTAINS.  That is impossible
+                  (the smaller model is the larger one with B pinned at 0), so it
+                  is a local optimum, not evidence.  >10 nats is warned about.
+   A ranking with either flag set is a report about the optimiser.
+
+2. Is there anything to explain?  The curves are percent signal change, so look
+   at their peak.  An ROI with no response gives the model nothing to work on and
+   its B values are noise however confidently flagged.
+
+3. Is there any modulation at all?  F(best) - F(null).  The conventional reading
+   of a log Bayes factor applies: ~3 nats is about 20:1, which is the usual floor
+   for calling a difference worth interpreting; below it the honest answer is
+   "no evidence that these conditions differ at any depth", and the depth
+   probabilities below are then a decomposition of nothing.
+
+4. Only then, WHERE.  Prefer P(depth modulated) in {prefix}_depths.tsv, which is
+   marginalised over the whole model space, to the winning model's name.  The
+   winner is one of 2^N hypotheses and its p=0.4 victory over a near-tie is not
+   a laminar claim; the marginal says how much of the posterior mass puts the
+   effect at that depth whatever else is going on.  The B credible intervals in
+   the same file are the best model's.
+
+5. Sign and size.  B modulates the self-inhibition sigma (A_kk = -sigma + u*B_k),
+   so POSITIVE B lowers inhibition.  sigma - B below zero is net self-excitation
+   while the modulation is on, which the published example ROI's fit has
+   (sigma 0.13 Hz, B 2-5 Hz).  P(depth modulated) ignores the sign, so a
+   comparison is non-directional however its two sides are ordered.
+
+THE DEVEINING OUTPUT
+
+_devein.tsv is the (N, K) pseudo-inverse of the fitted neuronal -> BOLD mixing.
+Three things about the true operator decide how far it can be trusted, and they
+are properties of the vasculature, not of this implementation:
+
+  It is TRIANGULAR, not diagonal.  Blood drains pial-ward, so a depth carries
+  contributions from every depth below it and none from above.  Measured on a
+  fitted model at K=6, N=3, superficial BOLD was ~49% contamination from below.
+  This is why a per-depth scalar is the wrong SHAPE: rescaling a depth against
+  itself cannot subtract what drained into it.
+
+  It has a TIME AXIS.  The ascending vein imposes a transit delay and smears the
+  response, and a scalar cannot represent a delay.  The amplitude reduction is
+  therefore exact for a summary statistic (peak, area) and not for a timecourse.
+  _neuronal.tsv is the exact answer instead, but it is tied to this stimulus and
+  this fit and is not an operator you can carry elsewhere.
+
+  It is AMPLITUDE-DEPENDENT.  The balloon and dHb terms are nonlinear, so an
+  operator derived at one effect size is wrong at another.  Fitting a CONTRAST
+  cancels much of this; a single condition (or -models null) does not, so its
+  operator is calibrated at that response amplitude and no other.
+
+And deconvolution amplifies noise: removing the deep contribution from a
+superficial depth subtracts a PREDICTION carrying posterior uncertainty.  A
+scalar multiplier hides that entirely -- it scales signal and noise together, so
+tSNR looks untouched and the correction looks free.  It is not.
+
+WHAT NOT TO BELIEVE
+
+  Low s_d is the dangerous direction.  Underestimating the ascending vein's
+  baseline-CBV slope gives qualitatively WRONG laminar profiles; overestimating
+  it is safe (Uludag & Havlicek 2021).  Look at the fitted s_d before trusting a
+  profile, and treat a low one as a reason to doubt the depth assignment.
+
+  Absolute F is not comparable across runs.  Under -hyperprior reference (the
+  default, for parity) the noise prior's centre is taken over the PADDED series,
+  so -pad_sd and -pad_seed move F by ~1 nat while the model comparison moves
+  ~0.2.  Rankings within a run are safe; F between runs with different seeds is
+  not.  -hyperprior rows removes the dependence and gives up comparability with
+  published values.
+
+  -free_energy reference (the default) takes F from the FIRST K only, as
+  spm_dcm_bpa leaves it, while the PARAMETERS are averaged over every K.  The
+  ranking therefore rests on one vascular resolution.  'sum' / 'mean' pool it,
+  at the cost of parity -- and neither is a proper joint log-evidence, since the
+  Ks are different samplings of the same voxels, not independent observations.
+
+  Identifiability at real SNR is unproven, by the model's authors' own account:
+  the 2021 paper declined to explore dynamic invertibility and warned it depends
+  on SNR, ROI size and within-ROI timecourse variability, and the neuronal model
+  is deliberately cross-laminar-uncoupled BECAUSE richer models stop being
+  distinguishable under fMRI noise.  Treat a depth assignment as a hypothesis
+  with evidence attached, not a measurement.
+
+  Depth is not layer.  Layer IV moves with curvature, and sensitivity varies
+  with depth at constant activity (baseline CBV, T2*, angle to B0).  Equivolume
+  sampling is the best cheap fix and is still imperfect.
+"""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = FfsArgumentParser(prog="ffs_laminar", description=_DESCRIPTION)
+    p = FfsArgumentParser(prog="ffs_laminar", description=_DESCRIPTION, epilog=_EPILOG)
     g = p.add_argument_group("Data")
     g.add_argument("-cond1", nargs="+", default=None, metavar="TSV",
                    help="The first (baseline) condition's curve table(s): one per K, or one "
