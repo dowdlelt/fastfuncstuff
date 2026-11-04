@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -53,11 +54,20 @@ def layer_model_targets(N: int = 3) -> list[tuple[int, ...]]:
     return out
 
 
+#: What ``faes_priors(free=...)`` can release from its fixed value, by the name the CLI
+#: uses -> the parameter. ``tau_*_in`` is the only tau the forward model reads, since
+#: inflation and deflation share one.
+FREEABLE_PARAMS = {"mu": "mu", "lam": "lam", "tau_v": "tau_v_in", "tau_d": "tau_d_in"}
+#: The same prior width as ``sigma``, the other estimated neuronal time scale.
+FREE_PARAM_VARIANCE = math.exp(-2)
+
+
 def faes_priors(
     spec: ModelSpec,
     target: tuple[int, ...] | list[int],
     *,
     b_variance: float = math.exp(0.5),
+    free: Sequence[str] = (),
 ) -> Priors:
     """Priors for one member of the Faes et al. model space.
 
@@ -69,7 +79,15 @@ def faes_priors(
     ``mu`` and ``lam`` carry non-zero prior *means* but zero variance: the
     adaptation they produce shapes the post-stimulus undershoot, which a short
     inter-trial interval cannot observe, so fitting them is not identifiable.
+
+    That reason is the paradigm's. A deconvolved response that reaches past the undershoot
+    does observe it, and there the fixed values cost hundreds of nats: ``free`` names
+    entries of :data:`FREEABLE_PARAMS` to estimate around the same prior means. The default
+    is the published model.
     """
+    unknown = sorted(set(free) - set(FREEABLE_PARAMS))
+    if unknown:
+        raise ValueError(f"cannot free {unknown}; choose from {sorted(FREEABLE_PARAMS)}")
     N = spec.N
     pE = zero_params(spec)
     pE["C"] = torch.tensor([[0.0, 1.0]] * N, dtype=spec.dtype, device=spec.device)
@@ -86,6 +104,10 @@ def faes_priors(
         torch.diag(torch.tensor(list(target), dtype=spec.dtype, device=spec.device))[None]
         * b_variance
     )
+    for name in free:
+        pC[FREEABLE_PARAMS[name]] = torch.tensor(
+            FREE_PARAM_VARIANCE, dtype=spec.dtype, device=spec.device
+        )
     return Priors(pE=pE, pC=pC)
 
 
@@ -352,6 +374,7 @@ def fit_model_space(
     names: list[str] | None = None,
     free_energy: str = "reference",
     progress: bool = True,
+    free: Sequence[str] = (),
     **vl_kwargs,
 ) -> tuple[list[str], list[BPAResult], list[list[VLResult]]]:
     """Invert every model at every vascular resolution, then average across K.
@@ -383,7 +406,7 @@ def fit_model_space(
             spec = spec_for_k[k]
             res = variational_laplace(
                 spec,
-                faes_priors(spec, target),
+                faes_priors(spec, target, free=free),
                 u_for_k[k],
                 data_for_k[k],
                 rows=rows,

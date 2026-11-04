@@ -238,6 +238,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Subset of the model space by name (null, superficial, middle, deep, "
                    "superficial+middle, ...). Default: all 2^N.")  # fmt: skip
     m.add_argument("-N", type=int, default=3, help="Neuronal depths.")
+    m.add_argument("-free_params", nargs="+", default=[], metavar="NAME",
+                   choices=("mu", "lam", "tau_v", "tau_d"),
+                   help="Estimate these instead of fixing them at the published values: mu and "
+                   "lam (the inhibitory feedback, gain and rate) and tau_v and tau_d (venule and "
+                   "ascending-vein volume recovery). Faes et al. fix them because a short ITI "
+                   "cannot observe the post-stimulus undershoot they shape, and fixed they "
+                   "predict almost none; a deconvolved curve that reaches past it does observe "
+                   "it. 'mu lam' fits an undershoot by neuronal inhibition, tau_* by slow venous "
+                   "recovery, and data this short may not tell the two apart. Default: none, the "
+                   "published model. F is comparable only between runs on the same curves.")  # fmt: skip
     m.add_argument("-free_energy", choices=("reference", "sum", "mean"), default="reference",
                    help="Which F an averaged model carries: 'reference' is the first K's, as "
                    "spm_dcm_bpa leaves it; 'sum'/'mean' accumulate over K.")  # fmt: skip
@@ -463,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
                       "hyper_from_rows": args.hyperprior == "rows", "rescue": args.rescue,
-                      "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
+                      "free": args.free_params, "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
                 # The PSF is geometry, so the permutations reuse the real run's: permuting
                 # labels cannot change how a depth was sampled.
                 built.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
@@ -514,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
                     "padding": {"rows": args.pad_rows, "sd": args.pad_sd, "seed": args.pad_seed,
                                 "hyperprior": args.hyperprior}, "free_energy": args.free_energy,
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
-                    "modulation": modulation,
+                    "modulation": modulation, "free_params": args.free_params,
                     "null_fit_prefix": args.null_fit_prefix,
                     "null_replicates": len(null_pairs),
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},

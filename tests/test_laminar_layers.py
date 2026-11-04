@@ -11,6 +11,7 @@ with::
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,8 @@ from fastfuncstuff.laminar.experiment import (
     posterior_model_probabilities,
 )
 from fastfuncstuff.laminar.forward import apply_depth_psf
-from fastfuncstuff.laminar.inversion import VLResult, vec
+from fastfuncstuff.laminar.integrate import build_input, integrate
+from fastfuncstuff.laminar.inversion import VLResult, variational_laplace, vec
 from fastfuncstuff.laminar.layers import (
     _conv_kernel_cost,
     depth_bin_centres,
@@ -224,6 +226,44 @@ def test_faes_priors_free_only_the_targeted_depths():
     assert torch.all(off == 0)
     # mu and lam have non-zero prior means but no variance.
     assert priors.pE["mu"] != 0 and priors.pC["mu"] == 0
+
+
+def test_faes_priors_free_releases_only_what_is_named():
+    spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
+    base, freed = faes_priors(spec, (1, 0, 1)), faes_priors(spec, (1, 0, 1), free=("mu", "tau_v"))
+    assert freed.pC["mu"] > 0 and freed.pC["tau_v_in"] > 0
+    assert freed.pC["lam"] == 0 and freed.pC["tau_d_in"] == 0
+    # The prior MEAN must not move: freeing is a width, or it would be a different model.
+    assert torch.equal(vec(freed.pE), vec(base.pE))
+    assert int((vec(freed.pC) > 0).sum()) == int((vec(base.pC) > 0).sum()) + 2
+    with pytest.raises(ValueError, match="cannot free"):
+        faes_priors(spec, (1, 0, 1), free=("sigma",))
+
+
+@pytest.mark.slow  # 27s: two inversions at K=7
+def test_freeing_adaptation_recovers_an_undershoot_the_fixed_model_cannot_fit():
+    """The bug of record: real curves undershoot by a third of the peak, and with mu and
+    lam fixed the prediction stays within a few percent of zero after the response."""
+    spec = ModelSpec(N=3, K=7, n_inputs=2, n_mod=1, TR=1.85)
+    n = 12
+    u = build_input(spec, [[1000.0], [1.85]], [[0.1], [1.0]], int(round(n * spec.TR / spec.dt)))
+    truth = {k: v.clone() for k, v in faes_priors(spec, (0, 0, 0)).pE.items()}
+    truth["mu"] = torch.tensor(-0.8 + math.log(2.5), dtype=spec.dtype)
+    truth["lam"] = torch.tensor(1.8 - math.log(2.5), dtype=spec.dtype)
+    truth["sigma"] = torch.tensor(math.log(0.15), dtype=spec.dtype)
+    y = integrate(u, truth, spec, n, delay_seconds=0.0)
+    assert y[:, 0].min() < -0.15 * y[:, 0].max()  # the data do undershoot
+
+    def fit(free):
+        pri = faes_priors(spec, (0, 0, 0), free=free)
+        return variational_laplace(spec, pri, u, y, max_iter=64, delay_seconds=0.0)
+
+    fixed, freed = fit(()), fit(("mu", "lam"))
+    trough = y[:, 0].argmin()
+    assert abs(freed.y_pred[trough, 0] - y[trough, 0]) < 0.5 * abs(
+        fixed.y_pred[trough, 0] - y[trough, 0]
+    )
+    assert freed.F > fixed.F
 
 
 def test_null_model_has_fewer_free_parameters():

@@ -22,6 +22,7 @@ Nothing here reads or writes files except :func:`write_results`.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -87,6 +88,18 @@ class RoiFit:
     warnings: list = field(default_factory=list)
 
 
+def _time_constants(spec, Ep: dict[str, torch.Tensor]) -> dict[str, float]:
+    """The best model's fitted time scales in physical units, so a run says what it found."""
+    p0 = spec.p0
+    return {
+        "sigma_hz": p0.sigma * float(torch.exp(Ep["sigma"])),
+        "mu_hz": p0.mu * float(torch.exp(Ep["mu"])),
+        "lam_hz": p0.lam * float(torch.exp(Ep["lam"])),
+        "tau_v_s": p0.tau_v_in * float(torch.exp(Ep["tau_v_in"])),
+        "tau_d_s": p0.tau_d_in * float(torch.exp(Ep["tau_d_in"])),
+    }
+
+
 def fit_roi(
     data_for_k: dict[int, LaminarData],
     kernel_for_k: dict[int, torch.Tensor | None] | None = None,
@@ -97,6 +110,7 @@ def fit_roi(
     max_iter: int = 128,
     hyper_from_rows: bool = False,
     rescue: int = 0,
+    free: Sequence[str] = (),
     roi: str = "",
     name: str = "",
     hemi: str = "",
@@ -136,6 +150,7 @@ def fit_roi(
         max_iter=max_iter,
         hyper_from_rows=hyper_from_rows,
         rescue=rescue,
+        free=free,
         **ikw,
     )  # fmt: skip
     F = np.array([float(a.F) for a in averaged])
@@ -170,7 +185,8 @@ def fit_roi(
         p_model=p_model, p_depth=p_depth, best=best, B_mean=b_mean, B_sd=b_sd, B_p=b_p,
         r2=r2, neuronal=dev.neuronal.numpy(), W=W.numpy(), W_inv=W_inv.numpy(),
         meta={"TR": first.meta.get("TR"), "block": first.meta.get("block"),
-              "gap": first.meta.get("gap"), "converged": [bool(r[0].converged) for r in per_k]},
+              "gap": first.meta.get("gap"), "converged": [bool(r[0].converged) for r in per_k],
+              "posterior": _time_constants(spec0, res0.Ep)},
         y_obs=first.y.numpy().copy(), y_hat=res0.y_pred.numpy().copy(), rows=rows.copy(),
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
         kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
@@ -386,6 +402,7 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
                 "hemi": f.hemi,
                 "best": f.models[f.best],
                 "converged": f.meta.get("converged"),
+                "posterior": f.meta.get("posterior"),
             }
             for f in fits
         ],  # fmt: skip
