@@ -97,6 +97,37 @@ def _oracle_problem():
     return spec, y, u, rows, kernel
 
 
+def test_width_rows_pads_instead_of_compiling_a_second_width():
+    """A subset re-inversion must be able to reuse the full batch's compiled width.
+
+    Every distinct width is its own static compile, so refitting a handful of columns
+    out of an already-inverted batch at the subset's OWN width paid a fresh compile per
+    model and K -- measured on real columns as 63% of a comparison's fitting time for
+    4.5% of its columns. The answer must not depend on which width was used.
+    """
+    from fastfuncstuff.laminar.experiment import faes_priors
+    from fastfuncstuff.laminar.integrate import batch_bucket
+
+    spec, y, u, rows, kernel = _oracle_problem()
+    g = torch.Generator().manual_seed(11)
+    Y = torch.stack([y + 0.05 * torch.randn(y.shape, generator=g, dtype=torch.float64)
+                     for _ in range(6)])  # fmt: skip
+    pr = faes_priors(spec, (1, 0, 0))
+    kw = dict(rows=rows, kernel=kernel, device=CPU, max_iter=3)
+    sub = Y[:2]
+    own = variational_laplace_batched(spec, pr, u, sub, **kw)
+    n_free = int(own.free_idx.numel())
+    assert batch_bucket(2 * (n_free + 1)) != batch_bucket(6 * (n_free + 1)), (
+        "the test needs the two widths to differ"
+    )
+    wide = variational_laplace_batched(spec, pr, u, sub, width_rows=int(Y.shape[0]), **kw)
+    torch.testing.assert_close(own.Ep_vec, wide.Ep_vec, rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(own.F, wide.F, rtol=1e-9, atol=1e-9)
+    # It never narrows: a batch wider than width_rows keeps its own width.
+    same = variational_laplace_batched(spec, pr, u, sub, width_rows=1, **kw)
+    torch.testing.assert_close(own.Ep_vec, same.Ep_vec, rtol=1e-9, atol=1e-9)
+
+
 @pytest.mark.slow  # ~60 s: three serial inversions per model and the batch
 @pytest.mark.parametrize("target", [(0, 0, 0), (1, 0, 0)])
 def test_batched_follows_each_serial_fit(target):

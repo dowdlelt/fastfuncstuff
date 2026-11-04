@@ -114,6 +114,39 @@ def _replace_rows(run: BatchedVL, idx: torch.Tensor, sub: BatchedVL) -> BatchedV
     return out
 
 
+class _Phase:
+    """A tqdm bar per phase of the fit, because the phases are not the same unit.
+
+    One bar over both phases is worse than no ETA: a full-model inversion is minutes
+    and a reduction is seconds, so tqdm's linear extrapolation from the first unit
+    quoted 2 h for a job that took half an hour.
+    """
+
+    def __init__(self, desc: str, *, enabled: bool = True):
+        self.desc, self.enabled, self.bar = desc, enabled, None
+
+    def open(self, total: int, phase: str) -> None:
+        self.close()
+        if not self.enabled or total < 2:
+            return
+        from tqdm.auto import tqdm
+
+        self.bar = tqdm(total=total, desc=f"{self.desc}: {phase}", leave=True)
+
+    def update(self, n: int = 1) -> None:
+        if self.bar is not None:
+            self.bar.update(n)
+
+    def note(self, text: str) -> None:
+        if self.bar is not None:
+            self.bar.set_postfix_str(text, refresh=bool(text))
+
+    def close(self) -> None:
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+
 def fit_columns(
     data_for_k: dict[int, LaminarData],
     kernel_for_k: dict[int, torch.Tensor | None] | None = None,
@@ -199,17 +232,13 @@ def fit_columns(
     sigma_all = np.zeros((n_m, n_cols))
     timing: dict[str, float] = {}
 
-    bar = None
-    if progress:
-        from tqdm.auto import tqdm
-
-        n_chunks = -(-n_cols // chunk)
-        # Reduction is not free: each model's reduce + integrability integration, and the
-        # refits it triggers, were 38% of a comparison's wall time with the bar already at
-        # 100% -- which reads as a hang.  Count that phase too.
-        n_inv = n_k * n_chunks + n_m * n_k if model_space == "reduce" else n_k * n_chunks * n_m
-        bar = tqdm(total=n_inv, desc=f"laminar {n_cols} columns", leave=True,
-                   disable=n_inv < 2)  # fmt: skip
+    n_chunks = -(-n_cols // chunk)
+    # ONE bar per phase, not one bar over both.  A full-model inversion is minutes and a
+    # reduction is seconds, so a single bar's linear ETA extrapolates the first inversion
+    # over every unit and quoted 2 h for a 30 min job.  Counting only the inversions was
+    # worse still -- the reduction phase, and the refits it triggers, ran after the bar
+    # read 100% (38% of a comparison's wall time once), which reads as a hang.
+    bar = _Phase(f"laminar {n_cols} columns", enabled=progress)
     full_target = tuple([1] * n)
 
     def invert(target, k, label, c0, c1):
@@ -224,8 +253,7 @@ def fit_columns(
             device=device, rescue=rescue, **d.integrate_kwargs,
         )  # fmt: skip
         timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
-        if bar is not None:
-            bar.update(1)
+        bar.update()
         return run
 
     def invert_idx(target, k, label, idx):
@@ -234,16 +262,24 @@ def fit_columns(
         if kern is not None and kern.ndim == 3:
             kern = kern[idx.cpu()]
         t0 = time.perf_counter()
-        if bar is not None:  # a refit is a full inversion; say so rather than going quiet
-            bar.set_postfix_str(f"{label}: {int(idx.numel())} col", refresh=True)
+        # A refit is a full inversion inside the cheap phase; say so rather than going quiet.
+        bar.note(f"{label}: {int(idx.numel())} col")
         run = variational_laplace_batched(
             d.spec, faes_priors(d.spec, target), d.u, d.y[idx.cpu()], rows=d.rows,
             kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
-            device=device, rescue=rescue, **d.integrate_kwargs,
+            device=device, rescue=rescue,
+            # OPEN QUESTION, measured but not resolved: this is where the time goes.  On
+            # real columns a refit touched 4.5% of them and cost 63% of the comparison's
+            # fitting time, because the subset re-inverts at its OWN bucketed width -- a
+            # fresh ~20 s static compile, charged once per model x K.  Passing
+            # width_rows=d.y.shape[0] would reuse the batch's compiled kernel instead, but
+            # 33 rows padded to an 8192-wide kernel is past the host-bound plateau
+            # (batch_bucket's docstring: it breaks near 128) and may cost MORE arithmetic
+            # than the compile it saves.  Needs a GPU A/B before it is turned on.
+            **d.integrate_kwargs,
         )  # fmt: skip
         timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
-        if bar is not None:
-            bar.set_postfix_str("", refresh=False)
+        bar.note("")
         return run
 
     def record(m, c0, c1, runs):
@@ -272,12 +308,15 @@ def fit_columns(
 
     chunks = [(c0, min(n_cols, c0 + chunk)) for c0 in range(0, n_cols, chunk)]
     if model_space == "invert":
+        bar.open(n_k * n_chunks * n_m, "inverting")
         for c0, c1 in chunks:
             for m, target in enumerate(targets):
                 record(m, c0, c1, [invert(target, k, names[m], c0, c1) for k in ks])
     else:
+        bar.open(n_k * n_chunks, "full model")
         full_all = {k: _cat_runs([invert(full_target, k, "full", c0, c1) for c0, c1 in chunks])
                     for k in ks}  # fmt: skip
+        bar.open(n_m * n_k, "model space")
         overrides: dict[int, dict] = {k: {} for k in ks}
         if vascular_given:
             for k in ks:
@@ -313,8 +352,7 @@ def fit_columns(
                 full = full_all[k]
                 if tuple(target) == full_target and not overrides[k]:
                     runs.append(full)  # already inverted; nothing to reduce
-                    if bar is not None:
-                        bar.update(1)
+                    bar.update()
                     continue
                 pri = faes_priors(d.spec, target)
                 if overrides[k]:
@@ -341,11 +379,9 @@ def fit_columns(
                         pred[idx] = sub.y_pred.to(pred)
                 run = dataclasses.replace(run, y_pred=pred)
                 runs.append(run)
-                if bar is not None:
-                    bar.update(1)
+                bar.update()
             record(m, 0, n_cols, runs)
-    if bar is not None:
-        bar.close()
+    bar.close()
 
     # Softmax over models, shifted by the max (see posterior_model_probabilities).
     fin = np.isfinite(F)

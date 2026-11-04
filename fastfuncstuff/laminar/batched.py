@@ -169,6 +169,7 @@ def variational_laplace_batched(
     rescue: int = 0,
     start: tuple[torch.Tensor, torch.Tensor] | None = None,
     width: int | None = None,
+    width_rows: int | None = None,
     **integrate_kwargs,
 ) -> BatchedVL:
     """Invert one model against ``Y`` ``(B, n_scans, K)``, all fits at once.
@@ -178,7 +179,12 @@ def variational_laplace_batched(
     :func:`~fastfuncstuff.laminar.inversion.variational_laplace` does: a restarted
     fit takes the restarted run's result. ``start`` is ``(p, h)`` per fit (reduced
     parameters, log-precisions) and ``width`` the compiled batch width; both exist
-    for the restarts.
+    for the restarts.  ``width_rows`` asks for the width a batch of that many fits
+    would have compiled to, for a caller re-inverting a SUBSET of a batch it has
+    already run: every distinct width is its own ~20 s static compile, and padding
+    rows to an already-compiled width is far cheaper than compiling a second kernel
+    for them.  Measured on real columns: refits touched 4.5% of the columns and cost
+    63% of a comparison's fitting time.
 
     ``kernel`` is the depth PSF: ``None``, one kernel for every fit (1-D or
     ``(K, K)``, applied inside the integration exactly as the serial path does),
@@ -249,7 +255,7 @@ def variational_laplace_batched(
     else:
         ihC = inv_b(priors.hC.to(dtype=dtype, device=device)[None])[0]
 
-    width = width or batch_bucket(B * (np_ + 1))
+    width = width or batch_bucket(max(B, width_rows or 0) * (np_ + 1))
     eye_np = torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
 
     def predict(p: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
