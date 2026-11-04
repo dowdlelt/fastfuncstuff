@@ -659,84 +659,6 @@ def parse_args():
     return parser
 
 
-def parse_tent_windows(tent_window_args, n_conditions):
-    """
-    Parse tent_window arguments into per-condition (bot, top) tuples
-
-    Supports multiple formats:
-    - Two values: ['0', '15'] → single window for all conditions
-    - Comma-separated pair: ['0,15'] → single window for all conditions
-    - Multiple pairs: ['0,15', '0,20', '0,25'] → per-condition windows
-
-    Parameters
-    ----------
-    tent_window_args : list
-        Raw arguments from argparse
-    n_conditions : int
-        Number of conditions
-
-    Returns
-    -------
-    windows : list of tuple
-        [(bot1, top1), (bot2, top2), ...] for each condition
-
-    Raises
-    ------
-    ValueError
-        If format is invalid or number of windows doesn't match conditions
-    """
-    if tent_window_args is None:
-        return None
-
-    # Check if we have comma-separated pairs
-    if all("," in arg for arg in tent_window_args):
-        # Format: ['0,15', '0,20', ...] (per-condition)
-        windows = []
-        for arg in tent_window_args:
-            parts = arg.split(",")
-            if len(parts) != 2:
-                raise ValueError(f"Invalid tent_window format: '{arg}'. Expected 'bot,top'")
-            try:
-                bot = float(parts[0])
-                top = float(parts[1])
-            except ValueError:
-                raise ValueError(
-                    f"Invalid tent_window values in '{arg}'. Expected numeric values."
-                ) from None
-            if bot >= top:
-                raise ValueError(f"Invalid tent_window '{arg}': bot ({bot}) must be < top ({top})")
-            windows.append((bot, top))
-
-        # Check if we have one or n_conditions windows
-        if len(windows) == 1:
-            # Single window applies to all conditions
-            return windows * n_conditions
-        elif len(windows) == n_conditions:
-            return windows
-        else:
-            raise ValueError(
-                f"Number of tent_windows ({len(windows)}) must be 1 or match "
-                f"number of conditions ({n_conditions})"
-            )
-
-    elif len(tent_window_args) == 2:
-        # Format: ['0', '15'] (single window for all conditions)
-        try:
-            bot = float(tent_window_args[0])
-            top = float(tent_window_args[1])
-        except ValueError:
-            raise ValueError("Invalid tent_window values. Expected numeric values.") from None
-        if bot >= top:
-            raise ValueError(f"Invalid tent_window: bot ({bot}) must be < top ({top})")
-        return [(bot, top)] * n_conditions
-
-    else:
-        raise ValueError(
-            "Invalid tent_window format. Use either: '0 15' (two values), "
-            "'0,15' (comma-separated), or '0,15 0,20 ...' (per-condition)"
-        )
-
-
 def _fit_noise_gaussian(r2_vals: np.ndarray) -> tuple[float, float]:
     """
     Estimate the noise component of a LORO R² distribution.
@@ -1784,6 +1706,8 @@ def main(argv: list[str] | None = None):
     # Priority: 1) explicit -window, 2) auto from condition_durations, 3) -duration fallback
     window_source: str
     if args.window is not None:
+        from fastfuncstuff.design.hrf import parse_tent_windows
+
         try:
             tent_windows = parse_tent_windows(args.window, n_conditions)
         except ValueError as e:
