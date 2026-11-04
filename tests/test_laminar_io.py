@@ -160,3 +160,15 @@ def test_duration_pair_is_validated():
         two_condition_batch(curves, curves, times, duration=(1.0, 2.0, 3.0), gap=4)
     with pytest.raises(ValueError, match="must be positive"):
         two_condition_batch(curves, curves, times, duration=(1.0, 0.0), gap=4)
+
+
+def test_a_window_that_starts_after_the_onset_is_refused():
+    """The event sits on the response's first sample, so a window starting at BOT > 0
+    used to produce a model bit-identical to the same curves at BOT = 0 -- the offset
+    was discarded and the response modelled as if it began at the event."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    curves = np.zeros((1, 8, 3))
+    two_condition_batch(curves, curves, np.arange(8) * 2.0, duration=1.0, gap=4)  # bot 0: fine
+    with pytest.raises(ValueError, match="start.*after the event|starts at 0"):
+        two_condition_batch(curves, curves, np.arange(8) * 2.0 + 6.0, duration=1.0, gap=4)

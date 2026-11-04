@@ -223,6 +223,15 @@ def two_condition_batch(
     if step.size == 0 or not np.allclose(step, step[0], rtol=1e-6):
         raise ValueError("curve samples must be evenly spaced (uniform TENT knots)")
     tr = float(step[0])
+    # The event sits on the response's FIRST sample (onset_a = tr below), so a window
+    # that starts after the onset would be modelled as if it started at it. Refused
+    # rather than shifted: the model integrates from rest, so a curve whose beginning
+    # was never sampled is a tail it cannot generate, not a delay it can absorb.
+    if abs(float(times[0])) > 1e-6 * max(tr, 1.0):
+        raise ValueError(
+            f"the curves start {float(times[0]):g} s after the event, but the model puts the "
+            "event on the first sample; refit with a window that starts at 0"
+        )
     n_b, _, k = first.shape
     block = len(times) + 1  # one zero baseline row, then the response
 
@@ -261,7 +270,9 @@ def two_condition_batch(
     if m_dur <= 0:
         raise ValueError("the modulatory input needs a positive duration")
     u = build_input(
-        spec, [[onset_b + m_start], [onset_a, onset_b]], [[m_dur], [dur_first, dur_test]],
+        spec,
+        [[onset_b + m_start], [onset_a, onset_b]],
+        [[m_dur], [dur_first, dur_test]],
         n_micro,
     )
     kwargs = {} if delay_seconds is None else {"delay_seconds": float(delay_seconds)}
