@@ -471,3 +471,93 @@ def test_concalc_adds_a_contrast_to_a_surface_bucket(tmp_path, monkeypatch):
     assert meta["mesh_fingerprint"] == "V_test" and "ClustSim_bi-sided" in meta
     t_arr = nib.load(str(out)).darrays[names.index("a_vs_b#0_Tstat")]
     assert t_arr.intent == 3 and dict(t_arr.meta)["StatCode"] == "3"
+
+
+def test_conjoin_by_label_signed_minimum():
+    # The min-statistic rule: signed minimum of the component t's, and
+    # separately of the component coefs (the two can come from different
+    # components). A negated component flips both.
+    from fastfuncstuff.glm.conjunction import ConjunctionPlan, conjoin_by_label
+
+    plan = ConjunctionPlan(n_user=2, conjunctions=(("AandB", ((0, 1.0), (1, -1.0))),))
+    labels = ["A", "B"]
+    coef = {"A": np.array([2.0, 1.0]), "B": np.array([-5.0, -0.5])}
+    tstat = {"A": np.array([4.0, 1.0]), "B": np.array([-3.0, -9.0])}
+    ((label, c, t),) = conjoin_by_label(plan, labels, coef, tstat)
+    assert label == "AandB"
+    # voxel 0: min(2, 5) = 2 ; min(4, 3) = 3   → coef and t from different components
+    # voxel 1: min(1, 0.5) = 0.5 ; min(1, 9) = 1
+    assert np.allclose(c, [2.0, 0.5])
+    assert np.allclose(t, [3.0, 1.0])
+
+    # A component that never computed → the conjunction is skipped, never
+    # treated as if the missing component passed.
+    assert conjoin_by_label(plan, labels, {"A": coef["A"]}, tstat) == []
+
+
+def test_concalc_recomputes_a_conjunction_like_reml(tmp_path, monkeypatch):
+    """A [[conjunctions]] table is recomputed, not ignored: concalc's
+    minimum-statistic bricks match the ones ffs_reml writes for the same spec,
+    and the internal component GLTs never reach the bucket."""
+    import sys
+
+    from fastfuncstuff.cli import reml, util_concalc
+    from fastfuncstuff.design.spec import (
+        ConjunctionSpec,
+        ContrastSpec,
+        build_stub_spec,
+        write_spec,
+    )
+
+    t_n, tr = 80, 2.0
+    rng = np.random.default_rng(5)
+    t = np.arange(t_n) * tr
+    with open(tmp_path / "ev.tsv", "w") as f:
+        f.write("onset\tduration\ttrial_type\n")
+        for i, o in enumerate(np.arange(0, t_n * tr - 20, 20)):
+            f.write(f"{o}\t10\t{'a' if i % 2 else 'b'}\n")
+    a_on = (((t // 20) % 2 == 1) & (t % 20 < 10)).astype(float)
+    hrf = np.exp(-((np.arange(0, 20, tr) - 6) ** 2) / 8)
+    sig = np.convolve(a_on, hrf)[:t_n]
+    amp = np.linspace(0, 3, 64).reshape(4, 4, 4)
+    data = 100 + amp[..., None] * sig + rng.normal(0, 1, (4, 4, 4, t_n))
+    src = tmp_path / "s.nii"
+    img = nib.Nifti1Image(data.astype(np.float32), np.eye(4))
+    img.header.set_zooms((1, 1, 1, tr))
+    nib.save(img, src)
+
+    spec, _ = build_stub_spec([src], [tmp_path / "ev.tsv"], tr=tr)
+    write_spec(spec, tmp_path / "plain.toml")
+    spec.contrasts = [ContrastSpec(label="a_vs_b", sym="SYM: +1*a -1*b")]
+    # One component is a spec contrast, one a bare condition — the two routes
+    # through plan_conjunctions (existing GLT vs internal one-row GLT).
+    spec.conjunctions = [ConjunctionSpec(label="aANDb", components=["a_vs_b", "a"])]
+    write_spec(spec, tmp_path / "con.toml")
+
+    def run(mod, prog, *argv):
+        monkeypatch.setattr(sys, "argv", [prog, *argv, "-device", "cpu", "-verb", "0"])
+        assert not mod.main()
+
+    run(reml, "ffs_reml", "-input", str(src), "-spec", str(tmp_path / "plain.toml"),
+        "-tout", "-Rbuck", str(tmp_path / "plain.nii.gz"))  # fmt: skip
+    run(reml, "ffs_reml", "-input", str(src), "-spec", str(tmp_path / "con.toml"),
+        "-tout", "-Rbuck", str(tmp_path / "ref.nii.gz"))  # fmt: skip
+    run(util_concalc, "ffs_util_concalc", "-stats", str(tmp_path / "plain.nii.gz"),
+        "-spec", str(tmp_path / "con.toml"))  # fmt: skip
+
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    out = nib.load(str(tmp_path / "plain_concalc.nii.gz"))
+    ref = nib.load(str(tmp_path / "ref.nii.gz"))
+    names = _read_brick_labels(out)
+    ref_names = _read_brick_labels(ref)
+    assert "aANDb#0_Tstat" in names
+    assert not [n for n in names if "__conj__" in n]
+    got_a, ref_a = np.asarray(out.dataobj), np.asarray(ref.dataobj)
+    for lab in ("Coef", "Tstat"):
+        np.testing.assert_allclose(
+            got_a[..., names.index(f"aANDb#0_{lab}")],
+            ref_a[..., ref_names.index(f"aANDb#0_{lab}")],
+            rtol=1e-3,
+            atol=1e-3,
+        )

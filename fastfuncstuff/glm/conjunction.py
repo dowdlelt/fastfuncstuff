@@ -174,3 +174,32 @@ def apply_conjunctions(results, plan: ConjunctionPlan | None) -> None:
     labels = list(getattr(results, "contrast_labels", None) or [])[: plan.n_user]
     results.contrast_labels = labels + [label for label, _ in plan.conjunctions]
     results._conjunctions_applied = True
+
+
+def conjoin_by_label(
+    plan: ConjunctionPlan,
+    glt_labels: Sequence[str],
+    coef_by_label: dict[str, np.ndarray],
+    tstat_by_label: dict[str, np.ndarray],
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """The same minimum statistic as :func:`apply_conjunctions`, for a caller
+    that holds its GLT results per label instead of as one column block.
+
+    ``glt_labels`` is the extended GLT list the plan indexes into (user
+    contrasts then ``__conj__*`` components). Returns
+    ``(label, coef, tstat)`` per conjunction, skipping any whose components
+    are not all present — a component that failed to compute cannot be
+    silently treated as passing.
+    """
+    out: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for label, comps in plan.conjunctions:
+        names = [glt_labels[i] for i, _ in comps]
+        if any(n not in coef_by_label or n not in tstat_by_label for n in names):
+            continue
+        signs = [sign for _, sign in comps]
+        coef = np.minimum.reduce([coef_by_label[n] * s for n, s in zip(names, signs, strict=True)])
+        tstat = np.minimum.reduce(
+            [tstat_by_label[n] * s for n, s in zip(names, signs, strict=True)]
+        )
+        out.append((label, coef, tstat))
+    return out

@@ -20,6 +20,8 @@ Inputs:
   -spec FILE    The design.spec — its [[contrasts]] block is the source of
                 truth. Every contrast in the spec is recomputed; this lets
                 you fix a bad contrast and add new ones in one shot.
+                [[conjunctions]] are recomputed too, from the fresh
+                components (the minimum statistic of ffs_reml -conj).
 
 Outputs:
   default     <stats stem>_concalc.<ext>
@@ -44,6 +46,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
+from fastfuncstuff.glm.conjunction import _INTERNAL_PREFIX as _CONJ_PREFIX
 from fastfuncstuff.io.afni import carry_afni_atrs, load_nifti, read_afni_design_matrix
 from fastfuncstuff.unique import sorted_unique
 
@@ -89,8 +92,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "-spec",
         required=True,
         metavar="FILE",
-        help="design.spec TOML. Every [[contrasts]] entry is "
-        "recomputed. Extension auto-appended (.toml).",
+        help="design.spec TOML. Every [[contrasts]] and "
+        "[[conjunctions]] entry is recomputed. Extension "
+        "auto-appended (.toml).",
     )
     p.add_argument(
         "-out",
@@ -825,8 +829,11 @@ def main() -> int:
     # ── 1) Resolve and compile the spec to get X + column labels ──────────
     spec_path = _resolve_spec_path(args.spec)
     spec = load_spec(spec_path)
-    if not spec.contrasts:
-        print("ERROR: spec has no [[contrasts]] entries to compute.", file=sys.stderr)
+    if not spec.contrasts and not spec.conjunctions:
+        print(
+            "ERROR: spec has no [[contrasts]] or [[conjunctions]] entries to compute.",
+            file=sys.stderr,
+        )
         return 1
 
     if args.matrix:
@@ -884,6 +891,44 @@ def main() -> int:
     for label, rows in resolved_rows_per_contrast:
         mat = glt_rows_to_matrix(rows, column_labels, stim_ranges=None)
         contrast_matrices.append((label, mat))
+
+    # ── 2b) [[conjunctions]]: minimum statistic over components ─────────
+    # A conjunction is a function of its components, so recomputing the
+    # contrasts without it would leave a stale (or dropped) conjunction brick
+    # beside fresh components. Components that are conditions rather than spec
+    # contrasts get an internal one-row GLT appended here and stripped again
+    # before the bucket is written.
+    conj_plan = None
+    if spec.conjunctions:
+        from fastfuncstuff.glm.conjunction import plan_conjunctions
+
+        # A fresh dict: the compiled xmat carries its own glt_labels, and the
+        # plan's indices have to point into *our* contrast list.
+        conj_info = {
+            "matrix": X_np,
+            "column_labels": column_labels,
+            "stim_labels": design_info.get("stim_labels"),
+            "stim_bots": design_info.get("stim_bots"),
+            "stim_tops": design_info.get("stim_tops"),
+            "glt_labels": [lab for lab, _ in contrast_matrices],
+            "glt_matrices": [mat for _, mat in contrast_matrices],
+        }
+        try:
+            conj_plan = plan_conjunctions(
+                [(c.label, c.components) for c in spec.conjunctions], conj_info
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        contrast_matrices = list(
+            zip(conj_info["glt_labels"], conj_info["glt_matrices"], strict=True)
+        )
+        if args.verb >= 1:
+            print(
+                f"🔗 Conjunctions: {', '.join(c.label for c in spec.conjunctions)}",
+                flush=True,
+            )
+
     if not contrast_matrices:
         print("ERROR: no usable contrasts after resolution.", file=sys.stderr)
         return 1
@@ -1073,7 +1118,7 @@ def main() -> int:
                     tstat.astype(np.float32),
                 )
             )
-            if args.verb >= 1:
+            if args.verb >= 1 and not label.startswith(_CONJ_PREFIX):
                 print(
                     f"   {label} (t): cᵀβ peak={np.nanmax(np.abs(cb)):.3f}, "
                     f"|t| peak={np.nanmax(np.abs(tstat)):.3f}"
@@ -1114,6 +1159,33 @@ def main() -> int:
                     f"{np.nanmax(fstat):.3f}, dof=({n_rows}, {dof_residual})"
                 )
 
+    # ── 8b) Conjunctions: signed voxelwise minimum over components ───────
+    if conj_plan is not None:
+        from fastfuncstuff.glm.conjunction import conjoin_by_label
+
+        coef_by_label = {e[0]: e[2] for e in contrast_results if e[1] == "t"}
+        tstat_by_label = {e[0]: e[3] for e in contrast_results if e[1] == "t"}
+        glt_labels_ext = [lab for lab, _ in contrast_matrices]
+        conjoined = conjoin_by_label(conj_plan, glt_labels_ext, coef_by_label, tstat_by_label)
+        done = {label for label, _, _ in conjoined}
+        for label, _ in conj_plan.conjunctions:
+            if label not in done:
+                print(
+                    f"WARN: conjunction {label!r}: a component was not computed. Skipping.",
+                    file=sys.stderr,
+                )
+        # The component GLTs were only a means to the minimum; they are not
+        # the user's contrasts and must not reach the bucket.
+        contrast_results = [e for e in contrast_results if not e[0].startswith(_CONJ_PREFIX)] + [
+            (label, "t", coef, tstat) for label, coef, tstat in conjoined
+        ]
+        if args.verb >= 1:
+            for label, coef, tstat in conjoined:
+                print(
+                    f"   {label} (conj t): min cᵀβ peak={np.nanmax(coef):.3f}, "
+                    f"min t peak={np.nanmax(tstat):.3f}"
+                )
+
     # ── 9) Build output bucket ─────────────────────────────────────────
     # Strip every sub-brick whose label is a *contrast* output from a prior
     # concalc / GLM run, so re-running doesn't stack old + new. β / t per
@@ -1128,7 +1200,10 @@ def main() -> int:
     # footgun: a spec whose stim labels don't match the bucket (e.g. singular
     # `face` vs the bucket's `faces#0_Coef`) silently reclassifies every β as
     # a stale contrast and strips it.
-    new_contrast_labels = {label for label, _ in contrast_matrices}
+    # What will actually be written — conjunction labels included, internal
+    # component GLTs excluded, and a contrast that failed to compute left out
+    # so its old bricks count as a real loss rather than a safe replacement.
+    new_contrast_labels = {entry[0] for entry in contrast_results}
     unsafe_drops = _unsafe_drops(stats_labels, keep_idx, new_contrast_labels)
     if unsafe_drops and not args.force:
         shown = ", ".join(unsafe_drops[:8]) + (" …" if len(unsafe_drops) > 8 else "")
