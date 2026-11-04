@@ -179,6 +179,36 @@ def split_read_targets(paths: Iterable[str | Path]) -> tuple[list[Path], list[Pa
     return directories, files
 
 
+def sort_dropped(paths: Iterable[str | Path]) -> tuple[list[Path], list[Path], list[Path]]:
+    """Files dropped on a window, as ``(datasets, meshes, skipped)``.
+
+    A mesh is told by its content when its name says nothing, because FreeSurfer's
+    have no extension. A BRIK stands for its HEAD, and selecting both is one dataset.
+    """
+    from fastfuncstuff.io.freesurfer import is_triangle_surface
+
+    datasets: list[Path] = []
+    meshes: list[Path] = []
+    skipped: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        lowered = path.name.lower()
+        if lowered.endswith((".brik", ".brik.gz")):
+            stem = path.name[: lowered.rindex(".brik")]
+            path = path.with_name(f"{stem}.HEAD")
+        if path.is_dir():
+            skipped.append(path)
+        elif lowered.endswith(".surf.gii"):
+            meshes.append(path)
+        elif _looks_openable(path.name) or lowered.endswith(".gii"):
+            datasets.append(path)
+        elif is_triangle_surface(path):
+            meshes.append(path)
+        else:
+            skipped.append(path)
+    return list(dict.fromkeys(datasets)), list(dict.fromkeys(meshes)), skipped
+
+
 def describe(paths: Iterable[str | Path]) -> Iterator[CatalogEntry]:
     """Header-read each path, skipping anything that will not open.
 

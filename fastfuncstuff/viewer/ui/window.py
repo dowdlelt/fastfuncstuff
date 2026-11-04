@@ -71,6 +71,7 @@ from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
 from fastfuncstuff.viewer.ui.widgets import (
     VALUE_ROLE,
+    FileDropFilter,
     PreviewCombo,
     RowSizedList,
     ValueColumnDelegate,
@@ -189,6 +190,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def __init__(self, session: ViewerSession) -> None:
         super().__init__()
         install_combo_pickers(QtWidgets.QApplication.instance())
+        self.setAcceptDrops(True)
+        QtWidgets.QApplication.instance().installEventFilter(
+            FileDropFilter(self._takes_drops, self._on_files_dropped, self)
+        )
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
         # Wide enough that the panel never scrolls sideways. The layer form
@@ -681,7 +686,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.load_button = QtWidgets.QPushButton(key_label("LOAD", "^L"))
         self.load_button.setToolTip(
             "Put the chosen dataset on top of the stack (ctrl+L).\n"
-            "Press it again for a second copy of the same file."
+            "Press it again for a second copy of the same file.\n"
+            "Or drop datasets and meshes on any viewer window."
         )
         self.load_button.clicked.connect(lambda: self._pick(self.data_box, Load))
         row.addWidget(self.load_button)
@@ -1251,6 +1257,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         if self.mesh_window is None:
             self.mesh_window = MeshWindow(lambda: self.session, self._dispatch, self)
+            self.mesh_window.setAcceptDrops(True)
         self.mesh_window.refresh()
         self.mesh_window.show()
         self.mesh_window.raise_()
@@ -2503,6 +2510,59 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """Open one dataset, on top of whatever is already loaded."""
         self._dispatch(Load(str(path)))
         self._sync_layer_list()
+
+    # -- dropped files ---------------------------------------------------
+    def _takes_drops(self, window: QtWidgets.QWidget) -> bool:
+        return window is self or window is self.mesh_window or self._owner_of(window) is not None
+
+    def _owner_of(self, window: QtWidgets.QWidget) -> Controller | None:
+        for ctl in self.controllers:
+            if any(window is win for win in ctl.manager.windows.values()):
+                return ctl
+        return None
+
+    def _on_files_dropped(self, window: QtWidgets.QWidget, paths: list[str]) -> None:
+        # A file dropped on B's axial is meant for B, whichever tab is showing.
+        owner = self._owner_of(window)
+        if owner is not None:
+            self.activate(owner)
+        self.open_dropped(paths)
+
+    def open_dropped(self, paths: list[str]) -> None:
+        """Load dropped files on top of the stack, listing their folders unread."""
+        datasets, meshes, skipped = catalog_mod.sort_dropped(paths)
+        session = self.session
+        self._preview_path(None)
+        # A LOAD lists its own folder; a mesh's has to be asked for. Same test as
+        # a LOAD's: a folder already read recursively covers what is inside it.
+        session.offer_directories(m.parent for m in meshes if session.directory_number(m) is None)
+        meshes_before = len(session.surfaces.meshes)
+        # Meshes first: a surface result needs the mesh it was made on to be there.
+        if meshes:
+            self._open_meshes()
+            assert self.mesh_window is not None
+            for mesh in meshes:
+                self.mesh_window.load_path(str(mesh))
+        failed = []
+        for path in datasets:
+            try:
+                self.open_path(path)
+            # Not just OSError/ValueError: nibabel's ImageFileError is a bare
+            # Exception, and one bad file must not lose the rest of the drop.
+            except Exception as exc:
+                failed.append(f"{path.name}: {exc}")
+        self._sync_layer_list()
+        parts = []
+        if datasets or meshes:
+            # A mesh that failed says why in the mesh window, which is open by now.
+            took = len(session.surfaces.meshes) - meshes_before + len(datasets) - len(failed)
+            parts.append(f"loaded {took} of {len(datasets) + len(meshes)} dropped")
+        if failed:
+            parts.append("could not load " + "; ".join(failed))
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            parts.append(f"not a dataset or mesh: {names}")
+        self.statusBar().showMessage("; ".join(parts), 8000)
 
     # ------------------------------------------------------------------
     # refresh

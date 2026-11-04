@@ -62,6 +62,18 @@ def _triangle_layout(raw: bytes) -> tuple[int, int, int]:
     return int(nv), int(nf), end + 9
 
 
+def is_triangle_surface(path: str | os.PathLike) -> bool:
+    """Whether a file starts like a triangle surface; reads three bytes.
+
+    FreeSurfer surfaces have no extension to go by (``lh.white``, ``surf.pial``).
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(3) == _TRIANGLE_MAGIC
+    except OSError:
+        return False
+
+
 def read_surface(path: str | os.PathLike) -> SurfaceFile:
     """Read a triangle surface, keeping enough layout to rewrite it in place."""
     import nibabel.freesurfer as nfs

@@ -306,6 +306,50 @@ class _ComboPickerFilter(QtCore.QObject):
         return False
 
 
+class FileDropFilter(QtCore.QObject):
+    """Takes local files dragged onto a claimed window, wherever on it they land.
+
+    On the application, not the windows, because a line edit or spin box accepts
+    a file drag for itself and would type its path into the field. Other windows
+    -- a file dialog's own sidebar drags URLs -- are left alone.
+
+    Always a copy: a file manager may propose a move, and accepting that is
+    consent for it to delete the source. Qt keeps a move if the source offers
+    nothing else, so a move-only drag is refused. The handler runs after the drop returns,
+    since a load, or a dialog asking about a mesh, would otherwise hold the file
+    manager waiting on the end of its drag.
+    """
+
+    def __init__(
+        self,
+        claims: Callable[[QtWidgets.QWidget], bool],
+        dropped: Callable[[QtWidgets.QWidget, list[str]], None],
+        parent: QtCore.QObject,
+    ) -> None:
+        super().__init__(parent)
+        self._claims = claims
+        self._dropped = dropped
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        # Enter and move events are drop events to Qt, and leave events are not.
+        if not isinstance(event, QtGui.QDropEvent) or not isinstance(obj, QtWidgets.QWidget):
+            return False
+        window = obj.window()
+        if not self._claims(window):
+            return False
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            return False
+        if not event.possibleActions() & QtCore.Qt.DropAction.CopyAction:
+            event.ignore()
+            return True
+        event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        event.accept()
+        if event.type() == QtCore.QEvent.Type.Drop:
+            QtCore.QTimer.singleShot(0, self, lambda: self._dropped(window, paths))
+        return True
+
+
 def open_combo_picker(combo: QtWidgets.QComboBox) -> ComboPicker:
     """Show ``combo``'s picker beside it, and return the dialog."""
     picker = ComboPicker(combo)
@@ -334,6 +378,7 @@ def install_combo_pickers(app: QtCore.QCoreApplication) -> None:
 
 __all__ = [
     "ComboPicker",
+    "FileDropFilter",
     "PreviewCombo",
     "RowSizedList",
     "install_combo_pickers",

@@ -134,6 +134,7 @@ class WindowManager(QtCore.QObject):
             t0 = time.perf_counter()
             if win is None:
                 win = self._build(viewport)
+                win.setAcceptDrops(True)
                 self.windows[vid] = win
                 if viewport.geometry is not None:
                     win.setGeometry(QtCore.QRect(*viewport.geometry))
