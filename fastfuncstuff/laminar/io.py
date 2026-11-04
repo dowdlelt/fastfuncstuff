@@ -116,6 +116,53 @@ class LaminarData:
     meta: dict = field(default_factory=dict)
 
 
+def _times_pair(
+    times: np.ndarray | Sequence[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(first, second)`` sample grids from one grid or two."""
+    arr = np.asarray(times, dtype=object) if isinstance(times, (list, tuple)) else None
+    if arr is not None and arr.dtype == object:
+        if len(times) != 2:  # type: ignore[arg-type]
+            raise ValueError(f"times takes one grid or two, got {len(times)}")  # type: ignore[arg-type]
+        return np.asarray(times[0], float), np.asarray(times[1], float)  # type: ignore[index]
+    one = np.asarray(times, float)
+    if one.ndim == 2:
+        if one.shape[0] != 2:
+            raise ValueError(f"times takes one grid or two, got {one.shape[0]}")
+        return one[0], one[1]
+    return one, one
+
+
+def _scan_interval(t_first: np.ndarray, t_second: np.ndarray) -> float:
+    """The shared sample spacing, which is the model's scan interval.
+
+    Both grids must start at the event: it is placed on the response's first sample
+    (``onset_a = tr``), so a window that starts later would be modelled as if it
+    started at the onset. Refused rather than shifted -- the model integrates from
+    rest, so a curve whose beginning was never sampled is a tail it cannot generate,
+    not a delay it can absorb.
+    """
+    steps = []
+    for t in (t_first, t_second):
+        d = np.diff(t)
+        if d.size == 0 or not np.allclose(d, d[0], rtol=1e-6):
+            raise ValueError("curve samples must be evenly spaced (uniform TENT knots)")
+        steps.append(float(d[0]))
+    if not np.isclose(steps[0], steps[1], rtol=1e-6):
+        raise ValueError(
+            f"the two conditions are sampled {steps[0]:g} s and {steps[1]:g} s apart; the "
+            "scan interval of the model is the knot spacing, so it must be the same"
+        )
+    tr = steps[0]
+    for name, t in (("baseline", t_first), ("test", t_second)):
+        if abs(float(t[0])) > 1e-6 * max(tr, 1.0):
+            raise ValueError(
+                f"the {name} curves start {float(t[0]):g} s after the event, but the model "
+                "puts the event on the first sample; refit with a window that starts at 0"
+            )
+    return tr
+
+
 def _duration_pair(duration: float | Sequence[float]) -> tuple[float, float]:
     """``(baseline, test)`` event lengths from one value or two."""
     if isinstance(duration, (int, float)):
@@ -172,10 +219,11 @@ def two_condition_data(
                 f"ROI {c.name}: curves look like data units, not percent change "
                 "(rerun ffs_deconvolve without -dont_scale)"
             )
-    if not np.array_equal(first.times, second.times):
-        raise ValueError("the two conditions are sampled at different times")
+    # The two may be sampled over different WINDOWS (a 3 s and a 10 s stimulus need
+    # different lengths of response); the spacing and the start are checked downstream.
     data = two_condition_batch(
-        first.values[None], second.values[None], first.times, duration=duration,
+        first.values[None], second.values[None], (first.times, second.times),
+        duration=duration,
         n_neuronal=n_neuronal, gap=gap, noise_sd=noise_sd, seed=seed,
         delay_seconds=delay_seconds, TE=TE, B0=B0, p0=p0, dtype=dtype, modulation=modulation,
     )  # fmt: skip
@@ -187,7 +235,7 @@ def two_condition_data(
 def two_condition_batch(
     first: np.ndarray,
     second: np.ndarray,
-    times: np.ndarray,
+    times: np.ndarray | Sequence[np.ndarray],
     *,
     duration: float | Sequence[float],
     n_neuronal: int = 3,
@@ -212,6 +260,13 @@ def two_condition_batch(
     modulatory input of ``modulation="event"`` follows the TEST event's own length,
     since that is the event it modulates.
 
+    ``times`` is one sample grid for both conditions, or ``(first, second)`` when
+    they were sampled over different windows -- a 3 s and a 10 s stimulus need
+    different lengths of response. The two must share a sample SPACING, which is the
+    model's scan interval, and both must start at the event. The blocks are then
+    concatenated at their own lengths and ``rows`` marks each one's extent, so the
+    second event's onset follows the first block's length rather than a shared one.
+
     ``modulation`` is when the modulatory input is on, relative to the second event:
     ``"event"`` (default) for the whole event, which is what a condition difference
     means when the conditions are simply different stimuli or tasks. ``"reference"``
@@ -219,21 +274,15 @@ def two_condition_batch(
     al. that is the fourth tone of a 1.6 s quartet at TR 1.6, the moment of the
     prediction violation: a property of that paradigm, needed only for parity.
     ``(start, duration)`` gives seconds after the second onset."""
-    step = np.diff(times)
-    if step.size == 0 or not np.allclose(step, step[0], rtol=1e-6):
-        raise ValueError("curve samples must be evenly spaced (uniform TENT knots)")
-    tr = float(step[0])
-    # The event sits on the response's FIRST sample (onset_a = tr below), so a window
-    # that starts after the onset would be modelled as if it started at it. Refused
-    # rather than shifted: the model integrates from rest, so a curve whose beginning
-    # was never sampled is a tail it cannot generate, not a delay it can absorb.
-    if abs(float(times[0])) > 1e-6 * max(tr, 1.0):
+    t_first, t_second = _times_pair(times)
+    tr = _scan_interval(t_first, t_second)
+    if first.shape[1] != len(t_first) or second.shape[1] != len(t_second):
         raise ValueError(
-            f"the curves start {float(times[0]):g} s after the event, but the model puts the "
-            "event on the first sample; refit with a window that starts at 0"
+            f"curves of {first.shape[1]} and {second.shape[1]} samples do not match their "
+            f"time grids of {len(t_first)} and {len(t_second)}"
         )
     n_b, _, k = first.shape
-    block = len(times) + 1  # one zero baseline row, then the response
+    block = len(t_first) + 1  # one zero baseline row, then the first response
 
     rng = np.random.default_rng(seed)
     pad = noise_sd * rng.standard_normal((gap, k))
@@ -245,7 +294,7 @@ def two_condition_batch(
     )
     rows = np.zeros(y.shape[1], bool)
     rows[1:block] = True
-    rows[block + gap + 1 :] = True
+    rows[block + gap + 1 :] = True  # the rest is the second response, whatever its length
 
     spec = ModelSpec(
         N=n_neuronal, K=k, n_inputs=2, n_mod=1, TE=TE, B0=B0, TR=tr, dtype=dtype,

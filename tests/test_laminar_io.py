@@ -172,3 +172,52 @@ def test_a_window_that_starts_after_the_onset_is_refused():
     two_condition_batch(curves, curves, np.arange(8) * 2.0, duration=1.0, gap=4)  # bot 0: fine
     with pytest.raises(ValueError, match="start.*after the event|starts at 0"):
         two_condition_batch(curves, curves, np.arange(8) * 2.0 + 6.0, duration=1.0, gap=4)
+
+
+def test_two_conditions_can_be_sampled_over_different_windows():
+    """A 3 s and a 10 s stimulus need different lengths of response, so the two
+    blocks are concatenated at their own lengths and the second event's onset
+    follows the first block, not a shared one."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    t_short, t_long = np.arange(8) * 2.0, np.arange(13) * 2.0
+    short = np.zeros((1, t_short.size, 3))
+    long_ = np.zeros((1, t_long.size, 3))
+    gap = 4
+    d = two_condition_batch(short, long_, (t_short, t_long), duration=(3.0, 10.0), gap=gap)
+
+    # 1 baseline + 8 + gap + 1 baseline + 13
+    assert d.y.shape[1] == 1 + 8 + gap + 1 + 13
+    assert int(d.rows.sum()) == 8 + 13
+    # Each block's own extent is marked, the baselines and padding are not.
+    assert not d.rows[0] and d.rows[1:9].all()
+    assert not d.rows[9 : 9 + gap].any() and not d.rows[9 + gap]
+    assert d.rows[9 + gap + 1 :].all()
+    # The driving input has both events; the second sits after the FIRST block.
+    assert d.spec.TR == 2.0
+
+    # Swapping which side is longer is not the same model (the onset moves).
+    flipped = two_condition_batch(long_, short, (t_long, t_short), duration=(10.0, 3.0), gap=gap)
+    assert flipped.y.shape[1] == d.y.shape[1]
+    assert not torch.equal(flipped.rows, d.rows)
+
+
+def test_different_sample_spacing_is_refused():
+    """The scan interval of the model IS the knot spacing, so the two conditions
+    cannot be sampled at different TRs even over different windows."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    a, b = np.arange(8) * 2.0, np.arange(8) * 1.5
+    curves_a, curves_b = np.zeros((1, 8, 3)), np.zeros((1, 8, 3))
+    with pytest.raises(ValueError, match="knot spacing|sampled .* apart"):
+        two_condition_batch(curves_a, curves_b, (a, b), duration=1.0, gap=4)
+
+
+def test_curves_must_match_their_time_grid():
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    with pytest.raises(ValueError, match="do not match their time grids"):
+        two_condition_batch(
+            np.zeros((1, 8, 3)), np.zeros((1, 8, 3)),
+            (np.arange(8) * 2.0, np.arange(13) * 2.0), duration=1.0, gap=4,
+        )  # fmt: skip
