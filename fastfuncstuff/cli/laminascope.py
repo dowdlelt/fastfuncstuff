@@ -3,7 +3,12 @@
 Command: ffs_laminascope
 
 Usage:
-    # voxel curves once (a linear estimator, so column means of them are exact)
+    # one step: the cells are fitted from the timeseries
+    ffs_laminascope -input run*.nii.gz -events *_events.tsv -window 0 14 \
+        -spec comparisons.toml -fs_subj $SUBJ -responsive faces_t.nii.gz \
+        -responsive_thresh 4 -depths 7 9 11 -equivolume -device cuda -prefix scope/sub
+
+    # or two steps, from voxel curves fitted once by a LINEAR estimator
     ffs_deconvolve -input run*.nii.gz -events ... -event_prefix task -model TENT \
         -window 0 14 -tent-smooth global -mask ribbon.nii.gz -prefix curves/sub
     ffs_laminascope -iresp_prefix curves/sub -window 0 14 -duration 1 \
@@ -33,12 +38,16 @@ responsive area sets how many there are. With the default spacing (half the radi
 an interior vertex sits in several columns that differ only in where their edges
 fall, and the maps report their consensus and how far they agree.
 
-Each column's depth curves are read from VOXEL response curves (-iresp_prefix: the
-{prefix}_iresp_<label> files of ffs_deconvolve, in percent signal change). Fit them
-with a linear estimator -- -tent-smooth global (one lambda), or plain TENT -- and a
-column's curve equals the fit of the column's mean, so fitting voxels once and
-sampling after loses nothing. Per-voxel lambda (-tent-smooth reml) is not linear and
-biases weak voxels flat.
+Each column's depth curves come from one of two routes. With -input, the voxel
+timeseries is averaged into column x depth cells and each cell is fitted here: an
+estimate of averaged data, so no linearity is assumed, the knots follow the events,
+and every cell carries its own residual variance. With -iresp_prefix the curves are
+read from the {prefix}_iresp_<label> files of ffs_deconvolve (percent signal change)
+and averaged; that is exact ONLY for a linear estimator -- -tent-smooth global (one
+lambda) or a fixed lambda -- because only then does a column's curve equal the fit of
+the column's mean. Per-voxel lambda (-tent-smooth reml) is not linear: it shrinks
+noisy voxels harder, and since the noise level is a depth gradient that lands in the
+amplitudes as a fake depth profile.
 
 Each -spec comparison is one model space at every column: baseline and test
 conditions concatenated with masked padding, every layer hypothesis inverted at
