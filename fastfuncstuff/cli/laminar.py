@@ -93,6 +93,17 @@ Read the tables in this order; each step decides whether the next one means anyt
    "no evidence that these conditions differ at any depth", and the depth
    probabilities below are then a decomposition of nothing.
 
+   That floor is a CONVENTION, and on real data it is too low.  The model space's
+   'null' is a model fitted to the same data, so its Bayes factor answers "does
+   something differ" and carries no false-positive rate: measured over 903 real
+   columns, permuting the condition labels gave a null median of 4.2 nats -- above
+   the 3-nat floor -- and a null maximum of 26.5.  Use -null_fit_prefix to get the
+   rate itself.  {prefix}_laminar_null.tsv then reports, per ROI and statistic,
+   p_perm = (1 + #{null >= real}) / (1 + n): the share of permutations of YOUR
+   labels that reached YOUR result.  That is the number to quote, and with -plots
+   the distribution behind it is drawn.  19 permutations is the fewest that can
+   express 0.05, so a smaller n is reported as the floor it is.
+
 4. Only then, WHERE.  Prefer P(depth modulated) in {prefix}_depths.tsv, which is
    marginalised over the whole model space, to the winning model's name.  The
    winner is one of 2^N hypotheses and its p=0.4 victory over a near-tie is not
@@ -255,6 +266,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "number, so results stay comparable with the published analysis.  2 is "
                    "plenty.")  # fmt: skip
 
+    n = p.add_argument_group("Permutation null")
+    n.add_argument("-null_fit_prefix", nargs="+", default=None, metavar="PREFIX",
+                   help="One or more PREFIXes of deconvolve runs whose condition labels were "
+                   "PERMUTED (scripts/laminar_null_onsets.py writes them), read with -conds "
+                   "exactly as -fit_prefix is.  Each is refitted through the identical model "
+                   "space and ROI selection, giving the distribution of every statistic when "
+                   "the two conditions are known not to differ -- which is the only thing that "
+                   "turns a free energy into a false-positive rate.  The model space's own "
+                   "'null' is a MODEL fitted to the same data, and on real data its Bayes "
+                   "factor is large almost everywhere (a measured null median of 4.2 nats "
+                   "against the conventional 3-nat floor), so it cannot play this part.  Cost "
+                   "is one extra fit per ROI per permutation, which is why this lives here and "
+                   "not in ffs_laminascope: 19 permutations is the fewest that can express "
+                   "p = 0.05, and ~100 is a readable distribution.")  # fmt: skip
+    n.add_argument("-null_cond1", nargs="+", default=None, metavar="FILE",
+                   help="Permuted replicates given as explicit tables instead of prefixes: "
+                   "N files for condition 1, matched by position with -null_cond2.  One K "
+                   "only; use -null_fit_prefix for multi-K runs.")  # fmt: skip
+    n.add_argument("-null_cond2", nargs="+", default=None, metavar="FILE",
+                   help="The condition-2 side of -null_cond1.")  # fmt: skip
+
     o = p.add_argument_group("Output")
     o.add_argument("-prefix", required=True, help="Output prefix.")
     o.add_argument("-plots", action="store_true",
@@ -334,6 +366,37 @@ def _resolve_fit_prefix(args) -> None:
         raise ValueError("give -cond1 and -cond2 (or -fit_prefix and -conds)")
 
 
+def _null_tables(args, ks):
+    """``[(cond1_by_k, cond2_by_k), ...]``, one pair per permutation replicate."""
+    from pathlib import Path
+
+    pairs = []
+    if args.null_fit_prefix:
+        if not args.conds:
+            raise ValueError("-null_fit_prefix needs -conds COND1 COND2")
+        for prefix in args.null_fit_prefix:
+            found = [f"{prefix}_iresp_{c}.tsv" for c in args.conds]
+            for path in found:
+                if not Path(path).exists():
+                    raise ValueError(f"{path}: not found (-null_fit_prefix {prefix})")
+            pairs.append(([found[0]], [found[1]]))
+    if args.null_cond1 or args.null_cond2:
+        if not (args.null_cond1 and args.null_cond2):
+            raise ValueError("-null_cond1 and -null_cond2 go together")
+        if len(args.null_cond1) != len(args.null_cond2):
+            raise ValueError(f"-null_cond1 has {len(args.null_cond1)} file(s) and -null_cond2 "
+                             f"{len(args.null_cond2)}; they pair by position")  # fmt: skip
+        pairs.extend(([a], [b]) for a, b in zip(args.null_cond1, args.null_cond2, strict=True))
+    out = []
+    for i, (c1, c2) in enumerate(pairs):
+        one, two = _by_k(c1, "-null_cond1"), _by_k(c2, "-null_cond2")
+        if sorted(one) != sorted(two) or sorted(one) != list(ks):
+            raise ValueError(f"permutation {i} has K = {sorted(one)} / {sorted(two)}, "
+                             f"but the real data have {list(ks)}")  # fmt: skip
+        out.append((one, two))
+    return out
+
+
 def _fit_one(job):
     import torch
 
@@ -377,29 +440,40 @@ def main(argv: list[str] | None = None) -> int:
 
         delay = None if args.reference_delay else args.delay
         modulation = parse_modulation(args.modulation)
-        jobs = []
-        for rid, name, hemi in keys:
-            data_for_k = {
-                k: two_condition_data(
-                    pick_roi(one[k], rid, hemi),
-                    pick_roi(two[k], rid, hemi),
-                    duration=args.duration,
-                    n_neuronal=args.N,
-                    gap=args.pad_rows,
-                    seed=args.pad_seed,
-                    noise_sd=args.pad_sd,
-                    delay_seconds=delay,
-                    TE=args.TE,
-                    B0=args.B0,
-                    p0=reference_p0(),
-                    modulation=modulation,
-                )  # fmt: skip
-                for k in ks
-            }
-            kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
-                  "hyper_from_rows": args.hyperprior == "rows", "rescue": args.rescue,
-                  "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
-            jobs.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
+
+        def build(one_tables, two_tables):
+            built = []
+            for rid, name, hemi in keys:
+                data_for_k = {
+                    k: two_condition_data(
+                        pick_roi(one_tables[k], rid, hemi),
+                        pick_roi(two_tables[k], rid, hemi),
+                        duration=args.duration,
+                        n_neuronal=args.N,
+                        gap=args.pad_rows,
+                        seed=args.pad_seed,
+                        noise_sd=args.pad_sd,
+                        delay_seconds=delay,
+                        TE=args.TE,
+                        B0=args.B0,
+                        p0=reference_p0(),
+                        modulation=modulation,
+                    )  # fmt: skip
+                    for k in ks
+                }
+                kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
+                      "hyper_from_rows": args.hyperprior == "rows", "rescue": args.rescue,
+                      "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
+                # The PSF is geometry, so the permutations reuse the real run's: permuting
+                # labels cannot change how a depth was sampled.
+                built.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
+            return built
+
+        jobs = build(one, two)
+        n_real = len(jobs)
+        null_pairs = _null_tables(args, ks)
+        for one_n, two_n in null_pairs:
+            jobs.extend(build(one_n, two_n))
     except (OSError, ValueError) as exc:
         print(f"ffs_laminar: {exc}", file=sys.stderr)
         return 1
@@ -409,8 +483,14 @@ def main(argv: list[str] | None = None) -> int:
         else "gaussian" if args.psf_variance is not None else "none"
     )  # fmt: skip
     if args.verb >= 1:
-        print(f"ffs_laminar: {len(jobs)} ROI(s) x {len(names)} model(s) x K = {ks} "
+        extra = (f" + {len(null_pairs)} permutation(s) of the same ROIs"
+                 if null_pairs else "")  # fmt: skip
+        print(f"ffs_laminar: {n_real} ROI(s){extra} x {len(names)} model(s) x K = {ks} "
               f"({len(jobs) * len(names) * len(ks)} inversions), PSF: {psf}")  # fmt: skip
+        if null_pairs and len(null_pairs) < 19:
+            print(f"  NOTE: {len(null_pairs)} permutation(s) cannot express a p below "
+                  f"{1 / (1 + len(null_pairs)):.3g}; 19 is the fewest that reaches 0.05",
+                  file=sys.stderr)  # fmt: skip
     workers = args.workers or max(1, __import__("os").cpu_count() // 2)
     workers = min(workers, len(jobs))
     if workers == 1:
@@ -420,6 +500,11 @@ def main(argv: list[str] | None = None) -> int:
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             fits = list(_progress(pool.map(_fit_one, jobs), args.verb, total=len(jobs)))
+    null_fits = fits[n_real:]
+    fits = fits[:n_real]
+    nulls_by_roi: dict[tuple[str, str], list] = {(f.roi, f.hemi): [] for f in fits}
+    for f in null_fits:
+        nulls_by_roi.setdefault((f.roi, f.hemi), []).append(f)
     written = write_results(
         args.prefix, fits,
         provenance={"cond1": args.cond1, "cond2": args.cond2, "duration": args.duration,
@@ -430,8 +515,14 @@ def main(argv: list[str] | None = None) -> int:
                                 "hyperprior": args.hyperprior}, "free_energy": args.free_energy,
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
                     "modulation": modulation,
+                    "null_fit_prefix": args.null_fit_prefix,
+                    "null_replicates": len(null_pairs),
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
     )  # fmt: skip
+    if null_pairs:
+        from fastfuncstuff.laminar.pipeline import write_null
+
+        written.extend(write_null(args.prefix, fits, nulls_by_roi))
     if args.plots:
         from fastfuncstuff.laminar.plots import plot_roi, plot_summary
 
@@ -439,6 +530,11 @@ def main(argv: list[str] | None = None) -> int:
         for f in fits:
             tag = f"{f.name}_{f.hemi}".replace("/", "-").replace(" ", "_")
             written.append(plot_roi(f, f"{args.prefix}_laminar_{tag}.png", conds))
+            if nulls_by_roi.get((f.roi, f.hemi)):
+                from fastfuncstuff.laminar.plots import plot_null
+
+                written.append(plot_null(f, nulls_by_roi[(f.roi, f.hemi)],
+                                         f"{args.prefix}_laminar_{tag}_null.png"))  # fmt: skip
         if len(fits) > 1:
             written.append(plot_summary(fits, f"{args.prefix}_laminar_summary.png", conds))
     for f in fits:
@@ -449,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {f.name} ({f.hemi}): best '{f.models[f.best]}' "
                   f"p={f.p_model[f.best]:.3f}; P(modulated) "
                   + ", ".join(f"{d} {p:.2f}" for d, p in zip(_names(args.N), f.p_depth, strict=True)))  # fmt: skip
+            if nulls_by_roi.get((f.roi, f.hemi)):
+                from fastfuncstuff.laminar.pipeline import null_statistics
+
+                st = null_statistics(f, nulls_by_roi[(f.roi, f.hemi)])
+                real, pp, draws = st["logBF_vs_null"]
+                print(f"    vs {len(draws)} permutation(s): logBF {real:.1f} against a null "
+                      f"median {np.median(draws):.1f} (max {np.max(draws):.1f}), "
+                      f"p_perm {pp:.3g}")  # fmt: skip
         for path in written:
             print(f"  wrote {path}")
         print(f"ffs_laminar: done in {time.time() - t0:.0f} s")

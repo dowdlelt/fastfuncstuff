@@ -199,6 +199,66 @@ def _warnings(names, targets, F, stalled, ks, rescue, tol: float = 10.0) -> list
     return out
 
 
+def _log_bf(fit: RoiFit) -> float:
+    """The best model's evidence over the model space's own ``null``, in nats."""
+    if "null" not in fit.models:
+        return float("nan")
+    return float(np.max(fit.F) - fit.F[fit.models.index("null")])
+
+
+def null_statistics(fit: RoiFit, nulls: list[RoiFit]) -> dict:
+    """Permutation p-values for one ROI: ``{statistic: (real, p, null values)}``.
+
+    ``p = (1 + #{null >= real}) / (1 + n)``, the standard permutation p-value, which
+    floors at ``1/(1+n)`` -- one replicate cannot license a rate finer than itself, and
+    19 are the fewest that reach 0.05.  The statistics are the ones a reader thresholds:
+    the evidence over the null MODEL, each depth's P(modulated), and the size of each
+    depth's modulation (``|B|``, unsigned, because a permutation null is symmetric in
+    sign and a two-sided question deserves a two-sided statistic).
+    """
+    out: dict[str, tuple[float, float, list[float]]] = {}
+
+    def add(name, real, draws):
+        vals = [v for v in draws if np.isfinite(v)]
+        p = (1 + sum(1 for v in vals if v >= real)) / (1 + len(vals)) if vals else float("nan")
+        out[name] = (float(real), float(p), [float(v) for v in vals])
+
+    add("logBF_vs_null", _log_bf(fit), [_log_bf(f) for f in nulls])
+    for i, d in enumerate(depth_names(len(fit.B_mean))):
+        add(f"p_modulated_{d}", fit.p_depth[i], [f.p_depth[i] for f in nulls])
+        add(f"abs_B_{d}", abs(fit.B_mean[i]), [abs(f.B_mean[i]) for f in nulls])
+    return out
+
+
+def write_null(prefix: str, fits: list[RoiFit], nulls_by_roi: dict) -> list[str]:
+    """``{prefix}_laminar_null.tsv`` (one line per ROI x statistic) and ``_null_draws.tsv``.
+
+    The draws are written out because the summary is three quantiles of them and a reader
+    may want a different tail, a different statistic, or to pool ROIs -- and because a
+    permutation distribution is the evidence for the p-value beside it.
+    """
+    paths = [f"{prefix}_laminar_null.tsv", f"{prefix}_laminar_null_draws.tsv"]
+    Path(paths[0]).parent.mkdir(parents=True, exist_ok=True)
+    with open(paths[0], "w") as fh:
+        fh.write("roi\tname\themi\tstatistic\treal\tp_perm\tn_perm\tnull_median"
+                 "\tnull_p95\tnull_max\n")  # fmt: skip
+        for f in fits:
+            stats = null_statistics(f, nulls_by_roi.get((f.roi, f.hemi), []))
+            for name, (real, p, draws) in stats.items():
+                q = (np.median(draws), np.percentile(draws, 95), np.max(draws)) if draws else (
+                    float("nan"), float("nan"), float("nan"))  # fmt: skip
+                fh.write(f"{f.roi}\t{f.name}\t{f.hemi}\t{name}\t{real:.6g}\t{p:.6g}\t"
+                         f"{len(draws)}\t{q[0]:.6g}\t{q[1]:.6g}\t{q[2]:.6g}\n")  # fmt: skip
+    with open(paths[1], "w") as fh:
+        fh.write("roi\tname\themi\tpermutation\tstatistic\tvalue\n")
+        for f in fits:
+            stats = null_statistics(f, nulls_by_roi.get((f.roi, f.hemi), []))
+            for name, (_real, _p, draws) in stats.items():
+                for j, v in enumerate(draws):
+                    fh.write(f"{f.roi}\t{f.name}\t{f.hemi}\t{j}\t{name}\t{v:.6g}\n")
+    return paths
+
+
 def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = None) -> list[str]:
     """Tidy tables, one line per ROI x (model | neuronal depth | measured depth | time):
 

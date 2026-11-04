@@ -3,11 +3,13 @@ carries every array the panels read."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from fastfuncstuff.laminar.pipeline import RoiFit
-from fastfuncstuff.laminar.plots import plot_roi, plot_summary
+from fastfuncstuff.laminar.plots import plot_null, plot_roi, plot_summary
 
 pytest.importorskip("matplotlib")
 
@@ -58,3 +60,13 @@ def test_the_summary_renders_for_several_rois(tmp_path):
         [("V1", "lh"), ("V2", "lh"), ("hMT", "rh"), ("A1", "lh"), ("PP", "rh")])]  # fmt: skip
     plot_summary(fits, tmp_path / "s.png", ("std", "dev"))
     assert (tmp_path / "s.png").stat().st_size > 15_000
+
+
+def test_the_null_page_renders_and_names_the_floor(tmp_path):
+    """One panel per statistic, and the suptitle must say what n permutations can claim:
+    a figure that hides the resolution of its own p-value invites reading 0 into it."""
+    fits = [fake_fit("V1", "lh", i + 1) for i in range(4)]
+    out = plot_null(fake_fit(), fits, tmp_path / "null.png")
+    assert Path(out).exists() and Path(out).stat().st_size > 5000
+    # No replicates at all is a degenerate but legal call: the observed value still draws.
+    assert Path(plot_null(fake_fit(), [], tmp_path / "none.png")).exists()

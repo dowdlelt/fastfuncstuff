@@ -250,3 +250,51 @@ def test_batched_rescue_matches_serial_rescue(reference):
     assert not bool(fixed.stalled.any()) and not serial.stalled
     for i in range(2):
         assert float(fixed.F[i]) == pytest.approx(float(serial.F), rel=1e-8, abs=1e-6)
+
+
+@pytest.mark.slow  # 41s: the real fit plus three permutation replicates
+def test_a_permutation_null_is_fitted_and_turned_into_p_perm(reference, tmp_path):
+    """The null replicates must be refitted through the identical model space, and the
+    p-value must be the permutation one -- floored at 1/(1+n), never 0."""
+    o, a, b, kern = reference
+    y = np.asarray(o["y"], float).reshape(o["ns"], o["K"])
+    times = np.arange(7) * float(o["TR"])
+    rng = np.random.default_rng(0)
+    nulls = []
+    for i in range(3):
+        # A replicate's "permutation" here is only a relabelling of the same curves plus
+        # noise: the point under test is the plumbing and the arithmetic, not the physics.
+        pair = y[1:8][:, ::-1], y[29:36][:, ::-1]
+        if i % 2:
+            pair = pair[1], pair[0]
+        p1 = _write_table(tmp_path / f"n{i}_iresp_c1.tsv", times,
+                          pair[0] + 0.01 * rng.standard_normal(pair[0].shape))  # fmt: skip
+        p2 = _write_table(tmp_path / f"n{i}_iresp_c3.tsv", times,
+                          pair[1] + 0.01 * rng.standard_normal(pair[1].shape))  # fmt: skip
+        nulls.append((str(p1), str(p2)))
+    prefix = str(tmp_path / "withnull")
+    rc = laminar.main(
+        ["-cond1", str(a), "-cond2", str(b), "-duration", "1.6", "-psf_kernel", str(kern),
+         "-reference_delay", "-modulation", "reference",
+         "-models", "null", "superficial", "-max_iter", "2",
+         "-null_cond1", *[n[0] for n in nulls], "-null_cond2", *[n[1] for n in nulls],
+         "-prefix", prefix, "-workers", "1", "-verb", "0"]
+    )  # fmt: skip
+    assert rc == 0
+    h, rows = _table(f"{prefix}_laminar_null.tsv")
+    assert h[:7] == ["roi", "name", "hemi", "statistic", "real", "p_perm", "n_perm"]
+    by = {r[3]: r for r in rows}
+    assert "logBF_vs_null" in by and {
+        f"p_modulated_{d}" for d in ("superficial", "middle", "deep")
+    } <= set(by)
+    for r in rows:
+        assert int(r[6]) == 3, "every statistic must see every replicate"
+        # (1 + #{null >= real}) / (1 + n) with n = 3: nothing below 0.25 is expressible.
+        assert 0.25 - 1e-9 <= float(r[5]) <= 1.0, f"{r[3]}: p_perm {r[5]}"
+    h, draws = _table(f"{prefix}_laminar_null_draws.tsv")
+    assert len({r[3] for r in draws}) == 3 and len(draws) == 3 * len(rows)
+    doc = json.load(open(f"{prefix}_laminar.json"))
+    assert doc["null_replicates"] == 3
+    # The real tables must be unchanged by the presence of a null: one line per model.
+    _h, models = _table(f"{prefix}_laminar_models.tsv")
+    assert [r[3] for r in models] == ["null", "superficial"]

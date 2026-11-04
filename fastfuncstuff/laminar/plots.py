@@ -350,3 +350,67 @@ __all__ = [
     "plot_roi",
     "plot_summary",
 ]
+
+
+def plot_null(fit: RoiFit, nulls: list[RoiFit], path: str | Path) -> str:
+    """One page per ROI: every statistic against its permutation distribution.
+
+    The point of the figure is that the reader sees the null, not a p-value standing in
+    for it.  A permutation distribution with a long right tail, or one whose median sits
+    where the real value sits, says something no single number does.
+    """
+    from fastfuncstuff.laminar.pipeline import null_statistics
+
+    plt = _plt()
+    stats = null_statistics(fit, nulls)
+    n = len(stats)
+    cols = min(4, n)
+    rows = -(-n // cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.1 * rows), squeeze=False)
+    for ax, (name, (real, p, draws)) in zip(axes.ravel(), stats.items(), strict=False):
+        if draws:
+            ax.hist(draws, bins=min(30, max(8, len(draws) // 4)), color="0.72",
+                    edgecolor="0.45", linewidth=0.5)  # fmt: skip
+            ax.axvline(float(np.percentile(draws, 95)), color="0.35", ls=":", lw=1.2,
+                       label="null 95th")  # fmt: skip
+        ax.axvline(real, color="crimson", lw=2, label="observed")
+        ax.set_title(f"{name}\np_perm = {p:.3g}  (n = {len(draws)})", fontsize=9)
+        ax.set_xlabel("statistic")
+        ax.set_ylabel("permutations")
+        ax.legend(fontsize=7, frameon=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    floor = 1 / (1 + len(nulls)) if nulls else float("nan")
+    fig.suptitle(
+        f"{fit.name} ({fit.hemi}): permutation null, {len(nulls)} replicate(s) "
+        f"-- no p below {floor:.3g} is expressible"
+        + ("   [the conditions were permuted; nothing here differs by design]"),
+        y=0.995, fontsize=11,
+    )  # fmt: skip
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return str(path)
+
+
+def panel_null_profile(ax, fit: RoiFit, nulls: list[RoiFit]) -> None:
+    """P(modulated) per depth with the permutation null's 5-95% band behind it."""
+    names = _depth_names(len(fit.p_depth))
+    x = np.arange(len(names))
+    if nulls:
+        draws = np.array([f.p_depth for f in nulls])  # (n_perm, N)
+        lo, hi = np.percentile(draws, 5, axis=0), np.percentile(draws, 95, axis=0)
+        ax.fill_between(x, lo, hi, color="0.8", label="null 5-95%")
+        ax.plot(x, np.median(draws, 0), color="0.45", ls="--", lw=1, label="null median")
+    ax.plot(x, fit.p_depth, "o-", color="crimson", lw=2, label="observed")
+    ax.set_xticks(x, names)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("P(depth modulated)")
+    ax.set_title("depth probability against the null")
+    ax.legend(fontsize=7, frameon=False)
+
+
+def _depth_names(n):
+    from fastfuncstuff.laminar.pipeline import depth_names
+
+    return depth_names(n)
