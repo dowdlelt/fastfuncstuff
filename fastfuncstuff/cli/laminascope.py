@@ -72,10 +72,10 @@ Mask every map with the 'gate' brick and read two others.  Nothing below this
 paragraph is needed to look at a result:
 
     R=myprefix_gender_vs_fixate_ribbon.nii.gz
-    3dcalc -a "$R[gate]" -b "$R[p_superficial]" -expr 'a*b' -prefix p_sup.nii.gz
+    3dcalc -a "$R[gate]" -b "$R[p_mod_superficial]" -expr 'a*b' -prefix p_sup.nii.gz
     3dcalc -a "$R[gate]" -b "$R[B_superficial]" -expr 'a*b' -prefix B_sup.nii.gz
 
-p_<depth> is P(this depth is modulated), 0 to 1, marginal over the whole model
+p_mod_<depth> is P(this depth is modulated), 0 to 1, marginal over the whole model
 space -- the map to threshold, at 0.75 or 0.95 as you would any posterior
 probability.  B_<depth> is how much, and its sign says which way (positive B
 LOWERS self-inhibition).  gate is 1 where the column responded at all, was read
@@ -96,7 +96,7 @@ For one gated location, read five numbers and say this:
    DEPTH statement is the marginal, not the winner."
 
 That is the whole content: WHERE (which column), WHETHER (logBF over null),
-WHICH DEPTH (p_<depth>), WHICH WAY AND HOW MUCH (B in Hz, on self-inhibition),
+WHICH DEPTH (p_mod_<depth>), WHICH WAY AND HOW MUCH (B in Hz, self-inhibition),
 and HOW SURE the single best story is (p_best).  There is no "what the effect
 was" beyond that: the model has one modulatory parameter per depth and it enters
 as the depth's self-inhibition, so "gender differed from fixate here" can only
@@ -161,7 +161,7 @@ values.  A signed contrast brick is usually several further along
 (3dinfo -label).
 
 Outside the columns there is no estimate, and the maps say so with NaN rather
-than 0 -- B, p_<depth> and logBF_vs_null are all legitimately near 0 INSIDE a
+than 0 -- B, p_mod_<depth> and logBF_vs_null are all legitimately near 0 INSIDE a
 column, so a zero fill would make "no column here" unreadable against "no effect
 here".  n_columns is the exception and keeps its 0: that is a real count, and
 n_columns > 0 is the coverage mask if your viewer wants one.
@@ -210,10 +210,19 @@ about noise.
    'gate' for that reason; add it (ispositive(logBF_vs_null-3)) if you want the
    published convention stated explicitly.
 
-5. ONLY THEN, WHERE.  Prefer p_<depth> -- P(depth modulated), marginalised over
+5. ONLY THEN, WHERE.  Prefer p_mod_<depth> -- P(depth modulated), marginalised over
    the whole model space -- to the winner map.  The winner is one of 2^N
    hypotheses and p_best says how narrowly it won; a p_best of 0.3 is a near-tie
-   dressed as an answer.  B_<depth> is the WINNER's modulation; the long table's
+   dressed as an answer.
+
+   Mind the two families of probability in the per-column TSV.  p_mod_<depth> is
+   the MARGINAL, P(this depth is modulated) over the whole space, and is what the
+   maps carry.  p_<MODEL> -- p_null, p_superficial+deep, ... -- is one model's
+   posterior, and a model can be near 0 while its depth is near 1 (measured on a
+   real column: p_superficial 6e-20, p_mod_superficial 0.84, because the depth's
+   support was spread over the five other models containing it).  Maps written
+   before 2026-11-04 named the marginal bricks p_<depth>, which collides with the
+   TSV's model column of the same name; they hold the marginal.  B_<depth> is the WINNER's modulation; the long table's
    B_bma is model-averaged, which is what a group test should carry, because a
    depth that some models pin at 0 contributes 0 rather than dropping out.
 
@@ -1225,7 +1234,7 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
          fov_full[:, None], full(fits.nesting)[:, None],
          np.where(valid, gate, np.nan)[:, None]], axis=1,
     )  # fmt: skip
-    names = ([f"p_{d}" for d in dnames] + [f"B_{d}" for d in dnames]
+    names = ([f"p_mod_{d}" for d in dnames] + [f"B_{d}" for d in dnames]
              + [f"PB_{d}" for d in dnames]
              + ["p_best", "logBF_vs_null", "r2", "baseline_peak", "in_fov", "nesting_nats",
                 "gate"])  # fmt: skip

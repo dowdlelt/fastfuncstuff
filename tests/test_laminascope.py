@@ -90,7 +90,10 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     assert np.isin(g[on], (0.0, 1.0)).all(), "the gate must be a mask, not a score"
     assert np.isnan(g[~on]).all(), "off the columns the gate must be NaN, not a passing 0"
     assert g[on].any(), "a responding sphere should leave something to look at"
-    p_sup = data[:, names.index("p_superficial")]
+    # p_<MODEL> and p_mod_<DEPTH> are different quantities and the maps carry only the
+    # second, so the map must not use a name the per-column TSV spends on the first.
+    assert "p_superficial" not in names, "the map brick collides with the TSV's model column"
+    p_sup = data[:, names.index("p_mod_superficial")]
     ok = np.isfinite(p_sup)
     assert ok.any() and ((p_sup[ok] >= 0) & (p_sup[ok] <= 1)).all()
     rows = open(f"{prefix}_ab_columns.tsv").read().splitlines()
