@@ -41,6 +41,9 @@ def parse_args(argv=None):
     )
     p.add_argument("-prefix", required=True, help="The run's -prefix (finds _columns.npz etc).")
     p.add_argument("-comparison", required=True, help="Comparison NAME from the run.")
+    p.add_argument("-table", default=None, metavar="TSV",
+                   help="Read the fields from this TSV (keyed by 'column' or 'region') instead "
+                   "of the run's own tables -- e.g. the output of laminascope_calibrate.py.")  # fmt: skip
     p.add_argument("-fields", nargs="+", required=True, help="Column names to paint.")
     p.add_argument("-fs_subj", required=True, help="FreeSurfer subject (the run's -fs_subj).")
     p.add_argument("-grid", default=None,
@@ -116,8 +119,9 @@ def main(argv=None) -> int:
     )  # fmt: skip
 
     wanted = list(args.fields)
-    tables = [f"{args.prefix}_{args.comparison}_regions_long.tsv",
-              f"{args.prefix}_{args.comparison}_columns.tsv"]  # fmt: skip
+    tables = ([args.table] if args.table else
+              [f"{args.prefix}_{args.comparison}_regions_long.tsv",
+               f"{args.prefix}_{args.comparison}_columns.tsv"])  # fmt: skip
     values, varies, found = {}, {}, set()
     for path in tables:
         try:
