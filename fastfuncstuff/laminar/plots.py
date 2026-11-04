@@ -15,11 +15,12 @@ display.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.laminar.pipeline import RoiFit, depth_names, profile_pair
+from fastfuncstuff.laminar.pipeline import RoiFit, curve_pair, depth_names, profile_pair
 
 BEST = "#c44e52"
 OTHER = "#4c72b0"
@@ -344,6 +345,63 @@ def plot_roi(
     return str(path)
 
 
+def plot_curves(
+    fit: RoiFit, path: str | Path, conditions: tuple[str, str] = ("cond 1", "cond 2")
+) -> str:
+    """Before and after deveining, one page per ROI, at the finest K: each condition's
+    curves measured and deveined, beside the peak depth profile. Returns the path.
+
+    Dots are the data at its knots; lines are the fitted model between them, so the page
+    also shows what the fit misses.
+    """
+    plt = _plt()
+    d = _req(fit.detail, "curves (fit_roi(detail=True))")
+    fig = plt.figure(figsize=(16, 8.5))
+    grid = fig.add_gridspec(2, 3, width_ratios=[1, 1, 1.15])
+    first = fig.add_subplot(grid[0, 0])
+    colours = _depth_colours(d.k)
+    for which, label in enumerate(conditions):
+        c = curve_pair(fit, which)
+        columns = (
+            ("measured", "fit", "measured"),
+            ("measured_deveined", "fit_deveined", "deveined"),
+        )
+        for col, (dots, line, name) in enumerate(columns):
+            ax = (
+                first
+                if (which, col) == (0, 0)
+                else fig.add_subplot(grid[which, col], sharey=first, sharex=first)
+            )
+            for i, colour in enumerate(colours):
+                ax.plot(c["t_fine"], c[line][:, i], color=colour, lw=1.6)
+                ax.plot(c["t_knots"], c[dots][:, i], "o", color=colour, ms=3.5)
+            ax.axhline(0, color="0.7", lw=0.8)
+            ax.grid(alpha=0.3)
+            ax.set(
+                xlabel="time after event (s)", ylabel="signal change (%)", title=f"{label}: {name}"
+            )
+    first.plot([], [], color=colours[0], lw=2, label="pial")
+    first.plot([], [], color=colours[-1], lw=2, label="deep")
+    first.legend(fontsize=8, loc="upper right")
+    panel_profiles(
+        fig.add_subplot(grid[:, 2]),
+        dataclasses.replace(fit, y_obs=d.y_obs, W=d.W, W_inv=d.W_inv),
+        conditions,
+    )
+    fig.suptitle(
+        f"{fit.name} ({fit.hemi}):  best model '{fit.models[fit.best]}',  K = {d.k}"
+        + ("   [WARNING: this fit stalled]" if d.stalled else "")
+        + "\ndots = data, lines = fit; deveining corrects amplitude at each time point, "
+        "transit delay stays in the curves",
+        fontsize=12,
+    )  # fmt: skip
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return str(path)
+
+
 __all__ = [
     "panel_drainage",
     "panel_fit",
@@ -357,6 +415,7 @@ __all__ = [
     "panel_profiles",
     "panel_psf",
     "panel_transit",
+    "plot_curves",
     "plot_roi",
     "plot_summary",
 ]

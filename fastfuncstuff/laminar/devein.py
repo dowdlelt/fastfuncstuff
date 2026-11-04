@@ -300,9 +300,9 @@ def depth_bin_map(n_vascular: int, n_neuronal: int) -> np.ndarray:
 def local_contribution(W, measured, W_inv=None) -> np.ndarray:
     """Percent BOLD at each vascular depth from THAT depth's own neurons.
 
-    ``W`` is ``(K, N)``, ``measured`` the ``(K,)`` peak depth profile in percent,
-    both superficial first; ``W_inv`` is ``W``'s pseudo-inverse if already to hand.
-    Returns ``(K,)`` in PERCENT -- the same units as ``measured``, no rescaling --
+    ``W`` is ``(K, N)``, ``measured`` the ``(..., K)`` amplitudes in percent (a peak
+    profile, or a curve with time leading), both superficial first; ``W_inv`` is
+    ``W``'s pseudo-inverse if already to hand. Returns ``(..., K)`` in PERCENT -- the same units as ``measured``, no rescaling --
     so the two read on one axis and their difference is the signal drained in from
     deeper cortex.
 
@@ -328,6 +328,6 @@ def local_contribution(W, measured, W_inv=None) -> np.ndarray:
     W = np.asarray(W)
     measured = np.asarray(measured)
     inv = np.linalg.pinv(W) if W_inv is None else np.asarray(W_inv)
-    drive = inv @ measured
+    drive = measured @ inv.T
     own = depth_bin_map(W.shape[0], W.shape[1])
-    return W[np.arange(W.shape[0]), own] * drive[own]
+    return W[np.arange(W.shape[0]), own] * drive[..., own]

@@ -8,8 +8,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fastfuncstuff.laminar.pipeline import RoiFit
-from fastfuncstuff.laminar.plots import plot_null, plot_roi, plot_summary
+from fastfuncstuff.laminar.pipeline import CurveDetail, RoiFit, condition_blocks, curve_pair
+from fastfuncstuff.laminar.plots import plot_curves, plot_null, plot_roi, plot_summary
 
 pytest.importorskip("matplotlib")
 
@@ -45,6 +45,45 @@ def fake_fit(name="V1", hemi="lh", seed=0, warn=False):
 def test_the_roi_page_renders(tmp_path):
     out = plot_roi(fake_fit(), tmp_path / "roi.png", ("std", "dev"))
     assert (tmp_path / "roi.png").stat().st_size > 20_000 and out.endswith("roi.png")
+
+
+def _with_detail(fit, steps=4):
+    fit.detail = CurveDetail(
+        k=fit.W.shape[0], y_obs=fit.y_obs, W=fit.W, W_inv=np.linalg.pinv(fit.W),
+        y_fine=np.repeat(fit.y_hat, steps, axis=0), steps_per_scan=steps, stalled=False,
+    )  # fmt: skip
+    return fit
+
+
+def test_the_curves_page_draws_five_panels(tmp_path, monkeypatch):
+    import matplotlib.figure as mf
+
+    seen = {}
+    savefig = mf.Figure.savefig
+
+    def spy(self, *a, **kw):
+        seen["n"] = len(self.axes)
+        return savefig(self, *a, **kw)
+
+    monkeypatch.setattr(mf.Figure, "savefig", spy)
+    plot_curves(_with_detail(fake_fit()), tmp_path / "c.png", ("std", "dev"))
+    assert seen["n"] == 5 and (tmp_path / "c.png").stat().st_size > 20_000
+    with pytest.raises(ValueError):
+        plot_curves(fake_fit(), tmp_path / "bad.png")
+
+
+def test_curve_pair_reads_each_condition_on_its_own_grid():
+    """The second window may be longer than the first, and rows is what says so."""
+    fit = _with_detail(fake_fit())
+    fit.rows[:] = False
+    fit.rows[1:8] = True
+    fit.rows[29:34] = True
+    assert condition_blocks(fit.rows) == [(1, 8), (29, 34)]
+    a, b = curve_pair(fit, 0), curve_pair(fit, 1)
+    assert a["measured"].shape[0] == 7 and b["measured"].shape[0] == 5
+    assert a["t_fine"][-1] == pytest.approx(a["t_knots"][-1])
+    assert b["t_fine"][-1] == pytest.approx(b["t_knots"][-1])
+    assert np.array_equal(b["fit"][0], fit.detail.y_fine[29 * 4])
 
 
 def test_the_page_marks_a_warned_fit_and_missing_data_is_a_plain_error(tmp_path):

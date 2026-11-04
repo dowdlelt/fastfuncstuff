@@ -22,6 +22,7 @@ Nothing here reads or writes files except :func:`write_results`.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,24 @@ def reference_p0() -> P0:
 
 def depth_names(n: int) -> list[str]:
     return list(DEPTH_NAMES) if n == 3 else [f"depth{i}" for i in range(n)]
+
+
+#: How finely the fitted curves are drawn. The data have one sample per knot (one TR);
+#: the model has a value at every microtime step, so it can show the shape between them.
+CURVE_STEP_SECONDS = 0.25
+
+
+@dataclass
+class CurveDetail:
+    """The best model at the finest K, for the figure of curves before and after deveining."""
+
+    k: int
+    y_obs: np.ndarray  # (n_scans, K) the padded input, percent change
+    W: np.ndarray  # (K, N)
+    W_inv: np.ndarray  # (N, K)
+    y_fine: np.ndarray  # (n_scans * steps_per_scan, K) the fit between the knots
+    steps_per_scan: int
+    stalled: bool
 
 
 @dataclass
@@ -86,6 +105,23 @@ class RoiFit:
     kernels: dict | None = None  # {K: depth PSF (K,K) or (L,) or None}
     stalled: np.ndarray | None = None  # (n_models, n_K) "converged" on rejected steps
     warnings: list = field(default_factory=list)
+    detail: CurveDetail | None = None
+
+
+def _curve_detail(data: LaminarData, res, kernel, ikw: dict, stalled: bool = False) -> CurveDetail:
+    from fastfuncstuff.laminar.devein import laminar_impulse_response, static_deveining_matrix
+    from fastfuncstuff.laminar.integrate import integrate
+
+    spec = data.spec
+    # At least two microtime bins per step: the integrator reads one state per bin.
+    steps = max(1, min(math.ceil(spec.TR / CURVE_STEP_SECONDS), int(spec.TR / (2 * spec.dt))))
+    fine = integrate(data.u, res.Ep, spec, int(data.y.shape[0]) * steps, kernel=kernel, **ikw)
+    ir = laminar_impulse_response(spec, res.Ep, n_scans=20, amplitude=1.0, kernel=kernel, **ikw)
+    W, W_inv = static_deveining_matrix(ir, mode="auc")
+    return CurveDetail(
+        k=spec.K, y_obs=data.y.numpy().copy(), W=W.numpy(), W_inv=W_inv.numpy(),
+        y_fine=fine.numpy().copy(), steps_per_scan=steps, stalled=bool(stalled),
+    )  # fmt: skip
 
 
 def _time_constants(spec, Ep: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -111,6 +147,7 @@ def fit_roi(
     hyper_from_rows: bool = False,
     rescue: int = 0,
     free: Sequence[str] = (),
+    detail: bool = False,
     roi: str = "",
     name: str = "",
     hemi: str = "",
@@ -179,6 +216,12 @@ def fit_roi(
     fid = deveining_fidelity(ir, spec0, res0.Ep, mode="auc")
     stalled = np.array([[bool(r.stalled) for r in runs] for runs in per_k])
     warnings = _warnings(names, list(targets), F, stalled, ks, rescue)
+    curves = None
+    if detail:
+        last = data_for_k[ks[-1]]
+        curves = _curve_detail(
+            last, per_k[best][-1], kernels.get(ks[-1]), ikw, stalled=bool(stalled[best, -1])
+        )
     return RoiFit(
         roi=roi, name=name, hemi=hemi, k_values=ks, models=list(names), targets=list(targets),
         F=F, per_k_F=np.array([[float(f) for f in a.per_k_F] for a in averaged]),
@@ -190,7 +233,7 @@ def fit_roi(
         y_obs=first.y.numpy().copy(), y_hat=res0.y_pred.numpy().copy(), rows=rows.copy(),
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
         kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
-        stalled=stalled, warnings=warnings,
+        stalled=stalled, warnings=warnings, detail=curves,
     )  # fmt: skip
 
 
@@ -307,6 +350,41 @@ def profile_pair(fit: RoiFit, which: int) -> tuple[np.ndarray, np.ndarray]:
     return measured, deveined
 
 
+def condition_blocks(rows: np.ndarray) -> list[tuple[int, int]]:
+    """``(start, stop)`` of each fitted stretch, one per condition, in scan rows. From the
+    mask rather than the block length, because the two windows may differ."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], np.asarray(rows, int), [0]])))
+    return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2], strict=True)]
+
+
+def curve_pair(fit: RoiFit, which: int) -> dict[str, np.ndarray]:
+    """One condition's curves at the finest K, measured and deveined, both in percent and
+    superficial first: the data at its knots and the fit between them.
+
+    The deveining is :func:`~fastfuncstuff.laminar.devein.local_contribution` at each time
+    point, the same operator as the depth profile. It is static, so it corrects amplitude
+    and leaves the vein's transit delay in the time course.
+    """
+    from fastfuncstuff.laminar.devein import local_contribution
+
+    d = fit.detail
+    if d is None:
+        raise ValueError("this fit kept no curves; fit_roi(detail=True) keeps them")
+    start, stop = condition_blocks(fit.rows)[which]
+    m = d.steps_per_scan
+    knots = d.y_obs[start:stop]
+    line = d.y_fine[start * m : (stop - 1) * m + 1]
+    tr = float(fit.meta["TR"])
+    return {
+        "t_knots": np.arange(len(knots)) * tr,
+        "t_fine": np.arange(len(line)) * tr / m,
+        "measured": knots,
+        "measured_deveined": local_contribution(d.W, knots, d.W_inv),
+        "fit": line,
+        "fit_deveined": local_contribution(d.W, line, d.W_inv),
+    }
+
+
 def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = None) -> list[str]:
     """Tidy tables, one line per ROI x (model | neuronal depth | measured depth | time):
 
@@ -322,6 +400,8 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
       condition and neuronal depth, from event onset;
     * ``{prefix}_laminar_profiles.tsv`` -- the peak depth profile per condition, measured
       and deveined, BOTH in percent signal change: what the figure's profile panel draws;
+    * ``{prefix}_laminar_curves.tsv`` -- with ``-plots``, the fit and its deveined version
+      between the knots, per condition and depth, at the finest K;
     * ``{prefix}_laminar.json`` -- how it was run.
     """
     paths = [
@@ -393,6 +473,23 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
                         f"{meas[i]:.6g}\t{dev[i]:.6g}\t{meas[i] - dev[i]:.6g}\n"
                     )
 
+    if any(f.detail is not None for f in fits):
+        paths.append(f"{prefix}_laminar_curves.tsv")
+        with open(paths[-1], "w") as fh:
+            fh.write("roi\tname\themi\tcondition\tK\ttime\tdepth\tfit_pct\tdeveined_pct\n")
+            for f in fits:
+                if f.detail is None:
+                    continue
+                k = f.detail.k
+                for which in (0, 1):
+                    c = curve_pair(f, which)
+                    for t, row, dev in zip(c["t_fine"], c["fit"], c["fit_deveined"], strict=True):
+                        for i in range(k):  # array index 0 is superficial; depth K is pial
+                            fh.write(
+                                f"{f.roi}\t{f.name}\t{f.hemi}\t{which + 1}\t{k}\t{t:.6g}\t"
+                                f"{k - i}\t{row[i]:.6g}\t{dev[i]:.6g}\n"
+                            )
+
     doc = {
         "tool": "ffs_laminar",
         "rois": [
@@ -415,7 +512,10 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
 
 __all__ = [
     "REFERENCE_P0",
+    "CurveDetail",
     "RoiFit",
+    "condition_blocks",
+    "curve_pair",
     "depth_names",
     "fit_roi",
     "profile_pair",

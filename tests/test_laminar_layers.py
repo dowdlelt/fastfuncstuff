@@ -266,6 +266,34 @@ def test_freeing_adaptation_recovers_an_undershoot_the_fixed_model_cannot_fit():
     assert freed.F > fixed.F
 
 
+@pytest.mark.slow  # 33s: compiles the integrator at two sample counts
+def test_fine_curves_pass_through_the_fit_at_its_knots():
+    """The fine grid must land on the fit's own samples, or the drawn line sits off the
+    data by a fraction of a TR: sample_indices is one bin different for a wrong offset."""
+    from types import SimpleNamespace
+
+    from fastfuncstuff.laminar.devein import local_contribution
+    from fastfuncstuff.laminar.io import DepthCurves, two_condition_data
+    from fastfuncstuff.laminar.pipeline import _curve_detail
+
+    times = np.arange(9) * 1.85
+    values = np.exp(-((times - 5) ** 2) / 6)[:, None] * np.linspace(0.7, 1.8, 7)[None]
+    c = DepthCurves(times=times, values=values, roi="1", name="r", hemi="lh")
+    d = two_condition_data(c, c, duration=1.0, delay_seconds=0.0)
+    pE = faes_priors(d.spec, (0, 0, 0)).pE
+    detail = _curve_detail(d, SimpleNamespace(Ep=pE), None, d.integrate_kwargs)
+    coarse = integrate(d.u, pE, d.spec, int(d.y.shape[0]), **d.integrate_kwargs).numpy()
+    assert detail.steps_per_scan > 1
+    # ULP tolerance: both routes go through a compiled kernel.
+    np.testing.assert_allclose(
+        detail.y_fine[:: detail.steps_per_scan], coarse, rtol=1e-6, atol=1e-6
+    )
+    # A time axis on the operator is the same operator at each time.
+    many = local_contribution(detail.W, coarse[:5], detail.W_inv)
+    one = np.stack([local_contribution(detail.W, r, detail.W_inv) for r in coarse[:5]])
+    np.testing.assert_allclose(many, one, rtol=1e-12, atol=1e-12)
+
+
 def test_null_model_has_fewer_free_parameters():
     spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
     counts = [int((vec(faes_priors(spec, t).pC) > 0).sum()) for t in layer_model_targets(3)]

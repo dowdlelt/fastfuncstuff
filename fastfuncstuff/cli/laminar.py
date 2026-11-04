@@ -481,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
 
         jobs = build(one, two)
         n_real = len(jobs)
+        for job in jobs:  # the null replicates draw no curves
+            job[4]["detail"] = args.plots
         null_pairs = _null_tables(args, ks)
         for one_n, two_n in null_pairs:
             jobs.extend(build(one_n, two_n))
@@ -534,12 +536,13 @@ def main(argv: list[str] | None = None) -> int:
 
         written.extend(write_null(args.prefix, fits, nulls_by_roi))
     if args.plots:
-        from fastfuncstuff.laminar.plots import plot_roi, plot_summary
+        from fastfuncstuff.laminar.plots import plot_curves, plot_roi, plot_summary
 
         conds = tuple(args.conds) if args.conds else ("cond 1", "cond 2")
         for f in fits:
             tag = f"{f.name}_{f.hemi}".replace("/", "-").replace(" ", "_")
             written.append(plot_roi(f, f"{args.prefix}_laminar_{tag}.png", conds))
+            written.append(plot_curves(f, f"{args.prefix}_laminar_{tag}_curves.png", conds))
             if nulls_by_roi.get((f.roi, f.hemi)):
                 from fastfuncstuff.laminar.plots import plot_null
 
