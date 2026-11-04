@@ -21,6 +21,7 @@ be percent signal change (``ffs_deconvolve``'s default since it scales; not with
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -115,11 +116,28 @@ class LaminarData:
     meta: dict = field(default_factory=dict)
 
 
+def _duration_pair(duration: float | Sequence[float]) -> tuple[float, float]:
+    """``(baseline, test)`` event lengths from one value or two."""
+    if isinstance(duration, (int, float)):
+        pair = (float(duration), float(duration))
+    else:
+        vals = [float(v) for v in duration]
+        if len(vals) == 1:
+            pair = (vals[0], vals[0])
+        elif len(vals) == 2:
+            pair = (vals[0], vals[1])
+        else:
+            raise ValueError(f"duration takes one value or two, got {len(vals)}")
+    if min(pair) <= 0:
+        raise ValueError(f"event durations must be positive, got {pair}")
+    return pair
+
+
 def two_condition_data(
     first: DepthCurves,
     second: DepthCurves,
     *,
-    duration: float,
+    duration: float | Sequence[float],
     n_neuronal: int = 3,
     gap: int = 20,
     noise_sd: float = 0.1,
@@ -134,7 +152,8 @@ def two_condition_data(
 ) -> LaminarData:
     """Faes et al.'s design from two conditions' curves of one ROI.
 
-    ``duration`` (s) is the event the curves respond to. The scan interval of the
+    ``duration`` (s) is the event the curves respond to -- one value, or
+    ``(baseline, test)`` when the conditions' events differ. The scan interval of the
     model is the curves' own sample spacing (the TENT knot spacing), which must be
     uniform and the same for both. ``delay_seconds`` is where in each sample the
     prediction is read: TENT knots sit at exact times after the event, so 0 by
@@ -170,7 +189,7 @@ def two_condition_batch(
     second: np.ndarray,
     times: np.ndarray,
     *,
-    duration: float,
+    duration: float | Sequence[float],
     n_neuronal: int = 3,
     gap: int = 20,
     noise_sd: float = 0.1,
@@ -187,6 +206,11 @@ def two_condition_batch(
     ``(B, n_scans, K)``; ``u``, ``rows`` and ``spec`` are shared, as
     :func:`~fastfuncstuff.laminar.batched.variational_laplace_batched` wants. Every
     region gets the same padding draw, as separate calls with one seed would.
+
+    ``duration`` is the length of the events the curves respond to: one value for
+    both, or ``(baseline, test)`` when the two conditions' events differ. The
+    modulatory input of ``modulation="event"`` follows the TEST event's own length,
+    since that is the event it modulates.
 
     ``modulation`` is when the modulatory input is on, relative to the second event:
     ``"event"`` (default) for the whole event, which is what a condition difference
@@ -223,8 +247,9 @@ def two_condition_batch(
     onset_a = tr  # the event on the first response sample
     onset_b = (block + gap + 1) * tr
     n_micro = int(round(y.shape[1] * tr / spec.dt))
+    dur_first, dur_test = _duration_pair(duration)
     if modulation == "event":
-        m_start, m_dur = 0.0, float(duration)
+        m_start, m_dur = 0.0, dur_test
     elif modulation == "reference":
         m_start, m_dur = tr - 0.1, 0.1
     elif isinstance(modulation, str):
@@ -236,7 +261,8 @@ def two_condition_batch(
     if m_dur <= 0:
         raise ValueError("the modulatory input needs a positive duration")
     u = build_input(
-        spec, [[onset_b + m_start], [onset_a, onset_b]], [[m_dur], [duration, duration]], n_micro
+        spec, [[onset_b + m_start], [onset_a, onset_b]], [[m_dur], [dur_first, dur_test]],
+        n_micro,
     )
     kwargs = {} if delay_seconds is None else {"delay_seconds": float(delay_seconds)}
     return LaminarData(

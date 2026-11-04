@@ -336,22 +336,152 @@ def test_single_step_chooses_its_own_lambda_and_reports_the_cells(tmp_path, caps
     assert meta["argv"] and "-duration" not in argv
 
 
-def test_differing_event_durations_are_refused_not_averaged(tmp_path):
-    """The model drives baseline and test with one duration, so two conditions with
-    different event lengths cannot be represented; say so instead of picking one."""
+@pytest.mark.slow  # 45s: one CLI run
+def test_differing_event_durations_drive_the_two_events_separately(tmp_path):
+    """Phase 3: the compared conditions' events may differ in length. Each side of a
+    comparison drives its own event, taken from the events themselves."""
+    import json
+
     from fastfuncstuff.cli import laminascope
 
     runs, events, _ = _write_runs(tmp_path)
-    for ev in events:  # make 'test' events twice as long
+    for ev in events:  # 'test' events are twice as long as 'base'
         lines = open(ev).read().splitlines()
         out = [lines[0]]
         for ln in lines[1:]:
-            o, d, lab = ln.split("\t")
-            out.append(f"{o}\t{2.0 if lab == 'test' else 1.0}\t{lab}")
+            onset, _dur, lab = ln.split("\t")
+            out.append(f"{onset}\t{2.0 if lab == 'test' else 1.0}\t{lab}")
         open(ev, "w").write("\n".join(out) + "\n")
+
+    out = str(tmp_path / "D")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "0", str((N_KNOTS - 1) * TR),
+        "-tent_lambda", "3.0", "-polort", "1", *_common(tmp_path), "-prefix", out,
+    ]) == 0  # fmt: skip
+    meta = json.load(open(f"{out}.json"))
+    assert meta["durations"]["ab"] == [1.0, 2.0], "the events' own lengths should reach the model"
+
+    # An explicit -duration still wins, and one value still means both.
+    out2 = str(tmp_path / "E")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "0", str((N_KNOTS - 1) * TR),
+        "-duration", "1.5", "-tent_lambda", "3.0", "-polort", "1",
+        *_common(tmp_path), "-prefix", out2,
+    ]) == 0  # fmt: skip
+    # Recorded as the pair actually used, so the provenance says what drove each event.
+    assert json.load(open(f"{out2}.json"))["durations"]["ab"] == [1.5, 1.5]
+
+
+def test_averaging_conditions_of_different_lengths_is_refused(tmp_path):
+    """A comparison side may average several labels, but averaging events of
+    different lengths gives a curve that is not a response to any one event."""
+    from fastfuncstuff.cli import laminascope
+
+    runs, events, _ = _write_runs(tmp_path)
+    for ev in events:  # split 'base' into two labels of different lengths
+        lines = open(ev).read().splitlines()
+        out, n = [lines[0]], 0
+        for ln in lines[1:]:
+            onset, _dur, lab = ln.split("\t")
+            if lab == "base":
+                n += 1
+                out.append(f"{onset}\t{1.0 if n % 2 else 3.0}\tbase{1 if n % 2 else 2}")
+            else:
+                out.append(f"{onset}\t1.0\t{lab}")
+        open(ev, "w").write("\n".join(out) + "\n")
+
     rc = laminascope.main([
         "-input", *runs, "-events", *events, "-window", "0", str((N_KNOTS - 1) * TR),
-        "-tent_lambda", "3.0", "-polort", "1", *_common(tmp_path),
-        "-prefix", str(tmp_path / "D"),
+        "-tent_lambda", "3.0", "-polort", "1",
+        *[a if a != "base" else "base1,base2" for a in _common(tmp_path)],
+        "-prefix", str(tmp_path / "F"),
     ])  # fmt: skip
     assert rc == 1
+
+
+def _write_three_condition_runs(tmp_path, n_runs=2, n_tp=70, seed=7):
+    """Three conditions, the third interleaved close enough to the other two that
+    leaving it out of the design contaminates their curves."""
+    import nibabel as nib
+
+    _surf, aff, shape3, xyz, r, (r_w, r_p) = _ribbon(tmp_path)
+    depth = np.clip((r - r_w) / (r_p - r_w), 0, 1)
+    in_ribbon = (r > r_w - 2.0) & (r < r_p + 2.0)
+    t = np.arange(N_KNOTS) * TR
+    hrf = (t / 5.0) ** 2 * np.exp(-(t - 5.0) / 1.5) * (t > 0)
+    hrf = hrf / hrf.max()
+    onsets = {
+        "base": np.array([6.0, 48.0, 90.0]),
+        "test": np.array([20.0, 62.0, 104.0]),
+        # Close behind every other event, so its response overlaps theirs.
+        "other": np.array([12.0, 26.0, 54.0, 68.0, 96.0, 110.0]),
+    }
+    gain = {"base": 1.0, "test": 1.4, "other": 2.0}
+    rng = np.random.default_rng(seed)
+    files, evs = [], []
+    for run in range(n_runs):
+        series = np.zeros((*shape3, n_tp), np.float64)
+        rows = []
+        for lab, ons in onsets.items():
+            amp = (0.5 + depth) * gain[lab] * in_ribbon
+            for o in ons:
+                for j, h in enumerate(hrf):
+                    tp = int(round((o + j * TR) / TR))
+                    if 0 <= tp < n_tp:
+                        series[..., tp] += amp * h
+                rows.append((o, lab))
+        series = 1000.0 * (1.0 + 0.01 * series)
+        series += 0.5 * rng.standard_normal(series.shape)
+        img = nib.Nifti1Image(series.astype(np.float32), aff)
+        img.header.set_zooms((2.0, 2.0, 2.0, TR))
+        path = tmp_path / f"t{run + 1}.nii.gz"
+        nib.save(img, path)
+        files.append(str(path))
+        ev = tmp_path / f"t{run + 1}_events.tsv"
+        ev.write_text(
+            "onset\tduration\ttrial_type\n"
+            + "".join(f"{o}\t1.0\t{lab}\n" for o, lab in sorted(rows))
+        )
+        evs.append(str(ev))
+    resp = (in_ribbon & (xyz[..., 2] > 0.0)).astype(np.float32)
+    nib.save(nib.Nifti1Image(resp, aff), tmp_path / "resp.nii.gz")
+    return files, evs
+
+
+@pytest.mark.slow  # 60s: two CLI runs
+def test_conditions_outside_the_comparison_are_still_modelled(tmp_path):
+    """Every condition in the events file gets its own TENT columns, whether or not a
+    comparison names it. It has to: its response overlaps the compared ones, so
+    leaving it out of the design pushes its variance into their curves. The laminar
+    stage then takes only the two the comparison asks for -- modelled, not of
+    interest."""
+    import json
+
+    from fastfuncstuff.cli import laminascope
+
+    runs, events = _write_three_condition_runs(tmp_path)
+    shared = [
+        "-input", *runs, "-events", *events, "-window", "0", str((N_KNOTS - 1) * TR),
+        "-tent_lambda", "0.5", "-polort", "1", *_common(tmp_path),
+    ]  # fmt: skip
+
+    full = str(tmp_path / "G")
+    assert laminascope.main([*shared, "-prefix", full]) == 0
+    # Three conditions x knots in the task block, though only two are compared.
+    assert json.load(open(f"{full}.json"))["durations"] == {"ab": [1.0, 1.0]}
+
+    # The same fit with the third condition dropped from the design entirely.
+    ignored = str(tmp_path / "H")
+    assert laminascope.main([*shared, "-event_ignore", "other", "-prefix", ignored]) == 0
+
+    zf, zi = np.load(f"{full}_columns.npz"), np.load(f"{ignored}_columns.npz")
+    assert np.array_equal(zf["fitted"], zi["fitted"])
+    # The compared conditions' curves move when 'other' is left out: that difference
+    # IS the contamination, so modelling it is not optional. Measured 55-60% of peak
+    # on this fixture (overlapping events at a 2 s TR).
+    base_f, base_i = zf["ab_baseline_K6"], zi["ab_baseline_K6"]
+    rel = np.abs(base_i - base_f).max() / np.abs(base_f).max()
+    assert rel > 0.05, (
+        f"dropping an overlapping condition changed the compared curves by only "
+        f"{rel:.1%}; the fixture is not exercising the contamination it claims to"
+    )

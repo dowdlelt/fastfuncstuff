@@ -79,8 +79,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "PREFIX_depth_psf.tsv (the measured PSF, used unless another PSF is chosen).")  # fmt: skip
     g.add_argument("-conds", nargs=2, default=None, metavar=("COND1", "COND2"),
                    help="With -fit_prefix: the two conditions' names, baseline first.")  # fmt: skip
-    g.add_argument("-duration", type=float, required=True, metavar="SEC",
-                   help="Duration of the event the curves respond to (s).")  # fmt: skip
+    g.add_argument("-duration", type=float, required=True, nargs="+", metavar="SEC",
+                   help="Duration of the events the curves respond to (s): one value, or "
+                   "two (BASELINE TEST) when the two conditions' events differ in length. "
+                   "With -modulation event the modulatory input follows the TEST event.")  # fmt: skip
     g.add_argument("-roi", nargs="+", default=None, metavar="ROI",
                    help="ROIs to fit, by id or name (default: every ROI in every table).")  # fmt: skip
     g.add_argument("-hemi", default=None, choices=("lh", "rh"),

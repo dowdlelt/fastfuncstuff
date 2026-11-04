@@ -78,9 +78,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Seconds after onset of the first and last curve sample (deconvolve's "
                    "-window). With -input this sets the TENT knots; one window for every "
                    "condition, so the curves share a time axis as the model needs.")  # fmt: skip
-    g.add_argument("-duration", type=float, default=None, metavar="SEC",
-                   help="Duration of the events the curves respond to (s). With -input it "
-                   "defaults to the events' own duration when they agree.")  # fmt: skip
+    g.add_argument("-duration", type=float, default=None, nargs="+", metavar="SEC",
+                   help="Duration of the events the curves respond to (s): one value, or two "
+                   "(BASELINE TEST) when the compared conditions' events differ in length. "
+                   "With -input it defaults to the events' own durations. With -modulation "
+                   "event the modulatory input follows the TEST event's length.")  # fmt: skip
     g.add_argument("-spec", default=None, metavar="TOML",
                    help="Comparisons to fit: [[comparison]] tables with name, baseline, test "
                    "(a label, a glob or a list, averaged) and optional models.")  # fmt: skip
@@ -296,27 +298,37 @@ def _resolve_timing(args, say):
     return timing, input_files
 
 
-def _event_duration(args, timing, used: list[str], labels: list[str]) -> float:
-    """The stimulus duration the laminar model drives both events with.
-
-    One scalar: the model's two-condition design gives baseline and test the same
-    duration, so differing ones cannot be represented yet and are refused rather
-    than silently averaged.
-    """
-    if args.duration is not None:
-        return float(args.duration)
+def _event_durations(timing, labels: list[str]) -> dict[str, float]:
+    """Each condition's own event length, from the events that defined it."""
     if not timing.durations_given:
         raise ValueError("-onsets without durations in the files: give -duration")
-    want = {lab: float(timing.durations[labels.index(lab)]) for lab in used}
-    spread = max(want.values()) - min(want.values())
-    if spread > 1e-6:
-        raise ValueError(
-            "the compared conditions have different event durations ("
-            + ", ".join(f"{lab} {d:g}s" for lab, d in sorted(want.items()))
-            + "); the laminar model drives both events with one duration, so give "
-            "-duration explicitly to choose it"
-        )
-    return next(iter(want.values()))
+    return {lab: float(timing.durations[labels.index(lab)]) for lab in labels}
+
+
+def _comparison_duration(cmp, args, per_label: dict[str, float] | None) -> list[float]:
+    """``[baseline, test]`` event lengths for one comparison.
+
+    A comparison's sides may each average several labels, so a side is only
+    well defined when its labels share a duration -- averaged curves of events of
+    different lengths are not a response to any one event.
+    """
+    if args.duration is not None:
+        given = [float(v) for v in args.duration]
+        return given * 2 if len(given) == 1 else given
+    if per_label is None:
+        raise ValueError("give -duration with -iresp_prefix (the curves do not carry it)")
+    out = []
+    for side, labs in (("baseline", cmp.baseline), ("test", cmp.test)):
+        vals = {lab: per_label[lab] for lab in labs}
+        if max(vals.values()) - min(vals.values()) > 1e-6:
+            raise ValueError(
+                f"comparison {cmp.name}: its {side} averages conditions whose events differ "
+                "in length ("
+                + ", ".join(f"{k} {v:g}s" for k, v in sorted(vals.items()))
+                + "); the averaged curve is not a response to one event, so give -duration"
+            )
+        out.append(next(iter(vals.values())))
+    return out
 
 
 def _iresp_cells(args, files, used, reads, columns, ks, shape3, n_t):
@@ -445,7 +457,6 @@ def _fit_cells(args, timing, input_files, reads, columns, ks, times, labels, use
         if good.any():
             say(f"  K={k}: effective knots {np.median(out.edf[k][good]):.1f} of {n_task}, "
                 f"median R2 {np.nanmedian(out.r2[k][good]):.3f}")  # fmt: skip
-    args.duration = _event_duration(args, timing, used, labels)
     return out
 
 
@@ -635,18 +646,27 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         0.5 * (np.asarray(surfaces[int(h)].white[v]) + np.asarray(surfaces[int(h)].pial[v]))
         for h, v in zip(columns.centre_surface, columns.centre_vertex, strict=True)
     ])  # fmt: skip
+    # Each condition's own event length, so a comparison whose two sides differ can
+    # drive the two events of the model differently.
+    per_label = _event_durations(timing, labels) if args.input else None
+    if args.duration is not None and len(args.duration) not in (1, 2):
+        raise ValueError(f"-duration takes one value or two, got {len(args.duration)}")
+
     results = {}
     out_npz: dict[str, np.ndarray] = {}
+    durations_used: dict[str, list[float]] = {}
     for cmp in comps:
         names = cmp.models or all_names
         targets = [all_targets[all_names.index(mm)] for mm in names]
+        duration = _comparison_duration(cmp, args, per_label)
+        durations_used[cmp.name] = duration
         data_for_k, kern_for_k = {}, {}
         for k in ks:
             base = np.mean([col_curves[k][lab][fit_idx] for lab in cmp.baseline], axis=0)
             test = np.mean([col_curves[k][lab][fit_idx] for lab in cmp.test], axis=0)
             data_for_k[k] = two_condition_batch(
                 base.transpose(0, 2, 1), test.transpose(0, 2, 1), times,
-                duration=args.duration, n_neuronal=args.N, gap=args.pad_rows,
+                duration=duration, n_neuronal=args.N, gap=args.pad_rows,
                 noise_sd=args.pad_sd, seed=args.pad_seed, delay_seconds=0.0,
                 TE=args.TE, B0=args.B0, p0=reference_p0(), modulation=modulation,
             )  # fmt: skip
@@ -656,8 +676,10 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                 kern_for_k[k] = None
             out_npz[f"{cmp.name}_baseline_K{k}"] = base
             out_npz[f"{cmp.name}_test_K{k}"] = test
+        dur_note = (f"{duration[0]:g} s" if duration[0] == duration[1]
+                    else f"{duration[0]:g} s baseline / {duration[1]:g} s test")  # fmt: skip
         say(f"\n{cmp.name}: {' + '.join(cmp.test)}  vs  {' + '.join(cmp.baseline)}  "
-            f"({len(names)} models x K {ks} x {fit_idx.size:,} columns)")  # fmt: skip
+            f"({len(names)} models x K {ks} x {fit_idx.size:,} columns, events {dur_note})")  # fmt: skip
         t0 = time.time()
         fits = fit_columns(data_for_k, kern_for_k, targets=targets, names=names,
                            free_energy=args.free_energy, max_iter=args.max_iter,
@@ -707,12 +729,13 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         json.dump({
             "tool": "ffs_laminascope", "argv": sys.argv,
             **({"input": input_files, "events": args.events, "onsets": args.onsets,
-                "window": list(args.window), "duration": args.duration, "tr": float(times[1] - times[0]),
+                "window": list(args.window), "durations": durations_used,
+                "tr": float(times[1] - times[0]),
                 "log10_lambda": cell.log10_lambda, "cell_lambda": args.cell_lambda,
                 "smooth_penalty": args.smooth_penalty, "polort": args.polort,
                 "do_scale": args.do_scale}
                if args.input else {"iresp": {lab: files[lab] for lab in used},
-                                   "window": list(args.window), "duration": args.duration}),
+                                   "window": list(args.window), "durations": durations_used}),
             "comparisons": [vars(c) for c in comps], "K": ks, "columns": columns.n_columns,
             "fitted": int(fit_idx.size), "radius_mm": columns.radius_mm,
             "spacing_mm": columns.spacing_mm, "depth_method": opts.method, "psf": args.psf,

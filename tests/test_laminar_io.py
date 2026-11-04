@@ -124,3 +124,39 @@ def test_modulation_defaults_to_the_event_and_keeps_the_reference_pulse():
     torch.testing.assert_close(span.u, ev.u)
     # The driving input is untouched.
     torch.testing.assert_close(ref.u[:, 1], ev.u[:, 1])
+
+
+def test_two_conditions_can_have_different_event_lengths():
+    """The driving input carries each event's own length, and -modulation event
+    follows the TEST event, since that is the event it modulates."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    times = np.arange(10) * 1.0
+    curves = np.zeros((1, times.size, 3))
+    one = two_condition_batch(curves, curves, times, duration=1.0, gap=4)
+    pair = two_condition_batch(curves, curves, times, duration=(1.0, 4.0), gap=4)
+    scalar_as_list = two_condition_batch(curves, curves, times, duration=[1.0], gap=4)
+
+    # One value and a one-element list mean the same thing.
+    assert torch.equal(one.u, scalar_as_list.u)
+    # u is (n_micro, 2): modulatory first, then driving (both events).
+    drive_one, drive_pair = one.u[:, 1], pair.u[:, 1]
+    assert drive_pair.sum() > drive_one.sum(), "the longer test event should drive for longer"
+    # The baseline event is unchanged; only the test event grew.
+    half = drive_one.numel() // 2
+    assert torch.equal(drive_pair[:half], drive_one[:half])
+    # -modulation event follows the test event's own length.
+    assert pair.u[:, 0].sum() > one.u[:, 0].sum()
+    # ... and equals the test event's own boxcar when they coincide.
+    assert pair.u[:, 0].sum() == pytest.approx(float(drive_pair[half:].sum()), rel=1e-6)
+
+
+def test_duration_pair_is_validated():
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    times = np.arange(10) * 1.0
+    curves = np.zeros((1, times.size, 3))
+    with pytest.raises(ValueError, match="one value or two"):
+        two_condition_batch(curves, curves, times, duration=(1.0, 2.0, 3.0), gap=4)
+    with pytest.raises(ValueError, match="must be positive"):
+        two_condition_batch(curves, curves, times, duration=(1.0, 0.0), gap=4)
