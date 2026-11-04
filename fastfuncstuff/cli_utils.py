@@ -948,8 +948,9 @@ def load_and_preprocess_runs(
             verbose=verbose,
         )
 
-        if verbose and scale_info["n_violations"] > 0:
-            print(f"    ⚠️  {scale_info['n_violations']} voxels had scaling violations")
+        # scale_to_percent_signal already printed the counts; n_violations is a
+        # TIMEPOINT total, so repeating it as a voxel count said 745,171 voxels of
+        # 595,917. The voxel count it meant is n_voxels_with_violations.
 
     # Create result
     result = LoadResult(
