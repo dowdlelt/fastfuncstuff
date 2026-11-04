@@ -82,6 +82,32 @@ LOWERS self-inhibition).  gate is 1 where the column responded at all, was read
 whole, and its fit was sound; it is 0 or NaN everywhere else, and it is the
 tool's own verdict, printed as a count when the maps are written.
 
+THE SENTENCE THE MAPS SUPPORT
+
+For one gated location, read five numbers and say this:
+
+  "In gender vs fixate, this column responded at 1.8% peak; the conditions
+   differed with 1,000:1 evidence over no difference (logBF 7); the modulation
+   was at the SUPERFICIAL depth (p 1.00, and 0.39 middle, 0.39 deep); it was
+   POSITIVE, B = +0.92 Hz against a self-inhibition of sigma Hz, i.e. gender
+   lowered that depth's self-inhibition -- more recurrent excitation, a larger
+   neuronal response -- by 0.92 of the 1/s units sigma is in; the best single
+   model was 'superficial', which won only p_best 0.38 of the posterior, so the
+   DEPTH statement is the marginal, not the winner."
+
+That is the whole content: WHERE (which column), WHETHER (logBF over null),
+WHICH DEPTH (p_<depth>), WHICH WAY AND HOW MUCH (B in Hz, on self-inhibition),
+and HOW SURE the single best story is (p_best).  There is no "what the effect
+was" beyond that: the model has one modulatory parameter per depth and it enters
+as the depth's self-inhibition, so "gender differed from fixate here" can only
+come out as "the neuronal gain at this depth changed by B".  Attention,
+adaptation and sharper tuning are indistinguishable in it.
+
+The winner brick is a DEPTH BITMASK, not a model number: bit 1 superficial,
+2 middle, 4 deep, so 5 = superficial+deep, 7 = all three, 0 = null.  The legend
+is printed when the maps are written and sits in the .gii metadata
+(winner_bits).  The per-column TSV spells the name out instead.
+
 Two bricks are NOT thresholds, however statistical they look.  logBF_vs_null is
 high nearly everywhere there is a response -- median 24.5 nats over 903 real
 columns, where 3 nats is the conventional floor -- because "these conditions
@@ -1208,10 +1234,22 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
         "no stalled or failed fit); mask every other map with it")  # fmt: skip
     vert, n_cov = col.paint_vertices(columns, per_column, valid)
     winner, agree = col.vertex_winner(columns, best_full, len(fits.models), valid)
-    vmaps = np.concatenate([vert, winner[:, None].astype(float), agree[:, None], n_cov[:, None]], 1)
+    # The winner is painted as a BITMASK over depths, not as the model's index in a list:
+    # a volume carries no legend, so an index is unreadable in any viewer, while bit 2^i
+    # per modulated depth is self-describing and arithmetic (5 = superficial+deep, and
+    # "superficial modulated" is simply bit 0 set).
+    bits = np.array([sum(1 << i for i, d in enumerate(dnames) if d in m.split("+"))
+                     for m in fits.models])  # fmt: skip
+    win_bits = np.where(winner >= 0, bits[np.clip(winner, 0, None)], np.nan)
+    say("  winner brick is a depth bitmask: "
+        + ", ".join(f"{1 << i}={d}" for i, d in enumerate(dnames))
+        + f" (so {sum(1 << i for i in range(len(dnames)))}=all, 0=null)")  # fmt: skip
+    vmaps = np.concatenate([vert, win_bits[:, None], agree[:, None], n_cov[:, None]], 1)
     vnames = names + ["winner", "agreement", "n_columns"]
     meta_base = {"tool": "ffs_laminascope", "comparison": cmp.name, "maps": ",".join(vnames),
-                 "winner_models": ",".join(fits.models)}  # fmt: skip
+                 "winner_models": ",".join(fits.models),
+                 "winner_bits": ",".join(f"{b}={m}" for b, m in zip(bits, fits.models, strict=True)),
+                 "depths": ",".join(dnames)}  # fmt: skip
     for h, s in enumerate(surfaces):
         if not np.any(columns.vertex_surface == h):
             continue
