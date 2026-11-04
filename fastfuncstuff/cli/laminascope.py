@@ -66,6 +66,31 @@ and {prefix}_columns.npz (columns, their curves and PSFs, every fit), {prefix}.j
 
 
 _EPILOG = """\
+START HERE: FOUR BRICKS, ONE MASK
+
+Mask every map with the 'gate' brick and read two others.  Nothing below this
+paragraph is needed to look at a result:
+
+    R=myprefix_gender_vs_fixate_ribbon.nii.gz
+    3dcalc -a "$R[gate]" -b "$R[p_superficial]" -expr 'a*b' -prefix p_sup.nii.gz
+    3dcalc -a "$R[gate]" -b "$R[B_superficial]" -expr 'a*b' -prefix B_sup.nii.gz
+
+p_<depth> is P(this depth is modulated), 0 to 1, marginal over the whole model
+space -- the map to threshold, at 0.75 or 0.95 as you would any posterior
+probability.  B_<depth> is how much, and its sign says which way (positive B
+LOWERS self-inhibition).  gate is 1 where the column responded at all, was read
+whole, and its fit was sound; it is 0 or NaN everywhere else, and it is the
+tool's own verdict, printed as a count when the maps are written.
+
+Two bricks are NOT thresholds, however statistical they look.  logBF_vs_null is
+high nearly everywhere there is a response -- median 24.5 nats over 903 real
+columns, where 3 nats is the conventional floor -- because "these conditions
+differ at SOME depth" is almost always true once a column responds at all.  It
+rules things out, it does not select.  And p_best is how narrowly ONE of 2^N
+hypotheses won: 0.3 is a near-tie, and its median on those same columns was 0.5.
+Neither is a p-value, and no voxel-wise correction is valid here (the columns
+overlap by construction -- see WHAT NOT TO BELIEVE).
+
 WHERE THE MAPS EXIST, AND WHERE THEY DO NOT
 
 The painted extent is NOT the -responsive mask.  Centres are placed so every
@@ -115,19 +140,21 @@ column, so a zero fill would make "no column here" unreadable against "no effect
 here".  n_columns is the exception and keeps its 0: that is a real count, and
 n_columns > 0 is the coverage mask if your viewer wants one.
 
-READING THE MAPS
+READING THE MAPS: WHAT THE GATE IS MADE OF
 
-Every map and every line of {prefix}_NAME_columns.tsv is one column's whole model
-space, so there is no one number to threshold.  Gate in this order -- each step
-decides whether the next one is about physiology or about noise.
+The 'gate' brick is steps 1-3 below, already applied; this is what it asserts and
+how to tighten it.  Each step decides whether the next one is about physiology or
+about noise.
 
 1. IS THERE A RESPONSE?  baseline_peak (percent, the peak of the depth-averaged
    baseline curve).  A column with no response gives the model nothing to
    explain and its B is noise however confidently flagged -- measured: an atlas
-   region with no event response still produced flagged depths.  This is the
-   first gate and the one most worth setting from your own distribution, since
-   it is in percent and therefore interpretable.  Judging a laminar effect in
-   tissue that did not respond is the commonest way to read this tool wrong.
+   region with no event response still produced flagged depths.  -gate_baseline
+   sets it (default 0.5%) and it is the one worth setting from your own
+   distribution, since it is in percent and therefore interpretable; on 903 real
+   columns the percentiles were 0.10 / 0.37 / 0.69 / 1.00 / 1.40.  Judging a
+   laminar effect in tissue that did not respond is the commonest way to read
+   this tool wrong.
 
 2. WAS THE COLUMN READ?  in_fov, the share of its ribbon inside the mask/FOV.
    A slab cuts V1 and V2 in half; a cut depth profile is not a shallow profile,
@@ -149,12 +176,13 @@ decides whether the next one is about physiology or about noise.
                     winner explains.
 
 4. IS THERE ANY MODULATION AT ALL?  logBF_vs_null, the best model's evidence over
-   the null.  The conventional log-Bayes-factor reading applies: ~3 nats is about
-   20:1, the usual floor for interpreting a difference.  Below it the honest
-   statement is "no evidence these conditions differ at any depth", and the depth
-   probabilities are a decomposition of nothing.  This is the closest thing to a
-   statistical threshold the tool has -- and it is a convention, not a
-   calibration measured on this data.
+   the null.  The conventional reading applies -- ~3 nats is about 20:1 -- and
+   below it the honest statement is "no evidence these conditions differ at any
+   depth".  But it is a floor, not a selector: on 903 real columns its median was
+   24.5 nats and it removed only 52 of the 547 that passed steps 1-3, so a map of
+   it looks significant everywhere and says almost nothing.  It is left out of
+   'gate' for that reason; add it (ispositive(logBF_vs_null-3)) if you want the
+   published convention stated explicitly.
 
 5. ONLY THEN, WHERE.  Prefer p_<depth> -- P(depth modulated), marginalised over
    the whole model space -- to the winner map.  The winner is one of 2^N
@@ -355,6 +383,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     c.add_argument("-min_coverage", type=float, default=0.99, metavar="FRAC",
                    help="Skip columns whose depth bins were read less than this inside the "
                    "data (FOV edge, mask): the model cannot fit a cut profile.")  # fmt: skip
+    c.add_argument("-gate_baseline", type=float, default=0.5, metavar="PCT",
+                   help="Peak baseline response, in percent signal change, below which a column "
+                   "fails the 'gate' brick of the maps.  Nothing is skipped and no other output "
+                   "changes: the fit still runs and is still written, because the cost of a "
+                   "column is paid before this is known.  0 passes every fitted column.  A "
+                   "column with no response gives the model nothing to explain, so its depth "
+                   "probabilities are a decomposition of noise -- set this from your own "
+                   "baseline_peak distribution (0.5 kept 587 of 903 real columns).")  # fmt: skip
     c.add_argument("-max_columns", type=int, default=None, metavar="N",
                    help="Fit a random N of the columns (a quick look).")  # fmt: skip
     c.add_argument("-seed", type=int, default=0, help="Seed of the cover order and -max_columns.")
@@ -1005,7 +1041,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         baseline_peak = base_mid.mean(1).max(1)
         _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
                           depth_names(args.N), device, say, in_fov=in_fov[fit_idx],
-                          baseline_peak=baseline_peak)  # fmt: skip
+                          baseline_peak=baseline_peak, gate_baseline=args.gate_baseline)  # fmt: skip
         _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say,
                     in_fov=in_fov[fit_idx], baseline_peak=baseline_peak)  # fmt: skip
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
@@ -1123,7 +1159,7 @@ def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say, *, in_
 
 
 def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
-                      dnames, device, say, *, in_fov, baseline_peak) -> None:  # fmt: skip
+                      dnames, device, say, *, in_fov, baseline_peak, gate_baseline) -> None:  # fmt: skip
     """The per-column maps and table.
 
     ``baseline_peak`` (percent, the depth-averaged baseline curve's peak) and ``in_fov``
@@ -1149,14 +1185,27 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
     null = fits.models.index("null") if "null" in fits.models else None
     log_bf = (full(np.max(fits.F, 1) - fits.F[:, null]) if null is not None
               else np.full(n_cols, np.nan))  # fmt: skip
+    # ONE brick to mask with.  The gating order was documented and nobody could apply it:
+    # assembling four bricks by hand in 3dcalc is a different skill from reading a map, and
+    # the thresholds are the tool's own claims, not the reader's.  So the tool states them.
+    bp_full, fov_full = full(baseline_peak), full(np.asarray(in_fov, float))
+    sound = np.zeros(n_cols, bool)
+    sound[fit_idx] = ~(fits.stalled.any((1, 2)) | fits.failed.any((1, 2)))
+    gate = (valid & sound & (bp_full >= gate_baseline) & (fov_full >= 0.9)
+            & (full(fits.nesting) <= 3.0))  # fmt: skip
     per_column = np.concatenate(
         [full(fits.p_depth), full(fits.B_mean), full(fits.B_p), p_best[:, None],
-         log_bf[:, None], full(fits.r2.max(1))[:, None], full(baseline_peak)[:, None],
-         full(np.asarray(in_fov, float))[:, None], full(fits.nesting)[:, None]], axis=1,
+         log_bf[:, None], full(fits.r2.max(1))[:, None], bp_full[:, None],
+         fov_full[:, None], full(fits.nesting)[:, None],
+         np.where(valid, gate, np.nan)[:, None]], axis=1,
     )  # fmt: skip
     names = ([f"p_{d}" for d in dnames] + [f"B_{d}" for d in dnames]
              + [f"PB_{d}" for d in dnames]
-             + ["p_best", "logBF_vs_null", "r2", "baseline_peak", "in_fov", "nesting_nats"])  # fmt: skip
+             + ["p_best", "logBF_vs_null", "r2", "baseline_peak", "in_fov", "nesting_nats",
+                "gate"])  # fmt: skip
+    say(f"  gate: {int(gate.sum()):,} of {fit_idx.size:,} fitted column(s) pass "
+        f"(baseline_peak >= {gate_baseline:g}%, in_fov >= 0.9, nesting <= 3 nats, "
+        "no stalled or failed fit); mask every other map with it")  # fmt: skip
     vert, n_cov = col.paint_vertices(columns, per_column, valid)
     winner, agree = col.vertex_winner(columns, best_full, len(fits.models), valid)
     vmaps = np.concatenate([vert, winner[:, None].astype(float), agree[:, None], n_cov[:, None]], 1)
@@ -1192,7 +1241,7 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
                  + "\t".join(f"p_{mm}" for mm in fits.models) + "\t"
                  + "\t".join(f"p_mod_{d}\tB_{d}\tB_sd_{d}\tPB_{d}" for d in dnames)
                  + "\tr2_best\ts_d\tbaseline_peak\tin_fov\tlogBF_vs_null"
-                 + "\tstalled\tfailed\tnesting_nats\n")  # fmt: skip
+                 + "\tstalled\tfailed\tnesting_nats\tgate\n")  # fmt: skip
         for j, c in enumerate(fit_idx):
             b = int(fits.best[j])
             fh.write(
@@ -1204,7 +1253,7 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
                 + f"\t{fits.r2[j, max(b, 0)]:.4g}\t{fits.s_d[j]:.4g}\t"
                 f"{baseline_peak[j]:.4g}\t{in_fov[j]:.4g}\t{log_bf[c]:.4g}\t"
                 f"{int(fits.stalled[j].any())}\t"
-                f"{int(fits.failed[j].any())}\t{fits.nesting[j]:.3g}\n"
+                f"{int(fits.failed[j].any())}\t{fits.nesting[j]:.3g}\t{int(gate[c])}\n"
             )  # fmt: skip
     say(f"  wrote {tsv}")
     if n_bad := int((fits.nesting > 10).sum()):

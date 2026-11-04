@@ -83,6 +83,13 @@ def test_the_tool_runs_on_a_sphere_and_paints_back(tmp_path):
     assert data.shape == (len(v), len(names)) and "agreement" in names
     covered = data[:, names.index("n_columns")]
     assert np.nanmax(covered) >= 1 and np.isnan(covered).any()  # painted where columns are
+    # The gate is the one brick a reader masks with, so it has to BE a mask: 0/1 on the
+    # columns and NaN off them, never a third value to wonder about.
+    g = data[:, names.index("gate")]
+    on = np.isfinite(covered) & (covered > 0)
+    assert np.isin(g[on], (0.0, 1.0)).all(), "the gate must be a mask, not a score"
+    assert np.isnan(g[~on]).all(), "off the columns the gate must be NaN, not a passing 0"
+    assert g[on].any(), "a responding sphere should leave something to look at"
     p_sup = data[:, names.index("p_superficial")]
     ok = np.isfinite(p_sup)
     assert ok.any() and ((p_sup[ok] >= 0) & (p_sup[ok] <= 1)).all()

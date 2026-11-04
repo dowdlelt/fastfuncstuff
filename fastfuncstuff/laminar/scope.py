@@ -268,14 +268,17 @@ def fit_columns(
             d.spec, faes_priors(d.spec, target), d.u, d.y[idx.cpu()], rows=d.rows,
             kernel=kern, max_iter=max_iter, hyper_from_rows=hyper_from_rows,
             device=device, rescue=rescue,
-            # OPEN QUESTION, measured but not resolved: this is where the time goes.  On
-            # real columns a refit touched 4.5% of them and cost 63% of the comparison's
-            # fitting time, because the subset re-inverts at its OWN bucketed width -- a
-            # fresh ~20 s static compile, charged once per model x K.  Passing
-            # width_rows=d.y.shape[0] would reuse the batch's compiled kernel instead, but
-            # 33 rows padded to an 8192-wide kernel is past the host-bound plateau
-            # (batch_bucket's docstring: it breaks near 128) and may cost MORE arithmetic
-            # than the compile it saves.  Needs a GPU A/B before it is turned on.
+            # Deliberately at the subset's OWN width, not the batch's.  Refits are where
+            # the time goes -- half of a real comparison's fitting time for 10% of its
+            # columns -- but the A/B says the width is not why.  Measured on an RTX 5070
+            # Ti, K=9, float64, 32 iterations: the first call at a new width costs ~13 s
+            # of compile, every call padded to the batch's 8192 costs ~9 s MORE than one
+            # at its own 16-512, and dynamo caches the width, so reuse (width_rows=) wins
+            # only for a width used exactly once.  What actually costs is that a 1-row
+            # inversion costs ~26 s against a 903-row one's ~54 s: the step is host-bound,
+            # so a tiny refit pays nearly a full batch.  The fix is fewer refit CALLS
+            # (one inversion carrying several models' subsets, or starting from the full
+            # model's integrable posterior so it converges in a few steps), not a width.
             **d.integrate_kwargs,
         )  # fmt: skip
         timing[f"{label}/K{k}"] = timing.get(f"{label}/K{k}", 0.0) + time.perf_counter() - t0
