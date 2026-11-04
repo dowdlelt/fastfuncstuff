@@ -74,10 +74,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="PREFIX of voxel curve files PREFIX_iresp_<label>.nii[.gz|.zst], from "
                    "ffs_deconvolve with a LINEAR estimator (-tent-smooth global or a fixed "
                    "lambda). Mutually exclusive with -input, which fits the curves here.")  # fmt: skip
-    g.add_argument("-window", type=float, nargs=2, required=True, metavar=("BOT", "TOP"),
-                   help="Seconds after onset of the first and last curve sample (deconvolve's "
-                   "-window). With -input this sets the TENT knots; one window for every "
-                   "condition, so the curves share a time axis as the model needs.")  # fmt: skip
+    g.add_argument("-window", nargs="+", default=None, metavar="WINDOW",
+                   help="Seconds after onset of the first and last curve sample, as "
+                   "ffs_deconvolve's -window: '0 14' or '0,14' (every condition), or "
+                   "'0,14 0,24' (one per condition, in -labels / trial_type order). A 3 s and "
+                   "a 10 s stimulus need different lengths of response, and the two blocks are "
+                   "then fitted at their own lengths. BOT must be 0: the model puts the event "
+                   "on the first sample. With -input and no -window, each condition's window is "
+                   "estimated from its own event duration.")  # fmt: skip
     g.add_argument("-duration", type=float, default=None, nargs="+", metavar="SEC",
                    help="Duration of the events the curves respond to (s): one value, or two "
                    "(BASELINE TEST) when the compared conditions' events differ in length. "
@@ -298,11 +302,92 @@ def _resolve_timing(args, say):
     return timing, input_files
 
 
+def _resolve_windows(args, labels: list[str], tr: float | None, per_label, n_file, say):
+    """Each condition's knot grid, seconds after its own onset.
+
+    Per-condition windows are the point: a 3 s and a 10 s stimulus need different
+    lengths of response. BOT must be 0 for every condition -- the model places the
+    event on the response's first sample, so a later start would be modelled as if
+    it began at the onset (see laminar/io.py:_scan_interval).
+
+    ``tr`` is the knot spacing when we are choosing the knots (``-input``). With
+    ``-iresp_prefix`` it is ``None`` and ``n_file`` maps each label to its file's
+    sample count; the spacing then comes from the longest window over its own file's
+    samples. Reading it from the header would be wrong as well as fragile -- the
+    header carries the data's TR, which is the knot spacing only when deconvolve put
+    one knot per TR, and ffs_deconvolve does not always write one at all.
+    """
+    from fastfuncstuff.design.hrf import compute_windows_from_durations, parse_tent_windows
+
+    if args.window is not None:
+        windows = parse_tent_windows(args.window, len(labels))
+        if tr is None:
+            # The condition with the longest window: its file is never shorter than
+            # its own window, so it fixes the spacing for all of them.
+            i_long = max(range(len(labels)), key=lambda i: windows[i][1])
+            n_long = n_file[labels[i_long]]
+            if n_long < 3:
+                raise ValueError(f"{labels[i_long]}: {n_long} curve sample(s); that is not a curve")
+            tr = windows[i_long][1] / (n_long - 1)
+        # Positional against the condition order, as ffs_deconvolve's -window is, and
+        # that order is trial_type's (alphabetical) unless -labels set it. Said out
+        # loud every time: giving the long condition the short window truncates its
+        # response, and nothing downstream can notice.
+        if len({w for w in windows}) > 1:
+            say("Windows as given, per condition: " + ", ".join(
+                f"{lab} 0-{top:g} s" for lab, (_b, top) in zip(labels, windows, strict=True)))  # fmt: skip
+    elif per_label is not None:
+        windows = compute_windows_from_durations([per_label[lab] for lab in labels], tr)
+        say("Windows from the events' own durations: " + ", ".join(
+            f"{lab} {per_label[lab]:g} s event -> 0-{top:g} s"
+            for lab, (_bot, top) in zip(labels, windows, strict=True)))  # fmt: skip
+    else:
+        raise ValueError("give -window (the curves do not carry it)")
+    assert tr is not None  # -input always has one; the iresp route derived it above
+
+    out = {}
+    for lab, (bot, top) in zip(labels, windows, strict=True):
+        if abs(bot) > 1e-6 * max(tr, 1.0):
+            raise ValueError(
+                f"condition {lab}: -window starts at {bot:g} s, but the model puts the event on "
+                "the response's first sample; use a window that starts at 0"
+            )
+        n = int(round((top - bot) / tr)) + 1
+        if n < 3:
+            raise ValueError(
+                f"condition {lab}: window 0-{top:g} s is only {n} knot(s) at TR {tr:g}; "
+                "the laminar model needs a curve"
+            )
+        out[lab] = np.linspace(0.0, bot + (n - 1) * tr, n)
+    return out
+
+
 def _event_durations(timing, labels: list[str]) -> dict[str, float]:
     """Each condition's own event length, from the events that defined it."""
     if not timing.durations_given:
         raise ValueError("-onsets without durations in the files: give -duration")
     return {lab: float(timing.durations[labels.index(lab)]) for lab in labels}
+
+
+def _comparison_times(cmp, times: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """``(baseline, test)`` sample grids for one comparison.
+
+    The two SIDES may differ -- that is the point of per-condition windows -- but the
+    labels averaged within one side must share a window, or there is no grid their
+    mean is sampled on.
+    """
+    out = []
+    for side, labs in (("baseline", cmp.baseline), ("test", cmp.test)):
+        widths = {lab: len(times[lab]) for lab in labs}
+        if len(set(widths.values())) > 1:
+            raise ValueError(
+                f"comparison {cmp.name}: its {side} averages conditions sampled over "
+                "different windows ("
+                + ", ".join(f"{k} {v} knots" for k, v in sorted(widths.items()))
+                + "); give one -window for them, or compare them separately"
+            )
+        out.append(times[labs[0]])
+    return out[0], out[1]
 
 
 def _comparison_duration(cmp, args, per_label: dict[str, float] | None) -> list[float]:
@@ -331,9 +416,17 @@ def _comparison_duration(cmp, args, per_label: dict[str, float] | None) -> list[
     return out
 
 
-def _iresp_cells(args, files, used, reads, columns, ks, shape3, n_t):
+def _iresp_cells(args, files, used, reads, columns, ks, shape3, times):
     """Column x depth curves by averaging per-voxel fits -- exact only because the
-    curves came from a linear estimator (see -iresp_prefix)."""
+    curves came from a linear estimator (see -iresp_prefix).
+
+    With per-condition windows ffs_deconvolve writes each condition at its OWN
+    length, so the files legitimately differ; requiring one length is what used to
+    refuse them. Its per-voxel-window branch instead pads every condition to the
+    longest window, so a file may also be longer than its window asks for -- the
+    extra samples are zeros and are trimmed, since they would otherwise enter the
+    model as a response that returns to baseline and holds.
+    """
     from fastfuncstuff.io.afni import load_nifti
     from fastfuncstuff.laminar import columns as col
 
@@ -341,21 +434,27 @@ def _iresp_cells(args, files, used, reads, columns, ks, shape3, n_t):
     for lab in used:
         img = load_nifti(files[lab])
         arr = np.asanyarray(img.dataobj)
-        if tuple(arr.shape[:3]) != shape3 or (arr.shape[3] if arr.ndim > 3 else 1) != n_t:
-            raise ValueError(f"{files[lab]}: grid or curve length differs from {files[used[0]]}")
-        curves_vox[lab] = np.asarray(arr.reshape(-1, n_t)[reads.voxels], np.float64)
+        n_lab = arr.shape[3] if arr.ndim > 3 else 1
+        keep = len(times[lab])
+        if tuple(arr.shape[:3]) != shape3:
+            raise ValueError(f"{files[lab]}: grid {arr.shape[:3]} is not {shape3}")
+        if n_lab < keep:
+            raise ValueError(f"{files[lab]}: {n_lab} sample(s), but its window asks for {keep}")
+        curves_vox[lab] = np.asarray(arr.reshape(-1, n_lab)[reads.voxels][:, :keep], np.float64)
         del arr, img
 
+    # Conditions may now have different lengths, so each is mixed on its own.
     col_curves, coverage, psfs = {}, {}, {}
     for k in ks:
-        stack = np.stack([curves_vox[lab] for lab in used], axis=-1)  # (V, T, L)
-        cc = col.column_curves(reads, columns, stack, k)
-        col_curves[k] = {lab: cc.values[..., i] for i, lab in enumerate(used)}
-        coverage[k], psfs[k] = cc.coverage, cc.psf
+        col_curves[k] = {}
+        for lab in used:
+            cc = col.column_curves(reads, columns, curves_vox[lab], k)
+            col_curves[k][lab] = cc.values
+            coverage[k], psfs[k] = cc.coverage, cc.psf
     return col_curves, coverage, psfs
 
 
-def _fit_cells(args, timing, input_files, reads, columns, ks, times, labels, used,
+def _fit_cells(args, timing, input_files, reads, columns, ks, times, labels,
                affine, shape3, device, say):  # fmt: skip
     """Mix the voxel timeseries into column x depth cells and fit each cell once."""
     import torch
@@ -394,20 +493,22 @@ def _fit_cells(args, timing, input_files, reads, columns, ks, times, labels, use
         f"(TR {tr:g}, {len(n_tp_per_run)} run(s), {time.time() - t0:.0f} s)")  # fmt: skip
     rows = cl.rows_for_reads(reads, load.mask_flat)
 
-    # The knot grid is the window at the data's TR; one window for every condition so
-    # the curves share a time axis, which is what two_condition_batch needs.
-    n_knots = len(times)
-    if abs((times[1] - times[0]) - tr) > 1e-6 * max(tr, 1.0):
-        raise ValueError(
-            f"-window {args.window[0]:g} {args.window[1]:g} gives {n_knots} knots spaced "
-            f"{times[1] - times[0]:g} s, but the data's TR is {tr:g} s"
-        )
+    # Each condition's knots are its own window at the data's TR.
+    widths = {lab: len(times[lab]) for lab in labels}
+    for lab in labels:
+        spacing = float(times[lab][1] - times[lab][0])
+        if abs(spacing - tr) > 1e-6 * max(tr, 1.0):
+            raise ValueError(
+                f"condition {lab}: the window gives knots spaced {spacing:g} s, but the "
+                f"data's TR is {tr:g} s"
+            )
     offset = args.microtime_offset
     if offset is None:
         offset = 0.0
     task = build_per_run_task_designs(
         timing.all_onsets, n_tp_per_run, tr, basis="TENT",
-        condition_labels=labels, fir_window_s=[(times[0], times[-1])] * len(labels),
+        condition_labels=labels,
+        fir_window_s=[(float(times[lab][0]), float(times[lab][-1])) for lab in labels],
         microtime_offset=float(offset), device=cpu,
     )  # fmt: skip
     n_task = task.per_run[0].shape[1]
@@ -439,10 +540,13 @@ def _fit_cells(args, timing, input_files, reads, columns, ks, times, labels, use
         design[sl, n_task + i * n_nuis : n_task + i * n_nuis + nuis_per_run[i].shape[1]] = (
             nuis_per_run[i]
         )
-    say(f"Design: {n_task} task column(s) ({len(labels)} x {n_knots} knots), "
-        f"{n_nuis * len(n_tp_per_run)} nuisance (polort {degrees})")  # fmt: skip
+    say(f"Design: {n_task} task column(s) ("
+        + ", ".join(f"{lab} {w}" for lab, w in widths.items())
+        + f" knots), {n_nuis * len(n_tp_per_run)} nuisance (polort {degrees})")  # fmt: skip
 
-    penalty = penalty_matrix(args.smooth_penalty, [n_knots] * len(labels), [tr] * len(labels))
+    penalty = penalty_matrix(
+        args.smooth_penalty, [widths[lab] for lab in labels], [tr] * len(labels)
+    )
     t0 = time.time()
     out = cl.fit_cell_curves(
         load.data, rows, reads, columns, ks, design, n_task, penalty, labels, times,
@@ -524,18 +628,24 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
     ref = load_nifti(input_files[0] if args.input else files[used[0]])
     affine = np.asarray(ref.affine, np.float64)
     shape3 = tuple(int(n) for n in ref.shape[:3])
-    if args.input:
-        # The knots are ours to choose, so the time axis is the window, not the file.
-        tr_hint = float(args.tr) if args.tr else _header_tr(ref)
-        n_t = int(round((args.window[1] - args.window[0]) / tr_hint)) + 1
-        if n_t < 3:
-            raise ValueError(
-                f"-window {args.window[0]:g} {args.window[1]:g} is only {n_t} knot(s) at "
-                f"TR {tr_hint:g}; the laminar model needs a curve"
+    # Each condition's own event length, so a comparison whose sides differ can drive
+    # the model's two events differently and sample them over different windows.
+    per_label = _event_durations(timing, labels) if args.input else None
+    n_file = (
+        {}
+        if args.input
+        else {
+            lab: (
+                int(load_nifti(files[lab]).shape[3]) if len(load_nifti(files[lab]).shape) > 3 else 1
             )
-    else:
-        n_t = int(ref.shape[3]) if len(ref.shape) > 3 else 1
-    times = np.linspace(args.window[0], args.window[1], n_t)
+            for lab in labels
+        }
+    )
+    # The knots are ours to choose with -input; with -iresp_prefix every file was
+    # written at the LONGEST window and zero-padded, so a condition's own window
+    # selects its real knots out of that padding, at the spacing those files imply.
+    tr_hint = (float(args.tr) if args.tr else _header_tr(ref)) if args.input else None
+    times = _resolve_windows(args, labels, tr_hint, per_label, n_file, say)
     mask = None
     if args.mask:
         mask = np.asanyarray(load_nifti(args.mask).dataobj).reshape(shape3) != 0
@@ -599,7 +709,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
                 for c in np.flatnonzero(cut)))  # fmt: skip
 
     if args.input:
-        cell = _fit_cells(args, timing, input_files, reads, columns, ks, times, labels, used,
+        cell = _fit_cells(args, timing, input_files, reads, columns, ks, times, labels,
                           affine, shape3, device, say)  # fmt: skip
         col_curves, coverage, psfs = cell.curves, cell.coverage, cell.psf
         logs += cell.notes
@@ -607,7 +717,7 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             say(f"  {note}")
     else:
         col_curves, coverage, psfs = _iresp_cells(
-            args, files, used, reads, columns, ks, shape3, n_t
+            args, files, used, reads, columns, ks, shape3, times
         )
 
     cov_ok = np.all([coverage[k].min(1) >= args.min_coverage for k in ks], axis=0)
@@ -628,7 +738,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         f"(coverage < {args.min_coverage:g})")  # fmt: skip
     if fit_idx.size == 0:
         raise ValueError("no column has complete depth coverage")
-    big = float(np.nanmax(np.abs(np.stack([col_curves[ks[0]][lab][fit_idx] for lab in used]))))
+    # Per condition: with per-condition windows they have different lengths.
+    big = max(float(np.nanmax(np.abs(col_curves[ks[0]][lab][fit_idx]))) for lab in used)
     if big > 50:
         raise ValueError(
             "curves look like data units, not percent change (fit without -dont_scale)"
@@ -646,9 +757,6 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         0.5 * (np.asarray(surfaces[int(h)].white[v]) + np.asarray(surfaces[int(h)].pial[v]))
         for h, v in zip(columns.centre_surface, columns.centre_vertex, strict=True)
     ])  # fmt: skip
-    # Each condition's own event length, so a comparison whose two sides differ can
-    # drive the two events of the model differently.
-    per_label = _event_durations(timing, labels) if args.input else None
     if args.duration is not None and len(args.duration) not in (1, 2):
         raise ValueError(f"-duration takes one value or two, got {len(args.duration)}")
 
@@ -660,12 +768,13 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         targets = [all_targets[all_names.index(mm)] for mm in names]
         duration = _comparison_duration(cmp, args, per_label)
         durations_used[cmp.name] = duration
+        t_base, t_test = _comparison_times(cmp, times)
         data_for_k, kern_for_k = {}, {}
         for k in ks:
             base = np.mean([col_curves[k][lab][fit_idx] for lab in cmp.baseline], axis=0)
             test = np.mean([col_curves[k][lab][fit_idx] for lab in cmp.test], axis=0)
             data_for_k[k] = two_condition_batch(
-                base.transpose(0, 2, 1), test.transpose(0, 2, 1), times,
+                base.transpose(0, 2, 1), test.transpose(0, 2, 1), (t_base, t_test),
                 duration=duration, n_neuronal=args.N, gap=args.pad_rows,
                 noise_sd=args.pad_sd, seed=args.pad_seed, delay_seconds=0.0,
                 TE=args.TE, B0=args.B0, p0=reference_p0(), modulation=modulation,
@@ -678,6 +787,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
             out_npz[f"{cmp.name}_test_K{k}"] = test
         dur_note = (f"{duration[0]:g} s" if duration[0] == duration[1]
                     else f"{duration[0]:g} s baseline / {duration[1]:g} s test")  # fmt: skip
+        if len(t_base) != len(t_test):
+            dur_note += f", windows 0-{t_base[-1]:g} / 0-{t_test[-1]:g} s"
         say(f"\n{cmp.name}: {' + '.join(cmp.test)}  vs  {' + '.join(cmp.baseline)}  "
             f"({len(names)} models x K {ks} x {fit_idx.size:,} columns, events {dur_note})")  # fmt: skip
         t0 = time.time()
@@ -721,21 +832,29 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         centre_vertex=columns.centre_vertex, members_data=m.data, members_indices=m.indices,
         members_indptr=m.indptr, members_shape=np.asarray(m.shape),
         vertex_surface=columns.vertex_surface, vertex_id=columns.vertex_id,
-        surfaces=np.asarray([s.name for s in surfaces]), fitted=fit_idx, times=times,
-        ks=np.asarray(ks), **{f"coverage_K{k}": coverage[k] for k in ks},
-        **{f"psf_K{k}": psfs[k] for k in ks if psfs[k] is not None}, **out_npz,
+        surfaces=np.asarray([s.name for s in surfaces]), fitted=fit_idx,
+        labels=np.asarray(labels), ks=np.asarray(ks),
+        **{f"times_{lab}": times[lab] for lab in labels},
+        **{f"coverage_K{k}": coverage[k] for k in ks},
+        **{f"psf_K{k}": psfs[k] for k in ks if psfs[k] is not None},
+        # Kept for readers written against one shared grid; absent when they differ.
+        **({"times": times[labels[0]]}
+           if len({len(t) for t in times.values()}) == 1 else {}),
+        **out_npz,
     )  # fmt: skip
     with open(f"{args.prefix}.json", "w") as fh:
         json.dump({
             "tool": "ffs_laminascope", "argv": sys.argv,
             **({"input": input_files, "events": args.events, "onsets": args.onsets,
-                "window": list(args.window), "durations": durations_used,
-                "tr": float(times[1] - times[0]),
+                "windows": {lab: [0.0, float(t[-1])] for lab, t in times.items()},
+                "durations": durations_used, "tr": tr_hint,
                 "log10_lambda": cell.log10_lambda, "cell_lambda": args.cell_lambda,
                 "smooth_penalty": args.smooth_penalty, "polort": args.polort,
                 "do_scale": args.do_scale}
                if args.input else {"iresp": {lab: files[lab] for lab in used},
-                                   "window": list(args.window), "durations": durations_used}),
+                                   "windows": {lab: [0.0, float(t[-1])]
+                                               for lab, t in times.items()},
+                                   "durations": durations_used}),
             "comparisons": [vars(c) for c in comps], "K": ks, "columns": columns.n_columns,
             "fitted": int(fit_idx.size), "radius_mm": columns.radius_mm,
             "spacing_mm": columns.spacing_mm, "depth_method": opts.method, "psf": args.psf,

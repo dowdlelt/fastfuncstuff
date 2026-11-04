@@ -16,6 +16,7 @@ the amplitudes, which are the measurement.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,10 +30,10 @@ class CellCurves:
     """What :func:`fit_cell_curves` hands the laminar model, shaped as the iresp
     route's ``col_curves`` / ``coverage`` / ``psfs`` so the downstream is identical."""
 
-    curves: dict[int, dict[str, np.ndarray]]  # K -> label -> (C, K, n_knots)
+    curves: dict[int, dict[str, np.ndarray]]  # K -> label -> (C, K, that label's n_knots)
     coverage: dict[int, np.ndarray]  # K -> (C, K)
     psf: dict[int, np.ndarray | None]  # K -> (C, K, K)
-    times: np.ndarray  # (n_knots,) seconds after onset
+    times: dict[str, np.ndarray]  # label -> (its n_knots,) seconds after onset
     labels: list[str]
     log10_lambda: float
     edf: dict[int, np.ndarray]  # K -> (C * K,) effective knots per cell
@@ -62,8 +63,13 @@ def rows_for_reads(reads, mask_flat: np.ndarray) -> np.ndarray:
     return rows
 
 
-def _condition_slices(n_knots: int, n_conditions: int) -> list[slice]:
-    return [slice(i * n_knots, (i + 1) * n_knots) for i in range(n_conditions)]
+def _condition_slices(n_knots: Sequence[int]) -> list[slice]:
+    """Where each condition's knots sit in the task block, at its own width."""
+    out, start = [], 0
+    for n in n_knots:
+        out.append(slice(start, start + n))
+        start += n
+    return out
 
 
 def fit_cell_curves(
@@ -76,7 +82,7 @@ def fit_cell_curves(
     n_task: int,
     penalty: np.ndarray,
     labels: list[str],
-    times: np.ndarray,
+    times: Mapping[str, np.ndarray],
     run_starts: list[int],
     *,
     lam: float | None = None,
@@ -108,11 +114,14 @@ def fit_cell_curves(
             "vertex maps and the group tables compare."
         )
     notes: list[str] = []
-    n_knots = len(times)
-    if n_task != n_knots * len(labels):
+    missing = [lab for lab in labels if lab not in times]
+    if missing:
+        raise ValueError(f"no sample grid for condition(s) {missing}")
+    widths = [len(times[lab]) for lab in labels]
+    if n_task != sum(widths):
         raise ValueError(
-            f"{n_task} task columns do not divide into {len(labels)} conditions of "
-            f"{n_knots} knots; per-condition windows are not supported yet"
+            f"{n_task} task columns do not add up to the conditions' knot counts "
+            f"{dict(zip(labels, widths, strict=True))}"
         )
 
     # Voxel timeseries in read order, float64 for the mixing (a weighted mean over
@@ -150,7 +159,7 @@ def fit_cell_curves(
     psf: dict[int, np.ndarray | None] = {}
     edf: dict[int, np.ndarray] = {}
     r2: dict[int, np.ndarray] = {}
-    sl = _condition_slices(n_knots, len(labels))
+    sl = _condition_slices(widths)
     for k in ks:
         cc = cells[k]
         n_c = cc.values.shape[0]
@@ -173,5 +182,6 @@ def fit_cell_curves(
         edf[k], r2[k] = this_edf, this_r2
         cells[k] = None  # type: ignore[assignment]  # the mixed timeseries can go
 
-    return CellCurves(curves, coverage, psf, np.asarray(times, np.float64), list(labels),
+    return CellCurves(curves, coverage, psf, {lab: np.asarray(times[lab], np.float64)
+                      for lab in labels}, list(labels),
                       float(np.log10(max(lam, 1e-300))), edf, r2, notes)  # fmt: skip

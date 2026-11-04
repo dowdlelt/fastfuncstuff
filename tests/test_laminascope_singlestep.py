@@ -485,3 +485,176 @@ def test_conditions_outside_the_comparison_are_still_modelled(tmp_path):
         f"dropping an overlapping condition changed the compared curves by only "
         f"{rel:.1%}; the fixture is not exercising the contamination it claims to"
     )
+
+
+def _write_mixed_duration_runs(tmp_path, n_runs=2, n_tp=90, seed=11):
+    """Two conditions whose stimuli are 3 s and 10 s long, so their responses need
+    windows of different lengths."""
+    import nibabel as nib
+
+    _surf, aff, shape3, xyz, r, (r_w, r_p) = _ribbon(tmp_path)
+    depth = np.clip((r - r_w) / (r_p - r_w), 0, 1)
+    in_ribbon = (r > r_w - 2.0) & (r < r_p + 2.0)
+    spec = {"short": (3.0, np.array([8.0, 70.0, 132.0]), 1.0),
+            "long": (10.0, np.array([32.0, 94.0, 156.0]), 1.3)}  # fmt: skip
+    rng = np.random.default_rng(seed)
+    files, evs = [], []
+    for run in range(n_runs):
+        series = np.zeros((*shape3, n_tp), np.float64)
+        rows = []
+        for lab, (dur, onsets, gain) in spec.items():
+            # A boxcar of the stimulus length convolved with a canonical-ish HRF, so a
+            # 10 s stimulus genuinely needs a longer window than a 3 s one.
+            t = np.arange(0.0, dur + 26.0, TR)
+            h = (t / 5.0) ** 2 * np.exp(-(t - 5.0) / 1.5) * (t > 0)
+            box = np.ones(max(1, int(round(dur / TR))))
+            kern = np.convolve(h / h.max(), box)[: t.size]
+            kern = kern / kern.max()
+            amp = (0.5 + depth) * gain * in_ribbon
+            for o in onsets:
+                for j, v in enumerate(kern):
+                    tp = int(round(o / TR)) + j
+                    if 0 <= tp < n_tp:
+                        series[..., tp] += amp * v
+                rows.append((o, dur, lab))
+        series = 1000.0 * (1.0 + 0.01 * series)
+        series += 0.5 * rng.standard_normal(series.shape)
+        img = nib.Nifti1Image(series.astype(np.float32), aff)
+        img.header.set_zooms((2.0, 2.0, 2.0, TR))
+        path = tmp_path / f"m{run + 1}.nii.gz"
+        nib.save(img, path)
+        files.append(str(path))
+        ev = tmp_path / f"m{run + 1}_events.tsv"
+        ev.write_text(
+            "onset\tduration\ttrial_type\n"
+            + "".join(f"{o}\t{d}\t{lab}\n" for o, d, lab in sorted(rows))
+        )
+        evs.append(str(ev))
+    resp = (in_ribbon & (xyz[..., 2] > 0.0)).astype(np.float32)
+    nib.save(nib.Nifti1Image(resp, aff), tmp_path / "resp.nii.gz")
+    return files, evs
+
+
+def _mixed_common(tmp_path, verb="0"):
+    return [
+        "-white_mesh", str(tmp_path / "lh.white.surf.gii"),
+        "-pial_mesh", str(tmp_path / "lh.pial.surf.gii"),
+        "-responsive", str(tmp_path / "resp.nii.gz"),
+        "-column_radius", "8", "-column_spacing", "6", "-depths", "6",
+        "-compare", "sl", "short", "long",
+        "-models", "null", "superficial", "-max_iter", "3", "-rescue", "0",
+        "-max_columns", "4", "-seed", "0", "-device", "cpu", "-verb", verb,
+    ]  # fmt: skip
+
+
+@pytest.mark.slow  # 50s: two CLI runs
+def test_conditions_of_different_length_get_their_own_windows(tmp_path):
+    """A 3 s and a 10 s stimulus in one comparison. Each condition's window is
+    estimated from its own event duration, the two response blocks are fitted and
+    concatenated at their own lengths, and the model drives each event with its own
+    duration."""
+    import json
+
+    from fastfuncstuff.cli import laminascope
+
+    runs, events = _write_mixed_duration_runs(tmp_path)
+    auto = str(tmp_path / "W")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-tent_lambda", "1.0", "-polort", "1",
+        *_mixed_common(tmp_path), "-prefix", auto,
+    ]) == 0  # fmt: skip
+
+    meta = json.load(open(f"{auto}.json"))
+    w_short, w_long = meta["windows"]["short"], meta["windows"]["long"]
+    assert w_long[1] > w_short[1], f"the 10 s stimulus needs the longer window: {meta['windows']}"
+    assert meta["durations"]["sl"] == [3.0, 10.0]
+
+    z = np.load(f"{auto}_columns.npz")
+    n_short, n_long = z["times_short"].size, z["times_long"].size
+    assert n_long > n_short
+    # The curves keep their own lengths all the way through.
+    assert z["sl_baseline_K6"].shape[-1] == n_short
+    assert z["sl_test_K6"].shape[-1] == n_long
+    # A single shared grid is no longer meaningful, so the legacy key is absent.
+    assert "times" not in z.files
+
+    # Explicit per-condition windows, deconvolve's spelling. They are POSITIONAL
+    # against the condition order, which is trial_type's (alphabetical: long, short)
+    # unless -labels sets it -- so the first pair here is 'long'.
+    explicit = str(tmp_path / "X")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "0,28", "0,14",
+        "-tent_lambda", "1.0", "-polort", "1", *_mixed_common(tmp_path), "-prefix", explicit,
+    ]) == 0  # fmt: skip
+    ze = np.load(f"{explicit}_columns.npz")
+    assert list(ze["labels"]) == ["long", "short"]
+    assert ze["times_long"].size == 15 and ze["times_short"].size == 8
+
+
+def test_a_window_count_that_does_not_match_the_conditions_is_refused(tmp_path):
+    from fastfuncstuff.cli import laminascope
+
+    runs, events = _write_mixed_duration_runs(tmp_path)
+    rc = laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "0,14", "0,28", "0,30",
+        "-tent_lambda", "1.0", "-polort", "1", *_mixed_common(tmp_path),
+        "-prefix", str(tmp_path / "Y"),
+    ])  # fmt: skip
+    assert rc == 1
+
+
+def test_a_window_starting_after_the_onset_is_refused_at_the_cli(tmp_path):
+    from fastfuncstuff.cli import laminascope
+
+    runs, events = _write_mixed_duration_runs(tmp_path)
+    rc = laminascope.main([
+        "-input", *runs, "-events", *events, "-window", "4,18",
+        "-tent_lambda", "1.0", "-polort", "1", *_mixed_common(tmp_path),
+        "-prefix", str(tmp_path / "Z"),
+    ])  # fmt: skip
+    assert rc == 1
+
+
+@pytest.mark.slow  # 90s: deconvolve + two laminascope runs
+def test_per_condition_windows_agree_between_the_two_routes(tmp_path):
+    """The equivalence gate, extended to per-condition windows.
+
+    With per-condition windows ffs_deconvolve writes each condition at its OWN length
+    (long 15 samples, short 8 here), so the iresp files legitimately differ in length;
+    requiring one length is what used to refuse them outright. Both routes must still
+    agree at one fixed lambda."""
+    from fastfuncstuff.cli import deconvolve, laminascope
+
+    runs, events = _write_mixed_duration_runs(tmp_path)
+    lam = "1.0"
+    # trial_type order is alphabetical: long, then short.
+    win_dec = ["0,28", "0,14"]
+
+    assert deconvolve.main([
+        "-input", *runs, "-events", *events, "-model", "TENT", "-window", *win_dec,
+        "-tent-smooth", lam, "-polort", "1", "-do_scale",
+        "-prefix", str(tmp_path / "mdec"), "-verb", "0", "-device", "cpu",
+    ]) == 0  # fmt: skip
+
+    a = str(tmp_path / "MA")
+    assert laminascope.main([
+        "-iresp_prefix", str(tmp_path / "mdec"), "-window", *win_dec, "-duration", "3", "10",
+        *_mixed_common(tmp_path), "-prefix", a,
+    ]) == 0  # fmt: skip
+    b = str(tmp_path / "MB")
+    assert laminascope.main([
+        "-input", *runs, "-events", *events, "-window", *win_dec,
+        "-tent_lambda", lam, "-polort", "1", *_mixed_common(tmp_path), "-prefix", b,
+    ]) == 0  # fmt: skip
+
+    za, zb = np.load(f"{a}_columns.npz"), np.load(f"{b}_columns.npz")
+    assert np.array_equal(za["fitted"], zb["fitted"])
+    assert za["times_short"].size == 8 and za["times_long"].size == 15
+    for key in ("sl_baseline_K6", "sl_test_K6"):
+        ca, cb = za[key], zb[key]
+        assert ca.shape == cb.shape and np.isfinite(ca).all()
+        np.testing.assert_allclose(cb, ca, rtol=3e-4, atol=3e-4)
+
+    # The short condition's curve runs to its own window's end, not to a flat tail.
+    short = za["sl_baseline_K6"]
+    assert np.abs(short[..., -1]).max() > 1e-3 * np.abs(short).max()
