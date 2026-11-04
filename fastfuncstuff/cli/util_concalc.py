@@ -544,6 +544,12 @@ _TSTAT_RE = re.compile(r"^(.+?)#(\d+)_Tstat$")
 _ZSTAT_RE = re.compile(r"^(.+?)#(\d+)_Zstat$")
 # Matches a contrast-style label (no '#N' segment) — i.e. a sub-brick that came
 # from a previous GLT computation rather than a per-stim coefficient.
+#: Bucket-wide omnibus sub-bricks: the model-level F and the z-transform of it
+#: that ``ffs_util_updatedof -numcomps`` adds after NORDIC. Neither depends on
+#: the contrast set, and neither carries a ``#N`` segment, so both have to be
+#: named here or the generic "no #N → stale contrast" rule strips them.
+_OMNIBUS_LABELS = frozenset({"Full_Fstat", "Full_Zstat"})
+
 _CONTRAST_COEF_RE = re.compile(r"^(?P<name>.+?)_Coef$")
 _CONTRAST_TSTAT_RE = re.compile(r"^(?P<name>.+?)_Tstat$")
 _CONTRAST_FSTAT_RE = re.compile(r"^(?P<name>.+?)_Fstat$")
@@ -593,14 +599,14 @@ def _select_non_contrast_subbricks(
 
     A label is treated as an existing contrast (and dropped) when it ends
     in ``_Coef`` / ``_Tstat`` / ``_Fstat`` / ``_Zstat`` AND its name part has
-    no ``#N`` segment AND it's not the bucket-wide ``Full_Fstat``. Everything
-    else (β, per-stim t/z, Full_Fstat, partial R², drift, anything we don't
-    know about) is preserved verbatim.
+    no ``#N`` segment AND it's not one of the bucket-wide omnibus bricks.
+    Everything else (β, per-stim t/z, the omnibus, partial R², drift,
+    anything we don't know about) is preserved verbatim.
     """
     keep: list[int] = []
     stim_set = set(stim_base_labels)
     for i, lbl in enumerate(stats_labels):
-        if lbl == "Full_Fstat":
+        if lbl in _OMNIBUS_LABELS:
             keep.append(i)
             continue
         # Per-stim β / t / z — has '#N' segment, name part is in stim list.
@@ -1111,7 +1117,7 @@ def main() -> int:
     # ── 9) Build output bucket ─────────────────────────────────────────
     # Strip every sub-brick whose label is a *contrast* output from a prior
     # concalc / GLM run, so re-running doesn't stack old + new. β / t per
-    # stim, Full_Fstat, partial R², and any other non-contrast sub-brick is
+    # stim, the omnibus bricks, partial R², and any other non-contrast sub-brick is
     # preserved verbatim.
     keep_idx = _select_non_contrast_subbricks(stats_labels, stim_base_labels)
 

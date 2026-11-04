@@ -63,6 +63,36 @@ def test_select_non_contrast_keeps_per_stim_zstat_drops_contrast_zstat():
     assert [labels[i] for i in keep] == ["DI#0_Coef", "DI#0_Tstat", "DI#0_Zstat"]
 
 
+def test_select_non_contrast_keeps_full_zstat_omnibus():
+    # ffs_util_updatedof -numcomps (NORDIC dof adjustment) adds a Full_Zstat
+    # next to Full_Fstat. It is the omnibus, carries no '#N', and does not
+    # change with the contrast set -- it used to be stripped as a stale
+    # contrast, which made every re-run of concalc on a NORDIC bucket refuse.
+    from fastfuncstuff.cli.util_concalc import (
+        _select_non_contrast_subbricks,
+        _unsafe_drops,
+    )
+
+    labels = [
+        "Full_Fstat",
+        "Full_Zstat",
+        "faces#0_Coef",
+        "faces#0_Tstat",
+        "faces#0_Zstat",
+        "FvO_Coef",
+        "FvO_Tstat",
+    ]
+    keep = _select_non_contrast_subbricks(labels, stim_base_labels=["faces"])
+    assert [labels[i] for i in keep] == [
+        "Full_Fstat",
+        "Full_Zstat",
+        "faces#0_Coef",
+        "faces#0_Tstat",
+        "faces#0_Zstat",
+    ]
+    assert _unsafe_drops(labels, keep, new_contrast_labels={"FvO"}) == []
+
+
 def test_contrast_base_name_strips_all_suffixes():
     from fastfuncstuff.cli.util_concalc import _contrast_base_name
 
