@@ -820,10 +820,10 @@ def _title(fig, title: str, sub: str, height: float) -> None:
 
 
 def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
-    """One row per file, one dot per method. methods: (id, label, tool, marker)."""
+    """One row per file, one dot per method: (id, label, tool, marker[, alpha])."""
     handles = []
     ys = list(range(len(files)))[::-1]
-    for method, label, tool, marker in methods:
+    for method, label, tool, marker, *fade in methods:
         xs, yy = [], []
         for f, y in zip(files, ys, strict=True):
             v = med.get((tier, f, method))
@@ -842,6 +842,7 @@ def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
                 yy,
                 s=62,
                 marker=marker,
+                alpha=fade[0] if fade else 1.0,
                 color=TOOL_COLOR[tool],
                 edgecolor="white",
                 linewidth=0.8,
@@ -1055,7 +1056,12 @@ def make_all(results: Path) -> None:
         (f"pzstd-1.p{n}>zstd.p1", "zstd reading a pzstd -1 file", "zstd", "D"),
         (f"pzstd-3.p{n}>zstd.p1", "zstd reading a pzstd -3 file", "zstd", "^"),
     ]
+    # ISA-L cannot read in parallel. Its 1-thread time stays on the N-thread panels,
+    # faded, because a reader choosing a format still needs to compare against it.
+    one_thread_only = "ISA-L, still 1 thread (faded: it cannot use more)"
     dec_n = [
+        ("isal-2.p1>isal.p1", one_thread_only, "isal", "o", 0.32),
+        (f"pigz-1.p{n}>isal.p1", one_thread_only, "isal", "s", 0.32),
         (f"isal-2.p1>rapidgzip.p{n}", "rapidgzip reading an ISA-L file", "rapidgzip", "o"),
         (f"pigz-1.p{n}>rapidgzip.p{n}", "rapidgzip reading a pigz file", "rapidgzip", "s"),
         (f"zstd-3.p1>pzstd.p{n}", "pzstd reading a single-frame file", "zstd", "v"),
@@ -1091,7 +1097,7 @@ def make_all(results: Path) -> None:
                 lambda ax: _dot_panel(ax, med, "decode", files, dec_n),
             ),
         ],
-        legend_cols=3,
+        legend_cols=4,
     )
 
     # Size against speed, one curve per tool.
