@@ -112,3 +112,36 @@ def test_ctrl_c_during_the_import_ends_the_process_promptly(tmp_path):
         [sys.executable, "-c", code], check=False, capture_output=True, text=True, timeout=30
     )
     assert done.returncode == 130, done.stderr
+
+
+def test_the_window_shows_the_steps_the_terminal_bar_shows(tmp_path, capfd):
+    """Same walk, both places: the file being waited on is named on screen too."""
+    from fastfuncstuff.viewer import catalog
+
+    heard = []
+    paths = [str(tmp_path / "a.nii.gz"), str(tmp_path / "b.nii.gz")]
+    with catalog.progress_to(lambda *step: heard.append(step)):
+        assert list(catalog.opening(paths)) == paths
+    assert heard == [("opening", 0, 2, "a.nii.gz"), ("opening", 1, 2, "b.nii.gz")]
+    assert "opening" in capfd.readouterr().err
+
+    list(catalog.opening(paths))  # the hook ends with its block: a later rescan is not told
+    assert len(heard) == 2
+
+
+def test_progress_fills_the_bar_and_a_long_name_cannot_widen_the_window():
+    from fastfuncstuff.viewer.ui.boot import BootWindow, application
+
+    application()
+    boot = BootWindow()
+    width = boot.width()
+    long_name = "sub-001_task-" + "x" * 400 + ".nii.zst"
+    boot.progress("opening", 0, 3, long_name)
+    assert boot._bar.maximum() == 3 and boot._bar.value() == 0
+    assert boot._status.text().startswith("opening 1/3")
+    assert "…" in boot._status.text()
+    boot.show()
+    assert boot.width() == width
+    boot.status("building the window")  # a phase with no count goes back to busy
+    assert boot._bar.maximum() == 0
+    boot.close()

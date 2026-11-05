@@ -379,3 +379,46 @@ def test_a_frozen_process_prints_its_stack_and_survives():
     finally:
         proc.kill()
         proc.wait(timeout=10)
+
+
+def test_image_windows_stay_hidden_through_the_read_then_appear(tmp_path, monkeypatch, no_listing):
+    """Shown as they are built, they sat empty over the bar reporting on the read."""
+    import signal
+
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui import window
+
+    a = _vol(tmp_path / "a.nii.gz")
+    built = []
+    real_init = window.ViewerWindow.__init__
+
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        built.append(self)
+
+    visible_during_read = []
+    visible_at_end = []
+
+    def run(_self=None):
+        w = built[0]
+        visible_at_end.extend(win.isVisible() for win in w.manager.windows.values())
+        w.close()
+        w.session.close()
+        return 0
+
+    monkeypatch.setattr(window.ViewerWindow, "__init__", init)
+    monkeypatch.setattr(QtWidgets.QApplication, "exec", run)
+    handler = signal.getsignal(signal.SIGINT)
+    try:
+        window.launch(
+            [str(a)],
+            device="cpu",
+            on_progress=lambda *_: visible_during_read.extend(
+                win.isVisible() for win in built[0].manager.windows.values()
+            ),
+        )
+    finally:
+        signal.signal(signal.SIGINT, handler)
+    assert visible_during_read and not any(visible_during_read)
+    assert visible_at_end and all(visible_at_end)

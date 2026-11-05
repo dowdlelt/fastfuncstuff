@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import signal
 import threading
+import time
 from importlib import import_module
 from types import ModuleType
 
@@ -21,6 +22,9 @@ from fastfuncstuff.viewer.ui.theme import stylesheet
 #: How often the wait wakes Python: to see the import finish, and to let a
 #: Ctrl+C run its handler, which cannot fire while idle in Qt's C++ loop.
 _POLL_MS = 50
+
+#: Each redraw is time taken from the file walk it reports on.
+_MIN_DRAW_S = 0.05
 
 _INTERRUPTED_EXIT = 130
 
@@ -44,14 +48,19 @@ class BootWindow(QtWidgets.QWidget):
         self.setStyleSheet(stylesheet())
         self.importing = False
         self._status = QtWidgets.QLabel("starting")
-        self._status.setWordWrap(True)
-        bar = QtWidgets.QProgressBar()
-        bar.setRange(0, 0)  # busy: nothing here knows how far along an import is
-        bar.setTextVisible(False)
-        bar.setFixedHeight(6)
-        layout = QtWidgets.QVBoxLayout(self)
+        # Elided rather than wrapped: a long path has no spaces to wrap on, and it
+        # would otherwise set the window's minimum width.
+        self._status.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred
+        )
+        self._bar = QtWidgets.QProgressBar()
+        self._bar.setRange(0, 0)  # busy, until something can say how far along it is
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(6)
+        self._drawn_at = 0.0
+        self._layout = layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self._status)
-        layout.addWidget(bar)
+        layout.addWidget(self._bar)
         layout.addStretch(1)
 
         screen = QtGui.QGuiApplication.primaryScreen()
@@ -60,10 +69,29 @@ class BootWindow(QtWidgets.QWidget):
         self.move(area.topLeft())
 
     def status(self, text: str) -> None:
-        self._status.setText(text)
+        self._bar.setRange(0, 0)
+        self._show(text)
+
+    def progress(self, what: str, index: int, total: int, name: str) -> None:
+        """A file walk's step, as ``catalog.progress_to`` reports it."""
+        now = time.perf_counter()
+        # A directory of cached headers walks far faster than anyone can read, and
+        # the first step always draws: one slow file may be all there is to see.
+        if index and now - self._drawn_at < _MIN_DRAW_S:
+            return
+        self._drawn_at = now
+        self._bar.setRange(0, total)
+        self._bar.setValue(index)
+        self._show(f"{what} {index + 1}/{total}  {name}")
+
+    def _show(self, text: str) -> None:
+        metrics = self._status.fontMetrics()
+        room = self.width() - 2 * self._layout.contentsMargins().left()
+        self._status.setText(metrics.elidedText(text, QtCore.Qt.TextElideMode.ElideMiddle, room))
         # repaint, not processEvents: once the real window is being built, pumping
         # the loop would run its timers against a half-constructed window.
         self._status.repaint()
+        self._bar.repaint()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.importing:

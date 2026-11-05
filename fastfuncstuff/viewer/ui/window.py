@@ -188,7 +188,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     #: ``(session, future, manual)`` from the rescan worker, delivered on the GUI thread.
     _rescanned = QtCore.Signal(object)
 
-    def __init__(self, session: ViewerSession) -> None:
+    def __init__(self, session: ViewerSession, *, hold_windows: bool = False) -> None:
         super().__init__()
         install_combo_pickers(QtWidgets.QApplication.instance())
         self.setAcceptDrops(True)
@@ -223,7 +223,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         #: On by default, as in AFNI: comparing two subjects at the same place
         #: is the reason to open a second controller at all.
         self.linked = True
-        self._active = self._add_controller(session)
+        self._active = self._add_controller(session, hold_windows=hold_windows)
 
         self._build_selector()
         self._build_panel()
@@ -285,11 +285,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def active(self) -> Controller:
         return self._active
 
-    def _add_controller(self, session: ViewerSession) -> Controller:
+    def _add_controller(self, session: ViewerSession, *, hold_windows: bool = False) -> Controller:
         used = {c.letter for c in self.controllers}
         letter = next((ch for ch in LETTERS if ch not in used), f"{len(self.controllers) + 1}")
         bridge = _Bridge()
         manager = WindowManager(session, lambda cmd: None, self)
+        manager.holding = hold_windows
         ctl = Controller(letter=letter, session=session, manager=manager, bridge=bridge)
         # Each controller's windows dispatch into their own session. Bound per
         # controller rather than through ``self.session``, which is whichever
@@ -3222,11 +3223,13 @@ def launch(
     say: Callable[[str], None] = lambda _text: None,
     started: float | None = None,
     on_shown: Callable[[], None] | None = None,
+    on_progress: catalog_mod.ProgressListener | None = None,
 ) -> int:
     """Open the controller and run the Qt loop, saying what startup is doing.
 
     ``on_shown`` runs once the loop is turning, so whatever stood in for the
     controller stays up until the controller has had its chance to paint.
+    ``on_progress`` hears the file walks the terminal bars show.
     """
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.viewer.residency import apply_vram_budget
@@ -3235,23 +3238,24 @@ def launch(
     session = ViewerSession(device=setup_device(device))
     apply_vram_budget(vram_budget, session.store.device)
     say(f"building the window, device {session.store.device}")
-    win = ViewerWindow(session)
+    win = ViewerWindow(session, hold_windows=True)
     quit_on_interrupt(app, win)
 
-    # Named paths only. Reading a dataset's directory uninvited can fetch every
-    # file in it on a synced folder, and the dropdown is one click from it.
-    if directories:
-        say(f"reading {directories[0]}")
-        win.read_directory(directories[0])
-        session.offer_directories(directories[1:])
-        win._sync_layer_list()
-        say(f"found {len(session.catalog)} datasets")
-    for p in catalog_mod.opening(paths):
-        win.open_path(p)
-    # After the opens: the headers it reads are in hand by now, so all the waiting
-    # on a slow file happens under the bar that names it.
-    if files:
-        win.read_files(files)
+    with catalog_mod.progress_to(on_progress or (lambda *_: None)):
+        # Named paths only. Reading a dataset's directory uninvited can fetch every
+        # file in it on a synced folder, and the dropdown is one click from it.
+        if directories:
+            say(f"reading {directories[0]}")
+            win.read_directory(directories[0])
+            session.offer_directories(directories[1:])
+            win._sync_layer_list()
+            say(f"found {len(session.catalog)} datasets")
+        for p in catalog_mod.opening(paths):
+            win.open_path(p)
+        # After the opens: the headers it reads are in hand by now, so all the waiting
+        # on a slow file happens under the bar that names it.
+        if files:
+            win.read_files(files)
     if surfaces:
         say(f"loading surfaces from {surfaces}")
         win.load_surfaces(surfaces, space=surf_space or "")
@@ -3268,6 +3272,8 @@ def launch(
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
     win.show()
+    for ctl in win.controllers:
+        ctl.manager.reveal()
     if on_shown is not None:
         QtCore.QTimer.singleShot(0, on_shown)
     win._row()

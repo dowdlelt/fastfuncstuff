@@ -361,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         say=say,
         started=started,
         on_shown=boot.close,
+        on_progress=boot.progress,
     )
 
 

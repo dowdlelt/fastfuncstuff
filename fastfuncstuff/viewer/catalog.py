@@ -12,11 +12,12 @@ eagerly rather than on demand.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -369,6 +370,39 @@ def sort_entries(entries: list[CatalogEntry], directory: str | Path) -> list[Cat
     return sorted(entries, key=key)
 
 
+#: Told ``(what, index, total, name)`` as a walk reaches each file.
+ProgressListener = Callable[[str, int, int, str], None]
+_listener: ProgressListener | None = None
+
+
+@contextlib.contextmanager
+def progress_to(listener: ProgressListener) -> Generator[None]:
+    """Report the file walks below to ``listener`` as well as the terminal.
+
+    A module-level hook because these walks sit several commands below whoever
+    wants to draw them. Startup's only: it runs on the GUI thread with the loop
+    not yet turning, so no background rescan can reach a walk while it is set.
+    """
+    global _listener
+    _listener = listener
+    try:
+        yield
+    finally:
+        _listener = None
+
+
+def _walk(paths: list, what: str, *, quiet: bool = False, name_each: bool = False) -> Iterator:
+    """Iterate ``paths`` under a terminal bar, telling any listener the same steps."""
+    bar = tqdm(paths, desc=f"ffs_viewer: {what}", unit="file", disable=quiet)
+    for index, path in enumerate(bar):
+        name = Path(path).name
+        if name_each:
+            bar.set_postfix_str(name)
+        if _listener is not None:
+            _listener(what, index, len(paths), name)
+        yield path
+
+
 def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry]:
     """Read a directory into a pickable catalog, in natural name order.
 
@@ -379,8 +413,9 @@ def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry
     Relative to the directory, so a recursive scan keeps subfolders together.
     """
     found = discover(directory, recursive=recursive)
-    bar = tqdm(found, desc="ffs_viewer: reading headers", unit="file", disable=len(found) < 10)
-    return sort_entries(list(describe(bar)), directory)
+    return sort_entries(
+        list(describe(_walk(found, "reading headers", quiet=len(found) < 10))), directory
+    )
 
 
 def opening(paths: list[str]) -> Iterator[str]:
@@ -389,10 +424,7 @@ def opening(paths: list[str]) -> Iterator[str]:
     Shown for a single file too: an online-only file on a synced folder can take
     minutes to arrive, and the name is what says what is being waited on.
     """
-    bar = tqdm(paths, desc="ffs_viewer: opening", unit="file", disable=not paths)
-    for path in bar:
-        bar.set_postfix_str(Path(path).name)
-        yield path
+    return _walk(paths, "opening", quiet=not paths, name_each=True)
 
 
 def suggest_underlay(entries: list[CatalogEntry]) -> CatalogEntry | None:
