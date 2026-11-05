@@ -118,15 +118,6 @@ class WindowManager(QtCore.QObject):
         self._timing = bool(os.environ.get("FFS_VIEWER_TIMING"))
         #: Whether the controller's player is running (the 3-D ANIMATE buttons show it).
         self.playing = False
-        #: Windows are made but kept off screen until :meth:`reveal`, for startup:
-        #: shown as they are built, they would sit empty for the whole file read,
-        #: over whatever is reporting on that read.
-        self.holding = False
-
-    def reveal(self) -> None:
-        self.holding = False
-        for win in self.windows.values():
-            win.show()
 
     # -- reconciliation -------------------------------------------------
     def sync(self) -> None:
@@ -149,8 +140,7 @@ class WindowManager(QtCore.QObject):
                     win.setGeometry(QtCore.QRect(*viewport.geometry))
                 else:
                     self._place_new(win)
-                if not self.holding:
-                    win.show()
+                win.show()
             win.apply(viewport)
             if opened and self._timing:
                 # Build, show and first fill: what a window costs before its first

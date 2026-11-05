@@ -4,55 +4,64 @@ The viewer is split into a headless core (state, commands, loading, residency,
 colourmapping) and a thin UI shell. Everything in the core is testable without a
 display, which is also what makes session recording and replay possible: the UI
 never mutates state directly, it dispatches commands.
-
-The names below resolve on first use: every ``fastfuncstuff.viewer.<module>`` import
-runs this file first, and these pull in torch -- which ffs_viewer needs to be able
-to show a window without (see ``ui/boot.py``).
 """
 
-from importlib import import_module
-from typing import Any
+from fastfuncstuff.viewer.colormap import (
+    apply_colormap,
+    available_colormaps,
+    build_lut,
+    composite,
+    suprathreshold_edges,
+    threshold_alpha,
+    to_rgba8,
+)
+from fastfuncstuff.viewer.commands import (
+    Aspect,
+    Command,
+    CommandBus,
+    command,
+    parse_script,
+    registered_names,
+    resolve,
+)
+from fastfuncstuff.viewer.layers import AlphaMode, Layer, LayerStack, SignMode
+from fastfuncstuff.viewer.residency import Resident, Tier, VolumeStore
+from fastfuncstuff.viewer.session import ViewerSession, derive_range
+from fastfuncstuff.viewer.slicing import extract_plane, plane_shape, voxel_value
+from fastfuncstuff.viewer.state import DisplayGrid, Plane, ViewerState
+from fastfuncstuff.viewer.viewports import ViewKind, Viewport, ViewportSet
 
-_HOMES = {
-    "apply_colormap": ".colormap",
-    "available_colormaps": ".colormap",
-    "build_lut": ".colormap",
-    "composite": ".colormap",
-    "suprathreshold_edges": ".colormap",
-    "threshold_alpha": ".colormap",
-    "to_rgba8": ".colormap",
-    "Aspect": ".commands",
-    "Command": ".commands",
-    "CommandBus": ".commands",
-    "command": ".commands",
-    "parse_script": ".commands",
-    "registered_names": ".commands",
-    "resolve": ".commands",
-    "AlphaMode": ".layers",
-    "Layer": ".layers",
-    "LayerStack": ".layers",
-    "SignMode": ".layers",
-    "Resident": ".residency",
-    "Tier": ".residency",
-    "VolumeStore": ".residency",
-    "ViewerSession": ".session",
-    "derive_range": ".session",
-    "extract_plane": ".slicing",
-    "plane_shape": ".slicing",
-    "voxel_value": ".slicing",
-    "DisplayGrid": ".state",
-    "Plane": ".state",
-    "ViewerState": ".state",
-    "ViewKind": ".viewports",
-    "Viewport": ".viewports",
-    "ViewportSet": ".viewports",
-}
-
-__all__ = sorted(_HOMES)
-
-
-def __getattr__(name: str) -> Any:
-    home = _HOMES.get(name)
-    if home is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(home, __name__), name)
+__all__ = [
+    "AlphaMode",
+    "Aspect",
+    "Command",
+    "CommandBus",
+    "DisplayGrid",
+    "Layer",
+    "LayerStack",
+    "Plane",
+    "Resident",
+    "SignMode",
+    "Tier",
+    "ViewKind",
+    "Viewport",
+    "ViewportSet",
+    "ViewerSession",
+    "ViewerState",
+    "VolumeStore",
+    "apply_colormap",
+    "available_colormaps",
+    "build_lut",
+    "command",
+    "composite",
+    "derive_range",
+    "extract_plane",
+    "parse_script",
+    "plane_shape",
+    "registered_names",
+    "resolve",
+    "suprathreshold_edges",
+    "threshold_alpha",
+    "to_rgba8",
+    "voxel_value",
+]
