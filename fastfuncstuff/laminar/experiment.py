@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -363,6 +363,51 @@ def fit_independent(
         return list(pool.map(_fit_one_worker, payload))
 
 
+def model_space_jobs(
+    spec_for_k: dict[int, ModelSpec],
+    data_for_k: dict[int, torch.Tensor],
+    u_for_k: dict[int, torch.Tensor],
+    *,
+    kernel_for_k: dict[int, torch.Tensor | None] | None = None,
+    rows: torch.Tensor | None = None,
+    targets: list[tuple[int, ...]],
+    free: Sequence[str] = (),
+    **vl_kwargs,
+) -> list[tuple]:
+    """One picklable task per inversion, model first then K, for :func:`invert_job`.
+
+    The fits are independent, so a caller with spare cores can run them in any order
+    and hand the results back in this order to :func:`average_model_space`.
+    """
+    return [
+        (
+            spec_for_k[k],
+            faes_priors(spec_for_k[k], target, free=free),
+            u_for_k[k],
+            data_for_k[k],
+            rows,
+            None if kernel_for_k is None else kernel_for_k[k],
+            vl_kwargs,
+        )
+        for target in targets
+        for k in sorted(spec_for_k)
+    ]
+
+
+def invert_job(job: tuple) -> VLResult:
+    spec, priors, u, y, rows, kernel, kwargs = job
+    return variational_laplace(spec, priors, u, y, rows=rows, kernel=kernel, **kwargs)
+
+
+def average_model_space(
+    runs: list[VLResult], spec: ModelSpec, n_k: int, free_energy: str = "reference"
+) -> tuple[list[BPAResult], list[list[VLResult]]]:
+    """Group :func:`model_space_jobs`' results by model and average each across K."""
+    per_model = [runs[i : i + n_k] for i in range(0, len(runs), n_k)]
+    averaged = [bayesian_parameter_average(r, spec, free_energy=free_energy) for r in per_model]
+    return averaged, per_model
+
+
 def fit_model_space(
     spec_for_k: dict[int, ModelSpec],
     data_for_k: dict[int, torch.Tensor],
@@ -375,14 +420,12 @@ def fit_model_space(
     free_energy: str = "reference",
     progress: bool = True,
     free: Sequence[str] = (),
-    on_inversion: Callable[[], object] | None = None,
     **vl_kwargs,
 ) -> tuple[list[str], list[BPAResult], list[list[VLResult]]]:
     """Invert every model at every vascular resolution, then average across K.
 
     Returns the model names, one :class:`BPAResult` per model, and the raw
-    per-K inversions. ``on_inversion`` is called after each inversion, for a caller
-    keeping its own count across processes.
+    per-K inversions.
     """
     ks = sorted(spec_for_k)
     n_neuronal = spec_for_k[ks[0]].N
@@ -390,40 +433,25 @@ def fit_model_space(
         targets = layer_model_targets(n_neuronal)
     if names is None:
         names = layer_model_names(n_neuronal)
+    jobs = model_space_jobs(
+        spec_for_k, data_for_k, u_for_k, kernel_for_k=kernel_for_k, rows=rows, targets=targets,
+        free=free, **vl_kwargs,
+    )  # fmt: skip
 
     bar = None
     if progress:
         try:
             from tqdm.auto import tqdm
 
-            bar = tqdm(total=len(targets) * len(ks), desc="laminar model space", leave=True)
+            bar = tqdm(total=len(jobs), desc="laminar model space", leave=True)
         except ImportError:  # pragma: no cover - tqdm is a soft dependency
             bar = None
-
-    per_model: list[list[VLResult]] = []
-    averaged: list[BPAResult] = []
-    for target in targets:
-        runs = []
-        for k in ks:
-            spec = spec_for_k[k]
-            res = variational_laplace(
-                spec,
-                faes_priors(spec, target, free=free),
-                u_for_k[k],
-                data_for_k[k],
-                rows=rows,
-                kernel=None if kernel_for_k is None else kernel_for_k[k],
-                **vl_kwargs,
-            )
-            runs.append(res)
-            if bar is not None:
-                bar.update(1)
-            if on_inversion is not None:
-                on_inversion()
-        per_model.append(runs)
-        averaged.append(
-            bayesian_parameter_average(runs, spec_for_k[ks[0]], free_energy=free_energy)
-        )
+    runs = []
+    for job in jobs:
+        runs.append(invert_job(job))
+        if bar is not None:
+            bar.update(1)
     if bar is not None:
         bar.close()
+    averaged, per_model = average_model_space(runs, spec_for_k[ks[0]], len(ks), free_energy)
     return names, averaged, per_model

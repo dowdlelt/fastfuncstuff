@@ -317,41 +317,51 @@ def test_a_permutation_null_is_fitted_and_turned_into_p_perm(reference, tmp_path
     assert [r[3] for r in models] == ["null", "superficial"]
 
 
-def _fake_fit(job):
-    """Finishes out of job order and reports the inversions an ROI would."""
+def _fake_invert(task):
+    """Finishes out of task order, which is what the pool is free to do."""
     import time
 
-    delay, inversions = job
+    delay, value = task
     time.sleep(delay)
-    for _ in range(inversions):
-        laminar._on_inversion()
-    return delay
+    if value is None:
+        raise TypeError("a failed inversion")
+    return value
 
 
-def test_run_jobs_counts_inversions_and_keeps_job_order(monkeypatch):
-    """The permutation nulls are sliced off by position, so results must stay in job order
-    however the workers finish; and every worker's inversions must reach the one bar."""
-    seen = {}
+def _fake_summarise(job, runs):
+    return job, runs
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_run_jobs_returns_each_roi_its_own_inversions_in_order(workers, monkeypatch):
+    """The averaging across K groups results by POSITION, so a worker finishing early must
+    not reorder them, and the permutation nulls are sliced off the output by position too."""
+    bars = []
     real = laminar._inversion_bar
 
     def spy(total, verb):
-        bar = real(total, verb)
-        seen["bar"], seen["total"] = bar, total
-        return bar
+        bars.append(real(total, verb))
+        return bars[-1]
 
     monkeypatch.setattr(laminar, "_inversion_bar", spy)
-    jobs = [(1.0, 3), (0.0, 4)]
-    assert laminar._run_jobs(jobs, 2, 7, 1, fit=_fake_fit) == [1.0, 0.0]
-    assert seen["bar"].n == seen["total"] == 7
-
-    assert laminar._run_jobs(jobs, 1, 7, 1, fit=_fake_fit) == [1.0, 0.0]
-    assert seen["bar"].n == 7
-    assert laminar._on_inversion is None  # a closed bar must not outlive the call
+    tasks = [[(0.6, "a0"), (0.0, "a1")], [(0.3, "b0"), (0.0, "b1"), (0.0, "b2")]]
+    out = laminar._run_jobs(
+        ["a", "b"], tasks, workers, 1, invert=_fake_invert, summarise=_fake_summarise
+    )
+    assert out == [("a", ["a0", "a1"]), ("b", ["b0", "b1", "b2"])]
+    assert bars[0].n == 5
 
 
 def test_run_jobs_raises_a_worker_failure():
-    with pytest.raises(TypeError):
-        laminar._run_jobs([(0.0, "not a count")], 2, 1, 0, fit=_fake_fit)
+    with pytest.raises(TypeError, match="failed inversion"):
+        laminar._run_jobs(
+            ["a"],
+            [[(0.0, None), (0.0, "ok")]],
+            2,
+            0,
+            invert=_fake_invert,
+            summarise=_fake_summarise,
+        )
 
 
 def test_forward_ad_warning_is_silenced():

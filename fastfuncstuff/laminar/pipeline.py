@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,10 +32,12 @@ import torch
 
 from fastfuncstuff.laminar.experiment import (
     DEPTH_NAMES,
+    average_model_space,
     depth_inclusion_probabilities,
-    fit_model_space,
+    invert_job,
     layer_model_names,
     layer_model_targets,
+    model_space_jobs,
     posterior_model_probabilities,
 )
 from fastfuncstuff.laminar.io import LaminarData
@@ -136,24 +138,65 @@ def _time_constants(spec, Ep: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
-def fit_roi(
+def _model_space(n: int, targets, names) -> tuple[list, list[str]]:
+    if targets is None:
+        targets = layer_model_targets(n)
+    if names is None:
+        all_names = layer_model_names(n)
+        all_targets = layer_model_targets(n)
+        names = [all_names[all_targets.index(tuple(t))] for t in targets]
+    return list(targets), list(names)
+
+
+def roi_inversion_jobs(
     data_for_k: dict[int, LaminarData],
     kernel_for_k: dict[int, torch.Tensor | None] | None = None,
     *,
     targets: list[tuple[int, ...]] | None = None,
     names: list[str] | None = None,
-    free_energy: str = "reference",
     max_iter: int = 128,
     hyper_from_rows: bool = False,
     rescue: int = 0,
     free: Sequence[str] = (),
+) -> list[tuple]:
+    """Every inversion one ROI needs, as independent tasks for ``invert_job``."""
+    ks = sorted(data_for_k)
+    first = data_for_k[ks[0]]
+    for k in ks[1:]:
+        if not torch.equal(data_for_k[k].rows, first.rows):
+            raise ValueError("every K must share the design (the same rows and time points)")
+    targets, _ = _model_space(first.spec.N, targets, names)
+    kernels = kernel_for_k or {k: None for k in ks}
+    return model_space_jobs(
+        {k: data_for_k[k].spec for k in ks},
+        {k: data_for_k[k].y for k in ks},
+        {k: data_for_k[k].u for k in ks},
+        kernel_for_k={k: kernels.get(k) for k in ks} if any(v is not None for v in kernels.values()) else None,
+        rows=first.rows,
+        targets=targets,
+        free=free,
+        max_iter=max_iter,
+        hyper_from_rows=hyper_from_rows,
+        rescue=rescue,
+        **first.integrate_kwargs,
+    )  # fmt: skip
+
+
+def summarise_roi(
+    data_for_k: dict[int, LaminarData],
+    kernel_for_k: dict[int, torch.Tensor | None] | None,
+    runs: list,
+    *,
+    targets: list[tuple[int, ...]] | None = None,
+    names: list[str] | None = None,
+    free_energy: str = "reference",
+    rescue: int = 0,
     detail: bool = False,
     roi: str = "",
     name: str = "",
     hemi: str = "",
-    on_inversion: Callable[[], object] | None = None,
 ) -> RoiFit:
-    """Invert, average across K, compare and devein one ROI's two-condition data."""
+    """Average :func:`roi_inversion_jobs`' results across K, compare and devein."""
     from fastfuncstuff.laminar.devein import (
         deveined_timecourses,
         laminar_impulse_response,
@@ -162,36 +205,11 @@ def fit_roi(
 
     ks = sorted(data_for_k)
     first = data_for_k[ks[0]]
-    for k in ks[1:]:
-        if not torch.equal(data_for_k[k].rows, first.rows):
-            raise ValueError("every K must share the design (the same rows and time points)")
     n = first.spec.N
-    if targets is None:
-        targets = layer_model_targets(n)
-    if names is None:
-        all_names = layer_model_names(n)
-        all_targets = layer_model_targets(n)
-        names = [all_names[all_targets.index(tuple(t))] for t in targets]
+    targets, names = _model_space(n, targets, names)
     kernels = kernel_for_k or {k: None for k in ks}
     ikw = dict(first.integrate_kwargs)
-
-    names, averaged, per_k = fit_model_space(
-        {k: data_for_k[k].spec for k in ks},
-        {k: data_for_k[k].y for k in ks},
-        {k: data_for_k[k].u for k in ks},
-        kernel_for_k={k: kernels.get(k) for k in ks} if any(v is not None for v in kernels.values()) else None,
-        rows=first.rows,
-        targets=list(targets),
-        names=list(names),
-        free_energy=free_energy,
-        progress=False,
-        max_iter=max_iter,
-        hyper_from_rows=hyper_from_rows,
-        rescue=rescue,
-        free=free,
-        on_inversion=on_inversion,
-        **ikw,
-    )  # fmt: skip
+    averaged, per_k = average_model_space(runs, first.spec, len(ks), free_energy)
     F = np.array([float(a.F) for a in averaged])
     p_model = posterior_model_probabilities(F).numpy()
     p_depth = depth_inclusion_probabilities(F, list(targets), n).numpy()
@@ -236,6 +254,33 @@ def fit_roi(
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
         kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
         stalled=stalled, warnings=warnings, detail=curves,
+    )  # fmt: skip
+
+
+def fit_roi(
+    data_for_k: dict[int, LaminarData],
+    kernel_for_k: dict[int, torch.Tensor | None] | None = None,
+    *,
+    targets: list[tuple[int, ...]] | None = None,
+    names: list[str] | None = None,
+    free_energy: str = "reference",
+    max_iter: int = 128,
+    hyper_from_rows: bool = False,
+    rescue: int = 0,
+    free: Sequence[str] = (),
+    detail: bool = False,
+    roi: str = "",
+    name: str = "",
+    hemi: str = "",
+) -> RoiFit:
+    """Invert, average across K, compare and devein one ROI's two-condition data."""
+    jobs = roi_inversion_jobs(
+        data_for_k, kernel_for_k, targets=targets, names=names, max_iter=max_iter,
+        hyper_from_rows=hyper_from_rows, rescue=rescue, free=free,
+    )  # fmt: skip
+    return summarise_roi(
+        data_for_k, kernel_for_k, [invert_job(j) for j in jobs], targets=targets, names=names,
+        free_energy=free_energy, rescue=rescue, detail=detail, roi=roi, name=name, hemi=hemi,
     )  # fmt: skip
 
 

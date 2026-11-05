@@ -60,8 +60,8 @@ and the best model's B with 90% credible intervals), _devein.tsv (the static
 deveining operator, neuronal depth x measured depth, depth 1 deepest), _neuronal.tsv
 (deveined neuronal time courses) and _laminar.json.
 
-Runs on the CPU in float64, as the model's small ODE wants; ROIs run in parallel
-across -workers processes.
+Runs on the CPU in float64, as the model's small ODE wants; inversions run in parallel
+across -workers processes, one thread each.
 """
 
 
@@ -407,68 +407,101 @@ def _null_tables(args, ks):
     return out
 
 
-_on_inversion = None
+_INVERSION_KW = ("max_iter", "hyper_from_rows", "rescue", "free")
+_SUMMARY_KW = ("free_energy", "rescue", "detail", "roi", "name", "hemi")
 
 
-def _count_into(counter) -> None:
-    """Pool initializer: every inversion in this worker adds to the shared count."""
-    global _on_inversion
+def _cpu_worker() -> None:
+    """Pool initializer: one thread, and no GPU.
 
-    def tick() -> None:
-        with counter.get_lock():
-            counter.value += 1
+    Nothing here runs on the GPU, yet torch still claims ~220 MiB of VRAM in every process
+    that touches CUDA, which at one worker per core costs a card someone may be fitting on.
+    """
+    import os
 
-    _on_inversion = tick
-
-
-def _fit_one(job):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
 
     torch.set_num_threads(1)
-    from fastfuncstuff.laminar.pipeline import fit_roi
+
+
+def _inversion_tasks(job) -> list:
+    from fastfuncstuff.laminar.pipeline import roi_inversion_jobs
 
     data_for_k, kernels, targets, names, kw = job
-    return fit_roi(
-        data_for_k, kernels, targets=targets, names=names, on_inversion=_on_inversion, **kw
+    return roi_inversion_jobs(
+        data_for_k, kernels, targets=targets, names=names, **{k: kw[k] for k in _INVERSION_KW}
     )
 
 
-def _run_jobs(jobs, workers: int, total: int, verb: int, fit=_fit_one) -> list:
-    """Fit every job and return the results in job order, counting inversions on one bar.
+def _invert(task):
+    from fastfuncstuff.laminar.experiment import invert_job
 
-    An ROI is minutes of work and results come back in job order, so a bar of ROIs sits
-    at zero through a healthy run. Inversions are the unit that visibly moves, and a
-    shared counter lets them report from inside a worker without waiting for its ROI.
+    return invert_job(task)
+
+
+def _summarise(job, runs):
+    from fastfuncstuff.laminar.pipeline import summarise_roi
+
+    data_for_k, kernels, targets, names, kw = job
+    return summarise_roi(
+        data_for_k, kernels, runs, targets=targets, names=names,
+        **{k: kw[k] for k in _SUMMARY_KW if k in kw},
+    )  # fmt: skip
+
+
+def _run_jobs(jobs, tasks, workers: int, verb: int, invert=_invert, summarise=_summarise) -> list:
+    """Run every ROI's inversions across the pool; return one result per job, in job order.
+
+    The inversion is the unit rather than the ROI, because an ROI is 24 independent fits
+    and a pool of ROIs leaves every core past the ROI count idle. ``tasks[j]`` are job
+    ``j``'s inversions, and each ROI is summarised from its own results in their original
+    order, whichever order the workers finished them in.
     """
-    global _on_inversion
-
+    total = sum(len(t) for t in tasks)
     bar = _inversion_bar(total, verb)
     try:
         if workers == 1:
-            _on_inversion = None if bar is None else bar.update
-            try:
-                return [fit(j) for j in jobs]
-            finally:
-                _on_inversion = None
+            _cpu_threads_only()
+            out = []
+            for job, job_tasks in zip(jobs, tasks, strict=True):
+                runs = []
+                for task in job_tasks:
+                    runs.append(invert(task))
+                    if bar is not None:
+                        bar.update(1)
+                out.append(summarise(job, runs))
+            return out
 
         import multiprocessing
-        from concurrent.futures import ProcessPoolExecutor, wait
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        ctx = multiprocessing.get_context()
-        counter = ctx.Value("i", 0)
         with ProcessPoolExecutor(
-            max_workers=workers, mp_context=ctx, initializer=_count_into, initargs=(counter,)
+            max_workers=workers, mp_context=multiprocessing.get_context(), initializer=_cpu_worker
         ) as pool:
-            futures = [pool.submit(fit, j) for j in jobs]
-            pending = set(futures)
-            while pending:
-                _, pending = wait(pending, timeout=0.5)
-                if bar is not None:
-                    bar.update(counter.value - bar.n)
-        return [f.result() for f in futures]
+            try:
+                futures = [[pool.submit(invert, t) for t in ts] for ts in tasks]
+                for done in as_completed([f for fs in futures for f in fs]):
+                    done.result()
+                    if bar is not None:
+                        bar.update(1)
+                finals = [
+                    pool.submit(summarise, job, [f.result() for f in fs])
+                    for job, fs in zip(jobs, futures, strict=True)
+                ]
+                return [f.result() for f in finals]
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
     finally:
         if bar is not None:
             bar.close()
+
+
+def _cpu_threads_only() -> None:
+    import torch
+
+    torch.set_num_threads(1)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -558,8 +591,9 @@ def main(argv: list[str] | None = None) -> int:
                   f"{1 / (1 + len(null_pairs)):.3g}; 19 is the fewest that reaches 0.05",
                   file=sys.stderr)  # fmt: skip
     workers = args.workers or max(1, __import__("os").cpu_count() // 2)
-    workers = min(workers, len(jobs))
-    fits = _run_jobs(jobs, workers, len(jobs) * len(names) * len(ks), args.verb)
+    tasks = [_inversion_tasks(j) for j in jobs]
+    workers = min(workers, sum(len(t) for t in tasks))
+    fits = _run_jobs(jobs, tasks, workers, args.verb)
     null_fits = fits[n_real:]
     fits = fits[:n_real]
     nulls_by_roi: dict[tuple[str, str], list] = {(f.roi, f.hemi): [] for f in fits}
