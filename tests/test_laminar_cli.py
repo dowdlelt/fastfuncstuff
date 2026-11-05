@@ -364,6 +364,36 @@ def test_run_jobs_raises_a_worker_failure():
         )
 
 
+def _fake_tensor_invert(task):
+    return [t + 1 for t in task]
+
+
+def _fake_tensor_summarise(job, runs):
+    return sum(float(t.sum()) for run in runs for t in run)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="counts /proc/self/fd")
+def test_run_jobs_survives_the_default_file_limit():
+    """A real run died on 'Too many open files' at the usual ulimit -n of 1024, on a shell
+    whose limit hid it from every earlier test: torch shares each tensor crossing a pool
+    through a descriptor, and a model space is thousands of small tensors."""
+    import os
+    import resource
+
+    import torch
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    tasks = [[[torch.ones(2) for _ in range(30)] for _ in range(10)] for _ in range(2)]
+    resource.setrlimit(resource.RLIMIT_NOFILE, (len(os.listdir("/proc/self/fd")) + 200, hard))
+    try:
+        out = laminar._run_jobs(
+            ["a", "b"], tasks, 2, 0, invert=_fake_tensor_invert, summarise=_fake_tensor_summarise
+        )
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert out == [10 * 30 * 2 * 2.0] * 2
+
+
 def test_forward_ad_warning_is_silenced():
     """A torch upgrade rewording the message would bring the warning back in every worker."""
     import subprocess

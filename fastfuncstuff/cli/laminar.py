@@ -17,6 +17,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
+import pickle
 import sys
 import time
 
@@ -427,9 +429,22 @@ def _cpu_worker() -> None:
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # Hiding the card makes torch's compile path report that it found no CUDA runtime,
+    # once per worker and straight through the progress bar.
+    logging.getLogger("torch.utils.cpp_extension").setLevel(logging.ERROR)
     import torch
 
     torch.set_num_threads(1)
+
+
+def _call_on_bytes(fn, payload: bytes) -> bytes:
+    """Run ``fn`` with its arguments and result as plain pickles.
+
+    The pool's own pickler shares each tensor through a file descriptor that stays open as
+    long as the tensor lives. A model space is ~70 small tensors per inversion, so that
+    exhausts a ulimit -n of 1024 within a run. These are tiny, so copying costs nothing.
+    """
+    return pickle.dumps(fn(*pickle.loads(payload)))
 
 
 def _inversion_tasks(job) -> list:
@@ -487,16 +502,23 @@ def _run_jobs(jobs, tasks, workers: int, verb: int, invert=_invert, summarise=_s
             max_workers=workers, mp_context=multiprocessing.get_context(), initializer=_cpu_worker
         ) as pool:
             try:
-                futures = [[pool.submit(invert, t) for t in ts] for ts in tasks]
+                futures = [
+                    [pool.submit(_call_on_bytes, invert, pickle.dumps((t,))) for t in ts]
+                    for ts in tasks
+                ]
                 for done in as_completed([f for fs in futures for f in fs]):
                     done.result()
                     if bar is not None:
                         bar.update(1)
                 finals = [
-                    pool.submit(summarise, job, [f.result() for f in fs])
+                    pool.submit(
+                        _call_on_bytes,
+                        summarise,
+                        pickle.dumps((job, [pickle.loads(f.result()) for f in fs])),
+                    )
                     for job, fs in zip(jobs, futures, strict=True)
                 ]
-                return [f.result() for f in finals]
+                return [pickle.loads(f.result()) for f in finals]
             except BaseException:
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
