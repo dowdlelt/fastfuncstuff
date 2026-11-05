@@ -870,6 +870,87 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
     plt.close(fig)
 
 
+def plot_crossover(results: Path, n: int) -> None:
+    """Speed against size. The colours here are settings, not the tools of the other figures."""
+    import matplotlib.pyplot as plt
+
+    groups: dict[tuple, list] = {}
+    for r in csv.DictReader(open(results / "crossover.csv")):
+        key = (r["file"], int(r["mb"]), r["op"], r["method"], r["reader"])
+        groups.setdefault(key, []).append(r)
+    files = sorted({k[0] for k in groups})
+
+    def curve(ax, f, op, method, reader, label, color, ls):
+        pts = sorted(k[1] for k in groups if k[:1] == (f,) and k[2:] == (op, method, reader))
+        ys = [
+            mb
+            * 2**20
+            / 1e6
+            / statistics.median(float(x["wall"]) for x in groups[(f, mb, op, method, reader)])
+            for mb in pts
+        ]
+        ax.plot(
+            pts, ys, color=color, ls=ls, lw=2, marker="o", ms=4.5, mec="white", mew=0.8, label=label
+        )
+
+    write = [
+        (f"pzstd-1.p{n}", f"pzstd -1, {n} threads", AQUA, "-"),
+        (f"pzstd-3.p{n}", f"pzstd -3, {n} threads", AQUA, "--"),
+        ("zstd-1.p1", "zstd -1, 1 thread", ORANGE, "-"),
+        ("zstd-3.p1", "zstd -3, 1 thread", ORANGE, "--"),
+        (f"zstd-f1.p{n}", f"zstd --fast=1, {n} threads", BLUE, "-"),
+    ]
+    read = [
+        (f"pzstd-1.p{n}", f"pzstd.p{n}", f"pzstd -1 file, pzstd {n} threads", AQUA, "-"),
+        (f"pzstd-3.p{n}", f"pzstd.p{n}", f"pzstd -3 file, pzstd {n} threads", AQUA, "--"),
+        (f"pzstd-1.p{n}", "zstd.p1", "pzstd -1 file, zstd 1 thread", ORANGE, "-"),
+        (f"pzstd-3.p{n}", "zstd.p1", "pzstd -3 file, zstd 1 thread", ORANGE, "--"),
+        (f"zstd-f1.p{n}", "zstd.p1", "--fast=1 file, zstd 1 thread", BLUE, "-"),
+    ]
+    h = 3.5 * len(files) + 1.9
+    fig, axes = plt.subplots(len(files), 2, figsize=(12.5, h), sharex=True, squeeze=False)
+    sizes = sorted({k[1] for k in groups})
+    for i, f in enumerate(files):
+        for method, label, color, ls in write:
+            curve(axes[i][0], f, "write", method, "", label, color, ls)
+        for method, reader, label, color, ls in read:
+            curve(axes[i][1], f, "read", method, reader, label, color, ls)
+        for ax, what in zip(axes[i], ("write", "read"), strict=True):
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            _style(ax)
+            _plain_log_ticks(ax.yaxis)
+            ax.set_xticks(sizes, [str(v) for v in sizes])
+            ax.minorticks_off()
+            ax.set_title(f"{f}, {what}", loc="left", fontsize=10.5, color=INK)
+            ax.set_ylabel("MB/s", color=MUTED, fontsize=9)
+    for ax in axes[-1]:
+        ax.set_xlabel("size of the cut, MB", color=MUTED, fontsize=9)
+    for j, col in enumerate((write, read)):
+        handles, labels = axes[0][j].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            frameon=False,
+            fontsize=8.5,
+            ncols=2,
+            loc="upper left",
+            bbox_to_anchor=(0.05 + 0.49 * j, 1 - 0.62 / h),
+        )
+        _ = col
+    fig.subplots_adjust(
+        top=1 - 1.6 / h, bottom=0.55 / h, left=0.06, right=0.99, wspace=0.14, hspace=0.25
+    )
+    _title(
+        fig,
+        "At what file size does pzstd start to pay?",
+        "Cuts from the middle of real files. Process start is included, and it dominates the left of each panel.",
+        h,
+    )
+    fig.savefig(results / "fig5_crossover.png", dpi=170)
+    plt.close(fig)
+
+
 def make_all(results: Path) -> None:
     import matplotlib
 
@@ -1107,6 +1188,9 @@ def make_all(results: Path) -> None:
         )
         fig.savefig(results / "fig4_end_to_end.png", dpi=170)
         plt.close(fig)
+
+    if (results / "crossover.csv").exists():
+        plot_crossover(results, n)
 
     lines = [f"# Results ({meta.get('cpu', '')}, {n} threads)\n"]
     for f in files:
