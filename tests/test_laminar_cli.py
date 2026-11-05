@@ -352,3 +352,19 @@ def test_run_jobs_counts_inversions_and_keeps_job_order(monkeypatch):
 def test_run_jobs_raises_a_worker_failure():
     with pytest.raises(TypeError):
         laminar._run_jobs([(0.0, "not a count")], 2, 1, 0, fit=_fake_fit)
+
+
+def test_forward_ad_warning_is_silenced():
+    """A torch upgrade rewording the message would bring the warning back in every worker."""
+    import subprocess
+    import sys
+
+    code = (
+        "import fastfuncstuff.laminar.integrate, torch\n"
+        "torch.autograd.forward_ad._maybe_load_decompositions()\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-W", "default", "-c", code], capture_output=True, text=True
+    )
+    assert run.returncode == 0, run.stderr
+    assert "torch.jit.script" not in run.stderr

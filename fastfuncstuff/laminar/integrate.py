@@ -33,6 +33,7 @@ the fit and the model ranking.
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal, overload
 
 import torch
@@ -41,6 +42,13 @@ from torch.func import jvp
 from fastfuncstuff._compile import safe_compile
 from fastfuncstuff.laminar.forward import ForwardCache, build_cache, g_obs, rhs
 from fastfuncstuff.laminar.params import ModelSpec
+
+# torch's own: the first jvp imports torch._decomp.decompositions_for_jvp, which scripts
+# its decompositions for TorchScript's autodiff and warns once per process on Python 3.14.
+# Nothing here runs TorchScript, and every worker repeats the warning through a progress bar.
+warnings.filterwarnings(
+    "ignore", message="`torch.jit.script` is not supported", category=FutureWarning
+)
 
 
 def sample_indices(n_micro: int, n_scans: int, delay_bins: int) -> torch.Tensor:
