@@ -11,7 +11,7 @@ import io
 import sys
 import time
 
-from fastfuncstuff.cli_help import FfsArgumentParser
+from fastfuncstuff.cli_help import FfsArgumentParser, add_device_arg
 
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
@@ -114,10 +114,6 @@ def _say(text: str) -> None:
 
 
 def build_parser() -> FfsArgumentParser:
-    # Here and not at the top of the module: cli_utils imports torch, and the
-    # console script imports this module before main() can say anything.
-    from fastfuncstuff.cli_utils import add_device_arg
-
     p = FfsArgumentParser(
         prog="ffs_viewer",
         description="Interactive GPU-first viewer for volumetric data.",
@@ -336,9 +332,10 @@ def main(argv: list[str] | None = None) -> int:
             session.close()
         return 0
 
-    _say("importing the viewer window...")
     try:
-        from fastfuncstuff.viewer.ui.window import launch
+        from fastfuncstuff.viewer.ui.boot import import_behind_window
+
+        boot, window = import_behind_window("fastfuncstuff.viewer.ui.window")
     except ImportError as exc:  # PySide6 is an extra, not a core dependency
         print(
             f"ffs_viewer needs the GUI extra: pip install 'fastfuncstuff[viewer]'\n  ({exc})",
@@ -346,7 +343,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    return launch(
+    def say(text: str) -> None:
+        _say(text)
+        boot.status(text)
+
+    return window.launch(
         datasets,
         device=args.device,
         script=args.script,
@@ -357,8 +358,9 @@ def main(argv: list[str] | None = None) -> int:
         meshes=args.mesh,
         surf_data=_surf_data_commands(args.surf_data),
         vram_budget=args.vram_budget,
-        say=_say,
+        say=say,
         started=started,
+        on_shown=boot.close,
     )
 
 

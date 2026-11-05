@@ -57,6 +57,7 @@ from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.state import Plane, grid_res_choices
 from fastfuncstuff.viewer.surfaces import next_outlines
 from fastfuncstuff.viewer.ui import theme
+from fastfuncstuff.viewer.ui.boot import application
 from fastfuncstuff.viewer.ui.colorbar import RangeBar, colormap_icon, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.flow import FlowBar
@@ -3220,16 +3221,17 @@ def launch(
     vram_budget: str | None = None,
     say: Callable[[str], None] = lambda _text: None,
     started: float | None = None,
+    on_shown: Callable[[], None] | None = None,
 ) -> int:
-    """Open the controller and run the Qt loop, saying what startup is doing."""
+    """Open the controller and run the Qt loop, saying what startup is doing.
+
+    ``on_shown`` runs once the loop is turning, so whatever stood in for the
+    controller stays up until the controller has had its chance to paint.
+    """
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.viewer.residency import apply_vram_budget
 
-    # The GTK accessibility bridge prints a dbind warning at every start on a
-    # desktop whose at-spi bus it cannot reach, and nothing here uses it.
-    # setdefault, so someone who needs a screen reader can still turn it on.
-    os.environ.setdefault("NO_AT_BRIDGE", "1")
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app = application()
     session = ViewerSession(device=setup_device(device))
     apply_vram_budget(vram_budget, session.store.device)
     say(f"building the window, device {session.store.device}")
@@ -3266,6 +3268,8 @@ def launch(
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
     win.show()
+    if on_shown is not None:
+        QtCore.QTimer.singleShot(0, on_shown)
     win._row()
     took = "" if started is None else f" in {time.perf_counter() - started:.1f} s"
     say(f"ready{took}")
