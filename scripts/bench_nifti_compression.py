@@ -1739,6 +1739,14 @@ def main() -> None:
     q = sub.add_parser("plot")
     q.add_argument("results")
     args = p.parse_args()
+    # Work in fresh subfolders, so the cleanup below can never delete a folder
+    # that was passed in and already held something.
+    import tempfile
+
+    for name in ("workdir", "diskdir"):
+        if getattr(args, name, None):
+            Path(getattr(args, name)).mkdir(parents=True, exist_ok=True)
+            setattr(args, name, tempfile.mkdtemp(prefix="bench-", dir=getattr(args, name)))
     if args.cmd == "run":
         try:
             run(args)
