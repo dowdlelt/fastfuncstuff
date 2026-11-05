@@ -315,3 +315,40 @@ def test_a_permutation_null_is_fitted_and_turned_into_p_perm(reference, tmp_path
     # The real tables must be unchanged by the presence of a null: one line per model.
     _h, models = _table(f"{prefix}_laminar_models.tsv")
     assert [r[3] for r in models] == ["null", "superficial"]
+
+
+def _fake_fit(job):
+    """Finishes out of job order and reports the inversions an ROI would."""
+    import time
+
+    delay, inversions = job
+    time.sleep(delay)
+    for _ in range(inversions):
+        laminar._on_inversion()
+    return delay
+
+
+def test_run_jobs_counts_inversions_and_keeps_job_order(monkeypatch):
+    """The permutation nulls are sliced off by position, so results must stay in job order
+    however the workers finish; and every worker's inversions must reach the one bar."""
+    seen = {}
+    real = laminar._inversion_bar
+
+    def spy(total, verb):
+        bar = real(total, verb)
+        seen["bar"], seen["total"] = bar, total
+        return bar
+
+    monkeypatch.setattr(laminar, "_inversion_bar", spy)
+    jobs = [(1.0, 3), (0.0, 4)]
+    assert laminar._run_jobs(jobs, 2, 7, 1, fit=_fake_fit) == [1.0, 0.0]
+    assert seen["bar"].n == seen["total"] == 7
+
+    assert laminar._run_jobs(jobs, 1, 7, 1, fit=_fake_fit) == [1.0, 0.0]
+    assert seen["bar"].n == 7
+    assert laminar._on_inversion is None  # a closed bar must not outlive the call
+
+
+def test_run_jobs_raises_a_worker_failure():
+    with pytest.raises(TypeError):
+        laminar._run_jobs([(0.0, "not a count")], 2, 1, 0, fit=_fake_fit)

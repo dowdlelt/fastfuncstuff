@@ -407,6 +407,20 @@ def _null_tables(args, ks):
     return out
 
 
+_on_inversion = None
+
+
+def _count_into(counter) -> None:
+    """Pool initializer: every inversion in this worker adds to the shared count."""
+    global _on_inversion
+
+    def tick() -> None:
+        with counter.get_lock():
+            counter.value += 1
+
+    _on_inversion = tick
+
+
 def _fit_one(job):
     import torch
 
@@ -414,7 +428,47 @@ def _fit_one(job):
     from fastfuncstuff.laminar.pipeline import fit_roi
 
     data_for_k, kernels, targets, names, kw = job
-    return fit_roi(data_for_k, kernels, targets=targets, names=names, **kw)
+    return fit_roi(
+        data_for_k, kernels, targets=targets, names=names, on_inversion=_on_inversion, **kw
+    )
+
+
+def _run_jobs(jobs, workers: int, total: int, verb: int, fit=_fit_one) -> list:
+    """Fit every job and return the results in job order, counting inversions on one bar.
+
+    An ROI is minutes of work and results come back in job order, so a bar of ROIs sits
+    at zero through a healthy run. Inversions are the unit that visibly moves, and a
+    shared counter lets them report from inside a worker without waiting for its ROI.
+    """
+    global _on_inversion
+
+    bar = _inversion_bar(total, verb)
+    try:
+        if workers == 1:
+            _on_inversion = None if bar is None else bar.update
+            try:
+                return [fit(j) for j in jobs]
+            finally:
+                _on_inversion = None
+
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor, wait
+
+        ctx = multiprocessing.get_context()
+        counter = ctx.Value("i", 0)
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=ctx, initializer=_count_into, initargs=(counter,)
+        ) as pool:
+            futures = [pool.submit(fit, j) for j in jobs]
+            pending = set(futures)
+            while pending:
+                _, pending = wait(pending, timeout=0.5)
+                if bar is not None:
+                    bar.update(counter.value - bar.n)
+        return [f.result() for f in futures]
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -505,13 +559,7 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)  # fmt: skip
     workers = args.workers or max(1, __import__("os").cpu_count() // 2)
     workers = min(workers, len(jobs))
-    if workers == 1:
-        fits = [_fit_one(j) for j in _progress(jobs, args.verb)]
-    else:
-        from concurrent.futures import ProcessPoolExecutor
-
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            fits = list(_progress(pool.map(_fit_one, jobs), args.verb, total=len(jobs)))
+    fits = _run_jobs(jobs, workers, len(jobs) * len(names) * len(ks), args.verb)
     null_fits = fits[n_real:]
     fits = fits[:n_real]
     nulls_by_roi: dict[tuple[str, str], list] = {(f.roi, f.hemi): [] for f in fits}
@@ -590,15 +638,15 @@ def _names(n):
     return depth_names(n)
 
 
-def _progress(it, verb, total=None):
+def _inversion_bar(total: int, verb: int):
     if verb < 1:
-        return it
+        return None
     try:
         from tqdm.auto import tqdm
 
-        return tqdm(it, total=total, desc="ROIs", leave=True, disable=(total or 2) < 2)
+        return tqdm(total=total, desc="Inversions", leave=True, disable=total < 2)
     except ImportError:  # pragma: no cover
-        return it
+        return None
 
 
 if __name__ == "__main__":

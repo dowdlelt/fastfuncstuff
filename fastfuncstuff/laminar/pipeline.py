@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -151,6 +151,7 @@ def fit_roi(
     roi: str = "",
     name: str = "",
     hemi: str = "",
+    on_inversion: Callable[[], object] | None = None,
 ) -> RoiFit:
     """Invert, average across K, compare and devein one ROI's two-condition data."""
     from fastfuncstuff.laminar.devein import (
@@ -188,6 +189,7 @@ def fit_roi(
         hyper_from_rows=hyper_from_rows,
         rescue=rescue,
         free=free,
+        on_inversion=on_inversion,
         **ikw,
     )  # fmt: skip
     F = np.array([float(a.F) for a in averaged])

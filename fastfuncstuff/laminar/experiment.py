@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -375,12 +375,14 @@ def fit_model_space(
     free_energy: str = "reference",
     progress: bool = True,
     free: Sequence[str] = (),
+    on_inversion: Callable[[], object] | None = None,
     **vl_kwargs,
 ) -> tuple[list[str], list[BPAResult], list[list[VLResult]]]:
     """Invert every model at every vascular resolution, then average across K.
 
     Returns the model names, one :class:`BPAResult` per model, and the raw
-    per-K inversions.
+    per-K inversions. ``on_inversion`` is called after each inversion, for a caller
+    keeping its own count across processes.
     """
     ks = sorted(spec_for_k)
     n_neuronal = spec_for_k[ks[0]].N
@@ -416,6 +418,8 @@ def fit_model_space(
             runs.append(res)
             if bar is not None:
                 bar.update(1)
+            if on_inversion is not None:
+                on_inversion()
         per_model.append(runs)
         averaged.append(
             bayesian_parameter_average(runs, spec_for_k[ks[0]], free_energy=free_energy)
