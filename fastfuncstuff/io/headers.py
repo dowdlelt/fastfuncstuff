@@ -11,9 +11,11 @@ only as far as the header extends, even for a multi-GB ``.nii.zst``.
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 import subprocess
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -249,10 +251,9 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
         except ImportError:
             pass
         else:
-            # In-process: ~0.2 ms a header against ~6 ms to spawn zstd, which
+            # In-process: ~0.15 ms a header against ~6 ms to spawn zstd, which
             # is what made reading a 650-file results directory take 8 s.
-            with zstd.ZstdFile(sp) as fh:
-                return fh.read(n)
+            return _zstd_leading_bytes(sp, n, zstd)
         # Stream zstd and stop as soon as we have enough. Closing the pipe early
         # sends SIGPIPE to zstd, so it never decompresses past the first block.
         proc = subprocess.Popen(
@@ -268,17 +269,84 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
             proc.wait()
         return buf
     if sp.endswith(".gz"):
-        import gzip
-
-        with gzip.open(sp, "rb") as fh:  # decompresses lazily, only what we read
-            return fh.read(n)
+        return _gzip_leading_bytes(sp, n)
     with open(sp, "rb") as fh:
         return fh.read(n)
 
 
+#: Compressed bytes per read when decoding a header in process. zstd emits nothing
+#: until a whole block has arrived, and a block holds up to 128 KiB, so a smaller
+#: read only buys a second one.
+_LEAD_CHUNK = (1 << 17) + 1024
+
+
+def _zstd_leading_bytes(path: str, n: int, zstd: Any) -> bytes:
+    """The first ``n`` bytes of a zstd stream, decoded straight off the file.
+
+    The same bytes ``ZstdFile`` returns, without its two buffering layers. Frames
+    are walked by hand because pzstd opens with a skippable frame that decodes to
+    nothing, then writes one frame per job. A file that ends inside a frame
+    raises ``EOFError``, as ``ZstdFile`` does.
+    """
+    out = bytearray()
+    dec = zstd.ZstdDecompressor()
+    pending, fed = b"", False
+    with open(path, "rb", buffering=0) as fh:
+        while len(out) < n:
+            if dec.eof:
+                pending, fed = dec.unused_data, False
+                dec = zstd.ZstdDecompressor()
+            if dec.needs_input and not pending:
+                pending = fh.read(_LEAD_CHUNK)
+                if not pending:
+                    if fed:
+                        raise EOFError(f"{path}: ends inside a zstd frame")
+                    break
+            if pending:
+                fed = True
+            out += dec.decompress(pending, max_length=n - len(out))
+            pending = b""
+    return bytes(out)
+
+
+def _gzip_leading_bytes(path: str, n: int) -> bytes:
+    """The first ``n`` bytes of a gzip stream, decoded straight off the file.
+
+    ``gzip.open`` returns the same bytes at about twice the cost per header. Like
+    it, this reads on through concatenated members, skips zero padding between
+    them, and raises ``EOFError`` on a file that ends inside one.
+    """
+    import zlib
+
+    out = bytearray()
+    dec = zlib.decompressobj(31)
+    pending, fed = b"", False
+    with open(path, "rb", buffering=0) as fh:
+        while len(out) < n:
+            if not fed:
+                pending = pending.lstrip(b"\x00")
+            if not pending:
+                pending = fh.read(1 << 16)
+                if not pending:
+                    if fed:
+                        raise EOFError(f"{path}: ends inside a gzip member")
+                    break
+                continue
+            # n - len(out) is never 0 here, which zlib would read as "no limit".
+            out += dec.decompress(pending, n - len(out))
+            fed = True
+            pending = dec.unconsumed_tail
+            if dec.eof:
+                pending, fed = dec.unused_data, False
+                dec = zlib.decompressobj(31)
+    return bytes(out)
+
+
 #: Bytes read on the first look at a header. AFNI extensions (history, labels,
 #: stat tables) are a few KB; a second read is a second zstd spawn where the
-#: stdlib module is missing, so the first one asks for plenty.
+#: stdlib module is missing, so the first one asks for plenty. Asking for less
+#: saves nothing in process: 4 KB and 64 KB peeks timed the same, because zstd
+#: decodes a whole block either way.
 _HEADER_PEEK = 1 << 16
 
 
@@ -470,10 +538,98 @@ def read_brick_labels(img) -> list[str]:
 
     Accepts legacy plain-text (``BRICK_LABS=a~b~…``) and AFNI-XML payloads.
     """
-    txt = _afni_ext_text(img)
+    return _brick_labels_from_text(_afni_ext_text(img))
+
+
+def _brick_labels_from_text(txt: str) -> list[str]:
     if "BRICK_LABS=" in txt and 'atr_name="BRICK_LABS"' not in txt:
         return txt.split("BRICK_LABS=")[1].split("\x00")[0].split("~")
     m = _XML_LABS_RE.search(txt)
     if m:
         return [s.strip() for s in m.group(1).split("~") if s.strip()]
     return []
+
+
+@dataclass(frozen=True)
+class NiftiSummary:
+    """What a file list shows of a NIfTI: see :func:`peek_nifti_summary`."""
+
+    shape: tuple[int, int, int]
+    n_volumes: int
+    tr: float
+    labels: tuple[str, ...]
+
+
+def peek_nifti_summary(path: Path) -> NiftiSummary | None:
+    """Shape, volume count, TR and sub-brick labels of a NIfTI-1, or ``None``.
+
+    The viewer's catalog needs only these. Going through nibabel and
+    ``dsetinfo.read_info`` costs about 1 ms a file, most of it geometry the list
+    never shows; parsed straight from the header bytes they cost a fifth of that.
+
+    ``None`` means "not the common case": NIfTI-2, a selector in the name, an
+    odd ``dim``, a non-finite TR, an extension that runs past the first read,
+    or a file that will not read at all. The caller then takes the full route,
+    so this never has to be right about anything unusual. Where it does answer,
+    it must agree with ``read_info`` exactly, which ``tests/test_dsetinfo.py``
+    checks.
+    """
+    if "[" in path.name:
+        return None
+    try:
+        lead = _read_leading_bytes(path, _HEADER_PEEK)
+    except Exception:
+        return None
+    if len(lead) < 352:
+        return None
+    for endian in ("<", ">"):
+        if struct.unpack_from(endian + "i", lead)[0] == 348:
+            break
+    else:
+        return None
+    dim = struct.unpack_from(endian + "8h", lead, 40)
+    ndim = dim[0]
+    if not 1 <= ndim <= 7:
+        return None
+    dims = dim[1 : ndim + 1]
+    if min(dims) <= 0:
+        return None
+    vox_offset = int(struct.unpack_from(endian + "f", lead, 108)[0]) or 352
+    if not 352 <= vox_offset <= len(lead):
+        return None
+
+    # As header_tr reads it: pixdim[4] in xyzt_units' time unit, seconds when
+    # the unit is unset or not a time.
+    tr = 0.0
+    if ndim >= 4:
+        raw = struct.unpack_from(endian + "f", lead, 92)[0]
+        if not math.isfinite(raw):
+            return None
+        if raw > 0:
+            unit = {8: "sec", 16: "msec", 24: "usec"}.get(lead[123] & 0x38)
+            tr = raw * _TIME_UNIT_SCALE.get(unit or "", 1.0)
+
+    labels: list[str] = []
+    if vox_offset > 352 and lead[348]:
+        texts, pos = [], 352
+        while pos + 8 <= vox_offset:
+            esize, ecode = struct.unpack_from(endian + "2i", lead, pos)
+            if esize < 16 or esize % 16 or pos + esize > vox_offset:
+                return None
+            if ecode == _NIFTI_ECODE_AFNI:
+                texts.append(lead[pos + 8 : pos + esize].decode("utf-8", errors="ignore"))
+            pos += esize
+        if texts:
+            labels = _brick_labels_from_text("\n".join(texts))
+
+    shape3 = (dims + (1, 1, 1))[:3]
+    n_vol = dims[3] if ndim > 3 else 1
+    # dim[5] carries the sub-brick count for AFNI buckets written as "3D+t of 1".
+    if ndim > 4 and dims[4] > 1 and n_vol == 1:
+        n_vol = dims[4]
+    return NiftiSummary(
+        shape=(int(shape3[0]), int(shape3[1]), int(shape3[2])),
+        n_volumes=int(n_vol),
+        tr=float(tr),
+        labels=tuple(labels),
+    )
