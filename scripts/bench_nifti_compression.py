@@ -348,7 +348,8 @@ def worker_read(route: str, src: Path, threads: int) -> dict:
     elif route == "nibabel-rapidgzip":
         _route_nibabel_gz_through_rapidgzip(threads)
     t0 = time.perf_counter()
-    arr = np.asarray(load(str(src)).dataobj, dtype=np.float32)
+    # copy=True for a plain .nii: a float32 one is memory-mapped, so asarray reads nothing.
+    arr = np.array(load(str(src)).dataobj, dtype=np.float32, copy=route == "nii" or None)
     wall = time.perf_counter() - t0
     if arr.size == 0:
         raise RuntimeError("empty read")
@@ -724,12 +725,219 @@ def run_crossover(args) -> None:
     print(f"done in {time.time() - t_start:.0f}s", flush=True)
 
 
+# --- on a real disk ---------------------------------------------------------------
+
+
+def flush_and_evict(path: Path) -> float:
+    """fsync, then drop the file from the page cache, so the next read really is cold.
+
+    posix_fadvise needs no root and takes effect once the pages are clean. Returns the
+    seconds fsync took: the part of a write the disk is responsible for.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        t0 = time.perf_counter()
+        os.fsync(fd)
+        seconds = time.perf_counter() - t0
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return seconds
+
+
+def disk_encoders(n: int) -> list[Encoder]:
+    return [
+        enc("isal", 2, 1),
+        enc("isal", 2, n),
+        enc("pigz", 1, n),
+        enc("zstd", 1, 1),
+        enc("pzstd", 1, n),
+        enc("pzstd", 3, n),
+    ]
+
+
+def disk_pairs(n: int) -> list[tuple[str, str]]:
+    """(encoder name, decoder name) for the cold reads."""
+    return [
+        ("isal-2.p1", "isal.p1"),
+        ("isal-2.p1", f"rapidgzip.p{n}"),
+        (f"pigz-1.p{n}", f"rapidgzip.p{n}"),
+        (f"pzstd-1.p{n}", "zstd.p1"),
+        (f"pzstd-1.p{n}", f"pzstd.p{n}"),
+        (f"pzstd-3.p{n}", f"pzstd.p{n}"),
+    ]
+
+
+#: Real write route -> the route that reads its file back.
+DISK_ROUTES = {
+    "nii": "nii",
+    "nibabel-isal2": "nibabel-isal",
+    "ffs-gz": "ffs-gz",
+    "ffs-zst": "ffs-zst",
+}
+
+
+def run_disk(args) -> None:
+    """The codec and real routes against an actual disk.
+
+    Sources stay in tmpfs, standing in for an array already in memory. Every write is
+    timed with its fsync, since a write that only reached the page cache is not finished,
+    and every read starts from a file evicted from that cache.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    work, disk = Path(args.workdir), Path(args.diskdir)
+    disk.mkdir(parents=True, exist_ok=True)
+    n = args.threads
+    rng = random.Random(args.seed)
+    inputs = prepare_inputs(args, work)
+    log = Log(out / "results_disk.csv")
+    encoders = disk_encoders(n)
+    decs = {d.name: d for d in decoders(n)}
+    t_start = time.time()
+    for label, info in inputs.items():
+        common = {k: info[k] for k in ("bytes", "dtype", "kind")} | {"file": label}
+        expected = source_crc(info["path"])
+        paths = {e.name: disk / f"{label}.{e.name}{e.ext}" for e in encoders}
+        plain = disk / f"{label}.plain.nii"
+        for rep in range(args.reps):
+            os.sync()
+            jobs = [*encoders, None]
+            rng.shuffle(jobs)
+            for e in jobs:
+                dst = plain if e is None else paths[e.name]
+                dst.unlink(missing_ok=True)
+                os.sync()
+                if e is None:
+                    t0, c0 = time.perf_counter(), _self_cpu()
+                    with open(info["path"], "rb") as fin, open(dst, "wb") as fout:
+                        shutil.copyfileobj(fin, fout, CHUNK)
+                    wall, cpu = time.perf_counter() - t0, _self_cpu() - c0
+                else:
+                    wall, cpu = run_encoder(e, info["path"], dst)
+                flush = flush_and_evict(dst)
+                log.row(
+                    tier="encode",
+                    method="plain" if e is None else e.name,
+                    encoder="",
+                    decoder="",
+                    tool="plain" if e is None else e.tool,
+                    level="" if e is None else e.level,
+                    threads=1 if e is None else e.threads,
+                    rep=rep,
+                    wall=wall + flush,
+                    cpu=flush,
+                    out_bytes=dst.stat().st_size,
+                    **common,
+                )
+            pairs = disk_pairs(n)
+            rng.shuffle(pairs)
+            reads = [*pairs, None]
+            rng.shuffle(reads)
+            for pair in reads:
+                if pair is None:
+                    flush_and_evict(plain)
+                    wall, cpu = _timed_cmd(["cat", str(plain)], os.devnull)
+                    log.row(
+                        tier="decode",
+                        method="plain",
+                        encoder="",
+                        decoder="",
+                        tool="plain",
+                        level="",
+                        threads=1,
+                        rep=rep,
+                        wall=wall,
+                        cpu=cpu,
+                        out_bytes=plain.stat().st_size,
+                        **common,
+                    )
+                    continue
+                ename, dname = pair
+                flush_and_evict(paths[ename])
+                wall, cpu = run_decoder(decs[dname], paths[ename])
+                log.row(
+                    tier="decode",
+                    method=f"{ename}>{dname}",
+                    encoder=ename,
+                    decoder=dname,
+                    tool=decs[dname].tool,
+                    level="",
+                    threads=decs[dname].threads,
+                    rep=rep,
+                    wall=wall,
+                    cpu=cpu,
+                    out_bytes=paths[ename].stat().st_size,
+                    **common,
+                )
+            if rep == 0:
+                for ename, dname in pairs:
+                    verify_decode(decs[dname], paths[ename], expected)
+            routes = list(DISK_ROUTES)
+            rng.shuffle(routes)
+            reference = None
+            for route in routes:
+                ext = (
+                    ".nii" if route == "nii" else ".nii.zst" if route.endswith("zst") else ".nii.gz"
+                )
+                dst = disk / f"route{ext}"
+                dst.unlink(missing_ok=True)
+                os.sync()
+                res = run_worker("write", route, info["path"], dst, n)
+                flush = flush_and_evict(dst)
+                log.row(
+                    tier="e2e-write",
+                    method=route,
+                    tool=route,
+                    threads=n,
+                    rep=rep,
+                    wall=res["wall"] + flush,
+                    cpu=flush,
+                    peak_gb=res["peak_gb"],
+                    out_bytes=dst.stat().st_size,
+                    **common,
+                )
+                read_route = DISK_ROUTES[route]
+                res = run_worker("read", read_route, dst, Path(os.devnull), n)
+                reference = reference if reference is not None else res["sum"]
+                if res["sum"] != reference:
+                    raise RuntimeError(f"{read_route} read different data from {label}")
+                log.row(
+                    tier="e2e-read",
+                    method=read_route,
+                    tool=read_route,
+                    threads=n,
+                    rep=rep,
+                    wall=res["wall"],
+                    peak_gb=res["peak_gb"],
+                    out_bytes=dst.stat().st_size,
+                    **common,
+                )
+                dst.unlink()
+            print(f"[{time.time() - t_start:5.0f}s] {label}: rep {rep + 1}", flush=True)
+        for p in [*paths.values(), plain]:
+            p.unlink(missing_ok=True)
+    print(f"done in {time.time() - t_start:.0f}s", flush=True)
+
+
 # --- figures and tables -----------------------------------------------------------
 
 BLUE, ORANGE, AQUA, YELLOW, GRAY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#7d7c78"
 INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e6e5e0"
 # Colour is the tool in every figure. The marker tells settings of one tool apart.
-TOOL_COLOR = {"isal": BLUE, "pigz": ORANGE, "zstd": AQUA, "pzstd": AQUA, "rapidgzip": YELLOW}
+TOOL_COLOR = {
+    "isal": BLUE,
+    "pigz": ORANGE,
+    "zstd": AQUA,
+    "pzstd": AQUA,
+    "rapidgzip": YELLOW,
+    "plain": GRAY,
+    "nii": GRAY,
+    "nibabel-isal2": BLUE,
+    "nibabel-isal": BLUE,
+    "ffs-gz": ORANGE,
+    "ffs-zst": AQUA,
+}
 ROUTE_NAME = {
     "nii": "uncompressed .nii (nibabel)",
     "nibabel-isal2": "nibabel through ISA-L 2 (the tedana PR)",
@@ -748,8 +956,8 @@ ROUTE_COLOR = {
 }
 
 
-def load_rows(results: Path) -> list[dict]:
-    rows = list(csv.DictReader(open(results / "results.csv")))
+def load_rows(results: Path, name: str = "results.csv") -> list[dict]:
+    rows = list(csv.DictReader(open(results / name)))
     for r in rows:
         r["bytes"] = int(r["bytes"])
         r["wall"] = float(r["wall"])
@@ -897,6 +1105,78 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
     _title(fig, title, sub, h)
     fig.savefig(results / name, dpi=170)
     plt.close(fig)
+
+
+def plot_disk(results: Path, n: int) -> None:
+    rows = load_rows(results, "results_disk.csv")
+    med = medians(rows)
+    sizes = {r["file"]: r["bytes"] for r in rows}
+    files = sorted(sizes, key=lambda f: sizes[f])
+    plain = ("plain", "uncompressed .nii", "plain", "s")
+    write = [
+        plain,
+        (f"isal-2.p{n}", "ISA-L 2", "isal", "o"),
+        (f"pzstd-1.p{n}", "pzstd -1", "pzstd", "D"),
+        (f"pzstd-3.p{n}", "pzstd -3", "pzstd", "^"),
+        (f"pigz-1.p{n}", "pigz -1", "pigz", "o"),
+    ]
+    read = [
+        plain,
+        (
+            "isal-2.p1>isal.p1",
+            "ISA-L, still 1 thread (faded: it cannot use more)",
+            "isal",
+            "o",
+            0.32,
+        ),
+        (f"isal-2.p1>rapidgzip.p{n}", "rapidgzip", "rapidgzip", "o"),
+        (f"pzstd-1.p{n}>pzstd.p{n}", "pzstd -1", "pzstd", "D"),
+        (f"pzstd-3.p{n}>pzstd.p{n}", "pzstd -3", "pzstd", "^"),
+    ]
+    routes_write = [
+        ("nii", "uncompressed .nii", "nii", "s"),
+        ("nibabel-isal2", "nibabel + ISA-L 2, 1 thread (tedana PR)", "nibabel-isal2", "P"),
+        ("ffs-gz", "save_nifti / load_nifti .nii.gz", "ffs-gz", "X"),
+        ("ffs-zst", "save_nifti / load_nifti .nii.zst", "ffs-zst", "v"),
+    ]
+    routes_read = [
+        ("nii", "uncompressed .nii", "nii", "s"),
+        ("nibabel-isal", "nibabel + ISA-L 2, 1 thread (tedana PR)", "nibabel-isal", "P"),
+        ("ffs-gz", "save_nifti / load_nifti .nii.gz", "ffs-gz", "X"),
+        ("ffs-zst", "save_nifti / load_nifti .nii.zst", "ffs-zst", "v"),
+    ]
+    xlabel = "seconds, left is less waiting"
+    _save_strip(
+        results,
+        "fig6_nvme.png",
+        "On a real NVMe: writes include fsync, reads start cold",
+        "Median of 3 shuffled repetitions, evicted from the page cache before each read. Codec panels read to /dev/null; real routes end in a float32 array.",
+        files,
+        sizes,
+        [
+            (
+                f"Codec write, {n} threads",
+                xlabel,
+                lambda ax: _dot_panel(ax, med, "encode", files, write, "seconds"),
+            ),
+            (
+                f"Codec read, {n} threads",
+                xlabel,
+                lambda ax: _dot_panel(ax, med, "decode", files, read, "seconds"),
+            ),
+            (
+                "Real write",
+                xlabel,
+                lambda ax: _dot_panel(ax, med, "e2e-write", files, routes_write, "seconds"),
+            ),
+            (
+                "Real read",
+                xlabel,
+                lambda ax: _dot_panel(ax, med, "e2e-read", files, routes_read, "seconds"),
+            ),
+        ],
+        legend_cols=4,
+    )
 
 
 def plot_crossover(results: Path, n: int) -> None:
@@ -1251,6 +1531,8 @@ def make_all(results: Path) -> None:
 
     if (results / "crossover.csv").exists():
         plot_crossover(results, n)
+    if (results / "results_disk.csv").exists():
+        plot_disk(results, n)
 
     lines = [f"# Results ({meta.get('cpu', '')}, {n} threads)\n"]
     for f in files:
@@ -1326,6 +1608,14 @@ def main() -> None:
     )
     x.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
     x.add_argument("-seed", type=int, default=0)
+    d = sub.add_parser("disk", help="cold reads and fsynced writes on a real disk")
+    d.add_argument("-out", required=True)
+    d.add_argument("-diskdir", required=True, help="scratch space on the disk under test")
+    d.add_argument("-workdir", default="/dev/shm/bench_nifti_disk", help="tmpfs for the sources")
+    d.add_argument("-file", action="append", default=[], metavar="LABEL=PATH")
+    d.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
+    d.add_argument("-reps", type=int, default=3)
+    d.add_argument("-seed", type=int, default=0)
     q = sub.add_parser("plot")
     q.add_argument("results")
     args = p.parse_args()
@@ -1334,6 +1624,12 @@ def main() -> None:
             run(args)
         finally:
             shutil.rmtree(args.workdir, ignore_errors=True)
+    elif args.cmd == "disk":
+        try:
+            run_disk(args)
+        finally:
+            shutil.rmtree(args.workdir, ignore_errors=True)
+            shutil.rmtree(args.diskdir, ignore_errors=True)
     elif args.cmd == "crossover":
         try:
             run_crossover(args)
