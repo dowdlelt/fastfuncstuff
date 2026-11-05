@@ -29,6 +29,33 @@ What makes it fair:
 * ISA-L is called in-process since that is the only way to use it from Python, so
   it pays no process start. The command-line tools do, about 1 ms, which only
   matters on files far smaller than a volume series.
+
+Runs on Linux and macOS. What differs on a Mac:
+
+* There is no /dev/shm. Without a RAM disk the scratch space falls back to the
+  temp directory, which is a real disk, and the run says so. Make a RAM disk
+  first (8 GiB here; the count is 512-byte sectors) and pass it as -workdir:
+  ``diskutil erasevolume HFS+ ramdisk $(hdiutil attach -nomount ram://16777216)``
+* macOS cannot drop one file from the page cache without root, so ``disk``
+  reads there are warm, and its figure says so. Writes are flushed with
+  F_FULLFSYNC, since a plain fsync on macOS does not reach the drive.
+* Peak RAM comes from ru_maxrss rather than Linux's VmHWM. If the OS carries a
+  parent's high-water mark across exec it reads high, so treat it as a bound.
+* Apple Silicon has no SMT, so the default (half the logical CPUs) may be fewer
+  threads than you want. Pass -threads.
+* ISA-L's hand-tuned code is mostly written for x86, so its numbers are the
+  most likely to move on ARM.
+
+Traps that produce a convincing wrong answer, whatever the machine:
+
+* A float32 ``.nii`` opened with nibabel is memory-mapped, so a "read" that
+  never copies the voxels has read nothing.
+* Decoding to /dev/null is not a load. A reader that wins there can lose once
+  the bytes go through a pipe into an array, as ``pzstd -1`` did against
+  ``-3`` through Linux's 64 KB default pipe. ``bench_nifti_write_path.py``
+  times the toolbox's real routes.
+* Check that a cut of a file compresses before trusting a size sweep. One
+  real warp's middle was all zeros.
 """
 
 from __future__ import annotations
@@ -273,12 +300,65 @@ READ_ROUTES = ["nii", "nibabel-isal", "nibabel-rapidgzip", "ffs-gz", "ffs-zst"]
 
 
 def _peak_rss_gb() -> float:
-    # VmHWM, not ru_maxrss: ru_maxrss survives exec, so every worker would report
-    # the harness's own peak.
-    for line in Path("/proc/self/status").read_text().splitlines():
-        if line.startswith("VmHWM:"):
-            return int(line.split()[1]) / 1024**2
-    return float("nan")
+    return peak_rss_gb()
+
+
+def peak_rss_gb() -> float:
+    """This process's peak resident memory, in GiB."""
+    # VmHWM, not ru_maxrss, where there is one: on Linux ru_maxrss survives exec,
+    # so every worker would report the harness's own peak.
+    status = Path("/proc/self/status")
+    if status.exists():
+        for line in status.read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024**2
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / 1024**3 if sys.platform == "darwin" else peak / 1024**2
+
+
+def default_threads() -> int:
+    """Half the CPUs this process may use: the physical cores on SMT x86."""
+    if hasattr(os, "sched_getaffinity"):
+        n = len(os.sched_getaffinity(0))
+    else:
+        n = os.cpu_count() or 2
+    return max(1, n // 2)
+
+
+def scratch_dir(name: str) -> str:
+    """tmpfs where there is one, else the temp directory, which is a real disk."""
+    if Path("/dev/shm").is_dir():
+        return f"/dev/shm/{name}"
+    import tempfile
+
+    return str(Path(tempfile.gettempdir()) / name)
+
+
+def warn_if_not_ram(path: Path) -> None:
+    """Say so when the scratch space is a disk, since then codec times include it."""
+    probe = path if path.exists() else path.parent
+    try:
+        out = subprocess.run(["df", "-P", str(probe)], capture_output=True, text=True).stdout
+        device = out.splitlines()[-1].split()[0]
+    except (OSError, IndexError):
+        return
+    ram = device in ("tmpfs", "shm", "none") or device.startswith("/dev/ram")
+    if sys.platform == "darwin":
+        # An hdiutil RAM disk is a disk image whose source is ram://.
+        info = subprocess.run(["hdiutil", "info"], capture_output=True, text=True).stdout
+        import re
+
+        whole = re.match(r"/dev/disk\d+", device)
+        ram = whole is not None and any(
+            "ram://" in block and re.search(re.escape(whole.group()) + r"\b", block)
+            for block in info.split("=" * 48)
+        )
+    if not ram:
+        print(
+            f"note: {probe} is on {device}, not a RAM disk, so these times include that disk."
+            " See the docstring for making one on macOS.",
+            flush=True,
+        )
 
 
 def worker_write(route: str, src: Path, dst: Path) -> dict:
@@ -401,10 +481,18 @@ def versions() -> dict:
 
     out["isal"] = isal.__version__
     out["nibabel"] = nibabel.__version__
-    for line in Path("/proc/cpuinfo").read_text().splitlines():
-        if line.startswith("model name"):
-            out["cpu"] = line.split(":", 1)[1].strip()
-            break
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text().splitlines():
+            if line.startswith("model name"):
+                out["cpu"] = line.split(":", 1)[1].strip()
+                break
+    elif sys.platform == "darwin":
+        res = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
+        )
+        out["cpu"] = res.stdout.strip()
+    out["platform"] = platform.platform()
     out["logical_cpus"] = os.cpu_count()
     return out
 
@@ -433,6 +521,7 @@ def run(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     work = Path(args.workdir)
+    warn_if_not_ram(work)
     n = args.threads
     rng = random.Random(args.seed)
     print("preparing inputs", flush=True)
@@ -623,6 +712,7 @@ def run_crossover(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     work = Path(args.workdir)
+    warn_if_not_ram(work)
     n = args.threads
     rng = random.Random(args.seed)
     inputs = prepare_inputs(args, work)
@@ -728,18 +818,30 @@ def run_crossover(args) -> None:
 # --- on a real disk ---------------------------------------------------------------
 
 
-def flush_and_evict(path: Path) -> float:
-    """fsync, then drop the file from the page cache, so the next read really is cold.
+#: Whether a file can be dropped from the page cache without root. Linux can;
+#: macOS cannot, so ``disk`` reads there are warm.
+CAN_EVICT = hasattr(os, "posix_fadvise")
 
-    posix_fadvise needs no root and takes effect once the pages are clean. Returns the
-    seconds fsync took: the part of a write the disk is responsible for.
+
+def flush_and_evict(path: Path) -> float:
+    """Flush to the drive, then drop the file from the page cache where the OS allows.
+
+    posix_fadvise needs no root and takes effect once the pages are clean. On macOS
+    a plain fsync stops at the drive's cache, so F_FULLFSYNC is used instead. Returns
+    the seconds the flush took: the part of a write the disk is responsible for.
     """
+    import fcntl
+
     fd = os.open(path, os.O_RDONLY)
     try:
         t0 = time.perf_counter()
-        os.fsync(fd)
+        if hasattr(fcntl, "F_FULLFSYNC"):
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        else:
+            os.fsync(fd)
         seconds = time.perf_counter() - t0
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        if CAN_EVICT:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
     return seconds
@@ -788,6 +890,12 @@ def run_disk(args) -> None:
     out.mkdir(parents=True, exist_ok=True)
     work, disk = Path(args.workdir), Path(args.diskdir)
     disk.mkdir(parents=True, exist_ok=True)
+    warn_if_not_ram(work)
+    if not CAN_EVICT:
+        print("note: this OS cannot evict a file without root, so reads will be warm", flush=True)
+    (out / "disk_meta.json").write_text(
+        json.dumps({"cold_reads": CAN_EVICT, "platform": platform.platform()}, indent=2)
+    )
     n = args.threads
     rng = random.Random(args.seed)
     inputs = prepare_inputs(args, work)
@@ -1109,6 +1217,14 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
 
 def plot_disk(results: Path, n: int) -> None:
     rows = load_rows(results, "results_disk.csv")
+    meta_path = results / "disk_meta.json"
+    cold_reads = json.loads(meta_path.read_text())["cold_reads"] if meta_path.exists() else True
+    cold = "reads start cold" if cold_reads else "reads are WARM (this OS cannot evict)"
+    evicted = (
+        "evicted from the page cache before each read"
+        if cold_reads
+        else "files stayed in the page cache"
+    )
     med = medians(rows)
     sizes = {r["file"]: r["bytes"] for r in rows}
     files = sorted(sizes, key=lambda f: sizes[f])
@@ -1149,8 +1265,8 @@ def plot_disk(results: Path, n: int) -> None:
     _save_strip(
         results,
         "fig6_nvme.png",
-        "On a real NVMe: writes include fsync, reads start cold",
-        "Median of 3 shuffled repetitions, evicted from the page cache before each read. Codec panels read to /dev/null; real routes end in a float32 array.",
+        f"On a real disk: writes include fsync, {cold}",
+        f"Median of 3 shuffled repetitions, {evicted}. Codec panels read to /dev/null; real routes end in a float32 array.",
         files,
         sizes,
         [
@@ -1584,7 +1700,7 @@ def main() -> None:
     r = sub.add_parser("run")
     r.add_argument("-out", required=True)
     r.add_argument(
-        "-workdir", default="/dev/shm/bench_nifti_compression", help="tmpfs scratch space"
+        "-workdir", default=scratch_dir("bench_nifti_compression"), help="RAM-backed scratch space"
     )
     r.add_argument(
         "-file", action="append", default=[], metavar="LABEL=PATH", help="another file; repeatable"
@@ -1592,7 +1708,7 @@ def main() -> None:
     r.add_argument(
         "-sweep", nargs="*", default=[], help="labels that also get the compression level sweep"
     )
-    r.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
+    r.add_argument("-threads", type=int, default=default_threads())
     r.add_argument("-reps", type=int, default=5)
     r.add_argument(
         "-reps_large", type=int, default=3, help="repetitions for files of 500 MB and up"
@@ -1601,19 +1717,23 @@ def main() -> None:
     r.add_argument("-no_e2e", action="store_true", help="skip the end-to-end array routes")
     x = sub.add_parser("crossover", help="at what file size does pzstd start to pay?")
     x.add_argument("-out", required=True)
-    x.add_argument("-workdir", default="/dev/shm/bench_nifti_crossover", help="tmpfs scratch space")
+    x.add_argument(
+        "-workdir", default=scratch_dir("bench_nifti_crossover"), help="RAM-backed scratch space"
+    )
     x.add_argument("-file", action="append", default=[], metavar="LABEL=PATH")
     x.add_argument(
         "-sizes_mb", nargs="*", type=int, default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
     )
-    x.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
+    x.add_argument("-threads", type=int, default=default_threads())
     x.add_argument("-seed", type=int, default=0)
     d = sub.add_parser("disk", help="cold reads and fsynced writes on a real disk")
     d.add_argument("-out", required=True)
     d.add_argument("-diskdir", required=True, help="scratch space on the disk under test")
-    d.add_argument("-workdir", default="/dev/shm/bench_nifti_disk", help="tmpfs for the sources")
+    d.add_argument(
+        "-workdir", default=scratch_dir("bench_nifti_disk"), help="RAM-backed space for the sources"
+    )
     d.add_argument("-file", action="append", default=[], metavar="LABEL=PATH")
-    d.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
+    d.add_argument("-threads", type=int, default=default_threads())
     d.add_argument("-reps", type=int, default=3)
     d.add_argument("-seed", type=int, default=0)
     q = sub.add_parser("plot")
