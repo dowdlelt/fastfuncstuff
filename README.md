@@ -35,7 +35,7 @@ Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstd) transparently. ZSTD is a fa
 large files that are read many times. AFNI `BRIK/HEAD` support  also included, but not as rigourously  tested. `MGZ` support is limited, lets say minimally functional.
 It needs the `zstd` / `pzstd` (preferred - gets you parallel  deflate) programs installed (see
 [INSTALL.md](INSTALL.md#zstd-niizst-support)) and AFNI cannot read it, so default outputs are
-`.nii.gz`, written with `pigz` when available.
+`.nii.gz`, written with ISA-L when available, otherwise `pigz`.
 
 ## What I'm very happy with
 

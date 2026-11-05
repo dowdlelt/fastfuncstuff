@@ -40,6 +40,10 @@ dependencies = [
     # Multi-threaded .nii.gz decoding (io/fastgzip.py): 4.8 s -> 1.9 s for a
     # 566 MB run on six cores. Optional at runtime -- reads fall back to zlib.
     "rapidgzip>=0.14",
+    # Multi-threaded .nii.gz writing (io/afni.py): a median 3.8x as fast as pigz -1 across
+    # 11 real files on six cores, at about the same size. Optional at runtime -- writes
+    # fall back to pigz, then zlib.
+    "isal>=1.7",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

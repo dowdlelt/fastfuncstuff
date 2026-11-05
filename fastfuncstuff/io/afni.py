@@ -2489,6 +2489,32 @@ def _gzip_level() -> int:
     return 1
 
 
+#: ISA-L's own default. Its levels only run 0-3: 1 and 2 are about the same in speed and
+#: size, 0 barely compresses (97% of original on raw BOLD), and 3 can be half the speed.
+_ISAL_LEVEL = 2
+
+
+def _isal_gzip_writer(dst: Path):
+    """An ISA-L ``.gz`` stream on ``dst``, or None when pigz or zlib should do it instead.
+
+    The output is ordinary gzip, about the same size as ``pigz -1``, written a median
+    3.8x as fast across 11 real files on six cores. Absent when ``isal`` is not installed.
+    An explicit ``FFS_GZIP_LEVEL`` also declines it: that scale runs to 9 for archival
+    runs, which ISA-L has no level to honour.
+    """
+    if os.environ.get("FFS_GZIP_LEVEL", "").strip():
+        return None
+    try:
+        from isal import igzip_threaded  # ty: ignore[unresolved-import]  # only present if installed
+    except ImportError:
+        return None
+    n_threads = max(1, resolve_cpu_threads()[0])
+    # threads=1 would still hand the work to a background thread; 0 is the plain writer.
+    return igzip_threaded.open(
+        dst, "wb", compresslevel=_ISAL_LEVEL, threads=n_threads if n_threads > 1 else 0
+    )
+
+
 def _zstd_level() -> int:
     """Compression level for ``.nii.zst`` writes.
 
@@ -2508,7 +2534,15 @@ def _zstd_level() -> int:
 
 
 def _compress_gz(src: Path, dst: Path, remove_original: bool) -> Path:
-    """Compress *src* (.nii) → *dst* (.nii.gz) using pigz or gzip fallback."""
+    """Compress *src* (.nii) → *dst* (.nii.gz) with ISA-L, else pigz, else zlib."""
+    writer = _isal_gzip_writer(dst)
+    if writer is not None:
+        with open(src, "rb") as f_in, writer as f_out:
+            shutil.copyfileobj(f_in, f_out, 1 << 20)
+        if remove_original and src != dst:
+            src.unlink()
+        return dst
+
     level = _gzip_level()
     pigz = shutil.which("pigz")
     if pigz:
@@ -3743,6 +3777,15 @@ def _stream_zst(img, dst: Path) -> None:
         raise
 
 
+def _stream_gz_through_isal(img, writer, dst: Path) -> None:
+    try:
+        with writer as gz:
+            _write_image_to_stream(img, gz, str(dst))
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+
+
 def _stream_gz_through_pigz(img, pigz: str, dst: Path) -> None:
     n_threads = max(1, resolve_cpu_threads()[0])
     try:
@@ -3975,16 +4018,20 @@ def save_nifti(
     def _do_write() -> None:
         # Straight into the compressor. On a 3.5 GB warp the uncompressed temp file this
         # replaced was about half of the whole write, and a full extra write to disk.
-        pigz = shutil.which("pigz")
+        is_gz = out_str.endswith(".nii.gz")
+        isal_writer = _isal_gzip_writer(out) if is_gz else None
+        pigz = shutil.which("pigz") if is_gz else None
         if out_str.endswith(".nii.zst"):
             _stream_zst(img, out)
-        elif out_str.endswith(".nii.gz") and pigz:
+        elif isal_writer is not None:
+            _stream_gz_through_isal(img, isal_writer, out)
+        elif pigz:
             _stream_gz_through_pigz(img, pigz, out)
         elif out_str.endswith(".nii"):
             # Uncompressed direct write — same >2 GiB single-write hazard as the temp.
             _nib_save_chunked(img, out_str)
         else:
-            # .nii.gz without pigz → nibabel's gzip stream chunks internally, so safe.
+            # .nii.gz with neither ISA-L nor pigz: nibabel's gzip stream chunks internally.
             nib.save(img, str(out))
 
     # Big writes can otherwise look wedged. This goes through the SAME spinner every

@@ -6,10 +6,12 @@ Uses the synthetic_data/ folder with known test datasets:
 - afni_nii_all_ones.nii.gz: Same data in NIfTI format
 """
 
+import gzip
 import io
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import nibabel as nib
@@ -1037,6 +1039,7 @@ class TestStreamedWrites:
         """It must raise, and a truncated dataset must not sit under the final name."""
         from fastfuncstuff.io import afni
 
+        monkeypatch.setitem(sys.modules, "isal", None)  # or ISA-L writes the .gz itself
         tools = tmp_path / "bin"
         tools.mkdir()
         # Reads a little and then dies, so the writer meets a broken pipe mid-stream.
@@ -1047,6 +1050,84 @@ class TestStreamedWrites:
         out = tmp_path / f"out{suffix}"
         with pytest.raises(subprocess.CalledProcessError):
             afni.save_nifti(data, str(out), affine=np.eye(4))
+        assert not out.exists()
+
+
+class TestIsalGzipWrites:
+    """ISA-L writes .nii.gz when it can, and pigz or zlib take over when it cannot."""
+
+    def _data(self):
+        return np.arange(4 * 5 * 6 * 3, dtype=np.float32).reshape(4, 5, 6, 3)
+
+    @pytest.mark.parametrize("n_threads", [1, 3])
+    def test_readable_by_every_gzip_reader(self, tmp_path, monkeypatch, n_threads):
+        pytest.importorskip("isal")
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setattr(afni, "resolve_cpu_threads", lambda *_: (n_threads, "test"))
+        data = self._data()
+        out = tmp_path / "out.nii.gz"
+        afni.save_nifti(data, str(out), affine=np.eye(4), brick_labels=["a", "b", "c"])
+        stored = gzip.decompress(out.read_bytes())
+        assert stored[:4] == (348).to_bytes(4, "little")
+        assert np.array_equal(np.asarray(nib.load(str(out)).dataobj, dtype=np.float32), data)
+        assert np.array_equal(np.asarray(afni.load_nifti(str(out)).dataobj, dtype=np.float32), data)
+
+    def test_data_larger_than_its_block_size(self, tmp_path, monkeypatch):
+        """The threaded writer works in 1 MiB blocks, and a volume arrives as one write."""
+        pytest.importorskip("isal")
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setattr(afni, "resolve_cpu_threads", lambda *_: (3, "test"))
+        data = np.random.default_rng(0).integers(0, 50, (120, 120, 60, 3), dtype=np.int16)
+        out = tmp_path / "out.nii.gz"
+        afni.save_nifti(data, str(out), affine=np.eye(4))
+        assert np.array_equal(np.asarray(nib.load(str(out)).dataobj), data)
+
+    def test_compress_nifti_uses_it_and_honours_remove_original(self, tmp_path):
+        pytest.importorskip("isal")
+        from fastfuncstuff.io.afni import _compress_gz
+
+        src = tmp_path / "keep.nii"
+        src.write_bytes(b"not really a nifti, but it compresses " * 100)
+        _compress_gz(src, tmp_path / "keep.nii.gz", remove_original=False)
+        assert src.exists()
+        assert gzip.decompress((tmp_path / "keep.nii.gz").read_bytes()) == src.read_bytes()
+        _compress_gz(src, tmp_path / "gone.nii.gz", remove_original=True)
+        assert not src.exists()
+
+    def test_an_explicit_level_goes_to_pigz(self, tmp_path, monkeypatch):
+        """ISA-L stops at its level 3, so it cannot honour an archival request for 9."""
+        from fastfuncstuff.io.afni import _isal_gzip_writer
+
+        monkeypatch.setenv("FFS_GZIP_LEVEL", "9")
+        assert _isal_gzip_writer(tmp_path / "out.nii.gz") is None
+
+    @pytest.mark.parametrize("has_pigz", [True, False])
+    def test_without_isal_falls_back(self, tmp_path, monkeypatch, has_pigz):
+        """The toolbox must keep writing where isal is not installed."""
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setitem(sys.modules, "isal", None)
+        if not has_pigz:
+            monkeypatch.setattr(afni.shutil, "which", lambda name: None)
+        data = self._data()
+        out = tmp_path / "out.nii.gz"
+        afni.save_nifti(data, str(out), affine=np.eye(4))
+        assert [p.name for p in tmp_path.iterdir()] == [out.name]
+        assert np.array_equal(np.asarray(nib.load(str(out)).dataobj, dtype=np.float32), data)
+
+    def test_a_failed_write_leaves_no_partial_output(self, tmp_path, monkeypatch):
+        pytest.importorskip("isal")
+        from fastfuncstuff.io import afni
+
+        def explode(*_):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(afni, "_write_image_to_stream", explode)
+        out = tmp_path / "out.nii.gz"
+        with pytest.raises(OSError, match="disk full"):
+            afni.save_nifti(self._data(), str(out), affine=np.eye(4))
         assert not out.exists()
 
 
