@@ -956,6 +956,30 @@ def _fake_tool(directory: Path, name: str, script: str) -> None:
     tool.chmod(0o755)
 
 
+class TestGrowPipe:
+    def test_grows_a_pipe_where_the_platform_can(self):
+        fcntl = pytest.importorskip("fcntl")
+        if not hasattr(fcntl, "F_SETPIPE_SZ"):
+            pytest.skip("no F_SETPIPE_SZ on this platform")
+        from fastfuncstuff.io.afni import _grow_pipe
+
+        read_end, write_end = os.pipe()
+        try:
+            with os.fdopen(read_end, "rb", buffering=0, closefd=False) as fobj:
+                _grow_pipe(fobj)
+            assert fcntl.fcntl(read_end, fcntl.F_GETPIPE_SZ) == 1 << 20
+        finally:
+            os.close(read_end)
+            os.close(write_end)
+
+    def test_refusal_changes_nothing(self, tmp_path):
+        """A regular file is not a pipe, so the call fails: the write must not care."""
+        from fastfuncstuff.io.afni import _grow_pipe
+
+        with open(tmp_path / "plain", "wb") as fobj:
+            _grow_pipe(fobj)
+
+
 class TestStreamedWrites:
     """save_nifti compresses straight from memory, with no uncompressed copy on disk."""
 

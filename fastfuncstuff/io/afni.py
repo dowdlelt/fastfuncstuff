@@ -201,6 +201,22 @@ _NIFTI1_MAGIC_SIZES = (348, 1543569408)
 _NIFTI2_MAGIC_SIZES = (540, 471072768)
 
 
+def _grow_pipe(fileobj) -> None:
+    """Ask for a 1 MiB pipe buffer, which is the default limit for unprivileged processes.
+
+    Linux's 64 KiB default makes the two processes take turns many times per megabyte.
+    Reading 894 MB from pzstd into an array took 0.65 s with it and 0.44 s with this,
+    against 0.26 s of actual decoding. Purely an optimisation: macOS has no such call,
+    and a user over their pipe quota is refused, so a failure changes nothing.
+    """
+    try:
+        import fcntl
+
+        fcntl.fcntl(fileobj.fileno(), fcntl.F_SETPIPE_SZ, 1 << 20)
+    except (ImportError, AttributeError, OSError):
+        pass
+
+
 def _read_exactly(stream: Any, n: int) -> bytes:
     """Read exactly *n* bytes from a pipe, or raise.
 
@@ -236,6 +252,7 @@ def _decode_zst_to_image(filepath: Path, threads: int | None) -> nib.Nifti1Image
     """
     cmd = _zstd_decode_command(filepath, threads)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    _grow_pipe(proc.stdout)
     try:
         # bufsize=0 makes this a raw FileIO, which supports readinto; the stub
         # only promises the buffered IO[Any] interface.
@@ -3732,6 +3749,7 @@ def _stream_image_through(img, cmd: list[str], dst: Path) -> None:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out, stderr=err, bufsize=0)
         stdin = proc.stdin
         assert stdin is not None
+        _grow_pipe(stdin)
         pipe_broke = False
         try:
             _write_image_to_stream(img, stdin, str(dst))
