@@ -6,6 +6,10 @@ Uses the synthetic_data/ folder with known test datasets:
 - afni_nii_all_ones.nii.gz: Same data in NIfTI format
 """
 
+import io
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import nibabel as nib
@@ -942,6 +946,108 @@ class TestZstdLevel:
             dst = afni._compress_zst(src, tmp_path / f"l{level}.nii.zst", remove_original=True)
             sizes[level] = dst.stat().st_size
         assert sizes["19"] < sizes["1"]
+
+
+def _fake_tool(directory: Path, name: str, script: str) -> None:
+    tool = directory / name
+    tool.write_text(f"#!/bin/sh\n{script}\n")
+    tool.chmod(0o755)
+
+
+class TestStreamedWrites:
+    """save_nifti compresses straight from memory, with no uncompressed copy on disk."""
+
+    @pytest.mark.parametrize("suffix", [".nii.gz", ".nii.zst"])
+    @pytest.mark.parametrize(
+        "dtype,shape",
+        [("float32", (4, 5, 6)), ("float32", (4, 5, 6, 3)), ("int16", (4, 5, 6, 2, 3))],
+    )
+    def test_round_trip_and_no_temp_file(self, tmp_path, suffix, dtype, shape):
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        data = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+        out = tmp_path / f"out{suffix}"
+        save_nifti(data, str(out), affine=np.diag([2.0, 2.0, 2.0, 1.0]))
+        assert [p.name for p in tmp_path.iterdir()] == [out.name]
+        img = load_nifti(str(out))
+        assert np.array_equal(np.asarray(img.dataobj, dtype=dtype), data)
+        assert np.allclose(img.affine, np.diag([2.0, 2.0, 2.0, 1.0]))
+
+    @pytest.mark.parametrize("suffix", [".nii.gz", ".nii.zst"])
+    def test_extension_survives_and_voxels_start_at_the_offset(self, tmp_path, suffix):
+        """The stream cannot seek, so the padding up to vox_offset has to be written.
+        Brick labels live in the header extension, which moves that offset."""
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        data = np.arange(4 * 5 * 6 * 2, dtype=np.float32).reshape(4, 5, 6, 2)
+        out = tmp_path / f"out{suffix}"
+        save_nifti(data, str(out), affine=np.eye(4), brick_labels=["first", "second"])
+        img = load_nifti(str(out))
+        assert np.array_equal(np.asarray(img.dataobj, dtype=np.float32), data)
+        assert any(b"first" in ext.get_content() for ext in img.header.extensions)
+
+    def test_matches_an_uncompressed_write_byte_for_byte(self, tmp_path):
+        from fastfuncstuff.io.afni import _write_image_to_stream
+
+        data = np.arange(4 * 5 * 6 * 2, dtype=np.float32).reshape(4, 5, 6, 2)
+        img = nib.Nifti1Image(data, np.eye(4))
+        plain = tmp_path / "plain.nii"
+        nib.save(img, str(plain))
+        sink = io.BytesIO()
+        _write_image_to_stream(nib.Nifti1Image(data, np.eye(4)), sink, "x.nii")
+        assert sink.getvalue() == plain.read_bytes()
+
+    def test_a_short_write_is_finished_not_truncated(self):
+        """A raw pipe may accept less than it was given."""
+        from fastfuncstuff.io.afni import _StreamWriter
+
+        class ShortWrites(io.BytesIO):
+            def write(self, b):
+                return super().write(bytes(b)[:3])
+
+        sink = ShortWrites()
+        writer = _StreamWriter(sink)
+        assert writer.write(b"0123456789") == 10
+        assert sink.getvalue() == b"0123456789"
+        assert writer.tell() == 10
+
+    def test_dying_pzstd_falls_back_to_stock_zstd(self, tmp_path, monkeypatch):
+        from fastfuncstuff.io import afni
+
+        real_zstd = shutil.which("zstd")
+        if real_zstd is None:
+            pytest.skip("needs zstd")
+        tools = tmp_path / "bin"
+        tools.mkdir()
+        _fake_tool(tools, "pzstd", "exit 3")
+        _fake_tool(tools, "zstd", f'exec "{real_zstd}" "$@"')
+        monkeypatch.setenv("PATH", str(tools))
+        monkeypatch.setattr(afni, "resolve_cpu_threads", lambda *_: (2, "test"))
+        data = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+        out = tmp_path / "out.nii.zst"
+        afni.save_nifti(data, str(out), affine=np.eye(4))
+        monkeypatch.undo()
+        img = afni.load_nifti(str(out))
+        assert np.array_equal(np.asarray(img.dataobj, dtype=np.float32), data)
+
+    @pytest.mark.parametrize("suffix,tool", [(".nii.zst", "zstd"), (".nii.gz", "pigz")])
+    def test_a_failed_compressor_leaves_no_partial_output(
+        self, tmp_path, monkeypatch, suffix, tool
+    ):
+        """It must raise, and a truncated dataset must not sit under the final name."""
+        from fastfuncstuff.io import afni
+
+        tools = tmp_path / "bin"
+        tools.mkdir()
+        # Reads a little and then dies, so the writer meets a broken pipe mid-stream.
+        _fake_tool(tools, tool, "echo partial; head -c 10 > /dev/null; exit 3")
+        monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+        monkeypatch.setattr(afni, "resolve_cpu_threads", lambda *_: (1, "test"))
+        data = np.zeros((64, 64, 64), dtype=np.float32)
+        out = tmp_path / f"out{suffix}"
+        with pytest.raises(subprocess.CalledProcessError):
+            afni.save_nifti(data, str(out), affine=np.eye(4))
+        assert not out.exists()
 
 
 def test_subbrick_selector_on_an_afni_bucket(tmp_path):

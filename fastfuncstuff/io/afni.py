@@ -3646,6 +3646,112 @@ def fill_layout(
         list(pool.map(_copy_block, range(n_threads)))
 
 
+class _StreamWriter(_ChunkedFileWriter):
+    """A write-only, forward-only sink for nibabel: a compressor's stdin or a gzip stream.
+
+    nibabel asks to seek to the start and then to the voxel offset. Seeking to where we
+    already are succeeds; anything else raises ``OSError``, and nibabel's ``seek_tell``
+    answers that by writing zeros up to the offset, which is what a seek would have left
+    in the file.
+    """
+
+    def __init__(self, fobj):
+        super().__init__(fobj)
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, b) -> int:
+        mv = memoryview(b).cast("B")
+        done = 0
+        while done < len(mv):
+            # A raw pipe may take less than it was given, and returns the count.
+            n = self._f.write(mv[done : done + self._CHUNK])
+            done += len(mv[done : done + self._CHUNK]) if n is None else n
+        self._pos += done
+        return done
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0 and offset == self._pos:
+            return self._pos
+        raise OSError("forward-only stream")
+
+    def tell(self) -> int:
+        return self._pos
+
+
+def _write_image_to_stream(img, sink, name: str) -> None:
+    """Write a NIfTI to ``sink`` through nibabel, so its header logic stays the only one."""
+    from nibabel.fileholders import FileHolder
+
+    wrapped = _StreamWriter(sink)
+    img.to_file_map({k: FileHolder(filename=name, fileobj=wrapped) for k in img.file_map})
+
+
+def _stream_image_through(img, cmd: list[str], dst: Path) -> None:
+    """Run ``img`` through a compressor reading stdin, with its stdout going to ``dst``."""
+    with open(dst, "wb") as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out, stderr=err, bufsize=0)
+        stdin = proc.stdin
+        assert stdin is not None
+        pipe_broke = False
+        try:
+            _write_image_to_stream(img, stdin, str(dst))
+        except BrokenPipeError:
+            pipe_broke = True
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            with contextlib.suppress(BrokenPipeError):
+                stdin.close()
+        returncode = proc.wait()
+        if returncode != 0 or pipe_broke:
+            err.seek(0)
+            raise subprocess.CalledProcessError(returncode, cmd, stderr=err.read())
+
+
+def _stream_zst(img, dst: Path) -> None:
+    """Compress straight into ``dst.nii.zst``, with no uncompressed copy on the way.
+
+    pzstd's independent frames are what make the file readable in parallel, so it goes
+    first. The array is still in memory if it dies, so stock zstd can simply start over.
+    """
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        raise RuntimeError(
+            "zstd is not installed or not in PATH.  "
+            "Install zstd to write .nii.zst files (e.g. apt install zstd)."
+        )
+    n_threads = max(1, resolve_cpu_threads()[0])
+    level = f"-{_zstd_level()}"
+    pzstd = shutil.which("pzstd")
+    if pzstd is not None and n_threads > 1:
+        with contextlib.suppress(subprocess.CalledProcessError, FileNotFoundError):
+            _stream_image_through(img, [pzstd, "-q", level, "-p", str(n_threads), "-c"], dst)
+            return
+    try:
+        _stream_image_through(img, [zstd, "-q", level, f"-T{n_threads}", "-c"], dst)
+    except BaseException:
+        # Half a dataset under the final name would read as a corrupt result later.
+        dst.unlink(missing_ok=True)
+        raise
+
+
+def _stream_gz_through_pigz(img, pigz: str, dst: Path) -> None:
+    n_threads = max(1, resolve_cpu_threads()[0])
+    try:
+        _stream_image_through(img, [pigz, "-c", f"-{_gzip_level()}", "-p", str(n_threads)], dst)
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+
+
 def _nib_save_chunked(img, path: str) -> None:
     """``nib.save`` for an uncompressed ``.nii`` that survives >2 GiB single writes."""
     from nibabel.fileholders import FileHolder
@@ -3867,17 +3973,13 @@ def save_nifti(
     from fastfuncstuff.cli_utils import spinner
 
     def _do_write() -> None:
-        if out_str.endswith(".nii.zst") or (out_str.endswith(".nii.gz") and shutil.which("pigz")):
-            # Write uncompressed to a temp file first, then compress externally.
-            # This avoids nibabel's single-threaded gzip and enables pigz / zstd.
-            stem = out.name
-            for ext in (".nii.zst", ".nii.gz"):
-                if stem.endswith(ext):
-                    stem = stem[: -len(ext)]
-                    break
-            tmp_nii = out.parent / (stem + ".nii")
-            _nib_save_chunked(img, str(tmp_nii))
-            compress_nifti(tmp_nii, out, remove_original=True)
+        # Straight into the compressor. On a 3.5 GB warp the uncompressed temp file this
+        # replaced was about half of the whole write, and a full extra write to disk.
+        pigz = shutil.which("pigz")
+        if out_str.endswith(".nii.zst"):
+            _stream_zst(img, out)
+        elif out_str.endswith(".nii.gz") and pigz:
+            _stream_gz_through_pigz(img, pigz, out)
         elif out_str.endswith(".nii"):
             # Uncompressed direct write — same >2 GiB single-write hazard as the temp.
             _nib_save_chunked(img, out_str)
