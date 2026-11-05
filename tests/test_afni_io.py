@@ -907,6 +907,43 @@ class TestGzipCompression:
         assert dst.exists()
 
 
+class TestZstdLevel:
+    def test_default_is_level_1(self):
+        """zstd's default of 3 costs a median 1.75x the write time on fMRI data for
+        at most 5% of the size, and -1 files read faster as well."""
+        from fastfuncstuff.io.afni import _zstd_level
+
+        assert _zstd_level() == 1
+
+    def test_env_override(self, monkeypatch):
+        from fastfuncstuff.io.afni import _zstd_level
+
+        monkeypatch.setenv("FFS_ZSTD_LEVEL", "9")
+        assert _zstd_level() == 9
+        monkeypatch.setenv("FFS_ZSTD_LEVEL", "not a number")
+        assert _zstd_level() == 1
+        monkeypatch.setenv("FFS_ZSTD_LEVEL", "42")
+        assert _zstd_level() == 19  # clamped
+
+    @pytest.mark.parametrize("n_threads", [1, 2])
+    def test_level_reaches_the_compressor(self, tmp_path, monkeypatch, n_threads):
+        """Both writers: pzstd when threaded, and stock zstd on a single thread."""
+        from fastfuncstuff.io import afni
+
+        rng = np.random.default_rng(0)
+        # Noise over a small alphabet, so -19 really does shrink it past -1.
+        payload = rng.integers(0, 4, 2_000_000, dtype=np.uint8).tobytes()
+        monkeypatch.setattr(afni, "resolve_cpu_threads", lambda *_: (n_threads, "test"))
+        sizes = {}
+        for level in ("1", "19"):
+            monkeypatch.setenv("FFS_ZSTD_LEVEL", level)
+            src = tmp_path / f"l{level}.nii"
+            src.write_bytes(payload)
+            dst = afni._compress_zst(src, tmp_path / f"l{level}.nii.zst", remove_original=True)
+            sizes[level] = dst.stat().st_size
+        assert sizes["19"] < sizes["1"]
+
+
 def test_subbrick_selector_on_an_afni_bucket(tmp_path):
     """Bug of record: AFNI's MNI152_2009_template_SSW is (x,y,z,1,5) — five
     sub-bricks in dim[5] with a singleton time axis. Selecting on axis 3 indexed a

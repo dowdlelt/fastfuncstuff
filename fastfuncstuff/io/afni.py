@@ -2489,6 +2489,24 @@ def _gzip_level() -> int:
     return 1
 
 
+def _zstd_level() -> int:
+    """Compression level for ``.nii.zst`` writes.
+
+    Level 1, not zstd's default of 3, because on fMRI data the extra work finds almost
+    nothing. Across 11 real files from 33 MB to 7.9 GB on six cores, -1 against -3 wrote
+    a median 1.75x as fast (3.9x on a raw magnitude run), read a median 1.13x as fast,
+    and cost at most 5% in size (see ``scripts/bench_nifti_compression.py``).
+    ``FFS_ZSTD_LEVEL`` overrides it for an archival run.
+    """
+    raw = os.environ.get("FFS_ZSTD_LEVEL", "").strip()
+    if raw:
+        try:
+            return min(19, max(1, int(raw)))
+        except ValueError:
+            pass
+    return 1
+
+
 def _compress_gz(src: Path, dst: Path, remove_original: bool) -> Path:
     """Compress *src* (.nii) → *dst* (.nii.gz) using pigz or gzip fallback."""
     level = _gzip_level()
@@ -2529,11 +2547,12 @@ def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
         )
     n_cpu, _ = resolve_cpu_threads()
     n_threads = max(1, n_cpu)
+    level = f"-{_zstd_level()}"
     pzstd = shutil.which("pzstd")
     if pzstd is not None and n_threads > 1:
         # Independent frames enable parallel reads later. The stream remains
         # decodable by every conforming zstd decoder, including our fallback.
-        cmd = [pzstd, "-q", "-p", str(n_threads), "-f"]
+        cmd = [pzstd, "-q", level, "-p", str(n_threads), "-f"]
         if remove_original:
             cmd.append("--rm")
         cmd.extend([str(src), "-o", str(dst)])
@@ -2544,7 +2563,7 @@ def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
             if not src.exists():
                 raise
 
-    cmd = [zstd, f"-T{n_threads}", "-f"]
+    cmd = [zstd, level, f"-T{n_threads}", "-f"]
     if remove_original:
         cmd.append("--rm")
     cmd.extend([str(src), "-o", str(dst)])
