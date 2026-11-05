@@ -842,7 +842,7 @@ def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
 def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) -> None:
     import matplotlib.pyplot as plt
 
-    h = 0.5 * len(files) + 2.3
+    h = 0.5 * len(files) + 2.6
     fig, axes = plt.subplots(1, len(panels), figsize=(12.5, h), sharey=True)
     axes = axes if len(panels) > 1 else [axes]
     seen: dict[str, object] = {}
@@ -864,7 +864,7 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
         loc="upper left",
         bbox_to_anchor=(0.005, 1 - 0.62 / h),
     )
-    fig.subplots_adjust(top=1 - 1.25 / h, bottom=0.55 / h, left=0.17, right=0.99, wspace=0.05)
+    fig.subplots_adjust(top=1 - 1.55 / h, bottom=0.55 / h, left=0.215, right=0.985, wspace=0.06)
     _title(fig, title, sub, h)
     fig.savefig(results / name, dpi=170)
     plt.close(fig)
@@ -884,60 +884,58 @@ def make_all(results: Path) -> None:
     files = sorted(sizes, key=lambda f: sizes[f])
     spread = f"Median of {meta['reps_large']}-{meta['reps']} shuffled repetitions, tmpfs to tmpfs."
 
+    level_1 = "zstd -1 (pzstd at N threads)"
+    level_3 = "zstd -3 (pzstd at N threads)"
     enc_1 = [
         ("isal-2.p1", "ISA-L 2", "isal", "o"),
-        ("zstd-1.p1", "zstd -1", "zstd", "D"),
-        ("zstd-3.p1", "zstd -3", "zstd", "o"),
+        ("zstd-1.p1", level_1, "zstd", "D"),
+        ("zstd-3.p1", level_3, "zstd", "^"),
     ]
     enc_n = [
         (f"isal-2.p{n}", "ISA-L 2", "isal", "o"),
         (f"pigz-1.p{n}", "pigz -1", "pigz", "o"),
-        (f"pzstd-1.p{n}", "pzstd -1", "pzstd", "D"),
-        (f"pzstd-3.p{n}", "pzstd -3", "pzstd", "^"),
-    ]
-    sizes_panel = [
-        ("isal-2.p1", "ISA-L 2", "isal", "o"),
-        (f"pigz-1.p{n}", "pigz -1", "pigz", "o"),
-        (f"pzstd-1.p{n}", "pzstd -1", "pzstd", "D"),
-        (f"pzstd-3.p{n}", "pzstd -3", "pzstd", "^"),
+        (f"pzstd-1.p{n}", level_1, "pzstd", "D"),
+        (f"pzstd-3.p{n}", level_3, "pzstd", "^"),
     ]
     _save_strip(
         results,
         "fig1_compress.png",
-        "Compression: size and speed",
+        "Compression speed, with size as a check",
         spread,
         files,
         sizes,
         [
             (
-                "Compressed size",
-                "% of original, left is smaller",
-                lambda ax: _dot_panel(ax, med, "encode", files, sizes_panel, "pct"),
-            ),
-            (
-                "Speed, 1 thread",
+                "1 thread",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "encode", files, enc_1),
             ),
             (
-                f"Speed, {n} threads",
+                f"{n} threads",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "encode", files, enc_n),
             ),
+            (
+                "Compressed size",
+                "% of original",
+                lambda ax: _dot_panel(ax, med, "encode", files, enc_n, "pct"),
+            ),
         ],
-        legend_cols=6,
+        legend_cols=4,
     )
 
     dec_1 = [
-        ("isal-2.p1>isal.p1", "ISA-L, ISA-L file", "isal", "o"),
-        (f"pigz-1.p{n}>isal.p1", "ISA-L, pigz file", "isal", "s"),
-        ("zstd-3.p1>zstd.p1", "zstd, zstd file", "zstd", "o"),
+        ("isal-2.p1>isal.p1", "ISA-L reading an ISA-L file", "isal", "o"),
+        (f"pigz-1.p{n}>isal.p1", "ISA-L reading a pigz file", "isal", "s"),
+        (f"pzstd-1.p{n}>zstd.p1", "zstd reading a pzstd -1 file", "zstd", "D"),
+        (f"pzstd-3.p{n}>zstd.p1", "zstd reading a pzstd -3 file", "zstd", "^"),
     ]
     dec_n = [
-        ("isal-2.p1>rapidgzip.p" + str(n), "rapidgzip, ISA-L file", "rapidgzip", "o"),
-        (f"pigz-1.p{n}>rapidgzip.p{n}", "rapidgzip, pigz file", "rapidgzip", "s"),
-        (f"zstd-3.p1>pzstd.p{n}", "pzstd, single-frame file", "zstd", "v"),
-        (f"pzstd-3.p{n}>pzstd.p{n}", "pzstd, pzstd file", "pzstd", "^"),
+        (f"isal-2.p1>rapidgzip.p{n}", "rapidgzip reading an ISA-L file", "rapidgzip", "o"),
+        (f"pigz-1.p{n}>rapidgzip.p{n}", "rapidgzip reading a pigz file", "rapidgzip", "s"),
+        (f"zstd-3.p1>pzstd.p{n}", "pzstd reading a single-frame file", "zstd", "v"),
+        (f"pzstd-1.p{n}>pzstd.p{n}", "pzstd reading a pzstd -1 file", "pzstd", "D"),
+        (f"pzstd-3.p{n}>pzstd.p{n}", "pzstd reading a pzstd -3 file", "pzstd", "^"),
     ]
     _save_strip(
         results,
@@ -958,7 +956,7 @@ def make_all(results: Path) -> None:
                 lambda ax: _dot_panel(ax, med, "decode", files, dec_n),
             ),
         ],
-        legend_cols=4,
+        legend_cols=3,
     )
 
     # Size against speed, one curve per tool.
@@ -995,6 +993,8 @@ def make_all(results: Path) -> None:
                     )
                     if tool == "zstd" and threads > 1:
                         continue  # one point; pzstd is the curve at this thread count
+                    # ISA-L 0 barely compresses (about 97%) and would squash every other point.
+                    pts = [v for v in pts if not (tool == "isal" and v["level"] == "0")]
                     if not pts:
                         continue
                     xs = [100 * v["out_bytes"] / v["bytes"] for v in pts]
@@ -1038,14 +1038,16 @@ def make_all(results: Path) -> None:
         _title(
             fig,
             "Size against speed, by compression level",
-            "Each point is a level, written beside it. Up and to the left is better.",
+            "Each point is a level, written beside it. Higher is faster. Note the narrow size axes. ISA-L level 0 is left off: about 97% of original, and at best slightly faster.",
             h,
         )
         fig.savefig(results / "fig3_tradeoff.png", dpi=170)
         plt.close(fig)
 
     # What a caller waits for, on the two largest files.
-    picks = [f for f in files[-2:] if ("e2e-read", f, "nii") in med]
+    integer = [f for f in files if "int" in next(r["dtype"] for r in rows if r["file"] == f)]
+    picks = [f for f in [*integer[-1:], *files[-2:]] if ("e2e-read", f, "nii") in med]
+    picks = list(dict.fromkeys(picks))
     if picks:
         h = 3.1 * len(picks) + 0.9
         fig, axes = plt.subplots(len(picks), 2, figsize=(12.5, h), squeeze=False)
@@ -1053,13 +1055,18 @@ def make_all(results: Path) -> None:
             for ax, (tier, title, routes) in zip(
                 axes[i],
                 [
-                    ("e2e-write", "array to file", WRITE_ROUTES),
-                    ("e2e-read", "file to float32 array", READ_ROUTES),
+                    ("e2e-write", "write", WRITE_ROUTES),
+                    ("e2e-read", "read", READ_ROUTES),
                 ],
                 strict=True,
             ):
                 items = sorted(
-                    (med[(tier, f, r)] for r in routes if (tier, f, r) in med),
+                    (
+                        med[(tier, f, r)]
+                        for r in routes
+                        # A float32 .nii is memory-mapped: "reading" it reads nothing yet.
+                        if (tier, f, r) in med and not (tier == "e2e-read" and r == "nii")
+                    ),
                     key=lambda v: -v["wall"],
                 )
                 ys = list(range(len(items)))
@@ -1090,12 +1097,12 @@ def make_all(results: Path) -> None:
                     color=INK,
                 )
         fig.subplots_adjust(
-            top=1 - 0.9 / h, bottom=0.5 / h, left=0.215, right=0.985, wspace=0.95, hspace=0.42
+            top=1 - 0.9 / h, bottom=0.5 / h, left=0.215, right=0.985, wspace=0.95, hspace=0.45
         )
         _title(
             fig,
             "What a Python caller actually waits for",
-            f"Real routes, a fresh process per trial, on tmpfs, {n} threads where the route can use them.",
+            f"Array to file and file to float32 array. Fresh process per trial, tmpfs, {n} threads where the route can use them.",
             h,
         )
         fig.savefig(results / "fig4_end_to_end.png", dpi=170)
