@@ -3735,12 +3735,58 @@ class _StreamWriter(_ChunkedFileWriter):
         return self._pos
 
 
+def _write_nifti_without_copying(img, fileobj) -> bool:
+    """Write ``img`` as nibabel would, but hand it the voxels' own memory. False if unsafe.
+
+    nibabel writes each slice along the last axis with ``slice.tobytes()``. For a
+    (160, 160, 114, 100, 3) warp that is three 1.2 GB allocations and copies, and 2.1 s of
+    a 4.4 s write, to produce bytes the array already holds in that order. Only an
+    F-contiguous array stored as its own dtype with no scaling qualifies; anything else
+    returns False before touching ``fileobj``, and nibabel writes it. The header still
+    comes from nibabel, and ``TestZeroCopyWrites`` holds the output to ``nib.save``'s bytes.
+    """
+    from nibabel.arraywriters import get_slope_inter, make_array_writer
+    from nibabel.volumeutils import seek_tell
+
+    data = img.dataobj
+    # An alias such as dtype="compat" only becomes a real dtype inside nibabel's writer.
+    if (
+        getattr(img, "_dtype_alias", None) is not None
+        or not isinstance(data, np.ndarray)
+        or not data.flags["F_CONTIGUOUS"]
+        or data.dtype.kind not in "fiu"
+        or data.dtype != img.get_data_dtype()
+    ):
+        return False
+    img.update_header()
+    hdr = img.header.copy()
+    # The same two fields, the same way, that nibabel's to_file_map decides this from.
+    slope = hdr["scl_slope"].item() if hdr.has_data_slope else np.nan
+    inter = hdr["scl_inter"].item() if hdr.has_data_intercept else np.nan
+    if not np.all(np.isnan((slope, inter))):
+        return False
+    writer = make_array_writer(
+        data, hdr.get_data_dtype(), hdr.has_data_slope, hdr.has_data_intercept
+    )
+    slope, inter = get_slope_inter(writer)
+    if slope != 1 or inter != 0:
+        return False
+    hdr.set_slope_inter(slope, inter)
+    hdr.write_to(fileobj)
+    seek_tell(fileobj, hdr.get_data_offset(), write0=True)
+    # An F-contiguous array ravels in F order to a view, and memoryview can only cast a
+    # view that is contiguous in C order, which one dimension always is.
+    fileobj.write(data.ravel(order="F"))
+    return True
+
+
 def _write_image_to_stream(img, sink, name: str) -> None:
-    """Write a NIfTI to ``sink`` through nibabel, so its header logic stays the only one."""
+    """Write a NIfTI to the forward-only ``sink``, with nibabel in charge of the header."""
     from nibabel.fileholders import FileHolder
 
     wrapped = _StreamWriter(sink)
-    img.to_file_map({k: FileHolder(filename=name, fileobj=wrapped) for k in img.file_map})
+    if not _write_nifti_without_copying(img, wrapped):
+        img.to_file_map({k: FileHolder(filename=name, fileobj=wrapped) for k in img.file_map})
 
 
 def _stream_image_through(img, cmd: list[str], dst: Path) -> None:
@@ -3819,7 +3865,8 @@ def _nib_save_chunked(img, path: str) -> None:
 
     with open(path, "w+b") as raw:
         wrapped = _ChunkedFileWriter(raw)
-        img.to_file_map({k: FileHolder(filename=path, fileobj=wrapped) for k in img.file_map})
+        if not _write_nifti_without_copying(img, wrapped):
+            img.to_file_map({k: FileHolder(filename=path, fileobj=wrapped) for k in img.file_map})
 
 
 @functools.lru_cache(maxsize=8)

@@ -956,6 +956,109 @@ def _fake_tool(directory: Path, name: str, script: str) -> None:
     tool.chmod(0o755)
 
 
+class TestZeroCopyWrites:
+    """Skipping nibabel's slice copies must not change a single byte of the file."""
+
+    def _write(self, img, tmp_path):
+        from fastfuncstuff.io.afni import _StreamWriter, _write_nifti_without_copying
+
+        sink = io.BytesIO()
+        taken = _write_nifti_without_copying(img, _StreamWriter(sink))
+        return taken, sink.getvalue()
+
+    @pytest.mark.parametrize(
+        "dtype",
+        ["float32", "float64", "int16", "uint16", "int32", "uint8", "int8", "uint32", "int64"],
+    )
+    @pytest.mark.parametrize("shape", [(4, 5, 6), (4, 5, 6, 3), (4, 5, 6, 1, 3), (7, 1, 1)])
+    def test_matches_nib_save_byte_for_byte(self, tmp_path, dtype, shape):
+        data = np.asfortranarray(np.arange(np.prod(shape)).reshape(shape).astype(dtype))
+        affine = np.diag([2.0, 3.0, 4.0, 1.0])
+        taken, fast = self._write(nib.Nifti1Image(data, affine, dtype=data.dtype), tmp_path)
+        assert taken
+        plain = tmp_path / "plain.nii"
+        nib.save(nib.Nifti1Image(data, affine, dtype=data.dtype), str(plain))
+        assert fast == plain.read_bytes()
+
+    @pytest.mark.parametrize("cls", [nib.Nifti1Image, nib.Nifti2Image])
+    def test_matches_with_a_header_extension(self, tmp_path, cls):
+        """An extension moves vox_offset, so the padding has to land in the right place."""
+        data = np.asfortranarray(np.arange(120, dtype=np.float32).reshape(4, 5, 6))
+
+        def build():
+            img = cls(data, np.eye(4))
+            img.header.extensions.append(nib.nifti1.Nifti1Extension("comment", b"hello there"))
+            return img
+
+        taken, fast = self._write(build(), tmp_path)
+        assert taken
+        plain = tmp_path / "plain.nii"
+        nib.save(build(), str(plain))
+        assert fast == plain.read_bytes()
+
+    def test_matches_with_nan_and_inf(self, tmp_path):
+        data = np.asfortranarray(np.arange(120, dtype=np.float32).reshape(4, 5, 6))
+        data[0, 0, 0], data[1, 1, 1], data[2, 2, 2] = np.nan, np.inf, -np.inf
+        taken, fast = self._write(nib.Nifti1Image(data, np.eye(4)), tmp_path)
+        assert taken
+        plain = tmp_path / "plain.nii"
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(plain))
+        assert fast == plain.read_bytes()
+
+    def test_a_c_order_array_is_left_to_nibabel(self, tmp_path):
+        """A C-order array in memory is not in file order: raw bytes would scramble it."""
+        data = np.arange(120, dtype=np.float32).reshape(4, 5, 6)
+        assert not data.flags["F_CONTIGUOUS"]
+        taken, fast = self._write(nib.Nifti1Image(data, np.eye(4)), tmp_path)
+        assert not taken and fast == b""
+
+    def test_a_dtype_change_is_left_to_nibabel(self, tmp_path):
+        """float32 stored as int16 needs nibabel's scaling, and raw bytes would be garbage."""
+        data = np.asfortranarray(np.arange(120, dtype=np.float32).reshape(4, 5, 6))
+        img = nib.Nifti1Image(data, np.eye(4))
+        img.header.set_data_dtype(np.int16)
+        taken, fast = self._write(img, tmp_path)
+        assert not taken and fast == b""
+
+    def test_a_dtype_alias_is_left_to_nibabel(self, tmp_path):
+        data = np.asfortranarray(np.arange(120, dtype=np.int64).reshape(4, 5, 6))
+        taken, fast = self._write(nib.Nifti1Image(data, np.eye(4), dtype="compat"), tmp_path)
+        assert not taken and fast == b""
+
+    def test_a_requested_scaling_is_left_to_nibabel(self, tmp_path):
+        data = np.asfortranarray(np.arange(120, dtype=np.float32).reshape(4, 5, 6))
+        img = nib.Nifti1Image(data, np.eye(4))
+        img.header.set_slope_inter(2.0, 1.0)
+        taken, fast = self._write(img, tmp_path)
+        assert not taken and fast == b""
+
+    @pytest.mark.parametrize("suffix", [".nii", ".nii.gz", ".nii.zst"])
+    @pytest.mark.parametrize("order", ["C", "F"])
+    def test_save_nifti_round_trip_in_either_layout(self, tmp_path, suffix, order):
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        data = np.arange(4 * 5 * 6 * 2, dtype=np.float32).reshape((4, 5, 6, 2), order=order)
+        out = tmp_path / f"out{suffix}"
+        save_nifti(data, str(out), affine=np.eye(4), brick_labels=["a", "b"])
+        assert np.array_equal(np.asarray(load_nifti(str(out)).dataobj, dtype=np.float32), data)
+
+    def test_writes_the_memory_it_was_given_not_a_copy(self, monkeypatch):
+        """The point of the path: tobytes on a whole slice is what cost 2.1 s of 4.4 s."""
+        from fastfuncstuff.io.afni import _StreamWriter, _write_nifti_without_copying
+
+        data = np.asfortranarray(np.arange(120, dtype=np.float32).reshape(4, 5, 6))
+        seen = []
+
+        class Sink(io.BytesIO):
+            def write(self, b):
+                if isinstance(b, memoryview) and b.nbytes == data.nbytes:
+                    seen.append(np.shares_memory(np.asarray(b), data))
+                return super().write(b)
+
+        assert _write_nifti_without_copying(nib.Nifti1Image(data, np.eye(4)), _StreamWriter(Sink()))
+        assert seen == [True]
+
+
 class TestGrowPipe:
     def test_grows_a_pipe_where_the_platform_can(self):
         fcntl = pytest.importorskip("fcntl")
