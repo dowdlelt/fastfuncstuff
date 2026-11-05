@@ -798,6 +798,18 @@ def _plain_log_ticks(axis) -> None:
     axis.set_minor_formatter(NullFormatter())
 
 
+def _seconds_axis(axis) -> None:
+    """Log seconds, written as plain numbers down to the millisecond range."""
+    from matplotlib.ticker import LogLocator, NullFormatter, NullLocator
+
+    axis.axes.set_xscale("log")
+    axis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    axis.set_major_formatter(lambda v, _: f"{v:g}")
+    axis.set_minor_locator(NullLocator())
+    axis.set_minor_formatter(NullFormatter())
+    axis.axes.tick_params(axis="x", labelsize=8)
+
+
 def _mb_label(mb: float) -> str:
     return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
 
@@ -816,7 +828,13 @@ def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
         for f, y in zip(files, ys, strict=True):
             v = med.get((tier, f, method))
             if v:
-                xs.append(100 * v["out_bytes"] / v["bytes"] if value == "pct" else v["mbps"])
+                xs.append(
+                    100 * v["out_bytes"] / v["bytes"]
+                    if value == "pct"
+                    else v["wall"]
+                    if value == "seconds"
+                    else v["mbps"]
+                )
                 yy.append(y)
         handles.append(
             ax.scatter(
@@ -833,7 +851,9 @@ def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
         )
     _style(ax)
     ax.grid(False, axis="x") if value == "pct" else None
-    if value != "pct":
+    if value == "seconds":
+        _seconds_axis(ax.xaxis)
+    elif value != "pct":
         ax.set_xscale("log")
         _plain_log_ticks(ax.xaxis)
     return handles
@@ -843,7 +863,9 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
     import matplotlib.pyplot as plt
 
     h = 0.5 * len(files) + 2.6
-    fig, axes = plt.subplots(1, len(panels), figsize=(12.5, h), sharey=True)
+    fig, axes = plt.subplots(
+        1, len(panels), figsize=(max(12.5, 3.6 * len(panels) + 2.6), h), sharey=True
+    )
     axes = axes if len(panels) > 1 else [axes]
     seen: dict[str, object] = {}
     for ax, (panel_title, xlabel, handles_fn) in zip(axes, panels, strict=True):
@@ -864,7 +886,13 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
         loc="upper left",
         bbox_to_anchor=(0.005, 1 - 0.62 / h),
     )
-    fig.subplots_adjust(top=1 - 1.55 / h, bottom=0.55 / h, left=0.215, right=0.985, wspace=0.06)
+    fig.subplots_adjust(
+        top=1 - 1.55 / h,
+        bottom=0.55 / h,
+        left=2.65 / max(12.5, 3.6 * len(panels) + 2.6),
+        right=0.985,
+        wspace=0.06,
+    )
     _title(fig, title, sub, h)
     fig.savefig(results / name, dpi=170)
     plt.close(fig)
@@ -880,17 +908,19 @@ def plot_crossover(results: Path, n: int) -> None:
         groups.setdefault(key, []).append(r)
     files = sorted({k[0] for k in groups})
 
-    def curve(ax, f, op, method, reader, label, color, ls):
+    def curve(ax, f, op, method, reader, label, color, ls, wait=False):
         pts = sorted(k[1] for k in groups if k[:1] == (f,) and k[2:] == (op, method, reader))
-        ys = [
-            mb
-            * 2**20
-            / 1e6
-            / statistics.median(float(x["wall"]) for x in groups[(f, mb, op, method, reader)])
+        walls = [
+            statistics.median(float(x["wall"]) for x in groups[(f, mb, op, method, reader)])
             for mb in pts
         ]
+        ys = (
+            [1000 * w for w in walls]
+            if wait
+            else [mb * 2**20 / 1e6 / w for mb, w in zip(pts, walls, strict=True)]
+        )
         ax.plot(
-            pts, ys, color=color, ls=ls, lw=2, marker="o", ms=4.5, mec="white", mew=0.8, label=label
+            pts, ys, color=color, ls=ls, lw=2, marker="o", ms=4, mec="white", mew=0.7, label=label
         )
 
     write = [
@@ -908,25 +938,30 @@ def plot_crossover(results: Path, n: int) -> None:
         (f"zstd-f1.p{n}", "zstd.p1", "--fast=1 file, zstd 1 thread", BLUE, "-"),
     ]
     h = 3.5 * len(files) + 1.9
-    fig, axes = plt.subplots(len(files), 2, figsize=(12.5, h), sharex=True, squeeze=False)
+    fig, axes = plt.subplots(len(files), 4, figsize=(17, h), sharex=True, squeeze=False)
     sizes = sorted({k[1] for k in groups})
     for i, f in enumerate(files):
         for method, label, color, ls in write:
-            curve(axes[i][0], f, "write", method, "", label, color, ls)
+            curve(axes[i][0], f, "write", method, "", label, color, ls, wait=True)
+            curve(axes[i][2], f, "write", method, "", label, color, ls)
         for method, reader, label, color, ls in read:
-            curve(axes[i][1], f, "read", method, reader, label, color, ls)
-        for ax, what in zip(axes[i], ("write", "read"), strict=True):
+            curve(axes[i][1], f, "read", method, reader, label, color, ls, wait=True)
+            curve(axes[i][3], f, "read", method, reader, label, color, ls)
+        titles = ("write, wait", "read, wait", "write, speed", "read, speed")
+        for j, (ax, what) in enumerate(zip(axes[i], titles, strict=True)):
             ax.set_xscale("log", base=2)
             ax.set_yscale("log")
             _style(ax)
             _plain_log_ticks(ax.yaxis)
-            ax.set_xticks(sizes, [str(v) for v in sizes])
+            ax.set_xticks(sizes, [str(v) for v in sizes], fontsize=8)
             ax.minorticks_off()
-            ax.set_title(f"{f}, {what}", loc="left", fontsize=10.5, color=INK)
-            ax.set_ylabel("MB/s", color=MUTED, fontsize=9)
+            ax.set_title(f"{f}\n{what}", loc="left", fontsize=9.5, color=INK)
+            ax.set_ylabel(
+                "milliseconds, lower is better" if j < 2 else "MB/s", color=MUTED, fontsize=9
+            )
     for ax in axes[-1]:
         ax.set_xlabel("size of the cut, MB", color=MUTED, fontsize=9)
-    for j, col in enumerate((write, read)):
+    for j in (0, 1):
         handles, labels = axes[0][j].get_legend_handles_labels()
         fig.legend(
             handles,
@@ -935,16 +970,15 @@ def plot_crossover(results: Path, n: int) -> None:
             fontsize=8.5,
             ncols=2,
             loc="upper left",
-            bbox_to_anchor=(0.05 + 0.49 * j, 1 - 0.62 / h),
+            bbox_to_anchor=(0.04 + 0.42 * j, 1 - 0.62 / h),
         )
-        _ = col
     fig.subplots_adjust(
-        top=1 - 1.6 / h, bottom=0.55 / h, left=0.06, right=0.99, wspace=0.14, hspace=0.25
+        top=1 - 1.75 / h, bottom=0.55 / h, left=0.05, right=0.99, wspace=0.26, hspace=0.32
     )
     _title(
         fig,
         "At what file size does pzstd start to pay?",
-        "Cuts from the middle of real files. Process start is included, and it dominates the left of each panel.",
+        "Cuts from the middle of real files. Process start is included: it is the floor of about 10 ms on the left of each wait panel.",
         h,
     )
     fig.savefig(results / "fig5_crossover.png", dpi=170)
@@ -981,18 +1015,28 @@ def make_all(results: Path) -> None:
     _save_strip(
         results,
         "fig1_compress.png",
-        "Compression speed, with size as a check",
-        spread,
+        "Compression: how long you wait, and how fast that is",
+        spread + " Size is a check, not the goal.",
         files,
         sizes,
         [
             (
-                "1 thread",
+                "Wait, 1 thread",
+                "seconds, left is less waiting",
+                lambda ax: _dot_panel(ax, med, "encode", files, enc_1, "seconds"),
+            ),
+            (
+                f"Wait, {n} threads",
+                "seconds, left is less waiting",
+                lambda ax: _dot_panel(ax, med, "encode", files, enc_n, "seconds"),
+            ),
+            (
+                "Speed, 1 thread",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "encode", files, enc_1),
             ),
             (
-                f"{n} threads",
+                f"Speed, {n} threads",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "encode", files, enc_n),
             ),
@@ -1021,18 +1065,28 @@ def make_all(results: Path) -> None:
     _save_strip(
         results,
         "fig2_decompress.png",
-        "Decompression speed",
+        "Decompression: how long you wait, and how fast that is",
         "Output to /dev/null, so nothing caps a fast decoder. " + spread,
         files,
         sizes,
         [
             (
-                "1 thread",
+                "Wait, 1 thread",
+                "seconds, left is less waiting",
+                lambda ax: _dot_panel(ax, med, "decode", files, dec_1, "seconds"),
+            ),
+            (
+                f"Wait, {n} threads",
+                "seconds, left is less waiting",
+                lambda ax: _dot_panel(ax, med, "decode", files, dec_n, "seconds"),
+            ),
+            (
+                "Speed, 1 thread",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "decode", files, dec_1),
             ),
             (
-                f"{n} threads",
+                f"Speed, {n} threads",
                 "MB/s of uncompressed data",
                 lambda ax: _dot_panel(ax, med, "decode", files, dec_n),
             ),
@@ -1197,18 +1251,20 @@ def make_all(results: Path) -> None:
         info = next(r for r in rows if r["file"] == f)
         lines += [
             f"\n## {f}: {info['bytes'] / 1e6:.0f} MB {info['dtype']} {info['kind']}\n",
-            "\n| encoder | MB/s | spread s | CPU s | size % |\n|---|--:|--:|--:|--:|",
+            "\n| encoder | seconds | MB/s | spread s | CPU s | size % |\n|---|--:|--:|--:|--:|--:|",
         ]
         for k, v in sorted(med.items(), key=lambda kv: -kv[1]["mbps"]):
             if k[0] == "encode" and k[1] == f:
                 lines.append(
-                    f"| {k[2]} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} | {100 * v['out_bytes'] / v['bytes']:.1f} |"
+                    f"| {k[2]} | {v['wall']:.2f} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} | {100 * v['out_bytes'] / v['bytes']:.1f} |"
                 )
-        lines.append("\n| file > decoder | MB/s | spread s | CPU s |\n|---|--:|--:|--:|")
+        lines.append(
+            "\n| file > decoder | seconds | MB/s | spread s | CPU s |\n|---|--:|--:|--:|--:|"
+        )
         for k, v in sorted(med.items(), key=lambda kv: -kv[1]["mbps"]):
             if k[0] == "decode" and k[1] == f:
                 lines.append(
-                    f"| {k[2]} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} |"
+                    f"| {k[2]} | {v['wall']:.2f} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} |"
                 )
         for tier in ("e2e-write", "e2e-read"):
             lines.append(
