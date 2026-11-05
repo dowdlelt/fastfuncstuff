@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 """How fast are the ways of compressing and reading a NIfTI? A fair comparison.
 
-Compares zlib (what nibabel uses), ISA-L, pigz, zstd and pzstd as encoders, and
-those plus rapidgzip as decoders, on your own files. Standalone: it needs numpy,
+Compares ISA-L, pigz, zstd and pzstd as encoders, and those plus rapidgzip as
+decoders, on your own files. Single-core zlib is left out on purpose: it is the
+slowest thing here by far and nobody needs a benchmark to know it. Standalone: it needs numpy,
 nibabel, matplotlib, the ``isal`` and ``rapidgzip`` Python packages and the
 ``pigz``, ``zstd`` and ``pzstd`` commands. If ``fastfuncstuff`` is importable it
 also times that toolbox's own save and load routes.
 
     python bench_nifti_compression.py run -out results -workdir /dev/shm/bench \
-        -ladder echo1.nii.gz echo2.nii.gz -ladder_mb 10 100 1000 \
-        -file raw_phase=phase.nii.gz -file t1=t1.nii.gz -sweep echo-ladder-1000
+        -file mask=mask.nii.gz -file t1=t1.nii.gz -file bold=bold.nii.gz \
+        -file warp=warp.nii.zst -sweep bold
     python bench_nifti_compression.py plot results
 
 What makes it fair:
@@ -34,13 +35,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 import json
 import os
 import platform
 import random
 import resource
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -55,24 +56,24 @@ LARGE_BYTES = 5 * 10**8
 @dataclass(frozen=True)
 class Encoder:
     name: str  # stable id, e.g. "isal-2.p6"; also the file stem
-    tool: str  # zlib | isal | pigz | zstd | pzstd
+    tool: str  # isal | pigz | zstd | pzstd
     level: int
     threads: int
 
     @property
     def ext(self) -> str:
-        return ".gz" if self.tool in ("zlib", "isal", "pigz") else ".zst"
+        return ".gz" if self.tool in ("isal", "pigz") else ".zst"
 
 
 @dataclass(frozen=True)
 class Decoder:
     name: str
-    tool: str  # zlib | isal | pigz | rapidgzip | zstd | pzstd
+    tool: str  # isal | pigz | rapidgzip | zstd | pzstd
     threads: int
 
     @property
     def ext(self) -> str:
-        return ".gz" if self.tool in ("zlib", "isal", "pigz", "rapidgzip") else ".zst"
+        return ".gz" if self.tool in ("isal", "pigz", "rapidgzip") else ".zst"
 
 
 def enc(tool: str, level: int, threads: int) -> Encoder:
@@ -82,14 +83,12 @@ def enc(tool: str, level: int, threads: int) -> Encoder:
 def core_encoders(n: int) -> list[Encoder]:
     """The settings people actually run, on every file.
 
-    zlib-1 is nibabel's default, ISA-L 2 is its default and the tedana PR's choice,
-    pigz -1 and pzstd -3 are what fastfuncstuff writes, zstd -1 is its fast setting.
+    ISA-L 2 is its default and the tedana PR's choice, pigz -1 and pzstd -3 are what
+    fastfuncstuff writes, zstd -1 is its fast setting.
     """
     return [
-        enc("zlib", 1, 1),
         enc("isal", 2, 1),
         enc("isal", 2, n),
-        enc("pigz", 1, 1),
         enc("pigz", 1, n),
         enc("zstd", 1, 1),
         enc("zstd", 3, 1),
@@ -101,21 +100,17 @@ def core_encoders(n: int) -> list[Encoder]:
 
 def sweep_encoders(n: int) -> list[Encoder]:
     """Level sweeps, for the size-against-speed curve."""
-    out = [enc("zlib", lv, 1) for lv in (1, 6, 9)]
-    for t in (1, n):
-        out += [enc("isal", lv, t) for lv in (0, 1, 2, 3)]
-        out += [enc("pigz", lv, t) for lv in (1, 3, 6, 9)]
-    out += [enc("zstd", lv, 1) for lv in (1, 3, 6, 9, 12)]
-    out += [enc("pzstd", lv, n) for lv in (1, 3, 6, 9, 12)]
+    out = [enc("isal", lv, t) for t in (1, n) for lv in (0, 1, 2, 3)]
+    out += [enc("pigz", lv, n) for lv in (1, 3, 6, 9)]
+    out += [enc("zstd", lv, 1) for lv in (1, 3)]
+    out += [enc("pzstd", lv, n) for lv in (1, 3, 6, 9)]
     return out
 
 
 def decoders(n: int) -> list[Decoder]:
     return [
-        Decoder("zlib.p1", "zlib", 1),
         Decoder("isal.p1", "isal", 1),
         Decoder(f"pigz.p{n}", "pigz", n),  # pigz never decodes in parallel; N buys helper threads
-        Decoder("rapidgzip.p1", "rapidgzip", 1),
         Decoder(f"rapidgzip.p{n}", "rapidgzip", n),
         Decoder("zstd.p1", "zstd", 1),
         Decoder(f"pzstd.p{n}", "pzstd", n),
@@ -126,7 +121,6 @@ def decode_encoders(n: int) -> list[Encoder]:
     """Whose files get decoded. Same format and level give the same read speed, so
     the other core encoders would only repeat these."""
     return [
-        enc("zlib", 1, 1),
         enc("isal", 2, 1),
         enc("isal", 2, n),
         enc("pigz", 1, n),
@@ -173,45 +167,37 @@ def _self_cpu() -> float:
     return ru.ru_utime + ru.ru_stime
 
 
-def _gz_writer(e: Encoder, fobj):
-    # Empty name and mtime=0 in both, as nibabel and the tedana PR write them.
-    if e.tool == "zlib":
-        return gzip.GzipFile("", "wb", e.level, fobj, mtime=0)
-    from isal import igzip
-
-    return igzip.IGzipFile("", "wb", e.level, fobj, mtime=0)
-
-
 def run_encoder(e: Encoder, src: Path, dst: Path) -> tuple[float, float]:
-    if e.tool in ("pigz", "zstd", "pzstd"):
+    if e.tool != "isal":
         return _timed_cmd(encode_cmd(e, src), dst)
     t0, c0 = time.perf_counter(), _self_cpu()
     with open(src, "rb") as fin:
-        if e.tool == "isal" and e.threads > 1:
+        if e.threads > 1:
             from isal import igzip_threaded
 
             with igzip_threaded.open(dst, "wb", compresslevel=e.level, threads=e.threads) as gz:
                 shutil.copyfileobj(fin, gz, CHUNK)
         else:
-            with open(dst, "wb") as fout, _gz_writer(e, fout) as gz:
+            from isal import igzip
+
+            # Empty name and mtime=0, as nibabel and the tedana PR write them.
+            with open(dst, "wb") as fout, igzip.IGzipFile("", "wb", e.level, fout, mtime=0) as gz:
                 shutil.copyfileobj(fin, gz, CHUNK)
     return time.perf_counter() - t0, _self_cpu() - c0
 
 
-def _open_in_process(d: Decoder, src: Path):
-    if d.tool == "zlib":
-        return gzip.open(src, "rb")
+def _open_in_process(src: Path):
     from isal import igzip
 
     return igzip.open(src, "rb")
 
 
 def run_decoder(d: Decoder, src: Path) -> tuple[float, float]:
-    if d.tool not in ("zlib", "isal"):
+    if d.tool != "isal":
         return _timed_cmd(decode_cmd(d, src), os.devnull)
     buf = bytearray(CHUNK)
     t0, c0 = time.perf_counter(), _self_cpu()
-    with _open_in_process(d, src) as fh:
+    with _open_in_process(src) as fh:
         while fh.readinto(buf):
             pass
     return time.perf_counter() - t0, _self_cpu() - c0
@@ -232,8 +218,8 @@ def source_crc(path: Path) -> tuple[int, int]:
 
 
 def verify_decode(d: Decoder, src: Path, expected: tuple[int, int]) -> None:
-    if d.tool in ("zlib", "isal"):
-        with _open_in_process(d, src) as fh:
+    if d.tool == "isal":
+        with _open_in_process(src) as fh:
             got = stream_crc(fh)
     else:
         proc = subprocess.Popen(decode_cmd(d, src), stdout=subprocess.PIPE, bufsize=0)
@@ -248,58 +234,39 @@ def verify_decode(d: Decoder, src: Path, expected: tuple[int, int]) -> None:
 # --- input preparation ------------------------------------------------------------
 
 
-def _write_series(paths: list[Path], dst: Path, target_bytes: int) -> tuple[int, str]:
-    """Join ``paths`` along time and keep whole volumes, up to about ``target_bytes``."""
-    import nibabel as nib
-    import numpy as np
-
-    first = nib.load(paths[0])
-    shape, dtype = first.shape, np.dtype(first.get_data_dtype())
-    vol_bytes = int(np.prod(shape[:3])) * dtype.itemsize
-    keep = max(1, round(target_bytes / vol_bytes))
-    arrays, have = [], 0
-    for p in paths:
-        img = nib.load(p)
-        if img.shape[:3] != shape[:3] or np.dtype(img.get_data_dtype()) != dtype:
-            raise ValueError(f"{p}: cannot join with {paths[0]}: different grid or datatype")
-        arr = np.asanyarray(img.dataobj)
-        if arr.ndim == 3:
-            arr = arr[..., None]
-        arrays.append(arr[..., : keep - have])
-        have += arrays[-1].shape[3]
-        if have >= keep:
-            break
-    data = np.concatenate(arrays, axis=3) if len(arrays) > 1 else arrays[0]
-    if data.dtype != dtype:
-        data = data.astype(dtype)  # a scaled input decodes wider than its stored type
-    nib.save(nib.Nifti1Image(data, first.affine, first.header), dst)
-    return dst.stat().st_size, str(dtype)
-
-
 def prepare_inputs(args, work: Path) -> dict[str, dict]:
-    """Uncompressed .nii copies in tmpfs. The result carries no source paths."""
+    """Byte-exact uncompressed copies in tmpfs. The result carries no source paths."""
+    import nibabel as nib
+
     src_dir = work / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
     inputs: dict[str, dict] = {}
-    if args.ladder:
-        paths = [Path(p) for p in args.ladder]
-        for mb in sorted(args.ladder_mb):
-            label = f"ladder-{mb}"
-            dst = src_dir / f"{label}.nii"
-            size, dtype = _write_series(paths, dst, mb * 10**6)
-            inputs[label] = {"path": dst, "bytes": size, "dtype": dtype, "kind": "ladder"}
     for spec in args.file:
         label, _, path = spec.partition("=")
         dst = src_dir / f"{label}.nii"
-        size, dtype = _write_series([Path(path)], dst, 10**15)
-        inputs[label] = {"path": dst, "bytes": size, "dtype": dtype, "kind": "type"}
-    return inputs
+        if path.endswith(".gz"):
+            cmd = ["pigz", "-dc", path]
+        elif path.endswith(".zst"):
+            cmd = ["zstd", "-qdc", path]
+        else:
+            cmd = ["cat", path]
+        with open(dst, "wb") as out:
+            subprocess.run(cmd, stdout=out, check=True)
+        hdr = nib.load(dst).header
+        shape = "x".join(str(v) for v in hdr.get_data_shape())
+        inputs[label] = {
+            "path": dst,
+            "bytes": dst.stat().st_size,
+            "dtype": str(hdr.get_data_dtype()),
+            "kind": shape,
+        }
+    return dict(sorted(inputs.items(), key=lambda kv: kv[1]["bytes"]))
 
 
 # --- end-to-end routes, each timed in a fresh process -----------------------------
 
-WRITE_ROUTES = ["nii", "nibabel-zlib1", "nibabel-isal2", "ffs-gz", "ffs-zst"]
-READ_ROUTES = ["nii", "nibabel-zlib", "nibabel-isal", "nibabel-rapidgzip", "ffs-gz", "ffs-zst"]
+WRITE_ROUTES = ["nii", "nibabel-isal2", "ffs-gz", "ffs-zst"]
+READ_ROUTES = ["nii", "nibabel-isal", "nibabel-rapidgzip", "ffs-gz", "ffs-zst"]
 
 
 def _peak_rss_gb() -> float:
@@ -624,6 +591,402 @@ def _can_import(name: str) -> bool:
     return res.returncode == 0
 
 
+# --- figures and tables -----------------------------------------------------------
+
+BLUE, ORANGE, AQUA, YELLOW, GRAY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#7d7c78"
+INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e6e5e0"
+# Colour is the tool in every figure. The marker tells settings of one tool apart.
+TOOL_COLOR = {"isal": BLUE, "pigz": ORANGE, "zstd": AQUA, "pzstd": AQUA, "rapidgzip": YELLOW}
+ROUTE_NAME = {
+    "nii": "uncompressed .nii (nibabel)",
+    "nibabel-isal2": "nibabel through ISA-L 2 (the tedana PR)",
+    "nibabel-isal": "nibabel through ISA-L",
+    "nibabel-rapidgzip": "nibabel through rapidgzip",
+    "ffs-gz": "fastfuncstuff .nii.gz (pigz / rapidgzip)",
+    "ffs-zst": "fastfuncstuff .nii.zst (pzstd)",
+}
+ROUTE_COLOR = {
+    "nii": GRAY,
+    "nibabel-isal2": BLUE,
+    "nibabel-isal": BLUE,
+    "nibabel-rapidgzip": YELLOW,
+    "ffs-gz": ORANGE,
+    "ffs-zst": AQUA,
+}
+
+
+def load_rows(results: Path) -> list[dict]:
+    rows = list(csv.DictReader(open(results / "results.csv")))
+    for r in rows:
+        r["bytes"] = int(r["bytes"])
+        r["wall"] = float(r["wall"])
+        r["cpu"] = float(r["cpu"]) if r["cpu"] else float("nan")
+        r["out_bytes"] = int(r["out_bytes"])
+        r["peak_gb"] = float(r["peak_gb"]) if r["peak_gb"] else float("nan")
+        r["threads"] = int(r["threads"])
+    return rows
+
+
+def medians(rows: list[dict]) -> dict[tuple[str, str, str], dict]:
+    """(tier, file, method) -> medians, with the spread across repetitions."""
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["tier"], r["file"], r["method"]), []).append(r)
+    out = {}
+    for key, g in groups.items():
+        wall = statistics.median(x["wall"] for x in g)
+        out[key] = dict(g[0]) | {
+            "wall": wall,
+            "wall_min": min(x["wall"] for x in g),
+            "wall_max": max(x["wall"] for x in g),
+            "n": len(g),
+            "cpu": statistics.median(x["cpu"] for x in g),
+            "peak_gb": statistics.median(x["peak_gb"] for x in g),
+            "mbps": g[0]["bytes"] / 1e6 / wall,
+        }
+    return out
+
+
+def _style(ax) -> None:
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=9, length=0)
+    ax.grid(True, color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+
+
+def _mb_label(mb: float) -> str:
+    return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+
+
+def _title(fig, title: str, sub: str, height: float) -> None:
+    fig.text(0.012, 1 - 0.12 / height, title, fontsize=13.5, fontweight="bold", color=INK, va="top")
+    fig.text(0.012, 1 - 0.42 / height, sub, fontsize=9.5, color=MUTED, va="top")
+
+
+def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
+    """One row per file, one dot per method. methods: (id, label, tool, marker)."""
+    handles = []
+    ys = list(range(len(files)))[::-1]
+    for method, label, tool, marker in methods:
+        xs, yy = [], []
+        for f, y in zip(files, ys, strict=True):
+            v = med.get((tier, f, method))
+            if v:
+                xs.append(100 * v["out_bytes"] / v["bytes"] if value == "pct" else v["mbps"])
+                yy.append(y)
+        handles.append(
+            ax.scatter(
+                xs,
+                yy,
+                s=62,
+                marker=marker,
+                color=TOOL_COLOR[tool],
+                edgecolor="white",
+                linewidth=0.8,
+                zorder=3,
+                label=label,
+            )
+        )
+    _style(ax)
+    ax.grid(False, axis="x") if value == "pct" else None
+    if value != "pct":
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(lambda v, _: f"{v:,.0f}")
+    return handles
+
+
+def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) -> None:
+    import matplotlib.pyplot as plt
+
+    h = 0.5 * len(files) + 2.3
+    fig, axes = plt.subplots(1, len(panels), figsize=(12.5, h), sharey=True)
+    axes = axes if len(panels) > 1 else [axes]
+    seen: dict[str, object] = {}
+    for ax, (panel_title, xlabel, handles_fn) in zip(axes, panels, strict=True):
+        for handle in handles_fn(ax):
+            seen.setdefault(handle.get_label(), handle)
+        ax.set_title(panel_title, loc="left", fontsize=10.5, color=INK)
+        ax.set_xlabel(xlabel, color=MUTED, fontsize=9)
+    ys = list(range(len(files)))[::-1]
+    axes[0].set_yticks(
+        ys, [f"{f}  {_mb_label(sizes[f] / 1e6)}" for f in files], color=INK, fontsize=9
+    )
+    fig.legend(
+        list(seen.values()),
+        list(seen),
+        frameon=False,
+        fontsize=9,
+        ncols=legend_cols,
+        loc="upper left",
+        bbox_to_anchor=(0.005, 1 - 0.62 / h),
+    )
+    fig.subplots_adjust(top=1 - 1.25 / h, bottom=0.55 / h, left=0.17, right=0.99, wspace=0.05)
+    _title(fig, title, sub, h)
+    fig.savefig(results / name, dpi=170)
+    plt.close(fig)
+
+
+def make_all(results: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = load_rows(results)
+    meta = json.loads((results / "meta.json").read_text())
+    n = meta["threads"]
+    med = medians(rows)
+    sizes = {r["file"]: r["bytes"] for r in rows}
+    files = sorted(sizes, key=lambda f: sizes[f])
+    spread = f"Median of {meta['reps_large']}-{meta['reps']} shuffled repetitions, tmpfs to tmpfs."
+
+    enc_1 = [
+        ("isal-2.p1", "ISA-L 2", "isal", "o"),
+        ("zstd-1.p1", "zstd -1", "zstd", "D"),
+        ("zstd-3.p1", "zstd -3", "zstd", "o"),
+    ]
+    enc_n = [
+        (f"isal-2.p{n}", "ISA-L 2", "isal", "o"),
+        (f"pigz-1.p{n}", "pigz -1", "pigz", "o"),
+        (f"pzstd-1.p{n}", "pzstd -1", "pzstd", "D"),
+        (f"pzstd-3.p{n}", "pzstd -3", "pzstd", "^"),
+    ]
+    sizes_panel = [
+        ("isal-2.p1", "ISA-L 2", "isal", "o"),
+        (f"pigz-1.p{n}", "pigz -1", "pigz", "o"),
+        (f"pzstd-1.p{n}", "pzstd -1", "pzstd", "D"),
+        (f"pzstd-3.p{n}", "pzstd -3", "pzstd", "^"),
+    ]
+    _save_strip(
+        results,
+        "fig1_compress.png",
+        "Compression: size and speed",
+        spread,
+        files,
+        sizes,
+        [
+            (
+                "Compressed size",
+                "% of original, left is smaller",
+                lambda ax: _dot_panel(ax, med, "encode", files, sizes_panel, "pct"),
+            ),
+            (
+                "Speed, 1 thread",
+                "MB/s of uncompressed data",
+                lambda ax: _dot_panel(ax, med, "encode", files, enc_1),
+            ),
+            (
+                f"Speed, {n} threads",
+                "MB/s of uncompressed data",
+                lambda ax: _dot_panel(ax, med, "encode", files, enc_n),
+            ),
+        ],
+        legend_cols=5,
+    )
+
+    dec_1 = [
+        ("isal-2.p1>isal.p1", "ISA-L, ISA-L file", "isal", "o"),
+        (f"pigz-1.p{n}>isal.p1", "ISA-L, pigz file", "isal", "s"),
+        ("zstd-3.p1>zstd.p1", "zstd, zstd file", "zstd", "o"),
+    ]
+    dec_n = [
+        ("isal-2.p1>rapidgzip.p" + str(n), "rapidgzip, ISA-L file", "rapidgzip", "o"),
+        (f"pigz-1.p{n}>rapidgzip.p{n}", "rapidgzip, pigz file", "rapidgzip", "s"),
+        (f"zstd-3.p1>pzstd.p{n}", "pzstd, single-frame file", "zstd", "v"),
+        (f"pzstd-3.p{n}>pzstd.p{n}", "pzstd, pzstd file", "pzstd", "^"),
+    ]
+    _save_strip(
+        results,
+        "fig2_decompress.png",
+        "Decompression speed",
+        "Output to /dev/null, so nothing caps a fast decoder. " + spread,
+        files,
+        sizes,
+        [
+            (
+                "1 thread",
+                "MB/s of uncompressed data",
+                lambda ax: _dot_panel(ax, med, "decode", files, dec_1),
+            ),
+            (
+                f"{n} threads",
+                "MB/s of uncompressed data",
+                lambda ax: _dot_panel(ax, med, "decode", files, dec_n),
+            ),
+        ],
+        legend_cols=4,
+    )
+
+    # Size against speed, one curve per tool.
+    swept = sorted(
+        {
+            r["file"]
+            for r in rows
+            if r["tier"] == "encode" and r["tool"] == "pigz" and r["level"] == "9"
+        },
+        key=lambda f: sizes[f],
+    )
+    if swept:
+        h = 3.9 * len(swept) + 0.9
+        fig, axes = plt.subplots(len(swept), 2, figsize=(12.5, h), sharey="row", squeeze=False)
+        for i, f in enumerate(swept):
+            for j, threads in enumerate((1, n)):
+                ax = axes[i][j]
+                for tool, name in (
+                    ("isal", "ISA-L"),
+                    ("pigz", "pigz"),
+                    ("zstd", "zstd"),
+                    ("pzstd", "pzstd"),
+                ):
+                    pts = sorted(
+                        (
+                            v
+                            for k, v in med.items()
+                            if k[0] == "encode"
+                            and k[1] == f
+                            and v["tool"] == tool
+                            and v["threads"] == threads
+                        ),
+                        key=lambda v: int(v["level"]),
+                    )
+                    if tool == "zstd" and threads > 1:
+                        continue  # one point; pzstd is the curve at this thread count
+                    if not pts:
+                        continue
+                    xs = [100 * v["out_bytes"] / v["bytes"] for v in pts]
+                    ys = [v["mbps"] for v in pts]
+                    ax.plot(
+                        xs,
+                        ys,
+                        color=TOOL_COLOR[tool],
+                        lw=2,
+                        marker="o",
+                        ms=6,
+                        mec="white",
+                        mew=1,
+                        label=name,
+                    )
+                    for x, y, v in zip(xs, ys, pts, strict=True):
+                        ax.annotate(
+                            v["level"],
+                            (x, y),
+                            xytext=(0, 7),
+                            textcoords="offset points",
+                            fontsize=8.5,
+                            color=MUTED,
+                            ha="center",
+                        )
+                ax.set_yscale("log")
+                _style(ax)
+                ax.yaxis.set_major_formatter(lambda v, _: f"{v:,.0f}")
+                ax.set_title(
+                    f"{f}, {threads} thread{'s' if threads > 1 else ''}",
+                    loc="left",
+                    fontsize=10.5,
+                    color=INK,
+                )
+                ax.set_xlabel("compressed size, % of original", color=MUTED, fontsize=9)
+                ax.legend(frameon=False, fontsize=9)
+            axes[i][0].set_ylabel("compression MB/s", color=MUTED, fontsize=9)
+        fig.subplots_adjust(
+            top=1 - 0.9 / h, bottom=0.55 / h, left=0.06, right=0.99, wspace=0.05, hspace=0.32
+        )
+        _title(
+            fig,
+            "Size against speed, by compression level",
+            "Each point is a level, written beside it. Up and to the left is better.",
+            h,
+        )
+        fig.savefig(results / "fig3_tradeoff.png", dpi=170)
+        plt.close(fig)
+
+    # What a caller waits for, on the two largest files.
+    picks = [f for f in files[-2:] if ("e2e-read", f, "nii") in med]
+    if picks:
+        h = 3.1 * len(picks) + 0.9
+        fig, axes = plt.subplots(len(picks), 2, figsize=(12.5, h), squeeze=False)
+        for i, f in enumerate(picks):
+            for ax, (tier, title, routes) in zip(
+                axes[i],
+                [
+                    ("e2e-write", "array to file", WRITE_ROUTES),
+                    ("e2e-read", "file to float32 array", READ_ROUTES),
+                ],
+                strict=True,
+            ):
+                items = sorted(
+                    (med[(tier, f, r)] for r in routes if (tier, f, r) in med),
+                    key=lambda v: -v["wall"],
+                )
+                ys = list(range(len(items)))
+                ax.barh(
+                    ys,
+                    [v["wall"] for v in items],
+                    color=[ROUTE_COLOR[v["method"]] for v in items],
+                    height=0.62,
+                )
+                ax.set_yticks(ys, [ROUTE_NAME[v["method"]] for v in items], fontsize=9, color=INK)
+                for y, v in zip(ys, items, strict=True):
+                    ax.text(
+                        v["wall"], y, f"  {v['wall']:.1f} s", va="center", fontsize=9, color=INK
+                    )
+                _style(ax)
+                ax.grid(False, axis="y")
+                ax.set_xlim(right=max(v["wall"] for v in items) * 1.18)
+                ax.set_xlabel("seconds", color=MUTED, fontsize=9)
+                ax.set_title(
+                    f"{f}  {_mb_label(sizes[f] / 1e6)}, {title}",
+                    loc="left",
+                    fontsize=10.5,
+                    color=INK,
+                )
+        fig.subplots_adjust(
+            top=1 - 0.9 / h, bottom=0.5 / h, left=0.215, right=0.985, wspace=0.95, hspace=0.42
+        )
+        _title(
+            fig,
+            "What a Python caller actually waits for",
+            f"Real routes, a fresh process per trial, on tmpfs, {n} threads where the route can use them.",
+            h,
+        )
+        fig.savefig(results / "fig4_end_to_end.png", dpi=170)
+        plt.close(fig)
+
+    lines = [f"# Results ({meta.get('cpu', '')}, {n} threads)\n"]
+    for f in files:
+        info = next(r for r in rows if r["file"] == f)
+        lines += [
+            f"\n## {f}: {info['bytes'] / 1e6:.0f} MB {info['dtype']} {info['kind']}\n",
+            "\n| encoder | MB/s | spread s | CPU s | size % |\n|---|--:|--:|--:|--:|",
+        ]
+        for k, v in sorted(med.items(), key=lambda kv: -kv[1]["mbps"]):
+            if k[0] == "encode" and k[1] == f:
+                lines.append(
+                    f"| {k[2]} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} | {100 * v['out_bytes'] / v['bytes']:.1f} |"
+                )
+        lines.append("\n| file > decoder | MB/s | spread s | CPU s |\n|---|--:|--:|--:|")
+        for k, v in sorted(med.items(), key=lambda kv: -kv[1]["mbps"]):
+            if k[0] == "decode" and k[1] == f:
+                lines.append(
+                    f"| {k[2]} | {v['mbps']:.0f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['cpu']:.1f} |"
+                )
+        for tier in ("e2e-write", "e2e-read"):
+            lines.append(
+                f"\n| {tier} | seconds | spread s | peak GB | file MB |\n|---|--:|--:|--:|--:|"
+            )
+            for k, v in sorted(med.items(), key=lambda kv: kv[1]["wall"]):
+                if k[0] == tier and k[1] == f:
+                    lines.append(
+                        f"| {k[2]} | {v['wall']:.2f} | {v['wall_min']:.2f}-{v['wall_max']:.2f} | {v['peak_gb']:.2f} | {v['out_bytes'] / 1e6:.0f} |"
+                    )
+    (results / "summary.md").write_text("\n".join(lines) + "\n")
+    loads = [float(r["load1"]) for r in rows]
+    print(
+        f"{len(rows)} trials; load average median {statistics.median(loads):.1f}, max {max(loads):.1f}"
+    )
+
+
 # --- entry ------------------------------------------------------------------------
 
 
@@ -640,10 +1003,6 @@ def main() -> None:
     r.add_argument(
         "-workdir", default="/dev/shm/bench_nifti_compression", help="tmpfs scratch space"
     )
-    r.add_argument(
-        "-ladder", nargs="*", default=[], help="series to join along time for the size ladder"
-    )
-    r.add_argument("-ladder_mb", nargs="*", type=int, default=[10, 100, 1000])
     r.add_argument(
         "-file", action="append", default=[], metavar="LABEL=PATH", help="another file; repeatable"
     )
@@ -666,7 +1025,7 @@ def main() -> None:
         finally:
             shutil.rmtree(args.workdir, ignore_errors=True)
     else:
-        raise NotImplementedError
+        make_all(Path(args.results))
 
 
 if __name__ == "__main__":
