@@ -77,7 +77,9 @@ class Decoder:
 
 
 def enc(tool: str, level: int, threads: int) -> Encoder:
-    return Encoder(f"{tool}-{level}.p{threads}", tool, level, threads)
+    """A negative level is zstd's --fast=N."""
+    name = f"f{-level}" if level < 0 else str(level)
+    return Encoder(f"{tool}-{name}.p{threads}", tool, level, threads)
 
 
 def core_encoders(n: int) -> list[Encoder]:
@@ -134,7 +136,8 @@ def encode_cmd(e: Encoder, src: Path) -> list[str]:
     if e.tool == "pigz":
         return ["pigz", "-c", f"-{e.level}", "-p", str(e.threads), str(src)]
     if e.tool == "zstd":
-        return ["zstd", "-q", "-c", f"-{e.level}", f"-T{e.threads}", str(src)]
+        level = f"--fast={-e.level}" if e.level < 0 else f"-{e.level}"
+        return ["zstd", "-q", "-c", level, f"-T{e.threads}", str(src)]
     return ["pzstd", "-q", "-c", f"-{e.level}", "-p", str(e.threads), str(src)]
 
 
@@ -591,6 +594,136 @@ def _can_import(name: str) -> bool:
     return res.returncode == 0
 
 
+# --- at what file size does pzstd start to pay? -----------------------------------
+
+
+def crossover_writers(n: int) -> list[Encoder]:
+    return [
+        *(enc("zstd", lv, t) for t in (1, n) for lv in (-3, -1, 1, 3)),
+        enc("pzstd", 1, n),
+        enc("pzstd", 3, n),
+    ]
+
+
+def count_frames(path: Path) -> int:
+    """Data frames in a zstd file. pzstd's parallel read needs more than one."""
+    res = subprocess.run(["zstd", "-l", str(path)], capture_output=True, text=True, check=True)
+    # The Frames column counts pzstd's skippable index frames too.
+    frames, skips = res.stdout.splitlines()[1].split()[:2]
+    return int(frames) - int(skips)
+
+
+def run_crossover(args) -> None:
+    """Middle-of-the-file cuts of each input, doubling in size.
+
+    The middle, because the start of a NIfTI is mostly air and would flatter every
+    codec. A cut is not a valid image, which does not matter: a codec only sees bytes.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    work = Path(args.workdir)
+    n = args.threads
+    rng = random.Random(args.seed)
+    inputs = prepare_inputs(args, work)
+    writers = crossover_writers(n)
+    readers = [Decoder("zstd.p1", "zstd", 1), Decoder(f"pzstd.p{n}", "pzstd", n)]
+    t_start = time.time()
+    with open(out / "crossover.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(
+            [
+                "file",
+                "mb",
+                "op",
+                "method",
+                "tool",
+                "level",
+                "threads",
+                "reader",
+                "rep",
+                "wall",
+                "cpu",
+                "out_bytes",
+                "frames",
+                "load1",
+            ]
+        )
+        for label, info in inputs.items():
+            for mb in args.sizes_mb:
+                size = mb * 2**20
+                if size > info["bytes"]:
+                    continue
+                cut = work / "cut.bin"
+                with open(info["path"], "rb") as fin, open(cut, "wb") as fout:
+                    fin.seek((info["bytes"] - size) // 2)
+                    fout.write(fin.read(size))
+                expected = source_crc(cut)
+                # Small files are the noisy ones, and the cheap ones.
+                reps = 9 if mb <= 32 else 5 if mb <= 128 else 3
+                paths = {e: work / f"{e.name}.zst" for e in writers}
+                for rep in range(reps):
+                    rng.shuffle(writers)
+                    for e in writers:
+                        paths[e].unlink(missing_ok=True)
+                        wall, cpu = run_encoder(e, cut, paths[e])
+                        w.writerow(
+                            [
+                                label,
+                                mb,
+                                "write",
+                                e.name,
+                                e.tool,
+                                e.level,
+                                e.threads,
+                                "",
+                                rep,
+                                wall,
+                                cpu,
+                                paths[e].stat().st_size,
+                                "",
+                                os.getloadavg()[0],
+                            ]
+                        )
+                frames = {e: count_frames(p) for e, p in paths.items()}
+                # Same level and writer family read alike, so the 1-thread zstd files are not read.
+                pairs = [(e, d) for e in writers if e.threads > 1 for d in readers]
+                for e, d in pairs:
+                    verify_decode(d, paths[e], expected)
+                for rep in range(reps):
+                    rng.shuffle(pairs)
+                    for e, d in pairs:
+                        wall, cpu = run_decoder(d, paths[e])
+                        w.writerow(
+                            [
+                                label,
+                                mb,
+                                "read",
+                                e.name,
+                                e.tool,
+                                e.level,
+                                e.threads,
+                                d.name,
+                                rep,
+                                wall,
+                                cpu,
+                                paths[e].stat().st_size,
+                                frames[e],
+                                os.getloadavg()[0],
+                            ]
+                        )
+                fh.flush()
+                print(
+                    f"[{time.time() - t_start:5.0f}s] {label} {mb} MB: frames "
+                    + " ".join(
+                        f"{e.name}={frames[e]}"
+                        for e in sorted(writers, key=lambda x: x.name)
+                        if e.tool == "pzstd"
+                    ),
+                    flush=True,
+                )
+    print(f"done in {time.time() - t_start:.0f}s", flush=True)
+
+
 # --- figures and tables -----------------------------------------------------------
 
 BLUE, ORANGE, AQUA, YELLOW, GRAY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#7d7c78"
@@ -655,6 +788,16 @@ def _style(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _plain_log_ticks(axis) -> None:
+    """1, 2, 5 steps as ordinary numbers; 3x10^2 is no way to write a speed."""
+    from matplotlib.ticker import LogLocator, NullFormatter, NullLocator
+
+    axis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    axis.set_major_formatter(lambda v, _: f"{v:,.0f}")
+    axis.set_minor_locator(NullLocator())
+    axis.set_minor_formatter(NullFormatter())
+
+
 def _mb_label(mb: float) -> str:
     return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
 
@@ -692,7 +835,7 @@ def _dot_panel(ax, med, tier, files, methods, value="mbps") -> list:
     ax.grid(False, axis="x") if value == "pct" else None
     if value != "pct":
         ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(lambda v, _: f"{v:,.0f}")
+        _plain_log_ticks(ax.xaxis)
     return handles
 
 
@@ -782,7 +925,7 @@ def make_all(results: Path) -> None:
                 lambda ax: _dot_panel(ax, med, "encode", files, enc_n),
             ),
         ],
-        legend_cols=5,
+        legend_cols=6,
     )
 
     dec_1 = [
@@ -879,7 +1022,7 @@ def make_all(results: Path) -> None:
                         )
                 ax.set_yscale("log")
                 _style(ax)
-                ax.yaxis.set_major_formatter(lambda v, _: f"{v:,.0f}")
+                _plain_log_ticks(ax.yaxis)
                 ax.set_title(
                     f"{f}, {threads} thread{'s' if threads > 1 else ''}",
                     loc="left",
@@ -929,7 +1072,12 @@ def make_all(results: Path) -> None:
                 ax.set_yticks(ys, [ROUTE_NAME[v["method"]] for v in items], fontsize=9, color=INK)
                 for y, v in zip(ys, items, strict=True):
                     ax.text(
-                        v["wall"], y, f"  {v['wall']:.1f} s", va="center", fontsize=9, color=INK
+                        v["wall"],
+                        y,
+                        f"  {v['wall']:.2f} s" if v["wall"] < 10 else f"  {v['wall']:.1f} s",
+                        va="center",
+                        fontsize=9,
+                        color=INK,
                     )
                 _style(ax)
                 ax.grid(False, axis="y")
@@ -1016,12 +1164,26 @@ def main() -> None:
     )
     r.add_argument("-seed", type=int, default=0)
     r.add_argument("-no_e2e", action="store_true", help="skip the end-to-end array routes")
+    x = sub.add_parser("crossover", help="at what file size does pzstd start to pay?")
+    x.add_argument("-out", required=True)
+    x.add_argument("-workdir", default="/dev/shm/bench_nifti_crossover", help="tmpfs scratch space")
+    x.add_argument("-file", action="append", default=[], metavar="LABEL=PATH")
+    x.add_argument(
+        "-sizes_mb", nargs="*", type=int, default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    )
+    x.add_argument("-threads", type=int, default=len(os.sched_getaffinity(0)) // 2)
+    x.add_argument("-seed", type=int, default=0)
     q = sub.add_parser("plot")
     q.add_argument("results")
     args = p.parse_args()
     if args.cmd == "run":
         try:
             run(args)
+        finally:
+            shutil.rmtree(args.workdir, ignore_errors=True)
+    elif args.cmd == "crossover":
+        try:
+            run_crossover(args)
         finally:
             shutil.rmtree(args.workdir, ignore_errors=True)
     else:
