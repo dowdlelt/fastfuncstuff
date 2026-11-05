@@ -281,8 +281,9 @@ def test_fine_curves_pass_through_the_fit_at_its_knots():
     c = DepthCurves(times=times, values=values, roi="1", name="r", hemi="lh")
     d = two_condition_data(c, c, duration=1.0, delay_seconds=0.0)
     pE = faes_priors(d.spec, (0, 0, 0)).pE
-    detail = _curve_detail(d, SimpleNamespace(Ep=pE), None, d.integrate_kwargs)
-    coarse = integrate(d.u, pE, d.spec, int(d.y.shape[0]), **d.integrate_kwargs).numpy()
+    fit = integrate(d.u, pE, d.spec, int(d.y.shape[0]), **d.integrate_kwargs)
+    detail = _curve_detail(d, SimpleNamespace(Ep=pE, y_pred=fit), None, d.integrate_kwargs)
+    coarse = fit.numpy()
     assert detail.steps_per_scan > 1
     # ULP tolerance: both routes go through a compiled kernel.
     np.testing.assert_allclose(
@@ -292,6 +293,42 @@ def test_fine_curves_pass_through_the_fit_at_its_knots():
     many = local_contribution(detail.W, coarse[:5], detail.W_inv)
     one = np.stack([local_contribution(detail.W, r, detail.W_inv) for r in coarse[:5]])
     np.testing.assert_allclose(many, one, rtol=1e-12, atol=1e-12)
+    # The attribution is per condition per depth, and stays below the whole fit it splits.
+    assert detail.model_local.shape == (2, d.spec.K)
+    assert (detail.model_local <= coarse.max(axis=0) + 1e-9).all()
+
+
+@pytest.mark.slow  # 30s: compiles the integrator at K=11
+def test_model_local_mixes_neuronal_depths_where_their_maps_overlap():
+    """Assigning each depth wholly to one neuronal bin kinked the profile at every bin edge
+    (0.52 to 0.34 at K=11 on real V1). A depth two maps share must get a mix, not a pick."""
+    from types import SimpleNamespace
+
+    from fastfuncstuff.laminar.devein import own_depth_responses
+    from fastfuncstuff.laminar.forward import neuronal_to_vascular
+    from fastfuncstuff.laminar.io import DepthCurves, two_condition_data
+    from fastfuncstuff.laminar.pipeline import _condition_slices, _model_local
+
+    times = np.arange(9) * 1.85
+    values = np.exp(-((times - 5) ** 2) / 6)[:, None] * np.linspace(0.7, 1.8, 11)[None]
+    c = DepthCurves(times=times, values=values, roi="1", name="r", hemi="lh")
+    d = two_condition_data(c, c, duration=1.0, delay_seconds=0.0)
+    pE = faes_priors(d.spec, (0, 0, 0)).pE
+    n_scans = int(d.y.shape[0])
+    fit = integrate(d.u, pE, d.spec, n_scans, **d.integrate_kwargs)
+    local = _model_local(d, SimpleNamespace(Ep=pE, y_pred=fit), None, d.integrate_kwargs)[0]
+
+    share = neuronal_to_vascular(d.spec, pE).numpy()
+    share = share / share.sum(-1, keepdims=True)
+    parts = own_depth_responses(d.spec, pE, d.u, n_scans, **d.integrate_kwargs).numpy()
+    sl = _condition_slices(d.meta)[0]
+    peak = sl.start + np.abs(fit.numpy()[sl]).argmax(axis=0)
+    mixed = np.flatnonzero(np.sort(share, axis=-1)[:, -2] > 0.1)  # the map is sharp: 0.18 at most
+    assert len(mixed) > 0
+    for k in mixed:
+        lead, second = np.argsort(share[k])[[-1, -2]]
+        a, b = parts[lead, peak[k], k], parts[second, peak[k], k]
+        assert min(a, b) < local[k] < max(a, b) or a == pytest.approx(b)
 
 
 def test_null_model_has_fewer_free_parameters():

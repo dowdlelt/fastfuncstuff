@@ -297,3 +297,41 @@ def test_local_contribution_reconstructs_the_measured_profile():
     # and the own-column part is never more than the whole
     dev = local_contribution(w, measured)
     assert np.all(dev <= measured + 1e-9)
+
+
+def _event_input(spec, n_scans):
+    n_micro = int(round(n_scans * spec.TR / spec.dt))
+    u = torch.zeros(n_micro, spec.n_inputs, dtype=spec.dtype)
+    u[: int(round(1.0 / spec.dt)), -1] = 1.0
+    return u
+
+
+def test_own_depth_responses_split_the_fit_by_driven_depth(params):
+    """Each part is the fit with one depth's input left on, and they roughly add back up:
+    the attribution is only meaningful if it accounts for what the model predicted."""
+    from fastfuncstuff.laminar.devein import own_depth_responses
+    from fastfuncstuff.laminar.integrate import integrate
+
+    u = _event_input(SPEC, N_SCANS)
+    parts = own_depth_responses(SPEC, params, u, N_SCANS)
+    assert parts.shape == (SPEC.N, N_SCANS, SPEC.K)
+    full = integrate(u, params, SPEC, N_SCANS)
+    assert torch.allclose(parts.sum(0), full, rtol=0.2, atol=0.05)
+
+    only_deep = {k: v.clone() for k, v in params.items()}
+    only_deep["C"][:-1] = 0.0
+    alone = integrate(u, only_deep, SPEC, N_SCANS)
+    assert torch.allclose(parts[-1], alone, rtol=1e-6, atol=1e-6)
+
+
+def test_uniform_drive_gives_the_middle_depth_its_own_signal(params):
+    """The bug of record. V1 at K=7 showed the middle depth with a third of the deep
+    depth's own signal, because the static inverse reads a straight profile as having no
+    middle. With every depth driven equally, the attribution must not produce that dip."""
+    from fastfuncstuff.laminar.devein import depth_bin_map, own_depth_responses
+
+    u = _event_input(SPEC, N_SCANS)
+    parts = own_depth_responses(SPEC, params, u, N_SCANS)
+    own = depth_bin_map(SPEC.K, SPEC.N)
+    peak = parts[torch.as_tensor(own), :, torch.arange(SPEC.K)].abs().max(dim=-1).values
+    assert peak[own == 1].mean() > 0.7 * peak[own == 2].mean()

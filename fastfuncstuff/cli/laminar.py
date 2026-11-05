@@ -58,7 +58,8 @@ Writes {prefix}_laminar_models.tsv (F, model and per-K evidence), _depths.tsv
 (P(depth modulated) marginalised over the model space -- prefer it to the winner --
 and the best model's B with 90% credible intervals), _devein.tsv (the static
 deveining operator, neuronal depth x measured depth, depth 1 deepest), _neuronal.tsv
-(deveined neuronal time courses) and _laminar.json.
+(deveined neuronal time courses), _profiles.tsv (peak depth profiles; see READING THE
+OUTPUT) and _laminar.json.
 
 Runs on the CPU in float64, as the model's small ODE wants; inversions run in parallel
 across -workers processes, one thread each.
@@ -67,6 +68,12 @@ across -workers processes, one thread each.
 
 _EPILOG = """\
 READING THE OUTPUT
+
+  Two estimates of what each depth's own neurons contributed (_profiles.tsv and the
+  profile panel).  model_local_pct is the fitted model with the other depths' input
+  zeroed.  Prefer it.  deveined_pct is the static operator applied to the measured peak
+  profile: on a nearly straight profile it gives the middle depth very little, whatever
+  the fit says, because the superficial and deep columns can already draw a line.
 
 Read the tables in this order; each step decides whether the next one means anything.
 

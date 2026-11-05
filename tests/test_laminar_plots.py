@@ -39,6 +39,7 @@ def fake_fit(name="V1", hemi="lh", seed=0, warn=False):
         y_obs=y, y_hat=y * 0.95, rows=rows, impulse=np.abs(rng.normal(size=(k, n_neu, 20))),
         drainage_shift=np.linspace(0.8, 0, k), kernels={7: None, 9: np.array([0.1, 0.2, 0.4, 0.2, 0.1])},
         stalled=np.zeros((4, 2), bool), warnings=["model 'deep' stalled at K=9"] if warn else [],
+        model_local=np.stack([np.linspace(0.8, 0.5, k), np.linspace(0.9, 0.6, k)]),
     )  # fmt: skip
 
 
@@ -109,3 +110,22 @@ def test_the_null_page_renders_and_names_the_floor(tmp_path):
     assert Path(out).exists() and Path(out).stat().st_size > 5000
     # No replicates at all is a degenerate but legal call: the observed value still draws.
     assert Path(plot_null(fake_fit(), [], tmp_path / "none.png")).exists()
+
+
+def test_the_profile_panel_draws_the_model_line_only_when_it_exists():
+    """Older fits and hand-built ones carry no attribution, and must still render."""
+    import matplotlib.pyplot as plt
+
+    from fastfuncstuff.laminar.plots import panel_profiles
+
+    fit = fake_fit()
+    fig, ax = plt.subplots()
+    panel_profiles(ax, fit)
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert sum("model own-depth" in t for t in labels) == 2
+    plt.close(fig)
+    fit.model_local = None
+    fig, ax = plt.subplots()
+    panel_profiles(ax, fit)
+    assert not any("model own-depth" in t.get_text() for t in ax.get_legend().get_texts())
+    plt.close(fig)

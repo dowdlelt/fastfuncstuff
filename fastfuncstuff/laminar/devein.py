@@ -3,7 +3,7 @@ Model-based deveining: laminar neuronal activity from depth-sampled BOLD.
 
 Once a model is inverted, the fitted parameters define a map from neuronal
 activity at ``N`` depths to BOLD at ``K`` depths. Deveining is the inverse of
-that map. This module provides it in three forms of decreasing fidelity, because
+that map. This module provides it in four forms of decreasing fidelity, because
 what a downstream analysis can actually *use* is usually not the full one:
 
 ``deveined_timecourses``
@@ -15,6 +15,10 @@ what a downstream analysis can actually *use* is usually not the full one:
     responds to depth ``n`` of the input with a kernel, not a number: the
     ascending vein imposes a transit delay and smears the response, which is why
     a scalar correction cannot be exact.
+
+``own_depth_responses``
+    The fitted model's BOLD split by which neuronal depth was driven: what the
+    posterior says each depth's neurons contributed. Tied to the fit, like the first.
 
 ``static_deveining_matrix``
     The transfer collapsed to a single ``(K, N)`` amplitude matrix, and its
@@ -151,6 +155,39 @@ def laminar_impulse_response(
     y = integrate(u, P_batch, spec, n_scans, kernel=kernel, **integrate_kwargs)
     # (width, n_scans, K) -> (K, N, n_scans), discarding the padded rows.
     return y[:N].permute(2, 0, 1).contiguous()
+
+
+def own_depth_responses(
+    spec: ModelSpec,
+    P: dict[str, torch.Tensor],
+    u: torch.Tensor,
+    n_scans: int,
+    *,
+    kernel: torch.Tensor | None = None,
+    **integrate_kwargs,
+) -> torch.Tensor:
+    """The fitted model's BOLD with only one neuronal depth driven, ``(N, n_scans, K)``.
+
+    Answers "who made this signal?" from the posterior itself: the actual design and the
+    fitted drive, with the other depths' input zeroed. The static operator answers from
+    the measured peak profile alone, and on a nearly straight profile its least-squares
+    inverse leaves the middle depth almost nothing, because the superficial and deep
+    columns can already draw a line. The parts add up to the fit only approximately,
+    since the model is nonlinear.
+    """
+    N = spec.N
+    width = batch_bucket(N)
+    P_batch = {}
+    for key, value in P.items():
+        v = torch.as_tensor(value, dtype=spec.dtype, device=spec.device)
+        P_batch[key] = v.expand((width,) + v.shape).clone()
+    keep = torch.zeros(width, N, 1, dtype=spec.dtype, device=spec.device)
+    keep[torch.arange(N), torch.arange(N)] = 1.0
+    P_batch["C"] = P_batch["C"] * keep
+    y = integrate(
+        u.expand((width,) + u.shape), P_batch, spec, n_scans, kernel=kernel, **integrate_kwargs
+    )
+    return y[:N]
 
 
 def static_deveining_matrix(

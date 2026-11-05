@@ -25,6 +25,7 @@ from fastfuncstuff.laminar.pipeline import RoiFit, curve_pair, depth_names, prof
 BEST = "#c44e52"
 OTHER = "#4c72b0"
 GOOD = "#55a868"
+MODEL_LOCAL = "#8172b3"
 
 
 def _req(a, what: str):
@@ -158,10 +159,11 @@ def _pial_deep(profile: np.ndarray) -> float:
 def panel_profiles(ax, fit: RoiFit, conditions: tuple[str, str] = ("cond 1", "cond 2")) -> None:
     """Peak response by depth, measured and deveined, BOTH in percent on one axis.
 
-    The measured profile ramps toward the pial surface; the deveined one is what each
-    depth's own neurons made, so the gap between them at the pial end IS the draining.
-    The deepest depth draws almost nothing from below, so its two values should nearly
-    coincide -- a deep end that moves a lot is a fit problem, not a result.
+    The measured profile ramps toward the pial surface. Two estimates of what each depth's
+    own neurons made sit beside it. "static" is the operator applied to this profile, and
+    on a nearly straight profile it starves the middle depth, an artifact of the
+    least-squares inverse. "model" is the fitted model with the other depths' input zeroed,
+    which also uses the time courses; it can sit below measured because the fit misses peaks.
     """
     for which, (label, style) in enumerate(zip(conditions, ("--", "-"), strict=True)):
         meas, dev = profile_pair(fit, which)
@@ -169,11 +171,15 @@ def panel_profiles(ax, fit: RoiFit, conditions: tuple[str, str] = ("cond 1", "co
         ax.plot(x, meas, style, color=BEST, lw=2.2, marker="o", ms=4,
                 label=f"{label}: measured  ({_pial_deep(meas):.2f})")  # fmt: skip
         ax.plot(x, dev, style, color=GOOD, lw=2.2, marker="s", ms=5,
-                label=f"{label}: deveined  ({_pial_deep(dev):.2f})")  # fmt: skip
+                label=f"{label}: static deveined  ({_pial_deep(dev):.2f})")  # fmt: skip
+        if fit.model_local is not None:
+            local = fit.model_local[which]
+            ax.plot(x, local, style, color=MODEL_LOCAL, lw=2.2, marker="^", ms=5,
+                    label=f"{label}: model own-depth  ({_pial_deep(local):.2f})")  # fmt: skip
     ax.axhline(0, color="0.75", lw=0.8)
     ax.set_xticks([0, 0.5, 1], ["WM", "mid", "pial"])
     ax.set(xlabel="cortical depth", ylabel="peak signal change (%)",
-           title="Depth profile: measured vs deveined (pial/deep)")  # fmt: skip
+           title="Depth profile: measured vs own-depth (pial/deep)")  # fmt: skip
     ax.legend(fontsize=6.5, loc="best")
 
 
@@ -385,7 +391,7 @@ def plot_curves(
     first.legend(fontsize=8, loc="upper right")
     panel_profiles(
         fig.add_subplot(grid[:, 2]),
-        dataclasses.replace(fit, y_obs=d.y_obs, W=d.W, W_inv=d.W_inv),
+        dataclasses.replace(fit, y_obs=d.y_obs, W=d.W, W_inv=d.W_inv, model_local=d.model_local),
         conditions,
     )
     fig.suptitle(

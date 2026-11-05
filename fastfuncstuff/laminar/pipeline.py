@@ -72,6 +72,7 @@ class CurveDetail:
     y_fine: np.ndarray  # (n_scans * steps_per_scan, K) the fit between the knots
     steps_per_scan: int
     stalled: bool
+    model_local: np.ndarray | None = None  # (2, K) see RoiFit.model_local
 
 
 @dataclass
@@ -108,6 +109,37 @@ class RoiFit:
     stalled: np.ndarray | None = None  # (n_models, n_K) "converged" on rejected steps
     warnings: list = field(default_factory=list)
     detail: CurveDetail | None = None
+    # (2, K0) percent per condition: BOLD at each depth from that depth's own neurons,
+    # read from the fitted model rather than through the static operator.
+    model_local: np.ndarray | None = None
+
+
+def _condition_slices(meta: dict) -> list[slice]:
+    block, gap = int(meta["block"]), int(meta["gap"])
+    return [slice(1, block), slice(block + gap + 1, block + gap + block)]
+
+
+def _model_local(data: LaminarData, res, kernel, ikw: dict) -> np.ndarray:
+    """Each depth's BOLD from its OWN neurons, per condition, at that depth's fitted peak.
+
+    "Own" follows the model's depth map: each neuronal depth's part counts by its share of
+    the vascular depth. Assigning a depth wholly to one neuronal bin puts a false kink in
+    the profile at every bin edge, up to a third of the signal at K=11.
+    """
+    from fastfuncstuff.laminar.devein import own_depth_responses
+    from fastfuncstuff.laminar.forward import neuronal_to_vascular
+
+    parts = own_depth_responses(
+        data.spec, res.Ep, data.u, int(data.y.shape[0]), kernel=kernel, **ikw
+    ).numpy()
+    share = neuronal_to_vascular(data.spec, res.Ep).numpy()
+    share = share / share.sum(axis=-1, keepdims=True)  # (K, N)
+    own = np.einsum("kn,ntk->tk", share, parts)
+    fit = res.y_pred.numpy()
+    k = np.arange(fit.shape[1])
+    return np.stack(
+        [own[sl.start + np.abs(fit[sl]).argmax(axis=0), k] for sl in _condition_slices(data.meta)]
+    )
 
 
 def _curve_detail(data: LaminarData, res, kernel, ikw: dict, stalled: bool = False) -> CurveDetail:
@@ -122,6 +154,7 @@ def _curve_detail(data: LaminarData, res, kernel, ikw: dict, stalled: bool = Fal
     W, W_inv = static_deveining_matrix(ir, mode="auc")
     return CurveDetail(
         k=spec.K, y_obs=data.y.numpy().copy(), W=W.numpy(), W_inv=W_inv.numpy(),
+        model_local=_model_local(data, res, kernel, ikw),
         y_fine=fine.numpy().copy(), steps_per_scan=steps, stalled=bool(stalled),
     )  # fmt: skip
 
@@ -254,6 +287,7 @@ def summarise_roi(
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
         kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
         stalled=stalled, warnings=warnings, detail=curves,
+        model_local=_model_local(first, res0, k0, ikw),
     )  # fmt: skip
 
 
@@ -388,8 +422,7 @@ def profile_pair(fit: RoiFit, which: int) -> tuple[np.ndarray, np.ndarray]:
     """
     from fastfuncstuff.laminar.devein import local_contribution
 
-    block, gap = int(fit.meta["block"]), int(fit.meta["gap"])
-    sl = [slice(1, block), slice(block + gap + 1, block + gap + block)][which]
+    sl = _condition_slices(fit.meta)[which]
     if fit.y_obs is None:
         raise ValueError("this fit kept no data; profiles need y_obs")
     measured = _peak(fit.y_obs[sl])
@@ -445,8 +478,11 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
       measured amplitudes (betas, FIR peaks, areas) of matching units;
     * ``{prefix}_laminar_neuronal.tsv`` -- the deveined neuronal time course per
       condition and neuronal depth, from event onset;
-    * ``{prefix}_laminar_profiles.tsv`` -- the peak depth profile per condition, measured
-      and deveined, BOTH in percent signal change: what the figure's profile panel draws;
+    * ``{prefix}_laminar_profiles.tsv`` -- the peak depth profile per condition, in percent
+      signal change, what the figure's profile panel draws: measured, the static operator's
+      deveined and drained parts, the fit's own peak, and ``model_local_pct``, the fit's BOLD
+      at that depth from its own neurons. The last two come from the posterior; the fit
+      can miss the measured peak, so ``model_local_pct`` need not sum to ``measured_pct``;
     * ``{prefix}_laminar_curves.tsv`` -- with ``-plots``, the fit and its deveined version
       between the knots, per condition and depth, at the finest K;
     * ``{prefix}_laminar.json`` -- how it was run.
@@ -506,18 +542,20 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
     # one should not, while their deepest values nearly coincide.
     with open(paths[4], "w") as fh:
         fh.write("roi\tname\themi\tcondition\tdepth\tdepth_frac\tmeasured_pct\t"
-                 "deveined_pct\tdrained_pct\n")  # fmt: skip
+                 "deveined_pct\tdrained_pct\tfit_pct\tmodel_local_pct\n")  # fmt: skip
         for f in fits:
             if f.y_obs is None:
                 continue
             for which in (0, 1):
                 meas, dev = profile_pair(f, which)
                 k = len(meas)
+                fitted = _peak(f.y_hat[_condition_slices(f.meta)[which]])
                 for i in range(k):  # array index 0 is superficial; depth K is pial
                     frac = 1.0 - i / max(k - 1, 1)  # 0 at white matter, 1 at pial
                     fh.write(
                         f"{f.roi}\t{f.name}\t{f.hemi}\t{which + 1}\t{k - i}\t{frac:.6g}\t"
-                        f"{meas[i]:.6g}\t{dev[i]:.6g}\t{meas[i] - dev[i]:.6g}\n"
+                        f"{meas[i]:.6g}\t{dev[i]:.6g}\t{meas[i] - dev[i]:.6g}\t"
+                        f"{fitted[i]:.6g}\t{f.model_local[which, i]:.6g}\n"
                     )
 
     if any(f.detail is not None for f in fits):

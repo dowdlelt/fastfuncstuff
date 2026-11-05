@@ -67,7 +67,7 @@ def test_the_cli_writes_the_five_tables(reference, tmp_path):
     # in percent, which is what the profile panel draws.
     h, rows = _table(f"{prefix}_laminar_profiles.tsv")
     assert h == ["roi", "name", "hemi", "condition", "depth", "depth_frac",
-                 "measured_pct", "deveined_pct", "drained_pct"]  # fmt: skip
+                 "measured_pct", "deveined_pct", "drained_pct", "fit_pct", "model_local_pct"]  # fmt: skip
     assert len(rows) == 2 * 9 and {r[3] for r in rows} == {"1", "2"}
     assert {r[4] for r in rows} == {str(d) for d in range(1, 10)}
     # depth_frac is 1 at the pial end and 0 at white matter, one row per condition.
