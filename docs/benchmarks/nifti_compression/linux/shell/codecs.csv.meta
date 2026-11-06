@@ -1,0 +1,7 @@
+# Intel(R) Xeon(R) W-2133 CPU @ 3.60GHz, Linux, 12 logical CPUs, threads=4, reps=3, 2026-11-06T12:55:20Z
+# igzip binary: igzip-mt (ISA-L 2.31 built with -DHAVE_THREADS)
+# igzip-mt (ISA-L 2.31 built with -DHAVE_THREADS): igzip command line interface 2.31.0
+# pigz: pigz 2.8
+# zstd: *** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***
+# pzstd: PZSTD version: 1.5.5.
+# rapidgzip: rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0

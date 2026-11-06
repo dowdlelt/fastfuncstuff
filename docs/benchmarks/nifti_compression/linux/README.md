@@ -62,6 +62,7 @@ tmpfs; fig4), against nibabel with single-thread ISA-L:
 | `fig5_crossover.png` | File size where parallel zstd starts paying |
 | `fig6_nvme.png` | On-disk (fsync writes, cold reads) |
 | `results.csv`, `results_disk.csv`, `crossover.csv`, `*meta.json` | Raw data for the figures |
+| `shell/` | The same files timed through each tool's CLI from bash, no Python in the loop |
 | `write_path.csv` | `bench_nifti_write_path.py` A/B of each fix (`summary` subcommand reads it) |
 
 ## Read before quoting
