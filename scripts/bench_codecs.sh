@@ -20,6 +20,8 @@
 # Without it the script times "$PYTHON -m isal.igzip", which cannot use
 # threads, and labels those rows igzip-py so they are never mistaken for the real one.
 #
+# Plot the CSV with scripts/plot_codecs.py (tall, one row per file).
+#
 # Needs bash 5 for $EPOCHREALTIME (macOS ships 3.2: use Homebrew's bash).
 set -euo pipefail
 
@@ -99,8 +101,10 @@ timed() {  # timed <stdout file> <command...>: prints wall seconds
 }
 shuffled() { printf '%s\n' "$@" | awk 'BEGIN { srand() } { print rand() "\t" $0 }' | sort -n | cut -f2-; }
 
+cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1)
+[[ -n $cpu ]] || cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
 {
-    echo "# $(uname -sm), $(getconf _NPROCESSORS_ONLN) logical CPUs, threads=$threads, reps=$reps, $(date -u +%FT%TZ)"
+    echo "# $cpu, $(uname -s), $(getconf _NPROCESSORS_ONLN) logical CPUs, threads=$threads, reps=$reps, $(date -u +%FT%TZ)"
     echo "# igzip binary: $(command -v "$igzip" || echo none)"
     for t in "$igzip" pigz zstd pzstd rapidgzip; do
         have $t && echo "# $t: $($t --version 2>&1 | head -1)"
