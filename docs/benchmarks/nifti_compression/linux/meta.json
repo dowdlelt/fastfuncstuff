@@ -7,9 +7,10 @@
   "isal": "1.9.1",
   "nibabel": "5.4.2",
   "cpu": "Intel(R) Xeon(R) W-2133 CPU @ 3.60GHz",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
   "logical_cpus": 12,
   "threads": 6,
   "reps": 5,
-  "reps_large": 2,
+  "reps_large": 3,
   "seed": 0
 }
