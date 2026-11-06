@@ -1051,7 +1051,7 @@ ROUTE_NAME = {
     "nibabel-isal2": "nibabel through ISA-L 2 (the tedana PR)",
     "nibabel-isal": "nibabel through ISA-L",
     "nibabel-rapidgzip": "nibabel through rapidgzip",
-    "ffs-gz": "fastfuncstuff .nii.gz (pigz / rapidgzip)",
+    "ffs-gz": "fastfuncstuff .nii.gz (threaded ISA-L / rapidgzip)",
     "ffs-zst": "fastfuncstuff .nii.zst (pzstd)",
 }
 ROUTE_COLOR = {
@@ -1642,7 +1642,7 @@ def make_all(results: Path) -> None:
                     color=INK,
                 )
         fig.subplots_adjust(
-            top=1 - 0.9 / h, bottom=0.5 / h, left=0.215, right=0.985, wspace=0.95, hspace=0.45
+            top=1 - 0.9 / h, bottom=0.5 / h, left=0.245, right=0.985, wspace=1.05, hspace=0.45
         )
         _title(
             fig,
