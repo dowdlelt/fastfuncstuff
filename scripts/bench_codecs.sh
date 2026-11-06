@@ -14,7 +14,10 @@
 #
 # Tools used if found: igzip (ISA-L's own CLI; -T threads), pigz, zstd, pzstd,
 # rapidgzip. ISA-L's CLI comes from the isal package (apt install isal, brew install
-# isa-l). Without it the script times "$PYTHON -m isal.igzip", which cannot use
+# isa-l). Distro builds can ignore -T: ISA-L's build never defines HAVE_THREADS, so
+# build it with  ./configure CFLAGS="-O2 -DHAVE_THREADS" LIBS=-lpthread  (needs nasm)
+# and point IGZIP= at programs/igzip. The script checks -T and refuses a build without it.
+# Without it the script times "$PYTHON -m isal.igzip", which cannot use
 # threads, and labels those rows igzip-py so they are never mistaken for the real one.
 #
 # Needs bash 5 for $EPOCHREALTIME (macOS ships 3.2: use Homebrew's bash).
@@ -57,9 +60,10 @@ have() { command -v "$1" >/dev/null; }
 
 # name|compress command (reads $src, writes stdout)|extension
 encoders=()
-if have igzip; then
-    for l in $levels_igzip; do encoders+=("igzip-$l.T$threads|igzip -c -$l -T $threads|gz"); done
-    igz_dec="igzip -d -c"
+igzip=${IGZIP:-igzip}
+if have "$igzip"; then
+    for l in $levels_igzip; do encoders+=("igzip-$l.T$threads|$igzip -c -$l -T $threads|gz"); done
+    igz_dec="$igzip -d -c"
 else
     py=${PYTHON:-$(command -v python3)}
     for l in $levels_igzip; do encoders+=("igzip-py-$l.T1|$py -m isal.igzip -c -$l|gz"); done
@@ -69,6 +73,17 @@ fi
 have pigz && for l in $levels_pigz; do encoders+=("pigz-$l.p$threads|pigz -c -$l -p $threads|gz"); done
 have pzstd && for l in $levels_zstd; do encoders+=("pzstd-$l.p$threads|pzstd -q -c -$l -p $threads|zst"); done
 have zstd && for l in $levels_zstd; do encoders+=("zstd-$l.T$threads|zstd -q -c -$l -T$threads|zst"); done
+
+if have "$igzip" && (( threads > 1 )); then
+    # A build without HAVE_THREADS accepts -T and ignores it: compare CPU time to wall.
+    probe=$work/probe.bin
+    head -c 100000000 /dev/urandom | base64 >"$probe"
+    cpu=$( { TIMEFORMAT='%R %U'; time "$igzip" -c -1 -T "$threads" "$probe" >/dev/null; } 2>&1 )
+    rm -f "$probe"
+    if awk -v r="${cpu% *}" -v u="${cpu#* }" 'BEGIN { exit !(u < 1.3 * r) }'; then
+        echo "$igzip ignores -T (built without HAVE_THREADS); see the header" >&2; exit 1
+    fi
+fi
 
 # name|decompress command (reads $src, writes stdout)|extension it reads
 decoders=("igzip.1|$igz_dec|gz")
@@ -86,7 +101,8 @@ shuffled() { printf '%s\n' "$@" | awk 'BEGIN { srand() } { print rand() "\t" $0 
 
 {
     echo "# $(uname -sm), $(getconf _NPROCESSORS_ONLN) logical CPUs, threads=$threads, reps=$reps, $(date -u +%FT%TZ)"
-    for t in igzip pigz zstd pzstd rapidgzip; do
+    echo "# igzip binary: $(command -v "$igzip" || echo none)"
+    for t in "$igzip" pigz zstd pzstd rapidgzip; do
         have $t && echo "# $t: $($t --version 2>&1 | head -1)"
     done
 } >"$out.meta"
