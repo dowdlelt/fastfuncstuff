@@ -3,6 +3,7 @@
 
     python scripts/plot_codecs.py codecs.csv            # writes codecs.png beside it
     python scripts/plot_codecs.py codecs.csv -o fig.png
+    python scripts/plot_codecs.py codecs.csv -split 4,4,3   # codecs_1.png .. codecs_3.png
 
 Bars are medians over the repetitions, fastest at the top, coloured by tool in the
 same colours as ``bench_nifti_compression.py``'s figures. A decoder that runs on one
@@ -130,6 +131,10 @@ def main() -> None:
     )
     p.add_argument("csv", type=Path)
     p.add_argument("-o", "--out", type=Path)
+    p.add_argument(
+        "-split",
+        help="files per figure, smallest first, e.g. 4,4,3; writes <out>_1.png, _2.png, ...",
+    )
     args = p.parse_args()
     out = args.out or args.csv.with_suffix(".png")
     med, extra, files = load(args.csv)
@@ -162,6 +167,18 @@ def main() -> None:
         ]
         panels.append((f, enc, dec))
 
+    groups = [int(g) for g in args.split.split(",")] if args.split else [len(panels)]
+    if sum(groups) != len(panels):
+        p.error(f"-split adds to {sum(groups)}, but the CSV has {len(panels)} files")
+    start = 0
+    for i, n in enumerate(groups):
+        part = out if len(groups) == 1 else out.with_name(f"{out.stem}_{i + 1}{out.suffix}")
+        draw(panels[start : start + n], extra, meta_line(args.csv), part)
+        start += n
+        print(part)
+
+
+def draw(panels: list, extra: dict, meta: str, out: Path) -> None:
     slots = [max(len(e), len(d)) for _, e, d in panels]
     gap = 3.4  # rows of space for the axis labels below a panel and the title above the next
     fig_h = (sum(slots) + gap * len(slots)) * ROW_IN + 1.0
@@ -196,7 +213,7 @@ def main() -> None:
     fig.text(
         0.012,
         1 - 0.5 / fig_h,
-        f"{meta_line(args.csv)}.\nRAM disk to RAM disk, median of shuffled repetitions. "
+        f"{meta}.\nRAM disk to RAM disk, median of shuffled repetitions. "
         "Blue ISA-L, green zstd/pzstd, orange pigz, yellow rapidgzip; faded = one core.",
         fontsize=9,
         color=MUTED,
@@ -205,7 +222,7 @@ def main() -> None:
     for ax in axes.flat:
         ax.spines["left"].set_color(GRID)
     fig.savefig(out, dpi=150)
-    print(out)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
