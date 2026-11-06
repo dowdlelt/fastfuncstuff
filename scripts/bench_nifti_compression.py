@@ -1215,6 +1215,11 @@ def _save_strip(results, name, title, sub, files, sizes, panels, legend_cols=4) 
     plt.close(fig)
 
 
+def _machine(results: Path) -> str:
+    meta_path = results / "meta.json"
+    return json.loads(meta_path.read_text()).get("cpu", "unknown CPU") if meta_path.exists() else "unknown CPU"
+
+
 def plot_disk(results: Path, n: int) -> None:
     rows = load_rows(results, "results_disk.csv")
     meta_path = results / "disk_meta.json"
@@ -1266,7 +1271,7 @@ def plot_disk(results: Path, n: int) -> None:
         results,
         "fig6_nvme.png",
         f"On a real disk: writes include fsync, {cold}",
-        f"Median of 3 shuffled repetitions, {evicted}. Codec panels read to /dev/null; real routes end in a float32 array.",
+        f"{_machine(results)}, {n} threads. Median of 3 shuffled repetitions, {evicted}. Codec panels read to /dev/null; real routes end in a float32 array.",
         files,
         sizes,
         [
@@ -1375,7 +1380,7 @@ def plot_crossover(results: Path, n: int) -> None:
     _title(
         fig,
         "At what file size does pzstd start to pay?",
-        "Cuts from the middle of real files. Process start is included: it is the floor of about 10 ms on the left of each wait panel.",
+        f"{_machine(results)}, {n} threads. Cuts from the middle of real files. Process start is included: it is the floor of about 10 ms on the left of each wait panel.",
         h,
     )
     fig.savefig(results / "fig5_crossover.png", dpi=170)
@@ -1394,7 +1399,10 @@ def make_all(results: Path) -> None:
     med = medians(rows)
     sizes = {r["file"]: r["bytes"] for r in rows}
     files = sorted(sizes, key=lambda f: sizes[f])
-    spread = f"Median of {meta['reps_large']}-{meta['reps']} shuffled repetitions, tmpfs to tmpfs."
+    spread = (
+        f"{meta.get('cpu', 'unknown CPU')}, {n} threads. "
+        f"Median of {meta['reps_large']}-{meta['reps']} shuffled repetitions, tmpfs to tmpfs."
+    )
 
     level_1 = "zstd -1 (pzstd at N threads)"
     level_3 = "zstd -3 (pzstd at N threads)"
