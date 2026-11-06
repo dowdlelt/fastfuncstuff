@@ -28,7 +28,8 @@ checked against the plain bytes before timing. ISA-L is its own `igzip` CLI, bui
   fastest gzip reader, reads any gzip (1.7x-5.5x). ISA-L's own decoder, on one core because
   that is all gzip allows, is 2-3x slower again.
 - **ISA-L level 1 is as good as 2.** Faster or tied on 9 of 11 files at the same size
-  (5D warp 2.76 vs 3.05 s). Level 3 is never the fastest. `save_nifti` uses level 2.
+  (5D warp 2.76 vs 3.05 s). Level 1 is the fastest ISA-L level on 7 files, 2 on 2, and 3
+  on 2 (bold, raw mag), so no level wins everywhere. `save_nifti` uses level 2.
 - **Who wrote a zst file matters.** Only `pzstd` output decodes in parallel; a `zstd -T4`
   file reads at single-thread speed even through `pzstd` (5D warp 2.41 s vs 0.75 s). The
   toolbox writes with `pzstd`. Who wrote a gzip file barely matters to rapidgzip.
