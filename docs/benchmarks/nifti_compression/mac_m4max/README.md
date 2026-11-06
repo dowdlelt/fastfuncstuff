@@ -2,7 +2,7 @@
 
 Why the toolbox writes `.nii.zst` for intermediates (and what `.nii.gz` costs).
 Produced by `scripts/bench_nifti_compression.py` and `scripts/bench_nifti_write_path.py`.
-Linux (6 threads) was measured separately; this directory is the Mac side only.
+Linux (6 threads) was measured separately, in `../linux/`.
 
 Machine: M4 Max (10 P + 4 E cores), 36 GB, macOS 15.7, RAM-disk scratch, 10 threads.
 isal 1.9.1, pigz 2.8 (zlib-ng build), zstd/pzstd 1.5.7, rapidgzip 0.16.0.

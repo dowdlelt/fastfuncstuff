@@ -1,0 +1,15 @@
+{
+  "python": "3.14.6",
+  "pigz": "pigz 2.8",
+  "zstd": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***",
+  "pzstd": "PZSTD version: 1.5.5.",
+  "rapidgzip": "rapidgzip, CLI to the parallelized, indexed, and seekable gzip decoding library rapidgzip version 0.16.0",
+  "isal": "1.9.1",
+  "nibabel": "5.4.2",
+  "cpu": "Intel(R) Xeon(R) W-2133 CPU @ 3.60GHz",
+  "logical_cpus": 12,
+  "threads": 6,
+  "reps": 5,
+  "reps_large": 2,
+  "seed": 0
+}
