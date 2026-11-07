@@ -620,6 +620,16 @@ def parse_args(
         "interpolant 3dUpsample uses.",
     )
     vaso_group.add_argument(
+        "-vaso_upsample",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Write the outputs on a grid N times denser than the pair TR (TR = "
+        "pair_tr / N), as LayNii pipelines do with 3dUpsample -n 2. The extra "
+        "points are interpolated, not measured: they add no bandwidth, and they "
+        "correlate neighbouring residuals in a GLM. Off (1) by default.",
+    )
+    vaso_group.add_argument(
         "-vaso_save_unshifted",
         action="store_true",
         help="Also write the motion-corrected BOLD at its own acquisition times "
@@ -1791,6 +1801,7 @@ _VASO_COMPATIBLE = frozenset(
         "vaso_first",
         "vaso_trim",
         "vaso_tinterp",
+        "vaso_upsample",
         "vaso_save_unshifted",
     }
 )
@@ -1844,6 +1855,8 @@ def _validate_vaso_args(args: argparse.Namespace) -> None:
         )
     if args.vaso_delay is not None and not 0 < args.vaso_delay < args.pair_tr:
         fail(f"-vaso_delay {args.vaso_delay:g} must lie between 0 and -pair_tr {args.pair_tr:g}")
+    if args.vaso_upsample < 1:
+        fail(f"-vaso_upsample must be >= 1, got {args.vaso_upsample}")
     if args.vaso_trim != "auto":
         try:
             if int(args.vaso_trim) < 0:
@@ -1921,6 +1934,7 @@ def _run_vaso(args, input_files: list[str], device: torch.device, verb: int) -> 
         tinterp=args.vaso_tinterp,
         header_info=header_info,
         device=device,
+        upsample=args.vaso_upsample,
     )
     split = res.split
     if verb >= 1:
@@ -1936,6 +1950,11 @@ def _run_vaso(args, input_files: list[str], device: torch.device, verb: int) -> 
             f"  BOLD shifted by {res.shift:.4f} pair-TR samples ({args.vaso_tinterp}) "
             "onto the nulled times"
         )
+        if res.upsample > 1:
+            print(
+                f"  Upsampled x{res.upsample}: {res.nulled.shape[0]} volumes at "
+                f"TR {args.pair_tr / res.upsample:g} s (interpolated, not measured)"
+            )
     n_mean, b_mean = res.brightness
     if n_mean >= b_mean:
         print(
@@ -1953,9 +1972,12 @@ def _run_vaso(args, input_files: list[str], device: torch.device, verb: int) -> 
         print("  " + vaso_lib.format_motion_comparison(res.comparison).replace("\n", "\n  "))
 
     paths = _vaso_paths(args.prefix)
-    hdr = _vaso_header(header_info, args.pair_tr)
+    out_tr = args.pair_tr / args.vaso_upsample
+    hdr = _vaso_header(header_info, out_tr)
     meta = {
-        "RepetitionTime": float(args.pair_tr),
+        "RepetitionTime": float(out_tr),
+        "VasoPairRepetitionTime": float(args.pair_tr),
+        "VasoUpsample": int(args.vaso_upsample),
         "NumberOfVolumesDiscardedByUser": int(split.n_discarded),
         # Seconds from the first raw volume to output volume 0: subtract from event
         # onsets timed to the first raw volume.
@@ -1974,11 +1996,16 @@ def _run_vaso(args, input_files: list[str], device: torch.device, verb: int) -> 
     if verb >= 1:
         print_cli_section("Outputs")
     for key, vol in series.items():
-        with spinner(f"Writing {paths[key]}", enabled=verb >= 1):
-            save_image(vol, paths[key], header_info=hdr)
         sidecar = dict(meta)
+        key_hdr = hdr
         if key == "bold_unshifted":
+            # BOLD's own acquisitions: never upsampled, so at the pair TR.
             sidecar["StartTimeOffset"] += float(delay)
+            sidecar["RepetitionTime"] = float(args.pair_tr)
+            sidecar["VasoUpsample"] = 1
+            key_hdr = _vaso_header(header_info, args.pair_tr)
+        with spinner(f"Writing {paths[key]}", enabled=verb >= 1):
+            save_image(vol, paths[key], header_info=key_hdr)
         _write_vaso_sidecar(paths[key], sidecar)
         if key != "bold_unshifted":
             save_image(vol.mean(dim=0), paths[f"{key}_mean"], header_info=hdr)

@@ -201,3 +201,44 @@ def test_moco_vaso_honours_skip_last(tmp_path):
     stem = _main_vaso(tmp_path, "run_cbv.nii.gz", "-pair_tr", "2.5", "-skip_last", "3")
     # 15 - 3 = 12 volumes, 4 trimmed -> 4 pairs
     assert nib.load(f"{stem}_vaso.nii.gz").shape[3] == 4
+
+
+def test_resample_stream_upsamples_onto_the_anchor_grid():
+    """x2 grid: anchor samples plus midpoints, BOLD delayed by `delay`."""
+    pair_tr, delay, n = 2.5, 0.9, 100
+    t = np.arange(n) * pair_tr
+    f = lambda x: np.sin(2 * np.pi * x / 40.0)  # noqa: E731
+    bold = torch.tensor(f(t + delay), dtype=torch.float32)[:, None, None, None]
+    out = vaso.resample_stream(bold, delay / pair_tr, factor=2, verb=0)[:, 0, 0, 0].numpy()
+    assert out.shape[0] == 2 * n - 1
+    t_out = np.arange(out.shape[0]) * pair_tr / 2
+    # the first output is the copied first volume; everything else interpolated
+    np.testing.assert_allclose(out[1:], f(t_out[1:]), atol=5e-3)
+    # factor 1 is the plain shift
+    one = vaso.resample_stream(bold, delay / pair_tr, factor=1, verb=0)
+    assert torch.equal(one, vaso.shift_series(bold, delay / pair_tr, verb=0))
+
+
+def test_moco_vaso_upsample_halves_the_tr(tmp_path):
+    import json
+
+    import nibabel as nib
+
+    stem = _main_vaso(
+        tmp_path,
+        "run_cbv.nii.gz",
+        "-pair_tr",
+        "2.5",
+        "-vaso_upsample",
+        "2",
+        "-vaso_save_unshifted",
+    )
+    img = nib.load(f"{stem}_vaso.nii.gz")
+    assert img.shape[3] == 2 * 5 - 1
+    assert img.header.get_zooms()[3] == pytest.approx(1.25)
+    np.testing.assert_allclose(np.asarray(img.dataobj)[6, 6, 4, :], 0.8, atol=1e-3)
+    meta = json.loads((tmp_path / "out_vaso.json").read_text())
+    assert meta["RepetitionTime"] == pytest.approx(1.25)
+    assert meta["VasoPairRepetitionTime"] == pytest.approx(2.5)
+    raw = nib.load(f"{stem}_bold_unshifted.nii.gz")
+    assert raw.shape[3] == 5 and raw.header.get_zooms()[3] == pytest.approx(2.5)

@@ -278,6 +278,41 @@ def extrapolated(nt: int, shift: float) -> np.ndarray:
     return (src < 0) | (src > nt - 1)
 
 
+def resample_stream(
+    data: Tensor,
+    shift: float,
+    factor: int = 1,
+    method: str = "heptic",
+    device: torch.device | None = None,
+    verb: int = 1,
+) -> Tensor:
+    """Put a stream on the anchor grid, optionally ``factor`` times denser.
+
+    ``out[k * factor + j] = data(k + j / factor - shift)`` in sample units, i.e.
+    :func:`shift_series` once per sub-grid phase, interleaved. The grid stops at
+    the last anchor sample, ``(n - 1) * factor + 1`` points, so no phase is
+    extrapolated past the end.
+
+    The extra points are interpolated, not measured: the information, and so
+    the usable bandwidth, is what the pair TR gives. ``factor`` exists to match
+    pipelines that model on the upsampled grid (LayNii's 3dUpsample -n 2). On
+    that grid neighbouring residuals are correlated by construction, which the
+    noise model has to absorb.
+    """
+    if factor < 1:
+        raise ValueError(f"factor must be >= 1, got {factor}")
+    if factor == 1:
+        return shift_series(data, shift, method=method, device=device, verb=verb)
+    n = int(data.shape[0])
+    n_out = (n - 1) * factor + 1
+    out = torch.empty((n_out, *data.shape[1:]), dtype=torch.float32)
+    for j in range(factor):
+        part = shift_series(data, shift - j / factor, method=method, device=device, verb=verb)
+        m = len(range(j, n_out, factor))
+        out[j::factor] = part[:m]
+    return out
+
+
 def bold_correct(nulled: Tensor, bold: Tensor, max_ratio: float = BOCO_MAX_RATIO) -> Tensor:
     """VASO = nulled / BOLD, as LN_BOCO computes it.
 
@@ -392,14 +427,17 @@ class VasoResult:
     """Everything ``ffs_moco -vaso`` writes, on the nulled stream's time grid."""
 
     split: VasoSplit
-    nulled: Tensor  # (n_pairs, ...) motion-corrected nulled stream (the time anchor)
-    bold: Tensor  # (n_pairs, ...) motion-corrected BOLD, shifted onto the nulled times
+    # nulled / bold / vaso are on the output grid: the nulled times, or with
+    # upsample > 1 that grid made denser, (n_pairs - 1) * upsample + 1 points.
+    nulled: Tensor  # motion-corrected nulled stream (the time anchor)
+    bold: Tensor  # motion-corrected BOLD, resampled onto the output grid
     bold_unshifted: Tensor  # (n_pairs, ...) motion-corrected BOLD at its own times
-    vaso: Tensor  # (n_pairs, ...) nulled / BOLD
+    vaso: Tensor  # nulled / BOLD
     motion_nulled: np.ndarray  # (n_pairs, 6) AFNI order
     motion_bold: np.ndarray  # (n_pairs, 6) AFNI order, BOLD's own times
     comparison: MotionComparison
     shift: float  # samples: bold_delay / pair_tr
+    upsample: int  # output TR is pair_tr / upsample
     brightness: tuple[float, float]  # brain mean (nulled, BOLD) before correction
 
 
@@ -413,6 +451,7 @@ def run_vaso(
     tinterp: str = "heptic",
     header_info: dict | None = None,
     device: torch.device | None = None,
+    upsample: int = 1,
 ) -> VasoResult:
     """Split, motion-correct each contrast, align BOLD to nulled in time, BOLD-correct.
 
@@ -421,6 +460,8 @@ def run_vaso(
     own pair index), so each contrast is aligned to a base of the same contrast.
     The temporal shift comes after the spatial correction: interpolating in time
     across volumes that are not yet in register would mix tissue between voxels.
+    ``upsample`` > 1 writes a denser grid (see :func:`resample_stream`); the motion
+    comparison stays at the pair rate, where both traces were measured.
     """
     from fastfuncstuff.processing.ffs_moco import moco, to_afni_motion
 
@@ -439,9 +480,14 @@ def run_vaso(
         results[name] = moco(stream.contiguous(), config, header_info=header_info)
 
     shift = bold_delay / pair_tr
-    nulled = results[NULLED].aligned.float().cpu()
+    nulled_native = results[NULLED].aligned.float().cpu()
     bold_unshifted = results[BOLD].aligned.float().cpu()
-    bold = shift_series(bold_unshifted, shift, method=tinterp, device=device, verb=verb)
+    nulled = (
+        nulled_native
+        if upsample == 1
+        else resample_stream(nulled_native, 0.0, upsample, tinterp, device, verb)
+    )
+    bold = resample_stream(bold_unshifted, shift, upsample, tinterp, device, verb)
     motion_nulled = to_afni_motion(results[NULLED].params)
     motion_bold = to_afni_motion(results[BOLD].params)
     return VasoResult(
@@ -454,5 +500,6 @@ def run_vaso(
         motion_bold=motion_bold,
         comparison=compare_motion(motion_nulled, motion_bold, shift, method=tinterp),
         shift=shift,
+        upsample=upsample,
         brightness=brightness,
     )
