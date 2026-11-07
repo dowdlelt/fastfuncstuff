@@ -3144,6 +3144,32 @@ def trim_spec_from_args(args, tr: float | None = None) -> TrimSpec:
         drop_first=int(getattr(args, "drop_first", 0) or 0),
         drop_last=int(getattr(args, "drop_last", 0) or 0),
         tr=tr,
+        onset_offset=tuple(float(v) for v in (getattr(args, "onset_offset", None) or ())),
+    )
+
+
+def add_onset_offset_arg(parser_or_group) -> None:
+    """Register ``-onset_offset``: seconds already cut from the start of each run.
+
+    Opt-in per tool rather than part of :func:`add_trim_args`: a tool that
+    registered it but built its design without :func:`apply_trim_to_timing`
+    would ignore it silently, which is the very misalignment it exists to fix.
+    """
+    parser_or_group.add_argument(
+        "-onset_offset",
+        "-onset-offset",
+        dest="onset_offset",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="SEC",
+        help=(
+            "Seconds removed from the start of the data BEFORE it reached this "
+            "tool, with event onsets still timed to the untrimmed start. "
+            "Positive = that much was deleted, and every onset moves back by it. "
+            "One value for every run, or one per -input run. Adds to -drop_first. "
+            "For ffs_moco -vaso outputs this is the sidecar's StartTimeOffset."
+        ),
     )
 
 
@@ -3959,11 +3985,17 @@ def apply_trim_to_timing(
     Returns the report (``None`` when the spec is inactive or TR-less), having
     already printed it when *verbose*.
     """
-    if not trim.active or trim.tr is None:
+    # An upstream -onset_offset needs no TR; dropped TRs do (N * TR seconds).
+    if not trim.shifts_timing or (trim.drop_first and trim.tr is None):
         return None
 
     n_runs = n_runs if n_runs is not None else len(spec.all_onsets[0]) if spec.all_onsets else 0
-    if run_lengths_tr is not None:
+    if len(trim.onset_offset) > 1 and len(trim.onset_offset) != n_runs:
+        raise ValueError(
+            f"-onset_offset takes one value for every run or one per run: got "
+            f"{len(trim.onset_offset)} values for {n_runs} runs"
+        )
+    if run_lengths_tr is not None and trim.tr is not None:
         run_lengths_sec = [n * trim.tr for n in run_lengths_tr]
     else:
         # Without run lengths only the start-of-run side can be checked; late

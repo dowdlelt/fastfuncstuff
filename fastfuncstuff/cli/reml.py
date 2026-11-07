@@ -46,6 +46,7 @@ try:
         add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_noise_comps_arguments,
+        add_onset_offset_arg,
         add_ortvec_arguments,
         add_round_onsets_arguments,
         add_trim_args,
@@ -990,6 +991,7 @@ Examples:
     add_microtime_offset_arg(proc_opts)
     add_device_arg(proc_opts)
     add_trim_args(proc_opts)
+    add_onset_offset_arg(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-legacy_contrasts",
@@ -2565,6 +2567,19 @@ def main():
         sys.exit(f"ERROR: {exc}")
 
     trim = trim_spec_from_args(args, tr=tr)
+    if trim.onset_offset:
+        if args.matrix:
+            # Covers -spec too (compiled to a matrix above): neither path rebuilds
+            # timing through apply_trim_to_timing, so the offset would be ignored.
+            sys.exit(
+                "ERROR: -onset_offset shifts event timing, so it needs -events or "
+                "-onsets; a -matrix/-spec design has its timing fixed already."
+            )
+        if len(trim.onset_offset) not in (1, len(input_files)):
+            sys.exit(
+                f"ERROR: -onset_offset takes one value or one per run: got "
+                f"{len(trim.onset_offset)} values for {len(input_files)} runs."
+            )
     if trim.active and args.matrix and not _matrix_from_spec:
         # A user-supplied xmat already fixes the timeline: its rows are the
         # design, and there is no timing left to shift onto a shorter one. A

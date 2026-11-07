@@ -370,3 +370,51 @@ class TestAutoprocGlmDropFlags:
             ["-bids_dir", "/tmp", "-subject", "01", "-glm_drop_first", "8", "-glm-drop-last", "2"]
         )
         assert (args.glm_drop_first, args.glm_drop_last) == (8, 2)
+
+
+class TestOnsetOffset:
+    """-onset_offset: seconds trimmed upstream (e.g. ffs_moco -vaso StartTimeOffset)."""
+
+    def test_offset_shifts_without_dropping_data(self):
+        spec = TrimSpec(onset_offset=(6.957,))
+        assert not spec.active  # the data are not touched
+        assert spec.shifts_timing
+        out, rep = shift_onsets_for_trim([[np.array([30.01, 90.15])]], [30.13], ["s"], [1e9], spec)
+        np.testing.assert_allclose(out[0][0], [23.053, 83.193])
+        assert rep.shift_sec == pytest.approx(6.957)
+
+    def test_offset_needs_no_tr(self):
+        assert TrimSpec(onset_offset=(2.0,)).run_shift(0) == pytest.approx(2.0)
+
+    def test_offset_adds_to_drop_first(self):
+        spec = TrimSpec(drop_first=2, tr=2.0, onset_offset=(1.5,))
+        assert spec.run_shift(0) == pytest.approx(5.5)
+
+    def test_per_run_offsets(self):
+        spec = TrimSpec(onset_offset=(1.0, 3.0))
+        onsets = [[np.array([10.0]), np.array([10.0])]]
+        out, rep = shift_onsets_for_trim(onsets, [1.0], ["s"], [1e9, 1e9], spec)
+        assert out[0][0][0] == pytest.approx(9.0)
+        assert out[0][1][0] == pytest.approx(7.0)
+        assert "per run" in rep.lines()[0]
+
+    def test_event_before_the_cut_straddles_or_drops(self):
+        spec = TrimSpec(onset_offset=(5.0,))
+        # [0, 10) straddles the cut at 5 s -> kept at -5; [0, 4) ended before it -> dropped
+        out, rep = shift_onsets_for_trim(
+            [[np.array([0.0])], [np.array([0.0])]], [10.0, 4.0], ["long", "short"], [1e9], spec
+        )
+        assert out[0][0][0] == pytest.approx(-5.0)
+        assert out[1][0].size == 0 and rep.n_before == 1
+
+    def test_apply_trim_to_timing_rejects_wrong_count(self):
+        from fastfuncstuff.cli_utils import TimingSpec, apply_trim_to_timing
+
+        timing = TimingSpec(
+            all_onsets=[[np.array([1.0])] * 3],
+            durations=[1.0],
+            condition_labels=["s"],
+            from_events=True,
+        )
+        with pytest.raises(ValueError, match="one per run"):
+            apply_trim_to_timing(timing, TrimSpec(onset_offset=(1.0, 2.0)), n_runs=3, verbose=False)
