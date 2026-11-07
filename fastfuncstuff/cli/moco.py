@@ -557,6 +557,75 @@ def parse_args(
         "_shifts_applied.1D, _corr.1D and (with -echo_times) _te_fit.1D.",
     )
 
+    # --- SS-SI VASO ---
+    vaso_group = parser.add_argument_group(
+        "SS-SI VASO (interleaved nulled / BOLD)",
+        "With -vaso the input is one interleaved VASO run. It is trimmed, split into "
+        "its nulled and BOLD streams, each stream is motion-corrected against its own "
+        "contrast, BOLD is shifted in time onto the nulled acquisition times, and "
+        "VASO = nulled / BOLD (LN_BOCO's rule). -prefix is required; from it come "
+        "{stem}_null / _bold / _vaso (+ mean_ of each), {stem}_null_motion.1D, "
+        "{stem}_bold_motion.1D (BOLD's own times), {stem}_bold_motion_aligned.1D, "
+        "{stem}_motion_compare.tsv, and a .json sidecar per series carrying the pair "
+        "TR and the discarded-volume count. Trailing noise-map volumes (signal below half "
+        "the image level) are detected and dropped. An input named *_cbv.* turns -vaso on "
+        "unless -no_vaso is given.",
+    )
+    vaso_group.add_argument("-vaso", action="store_true", help="Process an SS-SI VASO run.")
+    vaso_group.add_argument(
+        "-no_vaso",
+        action="store_true",
+        help="Treat a *_cbv input as an ordinary series (no VASO split).",
+    )
+    vaso_group.add_argument(
+        "-pair_tr",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Time from one nulled volume to the next, in seconds (required). Not "
+        "taken from the header: 3-D VASO headers hold a shot or volume TR. This "
+        "becomes the TR of every output series.",
+    )
+    vaso_group.add_argument(
+        "-vaso_delay",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Time from a nulled readout to its BOLD readout, in seconds. For "
+        "back-to-back 3-D readouts this is the volume TR. Default: pair_tr / 2, "
+        "the assumption the LayNii pipeline (3dUpsample -n 2 and a one-sample "
+        "shift) makes; set it whenever the protocol says otherwise.",
+    )
+    vaso_group.add_argument(
+        "-vaso_first",
+        choices=("nulled", "bold"),
+        default="nulled",
+        help="Contrast of raw volume 0. A check warns when the stream called nulled "
+        "is brighter than the BOLD one, the signature of the wrong parity.",
+    )
+    vaso_group.add_argument(
+        "-vaso_trim",
+        default="4",
+        metavar="N|auto",
+        help="Raw volumes dropped from the start (non-steady state). 'auto' drops "
+        "until both streams' brain means stay within 1%% of their level. If the "
+        "trim leaves a BOLD volume first, one more is dropped so pairs start on "
+        "a nulled volume. Inputs are never modified.",
+    )
+    vaso_group.add_argument(
+        "-vaso_tinterp",
+        default="heptic",
+        choices=("linear", "cubic", "quintic", "heptic", "wsinc5", "wsinc9", "fourier"),
+        help="Temporal kernel for the BOLD shift. heptic is the 7th-order Lagrange "
+        "interpolant 3dUpsample uses.",
+    )
+    vaso_group.add_argument(
+        "-vaso_save_unshifted",
+        action="store_true",
+        help="Also write the motion-corrected BOLD at its own acquisition times "
+        "({stem}_bold_unshifted).",
+    )
+
     # --- Output files ---
     out_group = parser.add_argument_group("Output files")
     out_group.add_argument("-1Dfile", default=None, help="Save 6-column motion parameters (.1D)")
@@ -1653,6 +1722,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> 
     loop go through it, so a manifest line reproduces a solo run bit-for-bit.
     """
     input_files = args.input_file
+    if _vaso_requested(args, verb):
+        t0 = time.time()
+        _run_vaso(args, input_files, device, verb)
+        if verb >= 1:
+            print_cli_footer("ffs_moco", elapsed_seconds=time.time() - t0)
+        return
     n_echoes = len(input_files)
     if n_echoes > 1 and args.reg_echo is None:
         print(
@@ -1675,6 +1750,247 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> 
         print_cli_footer("ffs_moco", elapsed_seconds=time.time() - t0)
 
 
+# Options -vaso honours: everything that shapes the per-stream registration, plus
+# I/O and run control. Any other option set away from its default is refused rather
+# than silently ignored -- each would need its own two-stream meaning first.
+_VASO_COMPATIBLE = frozenset(
+    {
+        "input_file",
+        "prefix",
+        "base",
+        # An explicit tail drop (e.g. known noise maps); the noise check still runs after it.
+        "skip_last",
+        "cost",
+        "maxiter",
+        "dxy_thresh",
+        "dph_thresh",
+        "twopass",
+        "chain_init",
+        "no_chain",
+        "automask",
+        "weight_automask",
+        "blur",
+        "fast",
+        "workhard",
+        "no_compile",
+        "reweight",
+        "reweight_tolerance",
+        "interp",
+        "final_interp",
+        "no_shear",
+        "device",
+        "verb",
+        "debug_memory",
+        "batch",
+        "batch_run",
+        "batch_skip",
+        "vaso",
+        "no_vaso",
+        "pair_tr",
+        "vaso_delay",
+        "vaso_first",
+        "vaso_trim",
+        "vaso_tinterp",
+        "vaso_save_unshifted",
+    }
+)
+
+
+def _vaso_requested(args: argparse.Namespace, verb: int) -> bool:
+    """-vaso, or a single *_cbv input (BIDS' suffix for VASO) without -no_vaso."""
+    if args.vaso:
+        return True
+    files = args.input_file or []
+    if args.no_vaso or len(files) != 1:
+        return False
+    if Path(files[0]).name.split(".")[0].endswith("_cbv"):
+        if verb >= 1:
+            print(f"  {Path(files[0]).name}: *_cbv input, running as VASO (-no_vaso to skip)")
+        return True
+    return False
+
+
+def _vaso_paths(prefix: str) -> dict[str, str]:
+    p = parse_prefix(prefix)
+    paths = {k: f"{p.stem}_{k}{p.nifti_ext}" for k in ("null", "bold", "vaso", "bold_unshifted")}
+    for k in ("null", "bold", "vaso"):
+        paths[f"{k}_mean"] = derive_prefixed_output_path(paths[k], "mean")
+    for k in ("null_motion", "bold_motion", "bold_motion_aligned"):
+        paths[k] = f"{p.stem}_{k}.1D"
+    paths["compare"] = f"{p.stem}_motion_compare.tsv"
+    return paths
+
+
+def _vaso_expected_outputs(args: argparse.Namespace) -> list[str]:
+    paths = _vaso_paths(args.prefix)
+    if not args.vaso_save_unshifted:
+        del paths["bold_unshifted"]
+    return list(paths.values())
+
+
+def _validate_vaso_args(args: argparse.Namespace) -> None:
+    def fail(msg: str) -> None:
+        print(f"Error: -vaso: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    if len(args.input_file or []) != 1:
+        fail("takes exactly one interleaved -input series")
+    if args.prefix is None:
+        fail("-prefix is required (it names the _null / _bold / _vaso outputs)")
+    if args.pair_tr is None or args.pair_tr <= 0:
+        fail(
+            "-pair_tr SEC is required: the nulled-to-nulled time. A 3-D VASO header "
+            "holds a shot or volume TR, so it is never read from there."
+        )
+    if args.vaso_delay is not None and not 0 < args.vaso_delay < args.pair_tr:
+        fail(f"-vaso_delay {args.vaso_delay:g} must lie between 0 and -pair_tr {args.pair_tr:g}")
+    if args.vaso_trim != "auto":
+        try:
+            if int(args.vaso_trim) < 0:
+                raise ValueError
+        except ValueError:
+            fail(f"-vaso_trim takes a non-negative integer or 'auto', got {args.vaso_trim!r}")
+    try:
+        int(args.base)
+    except ValueError:
+        fail("-base must be an index into each stream; an external base has one contrast")
+    defaults = vars(parse_args([]))
+    clash = sorted(
+        k for k, v in vars(args).items() if k not in _VASO_COMPATIBLE and v != defaults.get(k, v)
+    )
+    if clash:
+        fail("not supported yet with -vaso: " + ", ".join(f"-{k}" for k in clash))
+
+
+def _vaso_header(header_info: dict, pair_tr: float) -> dict:
+    """header_info with the pair TR, in seconds, as the time step."""
+    hdr = header_info["header"].copy()
+    zooms = tuple(hdr.get_zooms())
+    hdr.set_zooms(zooms[:3] + (float(pair_tr),) + zooms[4:])
+    hdr.set_xyzt_units(xyz=hdr.get_xyzt_units()[0], t="sec")
+    return {**header_info, "header": hdr}
+
+
+def _write_vaso_sidecar(path: str, meta: dict) -> None:
+    import json
+
+    p = parse_prefix(path)
+    Path(p.stem + ".json").write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def _run_vaso(args, input_files: list[str], device: torch.device, verb: int) -> None:
+    """ffs_moco -vaso: one interleaved SS-SI VASO run -> aligned BOLD + VASO."""
+    from fastfuncstuff.processing import vaso as vaso_lib
+
+    _validate_vaso_args(args)
+    input_file = input_files[0]
+    data, header_info = _load_trimmed(input_file, 0, args.skip_last, verb)
+    if verb >= 1:
+        print_cli_section("Input (VASO)")
+        print(f"  File: {input_file}")
+        print(f"  Data: {tuple(data.shape)} ({data.shape[0]} interleaved volumes)")
+
+    means = vaso_lib.volume_means(data)
+    n_noise = vaso_lib.trailing_noise_volumes(means)
+    if n_noise:
+        data, means = data[: data.shape[0] - n_noise], means[: means.size - n_noise]
+        if verb >= 1:
+            print(f"  Dropped {n_noise} trailing noise-map volume(s)")
+    if args.vaso_trim == "auto":
+        trim = vaso_lib.detect_steady_state(means)
+        how = "auto"
+    else:
+        trim = int(args.vaso_trim)
+        how = "fixed"
+    delay = args.vaso_delay if args.vaso_delay is not None else args.pair_tr / 2
+    if verb >= 1:
+        print(f"  Trim: {trim} raw volumes ({how})")
+        print(f"  Pair TR: {args.pair_tr:g} s;  BOLD delay after nulled: {delay:g} s", end="")
+        print("  (default pair_tr/2)" if args.vaso_delay is None else "")
+
+    config = _build_config(args, device, verb, skip_resample=False, base_index=int(args.base))
+    if verb >= 1:
+        print_cli_section("Estimating motion (per stream)")
+    res = vaso_lib.run_vaso(
+        data,
+        config,
+        pair_tr=args.pair_tr,
+        bold_delay=delay,
+        first=args.vaso_first,
+        trim=trim,
+        tinterp=args.vaso_tinterp,
+        header_info=header_info,
+        device=device,
+    )
+    split = res.split
+    if verb >= 1:
+        print_cli_section("VASO")
+        print(
+            f"  Discarded {split.n_discarded} leading volume(s)"
+            + (f" and {split.n_tail} trailing" if split.n_tail else "")
+            + f"; {split.n_pairs} nulled/BOLD pairs"
+        )
+        if split.n_discarded != trim:
+            print("    (+1 beyond -vaso_trim so the first pair starts on a nulled volume)")
+        print(
+            f"  BOLD shifted by {res.shift:.4f} pair-TR samples ({args.vaso_tinterp}) "
+            "onto the nulled times"
+        )
+    n_mean, b_mean = res.brightness
+    if n_mean >= b_mean:
+        print(
+            f"  WARNING: the 'nulled' stream is brighter than the BOLD one in brain "
+            f"({n_mean:.1f} vs {b_mean:.1f}). Nulled is darker in tissue, so the parity "
+            f"is probably wrong and the VASO here is inverted: check -vaso_first "
+            f"(now {args.vaso_first!r}) and -vaso_trim.",
+            file=sys.stderr,
+        )
+    elif verb >= 1:
+        print(f"  Brain mean: nulled {n_mean:.1f} < BOLD {b_mean:.1f} (parity looks right)")
+
+    if verb >= 1:
+        print_cli_section("Motion agreement (nulled vs BOLD on nulled times)")
+        print("  " + vaso_lib.format_motion_comparison(res.comparison).replace("\n", "\n  "))
+
+    paths = _vaso_paths(args.prefix)
+    hdr = _vaso_header(header_info, args.pair_tr)
+    meta = {
+        "RepetitionTime": float(args.pair_tr),
+        "NumberOfVolumesDiscardedByUser": int(split.n_discarded),
+        # Seconds from the first raw volume to output volume 0: subtract from event
+        # onsets timed to the first raw volume.
+        "StartTimeOffset": vaso_lib.anchor_time(
+            split.n_discarded, args.vaso_first, args.pair_tr, delay
+        ),
+        "VasoNoiseVolumesDropped": int(n_noise),
+        "VasoFirstContrast": args.vaso_first,
+        "VasoBoldDelay": float(delay),
+        "VasoTemporalInterpolation": args.vaso_tinterp,
+        "Sources": [str(input_file)],
+    }
+    series = {"null": res.nulled, "bold": res.bold, "vaso": res.vaso}
+    if args.vaso_save_unshifted:
+        series["bold_unshifted"] = res.bold_unshifted
+    if verb >= 1:
+        print_cli_section("Outputs")
+    for key, vol in series.items():
+        with spinner(f"Writing {paths[key]}", enabled=verb >= 1):
+            save_image(vol, paths[key], header_info=hdr)
+        sidecar = dict(meta)
+        if key == "bold_unshifted":
+            sidecar["StartTimeOffset"] += float(delay)
+        _write_vaso_sidecar(paths[key], sidecar)
+        if key != "bold_unshifted":
+            save_image(vol.mean(dim=0), paths[f"{key}_mean"], header_info=hdr)
+    np.savetxt(paths["null_motion"], res.motion_nulled, fmt="%9.4f")
+    np.savetxt(paths["bold_motion"], res.motion_bold, fmt="%9.4f")
+    np.savetxt(paths["bold_motion_aligned"], res.comparison.bold_aligned, fmt="%9.4f")
+    Path(paths["compare"]).write_text(vaso_lib.format_motion_comparison(res.comparison) + "\n")
+    if verb >= 1:
+        for key in ("null_motion", "bold_motion", "bold_motion_aligned", "compare"):
+            print(f"  {paths[key]}")
+
+
 def _expected_outputs(args: argparse.Namespace) -> list[str]:
     """Concrete output file paths a solo run of ``args`` would write.
 
@@ -1685,6 +2001,8 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     needs >=2 volumes; reweight maps need a live reweight), the run simply isn't
     skipped next time — safe, since re-running is cheaper than a wrong skip.
     """
+    if _vaso_requested(args, verb=0):
+        return _vaso_expected_outputs(args)
     outs: list[str] = []
     n_echoes = len(args.input_file or [])
     echoes: list[int | None] = list(range(1, n_echoes + 1)) if n_echoes > 1 else [None]
