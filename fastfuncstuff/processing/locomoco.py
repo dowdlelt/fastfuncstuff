@@ -51,6 +51,7 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
 from tqdm import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.utils import replicate_pad_3d
 
 from ..utils import get_device, linalg_device, to_linalg_f64
 
@@ -185,7 +186,7 @@ def _gaussian_blur3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
     k = _gaussian_kernel1d(sigma, vol.device, vol.dtype)
     r = (k.numel() - 1) // 2
     x = vol[None, None]
-    x = F.conv3d(F.pad(x, (0, 0, 0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1, 1))
+    x = F.conv3d(replicate_pad_3d(x, (0, 0, 0, 0, r, r)), k.view(1, 1, -1, 1, 1))
     x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1, 1))
     x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), k.view(1, 1, 1, 1, -1))
     return x[0, 0]
@@ -3109,7 +3110,7 @@ def _blur3d_b(vol: torch.Tensor, sigma: float, skip_axis: int | None = None) -> 
     for ax in range(3):
         if ax == skip_axis:
             continue
-        x = F.conv3d(F.pad(x, pads[ax], mode="replicate"), k.view(*views[ax]))
+        x = F.conv3d(replicate_pad_3d(x, pads[ax]), k.view(*views[ax]))
     return x.squeeze(1)
 
 
@@ -3716,7 +3717,7 @@ def _fourier_shifter(moving: torch.Tensor, axis: int, pad: int):
         spec = [0, 0, 0, 0, 0, 0]  # F.pad order (Zl,Zr, Yl,Yr, Xl,Xr) for 4-D (B,X,Y,Z)
         spec[2 * (2 - axis)] = pad
         spec[2 * (2 - axis) + 1] = pad
-        moving = F.pad(moving.unsqueeze(1), spec, mode="replicate").squeeze(1)
+        moving = replicate_pad_3d(moving.unsqueeze(1), tuple(spec)).squeeze(1)
     npad = moving.shape[dim]
     k = torch.fft.fftfreq(npad, device=moving.device) * (2.0 * math.pi)
     shape = [1, 1, 1, 1]

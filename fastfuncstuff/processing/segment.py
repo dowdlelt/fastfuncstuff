@@ -30,6 +30,7 @@ import torch
 from torch import Tensor
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.utils import replicate_pad_3d
 
 try:
     from tqdm import tqdm as _tqdm
@@ -87,7 +88,7 @@ def blur_log_prior(log_prior: Tensor, sigma: float) -> Tensor:
         pad = [0, 0, 0, 0, 0, 0]
         pad[2 * (2 - axis)] = r
         pad[2 * (2 - axis) + 1] = r
-        x = F.conv3d(F.pad(x, pad, mode="replicate"), w)
+        x = F.conv3d(replicate_pad_3d(x, tuple(pad)), w)
     return torch.log(x[:, 0].clamp_min(0.0) + tiny).to(log_prior.dtype)
 
 
@@ -121,7 +122,7 @@ def _smooth_field(field: Tensor, sigma: float, keep_weight: Tensor | None = None
         pad = [0, 0, 0, 0, 0, 0]
         pad[2 * (2 - axis)] = r
         pad[2 * (2 - axis) + 1] = r
-        x = F.conv3d(F.pad(x, pad, mode="replicate"), w, groups=3)
+        x = F.conv3d(replicate_pad_3d(x, tuple(pad)), w, groups=3)
     smoothed = x[0].permute(1, 2, 3, 0).contiguous()
     if keep_weight is None:
         return smoothed
@@ -2788,7 +2789,7 @@ def _smooth3(vol: Tensor, kernel: Tensor) -> Tensor:
         pad = [0, 0, 0, 0, 0, 0]
         pad[2 * (2 - axis)] = 1
         pad[2 * (2 - axis) + 1] = 1
-        x = F.conv3d(F.pad(x, pad, mode="replicate"), k)
+        x = F.conv3d(replicate_pad_3d(x, tuple(pad)), k)
     return x[0, 0]
 
 

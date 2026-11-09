@@ -34,3 +34,28 @@ def test_replicate_pad_3d_matches_cpu(shape):
     pad = (2, 1, 0, 3, 4, 2)
     ref = F.pad(x, pad, mode="replicate")
     torch.testing.assert_close(replicate_pad_3d(x.to("mps"), pad).cpu(), ref, rtol=0, atol=0)
+
+
+def _large_plane_cases():
+    from fastfuncstuff.processing import locomoco, segment
+
+    kern = lambda v: torch.tensor([0.25, 0.5, 0.25], device=v.device)  # noqa: E731
+    return {
+        "locomoco._gaussian_blur3d": lambda v: locomoco._gaussian_blur3d(v, 1.5),
+        "locomoco._blur3d_b": lambda v: locomoco._blur3d_b(v[None], 1.5),
+        "segment.blur_log_prior": lambda v: segment.blur_log_prior(
+            torch.log(v[None].repeat(2, 1, 1, 1) + 0.1), 1.5
+        ),
+        "segment._smooth_field": lambda v: segment._smooth_field(
+            v[..., None].repeat(1, 1, 1, 3), 1.5
+        ),
+        "segment._smooth3": lambda v: segment._smooth3(v, kern(v)),
+    }
+
+
+@pytest.mark.parametrize("name", list(_large_plane_cases()))
+def test_depth_only_blurs_match_cpu_on_large_planes(name):
+    # Every one pads depth alone on a 5-D volume: the pattern the Metal bug needs.
+    fn = _large_plane_cases()[name]
+    x = torch.rand(24, 300, 300, generator=torch.Generator().manual_seed(0))
+    torch.testing.assert_close(fn(x.to("mps")).cpu(), fn(x), rtol=1e-4, atol=1e-4)
