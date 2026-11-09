@@ -14,6 +14,7 @@ Practical rules:
 - Honour the user's `-device` flag end-to-end. Never silently force CPU mid-pipeline.
 - Write the CPU path even when slower, so users without a GPU aren't blocked.
 - Long-running loops (voxel chunks, CV folds, per-trial saves) should show a `tqdm` bar with `leave=True` and `disable=` for trivial cases — silence on tiny workloads, visible progress on real ones, and a persistent final line that doubles as timing info.
+- **Check MPS ops at real sizes.** Silent Metal failures sit at power-of-two thresholds that unit-test volumes never reach: a replicate/reflect/constant pad of a 5-D volume along depth alone is wrong from an in-plane size of 2**16 (a 256^3 brain), and it zeroed the autoweight without raising. Pad 5-D volumes through `utils.py:replicate_pad_3d`, compare any new MPS op with the CPU at sizes either side of 2**16 and 2**24, and re-run `scripts/audit_mps_vs_cpu.py` after a torch upgrade. See [[MPS traps in torch 2.14]].
 
 The companion wiki at `../fmri_wiki/` (Obsidian-compatible) is the long-form knowledge base: papers, design rationale, principles, debugging stories. **Read `../fmri_wiki/index.md` first** when a question touches methodology or "why does it do X this way".
 
@@ -25,6 +26,7 @@ All of these are spelled out under `../fmri_wiki/principles/`. Don't re-derive t
 - [[Block-diagonal nuisance]] — per-run nuisance lives in zero-padded block-diag columns. Use `glm/core.py:project_out_nuisance_per_run`; never roll your own. **Never combine `max_poly_degree=0` with block-diagonal nuisance** — rank-deficient, betas blow up.
 - [[LORO cross-validation]] — held-out R² is the empirical referee. The most common bug is projecting polynomials from the *full* dataset before splitting; projection must be fold-local.
 - [[Legendre polynomials]] — drift uses orthogonal polynomials via `design/matrices.py:construct_polynomial_matrix`, never raw monomials.
+- [[Cost footprint anchoring]] — a sampled cost is only as good as where it samples. The blok cost draws its match points where the source's field of view sat at the *start* pose, so a fit that lands elsewhere (a thin slab started a few mm off, a start far from the data) is judged where the data is not. `ffs_allineate -reanchor` rebuilds the footprint at the fitted pose and refits; never fix this with more trials or seeds, which were tried and do nothing.
 - [[Per-voxel optimization]] — when a hyperparameter is voxel-wise (ridge fraction, HRF index, ARMA(a,b)), fit it per voxel and save the parameter map as a diagnostic. A global value is a bad compromise everywhere.
 - [[Fractional ridge]] — parametrise ridge by `frac ∈ [0, 1]` (fraction of OLS norm kept), evaluated via a single SVD pass across the grid. See `fastfuncstuff/glm/ridge.py:_fit_ridge_multiple_fracs`.
 - [[Memory module]] — `fastfuncstuff/memory.py` is the single source of truth for chunk sizing. Every GPU-accelerated path must call `memory.py:estimate_chunk_size` (or a `bytes_per_voxel_*` planner); never hardcode. The 0.5 GPU safety factor compensates for PyTorch's caching allocator.
