@@ -314,6 +314,43 @@ def cpu_if_mps(device: torch.device, op: str) -> torch.device:
     return torch.device("cpu")
 
 
+# In-plane (H*W) size at which Metal's depth-axis replicate pad starts returning wrong
+# values. Re-measure after a torch upgrade (tests/test_mps_replicate_pad.py).
+MPS_REPLICATE_PAD_PLANE_LIMIT = 2**16
+
+
+def replicate_pad_3d(x: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
+    """``F.pad(x, pad, mode="replicate")`` for 5-D input, correct on Metal at any size.
+
+    torch 2.14 / MPS: a replicate pad along the depth axis returns wrong values
+    once the in-plane size H*W reaches 2**16 (255^2 is fine, 256^2 is not; a
+    20x300x300 volume fails too). Padding H or W, and every conv3d, are unaffected.
+    Bug of record: ``_separable_smooth_3d`` on a 320^3 base smoothed away 84% of the
+    brain, and the autoweight blur zeroed the whole weight, which then fell back to
+    ``ones`` -- so ffs_allineate on MPS fitted without autoweight, on a base missing
+    most of its brain.
+
+    The depth part is done as an exact edge-clamped ``index_select``; the rest goes
+    through ``F.pad`` as usual.
+    """
+    import torch.nn.functional as F
+
+    z0, z1 = pad[4], pad[5]
+    if (
+        x.device.type != "mps"
+        or x.ndim != 5
+        or (z0 == 0 and z1 == 0)
+        or x.shape[-2] * x.shape[-1] < MPS_REPLICATE_PAD_PLANE_LIMIT
+    ):
+        return F.pad(x, pad, mode="replicate")
+    n = x.shape[-3]
+    idx = torch.arange(-z0, n + z1, device=x.device).clamp_(0, n - 1)
+    x = x.index_select(-3, idx)
+    if any(pad[:4]):
+        x = F.pad(x, (*pad[:4], 0, 0), mode="replicate")
+    return x
+
+
 def shape_bucket(n: int, device: torch.device, limit: int | None = None) -> int:
     """Round a working-set size up so a shrinking batch reuses compiled kernels.
 

@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.utils import replicate_pad_3d
+
 
 def compute_weight_image(
     base: Tensor,
@@ -253,7 +255,7 @@ def _median_filter_ball(vol: Tensor, radius: float) -> Tensor:
         for dx in range(-r, r + 1)
         if dz * dz + dy * dy + dx * dx <= r2
     ]
-    vp = F.pad(vol[None, None], (r, r, r, r, r, r), mode="replicate")[0, 0]
+    vp = replicate_pad_3d(vol[None, None], (r, r, r, r, r, r))[0, 0]
 
     # Bound the stacked-neighbourhood tensor to ~256 MB.
     bytes_per_z = len(offs) * ny * nx * 4
@@ -290,7 +292,7 @@ def _gaussian_smooth_3d(vol: Tensor, sigma: float) -> Tensor:
     # Z direction
     if vol.shape[0] > 1:
         k = kernel_1d[None, None, :, None, None]  # (1, 1, K, 1, 1)
-        v = F.pad(v, (0, 0, 0, 0, radius, radius), mode="replicate")
+        v = replicate_pad_3d(v, (0, 0, 0, 0, radius, radius))
         v = F.conv3d(v, k)
 
     # Y direction

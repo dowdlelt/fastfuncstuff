@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from fastfuncstuff.unique import sorted_unique
+from fastfuncstuff.utils import replicate_pad_3d
 
 # ---------------------------------------------------------------------------
 # Clip-level estimation (matches THD_cliplevel)
@@ -291,7 +292,7 @@ def _count_neighbors_18_replicate(mask: Tensor) -> Tensor:
         (1, 2, 2),  # 12 edge
     ]:
         kernel[0, 0, dz, dy, dx] = 1
-    x = F.pad(mask.float()[None, None], (1,) * 6, mode="replicate")
+    x = replicate_pad_3d(mask.float()[None, None], (1,) * 6)
     return F.conv3d(x, kernel)[0, 0]
 
 

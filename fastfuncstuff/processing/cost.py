@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from fastfuncstuff.utils import to_linalg_f64
+from fastfuncstuff.utils import replicate_pad_3d, to_linalg_f64
 
 
 def pearson_correlation(base: Tensor, source: Tensor, weight: Tensor | None = None) -> Tensor:
@@ -224,7 +224,7 @@ def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) ->
     shape = [1, 1, 1, 1, 1]
     shape[axis] = kernel.shape[0]
     k = kernel.reshape(shape).expand(n_groups, 1, *shape[2:])
-    return F.conv3d(F.pad(vol, tuple(pad), mode="replicate"), k, groups=n_groups)
+    return F.conv3d(replicate_pad_3d(vol, tuple(pad)), k, groups=n_groups)
 
 
 def _separable_smooth_3d(
