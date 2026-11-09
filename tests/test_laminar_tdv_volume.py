@@ -681,3 +681,52 @@ def test_snr_ridge_auto_level_flattens_the_depth_lag():
     raw, corrected = pial_minus_deep(runs), pial_minus_deep(res.corrected)
     assert raw - target > 0.2, (raw, target)  # transport makes pial later still
     assert abs(corrected - target) < 0.3 * (raw - target), (raw, corrected, target)
+
+
+def test_lag_gate_leaves_fluctuations_without_transport_lag_alone():
+    """-lag_gate: slow fluctuations carried up the column (pial lags deep) are
+    corrected, but a fast one common to every depth at once has no transport lag,
+    and the plain inverse 'corrects' it into pial leading deep (ds004539: quiet
+    cortex and event runs). The gate measures, per band, the share of the model's
+    transport lag the data show, and scales the removal by it."""
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+    from fastfuncstuff.processing.laminar_tdv import _depth_lags, column_profiles
+
+    T, K, n = 300, 3, 90
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    freq = torch.fft.rfftfreq(T, spec.TR)
+    h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), n // 3)
+    labels = np.zeros(depth.size, int)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    fast_band = ((freq > 0.07) & (freq < 0.13)).double()[:, None]
+    torch.manual_seed(11)
+    runs = []
+    for _ in range(3):
+        drive = torch.randn(T, 1, dtype=torch.float64) + 0.02 * torch.randn(T, K, dtype=torch.float64)
+        a = 0.03 * torch.fft.irfft(
+            torch.fft.rfft(drive, dim=0) / (1 + (freq[:, None] / 0.03) ** 4), n=T, dim=0
+        )
+        y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+        fast = 0.3 * torch.fft.irfft(
+            torch.fft.rfft(torch.randn(T, 1, dtype=torch.float64), dim=0) * fast_band, n=T, dim=0
+        )
+        psc = read @ (y + fast).T + 0.01 * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+
+    def lag(rs, band):
+        prof = column_profiles(rs, depth, labels, K, 1, CPU).profiles[:, 0]
+        lg, power = _depth_lags(prof.double().numpy(), spec.TR, band)
+        return float(((lg[:, 0] - lg[:, -1]) * power).sum() / power.sum())
+
+    kw = dict(pad_seconds=20, polort=1, removal="column", strengths=(0.01,), verbose=False)
+    plain = devein_volume_runs(runs, depth, labels, spec, **kw)
+    gated = devein_volume_runs(runs, depth, labels, spec, lag_gate=True, **kw)
+    assert gated.lag_gate is not None
+    assert gated.lag_gate[0] > 0.7 and gated.lag_gate[5] < 0.25, gated.lag_gate
+    slow, fast_b = (0.01, 0.03), (0.08, 0.12)
+    assert lag(runs, slow) > 0.4  # transport: pial behind deep
+    assert lag(gated.corrected, slow) < 0.5 * lag(runs, slow)  # still corrected where it is
+    assert abs(lag(runs, fast_b)) < 0.1
+    assert lag(plain.corrected, fast_b) < -0.2, lag(plain.corrected, fast_b)  # the failure
+    assert abs(lag(gated.corrected, fast_b)) < 0.5 * abs(lag(plain.corrected, fast_b))

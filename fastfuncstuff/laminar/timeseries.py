@@ -370,6 +370,7 @@ def dynamic_inverse(
     cutoff_hz: float = 0.1,
     device: torch.device | None = None,
     scores: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
     verbose: bool = True,
 ) -> DynamicResult:
     """Regularized spectral inverse, selecting shrinkage per unit by GE LORO.
@@ -377,6 +378,9 @@ def dynamic_inverse(
     ``scores`` ``(len(strengths), U)`` selects instead (the largest wins), e.g.
     :func:`split_half_scores`, which needs no repeated runs; they are reported
     as ``cv_r2``.
+
+    ``gate`` ``(nf,)`` in [0, 1] scales the removal frequency by frequency (see
+    ``laminar_tdv.transport_lag_share``); the full-model fit is left as it is.
 
     profiles are detrended PSC, (runs, units, time, depths). Runs used for LORO
     MUST have the same task schedule and length. With one run a single supplied
@@ -417,6 +421,9 @@ def dynamic_inverse(
     freq = torch.fft.rfftfreq(T + 2 * pad, tr, device=dev)
     penalty = 1 + (freq / cutoff_hz) ** 4
     eye = torch.eye(K, device=dev, dtype=cdtype)
+    if gate is not None and tuple(gate.shape) != (nf,):
+        raise ValueError("gate must be (nf,) on the padded frequency grid")
+    g = None if gate is None else gate.to(device=dev, dtype=dtype)[:, None, None]
     weights_f = torch.full((nf,), 2.0, device=dev, dtype=dtype)
     weights_f[0] = 1
     if (T + 2 * pad) % 2 == 0:
@@ -456,6 +463,9 @@ def dynamic_inverse(
         )
         inv = torch.stack(inverses)[best, torch.arange(b, device=dev)]
         remove = (hs - Sc @ G) @ inv
+        grid_remove = (H - G) @ inv
+        if g is not None:
+            remove, grid_remove = remove * g, grid_remove * g
         transported = torch.einsum("bfij,rbfj->rbfi", remove, yf)
         fit = torch.einsum("bfij,rbfj->rbfi", hs @ inv, yf)
 
@@ -463,7 +473,7 @@ def dynamic_inverse(
             return _crop(z, T, pad).to(profiles.device).to(profiles.dtype)
 
         correction[:, start:stop], predicted[:, start:stop] = crop(transported), crop(fit)
-        grid_correction[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", (H - G) @ inv, yf))
+        grid_correction[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", grid_remove, yf))
         grid_predicted[:, start:stop] = crop(torch.einsum("bfij,rbfj->rbfi", H @ inv, yf))
         chosen[start:stop] = (
             torch.tensor(strengths, device=dev, dtype=dtype)[best]

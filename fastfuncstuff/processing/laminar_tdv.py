@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -734,6 +735,7 @@ class VolumeTdvResult:
     snr: np.ndarray | None = None  # V; ridge_snr only: the patch SNR that set its ridge
     snr_level: float | None = None  # ridge_snr only: the C used (chosen, with "auto")
     snr_level_at_edge: bool = False  # "auto" chose an end of SNR_RIDGE_GRID
+    lag_gate: np.ndarray | None = None  # per LAG_GATE_EDGES band, the removal share applied
 
 
 def devein_volume_runs(
@@ -761,6 +763,7 @@ def devein_volume_runs(
     ridge_snr: float | str | None = None,
     snr_band: tuple[float, float] = (0.01, 0.05),
     lag_band: tuple[float, float] = (0.01, 0.03),
+    lag_gate: bool = False,
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -782,6 +785,9 @@ def devein_volume_runs(
     (:func:`split_half_selection`, by ``split_blocks``) instead of across runs, so
     the runs need not share a schedule; a patch no split could score takes the
     strength most patches chose.
+
+    ``lag_gate`` scales the removal at each frequency by the share of the model's
+    transport lag the data actually show there (:func:`transport_lag_share`).
     """
     if pad_seconds < 0:
         raise ValueError("padding must be nonnegative")
@@ -832,6 +838,18 @@ def devein_volume_runs(
 
     scores, leak_u, unscored_np, snr_v, snr_level = None, None, None, None, None
     snr_edge = False
+    gate_rho, gate_for = None, None
+
+    def make_gate(weight):
+        nonlocal gate_rho, gate_for
+        gate_rho, gate_for = transport_lag_share(profiles, transfer, weight, tr=spec.TR)
+        if verbose:
+            print("  Lag gate (share of the model's transport lag present, by band): "
+                  + "  ".join(f"{lo:g}-{hi:g} Hz {r:.2f}" for (lo, hi), r in
+                              zip(itertools.pairwise(LAG_GATE_EDGES), gate_rho, strict=True)))  # fmt: skip
+
+    if lag_gate and ridge_snr is None:
+        make_gate(np.ones(len(columns.unit_labels)))
     if ridge_snr is not None:
         # Wiener-like shrinkage: each patch's ridge is C x its noise/signal ratio,
         # so a quiet patch (little shared signal, mostly noise) is shrunk hard and
@@ -845,6 +863,8 @@ def devein_volume_runs(
         )  # fmt: skip
         fallback = float(np.nanmedian(snr)) if np.isfinite(snr).any() else 1.0
         snr_f = np.maximum(np.where(np.isfinite(snr), snr, fallback), 1e-6)
+        if lag_gate:
+            make_gate(np.clip(np.where(np.isfinite(snr), snr, 0.0), 0.0, 20.0))
         strengths = tuple(float(x) for x in np.geomspace(1e-2, 1e3, 51))
 
         def snr_scores(c: float) -> torch.Tensor:
@@ -870,6 +890,7 @@ def devein_volume_runs(
                 grads[c] = _pooled_depth_lag(
                     profiles, columns, transfer, snr_scores(c), weight, strengths=strengths,
                     tr=spec.TR, cutoff_hz=cutoff_hz, band=lag_band, device=device,
+                    gate_for=gate_for,
                 )  # fmt: skip
             c_best = min(grads, key=lambda c: abs(grads[c] - lag_target))
             snr_edge = c_best in (SNR_RIDGE_GRID[0], SNR_RIDGE_GRID[-1])
@@ -938,6 +959,7 @@ def devein_volume_runs(
                     cutoff_hz=cutoff_hz,
                     device=device,
                     scores=scores,
+                    gate=None if gate_for is None else gate_for(prof.shape[2]),
                     verbose=verbose,
                 )  # fmt: skip
             )
@@ -958,7 +980,8 @@ def devein_volume_runs(
         result = dynamic_inverse(
             profiles, full, desired, sampling=columns.sampling, noise_cov=columns.noise_cov,
             strengths=strengths, tr=spec.TR, pad=pad, cutoff_hz=cutoff_hz, device=device,
-            scores=scores, verbose=verbose,
+            scores=scores, gate=None if gate_for is None else gate_for(lengths[0]),
+            verbose=verbose,
         )  # fmt: skip
     leak_v = None
     if leak_u is not None and unscored_np is not None:
@@ -973,6 +996,7 @@ def devein_volume_runs(
     out.snr = snr_v
     out.snr_level = snr_level
     out.snr_level_at_edge = snr_edge
+    out.lag_gate = gate_rho
     return out
 
 
@@ -1010,8 +1034,72 @@ def _local_lag(transfer, T: int, tr: float, band: tuple[float, float]) -> float:
     return float(lag[0, 0] - lag[0, -1])
 
 
+LAG_GATE_EDGES = (0.004, 0.02, 0.035, 0.05, 0.065, 0.08, 0.1, 0.13, 0.25)
+"""Bands (Hz) in which :func:`transport_lag_share` measures the data's depth lag."""
+
+
+def transport_lag_share(profiles, transfer, weight, *, tr: float, edges=LAG_GATE_EDGES):
+    """How much of the model's ascending-transport lag the data show, by frequency.
+
+    Blood carried up the column delays pial behind deep by the same time at every
+    frequency (the model: ~0.7 s). Where the measured pial-minus-deep lag of the
+    raw column profiles, pooled over patches (``weight`` x in-band power) and runs,
+    is only a share of that, only that share of the fluctuations behaves like
+    transported blood; the rest (noise, motion, anything common to all depths at
+    once) has none, and removing transport from it pushes pial ahead of deep. The
+    removal is scaled by that share, clipped to [0, 1]. Nothing is fitted to a
+    target lag: the data's own lag sets the share, so the level that differed
+    between datasets (block runs carry their power where the share is high,
+    event runs where it is low) follows the data.
+
+    Returns the share per band and ``gate_for(T)``, the share interpolated over
+    band centres onto run length T's padded frequency grid.
+    """
+    run_profiles = (
+        profiles
+        if isinstance(profiles, list)
+        else [profiles[r : r + 1] for r in range(len(profiles))]
+    )
+    bands = list(itertools.pairwise(edges))
+    num, den = np.zeros(len(bands)), np.zeros(len(bands))
+    for prof in run_profiles:
+        y = prof[0].double().cpu().numpy()
+        F, f = np.fft.rfft(y, axis=1), np.fft.rfftfreq(y.shape[1], tr)
+        seen = np.abs(y).sum((1, 2)) > 0  # a patch this run did not observe is all zero
+        for b, band in enumerate(bands):
+            lag, power = _spectral_lags(F, f, band)
+            w = weight * power * seen
+            num[b] += (lag[:, 0] - lag[:, -1]) @ w
+            den[b] += w.sum()
+    pad, full, _ = transfer(run_profiles[0].shape[2])
+    fm = np.fft.rfftfreq(run_profiles[0].shape[2] + 2 * pad, tr)
+    model = np.array(
+        [(lambda x: x[0, 0] - x[0, -1])(_spectral_lags(full.sum(-1).cpu().numpy()[None], fm, band)[0])
+         for band in bands]
+    )  # fmt: skip
+    share = np.clip(num / np.maximum(den, 1e-30) / np.maximum(model, 1e-6), 0.0, 1.0)
+    centres = np.array([(lo + hi) / 2 for lo, hi in bands])
+
+    def gate_for(T: int) -> torch.Tensor:
+        pad_t = transfer(T)[0]
+        return torch.as_tensor(np.interp(np.fft.rfftfreq(T + 2 * pad_t, tr), centres, share))
+
+    return share, gate_for
+
+
 def _pooled_depth_lag(
-    profiles, columns, transfer, scores, weight, *, strengths, tr, cutoff_hz, band, device
+    profiles,
+    columns,
+    transfer,
+    scores,
+    weight,
+    *,
+    strengths,
+    tr,
+    cutoff_hz,
+    band,
+    device,
+    gate_for=None,
 ) -> float:
     """Pial-minus-deep lag (s) of the corrected column profiles, pooled over runs and
     patches (``weight`` x in-band power). Profiles index depth 0 = pial."""
@@ -1027,6 +1115,7 @@ def _pooled_depth_lag(
             prof, full_r, desired_r, sampling=_per_run(columns.sampling, r),
             noise_cov=_per_run(columns.noise_cov, r), strengths=strengths, tr=tr, pad=pad,
             cutoff_hz=cutoff_hz, device=device, scores=scores, verbose=False,
+            gate=None if gate_for is None else gate_for(prof.shape[2]),
         )  # fmt: skip
         y = (prof[0] - res.correction[0]).double().numpy()
         lag, power = _depth_lags(y, tr, band)

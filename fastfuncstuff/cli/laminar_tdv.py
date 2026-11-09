@@ -16,6 +16,7 @@ AWAY from SE. See the wiki's Laminar timeseries deveining note.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 import time
@@ -433,6 +434,17 @@ def create_parser() -> FfsArgumentParser:
         "noise between neighbours, which would read as signal",
     )
     inv.add_argument(
+        "-lag_gate",
+        action="store_true",
+        help="Scale the removal at each frequency by the share of the model's transport "
+        "lag (pial behind deep, ~0.7 s) the raw columns actually show there, pooled over "
+        "patches (SNR x power with -ridge_snr). Fluctuations with no deep-to-pial lag "
+        "(noise, motion, anything common to all depths) are then not 'corrected' into "
+        "pial leading deep. Learned from the data, no target lag; costs one FFT pass. "
+        "On ds004539 it removed the over-correction of quiet cortex and event runs "
+        "and made the result insensitive to the -ridge_snr level",
+    )
+    inv.add_argument(
         "-repeated_runs",
         action="store_true",
         help="State that every run has the same task timing, which leave-one-run-out "
@@ -647,7 +659,7 @@ def main(argv: list[str] | None = None) -> None:
     from fastfuncstuff.laminar.params import ModelSpec, zero_params
     from fastfuncstuff.laminar.pipeline import reference_p0
     from fastfuncstuff.processing.io import load_image, save_image
-    from fastfuncstuff.processing.laminar_tdv import devein_volume_runs
+    from fastfuncstuff.processing.laminar_tdv import LAG_GATE_EDGES, devein_volume_runs
 
     verbose = args.verb >= 1
     print("ffs_laminar_tdv is EXPERIMENTAL: model physiology, not validated on real data")
@@ -881,6 +893,7 @@ def main(argv: list[str] | None = None) -> None:
         ridge_cv=args.ridge_cv,
         split_blocks=split_blocks,
         ridge_snr=args.ridge_snr,
+        lag_gate=args.lag_gate,
         split_repeats=args.ridge_cv_repeats,
         present=present,
         voxel_weight=voxel_weight,
@@ -960,6 +973,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
         "ridge_snr_level": result.snr_level,
         "ridge_snr_level_at_grid_edge": result.snr_level_at_edge,
+        "lag_gate": None
+        if result.lag_gate is None
+        else {
+            f"{lo:g}-{hi:g}": round(float(r), 4)
+            for (lo, hi), r in zip(itertools.pairwise(LAG_GATE_EDGES), result.lag_gate, strict=True)
+        },
         "physiology_cv": None
         if cv is None
         else [
