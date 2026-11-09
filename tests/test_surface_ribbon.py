@@ -53,11 +53,29 @@ def _voxel_mm(rm, aff):
 
 
 def test_ribbon_is_the_shell_and_depth_is_radial(shell):
-    d, f, centre, aff, rm = shell
+    """Centre rule: every voxel centre inside the shell, depth radial."""
+    d, f, centre, aff, _ = shell
+    rm = build_ribbon_map(centre + 20 * d, centre + 23 * d, f, aff, (64, 64, 64),
+                          min_gm_fraction=None)  # fmt: skip
     r = np.linalg.norm(_voxel_mm(rm, aff) - centre, axis=1)
     assert r.min() > 19.8 and r.max() < 23.2  # chord sag of a level-4 mesh only
     assert rm.flat.size > 0.9 * 4 / 3 * np.pi * (23**3 - 20**3)
     np.testing.assert_allclose(rm.depth, (r - 20) / 3, atol=0.08)
+    assert rm.gm_frac is None
+
+
+def test_fractional_ribbon_adds_the_shell_edge_voxels(shell):
+    """Default: the centre-rule voxels plus those the shell only clips (>= 10% in),
+    their centres within half a voxel diagonal of it, depths at their GM part."""
+    d, f, centre, aff, rm = shell
+    ctr = build_ribbon_map(centre + 20 * d, centre + 23 * d, f, aff, (64, 64, 64),
+                           min_gm_fraction=None)  # fmt: skip
+    assert np.isin(ctr.flat, rm.flat).all() and rm.flat.size > 1.2 * ctr.flat.size
+    r = np.linalg.norm(_voxel_mm(rm, aff) - centre, axis=1)
+    half = np.sqrt(3) / 2
+    assert r.min() > 20 - half - 0.2 and r.max() < 23 + half
+    assert rm.gm_frac is not None and rm.gm_frac.min() >= 0.1 - 1e-6
+    assert 0 <= rm.depth.min() and rm.depth.max() <= 1
 
 
 def test_each_voxel_belongs_to_the_vertex_above_it(shell):

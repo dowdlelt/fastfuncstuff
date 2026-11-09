@@ -14,9 +14,10 @@ directions:
   pial 1), so it can feed a depth or laminar analysis.
 
 Ribbon membership uses winding numbers (inside pial, not inside white), as
-``ffs_util_surf2layers`` does, so the ribbon is hole-free where the surfaces are. A
-voxel is in the ribbon by its centre; partial voxels at the boundary go to whichever
-side their centre is on.
+``ffs_util_surf2layers`` does, so the ribbon is hole-free where the surfaces are. By
+default a voxel is in the ribbon when >= 10% of it is (``min_gm_fraction``, the same
+fractional ribbon as surf2layers / laminar_tdv), its owner and depth measured at its
+grey-matter part; None keeps the voxel-centre rule.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ class RibbonMap:
     vertex: np.ndarray  # (N,) int64 owner vertex
     depth: np.ndarray  # (N,) float32, white 0 .. pial 1
     n_vertices: int
+    gm_frac: np.ndarray | None = None  # (N,) float32 share in the ribbon (fractional rule)
 
     def paint(self, values: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
         """Per-vertex ``values`` (V,) as an (X, Y, Z) float32 volume, 0 off the ribbon."""
@@ -67,6 +69,7 @@ def build_ribbon_map(
     shape: tuple[int, int, int],
     device=None,
     pad: int = 2,
+    min_gm_fraction: float | None = 0.1,
 ) -> RibbonMap:
     """The ribbon map of one hemisphere on the grid ``(shape, affine)``.
 
@@ -90,10 +93,24 @@ def build_ribbon_map(
     sub_aff = aff.copy()
     sub_aff[:3, 3] = aff[:3, :3] @ lo + aff[:3, 3]
     f = np.asarray(faces, np.int64)
-    inside = winding_number(p, f, sub_aff, sub_shape, device) > 0
-    inside &= ~(winding_number(w, f, sub_aff, sub_shape, device) > 0)
-    local = np.argwhere(inside)
-    pts = local @ sub_aff[:3, :3].T + sub_aff[:3, 3]
+    gm_frac = None
+    if min_gm_fraction is None:
+        inside = winding_number(p, f, sub_aff, sub_shape, device) > 0
+        inside &= ~(winding_number(w, f, sub_aff, sub_shape, device) > 0)
+        local = np.argwhere(inside)
+        at = local.astype(np.float64)
+    else:
+        import torch
+
+        from fastfuncstuff.surface.volume_depth import RibbonSurfaces, _fractional_ribbon
+
+        _, _, (kept, gm_frac, centroid), _ = _fractional_ribbon(
+            [RibbonSurfaces("h", w, p, f)], sub_aff, sub_shape, min_gm_fraction, 4,
+            device or torch.device("cpu"),
+        )  # fmt: skip
+        local = np.stack(np.unravel_index(kept, sub_shape), 1)
+        at = local + centroid  # owner and depth at the voxel's grey-matter part
+    pts = at @ sub_aff[:3, :3].T + sub_aff[:3, 3]
     # ~4 voxels a side, as volume_depth sizes it: the CUDA brick search, ignored elsewhere.
     brick_mm = 4.0 * float(np.abs(np.linalg.det(aff[:3, :3])) ** (1 / 3))
     mid = 0.5 * (w + p)
@@ -104,4 +121,4 @@ def build_ribbon_map(
     depth = (dw / np.maximum(dw + dp, 1e-6)).astype(np.float32)
     g = local + lo
     flat = np.ravel_multi_index((g[:, 0], g[:, 1], g[:, 2]), shape).astype(np.int64)
-    return RibbonMap(shape, aff, flat, owner.astype(np.int64), depth, len(w))
+    return RibbonMap(shape, aff, flat, owner.astype(np.int64), depth, len(w), gm_frac)

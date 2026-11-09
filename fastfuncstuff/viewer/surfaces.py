@@ -325,12 +325,16 @@ class SurfaceStore:
             h = self.hemis[hemi]
             white = np.asarray(h.states["white"])
             pial = np.asarray(h.states.get("pial", white))
-            disk = diskcache.content_key("ribbon-1", white, pial, np.asarray(h.faces), *grid)
+            # ribbon-2: the fractional ribbon (edge voxels >= 10% GM), and its shares.
+            disk = diskcache.content_key("ribbon-2", white, pial, np.asarray(h.faces), *grid)
             got = diskcache.load("ribbon_maps", disk)
             if got is not None:
-                return RibbonMap(grid[0], aff, got["flat"], got["vertex"], got["depth"], len(white))
+                return RibbonMap(grid[0], aff, got["flat"], got["vertex"], got["depth"],
+                                 len(white), got["gm_frac"])  # fmt: skip
             rm = build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
-            diskcache.save("ribbon_maps", disk, flat=rm.flat, vertex=rm.vertex, depth=rm.depth)
+            assert rm.gm_frac is not None
+            diskcache.save("ribbon_maps", disk, flat=rm.flat, vertex=rm.vertex, depth=rm.depth,
+                           gm_frac=rm.gm_frac)  # fmt: skip
             return rm
 
         if len(missing) > 1:
