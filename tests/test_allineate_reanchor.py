@@ -47,22 +47,52 @@ HDR = {"affine": np.eye(4)}
 
 
 @pytest.mark.parametrize(
-    ("mode", "coverage", "expected"),
+    ("mode", "overlap", "expected"),
     [
-        ("off", 0.01, False),
-        ("on", 0.9, True),
-        ("auto", 0.02, True),
-        ("auto", 0.9, False),
+        ("off", 0.1, False),
+        ("on", 1.0, True),
+        ("auto", 0.5, True),  # the fit landed mostly outside what was sampled
+        ("auto", 0.95, False),
     ],
 )
-def test_reanchor_decision(mode, coverage, expected):
+def test_reanchor_decision(mode, overlap, expected):
     cfg = A.AffineAlignConfig(reanchor=mode)
-    assert A._reanchor_wanted(cfg, {"source_coverage": coverage}, HDR, HDR) is expected
+    assert A._reanchor_wanted(cfg, {"footprint_overlap": overlap}, HDR, HDR) is expected
 
 
 def test_reanchor_needs_headers_to_hand_the_pose_on():
     cfg = A.AffineAlignConfig(reanchor="on")
-    assert not A._reanchor_wanted(cfg, {"source_coverage": 0.01}, None, HDR)
+    assert not A._reanchor_wanted(cfg, {"footprint_overlap": 0.01}, None, HDR)
+
+
+def _setup(footprint):
+    """Just the fields _footprint_overlap reads, on a 10x6x6 base of unit weight."""
+    from types import SimpleNamespace
+
+    base = torch.zeros(10, 6, 6)
+    return SimpleNamespace(base=base, start_footprint=footprint, brain_weight=torch.ones_like(base))
+
+
+def _slab_matrix(z0):
+    """Base->source voxel map putting a 3-slice source over base slices z0..z0+2."""
+    return _shift(dz=-float(z0))
+
+
+def test_overlap_is_one_when_the_fit_stays_on_what_was_sampled():
+    start = A._compute_source_validity_mask((3, 6, 6), (10, 6, 6), _slab_matrix(2))
+    assert A._footprint_overlap(_setup(start), (3, 6, 6), _slab_matrix(2)) == pytest.approx(1.0)
+
+
+def test_overlap_drops_when_the_fit_moves_onto_unsampled_data():
+    # Slab started at slices 2-4 and fitted to 4-6: one of its three slices was sampled.
+    start = A._compute_source_validity_mask((3, 6, 6), (10, 6, 6), _slab_matrix(2))
+    got = A._footprint_overlap(_setup(start), (3, 6, 6), _slab_matrix(4))
+    assert got == pytest.approx(1.0 / 3.0)
+
+
+def test_overlap_is_one_without_a_footprint():
+    # A source covering the whole grid has nothing cut away, so nothing to re-anchor.
+    assert A._footprint_overlap(_setup(None), (10, 6, 6), _shift()) == 1.0
 
 
 def _run(monkeypatch, shifts, **cfg_kw):
@@ -72,7 +102,7 @@ def _run(monkeypatch, shifts, **cfg_kw):
     def fake_align(base, source, config, bh, sh, *a):
         i = len(calls)
         calls.append(config.init_matrix)
-        a[-1]["source_coverage"] = 0.02  # the info dict
+        a[-1]["footprint_overlap"] = 0.5  # the info dict
         return _shift(dx=shifts[min(i, len(shifts) - 1)]), source
 
     monkeypatch.setattr(A, "_align", fake_align)

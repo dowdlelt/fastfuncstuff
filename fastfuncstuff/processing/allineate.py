@@ -151,20 +151,23 @@ class AffineAlignConfig:
     coarse_n_rot: int | None = None  # None -> derived from coarse_range/coarse_step
     coarse_n_random: int = 32  # extra random joint seeds, for robustness
 
-    # Re-anchoring for a partial field of view. The cost samples match points only
-    # where the source sits at the START pose, and warped points that land outside it
-    # are dropped. A thin slab (ds004539 VASO: 14 mm thick) whose start is a few mm
-    # off therefore has much of its true footprint outside the sampled domain, so the
-    # true peak is under-scored and the fit settles on a shoulder 4 mm / 4 deg away
-    # (common-yardstick cost 0.37 vs 1.07). More trials, denser coarse seeds, other
-    # optimizers and a perturbation cloud at the sharp stage all left it there.
-    # Refitting with the footprint rebuilt at the fitted pose moves the domain toward
-    # the true slab each pass: 0.105 -> 0.574 -> 1.100 on that data. ``auto`` turns
-    # it on when the source covers under ``reanchor_coverage`` of the base brain;
-    # it stops when the source's corners move less than ``reanchor_tol_mm``.
+    # Re-anchoring: evaluate the cost where the data is. The blok cost samples match
+    # points only where the source's field of view sat at the START pose (base brain
+    # inside that footprint), and warped points that land outside it are dropped. If
+    # the fit then lands where the footprint is mostly outside what was sampled, the
+    # true peak is under-scored and the search settles on a shoulder. A thin slab
+    # started a few mm off is the sharp case (ds004539 VASO: 0.37 vs 1.07 on a common
+    # yardstick; more trials, denser coarse seeds, other optimizers, wider ranges and a
+    # perturbation cloud all left it there); a start far from the data is the same
+    # failure in other clothes. Refitting with the footprint rebuilt at the fitted pose
+    # moves the sampled domain onto the data each pass: 0.105 -> 0.57 -> 1.10 -> 1.20.
+    # ``auto`` refits when under ``reanchor_overlap`` of the fitted footprint (within
+    # the brain) lies inside what was sampled, and stops once the source's corners move
+    # less than ``reanchor_tol_mm``. A source whose field of view covers the whole base
+    # brain samples the whole brain at any pose, so it never triggers.
     reanchor: str = "auto"
     reanchor_passes: int = 3
-    reanchor_coverage: float = 0.25
+    reanchor_overlap: float = 0.9
     reanchor_tol_mm: float = 0.25
 
     # Refinement tuning. Iteration counts are ceilings; Adam stops early on a
@@ -3082,8 +3085,10 @@ class _GridSetup:
     bounds: np.ndarray
     sample: SampleSet | None
     init_params: Tensor
-    source_coverage: float = 1.0
-    """Fraction of the base's nonzero voxels the source's field of view covers."""
+    start_footprint: Tensor | None = None
+    """Base voxels the source's field of view covered at the start pose (None: all)."""
+    brain_weight: Tensor | None = None
+    """The base-side weight before it was cut to ``start_footprint``."""
 
 
 def _prepare_grid(
@@ -3158,13 +3163,10 @@ def _prepare_grid(
     cmass_mat[:3, 3] = torch.as_tensor(cmass_shift, device=device, dtype=cmass_mat.dtype)
     align_matrix = g @ cmass_mat
 
-    source_coverage = 1.0
     if cross_grid or bool(np.any(cmass_shift != 0.0)):
         source_validity = _compute_source_validity_mask(
             source_native.shape, base.shape, align_matrix
         )
-        in_brain = base != 0
-        source_coverage = float((source_validity & in_brain).sum()) / max(1, int(in_brain.sum()))
         source_on_base = apply_affine(source_native, align_matrix, base.shape, zero_outside=True)
         source_on_base = source_on_base * source_validity.float()
         if verb >= 1 and cross_grid:
@@ -3193,6 +3195,7 @@ def _prepare_grid(
     )
 
     # Apply source validity mask to weight (exclude base voxels outside source)
+    brain_weight = weight if weight is not None else (base != 0).float()
     if source_validity is not None and weight is not None:
         weight = weight * source_validity.float()
 
@@ -3353,7 +3356,8 @@ def _prepare_grid(
         bounds=bounds,
         sample=sample,
         init_params=init_params,
-        source_coverage=source_coverage,
+        start_footprint=source_validity,
+        brain_weight=brain_weight if source_validity is not None else None,
     )
 
 
@@ -3445,6 +3449,25 @@ def allineate(
         return matrix, warped
 
 
+def _footprint_overlap(setup: _GridSetup, source_shape: tuple[int, ...], matrix: Tensor) -> float:
+    """Share of the fitted footprint (within the brain) that the cost actually sampled.
+
+    The footprint is where the source's field of view lands under ``matrix``; the
+    sampled domain is where it landed at the start (``setup.start_footprint``). 1.0
+    means the fit stayed on the data the cost could see; low means it moved onto
+    data the cost had cut away. No footprint at all (the source covered the whole
+    grid) is 1.0.
+    """
+    if setup.start_footprint is None or setup.brain_weight is None:
+        return 1.0
+    fitted = _compute_source_validity_mask(source_shape, tuple(setup.base.shape), matrix)
+    w = setup.brain_weight * fitted.to(setup.brain_weight.dtype)
+    total = float(w.sum())
+    if total <= 0.0:
+        return 1.0
+    return float((w * setup.start_footprint.to(w.dtype)).sum()) / total
+
+
 def _reanchor_wanted(
     config: AffineAlignConfig, info: dict, base_header: dict | None, source_header: dict | None
 ) -> bool:
@@ -3455,7 +3478,7 @@ def _reanchor_wanted(
         return False  # the pose is handed on as a header-space matrix
     if config.reanchor == "on":
         return True
-    return float(info.get("source_coverage", 1.0)) < config.reanchor_coverage
+    return float(info.get("footprint_overlap", 1.0)) < config.reanchor_overlap
 
 
 def _corner_motion_mm(
@@ -3566,7 +3589,7 @@ def _align(
 ) -> tuple[Tensor, Tensor]:
     """The alignment itself; :func:`allineate` is its public, movie-wrapped door.
 
-    ``info`` is filled with facts the caller decides on (``source_coverage``)."""
+    ``info`` is filled with facts the caller decides on (``footprint_overlap``)."""
     device = _align_device(base, config)
     base = base.to(device)
     source_native = source.to(device)
@@ -3594,8 +3617,6 @@ def _align(
         save_weight_path=None if full_to_work is not None else save_weight_path,
         force_cross_grid=full_to_work is not None,
     )
-    if info is not None:
-        info["source_coverage"] = setup.source_coverage
     setup, config = _header_or_cmass_start(
         setup, base, base_header, source_native, source_header, config, device, verb,
         force_cross_grid=full_to_work is not None,
@@ -3842,6 +3863,13 @@ def _align(
         )
         init_params, full_to_work = setup.init_params, None
         source_native = source_native.to(device)
+
+    if info is not None:
+        info["footprint_overlap"] = _footprint_overlap(
+            setup, tuple(source_native.shape), final_matrix
+        )
+        if verb >= 1 and setup.start_footprint is not None:
+            print(f"  Footprint overlap (fitted vs sampled): {info['footprint_overlap']:.2f}")
 
     if movie is not None:
         # The matrix the output is resampled with, so this frame IS the saved volume

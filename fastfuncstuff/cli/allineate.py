@@ -571,10 +571,12 @@ Examples:
         choices=["auto", "on", "off"],
         default="auto",
         help="Refit with the sampling footprint rebuilt at the fitted pose, until "
-        "the source stops moving. The cost samples match points where the source "
-        "sat at the start pose, so a thin slab started a few mm off cannot see its "
-        "true peak; each pass moves the footprint toward it. auto: on when the "
-        "source covers under 25%% of the base brain (a partial field of view).",
+        "the source stops moving. The cost samples match points where the source's "
+        "field of view sat at the start pose, so a fit that lands elsewhere (a thin "
+        "slab started a few mm off, or any start far from the data) is judged "
+        "where the data is not. auto: refit when under 90%% of the fitted footprint "
+        "lies inside what was sampled; a source covering the whole base brain "
+        "never triggers.",
     )
     search_group.add_argument(
         "-nmatch",
