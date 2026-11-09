@@ -116,6 +116,25 @@ def _resample(
     return warped.clamp_min(0.0) if no_neg else warped
 
 
+def _mask_on(path: str, header: dict, shape: tuple[int, int, int], device) -> torch.Tensor:
+    """A mask file as a bool volume on (shape, header's affine); another grid is
+    moved there through the headers with nearest neighbour."""
+    from fastfuncstuff.processing.grid import resample_to_grid
+
+    mask, mh = load_image(path)
+    if mask.ndim == 4:
+        if mask.shape[0] != 1:
+            raise SystemExit(f"{path}: a mask must be one volume")
+        mask = mask[0]
+    target, own = np.asarray(header["affine"], np.float64), np.asarray(mh["affine"], np.float64)
+    if tuple(mask.shape) != tuple(shape) or not np.allclose(own, target, atol=1e-4):
+        mask = resample_to_grid(mask, own, tuple(shape), target, interp="nearest")
+    out = mask.to(device) != 0
+    if not bool(out.any()):
+        raise SystemExit(f"{path}: the mask is empty on the image's grid")
+    return out
+
+
 def _resample_series(
     series: torch.Tensor,
     matrix: torch.Tensor,
@@ -468,6 +487,24 @@ Examples:
     )
     mask_group.add_argument(
         "-source_automask", dest="source_automask", action="store_true", help="Alias for -automask."
+    )
+    mask_group.add_argument(
+        "-source_mask",
+        default=None,
+        metavar="FILE",
+        help="Zero the source outside this mask for the fit (nonzero = keep), as "
+        "3dcalc -expr 'a*b' on the source would; the output is still resampled from "
+        "the unmasked source. E.g. an automask of the mean BOLD for a VASO source. "
+        "A mask on another grid is moved onto the source's through its header "
+        "(nearest neighbour).",
+    )
+    mask_group.add_argument(
+        "-base_mask",
+        default=None,
+        metavar="FILE",
+        help="Restrict the cost to the base voxels inside this mask (nonzero = in): "
+        "it multiplies the autoweight, or is the weight with -noautoweight. Same "
+        "grid handling as -source_mask.",
     )
     mask_group.add_argument(
         "-autoweight",
@@ -846,6 +883,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if verb >= 1:
             print(f"  Estimation volume: first of {source_4d.shape[0]}")
     source = source.to(device)
+    source_whole = source  # what the output is resampled from
+    if args.source_mask is not None and getattr(args, "1Dmatrix_apply", None) is None:
+        # The fit only: the output (and source_4d) comes from the unmasked source.
+        source = source * _mask_on(args.source_mask, source_header, tuple(source.shape), device)
 
     if verb >= 1:
         print_cli_section("Inputs", leading_blank=False)
@@ -1001,6 +1042,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         final_interp=args.final_interp,
         source_automask=args.source_automask,
         autoweight=not args.noautoweight,
+        base_mask=None
+        if args.base_mask is None
+        else _mask_on(args.base_mask, base_header, tuple(base.shape), device),
         autocrop=not args.noautocrop,
         work_dxyz=_parse_work_dxyz(args.work_dxyz),
         init_matrix=init_matrix,
@@ -1047,9 +1091,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     # --- Save outputs ---
     # -dxyz: re-resample onto the master grid at the requested voxel size (allineate returned
     # `warped` on the base grid). Same transform, finer/coarser output.
-    if args.dxyz is not None:
+    if args.dxyz is not None or source_whole is not source:
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
-        warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
+        warped = _resample(source_whole, om, out_shape, args.final_interp, args.no_neg)
     elif args.no_neg:
         warped = warped.clamp_min(0.0)
     if verb >= 1:

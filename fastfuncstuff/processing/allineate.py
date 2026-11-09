@@ -202,6 +202,9 @@ class AffineAlignConfig:
     # Masking
     source_automask: bool = False
     autoweight: bool = True
+    # Restrict the cost to these base voxels (base grid, nonzero = in): folded into
+    # the weight, so with autoweight off the mask IS the weight.
+    base_mask: Tensor | None = None
 
     # Cropping
     autocrop: bool = True  # crop zero margins from base for optimization
@@ -3193,6 +3196,17 @@ def _prepare_grid(
         if config.autoweight
         else None
     )
+
+    if config.base_mask is not None:
+        if tuple(config.base_mask.shape) != tuple(base.shape):
+            raise ValueError(
+                f"base_mask {tuple(config.base_mask.shape)} is not on the base grid {tuple(base.shape)}"
+            )
+        inside = (config.base_mask.to(device) != 0).to(base.dtype)
+        weight = inside if weight is None else weight * inside
+        if verb >= 1:
+            n = int(inside.sum().item())
+            print(f"  Base mask: {n}/{inside.numel()} voxels ({100.0 * n / inside.numel():.1f}%)")
 
     # Apply source validity mask to weight (exclude base voxels outside source)
     brain_weight = weight if weight is not None else (base != 0).float()
