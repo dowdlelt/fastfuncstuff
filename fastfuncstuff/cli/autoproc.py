@@ -873,6 +873,17 @@ def build_parser() -> argparse.ArgumentParser:
         "ffs_util_b0fmap) | auto = pepolar when present, else b0",
     )
     g.add_argument(
+        "-xrun_method",
+        "-xrun-method",
+        choices=("allineate", "moco"),
+        default=None,
+        help="cross-run linear engine. allineate (default): each run's mean to its "
+        "anchor, pair by pair. moco: all of an anchor's runs registered as one short "
+        "series (ffs_moco -stack, options in -xrun_moco_opts) -- on thin slabs a few "
+        "voxels apart it aligned better than allineate, which looked under-rotated. "
+        "Both write the same matrices, so the rest of the chain is unchanged",
+    )
+    g.add_argument(
         "-xrun_nonlin",
         "-xrun-nonlin",
         action="store_const",
@@ -3104,6 +3115,7 @@ def main(argv: list[str] | None = None) -> int:
         nordic_task_qc=args.nordic_task_qc,
         locomoco_task_qc=args.locomoco_task_qc,
         locomoco_detask=args.locomoco_detask,
+        xrun_method=eff(args.xrun_method, "xrun_method", "allineate"),
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
         xfam_nonlin=eff(args.xfam_nonlin, "xfam_nonlin"),

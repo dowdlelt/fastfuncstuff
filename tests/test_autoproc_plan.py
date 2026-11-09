@@ -4236,3 +4236,22 @@ def test_the_staged_anat_is_checked_against_its_source_not_its_future_path(tmp_p
     # plan down with it: the check is advisory, every real error is reported elsewhere.
     (mri / "brain.mgz").write_bytes(b"not a volume")
     assert _check_surface_anat(opt, "/w/fs_work/brain.nii.gz") == []
+
+
+def test_xrun_method_moco_stacks_each_anchors_runs_into_one_call():
+    """-xrun_method moco: stage06's linear step is one ffs_moco -stack per anchor,
+    writing the same matrix / _lin names the allineate path does, so the chain and
+    the nonlinear refinement downstream are unchanged."""
+    runs = [_run("01", "foo", str(i)) for i in (1, 2, 3)]
+    subj = Subject("X", [Session("01", runs)])
+    opts = Options(xrun_method="moco", xrun_nonlin=True)
+    s = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
+    stage = s[s.index("== stage06: cross-run") : s.index("== QC: cross-run")]
+    assert "ffs_allineate -batch" not in stage
+    assert 'ffs_moco -stack "$base" "${xsrc[@]}" -stack_matrices "${xmat[@]}"' in stage
+    assert 'XSTK_MAT["$base"]+="${xstem}.aff12.1D"' in stage
+    assert "ffs_formwarp -batch" in stage  # the nonlinear refinement still follows
+    default = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert "-stack_matrices" not in default and "ffs_allineate -batch" in default
+    if shutil.which("bash"):
+        assert subprocess.run(["bash", "-n"], input=s, text=True).returncode == 0

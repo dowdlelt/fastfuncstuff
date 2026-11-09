@@ -241,6 +241,10 @@ class Options:
     # also solve the in-plane axis: 3-D keeps only the TE-scaled partition shift, and 2-D
     # (no partition axis) skips locomoco altogether. True keeps the in-plane solve on top.
     medic_inplane_locomoco: bool = False
+    # Cross-run linear engine: "allineate" (each run to its anchor, one pair at a
+    # time) or "moco" (each anchor's runs registered as one short series with
+    # ffs_moco -stack; aligned ds004539's thin slabs better). Same matrices out.
+    xrun_method: str = "allineate"
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False
     xses_nonlin: bool = False

@@ -45,6 +45,10 @@ DEFAULT_OPTS: dict[str, str] = {
     # these aligned means feed the grandmean, so a sharper single resample avoids
     # accumulating interpolation blur down the chain (applies to every allineate).
     "xrun": "-rigid -cost lpa -source_automask -autoweight -final wsinc5",
+    # cross-run linear with -xrun_method moco: every run's mean registered to its
+    # anchor as one short series (ffs_moco -stack). -twopass: runs can sit several
+    # voxels apart, beyond a single fine pass's capture range.
+    "xrun_moco": "-twopass",
     # cross-run nonlinear refinement (formwarp/SyN residual). -final_interp wsinc5
     # for the same reason (sharper warped mean).
     "xrun_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "

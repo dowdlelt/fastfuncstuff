@@ -2503,6 +2503,36 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
     return "\n".join(p for p in out if p) + "\n"
 
 
+def _xrun_moco_stack(src_var: str) -> tuple[str, str, str]:
+    """-xrun_method moco: the loop body, declarations and launch for stage06.
+
+    The loop only collects each anchor's runs (source, matrix, QC image, one per
+    line); then ONE ``ffs_moco -stack`` per anchor registers them as a short series
+    and writes the same ``${xstem}.aff12.1D`` / ``_lin`` files the allineate path
+    does, so everything downstream is unchanged. With skip_xrun an anchor whose
+    matrices all exist is skipped.
+    """
+    collect = (
+        f'  XSTK_SRC["$base"]+="{src_var}"$\'\\n\'\n'
+        '  XSTK_MAT["$base"]+="${xstem}.aff12.1D"$\'\\n\'\n'
+        '  XSTK_IMG["$base"]+="${xstem}${LANE}_lin.nii$FMT"$\'\\n\''
+    )
+    decl = "declare -A XSTK_SRC=() XSTK_MAT=() XSTK_IMG=()\n"
+    opts = " ".join(_split_flags(config.DEFAULT_OPTS["xrun_moco"]))
+    launch = f"""for base in "${{!XSTK_SRC[@]}}"; do
+  mapfile -t xsrc < <(printf '%s' "${{XSTK_SRC[$base]}}")
+  mapfile -t xmat < <(printf '%s' "${{XSTK_MAT[$base]}}")
+  mapfile -t ximg < <(printf '%s' "${{XSTK_IMG[$base]}}")
+  if [ "$skip_xrun" -eq 1 ]; then
+    missing=0; for m in "${{xmat[@]}}"; do [ -f "$m" ] || missing=1; done
+    [ "$missing" -eq 0 ] && continue
+  fi
+  ffs_moco -stack "$base" "${{xsrc[@]}}" -stack_matrices "${{xmat[@]}}" \\
+    -stack_aligned "${{ximg[@]}}" {opts} -device "$DEVICE"
+done"""
+    return collect, decl, launch
+
+
 def _stage_xrun(plan: Plan, script_stem: str) -> str:
     opt = plan.options
     primary = _primary_lane(plan)
@@ -2540,16 +2570,21 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
     # The aligned images the pyramid actually consumes are stage07's runmeans
     # (both lanes, one shared matrix); these -prefix outputs are alignment QC, so
     # they carry the lane that produced them. The matrix never does.
-    lin_append = _manifest_line(
-        "albatch",
-        [
-            '-base "$base"',
-            f'-source "{src_var}"',
-            '-prefix "${xstem}${LANE}_lin.nii$FMT"',
-            '-1Dmatrix_save "${xstem}.aff12.1D"',
-            *_split_flags(config.DEFAULT_OPTS["xrun"]),
-        ],
-    )
+    if opt.xrun_method == "moco":
+        lin_append, group_decl, lin_launch = _xrun_moco_stack(src_var)
+    else:
+        group_decl = ""
+        lin_launch = _batch_launch("ffs_allineate", "albatch", "skip_xrun")
+        lin_append = _manifest_line(
+            "albatch",
+            [
+                '-base "$base"',
+                f'-source "{src_var}"',
+                '-prefix "${xstem}${LANE}_lin.nii$FMT"',
+                '-1Dmatrix_save "${xstem}.aff12.1D"',
+                *_split_flags(config.DEFAULT_OPTS["xrun"]),
+            ],
+        )
     # No-fmap mode: the session's first run IS the anchor, so it gets no xrun output.
     # Emit its lane image under the xrun name so the listing covers every run.
     markers = [
@@ -2584,19 +2619,20 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
 # Batched: the loop only WRITES the manifests, then ONE ffs_allineate (and one
 # nonlinear backend) process does every run — Python/CUDA/torch.compile startup is
 # paid once instead of once per run. The nonlinear batch runs after the linear
-# one because its source is that run's linear output.
+# one because its source is that run's linear output. With -xrun_method moco the
+# linear step is instead one ffs_moco -stack per anchor (its runs as one series).
 # skip_xrun=1 → -batch_skip (skip runs whose outputs already exist).
 {lane_note}echo '== stage06: cross-run alignment =='
 LANE="{f".src-{_src(primary)}" if _src(primary) else ""}"   # lineage tag on the QC images
 albatch="{albatch}"; : > "$albatch"
 fwbatch="{fwbatch}"; : > "$fwbatch"
-{marker_block}for k in "${{RUN_KEYS[@]}}"; do
+{marker_block}{group_decl}for k in "${{RUN_KEYS[@]}}"; do
   base="${{XRUNBASE[$k]:-}}"
   [ -z "$base" ] && continue   # this run is the anchor (identity) — no xrun
   xstem="stage06.xrun.${{FRAG[$k]}}"
 {lin_append}
 {nl_append}done
-{_batch_launch("ffs_allineate", "albatch", "skip_xrun")}{nl_launch}
+{lin_launch}{nl_launch}
 {_qc_xrun(plan)}
 """
 

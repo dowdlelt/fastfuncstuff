@@ -30,6 +30,7 @@ STAGE_TOOL: dict[str, str] = {
     "blip": "blipflip",
     "b0fmap": "util_b0fmap",
     "xrun": "allineate",
+    "xrun_moco": "moco",
     "xfam": "allineate",
     "xfam_nl": "formwarp",
     # The nonlinear stages' engine is a runtime choice; this is only the default
