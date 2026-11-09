@@ -371,3 +371,51 @@ def test_split_half_ridge_shrinks_the_noisier_patch_without_repeated_runs():
     # The leak index is an upper bound: in the quiet patch the little real signal above
     # the model band dominates it (~0.27 measured); where noise dominates it is ~0.
     assert np.abs(res.split_leak[labels == 1]).max() < 0.1
+
+
+def test_runs_of_different_length_are_each_inverted_on_their_own():
+    """At one ridge strength a run's correction depends on that run alone, so a run
+    mixed with a shorter one must come out exactly as if it were processed by itself."""
+    runs, depth, labels, spec = _runs()
+    runs = [runs[0], runs[1][:, :70]]
+    kw = dict(strengths=(0.01,), pad_seconds=20, polort=1, removal="column", verbose=False)
+    both = devein_volume_runs(runs, depth, labels, spec, **kw)
+    for r, run in enumerate(runs):
+        alone = devein_volume_runs([run], depth, labels, spec, **kw)
+        assert both.corrected[r].shape == run.shape
+        torch.testing.assert_close(both.corrected[r], alone.corrected[0], rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(both.removed_psc[r], alone.removed_psc[0], rtol=1e-5, atol=1e-5)
+    assert np.isnan(both.cv_r2).all()  # held-out prediction needs a shared schedule
+
+
+def test_voxel_gains_handle_runs_of_different_length():
+    runs, truth, depth, vein, spec = _vein_runs()
+    runs[1], truth[1] = runs[1][:, :120], truth[1][:, :120]
+    labels = np.zeros(depth.size, int)
+    kw = dict(strengths=(0.001,), pad_seconds=0, polort=1, verbose=False)
+    col = devein_volume_runs(runs, depth, labels, spec, removal="column", **kw)
+    vox = devein_volume_runs(runs, depth, labels, spec, removal="voxel", **kw)
+
+    def err(res, sel):
+        out = []
+        for raw, cor, lt in zip(runs, res.corrected, truth, strict=True):
+            psc = 100 * (cor / raw.mean(-1, keepdim=True) - 1)
+            psc = psc - psc.mean(-1, keepdim=True)
+            lt = lt - lt.mean(-1, keepdim=True)
+            out.append(((psc[sel] - lt[sel].float()) ** 2).mean())
+        return float(torch.stack(out).mean())
+
+    assert [c.shape[1] for c in vox.corrected] == [160, 120, 160]
+    assert err(vox, vein) < 0.2 * err(col, vein)
+    assert np.median(vox.gains.beta[vein, 1]) > 3
+    for raw, cor in zip(runs, vox.corrected, strict=True):
+        torch.testing.assert_close(cor[depth > 0.8], raw[depth > 0.8], rtol=0, atol=0)
+
+
+def test_runs_of_different_length_refuse_a_ridge_choice():
+    runs, depth, labels, spec = _runs()
+    with pytest.raises(ValueError, match="single ridge strength"):
+        devein_volume_runs(
+            [runs[0], runs[1][:, :70]], depth, labels, spec,
+            strengths=(0.01, 0.1), removal="column", verbose=False,
+        )  # fmt: skip

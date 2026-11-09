@@ -219,7 +219,11 @@ def create_parser() -> FfsArgumentParser:
     )
     req = parser.add_argument_group("Inputs")
     req.add_argument(
-        "-input", nargs="+", required=True, help="GE-BOLD runs, one file per run, same grid"
+        "-input",
+        nargs="+",
+        required=True,
+        help="GE-BOLD runs, one file per run, same grid. Runs may differ in length "
+        "with one -ridge value and no -events (each run is inverted on its own)",
     )
     req.add_argument("-prefix", required=True, help="Output prefix")
     req.add_argument("-tr", "-TR", type=float, default=None, help="TR in seconds (default: header)")
@@ -676,21 +680,30 @@ def main(argv: list[str] | None = None) -> None:
         >= 0
     )
     cand_idx = np.flatnonzero(candidates | shell_c)
-    series, covered = [], np.ones(cand_idx.size, bool)
+    series, covered, lengths = [], np.ones(cand_idx.size, bool), []
     for i, path in enumerate(files):
         d, h = (first, header) if i == 0 else load_image(path)
         if d.ndim != 4 or tuple(d.shape[1:]) != header["shape"] or not _same_grid(header, h):
             sys.exit(f"ERROR: {path}: every run must share the first run's grid")
-        if d.shape[0] != n_t:
-            sys.exit(f"ERROR: {path}: {d.shape[0]} volumes, first run has {n_t}; "
-                     "runs must be the same length")  # fmt: skip
+        lengths.append(int(d.shape[0]))
         if args.tr is None and abs(float(h["header"].get_zooms()[3]) - tr) > 1e-5:
             sys.exit(f"ERROR: {path}: TR differs from the first run's")
-        s = d.reshape(n_t, -1)[:, cand_idx].T.contiguous()
+        s = d.reshape(d.shape[0], -1)[:, cand_idx].T.contiguous()
         covered &= (torch.isfinite(s).all(1) & (s.amin(1) > 0)).numpy()
         series.append(s)
         del d
     del first
+    if len(set(lengths)) > 1:
+        # Each run's inverse stands alone at one ridge strength; only comparing runs
+        # sample by sample (event CV, choosing between strengths) needs one length.
+        if timing is not None:
+            sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
+                     "-events scores the physiology against one schedule across runs. "
+                     "Drop -events (fixed physiology) or give runs of one length")  # fmt: skip
+        if len(args.ridge) > 1:
+            sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
+                     "choosing between several -ridge values compares runs sample by sample. "
+                     "Give one -ridge value")  # fmt: skip
     ok = np.zeros(candidates.size, bool)
     ok[cand_idx[covered]] = True
     ribbon = candidates & ok.reshape(candidates.shape)
@@ -720,7 +733,7 @@ def main(argv: list[str] | None = None) -> None:
         ijk = np.array(np.unravel_index(np.flatnonzero(mask), mask.shape)).T
         split_blocks = volume_tiles(ijk, spacing, args.ridge_cv_mm)
 
-    polort = max_polort(resolve_polort(args.polort, [n_t] * len(runs), tr, verbose=verbose))
+    polort = max_polort(resolve_polort(args.polort, lengths, tr, verbose=verbose))
     overrides = json.loads(Path(args.vascular_json).read_text()) if args.vascular_json else {}
     baselines = reference_p0()
     try:
@@ -762,7 +775,7 @@ def main(argv: list[str] | None = None) -> None:
                       f"(best in {row['patch_share']:.0%} of patches){star}")  # fmt: skip
     if verbose:
         print(
-            f"  {len(runs)} runs x {n_t} volumes, TR {tr:g} s, TE {te * 1e3:g} ms, {b0:g} T; "
+            f"  {len(runs)} runs x {'/'.join(map(str, sorted(set(lengths))))} volumes, TR {tr:g} s, TE {te * 1e3:g} ms, {b0:g} T; "
             f"{int(in_columns.sum()):,} ribbon + {int((~in_columns).sum()):,} shell voxels in "
             f"{len(np.unique(labels)):,} patches; {args.removal} removal; "
             f"target {args.target}, {args.transfer_mode} transfer, "
@@ -795,7 +808,7 @@ def main(argv: list[str] | None = None) -> None:
     for i, path in enumerate(files):
         d, h = load_image(path)
         d = d.contiguous()  # so the flat view below writes into d
-        d.view(n_t, -1)[:, flat] = result.corrected[i].T
+        d.view(lengths[i], -1)[:, flat] = result.corrected[i].T
         result.corrected[i] = torch.empty(0)
         save_image(d, f"{pfx.stem}_corrected_run-{i + 1:02d}{ext}", h)
         del d
@@ -803,8 +816,8 @@ def main(argv: list[str] | None = None) -> None:
         if args.save_fit:
             outs.append(("fit_psc", result.smooth_psc))
         for suffix, arrs in outs:
-            out = torch.zeros(n_t, *header["shape"])
-            out.view(n_t, -1)[:, flat] = arrs[i].T
+            out = torch.zeros(lengths[i], *header["shape"])
+            out.view(lengths[i], -1)[:, flat] = arrs[i].T
             save_image(out, f"{pfx.stem}_{suffix}_run-{i + 1:02d}{ext}", h)
             del out
     removed_rms = torch.cat(result.removed_psc, -1).square().mean(-1).sqrt().numpy()
