@@ -28,7 +28,12 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
 )
 from fastfuncstuff.design.hrf_modes import HRF_LIBRARY_MODES, hrf_mode_type
-from fastfuncstuff.surface.ribbon_args import add_depth_args, add_ribbon_args
+from fastfuncstuff.surface.ribbon_args import (
+    add_depth_args,
+    add_ribbon_args,
+    add_ribbon_frac_arg,
+    ribbon_frac,
+)
 
 _EPILOG = """\
 what it does
@@ -122,6 +127,7 @@ def create_parser() -> FfsArgumentParser:
 
     surf = parser.add_argument_group("Cortical ribbon")
     add_ribbon_args(surf)
+    add_ribbon_frac_arg(surf, "Its share weights it in its unit's curve and pair. ")
 
     units = parser.add_argument_group("Units")
     units.add_argument(
@@ -639,7 +645,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
-    patches = tdv.ribbon_patches(surfaces, affine, shape, coverage, args.patch_mm, device)
+    patches = tdv.ribbon_patches(
+        surfaces, affine, shape, coverage, args.patch_mm, device,
+        min_gm_fraction=ribbon_frac(args),
+    )  # fmt: skip
     depth_flat, n_units = patches.depth, patches.n_patches
     label = patches.label
     regions: list = []
@@ -799,6 +808,11 @@ def main(argv: list[str] | None = None) -> None:
         min_voxels=args.min_voxels,
         lag_step=args.pair_step,
         unit_weight=unit_weight,
+        # A ribbon voxel counts by its share in grey matter; the grown shell and the
+        # tiles are whole voxels of their own.
+        voxel_share=None
+        if patches.gm_frac is None
+        else np.where(patches.gm_frac > 0, patches.gm_frac, 1.0)[analysed],
         device=device,
         verbose=verbose,
     )

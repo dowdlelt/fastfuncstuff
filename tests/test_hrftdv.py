@@ -393,3 +393,29 @@ def test_library_screen_takes_library_shapes_and_not_ones_the_library_forbids():
     _, r2_free, _ = tdv.screen_responsive(y, free, 2, 1e-3, CPU, sign_cols=np.arange(2) * 3)
     assert resp[0] and best[0] == 0 and r2_lib[0] > 0.9
     assert r2_free[1] > r2_lib[1] + 0.2
+
+
+def test_voxel_share_lets_ribbon_edge_voxels_count_by_their_grey_matter():
+    """A fractional ribbon admits edge voxels mostly outside grey matter -- often
+    late, pial-vein-like. Each counts by its share: ten late voxels at 10% GM no
+    longer set the unit's late lag, while at full weight they do."""
+    T, n_runs = 200, 2
+    h = _hrf()
+    build = _design_for(_events(n_runs, T, seed=5), T)
+    project, _, _ = _projector(n_runs, T)
+    rng = np.random.default_rng(4)
+    lags = np.r_[np.linspace(-0.3, 0.3, 30), np.full(10, 1.2)]
+    ys = [
+        build(tdv.stretch_shift(h, DT, lag, 1.0)).numpy() @ np.array([1.0, 0.7])
+        + 0.05 * rng.standard_normal(T * n_runs)
+        for lag in lags
+    ]
+    y = project(torch.as_tensor(np.stack(ys, 1))[None])[0].float()
+    args = (y, np.zeros(40, int), np.zeros(1, int), np.stack([h]), build, project,
+            np.ones(40, bool), np.ones(40), tdv.LagGrid.make(2.5, 0.1, (1.0,)), DT)  # fmt: skip
+    kw = dict(min_voxels=8, lag_step=0.1, device=CPU, verbose=False)
+    whole = tdv.fit_hrftdv(*args, **kw).pairs[0]
+    share = np.r_[np.ones(30), np.full(10, 0.1)]
+    shared = tdv.fit_hrftdv(*args, voxel_share=share, **kw).pairs[0]
+    assert whole.late_lag > 1.0
+    assert shared.late_lag < 0.5

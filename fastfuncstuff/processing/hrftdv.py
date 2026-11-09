@@ -740,6 +740,7 @@ def fit_hrftdv(
     min_voxels: int = 8,
     lag_step: float = 0.2,
     unit_weight: np.ndarray | None = None,
+    voxel_share: np.ndarray | None = None,
     device: torch.device,
     verbose: bool = True,
 ) -> TdvResult:
@@ -751,6 +752,9 @@ def fit_hrftdv(
     replaces the responsive-only unit mean of step 2 with a weighted mean
     over every voxel, so a unit the screen barely reached still gets its own
     shape; the pair (step 4) still comes from the responsive voxels.
+    ``voxel_share`` ``(V,)`` scales each voxel in the unit mean and in the pair's
+    percentiles: a ribbon-edge voxel only partly in grey matter counts by that part
+    (``ribbon_patches(min_gm_fraction=)``), as in ffs_laminar_tdv's column profiles.
     """
     device = linalg_device(device)  # float64 throughout; Metal has none
     V = y.shape[1]
@@ -764,6 +768,8 @@ def fit_hrftdv(
         if unit_weight is None
         else np.asarray(unit_weight, np.float64)
     )
+    share = np.ones(V) if voxel_share is None else np.asarray(voxel_share, np.float64)
+    w = w * share
     sums = torch.zeros(y.shape[0], U, dtype=torch.float64)
     counts = np.bincount(unit, weights=w, minlength=U)
     resp_idx = np.flatnonzero(w > 0)
@@ -807,11 +813,12 @@ def fit_hrftdv(
     for u in range(U):
         members = order[bounds[u] : bounds[u + 1]]
         m = members[usable[members]]
-        pair = column_pair(fit.lag[m], fit.width[m], fit.r2[m], percentiles, min_voxels=min_voxels)
+        r2w = fit.r2[m] * share[m]
+        pair = column_pair(fit.lag[m], fit.width[m], r2w, percentiles, min_voxels=min_voxels)
         pairs.append(pair)
         if m.size:
             rel[members] = fit.lag[members] - weighted_percentile(
-                fit.lag[m], np.clip(fit.r2[m], 1e-6, None), 50
+                fit.lag[m], np.clip(r2w, 1e-6, None), 50
             )
     valid = [p for p in pairs if p is not None]
     if valid:
