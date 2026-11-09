@@ -638,6 +638,87 @@ def split_half_selection(
     return SplitSelection(scores, out_leak, count)
 
 
+def column_snr(
+    runs: list[torch.Tensor],
+    depth: np.ndarray,
+    labels: np.ndarray,
+    columns: ColumnProfiles,
+    blocks: np.ndarray,
+    *,
+    K: int,
+    polort: int,
+    tr: float,
+    band: tuple[float, float],
+    robust: bool,
+    in_columns: np.ndarray | None,
+    present: list[np.ndarray] | None = None,
+    repeats: int = 2,
+    seed: int = 0,
+    device: torch.device,
+) -> np.ndarray:
+    """Each valid patch's signal-to-noise ratio from two halves of its voxels.
+
+    Signal is the in-``band`` cross-power of the halves' depth profiles (what
+    both share), noise the power of their half-difference (what each has on its
+    own), both summed over depths, in-band frequencies and runs. Whole
+    ``blocks`` go to one half so neighbours that share resampled noise do not
+    read as signal. No task: every fluctuation the halves share counts. A patch
+    no split could cover gets NaN.
+    """
+    U = len(columns.unit_labels)
+    pos = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
+    use = np.ones(len(labels), bool) if in_columns is None else np.asarray(in_columns, bool)
+    sig, noi = np.zeros(U), np.zeros(U)
+    rng = np.random.default_rng(seed)
+    ids = np.unique(blocks)
+    for _ in range(repeats):
+        side = np.zeros(int(ids.max()) + 1, bool)
+        side[ids] = rng.random(ids.size) < 0.5
+        try:
+            a, b = (
+                column_profiles(
+                    runs,
+                    depth,
+                    labels,
+                    K,
+                    polort,
+                    device,
+                    use=use & (side[blocks] == want),
+                    robust=robust,
+                    present=present,
+                )  # fmt: skip
+                for want in (True, False)
+            )
+        except ValueError:  # no unit spans every depth in one half
+            continue
+        both = np.intersect1d(a.unit_labels, b.unit_labels)
+        ia, ib = np.searchsorted(a.unit_labels, both), np.searchsorted(b.unit_labels, both)
+        dst = np.array([pos[int(x)] for x in both if int(x) in pos], np.int64)
+        keep = np.array([int(x) in pos for x in both])
+        pa = (
+            a.profiles
+            if isinstance(a.profiles, list)
+            else [a.profiles[r : r + 1] for r in range(len(runs))]
+        )
+        pb = (
+            b.profiles
+            if isinstance(b.profiles, list)
+            else [b.profiles[r : r + 1] for r in range(len(runs))]
+        )
+        for ya, yb in zip(pa, pb, strict=True):
+            T = ya.shape[2]
+            f = np.fft.rfftfreq(T, tr)
+            inb = torch.as_tensor((f >= band[0]) & (f <= band[1]))
+            fa = torch.fft.rfft(ya[0, ia][keep].double(), dim=1)[:, inb]
+            fb = torch.fft.rfft(yb[0, ib][keep].double(), dim=1)[:, inb]
+            sig[dst] += (fa * fb.conj()).real.sum((1, 2)).numpy()
+            noi[dst] += ((fa - fb).abs().square() / 4).sum((1, 2)).numpy()
+    out = np.full(U, np.nan)
+    ok = noi > 0
+    out[ok] = sig[ok] / noi[ok]
+    return out
+
+
 @dataclass
 class VolumeTdvResult:
     corrected: list[torch.Tensor]  # input units, V x T per run, original means retained
@@ -650,6 +731,7 @@ class VolumeTdvResult:
     profiles: torch.Tensor | list[torch.Tensor]  # R x U x T x K (per run if ragged), GE only
     gains: VoxelGains | None = None  # removal="voxel" only; its removed/fit are above
     split_leak: np.ndarray | None = None  # V; ridge_cv="split" only
+    snr: np.ndarray | None = None  # V; ridge_snr only: the patch SNR that set its ridge
 
 
 def devein_volume_runs(
@@ -674,6 +756,8 @@ def devein_volume_runs(
     split_repeats: int = 2,
     present: list[np.ndarray] | None = None,
     voxel_weight: np.ndarray | None = None,
+    ridge_snr: float | None = None,
+    snr_band: tuple[float, float] = (0.01, 0.05),
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -719,7 +803,7 @@ def devein_volume_runs(
     V = runs[0].shape[0]
     lengths = [int(r.shape[1]) for r in runs]
     ragged = len(set(lengths)) > 1
-    if (ragged or partial) and len(strengths) > 1 and ridge_cv != "split":
+    if (ragged or partial) and len(strengths) > 1 and ridge_cv != "split" and ridge_snr is None:
         raise ValueError(
             "runs of different lengths or coverage choose between several ridge strengths "
             "by voxel halves (ridge_cv='split'); leave-one-run-out compares runs sample by sample"
@@ -743,8 +827,34 @@ def devein_volume_runs(
             frequencies = torch.zeros_like(frequencies)
         return pad, *vascular_transfer(system, frequencies, target)
 
-    scores, leak_u, unscored_np = None, None, None
-    if ridge_cv == "split" and len(strengths) > 1:
+    scores, leak_u, unscored_np, snr_v = None, None, None, None
+    if ridge_snr is not None:
+        # Wiener-like shrinkage: each patch's ridge is ridge_snr x its noise/signal
+        # ratio, so a quiet patch (little shared signal, mostly noise) is shrunk
+        # hard and corrected little, a driven one corrected fully. One global
+        # constant; the spatial variation comes from the data's own SNR.
+        assert split_blocks is not None, "ridge_snr needs split_blocks"
+        snr = column_snr(
+            runs, depth, labels, columns, split_blocks, K=K, polort=polort, tr=spec.TR,
+            band=snr_band, robust=removal == "voxel", in_columns=in_columns,
+            present=columns.present, repeats=split_repeats, device=device,
+        )  # fmt: skip
+        fallback = float(np.nanmedian(snr)) if np.isfinite(snr).any() else 1.0
+        lam = np.clip(
+            ridge_snr / np.maximum(np.where(np.isfinite(snr), snr, fallback), 1e-6), 1e-2, 1e2
+        )
+        strengths = tuple(float(x) for x in np.geomspace(1e-2, 1e2, 41))
+        pick = np.abs(np.log(lam)[None] - np.log(strengths)[:, None]).argmin(0)
+        scores = torch.zeros(len(strengths), len(lam))
+        scores[pick, np.arange(len(lam))] = 1.0
+        pos_u = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
+        unit_v = np.array([pos_u.get(int(lab), -1) for lab in labels], np.int64)
+        snr_v = np.where(unit_v >= 0, snr[np.maximum(unit_v, 0)], np.nan).astype(np.float32)
+        if verbose:
+            q = np.nanpercentile(snr, [25, 50, 75])
+            print(f"  SNR ridge: patch SNR quartiles {q[0]:.2f} {q[1]:.2f} {q[2]:.2f} -> ridge "
+                  + " ".join(f"{ridge_snr / x:.2g}" for x in q[::-1]))  # fmt: skip
+    elif ridge_cv == "split" and len(strengths) > 1:
         assert split_blocks is not None
         pad0, full0 = (0, None) if (ragged or partial) else transfer(lengths[0])[:2]
         sel = split_half_selection(
@@ -811,15 +921,17 @@ def devein_volume_runs(
             scores=scores, verbose=verbose,
         )  # fmt: skip
     leak_v = None
-    if leak_u is not None:
+    if leak_u is not None and unscored_np is not None:
         result.cv_r2[torch.as_tensor(unscored_np)] = float("nan")  # chosen by the majority
         pos_u = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
         unit_v = np.array([pos_u.get(int(lab), -1) for lab in labels], np.int64)
         leak_v = np.where(unit_v >= 0, leak_u[np.maximum(unit_v, 0)], np.nan).astype(np.float32)
-    return _finish(
+    out = _finish(
         result, runs, columns, labels, removal, gain_lambdas, device, verbose,
         means, starts, removed, smooth, diagnostics, valid, leak_v,
     )  # fmt: skip
+    out.snr = snr_v
+    return out
 
 
 def _per_run(x, r):

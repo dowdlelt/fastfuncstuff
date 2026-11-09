@@ -408,7 +408,26 @@ def create_parser() -> FfsArgumentParser:
         "-ridge_cv_repeats",
         type=int,
         default=2,
-        help="-ridge_cv split: random half assignments averaged",
+        help="-ridge_cv split / -ridge_snr: random half assignments averaged",
+    )
+    inv.add_argument(
+        "-ridge_snr",
+        type=float,
+        default=None,
+        metavar="C",
+        help="Set each patch's ridge to C x its noise/signal ratio instead of -ridge: two "
+        "halves of the patch's voxels (blocks of -ridge_snr_mm) give the signal they share "
+        "in the hemodynamic band and the noise each has alone, pooled over runs. A quiet "
+        "patch is shrunk hard and corrected little, a driven one corrected fully. No task, "
+        "no reference. On ds004539 (VASO) C ~ 3 matched VASO's flat depth lag in both "
+        "driven and quiet cortex, where no single -ridge did",
+    )
+    inv.add_argument(
+        "-ridge_snr_mm",
+        type=float,
+        default=4.0,
+        help="-ridge_snr: voxels go to a half in cubes this size; resampled data share "
+        "noise between neighbours, which would read as signal",
     )
     inv.add_argument(
         "-repeated_runs",
@@ -598,6 +617,8 @@ def main(argv: list[str] | None = None) -> None:
     timed = bool(args.onsets or args.events)
     if args.cv_p0 and not timed:
         sys.exit("ERROR: -cv_p0 scores physiologies from events: give -events or -onsets")
+    if args.ridge_snr is not None and args.ridge_snr <= 0:
+        sys.exit("ERROR: -ridge_snr must be positive")
     if args.ridge_cv == "auto":
         args.ridge_cv = "loro" if args.repeated_runs else "split"
     if len(args.ridge) > 1 and args.ridge_cv == "loro" and not args.repeated_runs:
@@ -719,7 +740,9 @@ def main(argv: list[str] | None = None) -> None:
         del d
     del first
     # Choosing a strength by voxel halves works run by run; leave-one-run-out does not.
-    each_ok = timing is None and (len(args.ridge) == 1 or args.ridge_cv == "split")
+    each_ok = timing is None and (
+        len(args.ridge) == 1 or args.ridge_cv == "split" or args.ridge_snr is not None
+    )
     coverage = args.coverage if args.coverage != "auto" else ("each" if each_ok else "all")
     if coverage == "each" and not each_ok:
         sys.exit("ERROR: -coverage each solves every run on its own voxels, which needs no "
@@ -733,7 +756,7 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
                      "-events scores the physiology against one schedule across runs. "
                      "Drop -events (fixed physiology) or give runs of one length")  # fmt: skip
-        if len(args.ridge) > 1 and args.ridge_cv != "split":
+        if len(args.ridge) > 1 and args.ridge_cv != "split" and args.ridge_snr is None:
             sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
                      "choosing between -ridge values across runs compares them sample by sample. "
                      "Use -ridge_cv split, or one -ridge value")  # fmt: skip
@@ -771,11 +794,12 @@ def main(argv: list[str] | None = None) -> None:
     # Shell voxels never build columns, so only the ribbon's shares matter here.
     voxel_weight = None if gm_frac_vol is None else np.where(in_columns, gm_frac_vol[mask], 1.0)
     split_blocks = None
-    if args.ridge_cv == "split" and len(args.ridge) > 1:
+    if args.ridge_snr is not None or (args.ridge_cv == "split" and len(args.ridge) > 1):
         from fastfuncstuff.processing.hrftdv import volume_tiles
 
         ijk = np.array(np.unravel_index(np.flatnonzero(mask), mask.shape)).T
-        split_blocks = volume_tiles(ijk, spacing, args.ridge_cv_mm)
+        tile = args.ridge_snr_mm if args.ridge_snr is not None else args.ridge_cv_mm
+        split_blocks = volume_tiles(ijk, spacing, tile)
 
     polort = max_polort(resolve_polort(args.polort, lengths, tr, verbose=verbose))
     overrides = json.loads(Path(args.vascular_json).read_text()) if args.vascular_json else {}
@@ -843,6 +867,7 @@ def main(argv: list[str] | None = None) -> None:
         gain_lambdas=tuple(args.gain_lambdas),
         ridge_cv=args.ridge_cv,
         split_blocks=split_blocks,
+        ridge_snr=args.ridge_snr,
         split_repeats=args.ridge_cv_repeats,
         present=present,
         voxel_weight=voxel_weight,
@@ -885,6 +910,8 @@ def main(argv: list[str] | None = None) -> None:
         bricks["gain_cv"] = result.gains.cv_gain
     if result.split_leak is not None:
         bricks["split_leak"] = result.split_leak
+    if result.snr is not None:
+        bricks["snr"] = result.snr
     if cv is not None and columns is not None:
         patch_r2, patch_best = np.zeros(len(depth), np.float32), np.zeros(len(depth), np.float32)
         r2 = cv.patch_r2

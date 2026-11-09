@@ -584,3 +584,46 @@ def test_split_half_ridge_works_run_by_run():
     assert loud >= 10 * quiet, (quiet, loud)
     assert np.isfinite(res.cv_r2).all() and (res.cv_r2 < 1).all()
     torch.testing.assert_close(res.corrected[1][:6], runs[1][:6], rtol=0, atol=0)
+
+
+def test_snr_ridge_shrinks_each_patch_by_its_own_noise():
+    """-ridge_snr: one constant, each patch's ridge set by its noise/signal ratio.
+
+    Two patches carry the same signal under 3x different noise (9x the power):
+    the noisy one reads a lower SNR from its voxel halves and takes a
+    proportionally stronger ridge, with runs of different length and coverage.
+    """
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+
+    K, n = 3, 90
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 2 * n // 3)
+    labels = np.repeat([0, 1], n)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    noise = torch.from_numpy(np.repeat([0.03, 0.09], n))[:, None]  # SNR ~24 and ~3: unclipped
+    torch.manual_seed(4)
+    runs = []
+    for T in (160, 130):
+        freq = torch.fft.rfftfreq(T, spec.TR)
+        h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+        a = torch.randn(T, K, dtype=torch.float64) * 0.004
+        a = torch.fft.irfft(
+            torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+        psc = read @ y.T + noise * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+    present = [np.ones(depth.size, bool), np.ones(depth.size, bool)]
+    present[1][:6] = False
+    runs[1][torch.from_numpy(~present[1])] = 0
+    res = devein_volume_runs(
+        runs, depth, labels, spec, pad_seconds=0, polort=1, ridge_snr=3.0,
+        split_blocks=np.arange(depth.size), split_repeats=4, present=present, verbose=False,
+    )  # fmt: skip
+    assert res.snr is not None
+    quiet_snr, loud_snr = np.nanmedian(res.snr[labels == 0]), np.nanmedian(res.snr[labels == 1])
+    quiet, loud = res.regularization[labels == 0][0], res.regularization[labels == 1][0]
+    assert loud_snr < quiet_snr / 3, (quiet_snr, loud_snr)
+    # The ridge follows 3 / SNR on the log grid (41 steps over four decades).
+    np.testing.assert_allclose(loud / quiet, quiet_snr / loud_snr, rtol=0.3)
+    torch.testing.assert_close(res.corrected[1][:6], runs[1][:6], rtol=0, atol=0)
