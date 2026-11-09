@@ -95,21 +95,28 @@ def test_overlap_is_one_without_a_footprint():
     assert A._footprint_overlap(_setup(None), (10, 6, 6), _shift()) == 1.0
 
 
-def _run(monkeypatch, shifts, **cfg_kw):
-    """Run allineate with _align mocked to return a scripted sequence of poses."""
-    calls = []
+def _run(monkeypatch, shifts, scores=None, **cfg_kw):
+    """Run allineate with _align mocked to return a scripted sequence of poses.
+
+    ``scores``: what the common-yardstick closure returns, as a function of the
+    matrices it is asked about (None -> the closure is absent, as for non-blok costs).
+    """
+    calls, ranges = [], []
 
     def fake_align(base, source, config, bh, sh, *a):
         i = len(calls)
         calls.append(config.init_matrix)
+        ranges.append(config.range_scale)
         a[-1]["footprint_overlap"] = 0.5  # the info dict
+        if scores is not None:
+            a[-1]["score"] = scores
         return _shift(dx=shifts[min(i, len(shifts) - 1)]), source
 
     monkeypatch.setattr(A, "_align", fake_align)
     cfg = A.AffineAlignConfig(device="cpu", verb=0, **cfg_kw)
     base, src = torch.zeros(4, 4, 4), torch.zeros(4, 4, 4)
     matrix, _ = A.allineate(base, src, cfg, base_header=HDR, source_header=HDR)
-    return calls, matrix
+    return (calls, matrix, ranges) if scores is not None else (calls, matrix)
 
 
 def test_loop_stops_once_the_source_stops_moving(monkeypatch):
@@ -128,3 +135,47 @@ def test_loop_is_capped_when_it_never_settles(monkeypatch):
 def test_loop_off_runs_once(monkeypatch):
     calls, _ = _run(monkeypatch, [0.0, 5.0], reanchor="off")
     assert len(calls) == 1
+
+
+def _better_by_x(mats):
+    """A yardstick that likes larger x-shifts, so every pass looks like a gain."""
+    return [float(m[0, 3]) + 1.0 for m in mats]
+
+
+def test_later_passes_search_a_shrinking_range(monkeypatch):
+    # The user's range must not compound: each pass is centred on the last fit.
+    _, _, ranges = _run(monkeypatch, [0, 10, 20, 30], scores=_better_by_x, range_scale=0.25)
+    assert ranges == [0.25, 0.125, 0.0625, 0.03125]
+
+
+def test_pass_is_dropped_when_the_common_yardstick_says_no_gain(monkeypatch):
+    # Pose 8 scores worse than pose 0 on the common yardstick: keep the first fit.
+    calls, matrix, _ = _run(
+        monkeypatch, [0.0, 8.0, 16.0], scores=lambda mats: [1.0, 0.5], reanchor_passes=3
+    )
+    assert len(calls) == 2  # the first fit and one rejected pass, then it stops
+    assert float(matrix[0, 3]) == pytest.approx(0.0)
+
+
+def test_noise_gain_from_a_weak_fit_does_not_count(monkeypatch):
+    # 0.017 -> 0.0175 is what a wrong-cost fit does between passes: still weak, drop it.
+    calls, matrix, _ = _run(monkeypatch, [0.0, 8.0, 16.0], scores=lambda mats: [0.017, 0.0175])
+    assert len(calls) == 2
+    assert float(matrix[0, 3]) == pytest.approx(0.0)
+
+
+def test_a_weak_fit_that_finds_the_peak_is_followed(monkeypatch):
+    # A start far from the data: weak at first, then the footprint finds the real peak.
+    seq = iter([[0.04, 0.5], [0.5, 0.9], [0.9, 0.95]])
+    calls, matrix, _ = _run(
+        monkeypatch, [0.0, 8.0, 12.0, 12.1], scores=lambda mats: next(seq), reanchor_passes=3
+    )
+    assert len(calls) == 4
+    assert float(matrix[0, 3]) == pytest.approx(12.1)
+
+
+def test_weak_fit_warning_names_the_lpc_contrast_trap():
+    assert A._weak_fit_warning("lpa", 0.5) is None
+    msg = A._weak_fit_warning("lpc", 0.02)
+    assert "INVERSE contrast" in msg and "-cost lpa" in msg
+    assert "INVERSE" not in A._weak_fit_warning("lpa", 0.02)

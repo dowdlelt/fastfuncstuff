@@ -3428,25 +3428,124 @@ def allineate(
         voxdims = _voxdims_from_header(base_header)
         for k in range(config.reanchor_passes):
             init = voxel_matrix_to_dicom(matrix, base_header["affine"], source_header["affine"])
+            # Each pass searches around the LAST fit, so the user's range would compound:
+            # three passes of -verysmallrange can wander three ranges from the headers (a
+            # wrong-cost run moved the source 16, 23 and 8 mm). Halve the range every pass,
+            # so the total stays under twice what was asked for.
+            pass_info: dict = {}
             nxt, nxt_warped = _align(
                 base,
                 source,
-                replace(config, init_matrix=init.detach().cpu().numpy()),
+                replace(
+                    config,
+                    init_matrix=init.detach().cpu().numpy(),
+                    range_scale=config.range_scale / 2 ** (k + 1),
+                ),
                 base_header,
                 source_header,
                 None,
                 None,
                 None,
                 None,
-                {},
+                pass_info,
             )
             moved = _corner_motion_mm(matrix, nxt, tuple(source.shape), voxdims)
+            # Only keep a pass that scores better on ONE set of match points: each fit's
+            # own cost sits on its own domain, and re-anchoring moves the domain.
+            scores = pass_info["score"]([matrix, nxt]) if "score" in pass_info else None
+            # From a weak fit (no local correlation yet) a pass counts only if it climbs out
+            # of the weak range and doubles: noise moves a wrong-cost fit 0.0172 -> 0.0175,
+            # while a start far from the data that finds the real peak goes 0.04 -> 0.5.
+            # Above it, any gain over 0.1% counts.
+            needed = (
+                max(2.0 * scores[0], _WEAK_FIT_COST)
+                if scores is not None and abs(scores[0]) < _WEAK_FIT_COST
+                else (scores[0] + 1e-3 * max(abs(scores[0]), 1e-3) if scores is not None else 0.0)
+            )
+            if scores is not None and scores[1] < needed:
+                if config.verb >= 1:
+                    print(
+                        f"  Re-anchor pass {k + 1}: no gain on a common yardstick "
+                        f"({scores[0]:.4f} -> {scores[1]:.4f}, moved {moved:.2f} mm); "
+                        "keeping the previous fit"
+                    )
+                break
             matrix, warped = nxt, nxt_warped
             if config.verb >= 1:
-                print(f"  Re-anchor pass {k + 1}: source corners moved {moved:.2f} mm")
+                gain = f", yardstick {scores[0]:.4f} -> {scores[1]:.4f}" if scores else ""
+                print(f"  Re-anchor pass {k + 1}: source corners moved {moved:.2f} mm{gain}")
             if moved < config.reanchor_tol_mm:
                 break
         return matrix, warped
+
+
+def _common_scores(
+    setup: _GridSetup, source: Tensor, matrices: list[Tensor], max_points: int = 200_000
+) -> list[float] | None:
+    """Score several fits on ONE set of match points, so they can be compared.
+
+    Each fit's own cost is computed on the domain it was fitted on, and those domains
+    differ (two fits 0.1 mm apart printed 1.02 and 1.19). The domain here is the brain
+    inside the union of every fit's field of view, with one blok lattice, so a pose
+    that covers less of it is penalised the same way for all of them. Higher is better.
+    Only the blok costs have this sampled form; others return None.
+
+    ``matrices`` map base voxels to native source voxels, like the fit's own result.
+    """
+    ctx = setup.ctx
+    if ctx.name not in _BLOK_COSTS or ctx.blokrad_mm is None or setup.brain_weight is None:
+        return None
+    device = setup.base.device
+    footprints = [
+        _compute_source_validity_mask(tuple(source.shape), tuple(setup.base.shape), m.to(device))
+        for m in matrices
+    ]
+    union = footprints[0]
+    for fp in footprints[1:]:
+        union = union | fp
+    w = setup.brain_weight * union.to(setup.brain_weight.dtype)
+    idx = (w > 0).nonzero(as_tuple=False)
+    if idx.shape[0] < 2000:
+        return None
+    if idx.shape[0] > max_points:
+        g = torch.Generator(device="cpu").manual_seed(5)
+        idx = idx[torch.randperm(idx.shape[0], generator=g)[:max_points].to(device)]
+    z, y, x = idx[:, 0], idx[:, 1], idx[:, 2]
+    points_xyz = idx.flip(-1).to(torch.float32)
+    coords_mm = points_xyz * torch.tensor(ctx.base_voxdims, dtype=torch.float32, device=device)
+    blokset = assign_bloks_points(coords_mm, ctx.bloktype, ctx.blokrad_mm, device=device)
+    cost_fn = _batched_sampled_cost(
+        source.to(device).to(torch.float32),
+        points_xyz,
+        setup.base[z, y, x],
+        w[z, y, x],
+        blokset,
+        ctx,
+    )
+    stacked = torch.stack([m.to(device).to(torch.float32) for m in matrices])
+    with torch.no_grad():
+        return [float(c) for c in cost_fn(stacked).cpu()]
+
+
+# Below this a fit has essentially no local correlation: every good fit seen so far reads
+# 0.3-1.2, and a fit to the wrong contrast reads ~0.01-0.02.
+_WEAK_FIT_COST = 0.05
+
+
+def _weak_fit_warning(cost_name: str, score: float) -> str | None:
+    if score >= _WEAK_FIT_COST:
+        return None
+    hint = (
+        " lpc expects INVERSE contrast (e.g. T2* EPI against a T1); a pair with the same "
+        "contrast (T1w against T1w, MP2RAGE, VASO) wants -cost lpa."
+        if cost_name == "lpc"
+        else ""
+    )
+    return (
+        f"  WARNING: local correlation at the fit is only {score:.3f} (good fits read 0.3 or "
+        f"more): the fit has found little shared structure. Wrong -cost, a start too far "
+        f"from the data, or nothing in common to align.{hint}"
+    )
 
 
 def _footprint_overlap(setup: _GridSetup, source_shape: tuple[int, ...], matrix: Tensor) -> float:
@@ -3870,6 +3969,11 @@ def _align(
         )
         if verb >= 1 and setup.start_footprint is not None:
             print(f"  Footprint overlap (fitted vs sampled): {info['footprint_overlap']:.2f}")
+        info["score"] = lambda mats, st=setup, src=source_native: _common_scores(st, src, mats)
+    if verb >= 1 and cost_name in _BLOK_COSTS:
+        own = _common_scores(setup, source_native, [final_matrix])
+        if own is not None and (msg := _weak_fit_warning(cost_name, abs(own[0]))):
+            print(msg)
 
     if movie is not None:
         # The matrix the output is resampled with, so this frame IS the saved volume
