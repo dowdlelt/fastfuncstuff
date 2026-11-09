@@ -227,3 +227,24 @@ def test_meshes_without_a_subject_match_the_subject_and_take_edits(tmp_path):
                        volume_info=_volume_info())  # fmt: skip
     with pytest.raises(SystemExit, match="not the same mesh"):
         main([*lh[:2], "-pial_mesh", str(other), "-prefix", str(tmp_path / "x"), *run])
+
+
+def test_ribbon_frac_keeps_the_voxels_the_ribbon_clips(tmp_path):
+    """By default a voxel is GM when >= 10% of it lies between white and pial: the
+    centre-rule set plus the edge voxels it drops, with P_gm_frac holding each
+    share; -ribbon_frac 0 is the old rule and writes no gm_frac."""
+    subj, master = _subject(tmp_path)
+    run = ["-fs_subj", str(subj), "-master", str(master), "-device", "cpu", "-quiet"]
+    assert main([*run, "-prefix", str(tmp_path / "frac")]) == 0
+    assert main([*run, "-prefix", str(tmp_path / "ctr"), "-ribbon_frac", "0"]) == 0
+    frac = np.asarray(nib.load(f"{tmp_path / 'frac'}_rim.nii.gz").dataobj) == 3
+    ctr = np.asarray(nib.load(f"{tmp_path / 'ctr'}_rim.nii.gz").dataobj) == 3
+    share = np.asarray(nib.load(f"{tmp_path / 'frac'}_gm_frac.nii.gz").dataobj)
+    assert not (tmp_path / "ctr_gm_frac.nii.gz").exists()
+    assert (ctr & ~frac).sum() == 0 and (frac & ~ctr).sum() > 0.05 * ctr.sum()
+    assert share[frac].min() >= 0.1 - 1e-6 and share[~frac].max() == 0
+    # The added voxels are the ribbon's edges: mostly not in it.
+    assert np.median(share[frac & ~ctr]) < 0.5 < np.median(share[ctr])
+    # Their depth is measured at their GM part, so it stays inside [0, 1].
+    m = np.asarray(nib.load(f"{tmp_path / 'frac'}_metric_equidist.nii.gz").dataobj)[frac]
+    assert 0 <= m.min() and m.max() <= 1

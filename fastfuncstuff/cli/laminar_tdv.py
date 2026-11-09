@@ -33,7 +33,7 @@ from fastfuncstuff.cli_utils import (
     add_round_onsets_arguments,
     add_verbose_arg,
 )
-from fastfuncstuff.surface.ribbon_args import add_ribbon_args
+from fastfuncstuff.surface.ribbon_args import add_ribbon_args, add_ribbon_frac_arg, ribbon_frac
 
 _EPILOG = """\
 what it does
@@ -281,16 +281,7 @@ def create_parser() -> FfsArgumentParser:
         "pial, where pial veins sit), each with its nearest ribbon voxel's column and "
         "depth. Voxel removal only; 0 = ribbon only",
     )
-    surf.add_argument(
-        "-ribbon_frac",
-        type=float,
-        default=0.1,
-        metavar="F",
-        help="A voxel joins the ribbon when at least this share of it lies between "
-        "white and pial (64 points per voxel), so voxels the ribbon only clips, on the "
-        "pial or the WM side, are kept. Its depth and column are measured at its GM part "
-        "and its share weights it in the column profiles. 0 = the old voxel-centre rule",
-    )
+    add_ribbon_frac_arg(surf, "Its share weights it in the column profiles. ")
     surf.add_argument(
         "-coverage",
         choices=["auto", "each", "all"],
@@ -722,7 +713,7 @@ def main(argv: list[str] | None = None) -> None:
         xyz = header["shape"][::-1]
         patches = ribbon_patches(
             surfaces, header["affine"], xyz, np.ones(xyz, bool), args.patch_mm, device,
-            min_gm_fraction=args.ribbon_frac or None,
+            min_gm_fraction=ribbon_frac(args),
         )  # fmt: skip
         if patches.gm_frac is not None:
             gm_frac_vol = np.ascontiguousarray(patches.gm_frac.reshape(xyz).T)

@@ -45,6 +45,33 @@ def add_ribbon_args(group, *, hemi: bool = True) -> None:
     )
 
 
+RIBBON_FRAC_DEFAULT = 0.1
+
+
+def add_ribbon_frac_arg(group, what: str = "") -> None:
+    """``-ribbon_frac``: ribbon membership by a voxel's share in the ribbon (see
+    ``cortical_depth_volumes(min_gm_fraction=)``). ``what`` adds the tool's own use."""
+    group.add_argument(
+        "-ribbon_frac",
+        type=float,
+        default=RIBBON_FRAC_DEFAULT,
+        metavar="F",
+        help="A voxel joins the ribbon when at least this share of it lies between "
+        "white and pial (64 points per voxel), so voxels the ribbon only clips, on the "
+        "pial or the WM side, are kept and the ribbon has no holes at its edges. Its "
+        "depth and column are measured at its GM part. " + what + "0 = the voxel-centre "
+        "rule (several times faster on a fine whole-brain grid)",
+    )
+
+
+def ribbon_frac(args) -> float | None:
+    """``-ribbon_frac`` as ``min_gm_fraction``: None for 0 (the voxel-centre rule)."""
+    value = float(getattr(args, "ribbon_frac", 0.0) or 0.0)
+    if not 0 <= value <= 1:
+        raise SystemExit("-ribbon_frac must be between 0 and 1")
+    return value or None
+
+
 def add_depth_args(group, *, interp: bool = True, ribbon: bool = True) -> None:
     """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_smooth -depth_interp``.
 

@@ -169,9 +169,12 @@ class DepthVolumes:
         return self._dense(np.int16(value), dtype=np.int16)
 
     def outputs(self) -> Iterator[tuple[str, np.ndarray]]:
-        """``(LN2_LAYERS file tag, volume)``, built one at a time."""
+        """``(LN2_LAYERS file tag, volume)``, built one at a time; with the fractional
+        ribbon also ``gm_frac``, each voxel's share inside the ribbon."""
         for tag in OUTPUT_TAGS:
             yield tag, getattr(self, tag.replace("midGM", "mid_gm"))
+        if self.gm_frac is not None:
+            yield "gm_frac", self._dense(self.gm_frac)
 
     def thick_clusters(
         self, affine: np.ndarray, top: int | None = 5
@@ -467,9 +470,9 @@ def cortical_depth_volumes(
     owner = np.zeros(shape, np.int8)
     wm = np.zeros(shape, bool)
     n_overlap = 0
-    frac_vol, centroid = None, None
+    kept = None  # fractional ribbon: (sorted flat index, GM share, GM-centroid offset)
     if min_gm_fraction is not None:
-        owner, wm, frac_vol, centroid, n_overlap = _fractional_ribbon(
+        owner, wm, kept, n_overlap = _fractional_ribbon(
             surfaces, affine, shape, min_gm_fraction, supersample, device
         )
         log(f"fractional ribbon ({supersample}^3 points per voxel, >= {min_gm_fraction:g})")
@@ -503,8 +506,8 @@ def cortical_depth_volumes(
             log(f"{s.name}: not in the region, {idx.size:,} GM voxels dropped unmeasured")
             continue
         ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
-        if centroid is not None:
-            ijk += centroid[idx]
+        if kept is not None:
+            ijk += _kept_at(kept, idx)[1]
         pts = ijk @ affine[:3, :3].T + affine[:3, 3]
         del ijk
         cw = MeshDistance(s.white, s.faces, k)(pts, device, brick_mm=brick_mm)
@@ -521,8 +524,8 @@ def cortical_depth_volumes(
         idx_t = torch.as_tensor(idx, device=device)
         if owners:
             ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
-            if centroid is not None:
-                ijk += centroid[idx]
+            if kept is not None:
+                ijk += _kept_at(kept, idx)[1]
             pts = ijk @ affine[:3, :3].T + affine[:3, 3]
             near = MeshDistance(0.5 * (s.white + s.pial), s.faces, k)(
                 pts, device, brick_mm=brick_mm
@@ -566,8 +569,10 @@ def cortical_depth_volumes(
                 )
         vol_w = (
             None
-            if frac_vol is None
-            else torch.as_tensor(frac_vol[idx_t.cpu().numpy()], device=device, dtype=rho.dtype)
+            if kept is None
+            else torch.as_tensor(
+                _kept_at(kept, idx_t.cpu().numpy())[0], device=device, dtype=rho.dtype
+            )
         )
         equivol, rounds = volume_quantile_depth(
             rho, face, bary, s.faces, len(s.white), column_voxels, rounds=rounds, weight=vol_w
@@ -633,7 +638,7 @@ def cortical_depth_volumes(
         n_overlap=n_overlap,
         owner_hemi=host(owner_h) if owners else None,
         owner_vertex=host(owner_v) if owners else None,
-        gm_frac=None if frac_vol is None else frac_vol[host(gm_idx)],
+        gm_frac=None if kept is None else _kept_at(kept, host(gm_idx))[0],
     )
 
 
@@ -642,52 +647,87 @@ def _fractional_ribbon(surfaces, affine, shape, min_frac, s, device):
 
     Returns the owner volume (h + 1 / 0, as the centre rule builds it), the WM
     volume (most of the voxel inside a white surface: what rim borders call WM),
-    the flat GM fraction, each voxel's GM-centroid offset from its centre in
-    voxel units (flat, ``(N, 3)``), and the count of voxels two hemispheres share.
+    the kept voxels sparse -- ``(sorted flat index, GM share, GM-centroid offset
+    from the centre in voxel units)``, read with :func:`_kept_at` -- and the count
+    of voxels two hemispheres share. Dense, the centroids alone were ~10 GB of a
+    0.2 mm whole-brain grid.
+
+    The ``s``-times-finer grid is filled and reduced one x-chunk at a time, on the
+    device: rays run along z, so an x range is independent of the rest. Held whole
+    and reduced in numpy it was 75% of a 0.5 mm whole-brain run (48 of 64 s) and
+    would have been ~40 GB per fill at 0.2 mm.
     """
     nx, ny, nz = shape
     sub = np.eye(4)
     sub[:3, :3] /= s
     sub[:3, 3] = -(s - 1) / (2 * s)  # sub-point centres tile the voxel
-    fine_aff, fine = affine @ sub, (nx * s, ny * s, nz * s)
-    offs = (np.arange(s) - (s - 1) / 2) / s
-    white = np.zeros(fine, bool)
-    for surf in surfaces:
-        white |= winding_number(surf.white, surf.faces, fine_aff, fine, device) > 0
-    wm = white.reshape(nx, s, ny, s, nz, s).mean(axis=(1, 3, 5)) > 0.5
-    total = np.zeros(shape, np.float32)
-    best = np.zeros(shape, np.float32)
+    offs = torch.as_tensor((np.arange(s) - (s - 1) / 2) / s, device=device, dtype=torch.float64)
     owner = np.zeros(shape, np.int8)
-    centroid = np.zeros((*shape, 3), np.float32)
-    touched = np.zeros(shape, np.int8)
-    for h, surf in enumerate(surfaces):
-        gm = winding_number(surf.pial, surf.faces, fine_aff, fine, device) > 0
-        gm &= ~white
-        g = gm.reshape(nx, s, ny, s, nz, s)
-        del gm
-        count = g.sum(axis=(1, 3, 5), dtype=np.int32)
-        frac = count / float(s**3)
-        mine = frac > best
-        cnt = np.maximum(count, 1)
-        cx = (g.sum(axis=(3, 5), dtype=np.int32) * offs[None, :, None, None]).sum(1) / cnt
-        cy = (g.sum(axis=(1, 5), dtype=np.int32) * offs[None, None, :, None]).sum(2) / cnt
-        cz = (g.sum(axis=(1, 3), dtype=np.int32) * offs[None, None, None, :]).sum(3) / cnt
-        del g
-        centroid[mine] = np.stack([cx, cy, cz], -1)[mine]
-        owner[mine] = h + 1
-        best[mine] = frac[mine]
-        total += frac
-        touched += count > 0
-    del white
-    keep = total >= min_frac
-    owner[~keep] = 0
-    return (
-        owner,
-        wm & ~keep,
-        np.minimum(total, 1.0).reshape(-1),
-        centroid.reshape(-1, 3).astype(np.float64),
-        int(((touched > 1) & keep).sum()),
+    wm = np.zeros(shape, bool)
+    idx_parts, frac_parts, cen_parts = [], [], []
+    n_overlap = 0
+    # Per coarse x-plane: the int8 fill on the host and on the device, two bool
+    # masks, and the int32 partial sums over one sub-axis.
+    per_plane = ny * nz * s**3 * 8
+    avail = min(
+        get_available_memory(device, empty_cache=False), get_available_memory(torch.device("cpu"))
     )
+    # A quarter: winding_number sizes its own int16 buffers from what is left.
+    step = int(max(1, min(nx, avail // 4 // max(per_plane, 1))))
+    for x0 in range(0, nx, step):
+        x1 = min(nx, x0 + step)
+        xc = x1 - x0
+        shift = np.eye(4)
+        shift[0, 3] = x0
+        chunk_aff, fine = affine @ shift @ sub, (xc * s, ny * s, nz * s)
+
+        def fill(vertices, faces, chunk_aff=chunk_aff, fine=fine):
+            w = winding_number(vertices, faces, chunk_aff, fine, device)
+            return torch.as_tensor(w, device=device) > 0
+
+        white = torch.zeros(fine, dtype=torch.bool, device=device)
+        for surf in surfaces:
+            white |= fill(surf.white, surf.faces)
+        wm_c = white.view(xc, s, ny, s, nz, s).sum((1, 3, 5), dtype=torch.int32) * 2 > s**3
+        total = torch.zeros((xc, ny, nz), dtype=torch.float64, device=device)
+        best = torch.zeros_like(total)
+        own = torch.zeros((xc, ny, nz), dtype=torch.int8, device=device)
+        cen = torch.zeros((xc, ny, nz, 3), dtype=torch.float64, device=device)
+        touched = torch.zeros((xc, ny, nz), dtype=torch.int8, device=device)
+        for h, surf in enumerate(surfaces):
+            g = (fill(surf.pial, surf.faces) & ~white).view(xc, s, ny, s, nz, s)
+            count = g.sum((1, 3, 5), dtype=torch.int32)
+            cnt = count.clamp_min(1).double()
+            cx = (g.sum((3, 5), dtype=torch.int32) * offs[None, :, None, None]).sum(1) / cnt
+            cy = (g.sum((1, 5), dtype=torch.int32) * offs[None, None, :, None]).sum(2) / cnt
+            cz = (g.sum((1, 3), dtype=torch.int32) * offs[None, None, None, :]).sum(3) / cnt
+            del g
+            frac = count.double() / float(s**3)
+            mine = frac > best
+            cen[mine] = torch.stack([cx, cy, cz], -1)[mine]
+            own[mine] = h + 1
+            best = torch.where(mine, frac, best)
+            total += frac
+            touched += (count > 0).to(torch.int8)
+        del white
+        keep = total >= min_frac
+        owner[x0:x1] = torch.where(keep, own, 0).cpu().numpy()
+        wm[x0:x1] = (wm_c & ~keep).cpu().numpy()
+        n_overlap += int(((touched > 1) & keep).sum())
+        local = keep.reshape(-1).nonzero().squeeze(1)
+        idx_parts.append(local.cpu().numpy() + x0 * ny * nz)  # C-order (X, Y, Z) flat
+        frac_parts.append(total.clamp_max(1.0).reshape(-1)[local].float().cpu().numpy())
+        cen_parts.append(cen.reshape(-1, 3)[local].cpu().numpy())
+    kept = (np.concatenate(idx_parts), np.concatenate(frac_parts), np.concatenate(cen_parts))
+    return owner, wm, kept, n_overlap
+
+
+def _kept_at(kept, idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """GM share and GM-centroid offset of fractional-ribbon voxels ``idx`` (flat,
+    every one of them kept)."""
+    order, frac, cen = kept
+    pos = np.searchsorted(order, idx)
+    return frac[pos], cen[pos]
 
 
 def regrid(
@@ -752,12 +792,14 @@ def export_depth_volumes(
     thick_limit: float = 6.0,
     device: torch.device | None = None,
     verbose: bool = False,
+    min_gm_fraction: float | None = 0.1,
 ) -> tuple[DepthVolumes, np.ndarray, list[str]]:
     """Grid from a master, compute, and write ``{stem}_{tag}{ext}`` for every output.
 
     The whole of ffs_util_surf2layers below its argument parsing, shared with the
     viewer's export so the two cannot drift. Returns ``(volumes, grid affine,
-    written paths)``.
+    written paths)``. ``min_gm_fraction``: the fractional ribbon (see
+    :func:`cortical_depth_volumes`), None for the voxel-centre rule.
     """
     from pathlib import Path
 
@@ -785,6 +827,7 @@ def export_depth_volumes(
         thick_limit=thick_limit,
         device=device,
         verbose=verbose,
+        min_gm_fraction=min_gm_fraction,
     )
     if out.n_gm == 0:
         raise ValueError("no GM voxel centres on this grid: is the master aligned to the anat?")
@@ -1032,6 +1075,7 @@ def export_roi_depth_volumes(
     notes: list[str] | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
+    min_gm_fraction: float | None = 0.1,
 ) -> list[RoiDepthResult]:
     """:func:`export_depth_volumes` for one region at a time, each on its own crop.
 
@@ -1114,6 +1158,7 @@ def export_roi_depth_volumes(
             thick_limit=thick_limit,
             device=device,
             verbose=verbose,
+            min_gm_fraction=min_gm_fraction,
         )
         if out.n_gm == 0:
             raise ValueError(

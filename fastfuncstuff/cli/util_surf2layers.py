@@ -20,7 +20,7 @@ import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser
 from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
-from fastfuncstuff.surface.ribbon_args import add_ribbon_args
+from fastfuncstuff.surface.ribbon_args import add_ribbon_args, add_ribbon_frac_arg, ribbon_frac
 
 _DESCRIPTION = """\
 LN2_LAYERS's outputs computed directly from a FreeSurfer subject's white and pial
@@ -55,7 +55,10 @@ the region as a mask), named as LN2_LAYERS names them:
   P_metric_equidist  P_layers_equidist  P_midGM_equidist
   P_metric_equivol   P_layers_equivol   P_midGM_equivol
   P_thickness        d_white + d_pial, mm
-Metric is 0 at WM, 1 at CSF; layer 1 is deepest.
+  P_gm_frac          each GM voxel's share inside the ribbon (-ribbon_frac, on by default)
+Metric is 0 at WM, 1 at CSF; layer 1 is deepest. A voxel joins the ribbon when at
+least -ribbon_frac (0.1) of it lies in GM, so the ribbon's edge voxels are not lost;
+its depth is measured at the GM part of the voxel.
 
 GM thicker than -thick_warn (default 6 mm) is reported with the scanner-RAS
 centroids of its clusters -- almost always pial on dura or a sinus, worth a look.
@@ -89,6 +92,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     s = p.add_argument_group("surfaces and layers")
     add_ribbon_args(s)
+    add_ribbon_frac_arg(
+        s,
+        "Every output then covers these voxels (rim, metric, layers, midGM, thickness), "
+        "and P_gm_frac holds each one's share. Measured whole-brain at 0.3 mm: 82 s and "
+        "4.7 GB against 12 s and 2.6 GB. ",
+    )
     s.add_argument("-nr_layers", type=int, default=3, help="Number of layers (3)")
     s.add_argument(
         "-column_voxels",
@@ -264,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
             thick_limit=args.thick_warn,
             device=device,
             verbose=verbose,
+            min_gm_fraction=ribbon_frac(args),
         )
     except ValueError as err:
         raise SystemExit(f"ffs_util_surf2layers: {err}") from err
@@ -316,6 +326,7 @@ def _roi_main(args, surfaces, affine, shape, stem, ext, device, verbose, t0) -> 
             thick_limit=args.thick_warn,
             device=device,
             verbose=verbose,
+            min_gm_fraction=ribbon_frac(args),
         )
     except (OSError, ValueError) as err:
         raise SystemExit(f"ffs_util_surf2layers: {err}") from err
