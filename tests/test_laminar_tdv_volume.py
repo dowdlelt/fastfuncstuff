@@ -491,3 +491,54 @@ def test_cli_corrects_each_run_where_it_saw_the_voxel(tmp_path):
     assert not torch.equal(each0[v], raw0[v])  # run 1 saw it: corrected
     torch.testing.assert_close(each1[v], raw1[v], rtol=0, atol=0)  # run 2 did not
     torch.testing.assert_close(all0[v], raw0[v], rtol=0, atol=0)  # -coverage all: neither
+
+
+def test_a_deep_voxels_late_response_is_not_taken_for_drainage():
+    """Nothing drains into the deepest depth, so its transport is near zero.
+
+    A voxel there that responds a little late leaves task-locked signal its
+    column's local shape cannot take, and a delayed copy of the response is just
+    what transport looks like. With the pull toward gain 1 measured against the
+    transport's own tiny size, the gain grew to soak that up (x55-177 on
+    ds004539) and removed half the voxel's signal; leave-one-run-out cannot
+    object, because the task repeats in every run. Measured against the local
+    response the pull holds deep gains near 1, while a vein where drainage is
+    substantial still loses its excess.
+    """
+    from fastfuncstuff.processing.laminar_tdv import voxel_gain_removal
+
+    T, R = 200, 3
+    t = torch.arange(T, dtype=torch.float32)
+    box = ((t % 40) < 15).float()
+    k = torch.exp(-0.5 * ((torch.arange(20.0) - 6) / 2.5) ** 2)
+    s = torch.nn.functional.conv1d(box[None, None], (k / k.sum()).flip(0)[None, None], padding=19)
+    s = s[0, 0, :T] - s[0, 0, :T].mean()
+
+    def late(x, n):
+        return torch.cat([x[:1].repeat(n), x[:-n]])
+
+    # One column, two bins: bin 0 pial (drainage), bin 1 the deepest (almost none).
+    trans = torch.stack([0.3 * late(s, 3), 0.03 * late(s, 3)], -1)[None]  # (U, T, K)
+    local = torch.stack([s, s], -1)[None]
+    deep, vein = np.arange(0, 20), np.arange(20, 40)
+    read = np.zeros((40, 2), np.float32)
+    read[deep, 1] = 1
+    read[vein, 0] = 1
+    torch.manual_seed(2)
+    runs = []
+    for _ in range(R):
+        y = torch.empty(40, T)
+        y[deep] = late(s, 2) + 0.05 * torch.randn(20, T)
+        y[vein] = s + 5 * trans[0, :, 0] + 0.05 * torch.randn(20, T)
+        runs.append(200 * (1 + y / 100))
+    nuis = [torch.ones(T, 1) for _ in range(R)]
+    gains = voxel_gain_removal(
+        runs, np.zeros(40, np.int64), read, [trans] * R, [local] * R, nuis, device=CPU,
+        verbose=False,
+    )  # fmt: skip
+    for raw, rem in zip(runs, gains.removed, strict=True):
+        psc = 100 * (raw[deep] / raw[deep].mean(-1, keepdim=True) - 1)
+        share = rem[deep].square().sum() / (psc - psc.mean(-1, keepdim=True)).square().sum()
+        assert share < 0.01, f"deep voxels lost {float(share):.1%} of their signal"
+    assert np.abs(gains.beta[deep, 1] - 1).max() < 2
+    assert np.median(gains.beta[vein, 1]) > 3

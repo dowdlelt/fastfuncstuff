@@ -497,6 +497,16 @@ def voxel_gain_removal(
         beta, best, sse = loro_prior_ridge(
             torch.stack(xtx), torch.stack(xty), torch.stack(yy), prior, penalized, lambdas,
             n_runs=None if seen is None else seen.sum(0),
+            # The pull toward the column model is measured against the column's
+            # local response at the voxel's depth. Against the transport's own
+            # size it shrank a gain by the same fraction however little drained
+            # there, and near white (nothing drains into the deepest depth) a
+            # transport gain cancelled the task-shaped local term to soak up the
+            # voxel's own late response (x55-177 on ds004539, 2% of the signal
+            # removed). Task-locked data cannot tell a vein's delayed drainage
+            # from a voxel's own latency, so the model's drainage at that depth
+            # decides how far a gain may go: free near pial, held near 1 deep.
+            scale=torch.stack(xtx).sum(0)[:, 0, 0],
         )  # fmt: skip
         yy = torch.stack(yy)
         b32 = beta.to(torch.float32)

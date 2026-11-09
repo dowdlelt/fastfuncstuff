@@ -232,6 +232,7 @@ def loro_prior_ridge(
     penalized: torch.Tensor,
     lambdas: tuple[float, ...],
     n_runs: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-voxel ridge toward a prior mean, its strength chosen by leave-one-run-out.
 
@@ -248,6 +249,13 @@ def loro_prior_ridge(
     normal equations are zero where they did not. A voxel seen once cannot be
     held out against anything: every lambda ties and the weakest pull would win,
     a free fit to one run. It takes the strongest lambda, the prior, instead.
+
+    ``scale`` ``(b,)`` replaces the regressors' own Gram diagonal as the unit of
+    lambda. Measured against its own regressor, a penalty shrinks a coefficient
+    by the same fraction however little that regressor carries, so a near-zero
+    regressor collinear with an unpenalized one can take a huge coefficient and
+    cancel against it. A fixed per-voxel unit (the unpenalized regressor's
+    energy, say) makes a small regressor's coefficient expensive to move.
     """
     R = xtx.shape[0]
     if R < 2 or not lambdas or any(x <= 0 for x in lambdas):
@@ -257,7 +265,10 @@ def loro_prior_ridge(
     mu = prior.to(device=dev, dtype=dtype)
     tot_a, tot_b = xtx.sum(0), xty.sum(0)
     diag = tot_a.diagonal(dim1=-2, dim2=-1)
-    scale = (diag * pen).sum(-1) / pen.sum().clamp_min(1)
+    if scale is None:
+        scale = (diag * pen).sum(-1) / pen.sum().clamp_min(1)
+    else:
+        scale = scale.to(device=dev, dtype=dtype)
     # A regressor that is all zero (the deepest depth has nothing below it)
     # must still give a solvable system; it then returns its prior, times zero.
     floor = 1e-6 * diag.mean(-1) + torch.finfo(dtype).tiny
