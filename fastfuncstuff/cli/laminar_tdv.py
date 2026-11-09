@@ -280,6 +280,16 @@ def create_parser() -> FfsArgumentParser:
         "depth. Voxel removal only; 0 = ribbon only",
     )
     surf.add_argument(
+        "-ribbon_frac",
+        type=float,
+        default=0.1,
+        metavar="F",
+        help="A voxel joins the ribbon when at least this share of it lies between "
+        "white and pial (64 points per voxel), so voxels the ribbon only clips, on the "
+        "pial or the WM side, are kept. Its depth and column are measured at its GM part "
+        "and its share weights it in the column profiles. 0 = the old voxel-centre rule",
+    )
+    surf.add_argument(
         "-coverage",
         choices=["auto", "each", "all"],
         default="auto",
@@ -645,6 +655,7 @@ def main(argv: list[str] | None = None) -> None:
     header["shape"] = tuple(first.shape[1:])
     n_t = first.shape[0]
     tr = args.tr or float(header["header"].get_zooms()[3])
+    gm_frac_vol = None
     if surfaces_given:
         from fastfuncstuff.processing.hrftdv import ribbon_patches
         from fastfuncstuff.surface.volume_depth import resolve_ribbon_surfaces
@@ -664,8 +675,11 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"ERROR: {exc}")
         xyz = header["shape"][::-1]
         patches = ribbon_patches(
-            surfaces, header["affine"], xyz, np.ones(xyz, bool), args.patch_mm, device
-        )
+            surfaces, header["affine"], xyz, np.ones(xyz, bool), args.patch_mm, device,
+            min_gm_fraction=args.ribbon_frac or None,
+        )  # fmt: skip
+        if patches.gm_frac is not None:
+            gm_frac_vol = np.ascontiguousarray(patches.gm_frac.reshape(xyz).T)
         # Surface code is flat C-order over (X, Y, Z); load_image is (Z, Y, X).
         labels_vol = np.ascontiguousarray(patches.label.reshape(xyz).T)
         depth_vol = np.ascontiguousarray(1 - patches.depth.reshape(xyz).T)
@@ -752,6 +766,8 @@ def main(argv: list[str] | None = None) -> None:
               f"{len(runs)}; per run {', '.join(f'{int(p.sum()):,}' for p in present)}")  # fmt: skip
     del series
     depth, labels, in_columns = depth_vol[mask], lab_vol[mask], ribbon[mask]
+    # Shell voxels never build columns, so only the ribbon's shares matter here.
+    voxel_weight = None if gm_frac_vol is None else np.where(in_columns, gm_frac_vol[mask], 1.0)
     split_blocks = None
     if args.ridge_cv == "split" and len(args.ridge) > 1:
         from fastfuncstuff.processing.hrftdv import volume_tiles
@@ -827,6 +843,7 @@ def main(argv: list[str] | None = None) -> None:
         split_blocks=split_blocks,
         split_repeats=args.ridge_cv_repeats,
         present=present,
+        voxel_weight=voxel_weight,
         verbose=verbose,
     )
     del runs
@@ -857,6 +874,7 @@ def main(argv: list[str] | None = None) -> None:
         "shell": ~in_columns,
         "patch": labels + 1,
         "depth": 1 - depth,  # 0 white .. 1 pial, as ffs_hrftdv writes it
+        **({} if voxel_weight is None else {"gm_frac": np.where(in_columns, voxel_weight, 0.0)}),
     }
     if result.gains is not None:
         for i, term in enumerate(("local", "transport", "shift")):

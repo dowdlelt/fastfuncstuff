@@ -147,3 +147,47 @@ def test_equivolume_survives_freesurfer_sized_vertex_slide():
     e_equidist = np.abs(out.rho - truth).mean()
     e_equivol = np.abs(out.equivol - truth).mean()
     assert e_equivol < 0.5 * e_equidist, (e_equivol, e_equidist)
+
+
+def _gm_fraction_exact(affine, shape, n=16):
+    """Share of each voxel between the spheres, counted on an n^3 sub-grid."""
+    offs = (np.arange(n) - (n - 1) / 2) / n
+    ijk = np.stack(np.meshgrid(*[np.arange(k) for k in shape], indexing="ij"), -1).astype(float)
+    frac = np.zeros(shape)
+    for dx in offs:
+        for dy in offs:
+            for dz in offs:
+                p = (ijk + [dx, dy, dz]) @ affine[:3, :3].T + affine[:3, 3] - CENTRE
+                r = np.linalg.norm(p, axis=-1)
+                frac += (r > R1) & (r < R2)
+    return frac / n**3
+
+
+def test_fractional_ribbon_keeps_clipped_voxels_at_their_gm_depth():
+    """A voxel the ribbon clips at a corner belongs, with the depth of its GM part.
+
+    By centre it would be dropped, or kept with the depth of a point in CSF or WM;
+    on a 1 mm grid over 3 mm cortex that is a large share of the ribbon.
+    """
+    s, _, affine, shape = shell(step=1.0)
+    centre = cortical_depth_volumes([s], affine, shape, device=CPU)
+    frac = cortical_depth_volumes([s], affine, shape, device=CPU, min_gm_fraction=0.1)
+    assert frac.gm_frac is not None
+    exact = _gm_fraction_exact(affine, shape).reshape(-1)
+    got = np.zeros(exact.size)
+    got[frac.gm_idx] = frac.gm_frac
+    # 64 sub-points against 4096, on an inscribed polyhedron.
+    assert np.abs(got[frac.gm_idx] - exact[frac.gm_idx]).mean() < 0.04
+    member = np.zeros(exact.size, bool)
+    member[frac.gm_idx] = True
+    assert member[exact >= 0.15].all() and not member[exact < 0.05].any()
+    assert frac.n_gm > 1.15 * centre.n_gm  # the centre rule misses the edges
+    r = radius(affine, shape).reshape(-1)[frac.gm_idx]
+    rho = frac.rho
+    # Clipped voxels sit at the end their GM part touches.
+    assert (rho[r > R2] > 0.85).all() and (rho[r < R1] < 0.15).all()
+    # Wholly-GM voxels are measured at their centre, exactly as before.
+    both, ia, ib = np.intersect1d(centre.gm_idx, frac.gm_idx, return_indices=True)
+    whole = frac.gm_frac[ib] >= 1.0
+    assert whole.sum() > 100
+    np.testing.assert_array_equal(centre.rho[ia][whole], frac.rho[ib][whole])

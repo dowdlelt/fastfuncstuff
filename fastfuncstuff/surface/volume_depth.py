@@ -114,6 +114,8 @@ class DepthVolumes:
     #: as in the projection and the viewer.
     owner_hemi: np.ndarray | None = None
     owner_vertex: np.ndarray | None = None
+    #: With ``min_gm_fraction``: the share of each GM voxel inside the ribbon.
+    gm_frac: np.ndarray | None = None
 
     @property
     def n_gm(self) -> int:
@@ -221,6 +223,7 @@ def volume_quantile_depth(
     column_voxels: float = 64.0,
     bins: int = 64,
     rounds: int | None = None,
+    weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Equivolume depth as each voxel's volume quantile within its cortical column.
 
@@ -248,10 +251,12 @@ def volume_quantile_depth(
     Returns the depths and the rounds of mesh smoothing they took -- how far along
     the surface a column's volume was pooled, which is how much cortex beyond a
     region of interest its equivolume depths depend on. ``rounds`` sets that count
-    instead of deriving it from the voxels per column seen here.
+    instead of deriving it from the voxels per column seen here. ``weight`` is
+    each voxel's volume in voxels (its GM fraction, for a fractional ribbon), so a
+    voxel the ribbon only clips does not count as a whole one.
     """
     cdf, rounds = column_depth_cdf(
-        rho, face, bary, faces, n_vertices, column_voxels, bins, rounds=rounds
+        rho, face, bary, faces, n_vertices, column_voxels, bins, weight=weight, rounds=rounds
     )
     return column_quantile(cdf, rho, face, bary, faces), rounds
 
@@ -407,6 +412,8 @@ def cortical_depth_volumes(
     column_rounds: int | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
+    min_gm_fraction: float | None = None,
+    supersample: int = 4,
 ) -> DepthVolumes:
     """Rim, equidistant/equivolume metric + layers + midGM, and thickness.
 
@@ -432,9 +439,20 @@ def cortical_depth_volumes(
         and vertex density vary over a hemisphere, so a region's own measurement
         differs a little from a whole hemisphere's; pass the ``smooth_rounds`` of a
         whole-hemisphere run to reproduce its depths exactly.
+    min_gm_fraction : decide membership by how much of the voxel is ribbon instead
+        of where its centre falls. Each voxel is sampled at ``supersample``**3
+        points; it is GM when at least this share of them lies inside pial and
+        outside every white surface, so a voxel the ribbon only clips at a corner,
+        on the pial or the WM side, still belongs. Its depth and column are then
+        measured at the centroid of its GM points rather than at its centre (which
+        may sit in CSF or WM), and the share is returned as ``gm_frac``. A voxel
+        wholly in GM has its centre as centroid and keeps its centre-rule depth.
+        None keeps the centre rule.
     """
     device = device or torch.device("cpu")
     owners = owners or columns is not None
+    if min_gm_fraction is not None and not 0 < min_gm_fraction <= 1:
+        raise ValueError("min_gm_fraction must be in (0, 1]")
     if columns is not None and len(columns) != len(surfaces):
         raise ValueError(f"columns: {len(columns)} masks for {len(surfaces)} surfaces")
     shape = tuple(int(s) for s in shape)
@@ -449,7 +467,13 @@ def cortical_depth_volumes(
     owner = np.zeros(shape, np.int8)
     wm = np.zeros(shape, bool)
     n_overlap = 0
-    for h, s in enumerate(surfaces):
+    frac_vol, centroid = None, None
+    if min_gm_fraction is not None:
+        owner, wm, frac_vol, centroid, n_overlap = _fractional_ribbon(
+            surfaces, affine, shape, min_gm_fraction, supersample, device
+        )
+        log(f"fractional ribbon ({supersample}^3 points per voxel, >= {min_gm_fraction:g})")
+    for h, s in enumerate(surfaces if min_gm_fraction is None else ()):
         in_white = winding_number(s.white, s.faces, affine, shape, device) > 0
         gm = winding_number(s.pial, s.faces, affine, shape, device) > 0
         gm &= ~in_white
@@ -458,8 +482,9 @@ def cortical_depth_volumes(
         wm |= in_white
         del in_white, gm
         log(f"{s.name}: filled white + pial")
-    n_overlap += int((wm & (owner != 0)).sum())
-    owner[wm] = 0  # Inside any white surface is WM.
+    if min_gm_fraction is None:
+        n_overlap += int((wm & (owner != 0)).sum())
+        owner[wm] = 0  # Inside any white surface is WM.
 
     flat_owner = owner.reshape(-1)
     # ~4 voxels a side: measured fastest at 0.35 mm (64 points fill a program).
@@ -478,6 +503,8 @@ def cortical_depth_volumes(
             log(f"{s.name}: not in the region, {idx.size:,} GM voxels dropped unmeasured")
             continue
         ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
+        if centroid is not None:
+            ijk += centroid[idx]
         pts = ijk @ affine[:3, :3].T + affine[:3, 3]
         del ijk
         cw = MeshDistance(s.white, s.faces, k)(pts, device, brick_mm=brick_mm)
@@ -494,6 +521,8 @@ def cortical_depth_volumes(
         idx_t = torch.as_tensor(idx, device=device)
         if owners:
             ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
+            if centroid is not None:
+                ijk += centroid[idx]
             pts = ijk @ affine[:3, :3].T + affine[:3, 3]
             near = MeshDistance(0.5 * (s.white + s.pial), s.faces, k)(
                 pts, device, brick_mm=brick_mm
@@ -535,8 +564,13 @@ def cortical_depth_volumes(
                 rounds = column_smooth_rounds(
                     int(keep_t.sum()), int(torch.unique(touched).numel()), column_voxels
                 )
+        vol_w = (
+            None
+            if frac_vol is None
+            else torch.as_tensor(frac_vol[idx_t.cpu().numpy()], device=device, dtype=rho.dtype)
+        )
         equivol, rounds = volume_quantile_depth(
-            rho, face, bary, s.faces, len(s.white), column_voxels, rounds=rounds
+            rho, face, bary, s.faces, len(s.white), column_voxels, rounds=rounds, weight=vol_w
         )
         rounds_used.append((h, rounds))
         del face, bary
@@ -599,6 +633,60 @@ def cortical_depth_volumes(
         n_overlap=n_overlap,
         owner_hemi=host(owner_h) if owners else None,
         owner_vertex=host(owner_v) if owners else None,
+        gm_frac=None if frac_vol is None else frac_vol[host(gm_idx)],
+    )
+
+
+def _fractional_ribbon(surfaces, affine, shape, min_frac, s, device):
+    """Ribbon membership by the share of each voxel inside it (see ``min_gm_fraction``).
+
+    Returns the owner volume (h + 1 / 0, as the centre rule builds it), the WM
+    volume (most of the voxel inside a white surface: what rim borders call WM),
+    the flat GM fraction, each voxel's GM-centroid offset from its centre in
+    voxel units (flat, ``(N, 3)``), and the count of voxels two hemispheres share.
+    """
+    nx, ny, nz = shape
+    sub = np.eye(4)
+    sub[:3, :3] /= s
+    sub[:3, 3] = -(s - 1) / (2 * s)  # sub-point centres tile the voxel
+    fine_aff, fine = affine @ sub, (nx * s, ny * s, nz * s)
+    offs = (np.arange(s) - (s - 1) / 2) / s
+    white = np.zeros(fine, bool)
+    for surf in surfaces:
+        white |= winding_number(surf.white, surf.faces, fine_aff, fine, device) > 0
+    wm = white.reshape(nx, s, ny, s, nz, s).mean(axis=(1, 3, 5)) > 0.5
+    total = np.zeros(shape, np.float32)
+    best = np.zeros(shape, np.float32)
+    owner = np.zeros(shape, np.int8)
+    centroid = np.zeros((*shape, 3), np.float32)
+    touched = np.zeros(shape, np.int8)
+    for h, surf in enumerate(surfaces):
+        gm = winding_number(surf.pial, surf.faces, fine_aff, fine, device) > 0
+        gm &= ~white
+        g = gm.reshape(nx, s, ny, s, nz, s)
+        del gm
+        count = g.sum(axis=(1, 3, 5), dtype=np.int32)
+        frac = count / float(s**3)
+        mine = frac > best
+        cnt = np.maximum(count, 1)
+        cx = (g.sum(axis=(3, 5), dtype=np.int32) * offs[None, :, None, None]).sum(1) / cnt
+        cy = (g.sum(axis=(1, 5), dtype=np.int32) * offs[None, None, :, None]).sum(2) / cnt
+        cz = (g.sum(axis=(1, 3), dtype=np.int32) * offs[None, None, None, :]).sum(3) / cnt
+        del g
+        centroid[mine] = np.stack([cx, cy, cz], -1)[mine]
+        owner[mine] = h + 1
+        best[mine] = frac[mine]
+        total += frac
+        touched += count > 0
+    del white
+    keep = total >= min_frac
+    owner[~keep] = 0
+    return (
+        owner,
+        wm & ~keep,
+        np.minimum(total, 1.0).reshape(-1),
+        centroid.reshape(-1, 3).astype(np.float64),
+        int(((touched > 1) & keep).sum()),
     )
 
 

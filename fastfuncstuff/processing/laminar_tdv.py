@@ -113,12 +113,17 @@ def column_profiles(
     use: np.ndarray | None = None,
     robust: bool = False,
     present: list[np.ndarray] | None = None,
+    voxel_weight: np.ndarray | None = None,
 ) -> ColumnProfiles:
     """Percent change, per-run Legendre drift removed, averaged into K bins per patch.
 
     ``present`` (per run, a V bool) marks the voxels a run actually observed, for
     slabs that move between runs. Absent entries are never read. Each run then
     builds its patches from its own voxels (see :func:`_partial_column_profiles`).
+
+    ``voxel_weight`` (V) scales each voxel's share of its bins: a voxel's ribbon
+    fraction, so one the ribbon only clips fills the mask without counting as a
+    whole voxel of cortex.
 
     Only voxels flagged in ``use`` (default all) build the profiles -- the ribbon,
     not the shell around it. Patches that do not observe every model depth are
@@ -137,7 +142,7 @@ def column_profiles(
         raise ValueError("depth/labels must match voxels and runs need >=4 samples")
     if present is not None and not all(bool(np.all(p)) for p in present):
         return _partial_column_profiles(
-            runs, depth, labels, K, polort, device, use, robust, present
+            runs, depth, labels, K, polort, device, use, robust, present, voxel_weight
         )
     # Chunked finiteness: a whole-series isfinite allocates a full float copy of
     # the run for the abs it is built on. The all-zero half of the mask is
@@ -165,7 +170,7 @@ def column_profiles(
     del psc
     for unit in range(len(unique)):
         ix = np.flatnonzero((inverse == unit) & use)
-        W = read[ix].T
+        W = read[ix].T if voxel_weight is None else read[ix].T * voxel_weight[ix][None]
         if sd is not None and ix.size:
             weight = np.ones(ix.size, np.float32)
             home = read[ix].argmax(1)
@@ -213,6 +218,7 @@ def _partial_column_profiles(
     use: np.ndarray | None,
     robust: bool,
     present: list[np.ndarray],
+    voxel_weight: np.ndarray | None = None,
 ) -> ColumnProfiles:
     """Column profiles when runs observe different voxels (a slab that moved).
 
@@ -268,7 +274,7 @@ def _partial_column_profiles(
         fits = []
         for r in range(R):
             ix = ix_all[present[r][ix_all]]
-            W = read[ix].T
+            W = read[ix].T if voxel_weight is None else read[ix].T * voxel_weight[ix][None]
             if sd is not None and ix.size:
                 weight = np.ones(ix.size, np.float32)
                 home = read[ix].argmax(1)
@@ -620,6 +626,7 @@ def devein_volume_runs(
     split_blocks: np.ndarray | None = None,
     split_repeats: int = 2,
     present: list[np.ndarray] | None = None,
+    voxel_weight: np.ndarray | None = None,
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -657,7 +664,7 @@ def devein_volume_runs(
     if columns is None:
         columns = column_profiles(
             runs, depth, labels, K, polort, device, use=in_columns,
-            robust=removal == "voxel", present=present,
+            robust=removal == "voxel", present=present, voxel_weight=voxel_weight,
         )  # fmt: skip
     partial = columns.present is not None
     if present is not None and not all(bool(np.all(p)) for p in present) and not partial:

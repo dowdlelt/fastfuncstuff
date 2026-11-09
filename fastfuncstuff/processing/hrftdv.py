@@ -431,6 +431,7 @@ class RibbonPatches:
     depth: np.ndarray  # equivolume, 0 white .. 1 pial, NaN outside the ribbon
     owner_hemi: np.ndarray | None = None  # surface index per voxel, -1 = not covered ribbon
     owner_vertex: np.ndarray | None = None  # owning vertex per voxel, -1 likewise
+    gm_frac: np.ndarray | None = None  # share of each voxel in the ribbon, 0 outside
 
 
 def ribbon_patches(
@@ -440,17 +441,22 @@ def ribbon_patches(
     coverage: np.ndarray,
     patch_mm: float,
     device: torch.device | None = None,
+    min_gm_fraction: float | None = None,
 ) -> RibbonPatches:
     """Covered ribbon voxels -> geodesic midthickness patches via their owning vertex.
 
     ``coverage`` is ``(X, Y, Z)``; patch numbers run on across hemispheres. Depth
-    is kept for every ribbon voxel, covered or not.
+    is kept for every ribbon voxel, covered or not. ``min_gm_fraction`` admits
+    every voxel at least that much inside the ribbon, measured at its GM part
+    (see :func:`~fastfuncstuff.surface.volume_depth.cortical_depth_volumes`), and
+    returns the shares as ``gm_frac``; None keeps the voxel-centre rule.
     """
     from fastfuncstuff.surface.volume_depth import cortical_depth_volumes
 
     dv = cortical_depth_volumes(
-        list(surfaces), affine, shape, n_layers=3, owners=True, device=device
-    )
+        list(surfaces), affine, shape, n_layers=3, owners=True, device=device,
+        min_gm_fraction=min_gm_fraction,
+    )  # fmt: skip
     assert dv.owner_hemi is not None and dv.owner_vertex is not None
     in_cov = coverage.reshape(-1)[dv.gm_idx]
     gm_idx, o_hemi, o_vert = dv.gm_idx[in_cov], dv.owner_hemi[in_cov], dv.owner_vertex[in_cov]
@@ -471,7 +477,11 @@ def ribbon_patches(
         ok = lab >= 0
         label[gm_idx[sel][ok]] = lab[ok] + n_units
         n_units += int(vlab.max()) + 1
-    return RibbonPatches(label, n_units, depth, owner_h, owner_v)
+    gm_frac = None
+    if dv.gm_frac is not None:
+        gm_frac = np.zeros(label.size, np.float32)
+        gm_frac[dv.gm_idx] = dv.gm_frac
+    return RibbonPatches(label, n_units, depth, owner_h, owner_v, gm_frac)
 
 
 @dataclass
