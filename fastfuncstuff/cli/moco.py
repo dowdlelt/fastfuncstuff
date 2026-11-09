@@ -208,6 +208,32 @@ def parse_args(
         "multi-echo registration: motion is estimated once and applied to "
         "every echo.",
     )
+    io_group.add_argument(
+        "-stack",
+        nargs="+",
+        metavar="FILE",
+        help="Cross-run alignment: a BASE image followed by one or more SOURCE "
+        "images (3D, e.g. run means). They are stacked as one short series, "
+        "registered to the base (volume 0) like any moco run, and each source's "
+        "matrix is written to -stack_matrices in the ffs_allineate -1Dmatrix_save "
+        "form, so it drops into an allineate cross-run step. A source on another "
+        "grid is first moved onto the base grid through its header (wsinc5); that "
+        "is the identity in scanner space, so its matrix still maps base to the "
+        "ORIGINAL source. Replaces -input / -base / -prefix / -1Dmatrix_save; the "
+        "estimation options (-twopass, -interp, -automask, ...) apply as usual.",
+    )
+    io_group.add_argument(
+        "-stack_matrices",
+        nargs="+",
+        metavar="FILE",
+        help="-stack: one .aff12.1D per SOURCE, in order (required with -stack).",
+    )
+    io_group.add_argument(
+        "-stack_aligned",
+        nargs="+",
+        metavar="FILE",
+        help="-stack: optionally one aligned 3D image per SOURCE, on the base grid.",
+    )
     add_batch_args(
         io_group,
         tool="ffs_moco",
@@ -2157,6 +2183,10 @@ def main(argv: list[str] | None = None) -> None:
         _run_batch(args)
         return
 
+    if args.stack:
+        _run_stack(args)
+        return
+
     if not args.input_file:
         print(
             "Error: -input is required (or use -batch FILE / -batch_run ARGS).",
@@ -2182,6 +2212,76 @@ def main(argv: list[str] | None = None) -> None:
         print()
 
     _dispatch_run(args, device, verb)
+
+
+def _run_stack(args: argparse.Namespace) -> None:
+    """-stack: register N source images to a base as one short series and write one
+    allineate-form matrix per source (see the -stack help)."""
+    import tempfile
+
+    import numpy as np
+
+    from fastfuncstuff.processing.grid import resample_to_grid
+
+    base_path, sources = args.stack[0], args.stack[1:]
+    if not sources:
+        sys.exit("Error: -stack needs a base and at least one source image.")
+    if not args.stack_matrices or len(args.stack_matrices) != len(sources):
+        sys.exit(f"Error: -stack_matrices needs one file per source ({len(sources)}).")
+    if args.stack_aligned and len(args.stack_aligned) != len(sources):
+        sys.exit(f"Error: -stack_aligned needs one file per source ({len(sources)}).")
+    taken = [f for f, v in (("-input", args.input_file), ("-prefix", args.prefix),
+                            ("-1Dmatrix_save", getattr(args, "1Dmatrix_save", None)))
+             if v]  # fmt: skip
+    if taken or args.base not in (None, "0", 0):
+        sys.exit(f"Error: -stack sets these itself: {', '.join(taken or ['-base'])}.")
+
+    def volume(path):
+        vol, hdr = load_image(path)
+        if vol.ndim == 4:
+            if vol.shape[0] != 1:
+                sys.exit(f"Error: -stack images must be 3D (e.g. a run mean): {path}")
+            vol = vol[0]
+        return vol.float(), hdr
+
+    base, header = volume(base_path)
+    shape, affine = tuple(base.shape), np.asarray(header["affine"], np.float64)
+    vols = [base]
+    for path in sources:
+        vol, hdr = volume(path)
+        src_affine = np.asarray(hdr["affine"], np.float64)
+        if tuple(vol.shape) != shape or not np.allclose(src_affine, affine, atol=1e-4):
+            if args.verb >= 1:
+                print(f"  {Path(path).name}: onto the base grid through its header")
+            vol = resample_to_grid(vol, src_affine, shape, affine, interp="wsinc5")
+        vols.append(vol)
+    with tempfile.TemporaryDirectory(prefix="ffs_moco_stack_") as tmp:
+        stack_path, mat_path = f"{tmp}/stack.nii.gz", f"{tmp}/stack.aff12.1D"
+        save_image(torch.stack(vols), stack_path, header_info=header)
+        args.input_file, args.base = [stack_path], "0"
+        setattr(args, "1Dmatrix_save", mat_path)
+        args.prefix = f"{tmp}/stack_mc.nii.gz" if args.stack_aligned else None
+        _validate_run_args(args)
+        device = _select_device(args.device)
+        if args.verb >= 1:
+            print_cli_header("ffs_moco", f"Cross-run stack: {len(sources)} source(s) -> base")
+        _dispatch_run(args, device, args.verb)
+        rows = [
+            ln
+            for ln in Path(mat_path).read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+        if len(rows) != len(vols):
+            sys.exit(f"Error: expected {len(vols)} matrices, moco wrote {len(rows)}.")
+        for row, out in zip(rows[1:], args.stack_matrices, strict=True):
+            Path(out).write_text(row.strip() + "\n")
+        if args.stack_aligned:
+            aligned, _ = load_image(args.prefix)
+            for i, out in enumerate(args.stack_aligned, start=1):
+                save_image(aligned[i], out, header_info=header)
+    if args.verb >= 1:
+        for out in args.stack_matrices:
+            print(f"  Matrix: {out}")
 
 
 def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> None:
