@@ -81,8 +81,8 @@ what it does
   Coverage: the ribbon, plus a shell up to -extend_mm beyond it (pial veins sit
   just outside pial).  Shell voxels take the column and depth of their nearest
   ribbon voxel and only get voxel gains; they do not build the columns.
-  Subcortical and other voxels, those not positive in every run, and patches
-  that do not reach every model depth pass through bit-identical.
+  Subcortical and other voxels, those no run observed (see -coverage), and
+  patches that do not reach every model depth pass through bit-identical.
 
 ridge regularization (-ridge)
 
@@ -278,6 +278,17 @@ def create_parser() -> FfsArgumentParser:
         help="Also correct voxels up to this far outside the ribbon (into WM and past "
         "pial, where pial veins sit), each with its nearest ribbon voxel's column and "
         "depth. Voxel removal only; 0 = ribbon only",
+    )
+    surf.add_argument(
+        "-coverage",
+        choices=["auto", "each", "all"],
+        default="auto",
+        help="Which voxels a run must observe (positive at every volume) to be corrected. "
+        "each: a voxel is corrected in every run that saw it, patches are built per run "
+        "from that run's voxels, and voxel gains are chosen across the runs that saw it "
+        "(a voxel seen once takes the column model) -- for slabs that move between runs. "
+        "all: only voxels every run saw. auto: each when it can be (one -ridge value, no "
+        "-events, which compare runs sample by sample), else all",
     )
 
     vol = parser.add_argument_group("Volume depth (instead of surfaces)")
@@ -680,7 +691,7 @@ def main(argv: list[str] | None = None) -> None:
         >= 0
     )
     cand_idx = np.flatnonzero(candidates | shell_c)
-    series, covered, lengths = [], np.ones(cand_idx.size, bool), []
+    series, seen, lengths = [], [], []
     for i, path in enumerate(files):
         d, h = (first, header) if i == 0 else load_image(path)
         if d.ndim != 4 or tuple(d.shape[1:]) != header["shape"] or not _same_grid(header, h):
@@ -689,10 +700,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.tr is None and abs(float(h["header"].get_zooms()[3]) - tr) > 1e-5:
             sys.exit(f"ERROR: {path}: TR differs from the first run's")
         s = d.reshape(d.shape[0], -1)[:, cand_idx].T.contiguous()
-        covered &= (torch.isfinite(s).all(1) & (s.amin(1) > 0)).numpy()
+        seen.append((torch.isfinite(s).all(1) & (s.amin(1) > 0)).numpy())
         series.append(s)
         del d
     del first
+    each_ok = timing is None and len(args.ridge) == 1
+    coverage = args.coverage if args.coverage != "auto" else ("each" if each_ok else "all")
+    if coverage == "each" and not each_ok:
+        sys.exit("ERROR: -coverage each solves every run on its own voxels, which needs one "
+                 "-ridge value and no -events (both compare runs sample by sample)")  # fmt: skip
+    covered = np.logical_or.reduce(seen) if coverage == "each" else np.logical_and.reduce(seen)
     if len(set(lengths)) > 1:
         # Each run's inverse stands alone at one ridge strength; only comparing runs
         # sample by sample (event CV, choosing between strengths) needs one length.
@@ -708,7 +725,9 @@ def main(argv: list[str] | None = None) -> None:
     ok[cand_idx[covered]] = True
     ribbon = candidates & ok.reshape(candidates.shape)
     if not ribbon.any():
-        sys.exit("ERROR: no ribbon voxels positive in every run")
+        sys.exit(
+            f"ERROR: no ribbon voxels positive throughout {'any' if coverage == 'each' else 'every'} run"
+        )
     lab_vol = np.full(candidates.shape, -1, np.int64)
     if labels_vol is None:
         from fastfuncstuff.processing.laminar_tdv import depth_patches
@@ -724,6 +743,13 @@ def main(argv: list[str] | None = None) -> None:
     mask = ribbon | shell
     rows = np.searchsorted(cand_idx, np.flatnonzero(mask))
     runs = [s[torch.from_numpy(rows)] for s in series]
+    present = [p[rows] for p in seen]
+    if all(p.all() for p in present):
+        present = None
+    elif verbose:
+        n_all = int(np.logical_and.reduce(present).sum())
+        print(f"  Coverage each: {mask.sum():,} voxels seen by some run, {n_all:,} by all "
+              f"{len(runs)}; per run {', '.join(f'{int(p.sum()):,}' for p in present)}")  # fmt: skip
     del series
     depth, labels, in_columns = depth_vol[mask], lab_vol[mask], ribbon[mask]
     split_blocks = None
@@ -800,6 +826,7 @@ def main(argv: list[str] | None = None) -> None:
         ridge_cv=args.ridge_cv,
         split_blocks=split_blocks,
         split_repeats=args.ridge_cv_repeats,
+        present=present,
         verbose=verbose,
     )
     del runs

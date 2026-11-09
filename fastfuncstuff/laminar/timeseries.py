@@ -231,6 +231,7 @@ def loro_prior_ridge(
     prior: torch.Tensor,
     penalized: torch.Tensor,
     lambdas: tuple[float, ...],
+    n_runs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-voxel ridge toward a prior mean, its strength chosen by leave-one-run-out.
 
@@ -242,6 +243,11 @@ def loro_prior_ridge(
 
     Returns coefficients refit on all runs at each voxel's chosen lambda, the
     chosen index ``(b,)``, and held-out SSE per lambda ``(L, b)``.
+
+    ``n_runs`` ``(b,)`` counts the runs that observed each voxel, for runs whose
+    normal equations are zero where they did not. A voxel seen once cannot be
+    held out against anything: every lambda ties and the weakest pull would win,
+    a free fit to one run. It takes the strongest lambda, the prior, instead.
     """
     R = xtx.shape[0]
     if R < 2 or not lambdas or any(x <= 0 for x in lambdas):
@@ -275,6 +281,9 @@ def loro_prior_ridge(
                 + (beta[:, None] @ xtx[r] @ beta[..., None])[:, 0, 0]
             )
     best = sse.argmin(0)
+    if n_runs is not None:
+        strongest = int(torch.as_tensor(lambdas).argmax())
+        best = torch.where(n_runs.to(best.device) < 2, strongest, best)
     lam_best = torch.as_tensor(lambdas, device=dev, dtype=dtype)[best]
     return solve(tot_a, tot_b, lam_best), best, sse
 

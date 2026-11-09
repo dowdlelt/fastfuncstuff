@@ -419,3 +419,75 @@ def test_runs_of_different_length_refuse_a_ridge_choice():
             [runs[0], runs[1][:, :70]], depth, labels, spec,
             strengths=(0.01, 0.1), removal="column", verbose=False,
         )  # fmt: skip
+
+
+def test_a_fully_seen_run_corrects_as_alone_beside_a_run_missing_voxels():
+    """A slab that moved: run 2 lost a few voxels (zero-filled, as moco leaves them).
+    Each run is inverted on its own voxels, so the complete run must come out as it
+    does by itself, and the missing entries must pass through untouched."""
+    runs, depth, labels, spec = _runs()
+    a, b = runs[0], runs[1].clone()
+    seen_b = np.ones(len(depth), bool)
+    seen_b[[0, 1, 2, 30, 31]] = False
+    b[torch.from_numpy(~seen_b)] = 0
+    kw = dict(strengths=(0.01,), pad_seconds=20, polort=1, removal="column", verbose=False)
+    both = devein_volume_runs(
+        [a, b], depth, labels, spec, present=[np.ones(len(depth), bool), seen_b], **kw
+    )
+    alone = devein_volume_runs([a], depth, labels, spec, **kw)
+    torch.testing.assert_close(both.corrected[0], alone.corrected[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(both.corrected[1][~seen_b], b[~seen_b], rtol=0, atol=0)
+    assert torch.isfinite(both.corrected[1]).all()
+    assert not torch.equal(both.corrected[1][seen_b], b[seen_b])  # the seen part is corrected
+
+
+def test_voxel_gains_use_the_runs_that_saw_each_voxel():
+    runs, truth, depth, vein, spec = _vein_runs()
+    V = depth.size
+    present = [np.ones(V, bool) for _ in runs]
+    once = 10  # a normal mid-depth voxel only run 0 saw
+    present[1][once] = present[2][once] = False
+    present[2][[20, 21, 22]] = False
+    for r, p in enumerate(present):
+        runs[r][torch.from_numpy(~p)] = 0
+    labels = np.zeros(V, int)
+    kw = dict(strengths=(0.001,), pad_seconds=0, polort=1, verbose=False)
+    vox = devein_volume_runs(runs, depth, labels, spec, removal="voxel", present=present, **kw)
+    # Seen once: nothing to hold out against, so it keeps the column model.
+    assert vox.gains.lam[once] == max(vox.gains.lam[np.isfinite(vox.gains.lam)])
+    assert np.median(vox.gains.beta[vein, 1]) > 3  # veins still lose their excess
+    for raw, cor, p in zip(runs, vox.corrected, present, strict=True):
+        assert torch.isfinite(cor).all()
+        torch.testing.assert_close(cor[~p], raw[~p], rtol=0, atol=0)
+
+
+def test_cli_corrects_each_run_where_it_saw_the_voxel(tmp_path):
+    runs, depth, labels, spec = _runs()
+    shape = (5, 4, 3)
+    info = {"affine": np.diag([1.0, 1.0, 1.0, 1.0])}
+    r1 = runs[1].clone()
+    r1[13, :5] = 0  # voxel (1, 0, 1) slid out of the slab for five volumes of run 2
+    for i, r in enumerate([runs[0], r1]):
+        save_image(r.T.reshape(r.shape[1], *shape), tmp_path / f"r{i}.nii.gz", info)
+    for name, arr in [
+        ("depth", depth.reshape(shape)), ("gm", np.ones(shape)), ("columns", np.ones(shape))
+    ]:  # fmt: skip
+        save_image(torch.as_tensor(arr), tmp_path / f"{name}.nii.gz", info)
+    base = [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "r0.nii.gz",
+            "r1.nii.gz", "-depth", "depth.nii.gz", "-gmfrac", "gm.nii.gz", "-depth_order", "pial_to_white",
+            "-columns", "columns.nii.gz", "-depths", "3", "-extend_mm", "0", "-tr", "2",
+            "-ridge", ".01", "-te", ".025", "-b0", "7", "-device", "cpu"]  # fmt: skip
+    for cov in ("auto", "all"):
+        res = subprocess.run(
+            [*base, "-coverage", cov, "-prefix", cov], cwd=tmp_path, capture_output=True, text=True
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+    raw0, _ = load_image(tmp_path / "r0.nii.gz")
+    raw1, _ = load_image(tmp_path / "r1.nii.gz")
+    each0, _ = load_image(tmp_path / "auto_corrected_run-01.nii.gz")
+    each1, _ = load_image(tmp_path / "auto_corrected_run-02.nii.gz")
+    all0, _ = load_image(tmp_path / "all_corrected_run-01.nii.gz")
+    v = (slice(None), 1, 0, 1)
+    assert not torch.equal(each0[v], raw0[v])  # run 1 saw it: corrected
+    torch.testing.assert_close(each1[v], raw1[v], rtol=0, atol=0)  # run 2 did not
+    torch.testing.assert_close(all0[v], raw0[v], rtol=0, atol=0)  # -coverage all: neither

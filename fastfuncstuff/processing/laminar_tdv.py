@@ -94,11 +94,13 @@ class ColumnProfiles:
     members: list[np.ndarray]  # voxel indices per valid patch
     # R x U x T x K; for runs of different lengths, one 1 x U x T_r x K per run
     profiles: torch.Tensor | list[torch.Tensor]
-    sampling: torch.Tensor  # U x K x K, physiological depths -> measured bins
-    noise_cov: torch.Tensor  # U x K x K, bin covariance from shared voxels
+    # U x K x K; a list (one per run) when runs observe different voxels
+    sampling: torch.Tensor | list[torch.Tensor]  # physiological depths -> measured bins
+    noise_cov: torch.Tensor | list[torch.Tensor]  # bin covariance from shared voxels
     read: np.ndarray  # V x K point-sample weights
     nuisance: list[torch.Tensor]  # per run, T x n_poly
     unit_labels: np.ndarray  # U, the label of each valid patch
+    present: list[np.ndarray] | None = None  # per run, V bool; None = every voxel, every run
 
 
 def column_profiles(
@@ -110,8 +112,13 @@ def column_profiles(
     device: torch.device,
     use: np.ndarray | None = None,
     robust: bool = False,
+    present: list[np.ndarray] | None = None,
 ) -> ColumnProfiles:
     """Percent change, per-run Legendre drift removed, averaged into K bins per patch.
+
+    ``present`` (per run, a V bool) marks the voxels a run actually observed, for
+    slabs that move between runs. Absent entries are never read. Each run then
+    builds its patches from its own voxels (see :func:`_partial_column_profiles`).
 
     Only voxels flagged in ``use`` (default all) build the profiles -- the ribbon,
     not the shell around it. Patches that do not observe every model depth are
@@ -128,6 +135,10 @@ def column_profiles(
     lengths = [int(r.shape[1]) for r in runs]
     if len(labels) != V or len(depth) != V or min(lengths) < 4:
         raise ValueError("depth/labels must match voxels and runs need >=4 samples")
+    if present is not None and not all(bool(np.all(p)) for p in present):
+        return _partial_column_profiles(
+            runs, depth, labels, K, polort, device, use, robust, present
+        )
     # Chunked finiteness: a whole-series isfinite allocates a full float copy of
     # the run for the abs it is built on. The all-zero half of the mask is
     # implied by the positive-mean test that follows it.
@@ -189,6 +200,111 @@ def column_profiles(
         read,
         nuisance,
         np.asarray(kept),
+    )
+
+
+def _partial_column_profiles(
+    runs: list[torch.Tensor],
+    depth: np.ndarray,
+    labels: np.ndarray,
+    K: int,
+    polort: int,
+    device: torch.device,
+    use: np.ndarray | None,
+    robust: bool,
+    present: list[np.ndarray],
+) -> ColumnProfiles:
+    """Column profiles when runs observe different voxels (a slab that moved).
+
+    Requiring every voxel in every run keeps only the runs' intersection; on a
+    thin slab that drifts a few mm between runs that is a third of the ribbon.
+    Here each run averages each patch over the voxels it observed. A patch is
+    kept if it spans every model depth in at least one run; in a run where it
+    does not, its profile is zero and its sampling the identity, so nothing is
+    inverted or removed there. Sampling and noise covariance are per run because
+    they depend on which voxels were averaged. Absent entries are never read.
+    """
+    R, V = len(runs), runs[0].shape[0]
+    present = [np.asarray(p, bool) for p in present]
+    if len(present) != R or any(p.shape != (V,) for p in present):
+        raise ValueError("present needs one (voxels,) mask per run")
+    read = depth_interpolation(depth, K)
+    unique, inverse = np.unique(labels, return_inverse=True)
+    use = np.ones(V, bool) if use is None else np.asarray(use, bool)
+    psc_np, nuisance = [], []
+    s1, ss, n = np.zeros(V), np.zeros(V), np.zeros(V)
+    for run, pr in zip(runs, present, strict=True):
+        T = int(run.shape[1])
+        rows = run[torch.from_numpy(pr)]
+        if bool(invalid_voxel_mask(rows).any()) or not bool((rows.mean(-1) > 0).all()):
+            raise ValueError("present voxels need finite data and positive means")
+        nuis = construct_polynomial_matrix(T, polort, device, torch.float32)
+        psc, _ = project_out_nuisance_per_run(
+            100 * (rows / rows.mean(-1, keepdim=True) - 1),
+            torch.empty(T, 0, device=device), [nuis], [0], device=device, verbose=False,
+        )  # fmt: skip
+        full = np.zeros((V, T), np.float32)
+        full[pr] = psc.cpu().numpy()
+        del rows, psc
+        psc_np.append(full)
+        nuisance.append(nuis)
+        if robust:
+            s1[pr] += full[pr].sum(-1)
+            ss[pr] += np.square(full[pr], dtype=np.float64).sum(-1)
+            n[pr] += T
+    # Pooled over the runs that saw the voxel; the unbiased SD the full path takes.
+    sd = (
+        np.sqrt(np.maximum(ss - s1**2 / np.maximum(n, 1), 0) / np.maximum(n - 1, 1))
+        if robust
+        else None
+    )
+    eye = np.eye(K)
+    members, kept = [], []
+    samples: list[list[np.ndarray]] = [[] for _ in runs]
+    sampling: list[list[np.ndarray]] = [[] for _ in runs]
+    covs: list[list[np.ndarray]] = [[] for _ in runs]
+    for unit in range(len(unique)):
+        ix_all = np.flatnonzero((inverse == unit) & use)
+        fits = []
+        for r in range(R):
+            ix = ix_all[present[r][ix_all]]
+            W = read[ix].T
+            if sd is not None and ix.size:
+                weight = np.ones(ix.size, np.float32)
+                home = read[ix].argmax(1)
+                for k in np.unique(home):
+                    at = home == k
+                    med = np.median(sd[ix[at]])
+                    weight[at] = np.minimum(1.0, (med / np.maximum(sd[ix[at]], 1e-12)) ** 2)
+                W = W * weight[None]
+            mass = W.sum(-1)
+            # Every model depth must be observed in this run (see column_profiles).
+            fits.append(None if ix.size < 2 * K or mass.min() < 1.0 else (ix, W / mass[:, None]))
+        if all(f is None for f in fits):
+            continue
+        kept.append(unique[unit])
+        members.append(ix_all)
+        for r, fit in enumerate(fits):
+            if fit is None:
+                samples[r].append(np.zeros((runs[r].shape[1], K), np.float32))
+                sampling[r].append(eye)
+                covs[r].append(eye)
+            else:
+                ix, S = fit
+                samples[r].append((S @ psc_np[r][ix]).T)
+                sampling[r].append(S @ read[ix])
+                covs[r].append(S @ S.T)
+    if not kept:
+        raise ValueError("no patch spans every model depth; enlarge patches or reduce -depths")
+    return ColumnProfiles(
+        members,
+        [torch.as_tensor(np.stack(x))[None] for x in samples],
+        [torch.as_tensor(np.stack(x)) for x in sampling],
+        [torch.as_tensor(np.stack(x)) for x in covs],
+        read,
+        nuisance,
+        np.asarray(kept),
+        present,
     )
 
 
@@ -288,6 +404,7 @@ def voxel_gain_removal(
     grid_local: torch.Tensor,
     nuisance: list[torch.Tensor],
     *,
+    present: list[np.ndarray] | None = None,
     lambdas: tuple[float, ...] = DEFAULT_GAIN_LAMBDAS,
     device: torch.device,
     verbose: bool = True,
@@ -346,23 +463,35 @@ def voxel_gain_removal(
         # Runs are handled one at a time so they may differ in length; only their
         # (b, 3, 3) normal equations meet, in the leave-one-run-out ridge.
         Xs, xtx, xty, yy = [], [], [], []
+        seen = (
+            None
+            if present is None
+            else torch.stack([torch.as_tensor(p[j], device=device) for p in present])
+        )  # (R, b): which runs observed each voxel; absent rows add nothing below
         for r in range(R):
             raw = runs[r][j].to(device=device, dtype=torch.float32)
-            y = detrend(100 * (raw / raw.mean(-1, keepdim=True) - 1), r)
+            mean = raw.mean(-1, keepdim=True)
+            if seen is not None:
+                mean = torch.where(seen[r, :, None], mean, torch.ones_like(mean))
+            y = detrend(100 * (raw / mean - 1), r)
             del raw
             trans = torch.einsum("bk,btk->bt", w, grid_transport[r][u].to(device))
             local = torch.einsum("bk,btk->bt", w, grid_local[r][u].to(device))
             shift = torch.gradient(trans, dim=-1)[0]
             X = detrend(torch.stack([local, trans, shift], -1), r)
             del local, trans, shift
+            if seen is not None:
+                y = y * seen[r, :, None]
+                X = X * seen[r, :, None, None]
             Xd, yd = X.to(dtype), y.to(dtype)
             xtx.append(torch.einsum("btp,btq->bpq", Xd, Xd))
             xty.append(torch.einsum("btp,bt->bp", Xd, yd))
             yy.append(yd.square().sum(-1))
             Xs.append(X)
         beta, best, sse = loro_prior_ridge(
-            torch.stack(xtx), torch.stack(xty), torch.stack(yy), prior, penalized, lambdas
-        )
+            torch.stack(xtx), torch.stack(xty), torch.stack(yy), prior, penalized, lambdas,
+            n_runs=None if seen is None else seen.sum(0),
+        )  # fmt: skip
         yy = torch.stack(yy)
         b32 = beta.to(torch.float32)
         for r, X in enumerate(Xs):
@@ -490,6 +619,7 @@ def devein_volume_runs(
     ridge_cv: str = "loro",
     split_blocks: np.ndarray | None = None,
     split_repeats: int = 2,
+    present: list[np.ndarray] | None = None,
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -526,15 +656,19 @@ def devein_volume_runs(
     K = spec.K
     if columns is None:
         columns = column_profiles(
-            runs, depth, labels, K, polort, device, use=in_columns, robust=removal == "voxel"
-        )
+            runs, depth, labels, K, polort, device, use=in_columns,
+            robust=removal == "voxel", present=present,
+        )  # fmt: skip
+    partial = columns.present is not None
+    if present is not None and not all(bool(np.all(p)) for p in present) and not partial:
+        raise ValueError("columns were built without the runs' present masks")
     V = runs[0].shape[0]
     lengths = [int(r.shape[1]) for r in runs]
     ragged = len(set(lengths)) > 1
-    if ragged and len(strengths) > 1:
+    if (ragged or partial) and len(strengths) > 1:
         raise ValueError(
-            "runs of different lengths take a single ridge strength: choosing between "
-            "several compares the runs (or voxel halves) sample by sample"
+            "runs of different lengths or coverage take a single ridge strength: choosing "
+            "between several compares the runs (or voxel halves) sample by sample"
         )
     means = [r.mean(-1, keepdim=True) for r in runs]
     starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).tolist()
@@ -555,19 +689,19 @@ def devein_volume_runs(
             frequencies = torch.zeros_like(frequencies)
         return pad, *vascular_transfer(system, frequencies, target)
 
-    if ragged:
+    if ragged or partial:
         # A single strength makes each run's inverse independent, so every run is
-        # solved on its own grid; nothing is padded to a common length.
+        # solved on its own grid and its own voxels; nothing is padded or shared.
         parts = []
-        for prof in profiles:
+        for r, prof in enumerate(profiles):
             pad, full_r, desired_r = transfer(prof.shape[2])
             parts.append(
                 dynamic_inverse(
                     prof,
                     full_r,
                     desired_r,
-                    sampling=columns.sampling,
-                    noise_cov=columns.noise_cov,
+                    sampling=_per_run(columns.sampling, r),
+                    noise_cov=_per_run(columns.noise_cov, r),
                     strengths=strengths,
                     tr=spec.TR,
                     pad=pad,
@@ -642,6 +776,11 @@ def devein_volume_runs(
     )  # fmt: skip
 
 
+def _per_run(x, r):
+    """A per-run list's entry r, or the one tensor every run shares."""
+    return x[r] if isinstance(x, list) else x
+
+
 def _finish(
     result, runs, columns, labels, removal, gain_lambdas, device, verbose,
     means, starts, removed, smooth, diagnostics, valid, leak_v,
@@ -666,6 +805,7 @@ def _finish(
             result.grid_correction,
             [p - c for p, c in zip(result.grid_predicted, result.grid_correction, strict=True)],
             nuisance,
+            present=columns.present,
             lambdas=gain_lambdas,
             device=device,
             verbose=verbose,
@@ -715,6 +855,11 @@ def _finish(
         verbose=False,
     )
     removed = list(rem_concat.split(lengths, dim=-1))
+    if columns.present is not None:  # a run that did not observe a voxel takes nothing from it
+        for r, pr in enumerate(columns.present):
+            gone = torch.from_numpy(~pr)
+            removed[r][gone] = 0
+            smooth[r][gone] = 0
     corrected = [r - rem * m / 100 for r, rem, m in zip(runs, removed, means, strict=True)]
     return VolumeTdvResult(
         corrected, removed, smooth, *diagnostics, valid, profiles, split_leak=leak_v
