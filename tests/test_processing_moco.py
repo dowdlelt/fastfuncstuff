@@ -673,3 +673,30 @@ def test_afni_motion_params_pivot_at_the_cardinal_grid_centre():
     p[:3] = torch.tensor([1.0, 0.0, 0.0])
     M_dicom = voxel_matrix_to_dicom(p2m(p).float(), affine, affine)
     assert np.abs(afni_motion_params(M_dicom, affine, shape)[:3]).max() > 0.5
+
+
+@pytest.mark.parametrize("twopass", [False, True])
+def test_moco_slab_moved_by_slices_recovers_the_shift(twopass):
+    """A thin slab moved several slices (cross-run alignment of a 16-slice slab):
+    a third of the warped base samples from outside the source grid. Fitting
+    the resampler's zero fill as data stalled at 0 or 3 slices (CPU) and diverged
+    on CUDA; weighting only the voxels whose sample is inside recovers it."""
+    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import shift as ndshift
+
+    nz = 16
+    rng = np.random.default_rng(3)
+    tall = gaussian_filter(rng.normal(size=(nz + 12, 48, 48)), 1.5)
+    tall = (tall - tall.min()) / np.ptp(tall) + 0.5
+
+    def window(v):  # the slab: tissue in every slice, a different stretch per run
+        return v[2 : 2 + nz]
+
+    shifts = (2.0, 3.5, 5.0)
+    vols = [window(tall)] + [
+        window(ndshift(tall, (-dz, 0.3, -0.2), order=3, mode="nearest")) for dz in shifts
+    ]
+    ts = torch.tensor(np.stack(vols), dtype=torch.float32)
+    res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, twopass=twopass))
+    np.testing.assert_allclose(res.params[1:, 2], [-s for s in shifts], atol=0.1)
+    assert np.abs(res.params[1:, 3:]).max() < 0.3

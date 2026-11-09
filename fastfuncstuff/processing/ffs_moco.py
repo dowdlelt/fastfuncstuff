@@ -82,6 +82,10 @@ class MocoConfig:
     fixed_iter: bool = False  # Fast mode: skip convergence, run exactly max_iter
     compile: bool = True  # Use torch.compile for hot path (CUDA only)
     use_shear: bool = True  # Shear-based rigid resample (AFNI THD_rota_vol): estimation + final
+    # WLS: voxels whose sample leaves the source grid take no weight (slabs moved
+    # by more than the edge band). Default WLS paths only: -fixed_iter, the masked
+    # non-shear path, lpa and quad keep the resampler's zero fill.
+    valid_overlap: bool = True
     skip_resample: bool = False  # Estimate only: skip Pass 2 (no aligned output produced)
     device: str | None = None
     verb: int = 1
@@ -332,6 +336,85 @@ def _weighted_rms(base: Tensor, source: Tensor, weight: Tensor) -> float:
     return float(rms.item())
 
 
+def _weight_box_corners(weight: Tensor) -> Tensor | None:
+    """(4, 8) homogeneous (x, y, z, 1) index corners of the weight's nonzero box.
+
+    A rigid map sends that box's interior inside its mapped corners' hull, so
+    when every mapped corner lies inside the source grid no weighted sample can
+    come from outside it (see :func:`_leaves_source`). None for an empty weight.
+    """
+    nz = (weight > 0).nonzero()
+    if nz.numel() == 0:
+        return None
+    lo, hi = nz.min(0).values.flip(0), nz.max(0).values.flip(0)  # (x, y, z)
+    corners = torch.tensor(
+        [[(hi if (c >> a) & 1 else lo)[a].item() for a in range(3)] + [1.0] for c in range(8)],
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    return corners.t()
+
+
+def _leaves_source(mats: Tensor, corners: Tensor, shape: tuple[int, int, int]) -> Tensor:
+    """(B,) True where a matrix maps part of the weighted box outside the source grid."""
+    nz, ny, nx = shape
+    src = (mats if mats.ndim == 3 else mats[None]) @ corners  # (B, 4, 8)
+    hi = torch.tensor([nx - 1, ny - 1, nz - 1], device=src.device, dtype=src.dtype)[None, :, None]
+    return ((src[:, :3] < 0) | (src[:, :3] > hi)).any(dim=(1, 2))
+
+
+def _supported(ones_warped: Tensor) -> Tensor:
+    """Voxels whose sample point lies inside the source, from a ones volume resampled
+    with LINEAR taps (1 exactly when both neighbours are inside). Not the estimation
+    kernel's own taps: a heptic reaches 4 voxels, and requiring all of them inside
+    dropped most of a 16-slice slab and worsened the fit. Both devices zero-fill
+    the outer taps identically, so the sample point is the criterion that matters."""
+    return (ones_warped - 1).abs() < 1e-4
+
+
+def _trust_step(dp: Tensor) -> Tensor:
+    """Scale a (..., 6) GN step to at most 1 voxel / 1 degree per iteration.
+
+    Used only while the support restriction is active: with a third of a thin
+    slab dropped, the in-plane rotations are barely constrained, a full step
+    overshoots, the support shifts with it and the fit runs away (20+ degrees on
+    a synthetic 16-slice slab moved 5 slices under -twopass). The converged
+    answer is unchanged; only the path to it is.
+    """
+    big = torch.maximum(dp[..., :3].abs().amax(-1), dp[..., 3:6].abs().amax(-1))
+    return dp * (1.0 / big.clamp_min(1.0)).unsqueeze(-1)
+
+
+def _weight_where_supported(
+    weight_flat, matrix, source, coords, interp, shape, resample_fn, corners
+) -> Tensor:
+    """``weight_flat`` without the voxels whose sample under ``matrix`` left the
+    source -- for comparing two transforms' costs on the data each one sees."""
+    if corners is None or not bool(_leaves_source(matrix, corners, shape)[0]):
+        return weight_flat
+    sup = _supported(resample_fn(torch.ones_like(source), matrix, coords, "linear", shape))
+    return weight_flat * sup.reshape(-1)
+
+
+def _support_restricted(
+    weight_flat: Tensor, WJ: Tensor, JtWJ: Tensor, sup: Tensor
+) -> tuple[Tensor, Tensor | None]:
+    """Weight and normal matrix with the voxels whose sample left the source removed.
+
+    A sample from outside the source grid is the resampler's fill (zero), not
+    data: compared with the base it is a large, meaningless residual. On a thin
+    slab moved by a few slices that is a third of the volume, the fit turns
+    ill-conditioned, and the batched CUDA and per-volume CPU solvers settled up
+    to 0.7 mm / deg apart on the same stack (ds004539 cross-run). Only the lost
+    voxels' share leaves the Gram (``_gram_normal_eq`` is ``WJ @ WJ.T``), so this
+    costs little. Returns ``(weight, None)`` when nothing weighted was lost.
+    """
+    lost = (weight_flat > 0) & ~sup
+    if not bool(lost.any()):
+        return weight_flat, None
+    return weight_flat * sup, JtWJ - _gram_normal_eq(WJ[:, lost], WJ.device)
+
+
 def _unweighted_rms(base: Tensor, source: Tensor) -> float:
     """Compute unweighted RMS difference (matching AFNI 3dvolreg)."""
     diff = base - source
@@ -351,6 +434,7 @@ def _prefer_wls_incumbent(
     resample_fn=resample_affine_fast,
     p2m_fn=params_to_matrix,
     incumbent_rms: float | None = None,
+    support_corners: Tensor | None = None,
 ) -> Tensor:
     """Return the candidate only when it improves on a stage's incoming transform.
 
@@ -358,12 +442,20 @@ def _prefer_wls_incumbent(
     it -- gauss_newton_rigid's ``init_rms_out`` -- saving one full resample per
     stage per volume (a quarter of CPU -twopass time went to these checks).
     """
+
+    def weight_for(matrix):
+        return _weight_where_supported(
+            weight_flat, matrix, source, coords, interp, output_shape, resample_fn, support_corners
+        )
+
     with torch.no_grad():
         if incumbent_rms is None:
-            incumbent_warped = resample_fn(source, p2m_fn(incumbent), coords, interp, output_shape)
-            incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_flat)
-        candidate_warped = resample_fn(source, p2m_fn(candidate), coords, interp, output_shape)
-        candidate_rms = _weighted_rms(base_flat, candidate_warped.reshape(-1), weight_flat)
+            m = p2m_fn(incumbent)
+            incumbent_warped = resample_fn(source, m, coords, interp, output_shape)
+            incumbent_rms = _weighted_rms(base_flat, incumbent_warped.reshape(-1), weight_for(m))
+        m = p2m_fn(candidate)
+        candidate_warped = resample_fn(source, m, coords, interp, output_shape)
+        candidate_rms = _weighted_rms(base_flat, candidate_warped.reshape(-1), weight_for(m))
     return incumbent.clone() if incumbent_rms < candidate_rms else candidate
 
 
@@ -417,6 +509,7 @@ def gauss_newton_rigid(
     p2m_fn=params_to_matrix,
     resample_fn=resample_affine_fast,
     init_rms_out: list[float] | None = None,
+    support_corners: Tensor | None = None,
 ) -> tuple[Tensor, int]:
     """Per-volume Gauss-Newton WLS rigid body registration.
 
@@ -435,6 +528,10 @@ def gauss_newton_rigid(
         init_rms_out: if given, receives the weighted RMS at ``init_params`` --
             free from the first iteration's residual, and exactly what
             ``_weighted_rms`` would compute after a resample of its own.
+        support_corners: the weight box (:func:`_weight_box_corners`). When the
+            current transform maps part of it outside the source, voxels whose
+            sample is not fully inside take no weight (see
+            :func:`_support_restricted`); otherwise nothing changes.
 
     Returns:
         (params, n_iters): optimized (12,) parameters and iteration count.
@@ -454,18 +551,30 @@ def gauss_newton_rigid(
         matrix = p2m_fn(params)
         warped = resample_fn(source, matrix, coords, config.interp, output_shape)
         warped_flat = warped.reshape(-1)
+        weight_it, solve_it = weight_flat, normal_solve
+        if support_corners is not None and bool(
+            _leaves_source(matrix, support_corners, output_shape)[0]
+        ):
+            ones = torch.ones_like(source)
+            sup = _supported(resample_fn(ones, matrix, coords, "linear", output_shape))
+            weight_it, JtWJ_it = _support_restricted(weight_flat, WJ, JtWJ, sup.reshape(-1))
+            if JtWJ_it is not None:
+                solve_it = _prepare_normal_solve(JtWJ_it, device, dtype)
 
-        # Weighted residual
+        # Weighted residual (zero where the sample left the source, so WJ @ residual
+        # sums over the supported voxels only)
         diff = base_flat - warped_flat
-        residual = weight_flat * diff
+        residual = weight_it * diff
         if it == 0 and init_rms_out is not None:
-            w_sum = weight_flat.sum().clamp(min=1e-10)
+            w_sum = weight_it.sum().clamp(min=1e-10)
             init_rms_out.append(float(((residual * diff).sum() / w_sum).sqrt().item()))
 
         # Right-hand side: J^T W r
         JtWr = WJ @ residual  # (6,)
 
-        dp = _normal_solve(normal_solve, JtWr)
+        dp = _normal_solve(solve_it, JtWr)
+        if weight_it is not weight_flat:
+            dp = _trust_step(dp)
 
         # Update only rigid params (first 6)
         params[:6] += dp.to(params.dtype)
@@ -600,6 +709,7 @@ def batched_gn_estimate(
     fixed_iter: bool,
     init_params: Tensor | None = None,
     p2m_batched_fn=params_to_matrix_batched,
+    support_corners: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Gauss-Newton WLS for a whole batch of volumes at once (Triton shears).
 
@@ -614,10 +724,13 @@ def batched_gn_estimate(
         base_flat: (N,) flattened base. weight_flat_1d: (N,) weights.
         WJ: (6, N) weighted Jacobian. JtWJ: (6, 6) full normal matrix.
         init_params: optional (B,12) starting params (default: identity).
+        support_corners: as in :func:`gauss_newton_rigid`; volumes whose
+            transform leaves the source are solved with their own normal matrix.
     Returns:
         (params (B,12), n_iters (B,), invalid (B,)) — ``invalid`` flags volumes
         whose shear decomposition was ever degenerate (caller re-runs those).
     """
+    assert shear_resample_triton is not None, "batched estimation needs the Triton shear"
     B = sources.shape[0]
     device, dtype = sources.device, sources.dtype
     N = base_flat.numel()
@@ -633,13 +746,39 @@ def batched_gn_estimate(
     n_iters = torch.full((B,), max_iter, dtype=torch.int32, device=device)
     invalid = torch.zeros(B, dtype=torch.bool, device=device)
 
+    def support_weights(mats: Tensor) -> tuple[Tensor, dict[int, Tensor]]:
+        """(B, N) weights with unsupported voxels removed, and each affected
+        volume's own normal matrix (index -> 6x6)."""
+        w = weight_flat_1d[None].expand(B, N)
+        own: dict[int, Tensor] = {}
+        if support_corners is None:
+            return w, own
+        leave = _leaves_source(mats, support_corners, shape)
+        if not bool(leave.any()):
+            return w, own
+        rows = leave.nonzero(as_tuple=True)[0]
+        ones = torch.ones((rows.numel(), *shape), device=device, dtype=dtype)
+        sup, _ = shear_resample_triton(ones, mats[rows], shape, "linear")
+        w = w.clone()
+        for r, sv in zip(rows.tolist(), _supported(sup.reshape(rows.numel(), N)), strict=True):
+            w_r, JtWJ_r = _support_restricted(weight_flat_1d, WJ, JtWJ, sv)
+            if JtWJ_r is not None:
+                w[r] = w_r
+                own[r] = JtWJ_r
+        return w, own
+
     for it in range(max_iter):
         mats = p2m_batched_fn(params)  # (B,4,4)
         warped, valid = shear_resample_triton(sources, mats, shape, interp)
         invalid = invalid | ~valid
-        residual = weight_flat_1d[None] * (base_flat[None] - warped.reshape(B, N))
+        w_b, own = support_weights(mats)
+        residual = w_b * (base_flat[None] - warped.reshape(B, N))
         JtWr = residual @ WJ.t()  # (B,6)
         dp = _normal_solve(normal_solve, JtWr.t()).t().to(dtype)  # (B,6)
+        for r, JtWJ_r in own.items():
+            dp[r] = _trust_step(
+                _normal_solve(_prepare_normal_solve(JtWJ_r, device, dtype), JtWr[r]).to(dtype)
+            )
 
         # only update active, validly-decomposed volumes
         upd = (active & valid).unsqueeze(1).to(dtype)
@@ -664,13 +803,14 @@ def batched_gn_estimate(
         candidate_warped, candidate_valid = shear_resample_triton(
             sources, p2m_batched_fn(params), shape, interp
         )
-        denom = weight_flat_1d.sum().clamp_min(1e-10)
-        incumbent_mse = (
-            weight_flat_1d[None] * (base_flat[None] - incumbent_warped.reshape(B, N)) ** 2
-        ).sum(1) / denom
-        candidate_mse = (
-            weight_flat_1d[None] * (base_flat[None] - candidate_warped.reshape(B, N)) ** 2
-        ).sum(1) / denom
+        w_inc, _ = support_weights(p2m_batched_fn(incumbent))
+        w_can, _ = support_weights(p2m_batched_fn(params))
+        incumbent_mse = (w_inc * (base_flat[None] - incumbent_warped.reshape(B, N)) ** 2).sum(
+            1
+        ) / w_inc.sum(1).clamp_min(1e-10)
+        candidate_mse = (w_can * (base_flat[None] - candidate_warped.reshape(B, N)) ** 2).sum(
+            1
+        ) / w_can.sum(1).clamp_min(1e-10)
         keep_incumbent = incumbent_valid & (~candidate_valid | (incumbent_mse < candidate_mse))
         params = torch.where(keep_incumbent[:, None], incumbent, params)
         invalid = invalid | ~incumbent_valid | ~candidate_valid
@@ -978,6 +1118,7 @@ def _run_batched_estimation(
     coarse=None,
     p2m_fn=params_to_matrix,
     p2m_batched_fn=params_to_matrix_batched,
+    support_corners=(None, None),
 ):
     """Estimate all volumes' rigid params with the whole-batch shear GN solver.
 
@@ -1046,6 +1187,7 @@ def _run_batched_estimation(
                 ccfg.dph_thresh,
                 ccfg.fixed_iter,
                 p2m_batched_fn=p2m_batched_fn,
+                support_corners=support_corners[1],
             )
 
         params, nit, invalid = batched_gn_estimate(
@@ -1062,6 +1204,7 @@ def _run_batched_estimation(
             config.fixed_iter,
             init_params=init_params,
             p2m_batched_fn=p2m_batched_fn,
+            support_corners=support_corners[0],
         )
 
         # Re-fit any degenerate-decomposition volumes with the trusted solver.
@@ -1078,6 +1221,7 @@ def _run_batched_estimation(
                     config,
                     coords=homo,
                     p2m_fn=p2m_fn,
+                    support_corners=support_corners[0],
                 )
                 params[j] = p
                 nit[j] = ni
@@ -1420,6 +1564,7 @@ def moco(
         JtWJ = _gram_normal_eq(WJ, device)  # (6, 6)
 
         weight_flat_1d = weight.reshape(-1)
+        corners = _weight_box_corners(weight) if config.valid_overlap else None
     elif config.cost == "quad":
         from .quadrature import (
             apply_quadrature_filters_fft,
@@ -1451,6 +1596,8 @@ def moco(
         weight_flat_1d = None
         filter_spectra = None
         q_base = None
+    if config.cost != "wls":
+        corners = None
 
     # Pre-build homogeneous coordinate grid once (reused across all volumes/iterations)
     homo_coords = _build_homo_coords(vol_shape, device, dtype)
@@ -1542,9 +1689,11 @@ def moco(
         WJ_c = wf_coarse * derivs_coarse
         JtWJ_c = _gram_normal_eq(WJ_c, device)  # (6, 6)
         wf1_coarse = weight_coarse.reshape(-1)
+        corners_c = _weight_box_corners(weight_coarse) if config.valid_overlap else None
     else:
         base_coarse = weight_coarse = None
         bf_coarse = wf1_coarse = WJ_c = JtWJ_c = None
+        corners_c = None
 
     # Allocate output arrays
     # The aligned series is produced by Pass 2 (resample_timeseries); start
@@ -1612,6 +1761,7 @@ def moco(
             coarse=_coarse,
             p2m_fn=p2m_piv,
             p2m_batched_fn=p2m_piv_b,
+            support_corners=(corners, corners_c),
         )
 
     # ── Pass 1 (per-volume): estimate parameters ─────────────────────────
@@ -1681,6 +1831,7 @@ def moco(
                     p2m_fn=_p2m,
                     resample_fn=_resample,
                     init_rms_out=coarse_rms,
+                    support_corners=corners_c,
                 )
             init_params = _prefer_wls_incumbent(
                 bf_coarse,
@@ -1694,6 +1845,7 @@ def moco(
                 resample_fn=_resample,
                 p2m_fn=_p2m,
                 incumbent_rms=coarse_rms[0] if coarse_rms else None,
+                support_corners=corners_c,
             )
 
         # Main alignment
@@ -1754,6 +1906,7 @@ def moco(
                         p2m_fn=_p2m,
                         resample_fn=_resample,
                         init_rms_out=fine_rms,
+                        support_corners=corners,
                     )
         elif config.cost == "lpa":
             params, n_iter = gn_lpa_rigid(
@@ -1810,13 +1963,22 @@ def moco(
                 resample_fn=_resample,
                 p2m_fn=_p2m,
                 incumbent_rms=fine_rms[0] if fine_rms else None,
+                support_corners=corners,
             )
 
         # Fallback: if result is worse than identity, retry from identity (skip in fixed_iter mode)
         if not config.fixed_iter:
             mat_result = _p2m(params)
             warped_check = _resample(source_est, mat_result, homo_coords, config.interp, vol_shape)
-            rms_result = _weighted_rms(base_est, warped_check, weight)
+            w_check = (
+                weight
+                if corners is None
+                else _weight_where_supported(
+                    weight.reshape(-1), mat_result, source_est, homo_coords, config.interp,
+                    vol_shape, _resample, corners,
+                ).reshape(weight.shape)
+            )  # fmt: skip
+            rms_result = _weighted_rms(base_est, warped_check, w_check)
 
             rms_identity = _weighted_rms(base_est, source_est, weight)
             if rms_result > rms_identity * 1.05 and not torch.equal(init_params[:6], identity[:6]):
@@ -1850,6 +2012,7 @@ def moco(
                             coords=homo_coords,
                             p2m_fn=_p2m,
                             resample_fn=_resample,
+                            support_corners=corners,
                         )
                 elif config.cost == "lpa":
                     params, n_iter = gn_lpa_rigid(
