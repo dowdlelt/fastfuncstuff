@@ -116,6 +116,36 @@ def _resample(
     return warped.clamp_min(0.0) if no_neg else warped
 
 
+def _resample_series(
+    series: torch.Tensor,
+    matrix: torch.Tensor,
+    out_shape: tuple[int, int, int],
+    final_interp: str,
+    no_neg: bool,
+    *,
+    desc: str,
+    verb: int,
+) -> torch.Tensor:
+    """Resample every volume of a 4D series; the result is built on the HOST.
+
+    One volume at a time goes to ``matrix``'s device and comes back into a
+    preallocated host array. Stacking the results on the device instead put the
+    whole output there at once: a 291-volume run onto a 0.7 mm slab grid asked
+    for one 6.6 GB allocation and ran out of memory.
+    """
+    out = torch.empty((series.shape[0], *out_shape), dtype=torch.float32)
+    for t in tqdm(
+        range(series.shape[0]),
+        desc=desc,
+        unit="vol",
+        leave=True,
+        disable=verb < 1 or series.shape[0] < 4,
+    ):
+        vol = series[t].to(device=matrix.device, dtype=torch.float32)
+        out[t] = _resample(vol, matrix, out_shape, final_interp, no_neg).cpu()
+    return out
+
+
 def _follower_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
     """(dataset, prefix) pairs from -source_follower / -follower_prefix, validated."""
     followers = args.source_follower or []
@@ -152,25 +182,17 @@ def _apply_followers(
     a_src = torch.as_tensor(np.asarray(source_affine), dtype=torch.float64)
     for path, prefix in _follower_pairs(args):
         with spinner(f"Loading {Path(path).name}"):
-            follower, follower_header = load_image(path, device=device)
+            follower, follower_header = load_image(path)  # host: a 4D one stays there
         a_fol = torch.as_tensor(np.asarray(follower_header["affine"]), dtype=torch.float64)
         fm = plinalg.inv(a_fol) @ a_src @ matrix.detach().cpu().double()
         fm = fm.to(device=device, dtype=matrix.dtype)
         if follower.ndim == 4:
-            warped = torch.stack(
-                [
-                    _resample(follower[t], fm, out_shape, args.final_interp, args.no_neg)
-                    for t in tqdm(
-                        range(follower.shape[0]),
-                        desc=f"  Resampling {Path(path).name}",
-                        unit="vol",
-                        leave=True,
-                        disable=verb < 1 or follower.shape[0] < 4,
-                    )
-                ]
-            )
+            warped = _resample_series(
+                follower, fm, out_shape, args.final_interp, args.no_neg,
+                desc=f"  Resampling {Path(path).name}", verb=verb,
+            )  # fmt: skip
         else:
-            warped = _resample(follower, fm, out_shape, args.final_interp, args.no_neg)
+            warped = _resample(follower.to(device), fm, out_shape, args.final_interp, args.no_neg)
         with spinner(f"Writing {Path(prefix).name}"):
             save_image(warped, prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
@@ -801,10 +823,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
 
     # --- Load images ---
     t0 = time.time()
+    # Read to the host and move only the volumes the fit uses: a 4D source stays
+    # there and is resampled a volume at a time (_resample_series).
     with spinner(f"Loading {Path(args.base).name}"):
-        base, base_header = load_image(args.base, device=device)
+        base, base_header = load_image(args.base)
     with spinner(f"Loading {Path(args.source).name}"):
-        source, source_header = load_image(args.source, device=device)
+        source, source_header = load_image(args.source)
 
     # Handle 4D base
     if base.ndim == 4:
@@ -812,6 +836,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if verb >= 1:
             print(f"  Base volume: {idx} of {base.shape[0]}")
         base = base[idx]
+    base = base.to(device)
 
     # Handle 4D source
     source_4d = None
@@ -820,6 +845,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         source = source[0]
         if verb >= 1:
             print(f"  Estimation volume: first of {source_4d.shape[0]}")
+    source = source.to(device)
 
     if verb >= 1:
         print_cli_section("Inputs", leading_blank=False)
@@ -855,18 +881,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if source_4d is None:
             warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
         else:
-            warped = torch.stack(
-                [
-                    _resample(vol, om, out_shape, args.final_interp, args.no_neg)
-                    for vol in tqdm(
-                        source_4d,
-                        desc=f"  Resampling {source_4d.shape[0]} volumes",
-                        unit="vol",
-                        leave=True,
-                        disable=verb < 1 or source_4d.shape[0] < 4,
-                    )
-                ]
-            )
+            warped = _resample_series(
+                source_4d, om, out_shape, args.final_interp, args.no_neg,
+                desc=f"  Resampling {source_4d.shape[0]} volumes", verb=verb,
+            )  # fmt: skip
         if verb >= 1:
             print_cli_section("Outputs")
         with spinner(f"Writing {Path(args.prefix).name}"):
@@ -1077,17 +1095,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
         # One resample per volume, each a full-grid wsinc5 by default: minutes for a
         # long run, so it gets a bar rather than a line that sits there.
-        aligned_vols = [
-            _resample(source_4d[t], om, out_shape, args.final_interp, args.no_neg)
-            for t in tqdm(
-                range(source_4d.shape[0]),
-                desc=f"  Resampling {source_4d.shape[0]} volumes",
-                unit="vol",
-                leave=True,
-                disable=verb < 1 or source_4d.shape[0] < 4,
-            )
-        ]
-        result_4d = torch.stack(aligned_vols)
+        result_4d = _resample_series(
+            source_4d, om, out_shape, args.final_interp, args.no_neg,
+            desc=f"  Resampling {source_4d.shape[0]} volumes", verb=verb,
+        )  # fmt: skip
         with spinner(f"Writing {Path(args.prefix).name}"):
             save_image(result_4d, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:

@@ -141,3 +141,24 @@ def test_matrix_apply_preserves_every_4d_source_volume(tmp_path):
 
     result = nib.load(tmp_path / "out_4d.nii").get_fdata()
     assert result.shape == source.shape
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_4d_resample_builds_the_output_on_the_host(device):
+    """A 4D apply resampled every volume on the device and stacked them there: a
+    291-volume run onto a 0.7 mm slab grid asked for one 6.6 GB allocation. Each
+    volume now visits the device alone and lands in a host array."""
+    import torch
+
+    from fastfuncstuff.cli.allineate import _resample, _resample_series
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    series = torch.from_numpy(np.stack([_phantom(16) * k for k in (1.0, 2.0, 3.0)]))
+    m = torch.eye(4, device=device)
+    m[0, 3] = 0.4
+    out = _resample_series(series, m, (16, 16, 16), "wsinc5", False, desc="", verb=0)
+    assert out.device.type == "cpu" and series.device.type == "cpu"
+    for t in range(3):
+        one = _resample(series[t].to(device), m, (16, 16, 16), "wsinc5").cpu()
+        torch.testing.assert_close(out[t], one)
