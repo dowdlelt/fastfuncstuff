@@ -1063,7 +1063,7 @@ def transport_lag_share(profiles, transfer, weight, *, tr: float, edges=LAG_GATE
     bands = list(itertools.pairwise(edges))
     num, den = np.zeros(len(bands)), np.zeros(len(bands))
     for prof in run_profiles:
-        y = prof[0].double().cpu().numpy()
+        y = prof[0].cpu().double().numpy()
         F, f = np.fft.rfft(y, axis=1), np.fft.rfftfreq(y.shape[1], tr)
         seen = np.abs(y).sum((1, 2)) > 0  # a patch this run did not observe is all zero
         for b, band in enumerate(bands):
