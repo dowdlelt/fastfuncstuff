@@ -567,6 +567,16 @@ Examples:
         "coarse search; the other costs pay for each trial in full.",
     )
     search_group.add_argument(
+        "-reanchor",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Refit with the sampling footprint rebuilt at the fitted pose, until "
+        "the source stops moving. The cost samples match points where the source "
+        "sat at the start pose, so a thin slab started a few mm off cannot see its "
+        "true peak; each pass moves the footprint toward it. auto: on when the "
+        "source covers under 25%% of the base brain (a partial field of view).",
+    )
+    search_group.add_argument(
         "-nmatch",
         "-n_match",
         dest="n_match",
@@ -961,6 +971,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         ),
         adam_lr=args.adam_lr,
         tbest=args.tbest,
+        reanchor=args.reanchor,
         adam_iters_2x=adam_iters_2x,
         adam_iters_1x=adam_iters_1x,
         powell_maxfev=powell_maxfev,

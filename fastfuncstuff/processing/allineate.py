@@ -151,6 +151,22 @@ class AffineAlignConfig:
     coarse_n_rot: int | None = None  # None -> derived from coarse_range/coarse_step
     coarse_n_random: int = 32  # extra random joint seeds, for robustness
 
+    # Re-anchoring for a partial field of view. The cost samples match points only
+    # where the source sits at the START pose, and warped points that land outside it
+    # are dropped. A thin slab (ds004539 VASO: 14 mm thick) whose start is a few mm
+    # off therefore has much of its true footprint outside the sampled domain, so the
+    # true peak is under-scored and the fit settles on a shoulder 4 mm / 4 deg away
+    # (common-yardstick cost 0.37 vs 1.07). More trials, denser coarse seeds, other
+    # optimizers and a perturbation cloud at the sharp stage all left it there.
+    # Refitting with the footprint rebuilt at the fitted pose moves the domain toward
+    # the true slab each pass: 0.105 -> 0.574 -> 1.100 on that data. ``auto`` turns
+    # it on when the source covers under ``reanchor_coverage`` of the base brain;
+    # it stops when the source's corners move less than ``reanchor_tol_mm``.
+    reanchor: str = "auto"
+    reanchor_passes: int = 3
+    reanchor_coverage: float = 0.25
+    reanchor_tol_mm: float = 0.25
+
     # Refinement tuning. Iteration counts are ceilings; Adam stops early on a
     # relative-tolerance plateau, so generous caps are cheap when converged.
     adam_iters_2x: int = 300  # Adam iters at 2x downsampled (ceiling)
@@ -3066,6 +3082,8 @@ class _GridSetup:
     bounds: np.ndarray
     sample: SampleSet | None
     init_params: Tensor
+    source_coverage: float = 1.0
+    """Fraction of the base's nonzero voxels the source's field of view covers."""
 
 
 def _prepare_grid(
@@ -3140,10 +3158,13 @@ def _prepare_grid(
     cmass_mat[:3, 3] = torch.as_tensor(cmass_shift, device=device, dtype=cmass_mat.dtype)
     align_matrix = g @ cmass_mat
 
+    source_coverage = 1.0
     if cross_grid or bool(np.any(cmass_shift != 0.0)):
         source_validity = _compute_source_validity_mask(
             source_native.shape, base.shape, align_matrix
         )
+        in_brain = base != 0
+        source_coverage = float((source_validity & in_brain).sum()) / max(1, int(in_brain.sum()))
         source_on_base = apply_affine(source_native, align_matrix, base.shape, zero_outside=True)
         source_on_base = source_on_base * source_validity.float()
         if verb >= 1 and cross_grid:
@@ -3332,6 +3353,7 @@ def _prepare_grid(
         bounds=bounds,
         sample=sample,
         init_params=init_params,
+        source_coverage=source_coverage,
     )
 
 
@@ -3382,7 +3404,8 @@ def allineate(
     # The recorder is reached through a ContextVar rather than five more parameters,
     # so it is opened here and the whole alignment runs inside it.
     with _recording_movie(movie_recorder, _align_device(base, config)), _pivot_scope():
-        return _align(
+        info: dict = {}
+        matrix, warped = _align(
             base,
             source,
             config,
@@ -3392,7 +3415,71 @@ def allineate(
             save_cmass_path,
             save_weight_path,
             save_cost_trace_path,
+            info,
         )
+        if not _reanchor_wanted(config, info, base_header, source_header):
+            return matrix, warped
+        from .affine import voxel_matrix_to_dicom
+
+        voxdims = _voxdims_from_header(base_header)
+        for k in range(config.reanchor_passes):
+            init = voxel_matrix_to_dicom(matrix, base_header["affine"], source_header["affine"])
+            nxt, nxt_warped = _align(
+                base,
+                source,
+                replace(config, init_matrix=init.detach().cpu().numpy()),
+                base_header,
+                source_header,
+                None,
+                None,
+                None,
+                None,
+                {},
+            )
+            moved = _corner_motion_mm(matrix, nxt, tuple(source.shape), voxdims)
+            matrix, warped = nxt, nxt_warped
+            if config.verb >= 1:
+                print(f"  Re-anchor pass {k + 1}: source corners moved {moved:.2f} mm")
+            if moved < config.reanchor_tol_mm:
+                break
+        return matrix, warped
+
+
+def _reanchor_wanted(
+    config: AffineAlignConfig, info: dict, base_header: dict | None, source_header: dict | None
+) -> bool:
+    """Whether to refit with the sampling footprint rebuilt at the fitted pose."""
+    if config.reanchor == "off" or config.reanchor_passes <= 0:
+        return False
+    if base_header is None or source_header is None or "affine" not in base_header:
+        return False  # the pose is handed on as a header-space matrix
+    if config.reanchor == "on":
+        return True
+    return float(info.get("source_coverage", 1.0)) < config.reanchor_coverage
+
+
+def _corner_motion_mm(
+    m_old: Tensor,
+    m_new: Tensor,
+    source_shape: tuple[int, ...],
+    voxdims: tuple[float, float, float],
+) -> float:
+    """Largest distance the source volume's corners moved between two fits, in mm.
+
+    Both matrices map base voxels to source voxels, so a corner's base position is
+    ``inv(M) @ corner``. Reading the change at the corners keeps rotation and
+    translation in one number without choosing a convention for either.
+    """
+    nz, ny, nx = source_shape[-3:]
+    corners = np.array(
+        [[x, y, z, 1.0] for x in (0, nx - 1) for y in (0, ny - 1) for z in (0, nz - 1)]
+    ).T
+    scale = np.asarray(voxdims, dtype=np.float64)[:, None]
+    pos = []
+    for m in (m_old, m_new):
+        inv = np.linalg.inv(m.detach().cpu().double().numpy())  # CPU first: MPS has no float64
+        pos.append((inv @ corners)[:3] * scale)
+    return float(np.linalg.norm(pos[0] - pos[1], axis=0).max())
 
 
 def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
@@ -3475,8 +3562,11 @@ def _align(
     save_cmass_path: str | None,
     save_weight_path: str | None,
     save_cost_trace_path: str | None,
+    info: dict | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """The alignment itself; :func:`allineate` is its public, movie-wrapped door."""
+    """The alignment itself; :func:`allineate` is its public, movie-wrapped door.
+
+    ``info`` is filled with facts the caller decides on (``source_coverage``)."""
     device = _align_device(base, config)
     base = base.to(device)
     source_native = source.to(device)
@@ -3504,6 +3594,8 @@ def _align(
         save_weight_path=None if full_to_work is not None else save_weight_path,
         force_cross_grid=full_to_work is not None,
     )
+    if info is not None:
+        info["source_coverage"] = setup.source_coverage
     setup, config = _header_or_cmass_start(
         setup, base, base_header, source_native, source_header, config, device, verb,
         force_cross_grid=full_to_work is not None,
