@@ -959,6 +959,7 @@ def main(argv: list[str] | None = None) -> None:
             else "fixed physiology"
         ),
         "ridge_snr_level": result.snr_level,
+        "ridge_snr_level_at_grid_edge": result.snr_level_at_edge,
         "physiology_cv": None
         if cv is None
         else [

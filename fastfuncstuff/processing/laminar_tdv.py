@@ -733,6 +733,7 @@ class VolumeTdvResult:
     split_leak: np.ndarray | None = None  # V; ridge_cv="split" only
     snr: np.ndarray | None = None  # V; ridge_snr only: the patch SNR that set its ridge
     snr_level: float | None = None  # ridge_snr only: the C used (chosen, with "auto")
+    snr_level_at_edge: bool = False  # "auto" chose an end of SNR_RIDGE_GRID
 
 
 def devein_volume_runs(
@@ -830,6 +831,7 @@ def devein_volume_runs(
         return pad, *vascular_transfer(system, frequencies, target)
 
     scores, leak_u, unscored_np, snr_v, snr_level = None, None, None, None, None
+    snr_edge = False
     if ridge_snr is not None:
         # Wiener-like shrinkage: each patch's ridge is C x its noise/signal ratio,
         # so a quiet patch (little shared signal, mostly noise) is shrunk hard and
@@ -843,10 +845,10 @@ def devein_volume_runs(
         )  # fmt: skip
         fallback = float(np.nanmedian(snr)) if np.isfinite(snr).any() else 1.0
         snr_f = np.maximum(np.where(np.isfinite(snr), snr, fallback), 1e-6)
-        strengths = tuple(float(x) for x in np.geomspace(1e-2, 1e2, 41))
+        strengths = tuple(float(x) for x in np.geomspace(1e-2, 1e3, 51))
 
         def snr_scores(c: float) -> torch.Tensor:
-            lam = np.clip(c / snr_f, 1e-2, 1e2)
+            lam = np.clip(c / snr_f, 1e-2, 1e3)
             pick = np.abs(np.log(lam)[None] - np.log(strengths)[:, None]).argmin(0)
             out = torch.zeros(len(strengths), len(lam))
             out[pick, np.arange(len(lam))] = 1.0
@@ -870,11 +872,18 @@ def devein_volume_runs(
                     tr=spec.TR, cutoff_hz=cutoff_hz, band=lag_band, device=device,
                 )  # fmt: skip
             c_best = min(grads, key=lambda c: abs(grads[c] - lag_target))
+            snr_edge = c_best in (SNR_RIDGE_GRID[0], SNR_RIDGE_GRID[-1])
             if verbose:
                 print(f"  SNR ridge, auto level: target pial-deep lag {lag_target:+.2f} s (the local "
                       "veins' own, kept by the target); corrected lag by C: "
                       + "  ".join(f"{c:g}:{g:+.2f}" for c, g in grads.items())
                       + f"  -> C = {c_best:g}")  # fmt: skip
+            if snr_edge:
+                side = "strongest" if c_best == SNR_RIDGE_GRID[-1] else "weakest"
+                print(f"  WARNING: the chosen level is the grid's {side} shrinkage: no level "
+                      "brings the corrected depth lag to the model's, so the model does not "
+                      "describe these data well and the correction "
+                      + ("is held to a light touch" if side == "strongest" else "may be too weak"))  # fmt: skip
             ridge_snr = c_best
         scores = snr_scores(float(ridge_snr))
         snr_level = float(ridge_snr)
@@ -963,10 +972,11 @@ def devein_volume_runs(
     )  # fmt: skip
     out.snr = snr_v
     out.snr_level = snr_level
+    out.snr_level_at_edge = snr_edge
     return out
 
 
-SNR_RIDGE_GRID = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.5, 6.0, 9.0, 13.0, 20.0, 30.0)
+SNR_RIDGE_GRID = (0.5, 0.75, 1, 1.5, 2, 3, 4.5, 6, 9, 13, 20, 30, 45, 70, 100, 150, 220, 300)
 """Levels C that ``ridge_snr="auto"`` scores (ridge = C x noise/signal)."""
 
 
