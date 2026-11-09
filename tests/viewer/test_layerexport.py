@@ -34,7 +34,9 @@ def test_exports_the_in_memory_surfaces_onto_the_underlay(session, tmp_path):  #
     assert gm.sum() > 100
     assert abs(np.median(thick[gm]) - 0.1 * RADIUS) < 0.1
     np.testing.assert_allclose(np.abs(np.diag(rim.affine)[:3]), 1.0)
-    assert "wrote 8 files" in spec.done()
+    # The eight LN2_LAYERS outputs plus gm_frac: the export uses the fractional ribbon.
+    assert "wrote 9 files" in spec.done()
+    assert (tmp_path / "out" / "x_gm_frac.nii.gz").exists()
 
 
 def test_blocked_without_surfaces(session):  # noqa: F811

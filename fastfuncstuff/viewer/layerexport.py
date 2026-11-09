@@ -147,7 +147,10 @@ def export_dialog(session) -> DialogSpec:
     def install(result: Load | None) -> Aspect:
         return Aspect.NOTHING if result is None else session.do(result)
 
-    blurb = "LayNii rim, depth metrics, layers and thickness from the surfaces as shown"
+    blurb = (
+        "LayNii rim, depth metrics, layers and thickness from the surfaces as shown, on the "
+        "fractional ribbon (voxels >= 10% grey matter; gm_frac holds each share)"
+    )
     blurb += f" (edited: {', '.join(edited)})." if edited else "."
     return DialogSpec(
         name="surf2layers",
