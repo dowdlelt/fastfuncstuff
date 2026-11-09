@@ -292,3 +292,18 @@ def test_regions_from_atlas_keeps_names_and_hemispheres(sphere, tmp_path):
     north = regions.vertex_id[regions.members[0].indices]
     assert set(north) == set(np.flatnonzero(v[:, 2] > 0.7))
     assert v[regions.centre_vertex[0], 2] > 0.9
+
+
+def test_paint_ribbon_with_the_fractional_ribbon_fills_the_edge_voxels(sphere):
+    """laminascope's _ribbon maps follow -ribbon_frac: painted onto the fractional
+    ribbon, the voxels the ribbon only clips carry the column's value too."""
+    from fastfuncstuff.laminar.columns import paint_ribbon
+
+    surf, affine, shape, _, v = sphere
+    resp = np.ones(len(v), bool)
+    cols = make_columns([surf], [resp], radius_mm=7.0, spacing_mm=6.0, seed=1)
+    vals = np.ones((cols.vertex_id.size, 1))
+    ctr = paint_ribbon([surf], cols, vals, affine, shape, device=CPU)
+    frac = paint_ribbon([surf], cols, vals, affine, shape, device=CPU, min_gm_fraction=0.1)
+    on_c, on_f = np.isfinite(ctr[:, 0]), np.isfinite(frac[:, 0])
+    assert (on_c & ~on_f).sum() == 0 and (on_f & ~on_c).sum() > 0.1 * on_c.sum()

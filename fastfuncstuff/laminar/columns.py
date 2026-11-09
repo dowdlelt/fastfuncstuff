@@ -737,15 +737,24 @@ def full_surface(columns: ColumnSet, vertex_values: np.ndarray, surface: int, n_
 
 
 def paint_ribbon(
-    surfaces, columns: ColumnSet, vertex_values: np.ndarray, affine, shape, *, device=None
+    surfaces,
+    columns: ColumnSet,
+    vertex_values: np.ndarray,
+    affine,
+    shape,
+    *,
+    device=None,
+    min_gm_fraction: float | None = None,
 ) -> np.ndarray:
     """Vertex values into the ribbon voxels of a grid, through each voxel's owning
     vertex (nearest midthickness point, as the depth sampling owns its cells):
-    ``(X*Y*Z, ...)``, NaN off the columns."""
+    ``(X*Y*Z, ...)``, NaN off the columns. ``min_gm_fraction``: paint the
+    fractional ribbon (``cortical_depth_volumes``), edge voxels by their GM part."""
     from fastfuncstuff.surface.volume_depth import cortical_depth_volumes
 
     dv = cortical_depth_volumes(list(surfaces), affine, tuple(shape[:3]), n_layers=3,
-                                owners=True, device=device)  # fmt: skip
+                                owners=True, device=device,
+                                min_gm_fraction=min_gm_fraction)  # fmt: skip
     assert dv.owner_hemi is not None and dv.owner_vertex is not None
     key = dv.owner_hemi.astype(np.int64) * _KEY + dv.owner_vertex
     vkeys = columns.vertex_surface * _KEY + columns.vertex_id

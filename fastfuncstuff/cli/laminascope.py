@@ -26,6 +26,7 @@ import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, add_device_arg
 from fastfuncstuff.cli_utils import add_bids_events_args, add_ortvec_arguments
+from fastfuncstuff.surface.ribbon_args import ribbon_frac
 
 _DESCRIPTION = """\
 Run the laminar BOLD model (Havlicek & Uludag; the analysis of Faes et al. 2026, as
@@ -284,7 +285,11 @@ cohort.
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    from fastfuncstuff.surface.ribbon_args import add_depth_args, add_ribbon_args
+    from fastfuncstuff.surface.ribbon_args import (
+        add_depth_args,
+        add_ribbon_args,
+        add_ribbon_frac_arg,
+    )
 
     p = FfsArgumentParser(prog="ffs_laminascope", description=_DESCRIPTION, epilog=_EPILOG)
     g = p.add_argument_group("Curves and comparisons")
@@ -365,6 +370,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     c = p.add_argument_group("Columns")
     add_ribbon_args(c)
+    add_ribbon_frac_arg(c, "Used for the _ribbon.nii.gz maps only (the columns are cut "
+                        "from the surfaces). ")  # fmt: skip
     c.add_argument("-responsive", nargs="+", default=None, metavar="FILE",
                    help="Map marking responsive cortex: a mask, or a statistic with "
                    "-responsive_thresh. Either a VOLUME (file[N] picks a brick) or one .gii "
@@ -1076,7 +1083,8 @@ def _run(args, t_start) -> int:  # noqa: C901 -- a pipeline, read top to bottom
         baseline_peak = base_mid.mean(1).max(1)
         _write_comparison(args.prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
                           depth_names(args.N), device, say, in_fov=in_fov[fit_idx],
-                          baseline_peak=baseline_peak, gate_baseline=args.gate_baseline)  # fmt: skip
+                          baseline_peak=baseline_peak, gate_baseline=args.gate_baseline,
+                          min_gm_fraction=ribbon_frac(args))  # fmt: skip
         _write_long(args, cmp, fits, columns, fit_idx, surfaces, depth_names(args.N), say,
                     in_fov=in_fov[fit_idx], baseline_peak=baseline_peak)  # fmt: skip
         for key in ("F", "p_model", "p_depth", "best", "B_mean", "B_sd", "B_p", "r2",
@@ -1194,7 +1202,8 @@ def _write_long(args, cmp, fits, columns, fit_idx, surfaces, dnames, say, *, in_
 
 
 def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, shape3,
-                      dnames, device, say, *, in_fov, baseline_peak, gate_baseline) -> None:  # fmt: skip
+                      dnames, device, say, *, in_fov, baseline_peak, gate_baseline,
+                      min_gm_fraction=None) -> None:  # fmt: skip
     """The per-column maps and table.
 
     ``baseline_peak`` (percent, the depth-averaged baseline curve's peak) and ``in_fov``
@@ -1269,7 +1278,10 @@ def _write_comparison(prefix, cmp, fits, columns, fit_idx, surfaces, affine, sha
         path = f"{prefix}_{cmp.name}.{s.name}.func.gii"
         save_gifti_data(path, data, meta, time_series=False)
         say(f"  wrote {path}")
-    vol = col.paint_ribbon(surfaces, columns, vmaps, affine, shape3, device=device)
+    vol = col.paint_ribbon(
+        surfaces, columns, vmaps, affine, shape3, device=device,
+        min_gm_fraction=min_gm_fraction,
+    )  # fmt: skip
     # Outside the columns there is no estimate, and B / p_depth / logBF are all legitimately
     # ~0 INSIDE them: zero-filling made "no column here" unreadable against "no effect here",
     # which is the whole question a thresholded map is asked.  NaN is what the .func.gii
