@@ -414,7 +414,7 @@ def test_voxel_gains_handle_runs_of_different_length():
 
 def test_runs_of_different_length_refuse_a_ridge_choice():
     runs, depth, labels, spec = _runs()
-    with pytest.raises(ValueError, match="single ridge strength"):
+    with pytest.raises(ValueError, match="by voxel halves"):
         devein_volume_runs(
             [runs[0], runs[1][:, :70]], depth, labels, spec,
             strengths=(0.01, 0.1), removal="column", verbose=False,
@@ -542,3 +542,45 @@ def test_a_deep_voxels_late_response_is_not_taken_for_drainage():
         assert share < 0.01, f"deep voxels lost {float(share):.1%} of their signal"
     assert np.abs(gains.beta[deep, 1] - 1).max() < 2
     assert np.median(gains.beta[vein, 1]) > 3
+
+
+def test_split_half_ridge_works_run_by_run():
+    """Runs of different length and coverage choose strengths by voxel halves too.
+
+    Same two patches as above (same signal, 10x different noise), but run 2 is
+    shorter and lost some voxels: each run is scored on its own grid and the
+    scores pooled by squared error, so the noisy patch still takes more shrinkage
+    and a run where a patch is empty cannot score it as a perfect prediction.
+    """
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+
+    K, n = 3, 90
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 2 * n // 3)
+    labels = np.repeat([0, 1], n)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    noise = torch.from_numpy(np.repeat([0.002, 0.02], n))[:, None]
+    torch.manual_seed(3)
+    runs = []
+    for T in (120, 96):
+        freq = torch.fft.rfftfreq(T, spec.TR)
+        h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+        a = torch.randn(T, K, dtype=torch.float64) * 0.003
+        a = torch.fft.irfft(
+            torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+        psc = read @ y.T + noise * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+    present = [np.ones(depth.size, bool), np.ones(depth.size, bool)]
+    present[1][:6] = False  # run 2 slid off a few quiet-patch voxels
+    runs[1][torch.from_numpy(~present[1])] = 0
+    res = devein_volume_runs(
+        runs, depth, labels, spec, strengths=(1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0),
+        pad_seconds=0, polort=1, ridge_cv="split", split_blocks=np.arange(depth.size),
+        split_repeats=3, present=present, verbose=False,
+    )  # fmt: skip
+    quiet, loud = res.regularization[labels == 0][0], res.regularization[labels == 1][0]
+    assert loud >= 10 * quiet, (quiet, loud)
+    assert np.isfinite(res.cv_r2).all() and (res.cv_r2 < 1).all()
+    torch.testing.assert_close(res.corrected[1][:6], runs[1][:6], rtol=0, atol=0)

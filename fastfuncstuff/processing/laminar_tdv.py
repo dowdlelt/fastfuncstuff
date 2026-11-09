@@ -536,7 +536,7 @@ def split_half_selection(
     labels: np.ndarray,
     columns: ColumnProfiles,
     blocks: np.ndarray,
-    full: torch.Tensor,
+    full: torch.Tensor | None,
     *,
     K: int,
     polort: int,
@@ -550,12 +550,19 @@ def split_half_selection(
     seed: int = 0,
     device: torch.device,
     verbose: bool = True,
+    present: list[np.ndarray] | None = None,
+    transfer: Callable[[int], tuple[int, torch.Tensor, torch.Tensor]] | None = None,
 ) -> SplitSelection:
     """Per-unit ridge scores from voxel halves (:func:`split_half_scores`), no repeated runs.
 
     ``blocks`` labels each voxel's small spatial block; whole blocks go to one half,
     so neighbours that share resampled noise stay together. Each repeat draws a new
     assignment; a unit whose halves do not both span every depth goes unscored.
+
+    Runs of different length or coverage (``present``) are scored one at a time on
+    their own frequency grid (``transfer(T) -> (pad, full, target)``) and pooled by
+    squared error, so a run where a unit is empty adds nothing rather than a
+    perfect score.
     """
     U = len(columns.unit_labels)
     pos = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
@@ -573,7 +580,7 @@ def split_half_selection(
             try:
                 halves.append(column_profiles(
                     runs, depth, labels, K, polort, device, use=use & (side[blocks] == want),
-                    robust=robust,
+                    robust=robust, present=present,
                 ))  # fmt: skip
             except ValueError:  # no unit spans every depth in this half
                 break
@@ -585,12 +592,42 @@ def split_half_selection(
             continue
         ia = np.searchsorted(a.unit_labels, both)
         ib = np.searchsorted(b.unit_labels, both)
-        sc, lk = split_half_scores(
-            (a.profiles[:, ia], a.sampling[ia], a.noise_cov[ia]),
-            (b.profiles[:, ib], b.sampling[ib], b.noise_cov[ib]),
-            full, strengths=strengths, tr=tr, pad=pad, cutoff_hz=cutoff_hz, device=device,
-            verbose=verbose,
-        )  # fmt: skip
+        if isinstance(a.profiles, list):
+            assert transfer is not None and isinstance(b.profiles, list)
+            err = torch.zeros(len(strengths), both.size)
+            tot = torch.zeros(both.size)
+            lk = torch.zeros(both.size)
+            for r, (pa, pb) in enumerate(zip(a.profiles, b.profiles, strict=True)):
+                ya, yb = pa[:, ia], pb[:, ib]
+                t_r = ya.double().square().sum((0, 2, 3)) + yb.double().square().sum((0, 2, 3))
+                if not bool((t_r > 0).any()):
+                    continue
+                pad_r, full_r, _ = transfer(int(ya.shape[2]))
+                sc_r, lk_r = split_half_scores(
+                    (ya, _per_run(a.sampling, r)[ia], _per_run(a.noise_cov, r)[ia]),
+                    (yb, _per_run(b.sampling, r)[ib], _per_run(b.noise_cov, r)[ib]),
+                    full_r, strengths=strengths, tr=tr, pad=pad_r, cutoff_hz=cutoff_hz,
+                    device=device, verbose=verbose,
+                )  # fmt: skip
+                live = t_r > 0  # a unit empty in this run's halves scores nothing here
+                err[:, live] += ((1 - sc_r.double()) * t_r)[:, live].float()
+                tot[live] += t_r[live].float()
+                lk[live] += (lk_r.double() * t_r)[live].float()
+            seen = tot > 0
+            sc = torch.full((len(strengths), both.size), float("nan"))
+            sc[:, seen] = 1 - err[:, seen] / tot[seen]
+            lk = torch.where(seen, lk / tot.clamp_min(1e-30), torch.full_like(lk, float("nan")))
+            keep = seen.numpy()
+            both, sc, lk = both[keep], sc[:, keep], lk[keep]
+        else:
+            assert full is not None and isinstance(a.profiles, torch.Tensor)
+            assert isinstance(b.profiles, torch.Tensor)
+            sc, lk = split_half_scores(
+                (a.profiles[:, ia], a.sampling[ia], a.noise_cov[ia]),
+                (b.profiles[:, ib], b.sampling[ib], b.noise_cov[ib]),
+                full, strengths=strengths, tr=tr, pad=pad, cutoff_hz=cutoff_hz, device=device,
+                verbose=verbose,
+            )  # fmt: skip
         dst = np.array([pos[int(x)] for x in both])
         total[:, dst] += sc
         leak[dst] += lk.numpy()
@@ -682,10 +719,10 @@ def devein_volume_runs(
     V = runs[0].shape[0]
     lengths = [int(r.shape[1]) for r in runs]
     ragged = len(set(lengths)) > 1
-    if (ragged or partial) and len(strengths) > 1:
+    if (ragged or partial) and len(strengths) > 1 and ridge_cv != "split":
         raise ValueError(
-            "runs of different lengths or coverage take a single ridge strength: choosing "
-            "between several compares the runs (or voxel halves) sample by sample"
+            "runs of different lengths or coverage choose between several ridge strengths "
+            "by voxel halves (ridge_cv='split'); leave-one-run-out compares runs sample by sample"
         )
     means = [r.mean(-1, keepdim=True) for r in runs]
     starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).tolist()
@@ -706,51 +743,15 @@ def devein_volume_runs(
             frequencies = torch.zeros_like(frequencies)
         return pad, *vascular_transfer(system, frequencies, target)
 
-    if ragged or partial:
-        # A single strength makes each run's inverse independent, so every run is
-        # solved on its own grid and its own voxels; nothing is padded or shared.
-        parts = []
-        for r, prof in enumerate(profiles):
-            pad, full_r, desired_r = transfer(prof.shape[2])
-            parts.append(
-                dynamic_inverse(
-                    prof,
-                    full_r,
-                    desired_r,
-                    sampling=_per_run(columns.sampling, r),
-                    noise_cov=_per_run(columns.noise_cov, r),
-                    strengths=strengths,
-                    tr=spec.TR,
-                    pad=pad,
-                    cutoff_hz=cutoff_hz,
-                    device=device,
-                    verbose=verbose,
-                )  # fmt: skip
-            )
-        weight = torch.tensor(lengths, dtype=parts[0].noise_gain.dtype)
-        result = DynamicResult(
-            [p.correction[0] for p in parts],
-            [p.predicted[0] for p in parts],
-            [p.grid_correction[0] for p in parts],
-            [p.grid_predicted[0] for p in parts],
-            parts[0].regularization,
-            # Held-out prediction needs runs that share a schedule: undefined here.
-            torch.full_like(parts[0].cv_r2, float("nan")),
-            (torch.stack([p.noise_gain for p in parts]) * weight[:, None]).sum(0) / weight.sum(),
-        )
-        return _finish(
-            result, runs, columns, labels, removal, gain_lambdas, device, verbose,
-            means, starts, removed, smooth, diagnostics, valid, None,
-        )  # fmt: skip
-    pad, full, desired = transfer(lengths[0])
-    scores, leak_u = None, None
+    scores, leak_u, unscored_np = None, None, None
     if ridge_cv == "split" and len(strengths) > 1:
         assert split_blocks is not None
+        pad0, full0 = (0, None) if (ragged or partial) else transfer(lengths[0])[:2]
         sel = split_half_selection(
-            runs, depth, labels, columns, split_blocks, full, K=K, polort=polort,
-            strengths=strengths, tr=spec.TR, pad=pad, cutoff_hz=cutoff_hz,
+            runs, depth, labels, columns, split_blocks, full0, K=K, polort=polort,
+            strengths=strengths, tr=spec.TR, pad=pad0, cutoff_hz=cutoff_hz,
             robust=removal == "voxel", in_columns=in_columns, repeats=split_repeats,
-            device=device, verbose=verbose,
+            device=device, verbose=verbose, present=columns.present, transfer=transfer,
         )  # fmt: skip
         scores, leak_u = sel.scores, sel.leak
         unscored = ~torch.isfinite(scores).all(0)
@@ -767,20 +768,48 @@ def devein_volume_runs(
                 f"median leak above the model band {np.nanmedian(leak_u):.3f}"
             )
 
-    result = dynamic_inverse(
-        profiles,
-        full,
-        desired,
-        sampling=columns.sampling,
-        noise_cov=columns.noise_cov,
-        strengths=strengths,
-        tr=spec.TR,
-        pad=pad,
-        cutoff_hz=cutoff_hz,
-        device=device,
-        scores=scores,
-        verbose=verbose,
-    )
+    if ragged or partial:
+        # Each run's inverse is independent once the strength is fixed (one value,
+        # or each patch's split-half choice), so every run is solved on its own
+        # grid and its own voxels; nothing is padded or shared.
+        parts = []
+        for r, prof in enumerate(profiles):
+            pad, full_r, desired_r = transfer(prof.shape[2])
+            parts.append(
+                dynamic_inverse(
+                    prof,
+                    full_r,
+                    desired_r,
+                    sampling=_per_run(columns.sampling, r),
+                    noise_cov=_per_run(columns.noise_cov, r),
+                    strengths=strengths,
+                    tr=spec.TR,
+                    pad=pad,
+                    cutoff_hz=cutoff_hz,
+                    device=device,
+                    scores=scores,
+                    verbose=verbose,
+                )  # fmt: skip
+            )
+        weight = torch.tensor(lengths, dtype=parts[0].noise_gain.dtype)
+        result = DynamicResult(
+            [p.correction[0] for p in parts],
+            [p.predicted[0] for p in parts],
+            [p.grid_correction[0] for p in parts],
+            [p.grid_predicted[0] for p in parts],
+            parts[0].regularization,
+            # With split-half scores every run shares them; across runs, a held-out
+            # prediction needs runs that share a schedule, so it is undefined here.
+            parts[0].cv_r2 if scores is not None else torch.full_like(parts[0].cv_r2, float("nan")),
+            (torch.stack([p.noise_gain for p in parts]) * weight[:, None]).sum(0) / weight.sum(),
+        )
+    else:
+        pad, full, desired = transfer(lengths[0])
+        result = dynamic_inverse(
+            profiles, full, desired, sampling=columns.sampling, noise_cov=columns.noise_cov,
+            strengths=strengths, tr=spec.TR, pad=pad, cutoff_hz=cutoff_hz, device=device,
+            scores=scores, verbose=verbose,
+        )  # fmt: skip
     leak_v = None
     if leak_u is not None:
         result.cv_r2[torch.as_tensor(unscored_np)] = float("nan")  # chosen by the majority

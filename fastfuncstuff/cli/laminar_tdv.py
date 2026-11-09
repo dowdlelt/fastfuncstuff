@@ -223,7 +223,7 @@ def create_parser() -> FfsArgumentParser:
         nargs="+",
         required=True,
         help="GE-BOLD runs, one file per run, same grid. Runs may differ in length "
-        "with one -ridge value and no -events (each run is inverted on its own)",
+        "with no -events and one -ridge value or -ridge_cv split (each run is inverted on its own)",
     )
     req.add_argument("-prefix", required=True, help="Output prefix")
     req.add_argument("-tr", "-TR", type=float, default=None, help="TR in seconds (default: header)")
@@ -297,8 +297,8 @@ def create_parser() -> FfsArgumentParser:
         "each: a voxel is corrected in every run that saw it, patches are built per run "
         "from that run's voxels, and voxel gains are chosen across the runs that saw it "
         "(a voxel seen once takes the column model) -- for slabs that move between runs. "
-        "all: only voxels every run saw. auto: each when it can be (one -ridge value, no "
-        "-events, which compare runs sample by sample), else all",
+        "all: only voxels every run saw. auto: each when it can be (no -events, and one "
+        "-ridge value or -ridge_cv split; the others compare runs sample by sample), else all",
     )
 
     vol = parser.add_argument_group("Volume depth (instead of surfaces)")
@@ -718,11 +718,13 @@ def main(argv: list[str] | None = None) -> None:
         series.append(s)
         del d
     del first
-    each_ok = timing is None and len(args.ridge) == 1
+    # Choosing a strength by voxel halves works run by run; leave-one-run-out does not.
+    each_ok = timing is None and (len(args.ridge) == 1 or args.ridge_cv == "split")
     coverage = args.coverage if args.coverage != "auto" else ("each" if each_ok else "all")
     if coverage == "each" and not each_ok:
-        sys.exit("ERROR: -coverage each solves every run on its own voxels, which needs one "
-                 "-ridge value and no -events (both compare runs sample by sample)")  # fmt: skip
+        sys.exit("ERROR: -coverage each solves every run on its own voxels, which needs no "
+                 "-events and either one -ridge value or -ridge_cv split (the others compare "
+                 "runs sample by sample)")  # fmt: skip
     covered = np.logical_or.reduce(seen) if coverage == "each" else np.logical_and.reduce(seen)
     if len(set(lengths)) > 1:
         # Each run's inverse stands alone at one ridge strength; only comparing runs
@@ -731,10 +733,10 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
                      "-events scores the physiology against one schedule across runs. "
                      "Drop -events (fixed physiology) or give runs of one length")  # fmt: skip
-        if len(args.ridge) > 1:
+        if len(args.ridge) > 1 and args.ridge_cv != "split":
             sys.exit(f"ERROR: runs differ in length ({', '.join(map(str, lengths))} volumes); "
-                     "choosing between several -ridge values compares runs sample by sample. "
-                     "Give one -ridge value")  # fmt: skip
+                     "choosing between -ridge values across runs compares them sample by sample. "
+                     "Use -ridge_cv split, or one -ridge value")  # fmt: skip
     ok = np.zeros(candidates.size, bool)
     ok[cand_idx[covered]] = True
     ribbon = candidates & ok.reshape(candidates.shape)
