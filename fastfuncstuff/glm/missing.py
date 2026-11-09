@@ -72,6 +72,29 @@ class RunValidity:
     negative: torch.Tensor  # (n_voxels, n_runs) bool — rejected as negative
     negative_rule_active: bool  # False if auto-disabled (input is not magnitude)
 
+    def expand(self, rows: torch.Tensor) -> RunValidity:
+        """Place validity computed on the ``rows`` of a full voxel axis back on it.
+
+        ``rows`` is a bool mask over the full axis. Voxels outside it were never
+        loaded: they read as invalid in every run, with no rejection reason.
+        """
+        rows = rows.reshape(-1).bool()
+        if int(rows.sum()) != self.valid.shape[0]:
+            raise ValueError("rows must select exactly the voxels the validity was computed on")
+
+        def out(x: torch.Tensor) -> torch.Tensor:
+            full = torch.zeros((rows.numel(), x.shape[1]), dtype=x.dtype)
+            full[rows] = x
+            return full
+
+        return RunValidity(
+            valid=out(self.valid),
+            constant=out(self.constant),
+            zeros=out(self.zeros),
+            negative=out(self.negative),
+            negative_rule_active=self.negative_rule_active,
+        )
+
     @property
     def n_runs(self) -> int:
         return int(self.valid.shape[1])

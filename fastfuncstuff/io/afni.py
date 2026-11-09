@@ -1526,6 +1526,7 @@ def load_and_concatenate_runs(
     per_run_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     drop_first: int = 0,
     drop_last: int = 0,
+    mask_before_fn: bool = False,
 ) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -1653,9 +1654,11 @@ def load_and_concatenate_runs(
     # per_run_fn has to see full-volume data -- a spatial blur cannot be
     # computed on a masked voxel list -- so when one is given the mask moves out
     # of the decode and is applied in the consumer loop, after the callback.
-    decode_mask = None if per_run_fn is not None else mask_flat
+    # ``mask_before_fn`` is for callbacks that work voxel by voxel (a validity
+    # check), which then see the in-mask rows only.
+    decode_mask = None if per_run_fn is not None and not mask_before_fn else mask_flat
     deferred_mask: torch.Tensor | None = None
-    if per_run_fn is not None and mask_flat is not None:
+    if per_run_fn is not None and mask_flat is not None and not mask_before_fn:
         deferred_mask = torch.from_numpy(np.ascontiguousarray(mask_flat))
 
     def _iter_runs():
@@ -2342,8 +2345,13 @@ def get_tr_from_file(filepath: str | Path) -> float:
     >>> print(f"TR = {tr}s")
     """
     try:
-        img = load_nifti(filepath)
-        tr = header_tr(img)
+        # pixdim lives in the header: decoding a multi-GB series to read it was a
+        # full extra decompression on every ffs_reml run.
+        clean = str(filepath).split("[")[0].lower()
+        if clean.endswith((".nii", ".nii.gz", ".nii.zst")):
+            tr = header_tr(read_nifti_header(filepath))
+        else:
+            tr = header_tr(load_nifti(filepath))
         if tr is None:
             print(f"WARNING: TR not found in {filepath} header, using 1.0")
             return 1.0

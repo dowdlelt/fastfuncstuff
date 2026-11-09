@@ -96,6 +96,7 @@ try:
         load_nifti,
         nifti_shape,
         read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
+        read_nifti_header,
         replace_afni_extension,
         save_nifti,
     )
@@ -3646,15 +3647,21 @@ def main():
         print()
         print("📦 Preprocessing data...")
 
-        # Get header info from first file
-        first_img = load_nifti(input_files[0])
-        affine = first_img.affine
-        nifti_header = first_img.header.copy()
-        # nibabel ships without type stubs, so ty infers an overly broad
-        # (possibly-None) shape from its untyped source; a loaded image always
-        # has a concrete shape.
-        assert first_img.shape is not None
-        volume_shape = first_img.shape[:3]
+        # Get header info from first file. NIfTI from the header alone: decoding
+        # the first run here was a full extra decompression of the series.
+        if str(input_files[0]).split("[")[0].lower().endswith((".nii", ".nii.gz", ".nii.zst")):
+            nifti_header = read_nifti_header(input_files[0], extensions=True).copy()
+            affine = nifti_header.get_best_affine()
+            volume_shape = tuple(int(d) for d in nifti_header.get_data_shape()[:3])
+        else:
+            first_img = load_nifti(input_files[0])
+            affine = first_img.affine
+            nifti_header = first_img.header.copy()
+            # nibabel ships without type stubs, so ty infers an overly broad
+            # (possibly-None) shape from its untyped source; a loaded image
+            # always has a concrete shape.
+            assert first_img.shape is not None
+            volume_shape = first_img.shape[:3]
         # Voxel sizes from pixdim (get_zooms), which is orientation-independent.
         # The affine diagonal is wrong for permuted/oblique grids (e.g. an RSP/LIA
         # FreeSurfer master): the size sits off-diagonal, so np.diag reads 0 mm and
@@ -3724,11 +3731,35 @@ def main():
             )
             return torch.from_numpy(blurred.reshape(n_voxels, n_tps))
 
+        # Load only the -mask voxels when no step before the fit needs any other:
+        # the guard and the scaling work voxel by voxel. On a slab resampled into
+        # anatomical space the mask can be 3% of the grid, and guarding and
+        # scaling the other 97% was nearly all of the run time and memory.
+        # Spatial steps (blur, blur-to, ROI collapse) and the whole-volume
+        # diagnostics still load everything.
+        prefilter = None
+        if (
+            args.mask
+            and args.do_blur is None
+            and args.blur_to_fwhm is None
+            and args.blur_to_tsnr is None
+            and not args.atlas
+            and not want_diag
+            and not surface_input
+        ):
+            prefilter = (load_nifti(args.mask).get_fdata() > 0).reshape(-1)
+            if prefilter.size != n_voxels:
+                print(f"\n❌ ERROR: -mask has {prefilter.size:,} voxels, the data {n_voxels:,}")
+                sys.exit(1)
+            print(f"  Loading the {int(prefilter.sum()):,} -mask voxels only "
+                  f"({100 * prefilter.mean():.1f}% of the grid)")  # fmt: skip
+        n_rows = n_voxels if prefilter is None else int(prefilter.sum())
+
         guard_acc = None
         if guard_enabled:
             from fastfuncstuff.glm.missing import RunValidityAccumulator
 
-            guard_acc = RunValidityAccumulator(n_voxels, len(run_starts))
+            guard_acc = RunValidityAccumulator(n_rows, len(run_starts))
 
         def _per_run(run_data, run_idx):
             # Guard first: it must read the run RAW. Blurring here would smear
@@ -3755,6 +3786,8 @@ def main():
             per_run_fn=_per_run
             if (guard_acc is not None or (args.do_blur is not None or surface_smoother is not None))
             else None,
+            mask_flat=prefilter,
+            mask_before_fn=prefilter is not None,
         )
         fmri_data_preprocessed = data_tensor.numpy()
         del data_tensor
@@ -3771,7 +3804,12 @@ def main():
                 user_mask_flat = torch.from_numpy(
                     (load_nifti(args.mask).get_fdata() > 0).reshape(-1)
                 )
-            guard_validity = guard_acc.finalize(mask=user_mask_flat, verbose=True)
+            if prefilter is not None:  # every loaded row is in the mask
+                guard_validity = guard_acc.finalize(mask=None, verbose=True)
+                user_mask_flat = torch.from_numpy(prefilter)
+                guard_validity = guard_validity.expand(user_mask_flat)
+            else:
+                guard_validity = guard_acc.finalize(mask=user_mask_flat, verbose=True)
             guard_volume_shape = tuple(volume_shape)
 
             full = guard_validity.all_runs_valid
@@ -3883,7 +3921,8 @@ def main():
                 # something.
                 if guard_keep is not None:
                     _vi = scale_info["violation_voxel_indices"]
-                    _in_mask = int(guard_keep[_vi].sum())
+                    _rows_keep = guard_keep if prefilter is None else guard_keep[prefilter]
+                    _in_mask = int(_rows_keep[_vi].sum())
                     _n_mask = int(guard_keep.sum())
                     print(
                         f"  ⚠️  {_in_mask:,} of {_n_mask:,} in-mask voxels "
@@ -3906,6 +3945,12 @@ def main():
 
         # Reshape back to 4D for analyze_from_design_matrix
         total_tps = fmri_data_preprocessed.shape[1]
+        if prefilter is not None:
+            # Downstream indexes the full grid; outside the mask is never read.
+            full = np.zeros((n_voxels, total_tps), dtype=fmri_data_preprocessed.dtype)
+            full[prefilter] = fmri_data_preprocessed
+            fmri_data_preprocessed = full
+            del full
         if args.atlas:
             roi_geometry = dict(preproc_cached_metadata)
             roi_set, fmri_data_preprocessed = _collapse_preprocessed_to_rois(
