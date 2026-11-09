@@ -732,6 +732,7 @@ class VolumeTdvResult:
     gains: VoxelGains | None = None  # removal="voxel" only; its removed/fit are above
     split_leak: np.ndarray | None = None  # V; ridge_cv="split" only
     snr: np.ndarray | None = None  # V; ridge_snr only: the patch SNR that set its ridge
+    snr_level: float | None = None  # ridge_snr only: the C used (chosen, with "auto")
 
 
 def devein_volume_runs(
@@ -756,8 +757,9 @@ def devein_volume_runs(
     split_repeats: int = 2,
     present: list[np.ndarray] | None = None,
     voxel_weight: np.ndarray | None = None,
-    ridge_snr: float | None = None,
+    ridge_snr: float | str | None = None,
     snr_band: tuple[float, float] = (0.01, 0.05),
+    lag_band: tuple[float, float] = (0.01, 0.03),
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -827,12 +829,12 @@ def devein_volume_runs(
             frequencies = torch.zeros_like(frequencies)
         return pad, *vascular_transfer(system, frequencies, target)
 
-    scores, leak_u, unscored_np, snr_v = None, None, None, None
+    scores, leak_u, unscored_np, snr_v, snr_level = None, None, None, None, None
     if ridge_snr is not None:
-        # Wiener-like shrinkage: each patch's ridge is ridge_snr x its noise/signal
-        # ratio, so a quiet patch (little shared signal, mostly noise) is shrunk
-        # hard and corrected little, a driven one corrected fully. One global
-        # constant; the spatial variation comes from the data's own SNR.
+        # Wiener-like shrinkage: each patch's ridge is C x its noise/signal ratio,
+        # so a quiet patch (little shared signal, mostly noise) is shrunk hard and
+        # corrected little, a driven one corrected fully. The spatial pattern comes
+        # from the data's own SNR; C sets the overall level.
         assert split_blocks is not None, "ridge_snr needs split_blocks"
         snr = column_snr(
             runs, depth, labels, columns, split_blocks, K=K, polort=polort, tr=spec.TR,
@@ -840,20 +842,49 @@ def devein_volume_runs(
             present=columns.present, repeats=split_repeats, device=device,
         )  # fmt: skip
         fallback = float(np.nanmedian(snr)) if np.isfinite(snr).any() else 1.0
-        lam = np.clip(
-            ridge_snr / np.maximum(np.where(np.isfinite(snr), snr, fallback), 1e-6), 1e-2, 1e2
-        )
+        snr_f = np.maximum(np.where(np.isfinite(snr), snr, fallback), 1e-6)
         strengths = tuple(float(x) for x in np.geomspace(1e-2, 1e2, 41))
-        pick = np.abs(np.log(lam)[None] - np.log(strengths)[:, None]).argmin(0)
-        scores = torch.zeros(len(strengths), len(lam))
-        scores[pick, np.arange(len(lam))] = 1.0
+
+        def snr_scores(c: float) -> torch.Tensor:
+            lam = np.clip(c / snr_f, 1e-2, 1e2)
+            pick = np.abs(np.log(lam)[None] - np.log(strengths)[:, None]).argmin(0)
+            out = torch.zeros(len(strengths), len(lam))
+            out[pick, np.arange(len(lam))] = 1.0
+            return out
+
+        if ridge_snr == "auto":
+            # The level that differs between datasets (C fitted on one session
+            # over-corrected the next) is chosen per dataset: the C whose corrected
+            # column profiles come closest to the depth lag the model predicts
+            # survives, pooled over patches with SNR x power weights. Neural timing
+            # is instantaneous at this scale, so once ascending transport is gone a
+            # column's depths differ only by the local veins' own delay, which the
+            # model predicts (_local_lag). No task, no reference; pooled over
+            # hundreds of patches the lag is stable where one patch's is noise.
+            weight = np.clip(np.where(np.isfinite(snr), snr, 0.0), 0.0, 20.0)
+            lag_target = _local_lag(transfer, lengths[0], spec.TR, lag_band)
+            grads = {}
+            for c in SNR_RIDGE_GRID:
+                grads[c] = _pooled_depth_lag(
+                    profiles, columns, transfer, snr_scores(c), weight, strengths=strengths,
+                    tr=spec.TR, cutoff_hz=cutoff_hz, band=lag_band, device=device,
+                )  # fmt: skip
+            c_best = min(grads, key=lambda c: abs(grads[c] - lag_target))
+            if verbose:
+                print(f"  SNR ridge, auto level: target pial-deep lag {lag_target:+.2f} s (the local "
+                      "veins' own, kept by the target); corrected lag by C: "
+                      + "  ".join(f"{c:g}:{g:+.2f}" for c, g in grads.items())
+                      + f"  -> C = {c_best:g}")  # fmt: skip
+            ridge_snr = c_best
+        scores = snr_scores(float(ridge_snr))
+        snr_level = float(ridge_snr)
         pos_u = {int(lab): i for i, lab in enumerate(columns.unit_labels)}
         unit_v = np.array([pos_u.get(int(lab), -1) for lab in labels], np.int64)
         snr_v = np.where(unit_v >= 0, snr[np.maximum(unit_v, 0)], np.nan).astype(np.float32)
         if verbose:
             q = np.nanpercentile(snr, [25, 50, 75])
             print(f"  SNR ridge: patch SNR quartiles {q[0]:.2f} {q[1]:.2f} {q[2]:.2f} -> ridge "
-                  + " ".join(f"{ridge_snr / x:.2g}" for x in q[::-1]))  # fmt: skip
+                  + " ".join(f"{snr_level / x:.2g}" for x in q[::-1]))  # fmt: skip
     elif ridge_cv == "split" and len(strengths) > 1:
         assert split_blocks is not None
         pad0, full0 = (0, None) if (ragged or partial) else transfer(lengths[0])[:2]
@@ -931,7 +962,68 @@ def devein_volume_runs(
         means, starts, removed, smooth, diagnostics, valid, leak_v,
     )  # fmt: skip
     out.snr = snr_v
+    out.snr_level = snr_level
     return out
+
+
+SNR_RIDGE_GRID = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.5, 6.0, 9.0, 13.0, 20.0, 30.0)
+"""Levels C that ``ridge_snr="auto"`` scores (ridge = C x noise/signal)."""
+
+
+def _spectral_lags(F: np.ndarray, f: np.ndarray, band: tuple[float, float]):
+    """Spectra ``(U, nf, K)`` on frequencies ``f`` -> each depth's lag behind the
+    column mean (s) ``(U, K)`` from the cross-spectral phase slope in ``band``, and
+    each column's in-band power ``(U,)``."""
+    inb = (f >= band[0]) & (f <= band[1])
+    ref = F.mean(2, keepdims=True)
+    S = (F * ref.conj())[:, inb]
+    w, phi, fb = np.abs(S), np.angle(S), f[inb][None, :, None]
+    lag = -(w * phi * fb).sum(1) / (2 * np.pi * (w * fb**2).sum(1) + 1e-30)
+    return lag, (np.abs(ref[:, inb, 0]) ** 2).sum(1)
+
+
+def _depth_lags(y: np.ndarray, tr: float, band: tuple[float, float]):
+    """``(U, T, K)`` column profiles -> depth lags behind the column mean (s) and
+    in-band power (0 for an empty profile); see :func:`_spectral_lags`."""
+    return _spectral_lags(np.fft.rfft(y, axis=1), np.fft.rfftfreq(y.shape[1], tr), band)
+
+
+def _local_lag(transfer, T: int, tr: float, band: tuple[float, float]) -> float:
+    """Pial-minus-deep lag (s) the model predicts survives the correction: each
+    depth's own (local) response to one drive common to every depth. With target
+    "local" the local venous part, larger and slower toward pial, is kept by
+    design, so a perfect correction leaves this lag, not zero."""
+    pad, _, desired = transfer(T)
+    f = np.fft.rfftfreq(T + 2 * pad, tr)
+    r = desired.sum(-1).cpu().numpy()[None]  # (1, nf, K): common unit drive at every depth
+    lag, _ = _spectral_lags(r, f, band)
+    return float(lag[0, 0] - lag[0, -1])
+
+
+def _pooled_depth_lag(
+    profiles, columns, transfer, scores, weight, *, strengths, tr, cutoff_hz, band, device
+) -> float:
+    """Pial-minus-deep lag (s) of the corrected column profiles, pooled over runs and
+    patches (``weight`` x in-band power). Profiles index depth 0 = pial."""
+    run_profiles = (
+        profiles
+        if isinstance(profiles, list)
+        else [profiles[r : r + 1] for r in range(len(profiles))]
+    )
+    num, den = 0.0, 0.0
+    for r, prof in enumerate(run_profiles):
+        pad, full_r, desired_r = transfer(prof.shape[2])
+        res = dynamic_inverse(
+            prof, full_r, desired_r, sampling=_per_run(columns.sampling, r),
+            noise_cov=_per_run(columns.noise_cov, r), strengths=strengths, tr=tr, pad=pad,
+            cutoff_hz=cutoff_hz, device=device, scores=scores, verbose=False,
+        )  # fmt: skip
+        y = (prof[0] - res.correction[0]).double().numpy()
+        lag, power = _depth_lags(y, tr, band)
+        w = weight * power
+        num = num + (lag[:, 0] - lag[:, -1]) @ w
+        den += float(w.sum())
+    return float(num / max(den, 1e-30))
 
 
 def _per_run(x, r):

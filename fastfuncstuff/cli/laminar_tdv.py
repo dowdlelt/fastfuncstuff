@@ -15,6 +15,7 @@ AWAY from SE. See the wiki's Laminar timeseries deveining note.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -412,15 +413,17 @@ def create_parser() -> FfsArgumentParser:
     )
     inv.add_argument(
         "-ridge_snr",
-        type=float,
+        type=_ridge_snr_arg,
         default=None,
-        metavar="C",
+        metavar="C|auto",
         help="Set each patch's ridge to C x its noise/signal ratio instead of -ridge: two "
         "halves of the patch's voxels (blocks of -ridge_snr_mm) give the signal they share "
         "in the hemodynamic band and the noise each has alone, pooled over runs. A quiet "
         "patch is shrunk hard and corrected little, a driven one corrected fully. No task, "
-        "no reference. On ds004539 (VASO) C ~ 3 matched VASO's flat depth lag in both "
-        "driven and quiet cortex, where no single -ridge did",
+        "no reference. auto chooses C per dataset: the level whose corrected column "
+        "profiles have the flattest depth lag (pooled, SNR-weighted), since neural timing "
+        "is instantaneous at this scale. On ds004539 (VASO) one fixed C did not carry "
+        "between sessions; the level has to come from the data",
     )
     inv.add_argument(
         "-ridge_snr_mm",
@@ -524,6 +527,16 @@ def _physiology_grid(spec: list[list[str]] | None) -> list[dict[str, float]]:
             for combo in itertools.product(*[v for _, v in axes])]  # fmt: skip
 
 
+def _ridge_snr_arg(text: str) -> float | str:
+    """-ridge_snr: a positive level C, or 'auto' to choose it from the data."""
+    if text.lower() == "auto":
+        return "auto"
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number or 'auto'") from None
+
+
 def _design_builder(args, timing, files, n_t, tr, verbose):
     """Per-run (T, C) regressors for a CBF response curve, as ffs_hrftdv builds them."""
     import torch
@@ -617,7 +630,7 @@ def main(argv: list[str] | None = None) -> None:
     timed = bool(args.onsets or args.events)
     if args.cv_p0 and not timed:
         sys.exit("ERROR: -cv_p0 scores physiologies from events: give -events or -onsets")
-    if args.ridge_snr is not None and args.ridge_snr <= 0:
+    if isinstance(args.ridge_snr, float) and args.ridge_snr <= 0:
         sys.exit("ERROR: -ridge_snr must be positive")
     if args.ridge_cv == "auto":
         args.ridge_cv = "loro" if args.repeated_runs else "split"
@@ -945,6 +958,7 @@ def main(argv: list[str] | None = None) -> None:
             if cv is not None
             else "fixed physiology"
         ),
+        "ridge_snr_level": result.snr_level,
         "physiology_cv": None
         if cv is None
         else [

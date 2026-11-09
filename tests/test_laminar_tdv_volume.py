@@ -627,3 +627,57 @@ def test_snr_ridge_shrinks_each_patch_by_its_own_noise():
     # The ridge follows 3 / SNR on the log grid (41 steps over four decades).
     np.testing.assert_allclose(loud / quiet, quiet_snr / loud_snr, rtol=0.3)
     torch.testing.assert_close(res.corrected[1][:6], runs[1][:6], rtol=0, atol=0)
+
+
+def test_snr_ridge_auto_level_flattens_the_depth_lag():
+    """-ridge_snr auto: the level C is chosen per dataset by the flattest corrected depth
+    lag. Every depth gets the same neural drive (instantaneous at this scale) and
+    the model's own transport delays the upper ones; the chosen level must remove
+    most of that lag and be recorded."""
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+    from fastfuncstuff.processing.laminar_tdv import SNR_RIDGE_GRID, _depth_lags, column_profiles
+
+    T, K, n = 200, 3, 90
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    freq = torch.fft.rfftfreq(T, spec.TR)
+    h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), n // 3)
+    labels = np.zeros(depth.size, int)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    torch.manual_seed(7)
+    runs = []
+    for _ in range(3):
+        # One drive at every depth (instantaneous neural timing), plus a little of
+        # each depth's own so the halves' SNR is finite. More own drive turns a
+        # run's lag into noise (0.2 swung it by +-0.5 s); real data pool runs.
+        own = 0.02 * torch.randn(T, K, dtype=torch.float64)
+        drive = torch.randn(T, 1, dtype=torch.float64) + own
+        a = 0.03 * torch.fft.irfft(
+            torch.fft.rfft(drive, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+        psc = read @ y.T + 0.01 * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+    res = devein_volume_runs(
+        runs, depth, labels, spec, pad_seconds=20, polort=1, removal="column",
+        ridge_snr="auto", split_blocks=np.arange(depth.size), verbose=False,
+    )  # fmt: skip
+    assert res.snr_level in SNR_RIDGE_GRID
+
+    def pial_minus_deep(rs):
+        prof = column_profiles(rs, depth, labels, K, 1, CPU).profiles[:, 0]  # (R, T, K)
+        lag, power = _depth_lags(prof.double().numpy(), spec.TR, (0.01, 0.03))
+        return float(((lag[:, 0] - lag[:, -1]) * power).sum() / power.sum())
+
+    from fastfuncstuff.processing.laminar_tdv import _local_lag
+
+    pad = min(int(round(20 / spec.TR)), T - 1)
+
+    def transfer(t):
+        fr = torch.fft.rfftfreq(t + 2 * pad, spec.TR)
+        return pad, *vascular_transfer(linearized_vasculature(spec), fr, "local")
+
+    target = _local_lag(transfer, T, spec.TR, (0.01, 0.03))  # the local veins' own lag
+    raw, corrected = pial_minus_deep(runs), pial_minus_deep(res.corrected)
+    assert raw - target > 0.2, (raw, target)  # transport makes pial later still
+    assert abs(corrected - target) < 0.3 * (raw - target), (raw, corrected, target)
