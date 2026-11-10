@@ -21,6 +21,30 @@ CPU = torch.device("cpu")
 
 
 @pytest.mark.parametrize("fn", [make_tent_design, make_csplin_design])
+@pytest.mark.parametrize("t0", [0.0, 0.37])
+def test_long_run_aligned_knots_remain_exact_fir(fn, t0):
+    tr, n_tp = 1.857, 4000
+    indices = np.arange(5, n_tp - 10, 20)
+    onsets = (indices + 0.5) * tr + t0
+    got = fn([onsets], tr / 2, 8.5 * tr, tr, n_tp, device=CPU, microtime_offset=t0).numpy()
+    want = np.zeros((n_tp, 9))
+    for i in indices:
+        want[i + 1 : i + 10] = np.eye(9)
+    # Absolute float32 clocks attenuated the edge tents by as much as 0.135.
+    np.testing.assert_allclose(got, want, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("fn", [make_tent_design, make_csplin_design])
+def test_long_run_nontr_locked_design_is_translation_invariant(fn):
+    tr = 1.857
+    onsets = np.array([3.17, 17.41, 40.832])
+    kw = dict(bot=0.9285, top=15.7845, tr=tr, device=CPU, microtime_offset=0.23)
+    early = fn([onsets], n_timepoints=40, **kw)
+    late = fn([onsets + 3500 * tr], n_timepoints=3540, **kw)[3500:]
+    torch.testing.assert_close(late, early, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("fn", [make_tent_design, make_csplin_design])
 def test_microtime_offset_equals_shifting_onsets_earlier(fn):
     onsets = np.array([3.3, 17.8, 31.1, 44.6])
     kw = dict(bot=0.0, top=12.0, tr=2.0, n_timepoints=40, device=CPU)

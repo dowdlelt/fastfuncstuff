@@ -888,6 +888,29 @@ def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
     return torch.where(inside, val, torch.zeros_like(val))
 
 
+def _event_knot_coordinates(
+    onsets: list[float],
+    bot: float,
+    knot_dt: float,
+    tr: float,
+    n_timepoints: int,
+    microtime_offset: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Event-relative sample times, in knot spacings from the window start."""
+    # Subtracting float32 absolute times erodes late-run precision; at AFNI's
+    # narrow edge tents this attenuated aligned coefficients by 13% at TR 4000.
+    # Split the clock on the host, then subtract integer sample indices before
+    # scaling on-device. This also keeps MPS in float32 without losing alignment.
+    clock = (np.asarray(onsets, dtype=np.float64) + bot - microtime_offset) / tr
+    anchor = np.rint(clock)
+    phase = (clock - anchor) * (tr / knot_dt)
+    samples = torch.arange(n_timepoints, device=device, dtype=torch.float32)
+    anchors = torch.tensor(anchor, device=device, dtype=torch.float32)
+    phases = torch.tensor(phase, device=device, dtype=torch.float32)
+    return (samples[:, None] - anchors[None, :]) * (tr / knot_dt) - phases[None, :]
+
+
 def make_tent_design(
     onset_times_list: list[np.ndarray],
     bot: float,
@@ -999,11 +1022,6 @@ def make_tent_design(
     # Pre-allocate design matrix
     design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
-    # Create time vector for each TR (in seconds)
-    tr_times = (
-        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
-    )
-
     # Combine all onset times from all conditions
     all_onset_times = []
     for onset_array in onset_times_list:
@@ -1012,8 +1030,9 @@ def make_tent_design(
     if len(all_onset_times) == 0:
         return design
 
-    # Convert to tensor
-    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
+    rel_times = _event_knot_coordinates(
+        all_onset_times, bot, dt, tr, n_timepoints, microtime_offset, device
+    )
 
     # For each basis function
     basis_col_idx = 0
@@ -1021,24 +1040,19 @@ def make_tent_design(
         # Tent edges (matching AFNI exactly)
         if basis_idx == 0:
             # First tent: slightly before bot to bot+dt
-            tent_bot = bot - 0.00111 * dt
-            tent_mid = bot
-            tent_top = bot + dt
+            tent_bot = -0.00111
+            tent_mid = 0.0
+            tent_top = 1.0
         elif basis_idx == n_basis - 1:
             # Last tent: (top-dt) to slightly after top
-            tent_bot = top - dt
-            tent_mid = top
-            tent_top = top + 0.00111 * dt
+            tent_bot = n_basis - 2.0
+            tent_mid = n_basis - 1.0
+            tent_top = n_basis - 1.0 + 0.00111
         else:
             # Middle tents: standard spacing
-            tent_bot = bot + (basis_idx - 1) * dt
-            tent_mid = bot + basis_idx * dt
-            tent_top = bot + (basis_idx + 1) * dt
-
-        # Vectorized: compute relative time for every (TR, onset) pair at once
-        # tr_times: (n_tp,), onset_times_tensor: (n_onsets,)
-        # rel_times: (n_tp, n_onsets) - time of each TR relative to each onset
-        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
+            tent_bot = basis_idx - 1.0
+            tent_mid = float(basis_idx)
+            tent_top = basis_idx + 1.0
 
         # Evaluate tent basis on the full (n_tp, n_onsets) matrix, sum over onsets
         design[:, basis_col_idx] = basis_tent(rel_times, tent_bot, tent_mid, tent_top).sum(dim=1)
@@ -1128,7 +1142,7 @@ def make_csplin_design(
     dx = (top - bot) / (n_basis - 1)
 
     # Create knot positions
-    knots = [bot + i * dx for i in range(n_basis)]
+    knots = [float(i) for i in range(n_basis)]
 
     # Determine actual number of basis functions
     if zero_edges:
@@ -1151,20 +1165,13 @@ def make_csplin_design(
     if len(all_onset_times) == 0:
         return design
 
-    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
-
-    # Create time vector for each TR (in seconds)
-    tr_times = (
-        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
+    rel_times = _event_knot_coordinates(
+        all_onset_times, bot, dx, tr, n_timepoints, microtime_offset, device
     )
 
     # For each basis function
     basis_col_idx = 0
     for basis_idx in range(first_basis_idx, last_basis_idx):
-        # Vectorized: compute relative time for every (TR, onset) pair at once
-        # rel_times: (n_tp, n_onsets)
-        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
-
         # Evaluate cubic spline basis on full matrix, sum over onsets
         design[:, basis_col_idx] = basis_csplin(rel_times, knots, basis_idx).sum(dim=1)
 
