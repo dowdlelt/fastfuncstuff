@@ -521,3 +521,153 @@ def alignment_check(
     path = rec.figure_path(step + 1, "flicker")
     render.save_apng(frames, path, 800)
     rec.add_figure(step + 1, "flicker", "Alignment flicker (animated)", path)
+
+
+# ---------------------------------------------------------------------------
+# A stack of images that should all line up (runs, sessions, fieldmaps)
+# ---------------------------------------------------------------------------
+
+STACK_CORR_WARN = 0.9  # a frame this far from its peers is misaligned or broken
+MAX_STACK_FRAMES = 40
+
+
+def _head_mask(vol: np.ndarray) -> np.ndarray:
+    """Cheap torch-free support mask for display: above 10% of the 98th percentile."""
+    v = vol[np.isfinite(vol)]
+    if v.size == 0:
+        return np.zeros(vol.shape, bool)
+    return np.isfinite(vol) & (vol > 0.1 * np.percentile(v, 98))
+
+
+def stack_check(
+    rec: QCRecord,
+    step: int,
+    frames_zyx: np.ndarray,
+    affine,
+    labels: list[str],
+    *,
+    what: str = "",
+    n_cut: int = 5,
+) -> None:
+    """Every frame against the stack's median: a ranked similarity chart and a flicker.
+
+    ``frames_zyx`` is ``(n, z, y, x)``: images a pipeline stage claims to have put
+    in one space (autoproc's ``stageNN.QC.*`` stacks). The median frame is the
+    reference: robust to one bad frame, and its edges are drawn on every frame of
+    the flicker, so a misaligned run is visible even when paused.
+    """
+    x = np.asarray(frames_zyx, np.float32)[:MAX_STACK_FRAMES]
+    n = x.shape[0]
+    labels = (list(labels) + [f"#{i}" for i in range(len(labels), n)])[:n]
+    ref = np.median(x, axis=0)
+    mask = _head_mask(ref)
+    corr = np.array(
+        [
+            float(np.corrcoef(f[mask], ref[mask])[0, 1]) if mask.sum() > 10 else float("nan")
+            for f in x
+        ]
+    )
+    worst = int(np.nanargmin(corr)) if np.isfinite(corr).any() else 0
+    rec.metric("n_frames", n, "", "images in the stack")
+    rec.metric(
+        "corr_min",
+        float(np.nanmin(corr)),
+        "",
+        "lowest frame-to-median spatial correlation",
+        warn_lt=STACK_CORR_WARN,
+    )
+    rec.metric(
+        "corr_median", float(np.nanmedian(corr)), "", "median frame-to-median spatial correlation"
+    )
+    rec.info["worst_frame"] = labels[worst]
+
+    # --- ranked chart ---------------------------------------------------------
+    from matplotlib.figure import Figure
+
+    order = np.argsort(corr)
+    with style.mpl_style():
+        fig = Figure(figsize=(style.WIDTH / 100, 0.6 + 0.32 * n), dpi=100)
+        ax = fig.add_subplot(111)
+        ypos = np.arange(n)
+        # A dot plot, not bars: the interesting range is near 1, and a bar needs a
+        # zero baseline to be honest.
+        colors = [style.STATUS["warn"] if corr[i] < STACK_CORR_WARN else style.BLUE for i in order]
+        ax.hlines(ypos, 1.0, corr[order], color=style.GRID, lw=1.2)
+        ax.scatter(
+            corr[order], ypos, s=46, c=colors, zorder=3, edgecolors=style.SURFACE, linewidths=0.8
+        )
+        ax.set_yticks(ypos, [labels[i] for i in order], fontsize=9)
+        lo = min(float(np.nanmin(corr)) - 0.03, STACK_CORR_WARN - 0.03)
+        ax.set_xlim(lo, 1.005)
+        ax.set_ylim(n - 0.5, -0.5)  # worst at the top
+        ax.axvline(STACK_CORR_WARN, color=style.INK2, lw=1, ls=(0, (4, 3)))
+        for yy, i in zip(ypos, order, strict=True):
+            ax.annotate(
+                f"{corr[i]:.3f}",
+                (corr[i], yy),
+                xytext=(0, 7),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                color=style.INK2,
+            )
+        ax.set_xlabel("spatial correlation with the median frame")
+        ax.grid(axis="y", visible=False)
+        fig.subplots_adjust(left=0.28, right=0.97, top=0.98, bottom=0.6 / (0.6 + 0.32 * n) + 0.02)
+        body = render.figure_image(fig)
+    stats = [
+        (f"worst {labels[worst]}: {corr[worst]:.3f}", _status(corr[worst] < STACK_CORR_WARN)),
+    ]
+    title = f"{what or 'Stack'} · {rec.label}"
+    img = render.compose(
+        body,
+        title,
+        f"{n} images that should share one space",
+        stats,
+        "Each dot is one image's spatial correlation with the median of all of them, worst "
+        f"first. Look for: one image well below the rest (below {STACK_CORR_WARN}, yellow) — "
+        "misaligned, or a broken run. Open the flicker to see where.",
+    )
+    path = rec.figure_path(step, "ranking")
+    render.save_png(img, path)
+    rec.add_figure(step, "ranking", f"{what or 'Stack'} similarity ranking", path)
+
+    # --- flicker with the median's edges --------------------------------------
+    ras_ref, zooms = render.ras_volume(ref, affine)
+    ras_mask, _ = render.ras_volume(mask.astype(np.float32), affine)
+    grid = render.Grid(ras_ref, zooms, ras_mask > 0.5, n_cut=n_cut)
+    planes = ("axial", "coronal", "sagittal")
+    ref_edges = {
+        p: [render.edges_2d(s, grid.aspect(p)) for s in grid.slices(ras_ref, p)] for p in planes
+    }
+    color = style.hex_rgb(EDGE_A)
+    letters = [grid.side_letter(p) for p in planes]
+    pics = []
+    for i in range(n):
+        ras_f, _ = render.ras_volume(x[i], affine)
+        win = render.window(ras_f, ras_mask > 0.5)
+        rows = []
+        for p in planes:
+            asp = grid.aspect(p)
+            panels = []
+            for s, e in zip(grid.slices(ras_f, p), ref_edges[p], strict=True):
+                g = render.colorize(s, *win)
+                g[e] = color
+                panels.append(render.panel(g, asp, 200, smooth=False))
+            rows.append((p, panels))
+        body = render.montage(rows, side_letters=letters)
+        st = _status(corr[i] < STACK_CORR_WARN)
+        pics.append(
+            render.compose(
+                body,
+                title,
+                f"frame {i + 1}/{n}:  {labels[i]}",
+                [(f"r = {corr[i]:.3f}", st)],
+                "Animated: steps through every image with the MEDIAN image's edges (orange) "
+                "fixed on top. Look for: anatomy that stays under the same edges in every "
+                "frame; a frame whose anatomy slides out from under them is misaligned.",
+            )
+        )
+    path = rec.figure_path(step + 1, "flicker")
+    render.save_apng(pics, path, 600)
+    rec.add_figure(step + 1, "flicker", f"{what or 'Stack'} flicker (animated)", path)

@@ -243,3 +243,31 @@ def test_alignment_check_flags_a_shifted_source(tmp_path):
     assert bad.metrics["coverage"].value < 0.9 and "coverage" in bad.flagged()
     with Image.open(good.figure_path(2, "flicker")) as im:
         assert getattr(im, "n_frames", 1) == 2
+
+
+def test_stack_cli_finds_the_misaligned_frame(tmp_path):
+    """ffs_qc_stack ranks a shifted run last, labels it from the brick labels, and
+    skips re-rendering a stack whose figures are already newer."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.qc_stack import main
+    from fastfuncstuff.io.afni import _set_afni_brick_labels
+
+    base = _brain_series(nt=1)[0].numpy()
+    frames = [base * (1 + 0.05 * i) for i in range(5)]
+    frames[3] = np.roll(base, 5, axis=2)
+    data = np.stack(frames).transpose(3, 2, 1, 0)
+    img = nib.Nifti1Image(data, np.diag([-3.0, -3.0, 3.0, 1.0]))
+    labels = [f"run-{i + 1}" for i in range(5)]
+    _set_afni_brick_labels(img.header, labels)
+    stack = tmp_path / "stage06.QC.xrun.nii.gz"
+    nib.save(img, stack)
+    qc = tmp_path / "qc"
+    assert main(["-qc", str(qc), str(stack), "-verb", "0"]) == 0
+    (rec,) = load_records(qc)
+    assert rec["info"]["worst_frame"] == "run-4"
+    assert metric_flagged(rec["metrics"]["corr_min"])
+    flick = qc / "55.stack.02-flicker.stage06.QC.xrun.png"
+    mtime = flick.stat().st_mtime_ns
+    main(["-qc", str(qc), str(stack), "-verb", "0"])
+    assert flick.stat().st_mtime_ns == mtime

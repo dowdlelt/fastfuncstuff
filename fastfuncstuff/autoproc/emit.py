@@ -766,6 +766,12 @@ def _ref_image_file(plan: Plan, session: str | None, lane: str) -> str:
 QCItems = list[tuple[str, str]]
 
 
+# Per-tool QC figures + metrics (PNG folder): each tool's -qc writes into QC_DIR,
+# labelled per run with the same fragment the stage files use, and the last stage
+# (ffs_qc_report) stitches them into qc/index.html and qc/qc_review.tsv.
+QC_DIR = "qc"
+
+
 def _qc_on(plan: Plan) -> bool:
     return bool(getattr(plan.options, "qc", True))
 
@@ -840,8 +846,10 @@ def _qc_helper(plan: Plan, script_stem: str) -> str:
 # keeps a stage's QC available before the next stage consumes its outputs.
 skip_qc=1          # 1 = keep an existing QC stack; 0 = rebuild every one
 qcbatch="{script_stem}_qcbatch.txt"; : > "$qcbatch"
+qcstacks=()        # this stage's stacks, rendered into {QC_DIR}/ by ffs_qc_stack
 qc_tcat() {{
   local out="$1" labs="$2"; shift 2
+  qcstacks+=("$out")
   [ "$skip_qc" -eq 1 ] && [ -f "$out" ] && return 0
   local f line
   for f in "$@"; do
@@ -854,9 +862,17 @@ qc_tcat() {{
   printf '%s\\n' "$line" >> "$qcbatch"
 }}
 qc_flush() {{
-  [ -s "$qcbatch" ] || return 0
-  ffs_util_3dmath -batch "$qcbatch" -device "$DEVICE"
-  : > "$qcbatch"
+  if [ -s "$qcbatch" ]; then
+    ffs_util_3dmath -batch "$qcbatch" -device "$DEVICE"
+    : > "$qcbatch"
+  fi
+  # Each stack also becomes a ranking + flicker PNG (skipped when already newer).
+  local have=() s
+  for s in "${{qcstacks[@]}}"; do [ -f "$s" ] && have+=("$s"); done
+  if [ "${{#have[@]}}" -gt 0 ] && command -v ffs_qc_stack >/dev/null 2>&1; then
+    ffs_qc_stack -qc {QC_DIR} "${{have[@]}}"
+  fi
+  qcstacks=()
 }}
 """
 
@@ -1892,12 +1908,6 @@ def _moco_censor_flags(plan: Plan) -> str:
         ]
     parts.append('-censor \\"${mstem}.censor.1D\\"')
     return " " + " ".join(parts)
-
-
-# Per-tool QC figures + metrics (PNG folder): each tool's -qc writes into QC_DIR,
-# labelled per run with the same fragment the stage files use, and the last stage
-# (ffs_qc_report) stitches them into qc/index.html and qc/qc_review.tsv.
-QC_DIR = "qc"
 
 
 def _tool_qc_flags(plan: Plan, label: str = "${FRAG[$k]}") -> str:
