@@ -671,3 +671,249 @@ def stack_check(
     path = rec.figure_path(step + 1, "flicker")
     render.save_apng(pics, path, 600)
     rec.add_figure(step + 1, "flicker", f"{what or 'Stack'} flicker (animated)", path)
+
+
+# ---------------------------------------------------------------------------
+# GLM: the design and whether the task shows up at all
+# ---------------------------------------------------------------------------
+
+# 1d_tool.py -show_cormat_warnings starts warning at |r| 0.4; past 0.5 a task
+# regressor shares enough with a nuisance one that its beta is partly motion.
+TASK_NUISANCE_R_WARN = 0.5
+
+
+def column_roles(design_info: dict) -> list[str]:
+    """'task' / 'nuisance' / 'drift' per design column.
+
+    AFNI's ColumnGroups say it directly (-1 polort, 0 baseline, >0 stimulus);
+    designs built in-process carry stim/nuisance index lists instead, and their
+    polynomial columns are named ``Run#kPol#j`` as in AFNI.
+    """
+    import re
+
+    labels = list(design_info.get("column_labels") or [])
+    p = int(np.asarray(design_info["matrix"]).shape[1])
+    labels += [f"col{i}" for i in range(len(labels), p)]
+    groups = design_info.get("column_groups")
+    if groups is not None and len(groups) == p:
+        return ["drift" if g < 0 else "nuisance" if g == 0 else "task" for g in groups]
+    stim = set(design_info.get("stim_indices") or [])
+    out = []
+    for i, lab in enumerate(labels):
+        if re.search(r"Pol#\d+", lab):
+            out.append("drift")
+        elif i in stim:
+            out.append("task")
+        else:
+            out.append("nuisance")
+    return out
+
+
+def _diverging_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # Blue <-> red through the dark neutral: no hue at zero.
+    return LinearSegmentedColormap.from_list("qc_div", [style.BLUE, "#383835", style.RED])
+
+
+def glm_check(
+    rec: QCRecord,
+    step: int,
+    design_info: dict,
+    *,
+    fstat=None,
+    affine=None,
+    fstat_label: str = "Full_Fstat",
+) -> None:
+    """Design-matrix picture, regressor correlations, and the omnibus F map.
+
+    Correlations are taken after removing each run's drift columns (the fit does
+    the same), so two regressors that merely share a slow trend do not look
+    collinear. ``fstat`` is the omnibus statistic as a ``(z, y, x)`` array.
+    """
+    X = np.asarray(design_info["matrix"], dtype=np.float64)
+    n, p = X.shape
+    labels = list(design_info.get("column_labels") or [])
+    labels += [f"col{i}" for i in range(len(labels), p)]
+    roles = column_roles(design_info)
+    good = design_info.get("good_list")
+    keep = np.ones(n, bool)
+    if good is not None and len(good):
+        keep[:] = False
+        keep[np.asarray(good, int)] = True
+    Xg = X[keep]
+    drift = [i for i, r in enumerate(roles) if r == "drift"]
+    task = [i for i, r in enumerate(roles) if r == "task"]
+    nuis = [i for i, r in enumerate(roles) if r == "nuisance"]
+    dof = int(keep.sum()) - p
+    rec.metric("n_timepoints", int(keep.sum()), "TRs", "time points in the fit (after censoring)")
+    rec.metric("n_regressors", p, "", "design columns")
+    rec.metric("n_task", len(task), "", "task columns")
+    rec.metric("dof", dof, "", "residual degrees of freedom", warn_lt=20)
+    sd = Xg.std(axis=0)
+    nz = sd > 0
+    cond = (
+        float(np.linalg.cond(Xg[:, nz] / np.where(Xg[:, nz].std(0) > 0, Xg[:, nz].std(0), 1)))
+        if nz.any()
+        else float("nan")
+    )
+    rec.metric("cond", cond, "", "condition number of the column-normalised design")
+
+    # Residualise on drift, then correlate task + nuisance columns.
+    show = task + nuis
+    R = np.zeros((len(show), len(show)))
+    if show:
+        A = Xg[:, show]
+        if drift:
+            D = Xg[:, drift]
+            A = A - D @ np.linalg.lstsq(D, A, rcond=None)[0]
+        s = A.std(axis=0)
+        A = (A - A.mean(0)) / np.where(s > 0, s, 1)
+        R = (A.T @ A) / max(A.shape[0], 1)
+    t_pos = list(range(len(task)))
+    n_pos = list(range(len(task), len(show)))
+    max_tn = float(np.abs(R[np.ix_(t_pos, n_pos)]).max()) if t_pos and n_pos else 0.0
+    rec.metric(
+        "task_nuisance_r",
+        max_tn,
+        "",
+        "largest |r| between a task and a nuisance regressor (drift removed)",
+        warn_gt=TASK_NUISANCE_R_WARN,
+    )
+    if len(t_pos) > 1:
+        Rt = np.abs(R[np.ix_(t_pos, t_pos)])
+        np.fill_diagonal(Rt, 0)
+        rec.metric(
+            "task_task_r",
+            float(Rt.max()),
+            "",
+            "largest |r| between two task regressors (drift removed)",
+        )
+
+    # --- figure: design matrix + correlation matrix --------------------------
+    from matplotlib.figure import Figure
+
+    with style.mpl_style():
+        fig = Figure(figsize=(style.WIDTH / 100, 7.8), dpi=100)
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.25, 1.0], wspace=0.25)
+        ax = fig.add_subplot(gs[0])
+        cols = task + nuis
+        M = X[:, cols]
+        rng = np.abs(M).max(axis=0)
+        M = M / np.where(rng > 0, rng, 1)
+        ax.imshow(
+            M, aspect="auto", cmap=_diverging_cmap(), vmin=-1, vmax=1, interpolation="nearest"
+        )
+        ax.grid(False)
+        for rs in (design_info.get("run_starts") or [])[1:]:
+            ax.axhline(rs - 0.5, color=style.INK2, lw=0.8)
+        if len(task):
+            ax.axvline(len(task) - 0.5, color=style.INK, lw=1.4)
+        if not keep.all():
+            bad = np.flatnonzero(~keep)
+            ax.plot(
+                np.full(bad.size, -0.9), bad, "_", color=style.STATUS["fail"], ms=8, clip_on=False
+            )
+        if len(cols) <= 40:
+            ax.set_xticks(
+                range(len(cols)), [labels[i] for i in cols], rotation=70, ha="right", fontsize=7
+            )
+        else:
+            ax.set_xticks([])
+        ax.set_ylabel("time point")
+        ax.set_title(
+            f"design: {len(task)} task | {len(nuis)} nuisance  (+{len(drift)} drift, not shown)"
+        )
+        ax2 = fig.add_subplot(gs[1])
+        if show:
+            # The diagonal is 1 by definition; blank it so it does not out-shout the
+            # off-diagonal cells that carry the information.
+            shown = R.copy()
+            np.fill_diagonal(shown, np.nan)
+            cm = _diverging_cmap().with_extremes(bad=style.SURFACE)
+            ax2.imshow(shown, cmap=cm, vmin=-1, vmax=1, interpolation="nearest")
+            if len(show) <= 30:
+                ax2.set_xticks(
+                    range(len(show)), [labels[i] for i in show], rotation=70, ha="right", fontsize=7
+                )
+                ax2.set_yticks(range(len(show)), [labels[i] for i in show], fontsize=7)
+                for a in range(len(show)):
+                    for b in range(len(show)):
+                        if a != b and abs(R[a, b]) >= 0.4:
+                            ax2.text(
+                                b,
+                                a,
+                                f"{R[a, b]:.1f}",
+                                ha="center",
+                                va="center",
+                                fontsize=6,
+                                color=style.INK,
+                            )
+            else:
+                ax2.set_xticks([])
+                ax2.set_yticks([])
+            if t_pos and n_pos:
+                ax2.axhline(len(task) - 0.5, color=style.INK, lw=1.2)
+                ax2.axvline(len(task) - 0.5, color=style.INK, lw=1.2)
+        ax2.grid(False)
+        ax2.set_title("correlation (drift removed); |r| >= 0.4 printed")
+        fig.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.2)
+        body = render.figure_image(fig)
+    stats = [
+        (f"dof {dof}", _status(dof < 20)),
+        (f"max task–nuisance |r| {max_tn:.2f}", _status(max_tn > TASK_NUISANCE_R_WARN)),
+    ]
+    img = render.compose(
+        body,
+        f"Design · {rec.label}",
+        f"{rec.tool}  ·  {n} time points, {p} columns, {len(design_info.get('run_starts') or [0])} run(s)",
+        stats,
+        "Left: each column scaled to +/-1 (blue negative, red positive), time running down, run "
+        "boundaries as lines, task columns left of the bold line; red ticks at the left edge are "
+        "censored time points. Right: regressor correlations after drift removal. Look for: task "
+        "columns that correlate with motion (betas partly motion), and task columns that "
+        "correlate with each other (betas hard to separate).",
+    )
+    path = rec.figure_path(step, "design")
+    render.save_png(img, path)
+    rec.add_figure(step, "design", "Design matrix", path)
+
+    # --- figure: omnibus F ---------------------------------------------------
+    if fstat is None:
+        return
+    f = fstat.detach().cpu().numpy() if hasattr(fstat, "detach") else np.asarray(fstat)
+    f = np.nan_to_num(np.asarray(f, np.float32))
+    mask = f != 0
+    if not mask.any():
+        return
+    p99 = float(np.percentile(f[mask], 99))
+    rec.metric("fstat_p99", p99, "", f"99th percentile of {fstat_label} in the fitted voxels")
+    ras_f, zooms = render.ras_volume(f, affine)
+    ras_m, _ = render.ras_volume(mask.astype(np.float32), affine)
+    grid = render.Grid(ras_f, zooms, ras_m > 0.5, n_cut=7)
+    rows, letters = [], []
+    for plane in ("axial", "coronal", "sagittal"):
+        asp = grid.aspect(plane)
+        panels = []
+        for s, m in zip(grid.slices(ras_f, plane), grid.slices(ras_m, plane), strict=True):
+            rgb = render.colorize(s, 0, p99, "inferno")
+            # A faint silhouette where the fit ran, so the map has a brain to sit in.
+            rgb[(m > 0.5) & (s <= 0.02 * p99)] = style.hex_rgb("#2c2c2a")
+            rgb[m <= 0.5] = 0
+            panels.append(render.panel(rgb, asp, 220, smooth=False))
+        rows.append((plane, panels))
+        letters.append(grid.side_letter(plane))
+    body = render.montage(rows, side_letters=letters)
+    img = render.compose(
+        body,
+        f"Task response · {rec.label}",
+        f"{rec.tool}  ·  {fstat_label}, scaled 0 to its 99th percentile ({p99:.1f})",
+        [(f"F p99 {p99:.1f}", None)],
+        "The omnibus F: how much all task regressors together explain, per voxel. Look for: "
+        "high values in the regions the task should drive (visual cortex for visual stimuli, "
+        "motor cortex for button presses). Uniformly high F everywhere, or along the brain "
+        "edge, suggests the task is entangled with motion.",
+    )
+    path = rec.figure_path(step + 1, "fstat")
+    render.save_png(img, path)
+    rec.add_figure(step + 1, "fstat", "Omnibus F map", path)

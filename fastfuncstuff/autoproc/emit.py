@@ -5635,6 +5635,9 @@ def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[st
         *(["-clustsim"] if opt.clustsim else []),
         *(["-clustsim_null resid"] if opt.clustsim and opt.clustsim_null == "resid" else []),
         *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
+        # Labelled by the bucket stem, so a blur variant or the phasereg refit is its
+        # own QC row (a "/" in a folder stem becomes "_" in the file name).
+        *([f'-qc {QC_DIR} -qc_label "{stem}task-{task}"'] if _qc_on(plan) else []),
         *_reml_shared(opt, task),
     ]
 

@@ -4266,6 +4266,7 @@ def test_qc_folder_wired_into_moco_and_report():
     assert s.index("stage02: moco") < s.index("ffs_qc_report qc")
     assert "-qc qc -qc_label anat" in s  # the EPI <-> anat alignment edges
     assert 'ffs_qc_stack -qc qc "${have[@]}"' in s  # every QC stack -> ranking + flicker
+    assert '-qc qc -qc_label "stage12.task-foo"' in s  # the GLM design + F map
     opts = Options()
     opts.qc = False
     s2 = write_script(build_plan(subj, opts), "wd", bids_root="/bids")

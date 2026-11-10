@@ -1196,6 +1196,9 @@ Examples:
         ),
     )
 
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
     return parser
 
 
@@ -5425,10 +5428,44 @@ def main():
     elif args.clustsim:
         _run_clustsim(args, diag, device)
 
+    if getattr(args, "qc", None):
+        _write_glm_qc(args, design_info)
+
     print()
     print("=" * 70)
     print("✅ ffs_reml completed successfully!")
     print("=" * 70)
+
+
+def _write_glm_qc(args, design_info: dict) -> None:
+    """-qc: the design and its correlations, and the omnibus F from the written bucket.
+
+    Reads the F back from the bucket on disk rather than from memory: the written
+    file is the one -adjust_dof may have rewritten, and the one people will open.
+    """
+    from typing import cast
+
+    import nibabel as nib
+
+    from fastfuncstuff.io.headers import read_brick_labels
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import QCRecord
+
+    buck = _resolve_written_bucket(args.Rbuck) or _resolve_written_bucket(args.Obuck)
+    rec = QCRecord.for_args(args, "reml", buck or args.input[0])
+    if rec is None:
+        return
+    rec.info["bucket"] = buck
+    fstat = affine = None
+    if buck and ".nii" in buck:
+        img = cast("nib.Nifti1Image", nib.load(buck))  # stub gap: FileBasedImage
+        labels = read_brick_labels(img)
+        if "Full_Fstat" in labels and len(img.shape) >= 4:
+            vol = np.asanyarray(img.dataobj[..., labels.index("Full_Fstat")], dtype=np.float32)
+            fstat = np.ascontiguousarray(vol.reshape(vol.shape[:3]).transpose(2, 1, 0))
+            affine = img.affine
+    checks.glm_check(rec, 1, design_info, fstat=fstat, affine=affine)
+    rec.write()
 
 
 def _resolve_written_bucket(buck: str | None) -> str | None:

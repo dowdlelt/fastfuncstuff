@@ -271,3 +271,46 @@ def test_stack_cli_finds_the_misaligned_frame(tmp_path):
     mtime = flick.stat().st_mtime_ns
     main(["-qc", str(qc), str(stack), "-verb", "0"])
     assert flick.stat().st_mtime_ns == mtime
+
+
+def test_glm_check_flags_task_correlated_motion(tmp_path):
+    """A motion regressor that follows the task must trip the task-nuisance limit,
+    and drift columns must not count as collinear with anything."""
+    n = 100
+    t = np.arange(n)
+    box = ((t % 20) < 10).astype(float)
+    rng = np.random.default_rng(0)
+    X = np.column_stack(
+        [
+            np.ones(n),
+            np.linspace(-1, 1, n),
+            box,
+            box + 0.3 * rng.standard_normal(n),
+            rng.standard_normal(n),
+        ]
+    )
+    info = {
+        "matrix": X,
+        "column_labels": ["Run#1Pol#0", "Run#1Pol#1", "task#0", "mot_0", "mot_1"],
+        "column_groups": [-1, -1, 1, 0, 0],
+        "run_starts": [0],
+    }
+    assert checks.column_roles(info) == ["drift", "drift", "task", "nuisance", "nuisance"]
+    rec = _rec(tmp_path, "run-1", "reml")
+    f = np.zeros((6, 8, 8), np.float32)
+    f[2:4, 2:6, 2:6] = 10.0
+    f[f == 0] = 1.0
+    checks.glm_check(rec, 1, info, fstat=f, affine=np.eye(4))
+    assert rec.metrics["task_nuisance_r"].value > 0.8  # 0.88 measured: box + 0.3 SD noise
+    assert rec.flagged() == ["task_nuisance_r"]
+    assert rec.metrics["dof"].value == n - 5
+    assert {f["check"] for f in rec.figures} == {"design", "fstat"}
+
+
+def test_column_roles_without_groups():
+    info = {
+        "matrix": np.zeros((5, 3)),
+        "column_labels": ["Run#1Pol#0", "faces#0", "mot"],
+        "stim_indices": [1],
+    }
+    assert checks.column_roles(info) == ["drift", "task", "nuisance"]
