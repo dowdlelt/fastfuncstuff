@@ -371,3 +371,153 @@ def _masked_traces(x, mask: np.ndarray, dev) -> tuple[np.ndarray, np.ndarray]:
         if nt > 1:
             dsq += (s[1:] - s[:-1]).pow(2).sum(1, dtype=torch.float64)
     return dsq.cpu().numpy(), gsum.cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Alignment: two images that should now share one space
+# ---------------------------------------------------------------------------
+
+# Edge colours: bright steps of two categorical hues, so they read on grey.
+EDGE_A = "#eb6834"  # edges of the base, drawn over the source
+EDGE_B = "#1baf7a"  # edges of the source, drawn over the base
+
+
+def _support(vol: np.ndarray) -> np.ndarray:
+    """Where an image has signal: automask, or nonzero when the automask is empty
+    (a skull-stripped or thin-slab image can starve AFNI's clip level)."""
+    import torch
+
+    from fastfuncstuff.processing.mask import automask
+
+    t = torch.from_numpy(np.ascontiguousarray(vol, dtype=np.float32))
+    try:
+        m = automask(t, device=torch.device("cpu")).cpu().numpy().astype(bool)
+    except Exception:
+        m = np.zeros(vol.shape, bool)
+    if m.sum() < 64:
+        m = np.isfinite(vol) & (vol > 0)
+    return m
+
+
+def alignment_check(
+    rec: QCRecord,
+    step: int,
+    base,
+    moved,
+    affine,
+    *,
+    base_name: str = "base",
+    moved_name: str = "source",
+    n_cut: int = 6,
+    subtitle: str = "",
+) -> None:
+    """Edges of each image over the other, and an animated flicker between them.
+
+    ``base`` and ``moved`` are 3-D ``(z, y, x)`` arrays on the SAME grid (the
+    moved image already resampled onto the base). Cuts are placed inside the moved
+    image's coverage, so a slab is checked where it has data, not where the base
+    happens to be big.
+    """
+    b = base.detach().cpu().numpy() if hasattr(base, "detach") else np.asarray(base)
+    m = moved.detach().cpu().numpy() if hasattr(moved, "detach") else np.asarray(moved)
+    b = np.asarray(b, np.float32)
+    m = np.asarray(m, np.float32)
+    if b.ndim == 4:
+        b = b.mean(0)
+    if m.ndim == 4:
+        m = m.mean(0)
+    mb, mm = _support(b), _support(m)
+    both = mb & mm
+    dice = float(2 * both.sum() / max(mb.sum() + mm.sum(), 1))
+    rec.metric(
+        "mask_dice",
+        dice,
+        "",
+        f"Dice overlap of the {base_name} and {moved_name} masks (AFNI's anat/EPI mask Dice)",
+    )
+    corr = float(np.corrcoef(b[both], m[both])[0, 1]) if both.sum() > 10 else float("nan")
+    rec.metric(
+        "corr",
+        corr,
+        "",
+        "Pearson r in the overlap; negative is expected across contrasts (T1w vs T2*)",
+    )
+    cover = float(both.sum() / max(mm.sum(), 1))
+    rec.metric(
+        "coverage",
+        cover,
+        "",
+        f"fraction of the {moved_name} mask that lands inside the {base_name} mask",
+        warn_lt=0.9,
+    )
+
+    ras_b, zooms = render.ras_volume(b, affine)
+    ras_m, _ = render.ras_volume(m, affine)
+    ras_mm, _ = render.ras_volume(mm.astype(np.float32), affine)
+    grid = render.Grid(ras_b, zooms, ras_mm > 0.5, n_cut=n_cut)
+    ras_both, _ = render.ras_volume(both.astype(np.float32), affine)
+    wb = render.window(ras_b, ras_both > 0.5, 1, 99.5)
+    wm = render.window(ras_m, ras_both > 0.5, 1, 99.5)
+    ca, cb = style.hex_rgb(EDGE_A), style.hex_rgb(EDGE_B)
+
+    rows, letters = [], []
+    plain_b, plain_m = [], []
+    for plane in ("axial", "coronal", "sagittal"):
+        asp = grid.aspect(plane)
+        sb, sm = grid.slices(ras_b, plane), grid.slices(ras_m, plane)
+        over_m, over_b, pb, pm = [], [], [], []
+        for x_b, x_m in zip(sb, sm, strict=True):
+            gb = render.colorize(x_b, *wb)
+            gm = render.colorize(x_m, *wm)
+            pb.append(render.panel(gb, asp, 220))
+            pm.append(render.panel(gm, asp, 220))
+            e_b, e_m = render.edges_2d(x_b, asp), render.edges_2d(x_m, asp)
+            a, c = gm.copy(), gb.copy()
+            a[e_b] = ca
+            c[e_m] = cb
+            # Edges are one pixel wide in data space; nearest-neighbour keeps them crisp.
+            over_m.append(render.panel(a, asp, 220, smooth=False))
+            over_b.append(render.panel(c, asp, 220, smooth=False))
+        rows += [
+            (f"{moved_name}\n+ {base_name} edges · {plane}", over_m),
+            (f"{base_name}\n+ {moved_name} edges · {plane}", over_b),
+        ]
+        letters += [grid.side_letter(plane)] * 2
+        plain_b.append((f"{plane}", pb))
+        plain_m.append((f"{plane}", pm))
+
+    stats = [(f"Dice {dice:.3f}", None), (f"coverage {100 * cover:.1f}%", _status(cover < 0.9))]
+    body = render.montage(rows, side_letters=letters)
+    cap = (
+        f"Orange: edges of the {base_name} drawn on the {moved_name}. Green: edges of the "
+        f"{moved_name} on the {base_name}. Rows go axial, coronal, sagittal. Look for: edges "
+        "that sit on the matching boundary (ventricles, the brain outline, the cortical "
+        "ribbon) in every plane; a consistent offset in one direction is a misalignment, a "
+        "local mismatch near sinuses or the brain edge is usually distortion."
+    )
+    title = f"Alignment · {rec.label}"
+    sub = subtitle or f"{rec.tool}  ·  {moved_name} → {base_name}"
+    img = render.compose(body, title, sub, stats, cap)
+    path = rec.figure_path(step, "edges")
+    render.save_png(img, path)
+    rec.add_figure(step, "edges", "Alignment edges", path)
+
+    letters3 = [grid.side_letter(p) for p in ("axial", "coronal", "sagittal")]
+    frames = []
+    for which, rws in ((base_name, plain_b), (moved_name, plain_m)):
+        body = render.montage(rws, side_letters=letters3)
+        frames.append(
+            render.compose(
+                body,
+                title,
+                f"{sub}  ·  showing: {which.upper()}",
+                stats,
+                f"Animated: alternates {base_name} and {moved_name} on identical cuts. "
+                "Look for: anatomy that stays still while only the contrast changes. Any "
+                "boundary that jumps between frames is misaligned there. Frame 1 is the "
+                f"{base_name} in viewers that do not animate.",
+            )
+        )
+    path = rec.figure_path(step + 1, "flicker")
+    render.save_apng(frames, path, 800)
+    rec.add_figure(step + 1, "flicker", "Alignment flicker (animated)", path)

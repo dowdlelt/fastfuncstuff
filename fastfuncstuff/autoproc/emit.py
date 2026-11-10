@@ -3146,6 +3146,7 @@ def _stage_anat(plan: Plan) -> str:
                 '-1Dmatrix_save "stage09.anat.aff12.1D"',
                 *_split_flags(config.DEFAULT_OPTS["anat"]),
                 "-tbest 16",
+                *([f"-qc {QC_DIR} -qc_label anat"] if _qc_on(plan) else []),
                 '-device "$DEVICE"',
             ],
         )

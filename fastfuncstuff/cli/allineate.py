@@ -218,6 +218,28 @@ def _apply_followers(
             print(f"Saved follower: {prefix}")
 
 
+def _write_alignment_qc(args, base, warped, base_header, verb) -> None:
+    """-qc: edges of each image over the other, plus a flicker, on the base grid."""
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import QCRecord
+
+    rec = QCRecord.for_args(args, "allineate", args.prefix)
+    if rec is None:
+        return
+    rec.info["base"] = args.base
+    rec.info["source"] = args.source
+    rec.info["cost"] = args.cost
+    checks.alignment_check(
+        rec,
+        1,
+        base,
+        warped,
+        base_header["affine"],
+        subtitle=f"allineate  ·  {Path(args.source).name} → {Path(args.base).name}  ·  cost {args.cost}",
+    )
+    rec.write(verb)
+
+
 def _resolve_ov(args: argparse.Namespace) -> float:
     """Overlap-penalty weight, defaulting the way AFNI does per cost.
 
@@ -713,6 +735,10 @@ Examples:
     # source, so the base rides along in its own row unless asked otherwise.
     add_warp_movie_args(parser, what="alignment", overlay_default="base")
 
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
+
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
@@ -1087,6 +1113,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         save_cost_trace_path=args.save_cost_trace,
         movie_recorder=recorder,
     )
+    warped_on_base = warped  # the -qc pair: both on the base grid, before any -dxyz regrid
 
     # --- Save outputs ---
     # -dxyz: re-resample onto the master grid at the requested voxel size (allineate returned
@@ -1159,6 +1186,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         print("  Mean: skipped (source is 3D)")
 
     render_warp_movie(recorder, args, verb)
+    _write_alignment_qc(args, base, warped_on_base, base_header, verb)
 
     if verb >= 1:
         print(f"  Alignment: {time.time() - t1:.2f}s")

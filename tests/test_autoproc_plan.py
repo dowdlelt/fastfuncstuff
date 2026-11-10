@@ -4264,6 +4264,7 @@ def test_qc_folder_wired_into_moco_and_report():
     s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
     assert '-qc qc -qc_label \\"${FRAG[$k]}\\"' in s
     assert s.index("stage02: moco") < s.index("ffs_qc_report qc")
+    assert "-qc qc -qc_label anat" in s  # the EPI <-> anat alignment edges
     opts = Options()
     opts.qc = False
     s2 = write_script(build_plan(subj, opts), "wd", bids_root="/bids")

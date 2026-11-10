@@ -226,3 +226,20 @@ def test_moco_cli_writes_qc(tmp_path):
     assert {f["check"] for f in rec["figures"]} == {"motion", "tsnr", "carpet"}
     assert rec["metrics"]["outlier_vol0"]["value"] is not None
     assert json.loads((qc / "records" / "20.moco.run-1.json").read_text())["tool"] == "moco"
+
+
+def test_alignment_check_flags_a_shifted_source(tmp_path):
+    """Coverage falls when the source sits off the base; the flicker is a real
+    two-frame APNG."""
+    from PIL import Image
+
+    base = _brain_series(nt=1)[0].numpy()
+    aff = np.diag([-3.0, -3.0, 3.0, 1.0])
+    good = _rec(tmp_path, "good", "allineate")
+    checks.alignment_check(good, 1, base, base * 0.5 + 3, aff)
+    bad = _rec(tmp_path, "bad", "allineate")
+    checks.alignment_check(bad, 1, base, np.roll(base, 6, axis=2), aff)
+    assert good.metrics["coverage"].value > 0.99 and good.metrics["mask_dice"].value > 0.99
+    assert bad.metrics["coverage"].value < 0.9 and "coverage" in bad.flagged()
+    with Image.open(good.figure_path(2, "flicker")) as im:
+        assert getattr(im, "n_frames", 1) == 2
