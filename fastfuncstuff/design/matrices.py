@@ -850,10 +850,18 @@ def basis_tent(x: torch.Tensor, bot: float, mid: float, top: float) -> torch.Ten
 
 def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
     """
-    Cubic spline basis function (cardinal B-spline)
+    Cardinal cubic spline basis function centred at ``knots[idx]`` (AFNI CSPLIN).
 
-    Evaluates a cubic B-spline basis centered at knots[idx].
-    This is a piecewise cubic polynomial with C² continuity.
+    A port of ``hh_csplin`` / ``basis_csplin`` in AFNI's ``3dDeconvolve.c``: the cubic
+    convolution kernel with slope -1/2 at one knot spacing from its centre. It is 1 at
+    its own knot and 0 at every other knot, so a coefficient IS the response at that
+    knot's time, as with TENT. Support is two knot spacings either side, cut at the ends
+    of the knot range (the response is zero outside its window).
+
+    Bug of record: until 2026-11-10 this was a cubic B-spline scaled by 1.5. That is 1
+    at its own knot but 0.25 at each neighbour, so the fitted curve at a knot was
+    ``b[k] + 0.25 * (b[k-1] + b[k+1])`` and the coefficients written as the response
+    read about 2/3 of it (0.66-0.85 of the true peak in simulation).
 
     Parameters
     ----------
@@ -863,66 +871,21 @@ def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
         All knot positions (must be equally spaced)
     idx : int
         Index of center knot for this basis function
-
-    Returns
-    -------
-    values : torch.Tensor
-        Cubic spline basis values at each x
-
-    Notes
-    -----
-    Cubic B-spline basis has support over 4 intervals:
-    - Non-zero from knots[idx-2] to knots[idx+2]
-    - Value = 1 at knots[idx]
-    - C² continuous everywhere
-
-    This provides smoother interpolation than TENT (piecewise linear).
-    Parameters still represent HRF values at knots (cardinal interpolation).
-
-    References
-    ----------
-    AFNI 3dDeconvolve CSPLIN implementation
-    de Boor, "A Practical Guide to Splines" (2001)
     """
     n_knots = len(knots)
-
-    # Handle edge cases
-    if idx < 0 or idx >= n_knots:
+    if idx < 0 or idx >= n_knots or n_knots < 2:
         return torch.zeros_like(x)
 
-    # Get knot spacing (assume uniform)
-    if n_knots > 1:
-        dx = knots[1] - knots[0]
-    else:
-        return torch.zeros_like(x)
-
-    # Center position
-    x_center = knots[idx]
-
-    # Normalized distance from center: t = (x - x_center) / dx
-    t = (x - x_center) / dx
-
-    # Cubic B-spline is non-zero for |t| < 2
-    val = torch.zeros_like(x)
-
-    # Use standard cubic B-spline formula (normalized)
-    # Split into 4 regions based on |t|
-
-    # Region 1: 0 <= |t| < 1 (central peak)
-    mask1 = torch.abs(t) < 1.0
-    t1 = torch.abs(t[mask1])
-    val[mask1] = (2.0 / 3.0) - t1**2 + 0.5 * t1**3
-
-    # Region 2: 1 <= |t| < 2 (tails)
-    mask2 = (torch.abs(t) >= 1.0) & (torch.abs(t) < 2.0)
-    t2 = torch.abs(t[mask2])
-    val[mask2] = (2.0 - t2) ** 3 / 6.0
-
-    # Normalize so peak value = 1.0 (for cardinal interpolation)
-    # Peak of cubic B-spline is 2/3, so multiply by 3/2
-    val = val * 1.5
-
-    return val
+    dx = knots[1] - knots[0]
+    y = torch.abs((x - knots[idx]) / dx)
+    ca = 0.5  # AFNI's CA: the negative of the kernel's slope at |y| = 1
+    inner = 1.0 + y * y * ((2.0 - ca) * y - (3.0 - ca))
+    outer = -ca * (-4.0 + y * (8.0 + y * (-5.0 + y)))
+    val = torch.where(y < 1.0, inner, torch.where(y < 2.0, outer, torch.zeros_like(y)))
+    # AFNI's edge flags cut each function at the first and last knot, with its tolerance.
+    tol = 0.0009 * dx
+    inside = (x >= knots[0] - tol) & (x <= knots[-1] + tol)
+    return torch.where(inside, val, torch.zeros_like(val))
 
 
 def make_tent_design(
