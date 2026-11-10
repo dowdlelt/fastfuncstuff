@@ -114,7 +114,9 @@ class RoiFit:
     model_local: np.ndarray | None = None
 
 
-def _condition_slices(meta: dict) -> list[slice]:
+def _condition_slices(meta: dict, rows: np.ndarray | None = None) -> list[slice]:
+    if rows is not None:
+        return [slice(start, stop) for start, stop in condition_blocks(rows)]
     block, gap = int(meta["block"]), int(meta["gap"])
     return [slice(1, block), slice(block + gap + 1, block + gap + block)]
 
@@ -138,7 +140,10 @@ def _model_local(data: LaminarData, res, kernel, ikw: dict) -> np.ndarray:
     fit = res.y_pred.numpy()
     k = np.arange(fit.shape[1])
     return np.stack(
-        [own[sl.start + np.abs(fit[sl]).argmax(axis=0), k] for sl in _condition_slices(data.meta)]
+        [
+            own[sl.start + np.abs(fit[sl]).argmax(axis=0), k]
+            for sl in _condition_slices(data.meta, data.rows.numpy())
+        ]
     )
 
 
@@ -422,7 +427,7 @@ def profile_pair(fit: RoiFit, which: int) -> tuple[np.ndarray, np.ndarray]:
     """
     from fastfuncstuff.laminar.devein import local_contribution
 
-    sl = _condition_slices(fit.meta)[which]
+    sl = _condition_slices(fit.meta, fit.rows)[which]
     if fit.y_obs is None:
         raise ValueError("this fit kept no data; profiles need y_obs")
     measured = _peak(fit.y_obs[sl])
@@ -552,7 +557,7 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
             for which in (0, 1):
                 meas, dev = profile_pair(f, which)
                 k = len(meas)
-                fitted = _peak(f.y_hat[_condition_slices(f.meta)[which]])
+                fitted = _peak(f.y_hat[_condition_slices(f.meta, f.rows)[which]])
                 for i in range(k):  # array index 0 is superficial; depth K is pial
                     frac = 1.0 - i / max(k - 1, 1)  # 0 at white matter, 1 at pial
                     fh.write(
