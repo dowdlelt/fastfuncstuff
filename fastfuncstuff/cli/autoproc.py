@@ -1272,7 +1272,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-no_qc",
         "-no-qc",
         action="store_true",
-        help="Don't emit the stageNN.QC.* stacks. By default every alignment stage "
+        help="Don't emit QC: neither the qc/ folder of per-tool figures and metrics "
+        "(motion, tSNR, carpet, ...; stitched into qc/index.html and qc/qc_review.tsv "
+        "by ffs_qc_report at the end) nor the stageNN.QC.* stacks. By default every alignment stage "
         "concatenates the set of images it claims to have brought into one space "
         "into a single 4-D file (labelled per sub-brick), so a misregistration is "
         "seen by scrolling the time axis instead of loading N files by hand. "

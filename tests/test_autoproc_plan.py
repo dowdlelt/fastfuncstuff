@@ -4255,3 +4255,16 @@ def test_xrun_method_moco_stacks_each_anchors_runs_into_one_call():
     assert "-stack_matrices" not in default and "ffs_allineate -batch" in default
     if shutil.which("bash"):
         assert subprocess.run(["bash", "-n"], input=s, text=True).returncode == 0
+
+
+def test_qc_folder_wired_into_moco_and_report():
+    """-qc: every moco job writes into qc/ under its run fragment, and the script
+    ends by stitching the folder; -no_qc drops both."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert '-qc qc -qc_label \\"${FRAG[$k]}\\"' in s
+    assert s.index("stage02: moco") < s.index("ffs_qc_report qc")
+    opts = Options()
+    opts.qc = False
+    s2 = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
+    assert "-qc qc" not in s2 and "ffs_qc_report" not in s2

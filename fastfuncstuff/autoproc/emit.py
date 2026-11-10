@@ -1894,6 +1894,35 @@ def _moco_censor_flags(plan: Plan) -> str:
     return " " + " ".join(parts)
 
 
+# Per-tool QC figures + metrics (PNG folder): each tool's -qc writes into QC_DIR,
+# labelled per run with the same fragment the stage files use, and the last stage
+# (ffs_qc_report) stitches them into qc/index.html and qc/qc_review.tsv.
+QC_DIR = "qc"
+
+
+def _tool_qc_flags(plan: Plan, label: str = "${FRAG[$k]}") -> str:
+    """`` -qc qc -qc_label <run>`` for a manifest line (escaped for its printf), or ""."""
+    if not _qc_on(plan):
+        return ""
+    return f' -qc {QC_DIR} -qc_label \\"{label}\\"'
+
+
+def _stage_qc_report(plan: Plan) -> str:
+    if not _qc_on(plan):
+        return ""
+    return f"""
+# ============================ QC report =====================================
+# Every tool above that took -qc dropped self-explanatory PNGs + a metrics record
+# into {QC_DIR}/. Scroll that folder in any image viewer (names sort check-first,
+# run-second), or open {QC_DIR}/index.html. {QC_DIR}/qc_review.tsv is this subject's
+# row block for ffs_qc_table, which compares subjects.
+echo '== QC report =='
+if [ -d {QC_DIR} ]; then
+  if command -v ffs_qc_report >/dev/null 2>&1; then ffs_qc_report {QC_DIR}
+  else echo "  ffs_qc_report not on PATH (reinstall fastfuncstuff); figures are in {QC_DIR}/"; fi
+fi"""
+
+
 def _stage_moco(plan: Plan, script_stem: str) -> str:
     moco_flags = " ".join(_split_flags(config.DEFAULT_OPTS["moco"]))
     batchfile = f"{script_stem}_mocobatch.txt"
@@ -1940,7 +1969,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
 {_medic_moco_source(plan)}  ins="\\"$raw\\""; me_args=""; mpfx="${{mstem}}${{E1[$k]:-}}"
-{me3d_block}  printf '%s\\n' "-input $ins $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}{censor_arg}$me_args" >> "$mocobatch"
+{me3d_block}  printf '%s\\n' "-input $ins $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}{censor_arg}{_tool_qc_flags(plan)}$me_args" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -6132,5 +6161,6 @@ def _pipeline_body(plan: Plan, bids_root: str | None, script_stem: str, header: 
         _stage_stats(plan, bids_root),
         _stage_hrftdv(plan, bids_root),
         _stage_surface_stats(plan, bids_root),
+        _stage_qc_report(plan),
     ]
     return "\n".join(p for p in parts if p).rstrip() + "\n"
