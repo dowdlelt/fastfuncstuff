@@ -1,0 +1,42 @@
+{
+  "seed": 920,
+  "dtype": "float64",
+  "device": "cpu",
+  "checks": [
+    {
+      "K": 3,
+      "steady_state_max_derivative": 4.66103866792059e-16,
+      "absolute_flux_max_residual": 4.440892098500626e-16,
+      "baseline_bold": 0.0,
+      "baseline_rhs": 0.0
+    },
+    {
+      "K": 7,
+      "steady_state_max_derivative": 1.9558811797754353e-15,
+      "absolute_flux_max_residual": 2.2516710718178956e-15,
+      "baseline_bold": 0.0,
+      "baseline_rhs": 0.0
+    },
+    {
+      "K": 9,
+      "steady_state_max_derivative": 1.4483266434016475e-15,
+      "absolute_flux_max_residual": 2.6645352591003757e-15,
+      "baseline_bold": 0.0,
+      "baseline_rhs": 0.0
+    },
+    {
+      "K": 10,
+      "steady_state_max_derivative": 3.3621904980690024e-15,
+      "absolute_flux_max_residual": 3.1086244689504383e-15,
+      "baseline_bold": 0.0,
+      "baseline_rhs": 5.947623346206196e-16
+    },
+    {
+      "K": 11,
+      "steady_state_max_derivative": 2.9642869431462365e-15,
+      "absolute_flux_max_residual": 2.7200464103316335e-15,
+      "baseline_bold": 0.0,
+      "baseline_rhs": 7.477012206659218e-16
+    }
+  ]
+}
