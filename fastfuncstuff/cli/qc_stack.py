@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import cast
 
 from fastfuncstuff.cli_help import FfsArgumentParser
 
@@ -52,7 +53,7 @@ def render_stack(path: Path, qc_dir: Path, overwrite: bool, verb: int) -> bool:
     out = rec.figure_path(2, "flicker")
     if not overwrite and out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
         return False
-    img = nib.load(str(path))
+    img = cast("nib.Nifti1Image", nib.load(str(path)))  # stub gap: FileBasedImage
     if len(img.shape) != 4 or img.shape[3] < 2:
         if verb >= 1:
             print(f"  {path.name}: not a 4-D stack of >= 2 images, skipped")
