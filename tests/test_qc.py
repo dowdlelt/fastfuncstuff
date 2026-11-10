@@ -314,3 +314,33 @@ def test_column_roles_without_groups():
         "stim_indices": [1],
     }
     assert checks.column_roles(info) == ["drift", "task", "nuisance"]
+
+
+def test_blipflip_cli_writes_distortion_qc(tmp_path):
+    """ffs_blipflip -qc: an animated pair (raw vs corrected) and the field map, with
+    correction bringing the blips together on a pair with a known field."""
+    import nibabel as nib
+    from PIL import Image
+
+    from fastfuncstuff.cli.blipflip import main
+    from tests.test_blipflip import _make_synthetic
+
+    _, _, (up, down) = _make_synthetic()
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    paths = []
+    for name, sc in (("up", up), ("down", down)):
+        p = tmp_path / f"{name}.nii.gz"
+        nib.save(nib.Nifti1Image(sc.data.numpy().transpose(2, 1, 0), aff), p)
+        paths.append(str(p))
+    qc = tmp_path / "qc"
+    rc = main(
+        ["-blip_up", paths[0], "-blip_down", paths[1], "-pe_dir", "j", "-readout", "0.5",
+         "-prefix", str(tmp_path / "bf"), "-device", "cpu", "-qc", str(qc), "-verb", "0"]
+    )  # fmt: skip
+    assert rc in (0, None)
+    (rec,) = load_records(qc)
+    m = rec["metrics"]
+    assert m["pair_r_after"]["value"] > m["pair_r_before"]["value"]
+    assert {f["check"] for f in rec["figures"]} == {"pair", "field"}
+    with Image.open(qc / rec["figures"][0]["file"]) as im:
+        assert im.n_frames == 2

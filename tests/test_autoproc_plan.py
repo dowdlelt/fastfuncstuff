@@ -4271,3 +4271,12 @@ def test_qc_folder_wired_into_moco_and_report():
     opts.qc = False
     s2 = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
     assert "-qc qc" not in s2 and "ffs_qc_report" not in s2
+
+
+def test_qc_folder_wired_into_blipflip():
+    f1 = FmapGroup("01", "a", Path("/a.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], fmaps=[f1])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert re.search(r'-qc qc -qc_label \\"stage04\.blip\.[^"]+\\"', s), (
+        "blipflip manifest lacks -qc"
+    )

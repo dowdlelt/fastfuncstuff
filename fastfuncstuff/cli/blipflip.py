@@ -485,6 +485,9 @@ def create_parser() -> argparse.ArgumentParser:
         "no accuracy cost here (the sensitive reductions accumulate in float64 anyway); "
         "float64 reproduces the original all-double behaviour.",
     )
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
     add_device_arg(
         misc,
         extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
@@ -1119,6 +1122,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             print(f"  wrote {movpar_path}  (per-scan rigid movement)")
 
     render_warp_movie(recorder, args, args.verb)
+    _write_distortion_qc(args, scans, result, affine, neg_frac, no_readout, stem)
 
     pe_letter = {0: "i", 1: "j", 2: "k"}[ref.pe_axis]
     if args.verb >= 1:
@@ -1129,6 +1133,28 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         )
         print("          (-jac applies the phase-encode Jacobian intensity correction)")
     return 0
+
+
+def _write_distortion_qc(args, scans, result, affine, fold_frac, no_readout, stem) -> None:
+    """-qc: the pair flickered raw vs corrected, and the field map under the edges."""
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import QCRecord
+
+    rec = QCRecord.for_args(args, "blipflip", stem)
+    if rec is None or len(scans) < 2:
+        return
+    rec.info["blip_up"] = args.blip_up or (args.imain[0] if args.imain else None)
+    rec.info["blip_down"] = args.blip_down
+    checks.distortion_check(
+        rec,
+        1,
+        [sc.data for sc in scans[:2]],
+        list(result.unwarped[:2]),
+        affine,
+        field_hz=None if no_readout else result.field_hz,
+        fold_frac=fold_frac,
+    )
+    rec.write(args.verb)
 
 
 def _save_zyx(path: str, vol_zyx: torch.Tensor, affine: np.ndarray) -> None:

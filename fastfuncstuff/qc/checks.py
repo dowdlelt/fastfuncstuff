@@ -917,3 +917,150 @@ def glm_check(
     path = rec.figure_path(step + 1, "fstat")
     render.save_png(img, path)
     rec.add_figure(step + 1, "fstat", "Omnibus F map", path)
+
+
+# ---------------------------------------------------------------------------
+# Distortion correction: a reversed phase-encode pair before and after
+# ---------------------------------------------------------------------------
+
+
+def _arr(x) -> np.ndarray:
+    a = x.detach().float().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+    return np.asarray(a, np.float32)
+
+
+def distortion_check(
+    rec: QCRecord,
+    step: int,
+    raw: list,
+    corrected: list,
+    affine,
+    *,
+    field_hz=None,
+    fold_frac: float | None = None,
+    names: tuple[str, str] = ("blip up", "blip down"),
+) -> None:
+    """Flicker between the two blips, raw rows above corrected rows; the field map.
+
+    In the raw rows the anatomy jumps along the phase-encode axis between frames
+    (opposite distortion); in the corrected rows it should stand still. That one
+    animation is the whole check, so it comes first.
+    """
+    r = [_arr(v) for v in raw[:2]]
+    c = [_arr(v) for v in corrected[:2]]
+    ref = 0.5 * (c[0] + c[1])
+    mask = _head_mask(ref)
+
+    def _r(a, b):
+        return float(np.corrcoef(a[mask], b[mask])[0, 1]) if mask.sum() > 10 else float("nan")
+
+    r_before, r_after = _r(r[0], r[1]), _r(c[0], c[1])
+    rec.metric("pair_r_before", r_before, "", "spatial r between the two blips before correction")
+    rec.metric("pair_r_after", r_after, "", "spatial r between the two blips after correction")
+    rec.metric(
+        "pair_r_gain",
+        r_after - r_before,
+        "",
+        "how much correction brought the pair together (negative = made it worse)",
+        warn_lt=0.0,
+    )
+    if fold_frac is not None:
+        rec.metric(
+            "fold_frac",
+            fold_frac,
+            "",
+            "fraction of voxels where the warp folds (Jacobian < 0)",
+            warn_gt=0.0,
+        )
+    stats = [
+        (f"pair r {r_before:.3f} → {r_after:.3f}", _status(r_after < r_before)),
+    ]
+
+    ras_ref, zooms = render.ras_volume(ref, affine)
+    ras_mask, _ = render.ras_volume(mask.astype(np.float32), affine)
+    grid = render.Grid(ras_ref, zooms, ras_mask > 0.5, n_cut=6)
+    planes = ("axial", "sagittal")
+    ras_r = [render.ras_volume(v, affine)[0] for v in r]
+    ras_c = [render.ras_volume(v, affine)[0] for v in c]
+    # One window for both blips of a row: the flicker should change geometry, not
+    # brightness.
+    w_raw = render.window(np.concatenate([ras_r[0][ras_mask > 0.5], ras_r[1][ras_mask > 0.5]]))
+    w_cor = render.window(np.concatenate([ras_c[0][ras_mask > 0.5], ras_c[1][ras_mask > 0.5]]))
+    ref_edges = {
+        p: [render.edges_2d(s, grid.aspect(p)) for s in grid.slices(ras_ref, p)] for p in planes
+    }
+    color = style.hex_rgb(EDGE_A)
+    frames = []
+    for k in range(2):
+        rows, letters = [], []
+        for p in planes:
+            asp = grid.aspect(p)
+            for tag, vol, win in (("raw", ras_r[k], w_raw), ("corrected", ras_c[k], w_cor)):
+                panels = []
+                for s, e in zip(grid.slices(vol, p), ref_edges[p], strict=True):
+                    g = render.colorize(s, *win)
+                    g[e] = color
+                    panels.append(render.panel(g, asp, 200, smooth=False))
+                rows.append((f"{tag}\n{p}", panels))
+                letters.append(grid.side_letter(p))
+        body = render.montage(rows, side_letters=letters)
+        frames.append(
+            render.compose(
+                body,
+                f"Distortion correction · {rec.label}",
+                f"{rec.tool}  ·  showing: {names[k].upper()}",
+                stats,
+                "Animated: alternates the two phase-encode directions, with the corrected mean's "
+                "edges (orange) fixed on top. Look for: raw rows that jump along the phase-encode "
+                "axis between frames (expected) and corrected rows that stand still under the "
+                "edges. Corrected rows that still jump, or stretch near the sinuses, mean the "
+                "field is wrong there.",
+            )
+        )
+    path = rec.figure_path(step, "pair")
+    render.save_apng(frames, path, 700)
+    rec.add_figure(step, "pair", "Blip pair flicker (animated)", path)
+
+    if field_hz is None:
+        return
+    f = _arr(field_hz)
+    lim = float(np.percentile(np.abs(f[mask]), 99)) if mask.any() else 1.0
+    lim = max(lim, 1e-3)
+    rec.metric("field_abs_p99", lim, "Hz", "99th percentile of |field| in the head")
+    ras_f, _ = render.ras_volume(f, affine)
+    cmap = "RdBu_r"
+    rows, letters = [], []
+    for p in ("axial", "coronal", "sagittal"):
+        asp = grid.aspect(p)
+        panels = []
+        for s, m, e in zip(
+            grid.slices(ras_f, p),
+            grid.slices(ras_mask, p),
+            [render.edges_2d(x, asp) for x in grid.slices(ras_ref, p)],
+            strict=True,
+        ):
+            g = render.colorize(s, -lim, lim, cmap)
+            g[m <= 0.5] = (g[m <= 0.5] * 0.35).astype(np.uint8)
+            g[e] = (20, 20, 20)
+            panels.append(render.panel(g, asp, 200, smooth=False))
+        rows.append((p, panels))
+        letters.append(grid.side_letter(p))
+    body = render.montage(rows, side_letters=letters)
+    img = render.compose(
+        body,
+        f"Field map · {rec.label}",
+        f"{rec.tool}  ·  off-resonance in Hz, blue negative / red positive, +/-{lim:.0f} Hz (99th pct)",
+        [(f"|field| p99 {lim:.0f} Hz", None)]
+        + (
+            [(f"folds {100 * fold_frac:.3f}%", _status(fold_frac > 0))]
+            if fold_frac is not None
+            else []
+        ),
+        "Dark lines are the corrected mean's edges; outside the head is dimmed. Look for: a smooth "
+        "field that is strongest above the sinuses and ear canals (orbitofrontal, inferior "
+        "temporal). Speckle, stripes along slices, or strong field deep in the brain are fit "
+        "errors.",
+    )
+    path = rec.figure_path(step + 1, "field")
+    render.save_png(img, path)
+    rec.add_figure(step + 1, "field", "Field map", path)

@@ -2287,6 +2287,7 @@ def _stage_blip(plan: Plan, script_stem: str) -> str:
                 # QC answer to "what went into the fit", see _qc_distortion.
                 "-save_pad_phase",
                 f'-prefix "{st}.nii$FMT"',
+                *([f'-qc {QC_DIR} -qc_label "{st}"'] if _qc_on(plan) else []),
             ]
         )
     if blip_jobs:
