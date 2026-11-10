@@ -878,6 +878,10 @@ def parse_args(
     )
 
     # --- Hardware ---
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
+
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
         hw_group,
@@ -1199,16 +1203,20 @@ def _want_censor_outputs(args) -> bool:
     return any(getattr(args, n, None) is not None for n in ("enorm", "fd", "outcount", "censor"))
 
 
-def _save_censor_outputs(args, result, series, input_file, device, verb) -> None:
+def _save_censor_outputs(args, result, series, input_file, device, verb, qc=False) -> dict:
     """Motion traces, outlier fractions and the combined censor file for one run.
 
     ``series`` is the trimmed, uncorrected estimation source: afni_proc counts
     outliers on the raw (tcat) data, before any resampling smooths spikes out.
+    Returns what was computed (traces, ``outfrac``, ``keep``) for -qc, which asks
+    for the traces and outlier fractions even when no file was requested.
     """
-    if not _want_censor_outputs(args):
-        return
+    if not _want_censor_outputs(args) and not qc:
+        return {}
+    computed: dict = {}
     afni_params = to_afni_motion(result.params)
     traces = {m: censor_lib.motion_trace(afni_params, m) for m in censor_lib.MOTION_METRICS}
+    computed.update(traces)
     for metric in censor_lib.MOTION_METRICS:
         path = getattr(args, metric, None)
         if path is not None:
@@ -1231,7 +1239,7 @@ def _save_censor_outputs(args, result, series, input_file, device, verb) -> None
                 f"{int((keep == 0).sum())} of {keep.size} TRs"
             )
 
-    if args.outcount is not None or args.censor_outliers is not None:
+    if args.outcount is not None or args.censor_outliers is not None or qc:
         tr = None
         if args.outlier_polort is None:
             from fastfuncstuff.io.afni import get_tr_from_file
@@ -1240,6 +1248,7 @@ def _save_censor_outputs(args, result, series, input_file, device, verb) -> None
         frac, nvox = censor_lib.outlier_fraction_4d(
             series.float(), tr=tr, polort=args.outlier_polort, progress=verb >= 1, device=device
         )
+        computed["outfrac"] = frac
         if args.outcount is not None:
             censor_lib.write_1d(args.outcount, frac, fmt="%0.5f")
             if verb >= 1:
@@ -1257,11 +1266,63 @@ def _save_censor_outputs(args, result, series, input_file, device, verb) -> None
                     f"{int((keep == 0).sum())} of {keep.size} TRs"
                 )
 
+    if masks:
+        computed["keep"] = censor_lib.combine_censor(*masks)
     if args.censor is not None:
-        keep = censor_lib.combine_censor(*masks)
+        keep = computed["keep"]
         censor_lib.write_1d(args.censor, keep, fmt="%d")
         if verb >= 1:
             print(f"Saved censor: {args.censor} ({int((keep == 0).sum())} of {keep.size} censored)")
+    return computed
+
+
+def _qc_record(args, input_file: str):
+    """The -qc record for this run, or None. Labelled by -qc_label, else -prefix,
+    else the input name."""
+    from fastfuncstuff.qc.record import QCRecord
+
+    return QCRecord.for_args(args, "moco", args.prefix or input_file)
+
+
+def _write_moco_qc(rec, args, result, aligned, header_info, input_file, computed, device) -> None:
+    """-qc: the motion story, then the corrected series' mean, tSNR and carpet."""
+    from fastfuncstuff.qc import checks
+
+    try:
+        from fastfuncstuff.io.afni import get_tr_from_file
+
+        tr = float(get_tr_from_file(input_file)) or None
+    except Exception:
+        tr = None
+    rec.info["input"] = input_file
+    rec.info["base"] = args.base
+    checks.motion_check(
+        rec,
+        1,
+        to_afni_motion(result.params),
+        tr=tr,
+        enorm=computed.get("enorm"),
+        fd=computed.get("fd"),
+        max_displacement=result.max_displacement,
+        outlier_frac=computed.get("outfrac"),
+        keep=computed.get("keep"),
+        motion_limit=args.censor_motion,
+        motion_metric=args.censor_metric,
+        outlier_limit=args.censor_outliers,
+    )
+    if aligned is not None and aligned.ndim == 4 and aligned.shape[0] > 3:
+        affine = header_info.get("affine") if header_info else None
+        checks.epi_check(
+            rec,
+            2,
+            aligned,
+            affine,
+            tr=tr,
+            keep=computed.get("keep"),
+            motion=computed.get(args.censor_metric),
+            motion_name=args.censor_metric,
+            device=device,
+        )
 
 
 def _validate_censor_args(args) -> None:
@@ -1422,13 +1483,14 @@ def _validate_run_args(args: argparse.Namespace) -> None:
             "fd",
             "outcount",
             "censor",
+            "qc",
         )
     ) or _want_qc(args)
     if not _any_output:
         print(
             "Error: no outputs requested. Give at least one of -prefix, "
             "-save_mean, -save_max, -save_min, -1Dfile, -1Dmatrix_save, -dfile, "
-            "-maxdisp1D, -iterfile, -enorm, -fd, -outcount, -censor.",
+            "-maxdisp1D, -iterfile, -enorm, -fd, -outcount, -censor, -qc.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2298,7 +2360,13 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
 
     # Resampling is only needed if we will emit a corrected series, its mean, or a
     # corrected-series QC map (-save_initial reads the raw data only).
-    need_aligned = args.prefix is not None or _want_reductions(args) or _want_corrected_qc(args)
+    rec = _qc_record(args, input_file)
+    need_aligned = (
+        args.prefix is not None
+        or _want_reductions(args)
+        or _want_corrected_qc(args)
+        or rec is not None
+    )
     config = _build_config(
         args, device, verb, skip_resample=not need_aligned, base_index=base_index
     )
@@ -2346,7 +2414,12 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         )
 
     _save_estimation_outputs(args, result, header_info, verb)
-    _save_censor_outputs(args, result, data, input_file, device, verb)
+    computed = _save_censor_outputs(
+        args, result, data, input_file, device, verb, qc=rec is not None
+    )
+    if rec is not None:
+        _write_moco_qc(rec, args, result, result.aligned, header_info, input_file, computed, device)
+        rec.write(verb)
     _save_motsim(
         args,
         result,
@@ -2428,8 +2501,10 @@ def _run_multi_echo(
         if args.motsim is None
         else (base_vol if base_vol is not None else reg_data[base_index].clone())
     )
-    _save_censor_outputs(
-        args, result, reg_data, input_files[0 if reg_mean else reg_index], device, verb
+    rec = _qc_record(args, input_files[0])
+    qc_echo = 0 if reg_mean else reg_index
+    computed = _save_censor_outputs(
+        args, result, reg_data, input_files[qc_echo], device, verb, qc=rec is not None
     )
     del reg_data  # free the estimation series before loading echoes for resampling
 
@@ -2438,7 +2513,7 @@ def _run_multi_echo(
     want_qc = _want_qc(args)
 
     # Resample each echo with the shared matrices and write .echo-N outputs.
-    if write_series or write_reductions or want_qc:
+    if write_series or write_reductions or want_qc or rec is not None:
         # Normally the base volume is copied through verbatim to spare it an
         # interpolation. With -me_3depi it must NOT be: its own shift correction
         # is nonzero and lives in the matrix we are about to fold.
@@ -2511,6 +2586,10 @@ def _run_multi_echo(
                 base_path = entity_path(parse_prefix(args.prefix).as_file(), echo=echo_num)
                 _write_qc(args, aligned, echo, base_path, echo_hdr, verb)
 
+            if rec is not None and i == qc_echo:
+                rec.info["qc_echo"] = echo_num
+                _write_moco_qc(rec, args, result, aligned, echo_hdr, path, computed, device)
+
             if args.phase:
                 # This echo's matrices, partition shift folded in: the shift moves the
                 # complex image, so the phase must take the identical resample.
@@ -2523,6 +2602,8 @@ def _run_multi_echo(
                 torch.cuda.empty_cache()
 
     _save_estimation_outputs(args, result, header_info, verb)
+    if rec is not None:
+        rec.write(verb)
     if motsim_base is not None:
         _save_motsim(args, result, motsim_base, config, device, header_info, verb)
     if est is not None:

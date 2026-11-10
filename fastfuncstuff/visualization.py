@@ -1064,85 +1064,12 @@ def plot_noise_pool_pca_scree(
     return fig
 
 
-# Multi-planar cut geometry for the denoising PC figures, in RAS+ index order
-# (axis 0 = R, 1 = A, 2 = S), which is what `termvis.to_ras` hands back. Volumes
-# must be reoriented through the affine first: a dataset written LPI and one
-# written RAI are the same brain, and only the header says which is which -- the
-# old index-space specs drew whichever of upside-down, mirrored or rotated the
-# input happened to imply.
-#
-# Display convention is AFNI's, and matches `viz/slices.py`: radiological, so
-# subject right is on the left of the axial and coronal panels; superior is up on
-# the sagittal and coronal, anterior up on the axial and to the right on the
-# sagittal. Panels are drawn with origin="upper".
-#
-# Fields: (name, cut axis, row axis, col axis, flip rows, flip cols, left letter).
-_PLANE_SPECS = (
-    ("Sagittal", 0, 2, 1, True, False, "P"),
-    ("Coronal", 1, 2, 0, True, True, "R"),
-    ("Axial", 2, 1, 0, True, True, "R"),
-)
-
-
-def _plane_slice(
-    vol: np.ndarray, cut_ax: int, idx: int, row_ax: int, flip_rows: bool, flip_cols: bool
-) -> np.ndarray:
-    """One 2-D cut of a RAS-ordered volume, laid out for display."""
-    cut = np.take(vol, idx, axis=cut_ax)
-    # np.take drops cut_ax, so the surviving axes keep their relative order.
-    remaining = [a for a in range(3) if a != cut_ax]
-    img = cut if remaining[0] == row_ax else cut.T
-    return img[:: -1 if flip_rows else 1, :: -1 if flip_cols else 1]
-
-
-def _cut_indices(mask_vol: np.ndarray | None, cut_ax: int, n_cut: int, extent: int) -> np.ndarray:
-    """Evenly spaced cuts inside the mask's extent along `cut_ax`.
-
-    The old code hardcoded a 5-voxel inset from each end, which inverts the
-    range on a thin slab (a 12-slice slab has no interior left). Work in
-    fractions of the mask extent instead so slabs and whole brains both land
-    on interior cuts.
-    """
-    lo, hi = 0, extent - 1
-    if mask_vol is not None:
-        present = np.where(mask_vol.any(axis=tuple(a for a in range(3) if a != cut_ax)))[0]
-        if present.size:
-            lo, hi = int(present.min()), int(present.max())
-
-    span = hi - lo
-    fracs = (np.arange(n_cut) + 1.0) / (n_cut + 1.0)
-    return np.clip(np.round(lo + fracs * span).astype(int), 0, extent - 1)
-
-
-def _mask_bbox(mask_vol: np.ndarray, pad: int = 2) -> tuple[slice, slice, slice]:
-    """Tightest box containing the mask, padded by `pad` voxels per side.
-
-    Without this the montage draws the whole acquisition box, and on a slab the
-    empty surround is most of the picture.
-    """
-    box = []
-    for ax in range(3):
-        present = np.where(mask_vol.any(axis=tuple(a for a in range(3) if a != ax)))[0]
-        if present.size:
-            lo = max(0, int(present.min()) - pad)
-            hi = min(mask_vol.shape[ax], int(present.max()) + 1 + pad)
-        else:
-            lo, hi = 0, mask_vol.shape[ax]
-        box.append(slice(lo, hi))
-    return box[0], box[1], box[2]
-
-
-def _montage_2d(cuts: list[np.ndarray], pad: int = 2) -> np.ndarray:
-    """Lay cuts of one plane side by side with a NaN gutter between them."""
-    if len(cuts) == 1:
-        return cuts[0]
-    gutter = np.full((cuts[0].shape[0], pad), np.nan)
-    pieces: list[np.ndarray] = []
-    for i, cut in enumerate(cuts):
-        if i:
-            pieces.append(gutter)
-        pieces.append(cut)
-    return np.hstack(pieces)
+# Plane helpers live with the QC renderer, which draws the same montages.
+from fastfuncstuff.qc.render import PLANE_SPECS as _PLANE_SPECS  # noqa: E402
+from fastfuncstuff.qc.render import cut_indices as _cut_indices  # noqa: E402
+from fastfuncstuff.qc.render import mask_bbox as _mask_bbox  # noqa: E402
+from fastfuncstuff.qc.render import montage_2d as _montage_2d  # noqa: E402
+from fastfuncstuff.qc.render import plane_slice as _plane_slice  # noqa: E402
 
 
 def plot_denoising_pcs(
