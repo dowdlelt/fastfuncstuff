@@ -300,3 +300,18 @@ def test_curves_must_match_their_time_grid():
             np.zeros((1, 8, 3)), np.zeros((1, 8, 3)),
             (np.arange(8) * 2.0, np.arange(13) * 2.0), duration=1.0, gap=4,
         )  # fmt: skip
+
+
+def test_another_field_strength_warns_that_the_relaxation_constants_are_7t():
+    """-B0 reaches only the susceptibility frequency; R2* and r0 stay Havlicek & Uludag's
+    7 T values, so another field without its own constants is an inconsistent model."""
+    import warnings
+
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    curves = np.zeros((1, 6, 3))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4)
+    with pytest.warns(UserWarning, match="7 T values"):
+        two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4, B0=3.0)

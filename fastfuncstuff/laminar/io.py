@@ -134,6 +134,8 @@ def _times_pair(
     return one, one
 
 
+_P0_7T = P0()
+
 #: Seconds of padding the reference puts between the two conditions (20 rows at its
 #: 1.6 s). The second block is modelled on top of whatever is left of the first
 #: response, while the data there is the second response alone, so the gap must be long
@@ -350,10 +352,22 @@ def two_condition_batch(
     rows[1:block] = True
     rows[block + gap + 1 :] = True  # the rest is the second response, whatever its length
 
+    base_p0 = p0 if p0 is not None else P0()
+    if abs(B0 - 7.0) > 1e-6 and (base_p0.R2s_t, base_p0.R2s_v, base_p0.R2s_d, base_p0.r0v, base_p0.r0d) == (
+        _P0_7T.R2s_t, _P0_7T.R2s_v, _P0_7T.R2s_d, _P0_7T.r0v, _P0_7T.r0d
+    ):  # fmt: skip
+        import warnings
+
+        warnings.warn(
+            f"B0 = {B0:g} T scales only the susceptibility term of the BOLD equation; the "
+            "relaxation rates (R2s_t/v/d) and the intravascular slopes (r0v/r0d) are still "
+            "the 7 T values of Havlicek & Uludag (2020). Pass a P0 with that field's values.",
+            stacklevel=2,
+        )
     spec = ModelSpec(
         N=n_neuronal, K=k, n_inputs=2, n_mod=1, TE=TE, B0=B0, TR=tr, dtype=dtype,
         dt=_microtime_step(tr, (start_a, start_b)),
-        p0=p0 if p0 is not None else P0(),  # e.g. pipeline.reference_p0(): the driver's baselines
+        p0=base_p0,  # e.g. pipeline.reference_p0(): the driver's baselines
     )  # fmt: skip
     from fastfuncstuff.laminar.integrate import build_input
 
