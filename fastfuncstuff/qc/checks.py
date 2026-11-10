@@ -175,6 +175,29 @@ def _legendre(nt: int, degree: int, device, dtype):
     return q.to(dtype).to(device)
 
 
+_ORDER_WORDS = {
+    "pc": "sorted within each group by loading on the first principal time course (PC1)",
+    "gs": "sorted within each group by correlation with the global signal",
+    "none": "in mask order",
+}
+
+
+def _carpet_caption(order: str, extra: str) -> str:
+    return (
+        f"Rows: neighbouring voxels (detrended, z-scored) averaged, {_ORDER_WORDS[order]}; "
+        "ONE grey scale for the whole image (+/-2 robust SD), so rows whose voxels share a "
+        "fluctuation stand out against the averaged-down noise. " + extra
+    )
+
+
+def _pc1_trace(cp) -> list:
+    if cp.pc1 is None:
+        return []
+    return [
+        Trace(f"PC1 ({100 * cp.pc1_frac:.0f}% var)", cp.pc1 * np.sqrt(len(cp.pc1)), style.GREEN)
+    ]
+
+
 def epi_check(
     rec: QCRecord,
     step: int,
@@ -188,6 +211,7 @@ def epi_check(
     device=None,
     groups: Mapping[str, np.ndarray] | None = None,
     what: str = "corrected",
+    carpet_order: str = "pc",
 ) -> None:
     """Mean + tSNR montage and a carpet plot for one 4-D series.
 
@@ -248,10 +272,14 @@ def epi_check(
         for k, v in flat.items():
             gl.append((k, np.arange(pos, pos + len(v))))
             pos += len(v)
-        rows, blocks = plots.carpet_rows(ts, gl)
-        z = plots._zscore_detrended(ts)
-        u = z / np.sqrt(max(nt, 1))
-        gcor = float(np.sum(u.mean(axis=1) ** 2))
+        cp = plots.carpet_rows(ts, gl, order=carpet_order)
+        gcor = cp.gcor
+        rec.metric(
+            "pc1_frac",
+            cp.pc1_frac,
+            "",
+            "variance fraction of the first principal time course (carpet voxels)",
+        )
         rec.metric(
             "gcor",
             gcor,
@@ -259,7 +287,7 @@ def epi_check(
             "global correlation: mean correlation between all voxel pairs (AFNI GCOR)",
         )
     else:
-        rows, blocks = np.zeros((1, nt)), [("mask", 0, 1)]
+        cp = plots.Carpet(np.zeros((1, nt)), [("mask", 0, 1)], None, 0.0, float("nan"))
 
     # --- figure 1: mean + tSNR montage --------------------------------------
     ras_mean, zooms = render.ras_volume(mean, affine)
@@ -306,17 +334,19 @@ def epi_check(
     # DVARS has no value at the first volume; NaN leaves a gap rather than a fake dip.
     traces.append(Trace("DVARS (%)", np.concatenate([[np.nan], dvars[1:]]), style.ORANGE))
     traces.append(Trace("global (%)", gpct, style.AQUA))
-    body = plots.carpet(rows, blocks, traces, tr=tr, keep=keep)
-    cap = (
-        "Each row is a group of voxels (detrended, z-scored, grey = +/-2 SD); each column a "
-        "volume. Look for: vertical bands across all rows (motion, global signal changes) that "
-        "line up with the traces above; horizontal stripes (bad voxels/slices); a shell "
-        "brighter than the interior during motion."
+    traces += _pc1_trace(cp)
+    body = plots.carpet(cp.rows, cp.blocks, traces, tr=tr, keep=keep)
+    cap = _carpet_caption(
+        carpet_order,
+        "Look for: vertical bands (motion, breathing, global changes) that line up with the "
+        "traces above; with PC order, a band concentrated at the top of a group is the "
+        "structure PC1 captured. Horizontal stripes are bad voxels or slices; a shell band "
+        "brighter than the interior during motion is motion.",
     )
     img = render.compose(
         body,
         f"Carpet · {rec.label}",
-        f"{rec.tool}  ·  {what} series  ·  rows: " + ", ".join(b[0] for b in blocks),
+        f"{rec.tool}  ·  {what} series  ·  rows: " + ", ".join(b[0] for b in cp.blocks),
         [
             (f"GCOR {gcor:.3f}", None),
             (f"mean DVARS {dvars[1:].mean() if nt > 1 else 0:.2f}%", None),
@@ -1081,6 +1111,7 @@ def denoise_check(
     tr: float | None = None,
     device=None,
     extra_maps: dict | None = None,
+    carpet_order: str = "pc",
 ) -> None:
     """tSNR before and after on one scale, the removed std, and a carpet of what
     was removed.
@@ -1132,13 +1163,18 @@ def denoise_check(
     flat = np.flatnonzero(mask.reshape(-1))
     flat = flat[:: max(1, flat.size // 60000)]
     gcor = float("nan")
-    rows, blocks = np.zeros((1, nt)), [("mask", 0, 1)]
+    cp = plots.Carpet(np.zeros((1, nt)), [("mask", 0, 1)], None, 0.0, float("nan"))
     if flat.size:
         idx = torch.from_numpy(flat)
         d = (b.reshape(nt, -1)[:, idx].float() - a.reshape(nt, -1)[:, idx].float()).numpy()
-        rows, blocks = plots.carpet_rows(d, [("removed", np.arange(d.shape[1]))])
-        z = plots._zscore_detrended(d)
-        gcor = float(np.sum((z / np.sqrt(nt)).mean(axis=1) ** 2))
+        cp = plots.carpet_rows(d, [("removed", np.arange(d.shape[1]))], order=carpet_order)
+        gcor = cp.gcor
+        rec.metric(
+            "removed_pc1_frac",
+            cp.pc1_frac,
+            "",
+            "variance fraction of the removed series' first principal time course; white noise gives ~1/T",
+        )
         rec.metric(
             "removed_gcor",
             gcor,
@@ -1194,15 +1230,20 @@ def denoise_check(
     render.save_png(img, path)
     rec.add_figure(step, "tsnr", "tSNR before/after and removed noise", path)
 
-    body = plots.carpet(rows, blocks, [Trace("mean removed", gtrace, style.ORANGE)], tr=tr)
+    body = plots.carpet(
+        cp.rows, cp.blocks, [Trace("mean removed", gtrace, style.ORANGE), *_pc1_trace(cp)], tr=tr
+    )
     img = render.compose(
         body,
         f"Removed signal · {rec.label}",
         f"{rec.tool}  ·  input minus output, detrended and z-scored per voxel",
         [(f"removed GCOR {gcor:.3f}", None)],
-        "What the denoiser took out. Look for: uniform TV-static. Vertical bands (shared across "
-        "voxels), a trace that follows the task, or horizontal stripes mean structured signal "
-        "was removed along with the thermal noise.",
+        _carpet_caption(
+            carpet_order,
+            "What the denoiser took out. Look for: uniform TV-static. Vertical bands, a PC1 "
+            "that follows the task, or horizontal stripes mean structured signal was removed "
+            "along with the thermal noise.",
+        ),
     )
     path = rec.figure_path(step + 1, "removed")
     render.save_png(img, path)

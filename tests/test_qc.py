@@ -89,17 +89,34 @@ def test_panel_keeps_physical_aspect():
     assert img.size == (160, 120)
 
 
-def test_carpet_rows_blocks_and_scale():
+def test_carpet_rows_blocks_and_order():
     rng = np.random.default_rng(0)
     x = rng.standard_normal((50, 5000)).astype(np.float32) + np.linspace(0, 10, 50)[:, None]
-    rows, blocks = plots.carpet_rows(
-        x, [("a", np.arange(1000)), ("b", np.arange(1000, 5000))], max_rows=100
-    )
-    assert rows.shape == (100, 50)
-    assert blocks == [("a", 0, 20), ("b", 20, 100)]
-    # Detrended: the shared ramp is gone, every row is z-scored.
-    np.testing.assert_allclose(rows.mean(axis=1), 0, atol=1e-4)
-    np.testing.assert_allclose(rows.std(axis=1), 1, atol=1e-3)
+    cp = plots.carpet_rows(x, [("a", np.arange(1000)), ("b", np.arange(1000, 5000))], max_rows=100)
+    assert cp.rows.shape == (100, 50)
+    assert cp.blocks == [("a", 0, 20), ("b", 20, 100)]
+    with pytest.raises(ValueError):
+        plots.carpet_rows(x, [("a", np.arange(10))], order="random")
+
+
+def test_carpet_shared_structure_stands_out_and_sorts_to_the_top():
+    """A fluctuation shared by a scattered 20% of voxels must end up as rows at the
+    top of the group, louder than the pure-noise rows. Re-z-scoring each row (the
+    old scaling) made both equally loud."""
+    rng = np.random.default_rng(1)
+    n, v = 120, 6000
+    x = rng.standard_normal((n, v)).astype(np.float32)
+    shared = np.sin(np.arange(n) / 3.0).astype(np.float32)
+    carriers = rng.choice(v, v // 5, replace=False)
+    x[:, carriers] += 0.8 * shared[:, None]
+    for order in ("pc", "gs"):
+        cp = plots.carpet_rows(x, [("all", np.arange(v))], max_rows=200, order=order)
+        amp = cp.rows.std(axis=1)
+        assert amp[:30].mean() > 2 * amp[-100:].mean(), order  # 2.8x measured; unsorted 1.0x
+        assert abs(np.corrcoef(cp.rows[:30].mean(0), shared)[0, 1]) > 0.95
+    assert cp.pc1_frac > 0.05
+    unsorted = plots.carpet_rows(x, [("all", np.arange(v))], max_rows=200, order="none")
+    assert unsorted.rows.std(axis=1)[:30].mean() < 2 * unsorted.rows.std(axis=1)[-100:].mean()
 
 
 def _brain_series(nt=40, noise=0.01, seed=0):

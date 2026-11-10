@@ -186,35 +186,94 @@ def _zscore_detrended(x: np.ndarray) -> np.ndarray:
     return x / np.where(sd > 0, sd, 1.0)
 
 
+CARPET_ORDERS = ("pc", "gs", "none")
+
+
+@dataclass
+class Carpet:
+    """A carpet image and what was learned building it."""
+
+    rows: np.ndarray  # (rows, time), in units of the image's robust SD
+    blocks: list[tuple[str, int, int]]  # (label, first row, end row)
+    pc1: np.ndarray | None  # first principal time course (unit norm), or None
+    pc1_frac: float  # variance fraction PC1 explains across the voxels used
+    gcor: float  # AFNI GCOR of the same voxels
+
+
+def _first_pc(z: np.ndarray) -> tuple[np.ndarray, float]:
+    """Top time course of ``z`` (time, voxels) via the time x time Gram matrix.
+
+    The Gram route costs O(T^2 V) and a T x T eigh, where an SVD of the wide
+    matrix would cost O(T V^2)-ish memory traffic; T is hundreds, V tens of
+    thousands.
+    """
+    g = (z @ z.T).astype(np.float64)
+    w, v = np.linalg.eigh(g)
+    tr = float(np.trace(g))
+    return v[:, -1].astype(np.float32), float(w[-1] / tr) if tr > 0 else 0.0
+
+
 def carpet_rows(
     series_tv: np.ndarray,
     groups: Sequence[tuple[str, np.ndarray]],
     max_rows: int = 700,
-) -> tuple[np.ndarray, list[tuple[str, int, int]]]:
+    order: str = "pc",
+) -> Carpet:
     """Carpet rows from ``(time, voxels)`` data and named voxel groups.
 
-    Each voxel is detrended (linear + quadratic) and z-scored, or slow drift
-    dominates the grey scale and hides the bands (spikes, slice dropouts,
-    respiration) a carpet exists to show. Groups share ``max_rows`` in proportion
-    to their size; within a group, neighbouring voxels (in the given order) are
-    averaged into one row and re-z-scored, so a 100k-voxel brain draws as a few
-    hundred legible rows without dropping any voxel.
+    Each voxel is detrended (linear + quadratic) and z-scored, or slow drift and
+    bright voxels dominate. Then two choices decide whether structure is visible:
 
-    Returns the ``(rows, time)`` image and ``(label, start, stop)`` row blocks.
+    - **Order.** Within each group, voxels are sorted by their loading on the
+      first principal time course (``pc``, default) or their correlation with the
+      global mean (``gs``), so voxels that move together sit together and a shared
+      fluctuation reads as one coherent band, not scattered speckle.
+    - **Scale.** Neighbouring voxels (in that order) are averaged into rows, and
+      the WHOLE image is divided by one robust SD. Averaging shrinks independent
+      noise and keeps what the voxels share, so shared structure stands above a
+      dim noise floor. Re-z-scoring each row instead would inflate pure-noise rows
+      to the same contrast as structured ones and erase exactly that difference.
+
+    Groups share ``max_rows`` in proportion to their size.
     """
+    if order not in CARPET_ORDERS:
+        raise ValueError(f"order must be one of {CARPET_ORDERS}, got {order!r}")
     x = np.asarray(series_tv, dtype=np.float32)
-    total = sum(len(idx) for _, idx in groups)
-    out, blocks, start = [], [], 0
+    n = x.shape[0]
+    allidx = (
+        np.concatenate([np.asarray(idx, int) for _, idx in groups]) if groups else np.zeros(0, int)
+    )
+    z_all = _zscore_detrended(x[:, allidx]) if allidx.size else np.zeros((n, 0), np.float32)
+    gmean = z_all.mean(axis=1) if allidx.size else np.zeros(n, np.float32)
+    gcor = float(np.sum((gmean / np.sqrt(max(n, 1))) ** 2))
+    pc1, frac = _first_pc(z_all) if allidx.size and n > 1 else (None, 0.0)
+    if order == "pc" and pc1 is not None:
+        score = z_all.T @ pc1
+        if score.sum() < 0:  # orient so most voxels load positively: top = strongest
+            score, pc1 = -score, -pc1
+    elif order == "gs":
+        score = z_all.T @ gmean
+    else:
+        score = None
+    total = allidx.size
+    out, blocks, start, pos = [], [], 0, 0
     for label, idx in groups:
-        if len(idx) == 0:
+        k = len(idx)
+        if k == 0:
             continue
-        z = _zscore_detrended(x[:, idx])
-        n_rows = max(1, min(len(idx), round(max_rows * len(idx) / max(total, 1))))
-        bounds = np.linspace(0, len(idx), n_rows + 1).astype(int)
-        rows = np.add.reduceat(z, bounds[:-1], axis=1) / np.diff(bounds)
-        sd = rows.std(axis=0)
-        rows = (rows - rows.mean(axis=0)) / np.where(sd > 0, sd, 1.0)
-        out.append(rows.T)
+        z = z_all[:, pos : pos + k]
+        if score is not None:
+            z = z[:, np.argsort(-score[pos : pos + k], kind="stable")]
+        pos += k
+        n_rows = max(1, min(k, round(max_rows * k / max(total, 1))))
+        bounds = np.linspace(0, k, n_rows + 1).astype(int)
+        out.append((np.add.reduceat(z, bounds[:-1], axis=1) / np.diff(bounds)).T)
         blocks.append((label, start, start + n_rows))
         start += n_rows
-    return np.concatenate(out, axis=0), blocks
+    if not out:
+        return Carpet(np.zeros((1, n), np.float32), [("empty", 0, 1)], None, 0.0, float("nan"))
+    rows = np.concatenate(out, axis=0)
+    rows = rows - np.median(rows, axis=1, keepdims=True)
+    scale = 1.4826 * float(np.median(np.abs(rows)))
+    rows = rows / (scale if scale > 0 else 1.0)
+    return Carpet(rows, blocks, pc1, frac, gcor)
