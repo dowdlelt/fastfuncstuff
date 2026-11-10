@@ -127,7 +127,8 @@ def panel_fit(ax, fit: RoiFit, conditions: tuple[str, str]) -> None:
 
 def _era(fit: RoiFit, which: int) -> tuple[np.ndarray, slice]:
     sl = _blocks(fit)[which]
-    return np.arange(sl.stop - sl.start) * float(fit.meta["TR"]), sl
+    t0 = float(fit.meta.get("start", (0.0, 0.0))[which])
+    return t0 + np.arange(sl.stop - sl.start) * float(fit.meta["TR"]), sl
 
 
 def panel_measured(ax, fit: RoiFit, conditions: tuple[str, str]) -> None:
