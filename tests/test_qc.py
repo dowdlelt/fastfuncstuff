@@ -344,3 +344,25 @@ def test_blipflip_cli_writes_distortion_qc(tmp_path):
     assert {f["check"] for f in rec["figures"]} == {"pair", "field"}
     with Image.open(qc / rec["figures"][0]["file"]) as im:
         assert im.n_frames == 2
+
+
+def test_nordic_cli_writes_denoise_qc(tmp_path):
+    """ffs_nordic -qc: tSNR goes up, a fraction of variance is removed, and both the
+    tSNR montage (with the g-factor row) and the removed-signal carpet exist."""
+    from fastfuncstuff.cli.nordic import main
+    from tests.test_nordic import _planted_task_run
+
+    magn_file, _ = _planted_task_run(tmp_path, amp=0.0)
+    qc = tmp_path / "qc"
+    # fmt: off
+    main([
+        "-input-magn", str(magn_file), "-prefix", str(tmp_path / "NORD"), "-magnitude-only",
+        "-kernel-size-pca", "3", "3", "3", "-kernel-size-gfactor", "3", "3", "1",
+        "-gfactor-nvols", "8", "-device", "cpu", "-qc", str(qc),
+    ])
+    # fmt: on
+    (rec,) = load_records(qc)
+    m = rec["metrics"]
+    assert m["tsnr_median_after"]["value"] > m["tsnr_median_before"]["value"]
+    assert 0 < m["removed_var_frac"]["value"] < 1
+    assert {f["check"] for f in rec["figures"]} == {"tsnr", "removed"}

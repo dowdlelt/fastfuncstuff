@@ -264,8 +264,9 @@ def montage(
         total = sum(p.width for p in panels) + gutter * (len(panels) - 1)
         scale = avail / max(total, 1)
         h = max(1, round(panels[0].height * scale))
+        # floor, not round: rounding every panel up can push a row past the canvas edge.
         ps = [
-            p.resize((max(1, round(p.width * scale)), h), Image.Resampling.BILINEAR) for p in panels
+            p.resize((max(1, int(p.width * scale)), h), Image.Resampling.BILINEAR) for p in panels
         ]
         scaled.append((label, ps, h))
     height = sum(h for _, _, h in scaled) + gutter * (len(scaled) + 1)

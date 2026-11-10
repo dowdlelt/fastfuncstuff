@@ -4280,3 +4280,9 @@ def test_qc_folder_wired_into_blipflip():
     assert re.search(r'-qc qc -qc_label \\"stage04\.blip\.[^"]+\\"', s), (
         "blipflip manifest lacks -qc"
     )
+
+
+def test_qc_folder_wired_into_nordic():
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root="/bids")
+    assert '-qc qc -qc_label "stage00.nordic.${FRAG[$k]}${esfx}"' in s

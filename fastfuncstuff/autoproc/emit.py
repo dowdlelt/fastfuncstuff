@@ -1828,6 +1828,11 @@ def _stage_nordic(plan: Plan) -> str:
             '-prefix "$outf"',
             '-noise-volume-last "${NOISE[$k]}"',
             *_split_flags(config.DEFAULT_OPTS["nordic"]),
+            *(
+                [f'-qc {QC_DIR} -qc_label "stage00.nordic.${{FRAG[$k]}}${{esfx}}"']
+                if _qc_on(plan)
+                else []
+            ),
             resid,
             numcomps,
             # The task QC is a diagnostic: NORDIC decides what to discard from a

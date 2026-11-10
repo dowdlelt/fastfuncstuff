@@ -1064,3 +1064,146 @@ def distortion_check(
     path = rec.figure_path(step + 1, "field")
     render.save_png(img, path)
     rec.add_figure(step + 1, "field", "Field map", path)
+
+
+# ---------------------------------------------------------------------------
+# Denoising: what came out should look like noise
+# ---------------------------------------------------------------------------
+
+
+def denoise_check(
+    rec: QCRecord,
+    step: int,
+    before,
+    after,
+    affine,
+    *,
+    tr: float | None = None,
+    device=None,
+    extra_maps: dict | None = None,
+) -> None:
+    """tSNR before and after on one scale, the removed std, and a carpet of what
+    was removed.
+
+    ``before`` / ``after`` are ``(t, z, y, x)`` on one grid. The removed series
+    (before - after) is formed one slice at a time, so no third copy of the run
+    exists. A denoiser that works removes something spatially flat and temporally
+    white; structure in the removed carpet (bands, a response that follows the
+    task) is signal lost. ``extra_maps`` adds rows (e.g. NORDIC's g-factor).
+    """
+    import torch
+
+    from fastfuncstuff.processing.mask import automask
+
+    b = before if isinstance(before, torch.Tensor) else torch.from_numpy(np.asarray(before))
+    a = after if isinstance(after, torch.Tensor) else torch.from_numpy(np.asarray(after))
+    nt = min(b.shape[0], a.shape[0])
+    b, a = b[:nt], a[:nt]
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    mean_b, std_b = _slice_moments(b, dev)
+    mean_a, std_a = _slice_moments(a, dev)
+    mask_t = automask(mean_b, device=torch.device("cpu")).cpu().bool()
+    mask = mask_t.numpy()
+    nz = b.shape[1]
+    rem_sd = torch.zeros_like(mean_b)
+    for z in range(nz):
+        d = (b[:, z].to(dev).float() - a[:, z].to(dev).float()).reshape(nt, -1)
+        rem_sd[z] = d.std(0).reshape(rem_sd.shape[1:]).cpu()
+    tb = torch.where(std_b > 0, mean_b / std_b, 0).numpy()
+    ta = torch.where(std_a > 0, mean_a / std_a, 0).numpy()
+    tb, ta = np.where(mask, tb, 0), np.where(mask, ta, 0)
+    rem = np.where(mask, rem_sd.numpy(), 0)
+    med_b = float(np.median(tb[mask])) if mask.any() else float("nan")
+    med_a = float(np.median(ta[mask])) if mask.any() else float("nan")
+    rec.metric("tsnr_median_before", med_b, "", "median detrended tSNR before denoising")
+    rec.metric("tsnr_median_after", med_a, "", "median detrended tSNR after denoising")
+    rec.metric("tsnr_gain", med_a / med_b if med_b > 0 else float("nan"), "x", "after / before")
+    sdb = std_b.numpy()
+    frac = (
+        float(np.median((rem[mask] / np.maximum(sdb[mask], 1e-12)) ** 2))
+        if mask.any()
+        else float("nan")
+    )
+    rec.metric(
+        "removed_var_frac", frac, "", "median fraction of each voxel's temporal variance removed"
+    )
+
+    # Removed-series carpet + GCOR: correlated removal is structure, not noise.
+    flat = np.flatnonzero(mask.reshape(-1))
+    flat = flat[:: max(1, flat.size // 60000)]
+    gcor = float("nan")
+    rows, blocks = np.zeros((1, nt)), [("mask", 0, 1)]
+    if flat.size:
+        idx = torch.from_numpy(flat)
+        d = (b.reshape(nt, -1)[:, idx].float() - a.reshape(nt, -1)[:, idx].float()).numpy()
+        rows, blocks = plots.carpet_rows(d, [("removed", np.arange(d.shape[1]))])
+        z = plots._zscore_detrended(d)
+        gcor = float(np.sum((z / np.sqrt(nt)).mean(axis=1) ** 2))
+        rec.metric(
+            "removed_gcor",
+            gcor,
+            "",
+            "GCOR of the removed series: ~0 for white noise, higher when the removal is structured",
+        )
+        gtrace = d.mean(axis=1)
+    else:
+        gtrace = np.zeros(nt)
+
+    ras_b, zooms = render.ras_volume(tb, affine)
+    ras_a, _ = render.ras_volume(ta, affine)
+    ras_r, _ = render.ras_volume(rem, affine)
+    ras_m, _ = render.ras_volume(mask.astype(np.float32), affine)
+    grid = render.Grid(ras_b, zooms, ras_m > 0.5, n_cut=7)
+    # Before and after share ONE scale: here the change is the point.
+    t_hi = float(np.percentile(ras_a[ras_m > 0.5], 99)) if (ras_m > 0.5).any() else 1.0
+    r_hi = float(np.percentile(ras_r[ras_m > 0.5], 99)) if (ras_m > 0.5).any() else 1.0
+    extra = {k: render.ras_volume(_arr(v), affine)[0] for k, v in (extra_maps or {}).items()}
+    rows_img, letters = [], []
+    for plane in ("axial", "coronal"):
+        asp = grid.aspect(plane)
+        for name, vol, lo, hi, cmap in (
+            ("tSNR before", ras_b, 0, t_hi, "inferno"),
+            ("tSNR after", ras_a, 0, t_hi, "inferno"),
+            ("removed SD", ras_r, 0, r_hi, "gray"),
+            *((k, v, *render.window(v, ras_m > 0.5), "viridis") for k, v in extra.items()),
+        ):
+            rows_img.append(
+                (
+                    f"{name}\n{plane}",
+                    [
+                        render.panel(render.colorize(s, lo, hi, cmap), asp, 200)
+                        for s in grid.slices(vol, plane)
+                    ],
+                )
+            )
+            letters.append(grid.side_letter(plane))
+    body = render.montage(rows_img, side_letters=letters)
+    img = render.compose(
+        body,
+        f"Denoising · {rec.label}",
+        f"{rec.tool}  ·  tSNR rows share one scale (0 to {t_hi:.0f})",
+        [
+            (f"tSNR {med_b:.1f} → {med_a:.1f}", None),
+            (f"removed {100 * frac:.0f}% of variance", None),
+        ],
+        "Look for: tSNR after brighter everywhere and the removed SD flat across the brain, "
+        "highest where g-factor (coil geometry) is worst. Anatomy, vessels or activation visible "
+        "in the removed SD means signal was taken out with the noise.",
+    )
+    path = rec.figure_path(step, "tsnr")
+    render.save_png(img, path)
+    rec.add_figure(step, "tsnr", "tSNR before/after and removed noise", path)
+
+    body = plots.carpet(rows, blocks, [Trace("mean removed", gtrace, style.ORANGE)], tr=tr)
+    img = render.compose(
+        body,
+        f"Removed signal · {rec.label}",
+        f"{rec.tool}  ·  input minus output, detrended and z-scored per voxel",
+        [(f"removed GCOR {gcor:.3f}", None)],
+        "What the denoiser took out. Look for: uniform TV-static. Vertical bands (shared across "
+        "voxels), a trace that follows the task, or horizontal stripes mean structured signal "
+        "was removed along with the thermal noise.",
+    )
+    path = rec.figure_path(step + 1, "removed")
+    render.save_png(img, path)
+    rec.add_figure(step + 1, "removed", "Removed signal carpet", path)

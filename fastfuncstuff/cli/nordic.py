@@ -451,6 +451,9 @@ Examples:
     )
 
     perf_group = parser.add_argument_group("Performance")
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
     add_device_arg(
         perf_group,
         extra="MPS supports Gram-eigh patches; direct complex SVD falls back to CPU.",
@@ -1146,6 +1149,39 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
     }
 
 
+def _write_denoise_qc(args, magn_file, outputs, prefix: str, device) -> None:
+    """-qc: tSNR before/after, the removed SD (beside the g-factor) and a carpet of
+    what was removed. Echo 1 only for multi-echo: the echoes share the patches.
+
+    Reads both series back from disk -- two copies of the run, which the denoise
+    itself already exceeded -- so the QC sees exactly what was written.
+    """
+    from fastfuncstuff.processing.io import load_image
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import QCRecord
+
+    rec = QCRecord.for_args(args, "nordic", prefix)
+    if rec is None:
+        return
+    before, hdr = load_image(magn_file)
+    after, _ = load_image(outputs.magnitude_file)
+    extra = {}
+    if outputs.gfactor_file is not None:
+        g, _ = load_image(outputs.gfactor_file)
+        extra["g-factor"] = g if g.ndim == 3 else g[0]
+    rec.info["input"] = str(magn_file)
+    try:
+        from fastfuncstuff.io.afni import get_tr_from_file
+
+        tr = float(get_tr_from_file(str(magn_file))) or None
+    except Exception:
+        tr = None
+    checks.denoise_check(
+        rec, 1, before, after, hdr["affine"], tr=tr, device=device, extra_maps=extra
+    )
+    rec.write(getattr(args, "verb", 1))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     check_bids_event_args(args)
@@ -1328,6 +1364,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         ]
     elapsed = time.time() - t0
+    _write_denoise_qc(args, magn_files[0], all_outputs[0], prefix, device)
 
     if task_stage:
         print_cli_section("Task-leak diagnostic")
