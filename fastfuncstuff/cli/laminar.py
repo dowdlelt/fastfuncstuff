@@ -291,8 +291,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "neuronal time constant) held fixed and only its drive at each depth "
                    "free.  Writes {prefix}_laminar_transfer.tsv: a drive per depth for each "
                    "condition and their difference.  For conditions that are not the same "
-                   "input at a different gain; see TRANSFER below.  Put the condition with "
-                   "more signal first.")  # fmt: skip
+                   "input at a different gain; see TRANSFER below.  The first condition is the "
+                   "reference, as in the default analysis: here it also has to carry the "
+                   "physiology estimate, so it should be the well-driven one.")  # fmt: skip
     m.add_argument("-free_energy", choices=("reference", "sum", "mean"), default="reference",
                    help="Which F an averaged model carries: 'reference' is the first K's, as "
                    "spm_dcm_bpa leaves it; 'sum'/'mean' accumulate over K.")  # fmt: skip
