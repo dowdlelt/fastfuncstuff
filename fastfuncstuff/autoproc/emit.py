@@ -5650,8 +5650,40 @@ def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[st
             if _qc_on(plan) and _own_anat(opt)
             else []
         ),
+        *_qc_tissue_flags(plan),
         *_reml_shared(opt, task),
     ]
+
+
+# One carpet band per tissue, not per aseg structure: cortex, cerebellar and
+# subcortical grey are all GM, the two CSF classes are CSF, and the skull class
+# is no part of a brain-masked fit.
+FS_TPM_QC_NAMES = ("GM", "GM", "WM", "WM", "GM", "CSF", "CSF", "-")
+
+
+def _qc_tissue_flags(plan: Plan) -> list[str]:
+    """``-qc_tissue`` for stage12: the subject TPM this pipeline built on the anat,
+    so the model carpet's bands are tissue classes instead of shell / interior.
+
+    Only when the final grid IS the anat's space (not MNI, not a borrowed
+    reference) and the TPM is one built here, whose class order is known: a
+    user's -tpm may be any class set on any grid, and a band labelled "GM" that
+    is something else is worse than a band labelled "shell". ffs_reml falls
+    back to shell / interior by itself when the file is not there.
+    """
+    opt = plan.options
+    if not (_qc_on(plan) and _own_anat(opt)) or opt.do_mni:
+        return []
+    if opt.fs_tpm:
+        names = " ".join(FS_TPM_QC_NAMES)
+        return [
+            '-qc_tissue "tpm_work/sub_specific_fsTPM.nii.gz"',
+            f"-qc_tissue_names {names}",
+        ]
+    if opt.anat_tpm:
+        # SPM's order, which is ffs_reml's default naming (GM WM CSF, rest unused).
+        return [f'-qc_tissue "{_anat_tpm_file()}"']
+    return []
 
 
 def _phasereg_glm(

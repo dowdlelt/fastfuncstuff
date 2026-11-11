@@ -4257,6 +4257,28 @@ def test_xrun_method_moco_stacks_each_anchors_runs_into_one_call():
         assert subprocess.run(["bash", "-n"], input=s, text=True).returncode == 0
 
 
+def test_glm_qc_gets_the_tissue_classes_this_pipeline_built():
+    """The model carpet is banded by tissue only from a TPM autoproc made itself, on
+    the anat, with the final grid in the anat's space. MNI output or a TPM of
+    unknown class order keeps shell / interior rather than mislabelling a band."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
+
+    def glm(**kw):
+        s = write_script(build_plan(subj, Options(**kw)), "wd", bids_root="/bids")
+        assert "stats-reml.task-foo" in s
+        return s
+
+    fs = glm(anat_nonlin=True, fs_tpm=True, tpm="tpm_work/sub_specific_fsTPM.nii.gz")
+    assert '-qc_tissue "tpm_work/sub_specific_fsTPM.nii.gz"' in fs
+    assert "-qc_tissue_names GM GM WM WM GM CSF CSF -" in fs  # aseg's 8 classes -> 3 bands
+    spm = glm(anat_nonlin=True, anat_tpm=True)
+    assert '-qc_tissue "tpm_work/sub_specific_anatTPM.nii.gz"' in spm
+    assert "-qc_tissue_names" not in spm  # SPM order is ffs_reml's default
+    assert "-qc_tissue" not in glm(anat_nonlin=True, tpm="mine.nii.gz")
+    assert "-qc_tissue" not in glm(anat_nonlin=True, anat_tpm=True, do_mni=True)
+    assert "-qc_tissue" not in glm(anat_nonlin=True, anat_tpm=True, qc=False)
+
+
 def test_qc_folder_wired_into_moco_and_report():
     """-qc: every moco job writes into qc/ under its run fragment, and the script
     ends by stitching the folder; -no_qc drops both."""
@@ -4265,8 +4287,9 @@ def test_qc_folder_wired_into_moco_and_report():
     assert '-qc qc -qc_label \\"${FRAG[$k]}\\"' in s
     assert s.index("stage02: moco") < s.index("ffs_qc_report qc")
     assert "-qc qc -qc_label anat" in s  # the EPI <-> anat alignment edges
-    assert 'ffs_qc_stack -qc qc "${have[@]}"' in s  # every QC stack -> ranking + flicker
+    assert 'ffs_qc_stack -qc qc "${have[@]}"' in s  # every QC stack -> a flicker
     assert '-qc qc -qc_label "stage12.task-foo"' in s  # the GLM design + F map
+    assert "-qc_tissue" not in s  # no TPM built here: the carpet stays shell / interior
     opts = Options()
     opts.qc = False
     s2 = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
