@@ -11,6 +11,7 @@ table (``ffs_qc_table``) flags robust outliers among comparable runs instead.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 
 import numpy as np
@@ -109,6 +110,15 @@ def motion_check(
         )
         if of[0] > PRE_STEADY_LIMIT:
             stats.append(("pre-steady-state vol 0", "warn"))
+
+    for name, trace in (("enorm", enorm), ("fd", fd)):
+        if trace is not None:
+            rec.add_series(name, np.asarray(trace, float))
+    if keep is not None:
+        rec.add_series("keep", np.asarray(keep))
+    if motion_limit is not None:
+        rec.info["motion_limit"] = motion_limit
+        rec.info["motion_metric"] = motion_metric
 
     roll, pitch, yaw = (p[:, i] for i in range(3))
     d_s, d_l, d_p = (p[:, i] for i in range(3, 6))
@@ -296,35 +306,30 @@ def epi_check(
     ras_mask = ras_mask > 0.5
     grid = render.Grid(ras_mean, zooms, ras_mask, n_cut=7)
     lo, hi = render.window(ras_mean, ras_mask)
-    t_hi = float(np.percentile(ras_tsnr[ras_mask], 99)) if ras_mask.any() else 1.0
-    rows_img, letters = [], []
-    for plane in ("axial", "coronal", "sagittal"):
-        asp = grid.aspect(plane)
-        mean_panels = [
-            render.panel(render.colorize(s, lo, hi), asp, 220) for s in grid.slices(ras_mean, plane)
-        ]
-        tsnr_panels = [
-            render.panel(render.colorize(s, 0, t_hi, "inferno"), asp, 220)
-            for s in grid.slices(ras_tsnr, plane)
-        ]
-        rows_img += [(f"mean\n{plane}", mean_panels), (f"tSNR\n{plane}", tsnr_panels)]
-        letters += [grid.side_letter(plane)] * 2
-    body = render.montage(rows_img, side_letters=letters)
-    cap = (
-        f"tSNR = mean / detrended temporal std, scaled 0 to {t_hi:.0f} (99th percentile). "
-        "Look for: tSNR highest in cortex and falling off smoothly toward the centre; dark "
-        "bands or stripes along slices (slice dropout, multiband leakage), signal loss near "
-        "sinuses, or bright rims at the brain edge (motion)."
-    )
-    img = render.compose(
-        body,
-        f"Mean & tSNR · {rec.label}",
-        f"{rec.tool}  ·  {what} series  ·  {nvox:,} automask voxels",
-        [(f"median tSNR {med_tsnr:.1f}", None)],
-        cap,
-    )
-    path = rec.figure_path(step, "tsnr")
-    render.save_png(img, path)
+    t_p99 = float(np.percentile(ras_tsnr[ras_mask], 99)) if ras_mask.any() else 1.0
+    planes: dict[str, np.ndarray] = {}
+    for plane in TSNR_PLANES:
+        # The mean is stored already windowed (uint8): it is only ever drawn grey.
+        m = [render.colorize(s_, lo, hi)[..., 0] for s_ in grid.slices(ras_mean, plane)]
+        planes[f"{plane}_mean"] = np.stack(m)
+        planes[f"{plane}_tsnr"] = np.stack(grid.slices(ras_tsnr, plane)).astype(np.float16)
+        planes[f"{plane}_aspect"] = np.asarray(grid.aspect(plane))
+    meta = {
+        "label": rec.label,
+        "tool": rec.tool,
+        "what": what,
+        "nvox": nvox,
+        "med_tsnr": med_tsnr,
+        "t_p99": t_p99,
+        "file": rec.figure_path(step, "tsnr").name,
+        "letters": {p_: grid.side_letter(p_) for p_ in TSNR_PLANES},
+    }
+    # A sidecar with exactly what the figure is drawn from, so ffs_qc_report can
+    # redraw every run's tSNR on ONE scale once all runs exist (no run knows the
+    # others' range when it is written).
+    np.savez_compressed(rec.sidecar_path("tsnr"), meta=json.dumps(meta), **planes)
+    path = rec.qc_dir / meta["file"]
+    render.save_png(tsnr_figure(meta, planes, t_p99), path)
     rec.add_figure(step, "tsnr", "Mean and tSNR", path)
 
     # --- figure 2: carpet -----------------------------------------------------
@@ -356,6 +361,59 @@ def epi_check(
     path = rec.figure_path(step + 1, "carpet")
     render.save_png(img, path)
     rec.add_figure(step + 1, "carpet", "Carpet plot", path)
+
+
+TSNR_PLANES = ("axial", "coronal", "sagittal")
+
+
+def tsnr_figure(meta: dict, planes: Mapping[str, np.ndarray], t_hi: float, shared: str = ""):
+    """The mean + tSNR montage of one run, tSNR drawn 0..``t_hi``, with its colour bar.
+
+    ``shared`` names the runs the scale is shared with; empty means the run's own
+    99th percentile.
+    """
+    rows_img, letters = [], []
+    for plane in TSNR_PLANES:
+        asp = tuple(float(a) for a in planes[f"{plane}_aspect"])
+        mean_panels = [
+            render.panel(np.repeat(m[..., None], 3, axis=2), asp, 220)
+            for m in planes[f"{plane}_mean"]
+        ]
+        tsnr_panels = [
+            render.panel(render.colorize(t.astype(np.float32), 0, t_hi, "inferno"), asp, 220)
+            for t in planes[f"{plane}_tsnr"]
+        ]
+        rows_img += [(f"mean\n{plane}", mean_panels), (f"tSNR\n{plane}", tsnr_panels)]
+        letters += [meta["letters"][plane]] * 2
+    scale = shared or f"this run's 99th percentile ({meta['t_p99']:.0f})"
+    bar = render.colorbar(
+        render.lut("inferno"),
+        0.0,
+        t_hi,
+        "tSNR",
+        ticks=np.linspace(0, t_hi, 5),
+        fmt="{:.0f}",
+        note=f"0 to {t_hi:.0f}: {scale}",
+    )
+    body = render.vstack([render.montage(rows_img, side_letters=letters), bar])
+    look = (
+        "Shared scale: a run darker than its neighbours has lower tSNR, one brighter has higher. "
+        if shared
+        else ""
+    )
+    cap = (
+        f"tSNR = mean / detrended temporal std, scaled 0 to {t_hi:.0f} ({scale}). {look}"
+        "Look for: tSNR highest in cortex and falling off smoothly toward the centre; dark "
+        "bands or stripes along slices (slice dropout, multiband leakage), signal loss near "
+        "sinuses, or bright rims at the brain edge (motion)."
+    )
+    return render.compose(
+        body,
+        f"Mean & tSNR · {meta['label']}",
+        f"{meta['tool']}  ·  {meta['what']} series  ·  {meta['nvox']:,} automask voxels",
+        [(f"median tSNR {meta['med_tsnr']:.1f}", None)],
+        cap,
+    )
 
 
 def _slice_moments(x, dev) -> tuple:

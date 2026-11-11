@@ -183,14 +183,74 @@ def lut(name: str) -> np.ndarray:
     return (cmap(np.linspace(0, 1, 256))[:, :3] * 255).round().astype(np.uint8)
 
 
-def colorize(img: np.ndarray, lo: float, hi: float, cmap: str = "gray") -> np.ndarray:
-    """Window + colour table -> (H, W, 3) uint8. NaN draws as the surface colour."""
+def ramp_lut(*stops: str) -> np.ndarray:
+    """A 256x3 table running linearly through hex colour stops."""
+    cols = np.array([style.hex_rgb(c) for c in stops], dtype=np.float64)
+    pos = np.linspace(0, 1, len(stops))
+    t = np.linspace(0, 1, 256)
+    return np.stack([np.interp(t, pos, cols[:, k]) for k in range(3)], 1).round().astype(np.uint8)
+
+
+# Overlay tables for statistics drawn on a grey anatomy. Every entry is a saturated
+# colour, including the one at the threshold: a map that starts at black (inferno,
+# hot) loses its weakest suprathreshold voxels into the anatomy. Positive runs
+# red -> yellow and negative blue -> cyan, the AFNI/FSL convention, so sign reads
+# from hue and size from brightness.
+POS_LUT = ramp_lut("#c81e1e", "#ff7a00", "#ffff3c")
+NEG_LUT = ramp_lut("#1e3cff", "#0096ff", "#3cffff")
+
+
+def diverging_overlay_lut() -> np.ndarray:
+    """-max ... 0 ... +max: cyan -> blue | red -> yellow (a step in hue at zero)."""
+    return np.concatenate([NEG_LUT[::-1][::2], POS_LUT[::2]], axis=0)
+
+
+def colorize(
+    img: np.ndarray, lo: float, hi: float, cmap: str = "gray", table: np.ndarray | None = None
+) -> np.ndarray:
+    """Window + colour table -> (H, W, 3) uint8. NaN draws as the surface colour.
+
+    ``table`` (256x3 uint8) overrides the named ``cmap``."""
     finite = np.isfinite(img)
     t = np.clip((np.where(finite, img, lo) - lo) / (hi - lo), 0, 1)
-    rgb = lut(cmap)[(t * 255).astype(np.uint8)]
+    rgb = (lut(cmap) if table is None else table)[(t * 255).astype(np.uint8)]
     if not finite.all():
         rgb[~finite] = style.hex_rgb(style.SURFACE)
     return rgb
+
+
+def overlay(
+    under_rgb: np.ndarray, stat: np.ndarray, show: np.ndarray, lo: float, hi: float, table
+) -> np.ndarray:
+    """Paint ``stat`` (windowed lo..hi through ``table``) opaquely where ``show``."""
+    out = under_rgb.copy()
+    if show.any():
+        out[show] = colorize(stat, lo, hi, table=table)[show]
+    return out
+
+
+def resample_like(src_zyx: np.ndarray, src_aff, dst_shape_zyx, dst_aff, order: int = 1):
+    """``src`` (z, y, x) resampled onto another grid through both affines (world mm).
+
+    For QC overlays only: a stat map on the EPI grid drawn on an anatomy at its own
+    resolution. Outside the source FOV is 0.
+    """
+    from scipy.ndimage import affine_transform
+
+    a_src = np.asarray(src_aff, float)
+    a_dst = np.asarray(dst_aff, float)
+    m = np.linalg.inv(a_src) @ a_dst  # dst voxel (i, j, k) -> src voxel
+    src = np.ascontiguousarray(np.asarray(src_zyx, np.float32).transpose(2, 1, 0))
+    out = affine_transform(
+        src,
+        m[:3, :3],
+        offset=m[:3, 3],
+        output_shape=tuple(int(n) for n in reversed(tuple(dst_shape_zyx))),
+        order=order,
+        mode="constant",
+        cval=0.0,
+    )
+    return np.ascontiguousarray(out.transpose(2, 1, 0))
 
 
 def blend(base: np.ndarray, over: np.ndarray, alpha: np.ndarray | float) -> np.ndarray:
@@ -292,6 +352,66 @@ def montage(
         if side_letters is not None and side_letters[r]:
             _text(draw, (label_w + 4, y + 4), side_letters[r], 12, style.MUTED)
         y += h + gutter
+    return canvas
+
+
+def vstack(images: Sequence, width: int = style.WIDTH):
+    """Stack PIL images top to bottom on the surface colour, left-aligned."""
+    from PIL import Image
+
+    h = sum(im.height for im in images)
+    canvas = Image.new("RGB", (width, h), style.SURFACE)
+    y = 0
+    for im in images:
+        canvas.paste(im, (0, y))
+        y += im.height
+    return canvas
+
+
+def colorbar(
+    table: np.ndarray,
+    lo: float,
+    hi: float,
+    label: str,
+    *,
+    ticks: Sequence[float] | None = None,
+    marks: Sequence[tuple[float, str]] = (),
+    note: str = "",
+    width: int = style.WIDTH,
+    x0: int = 120,
+    bar_w: int = 560,
+    fmt: str = "{:g}",
+):
+    """A horizontal colour bar strip to sit under a montage.
+
+    ``label`` is a short name (it sits in the row-label gutter), ``marks`` are
+    labelled lines on the bar (a threshold), ``note`` is free text to the right of
+    it (what is hidden, what the scale is shared with).
+    """
+    from PIL import Image, ImageDraw
+
+    h, bar_h, top = 66, 14, 24
+    canvas = Image.new("RGB", (width, h), style.SURFACE)
+    draw = ImageDraw.Draw(canvas)
+    # The label sits in the montage's row-label gutter, so marks above the bar are free.
+    _text(draw, (16, top - 1), label, 13, style.INK, bold=True)
+    grad = np.asarray(table)[np.linspace(0, 255, bar_w).astype(int)]
+    canvas.paste(to_image(np.repeat(grad[None], bar_h, axis=0)), (x0, top))
+    draw.rectangle((x0 - 1, top - 1, x0 + bar_w, top + bar_h), outline=style.GRID)
+
+    def xpos(v: float) -> int:
+        return x0 + round((v - lo) / (hi - lo if hi != lo else 1.0) * (bar_w - 1))
+
+    for v in ticks if ticks is not None else (lo, hi):
+        x = xpos(v)
+        draw.line((x, top + bar_h, x, top + bar_h + 4), fill=style.MUTED)
+        _text(draw, (x, top + bar_h + 6), fmt.format(v), 11, style.MUTED, anchor="ma")
+    for v, txt in marks:
+        x = xpos(v)
+        draw.line((x, top - 4, x, top + bar_h + 3), fill=style.INK, width=2)
+        _text(draw, (x + 4, top - 2), txt, 11, style.INK, anchor="lb")
+    if note:
+        _text(draw, (x0 + bar_w + 28, top - 1), note, 12, style.INK2)
     return canvas
 
 

@@ -277,3 +277,127 @@ def carpet_rows(
     scale = 1.4826 * float(np.median(np.abs(rows)))
     rows = rows / (scale if scale > 0 else 1.0)
     return Carpet(rows, blocks, pc1, frac, gcor)
+
+
+def _kde(v: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Gaussian KDE at Silverman's bandwidth (numpy only; a few hundred points)."""
+    v = v[np.isfinite(v)]
+    if v.size < 2 or np.ptp(v) == 0:
+        return np.zeros_like(grid)
+    iqr = np.subtract(*np.percentile(v, [75, 25]))
+    sd = min(v.std(), iqr / 1.349) if iqr > 0 else v.std()
+    bw = 0.9 * sd * v.size ** (-0.2) or 1e-3
+    d = (grid[:, None] - v[None, :]) / bw
+    return np.exp(-0.5 * d * d).sum(axis=1) / (v.size * bw * np.sqrt(2 * np.pi))
+
+
+@dataclass
+class RunValues:
+    """One run's per-TR values for :func:`raincloud`."""
+
+    label: str
+    values: np.ndarray
+    censored: np.ndarray | None = None  # boolean, True = censored TR
+
+
+def raincloud(
+    panels: Sequence[tuple[str, Sequence[RunValues], float | None]],
+    width_px: int = style.WIDTH,
+    seed: int = 0,
+):
+    """Per-run distributions side by side on ONE y scale: half violin, box, points.
+
+    ``panels`` is ``[(ylabel, runs, limit)]``, one row per measure. The y range is
+    shared by every run in a panel so a run that moved more stands out; the top is
+    the pooled 99.5th percentile (a single huge spike would otherwise flatten every
+    other run into the floor), and values above it are drawn as triangles on the
+    top edge with their count.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+
+    rng = np.random.default_rng(seed)
+    n_runs = max(len(runs) for _, runs, _ in panels)
+    panel_h = 3.0
+    with style.mpl_style():
+        fig = Figure(figsize=(width_px / DPI, panel_h * len(panels) + 0.9), dpi=DPI)
+        axes = fig.subplots(len(panels), 1, squeeze=False)[:, 0]
+        for ax, (ylabel, runs, limit) in zip(axes, panels, strict=True):
+            pooled = np.concatenate([r.values[np.isfinite(r.values)] for r in runs] or [[0.0]])
+            top = float(np.percentile(pooled, 99.5)) if pooled.size else 1.0
+            if limit is not None:
+                top = max(top, 1.15 * limit)
+            top = top * 1.08 if top > 0 else 1.0
+            grid = np.linspace(0, top, 200)
+            for i, r in enumerate(runs):
+                v = np.asarray(r.values, float)
+                fin = np.isfinite(v)
+                dens = _kde(np.minimum(v[fin], top), grid)
+                if dens.max() > 0:
+                    dens = 0.36 * dens / dens.max()
+                    ax.fill_betweenx(
+                        grid, i - 0.06 - dens, i - 0.06, color=style.BLUE, alpha=0.55, lw=0
+                    )
+                if fin.any():
+                    q1, med, q3 = np.percentile(v[fin], [25, 50, 75])
+                    ax.add_patch(
+                        Rectangle((i - 0.045, q1), 0.09, q3 - q1, fc=style.PANEL, ec=style.INK2)
+                    )
+                    ax.plot([i - 0.045, i + 0.045], [med, med], color=style.INK, lw=1.6)
+                    ax.plot(i, float(np.mean(v[fin])), "o", color=style.YELLOW, ms=4, zorder=4)
+                jit = i + 0.1 + 0.22 * rng.random(v.size)
+                cens = (
+                    np.asarray(r.censored, bool)
+                    if r.censored is not None and len(r.censored) == v.size
+                    else np.zeros(v.size, bool)
+                )
+                over = fin & (v > top)
+                ok = fin & ~over
+                ax.scatter(jit[ok & ~cens], v[ok & ~cens], s=5, color=style.AQUA, alpha=0.6, lw=0)
+                ax.scatter(
+                    jit[ok & cens], v[ok & cens], s=7, color=style.STATUS["fail"], alpha=0.9, lw=0
+                )
+                if over.any():
+                    ax.plot(
+                        jit[over], np.full(over.sum(), top), "^", color=style.STATUS["fail"], ms=5
+                    )
+                    ax.annotate(
+                        f"{int(over.sum())} > {top:.2g}",
+                        (i + 0.2, top),
+                        xytext=(0, -12),
+                        textcoords="offset points",
+                        ha="center",
+                        fontsize=8,
+                        color=style.INK2,
+                    )
+            if limit is not None:
+                ax.axhline(limit, color=style.INK2, lw=1.0, ls=(0, (4, 3)))
+                ax.annotate(
+                    f"censor limit {limit:g}",
+                    xy=(1.0, limit),
+                    xycoords=("axes fraction", "data"),
+                    xytext=(4, 0),
+                    textcoords="offset points",
+                    va="center",
+                    fontsize=9,
+                    color=style.INK2,
+                )
+            ax.set_ylim(0, top)
+            ax.set_xlim(-0.6, n_runs - 0.4)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="x", visible=False)
+            ticks = [
+                f"{r.label}\nmean {np.nanmean(r.values):.3f}"
+                if np.isfinite(r.values).any()
+                else r.label
+                for r in runs
+            ]
+            ax.set_xticks(range(len(runs)), ticks, fontsize=8 if n_runs > 8 else 9)
+            if n_runs > 8:
+                for t in ax.get_xticklabels():
+                    t.set_rotation(30)
+                    t.set_ha("right")
+        fig.subplots_adjust(
+            left=0.07, right=0.92, top=0.97, bottom=0.16 if n_runs > 8 else 0.11, hspace=0.45
+        )
+        return figure_image(fig)

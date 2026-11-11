@@ -137,6 +137,9 @@ class QCRecord:
     metrics: dict[str, Metric] = field(default_factory=dict)
     figures: list[dict] = field(default_factory=list)
     info: dict[str, Any] = field(default_factory=dict)
+    # Per-TR traces kept for summaries drawn across runs (ffs_qc_report), which
+    # only ever see the records, never the tool's arrays.
+    series: dict[str, list] = field(default_factory=dict)
 
     @classmethod
     def for_args(cls, args, tool: str, fallback_label: str | os.PathLike) -> QCRecord | None:
@@ -169,6 +172,15 @@ class QCRecord:
     def figure_path(self, step: int, check: str, ext: str = ".png") -> Path:
         return self.qc_dir / f"{self.order:02d}.{self.tool}.{step:02d}-{check}.{self.label}{ext}"
 
+    def add_series(self, name: str, values) -> None:
+        self.series[name] = [_jsonable(round(float(v), 5)) for v in values]
+
+    def sidecar_path(self, kind: str, ext: str = ".npz") -> Path:
+        """Data a cross-run re-render needs (``records/<order>.<tool>.<label>.<kind>``)."""
+        out = self.qc_dir / RECORDS_DIR / f"{self.order:02d}.{self.tool}.{self.label}.{kind}{ext}"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        return out
+
     def add_figure(self, step: int, check: str, title: str, path: Path) -> None:
         self.figures.append({"step": step, "check": check, "title": title, "file": path.name})
 
@@ -183,6 +195,7 @@ class QCRecord:
             "info": {k: _jsonable(v) for k, v in self.info.items()},
             "metrics": {k: asdict_metric(m) for k, m in self.metrics.items()},
             "figures": sorted(self.figures, key=lambda f: f["step"]),
+            **({"series": self.series} if self.series else {}),
         }
 
     def write(self, verb: int = 1) -> Path:

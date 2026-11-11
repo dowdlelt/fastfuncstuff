@@ -184,6 +184,8 @@ def _metrics_table(records: list[dict]) -> str:
     )
     rows = []
     for rec in sorted(records, key=lambda r: natural_key(r["label"])):
+        if not rec["metrics"]:  # a cross-run summary: figures only
+            continue
         cells = []
         for c in cols:
             m = rec["metrics"].get(c)
@@ -200,10 +202,15 @@ def _metrics_table(records: list[dict]) -> str:
 
 
 def build_report(qc_dir: str | os.PathLike, title: str = "", html_page: bool = True) -> dict:
+    from .summary import motion_summary, shared_tsnr
+
     d = Path(qc_dir)
     records = load_records(d)
     tsv, txt = write_tables(d, records)
-    out = {"records": len(records), "tsv": tsv, "txt": txt}
+    # Cross-run figures: drawn before the page so it stitches them in.
+    summaries = motion_summary(d, records)
+    out = {"records": len(records), "tsv": tsv, "txt": txt, "tsnr_shared": shared_tsnr(d)}
+    out["summaries"] = [f["file"] for s in summaries for f in s["figures"]]
     if html_page:
-        out["html"] = write_html(d, records, title)
+        out["html"] = write_html(d, records + summaries, title)
     return out
