@@ -315,3 +315,26 @@ def test_another_field_strength_warns_that_the_relaxation_constants_are_7t():
         two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4)
     with pytest.warns(UserWarning, match="7 T values"):
         two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4, B0=3.0)
+
+
+def test_a_first_event_longer_than_its_curve_cannot_reach_the_second():
+    """The model integrates through both blocks, so a 30 s event on a 10 s curve keeps
+    driving for 20 s of padding. The default padding grows by that; a fixed one too short
+    to hold it is refused. Without this the second block was fitted on top of the first
+    event's plateau (measured: 100% of the peak) and nothing said so."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    curves = np.zeros((1, 11, 5))
+    times = np.arange(11) * 1.0
+    short = two_condition_batch(curves, curves, times, duration=(2.0, 30.0))
+    long_ = two_condition_batch(curves, curves, times, duration=(30.0, 2.0))
+    assert short.meta["gap"] == 32  # the test event's length is not the first block's problem
+    assert long_.meta["gap"] == 32 + 20
+    # the driving input is silent for MIN_GAP_SECONDS before the second onset
+    onset_b = (long_.meta["block"] + long_.meta["gap"] + 1) * 1.0
+    dt = long_.spec.dt
+    drive = long_.u[:, 1].numpy()
+    assert not drive[int(round((onset_b - 31.5) / dt)) : int(round(onset_b / dt)) - 1].any()
+    with pytest.raises(ValueError, match="still be driving"):
+        two_condition_batch(curves, curves, times, duration=(30.0, 2.0), gap=10)
+    two_condition_batch(curves, curves, times, duration=(30.0, 2.0), gap=25)  # ends in the padding

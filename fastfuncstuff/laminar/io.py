@@ -327,7 +327,9 @@ def two_condition_batch(
 
     ``gap`` is the padding between the blocks in rows. Left ``None`` it is the
     reference's 20, or as many as cover :data:`MIN_GAP_SECONDS` when the samples are
-    closer together than the reference's."""
+    closer together than the reference's, plus however long the first event runs past
+    the end of its own curve. A given ``gap`` that leaves the first event still on at
+    the second onset is refused."""
     t_first, t_second = _times_pair(times)
     tr, (start_a, start_b) = _scan_interval(t_first, t_second)
     if first.shape[1] != len(t_first) or second.shape[1] != len(t_second):
@@ -336,8 +338,20 @@ def two_condition_batch(
             f"time grids of {len(t_first)} and {len(t_second)}"
         )
     n_b, _, k = first.shape
+    dur_first, dur_test = _duration_pair(duration)
+    # Seconds the first event runs past the end of its own curve. The model integrates
+    # straight through both blocks, so an event longer than its window keeps driving
+    # into the padding, and into the second response if the padding is too short.
+    overrun = max(0.0, dur_first - start_a - (len(t_first) - 1) * tr)
     if gap is None:  # the reference's rows, or as many as cover its seconds
-        gap = max(REFERENCE_GAP_ROWS, math.ceil(MIN_GAP_SECONDS / tr - 1e-9))
+        gap = max(REFERENCE_GAP_ROWS, math.ceil((MIN_GAP_SECONDS + overrun) / tr - 1e-9))
+    elif overrun >= (gap + 1) * tr:
+        raise ValueError(
+            f"the first event lasts {dur_first:g} s but its curve covers "
+            f"{start_a + (len(t_first) - 1) * tr:g} s and the padding {gap} rows "
+            f"({gap * tr:g} s): the model would still be driving it when the second "
+            "event starts. Lengthen the padding or leave it to the default."
+        )
     block = len(t_first) + 1  # one zero baseline row, then the first response
 
     rng = np.random.default_rng(seed)
@@ -376,7 +390,6 @@ def two_condition_batch(
     onset_a = tr - start_a
     onset_b = (block + gap + 1) * tr - start_b
     n_micro = int(round(y.shape[1] * tr / spec.dt))
-    dur_first, dur_test = _duration_pair(duration)
     if modulation == "event":
         m_start, m_dur = 0.0, dur_test
     elif modulation == "reference":
