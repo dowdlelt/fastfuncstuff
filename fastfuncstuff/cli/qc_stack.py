@@ -7,8 +7,11 @@ in one space: every run's mean after cross-run alignment, each session after
 cross-session alignment, the fieldmaps. autoproc writes these as stageNN.QC.*;
 any 4-D file works. Per stack this writes, into -qc DIR:
 
-    a ranking   every image's spatial correlation with the stack's median
-    a flicker   an animated PNG stepping through the images under the median's edges
+    a flicker   an animated PNG stepping through the images under the median's edges,
+                each frame headed by its spatial correlation with the stack's median
+
+The correlations themselves go to the record (the table's corr_min / corr_median,
+and one per frame for the session wheel); there is no chart of them.
 
 Usage:
     ffs_qc_stack -qc qc stage06.QC.xrun.nii.gz stage10.QC.final.nii.gz
@@ -27,7 +30,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = FfsArgumentParser(
         prog="ffs_qc_stack",
-        description="Ranking + flicker QC figures for 4-D stacks of images that should line up.",
+        description="Flicker QC figures and similarity numbers for 4-D stacks of images that should line up.",
     )
     parser.add_argument("stacks", nargs="+", metavar="STACK", help="4-D NIfTI stack(s).")
     parser.add_argument("-qc", required=True, metavar="DIR", help="QC folder to write into.")

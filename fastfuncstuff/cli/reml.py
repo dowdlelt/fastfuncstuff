@@ -1206,6 +1206,26 @@ Examples:
         help="Anatomy to draw the -qc F and Coef maps on (any grid in the same space: the "
         "maps are resampled onto it). Without it they sit on a silhouette of the fit mask.",
     )
+    parser.add_argument(
+        "-qc_tissue",
+        default=None,
+        metavar="DSET",
+        help="Segmentation that names the bands of the -qc model carpet and the dots of its "
+        "tSNR scatter: a label volume (1, 2, 3, ...) or a stack of tissue probabilities, on "
+        "any grid in the same space as the input (it is resampled). A voxel joins a tissue "
+        "only where that tissue holds 90%% of it, since most EPI voxels are partial volume. "
+        "Only meaningful when the data is aligned to the anatomy the segmentation came from. "
+        "Without it the bands are the mask's outer shell and its interior.",
+    )
+    parser.add_argument(
+        "-qc_tissue_names",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="One name per -qc_tissue volume (or label value), in order. A repeated name "
+        "pools its volumes (cortex and subcortex both GM); '-' leaves a volume out. "
+        "Default: GM WM CSF, SPM's order, and anything after them left out.",
+    )
     return parser
 
 
@@ -5436,7 +5456,12 @@ def main():
         _run_clustsim(args, diag, device)
 
     if getattr(args, "qc", None):
-        _write_glm_qc(args, design_info)
+        _write_glm_qc(
+            args,
+            design_info,
+            data=None if (surface_input or roi_set is not None) else fmri_data_to_use,
+            device=device,
+        )
 
     print()
     print("=" * 70)
@@ -5444,11 +5469,14 @@ def main():
     print("=" * 70)
 
 
-def _write_glm_qc(args, design_info: dict) -> None:
-    """-qc: the design and its correlations, and the omnibus F from the written bucket.
+def _write_glm_qc(args, design_info: dict, data=None, device=None) -> None:
+    """-qc: the design and its correlations, the omnibus F from the written bucket,
+    and what the model left in the data.
 
     Reads the F back from the bucket on disk rather than from memory: the written
     file is the one -adjust_dof may have rewritten, and the one people will open.
+    ``data`` is the series the fit used, still resident as ``(x, y, z, time)``; the
+    residual figures are skipped when the fit read it some other way.
     """
     from typing import cast
 
@@ -5496,7 +5524,83 @@ def _write_glm_qc(args, design_info: dict) -> None:
             except Exception as err:  # QC must never fail a finished fit
                 print(f"  QC: could not read -qc_underlay {und} ({err}); drawing without it")
     checks.glm_check(rec, 1, design_info, **kw)
+    if kw.get("fstat") is not None:
+        try:
+            _residual_qc(args, rec, design_info, data, kw["fstat"], kw["affine"], device)
+        except Exception as err:  # QC must never fail a finished fit
+            print(f"  QC: residual figures skipped ({type(err).__name__}: {err})")
     rec.write()
+
+
+def _residual_qc(args, rec, design_info: dict, data, fstat, affine, device) -> None:
+    """The tSNR-gain scatter and the data / fit / residual carpets, from the resident data."""
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import label_from_path
+
+    n_time = int(np.asarray(design_info["matrix"]).shape[0])
+    grid = fstat.shape[::-1]  # the bucket is drawn (z, y, x); the series is held (x, y, z, t)
+    if not isinstance(data, np.ndarray) or data.shape != (*grid, n_time):
+        why = "not resident" if not isinstance(data, np.ndarray) else f"shape {data.shape}"
+        print(f"  QC: residual figures need the series in memory ({why}); skipped")
+        return
+    flat_index = np.arange(int(np.prod(grid))).reshape(grid).transpose(2, 1, 0)
+    mask = fstat != 0
+    checks.residual_check(
+        rec,
+        4,
+        data,
+        flat_index,
+        mask,
+        affine,
+        design_info,
+        tr=args.tr,
+        device=device,
+        tissue=_qc_tissue(args, mask, affine),
+        fstat=fstat,
+        run_labels=[label_from_path(str(f).split("[")[0]) for f in args.input],
+    )
+
+
+def _qc_tissue(args, mask: np.ndarray, affine) -> dict | None:
+    """-qc_tissue resampled onto the fit's grid, as ``{name: mask}``; None without it."""
+    from typing import cast
+
+    import nibabel as nib
+
+    from fastfuncstuff.qc import render
+    from fastfuncstuff.qc import residuals as rs
+
+    path = getattr(args, "qc_tissue", None)
+    if not path:
+        return None
+    try:
+        img = cast("nib.Nifti1Image", nib.load(path))
+        vol = np.asanyarray(img.dataobj, dtype=np.float32)
+    except Exception as err:
+        print(f"  QC: could not read -qc_tissue {path} ({err}); using shell / interior")
+        return None
+    vol = vol.reshape(*vol.shape[:3], -1)
+    labels = vol.shape[3] == 1
+    names = list(getattr(args, "qc_tissue_names", None) or rs.SPM_CLASSES)
+    if labels:
+        # One probability volume per label value, so resampling never blends two
+        # labels into a third.
+        lab = np.rint(vol[..., 0]).astype(int)
+        stack = [(lab == i + 1).astype(np.float32) for i in range(len(names))]
+    else:
+        stack = [vol[..., i] for i in range(min(len(names), vol.shape[3]))]
+    on_grid = np.stack(
+        [
+            render.resample_like(
+                np.ascontiguousarray(v.transpose(2, 1, 0)), img.affine, mask.shape, affine
+            )
+            for v in stack
+        ]
+    )
+    groups = rs.tissue_groups(on_grid, names, mask)
+    if not groups:
+        print(f"  QC: -qc_tissue {path} has no confident voxels in the fit mask; using shell")
+    return groups or None
 
 
 def _strongest_coef(labels, stataux, brick, mask) -> dict | None:

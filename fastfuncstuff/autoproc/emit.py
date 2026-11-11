@@ -866,7 +866,7 @@ qc_flush() {{
     ffs_util_3dmath -batch "$qcbatch" -device "$DEVICE"
     : > "$qcbatch"
   fi
-  # Each stack also becomes a ranking + flicker PNG (skipped when already newer).
+  # Each stack also becomes a flicker PNG (skipped when already newer).
   local have=() s
   for s in "${{qcstacks[@]}}"; do [ -f "$s" ] && have+=("$s"); done
   if [ "${{#have[@]}}" -gt 0 ] && command -v ffs_qc_stack >/dev/null 2>&1; then

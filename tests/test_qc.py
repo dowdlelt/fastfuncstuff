@@ -263,7 +263,7 @@ def test_alignment_check_flags_a_shifted_source(tmp_path):
 
 
 def test_stack_cli_finds_the_misaligned_frame(tmp_path):
-    """ffs_qc_stack ranks a shifted run last, labels it from the brick labels, and
+    """ffs_qc_stack scores a shifted run lowest, labels it from the brick labels, and
     skips re-rendering a stack whose figures are already newer."""
     import nibabel as nib
 
@@ -284,6 +284,12 @@ def test_stack_cli_finds_the_misaligned_frame(tmp_path):
     (rec,) = load_records(qc)
     assert rec["info"]["worst_frame"] == "run-4"
     assert metric_flagged(rec["metrics"]["corr_min"])
+    # The numbers are kept per frame (the wheel names the run); the dot plot of
+    # them is gone, so the flicker is the stack's only figure.
+    assert rec["info"]["frames"].split("\n")[3] == "run-4"
+    assert int(np.argmin(rec["series"]["corr"])) == 3
+    assert [f["check"] for f in rec["figures"]] == ["flicker"]
+    assert not list(qc.glob("*ranking*"))
     flick = qc / "55.stack.02-flicker.stage06.QC.xrun.png"
     mtime = flick.stat().st_mtime_ns
     main(["-qc", str(qc), str(stack), "-verb", "0"])

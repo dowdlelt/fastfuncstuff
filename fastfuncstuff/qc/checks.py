@@ -18,7 +18,7 @@ import numpy as np
 
 from . import plots, render, style
 from .plots import Trace
-from .record import QCRecord
+from .record import QCRecord, clean_label
 
 # AFNI's own pre-steady-state rule (3dToutcount in afni_proc): more than 40% of
 # voxels outlying in the first volume means it was acquired before T1 settled.
@@ -637,7 +637,7 @@ def stack_check(
     what: str = "",
     n_cut: int = 5,
 ) -> None:
-    """Every frame against the stack's median: a ranked similarity chart and a flicker.
+    """Every frame against the stack's median: similarity numbers and a flicker.
 
     ``frames_zyx`` is ``(n, z, y, x)``: images a pipeline stage claims to have put
     in one space (autoproc's ``stageNN.QC.*`` stacks). The median frame is the
@@ -668,57 +668,14 @@ def stack_check(
         "corr_median", float(np.nanmedian(corr)), "", "median frame-to-median spatial correlation"
     )
     rec.info["worst_frame"] = labels[worst]
+    # Per frame, for the session wheel: which RUN a poor frame is.
+    rec.info["frames"] = "\n".join(labels)
+    rec.add_series("corr", np.nan_to_num(corr, nan=0.0))
 
-    # --- ranked chart ---------------------------------------------------------
-    from matplotlib.figure import Figure
-
-    order = np.argsort(corr)
-    with style.mpl_style():
-        fig = Figure(figsize=(style.WIDTH / 100, 0.6 + 0.32 * n), dpi=100)
-        ax = fig.add_subplot(111)
-        ypos = np.arange(n)
-        # A dot plot, not bars: the interesting range is near 1, and a bar needs a
-        # zero baseline to be honest.
-        colors = [style.STATUS["warn"] if corr[i] < STACK_CORR_WARN else style.BLUE for i in order]
-        ax.hlines(ypos, 1.0, corr[order], color=style.GRID, lw=1.2)
-        ax.scatter(
-            corr[order], ypos, s=46, c=colors, zorder=3, edgecolors=style.SURFACE, linewidths=0.8
-        )
-        ax.set_yticks(ypos, [labels[i] for i in order], fontsize=9)
-        lo = min(float(np.nanmin(corr)) - 0.03, STACK_CORR_WARN - 0.03)
-        ax.set_xlim(lo, 1.005)
-        ax.set_ylim(n - 0.5, -0.5)  # worst at the top
-        ax.axvline(STACK_CORR_WARN, color=style.INK2, lw=1, ls=(0, (4, 3)))
-        for yy, i in zip(ypos, order, strict=True):
-            ax.annotate(
-                f"{corr[i]:.3f}",
-                (corr[i], yy),
-                xytext=(0, 7),
-                textcoords="offset points",
-                ha="center",
-                fontsize=8,
-                color=style.INK2,
-            )
-        ax.set_xlabel("spatial correlation with the median frame")
-        ax.grid(axis="y", visible=False)
-        fig.subplots_adjust(left=0.28, right=0.97, top=0.98, bottom=0.6 / (0.6 + 0.32 * n) + 0.02)
-        body = render.figure_image(fig)
-    stats = [
-        (f"worst {labels[worst]}: {corr[worst]:.3f}", _status(corr[worst] < STACK_CORR_WARN)),
-    ]
+    # No chart of the correlations: a ranked dot plot said less than the table row
+    # and the flicker already do, so the numbers live in the record (and the
+    # session wheel reads them per run) and the flicker is the figure.
     title = f"{what or 'Stack'} · {rec.label}"
-    img = render.compose(
-        body,
-        title,
-        f"{n} images that should share one space",
-        stats,
-        "Each dot is one image's spatial correlation with the median of all of them, worst "
-        f"first. Look for: one image well below the rest (below {STACK_CORR_WARN}, yellow) — "
-        "misaligned, or a broken run. Open the flicker to see where.",
-    )
-    path = rec.figure_path(step, "ranking")
-    render.save_png(img, path)
-    rec.add_figure(step, "ranking", f"{what or 'Stack'} similarity ranking", path)
 
     # --- flicker with the median's edges --------------------------------------
     ras_ref, zooms = render.ras_volume(ref, affine)
@@ -749,8 +706,8 @@ def stack_check(
             render.compose(
                 body,
                 title,
-                f"frame {i + 1}/{n}:  {labels[i]}",
-                [(f"r = {corr[i]:.3f}", st)],
+                f"frame {i + 1}/{n}:  {labels[i]}  ·  {n} images that should share one space",
+                [(f"r with the median = {corr[i]:.3f}", st)],
                 "Animated: steps through every image with the MEDIAN image's edges (orange) "
                 "fixed on top. Look for: anatomy that stays under the same edges in every "
                 "frame; a frame whose anatomy slides out from under them is misaligned.",
@@ -1089,6 +1046,281 @@ def glm_check(
     path = rec.figure_path(step + 2, "coef")
     render.save_png(img, path)
     rec.add_figure(step + 2, "coef", "Task coefficient", path)
+
+
+# Carpet voxels are capped by array size, not count: three voxel-by-time arrays
+# (data, fit, residual) live at once, and a long concatenated series would make a
+# fixed voxel count cost gigabytes. Rows are block averages of ~700 either way.
+CARPET_MAX_VOXELS = 30000
+CARPET_MAX_ELEMENTS = 24e6
+WHEEL_SIDECAR = "wheel"
+
+
+def _shell_interior(mask: np.ndarray) -> dict[str, np.ndarray]:
+    import torch
+
+    from fastfuncstuff.processing.mask import _erode_6conn
+
+    core = _erode_6conn(torch.from_numpy(mask), 2).numpy()
+    return {"shell": mask & ~core, "interior": core}
+
+
+def residual_check(
+    rec: QCRecord,
+    step: int,
+    data,
+    flat_index: np.ndarray,
+    mask: np.ndarray,
+    affine,
+    design_info: dict,
+    *,
+    tr: float | None = None,
+    device=None,
+    tissue: Mapping[str, np.ndarray] | None = None,
+    fstat: np.ndarray | None = None,
+    run_labels: list[str] | None = None,
+) -> None:
+    """What the model removed and what it left: tSNR in vs out, and three carpets.
+
+    ``data`` is the series the fit used, time last, in whatever layout the tool
+    holds it; ``flat_index`` is a ``(z, y, x)`` volume giving each voxel's row in
+    ``data.reshape(-1, T)``, so nothing is transposed or copied to get here.
+    ``mask`` is the fitted voxels on that ``(z, y, x)`` grid. ``tissue`` maps a
+    name to a boolean mask (from a segmentation on this grid) for the carpet
+    bands; without it the mask splits into shell and interior.
+
+    Residuals are OLS on the shared design (see :mod:`fastfuncstuff.qc.residuals`
+    for why not the whitened ones), and both noise levels are dof-corrected.
+    """
+    from . import residuals as rs
+
+    x = np.asarray(design_info["matrix"], dtype=np.float64)
+    n_time = x.shape[0]
+    roles = column_roles(design_info)
+    drift = [i for i, r in enumerate(roles) if r == "drift"]
+    task = [i for i, r in enumerate(roles) if r == "task"]
+    nuis = [i for i, r in enumerate(roles) if r != "task"]
+    keep = np.ones(n_time, bool)
+    good = design_info.get("good_list")
+    if good is not None and len(good):
+        keep[:] = False
+        keep[np.asarray(good, int)] = True
+    run_starts = [int(s) for s in (design_info.get("run_starts") or [0])]
+    n_runs = len(run_starts)
+    mask = np.asarray(mask, bool)
+    if not mask.any():
+        return
+    voxels = np.asarray(flat_index)[mask]
+
+    st = rs.residual_stats(data, voxels, x, drift, run_starts, keep, device)
+    t_in, t_res = st.tsnr_in(), st.tsnr_res()
+    live = (t_in > 0) & (t_res > 0)
+    if not live.any():
+        return
+    med_in, med_res = float(np.median(t_in[live])), float(np.median(t_res[live]))
+    gain = float(np.median(t_res[live] / t_in[live]))
+    rec.metric(
+        "tsnr_input_median",
+        med_in,
+        "",
+        "median tSNR of the GLM's input (mean / SD after drift only, dof-corrected)",
+    )
+    rec.metric(
+        "tsnr_resid_median",
+        med_res,
+        "",
+        "median tSNR of the residuals (mean / residual SD, dof-corrected)",
+    )
+    rec.metric(
+        "tsnr_gain",
+        gain,
+        "x",
+        "median per-voxel ratio residual tSNR / input tSNR; 1 = the regressors removed "
+        "no more variance than their degrees of freedom cost",
+    )
+    run_in = np.array([np.median(v[live]) for v in st.run_tsnr(st.run_sd_in)])
+    run_res = np.array([np.median(v[live]) for v in st.run_tsnr(st.run_sd_res)])
+    empty = st.run_kept == 0
+    run_in[empty] = np.nan
+    run_res[empty] = np.nan
+
+    # --- groups: tissue classes when a segmentation is at hand ---------------
+    groups = {k: np.asarray(v, bool) & mask for k, v in (tissue or {}).items()}
+    groups = {k: v for k, v in groups.items() if v.any()}
+    by_tissue = bool(groups)
+    if not groups:
+        groups = _shell_interior(mask)
+    pos_in_mask = np.full(mask.shape, -1, np.int64)
+    pos_in_mask[mask] = np.arange(int(mask.sum()))
+    gpos = {k: pos_in_mask[v] for k, v in groups.items()}
+
+    # --- figure: input vs residual tSNR --------------------------------------
+    markers = [
+        (
+            k,
+            float(np.median(t_in[p][live[p]])) if live[p].any() else 0.0,
+            float(np.median(t_res[p][live[p]])) if live[p].any() else 0.0,
+            style.SERIES[i % len(style.SERIES)],
+        )
+        for i, (k, p) in enumerate(gpos.items())
+    ]
+    for k, p in gpos.items():
+        if live[p].any():
+            rec.metric(
+                f"tsnr_gain_{clean_label(k)}",
+                float(np.median(t_res[p][live[p]] / t_in[p][live[p]])),
+                "x",
+                f"tsnr_gain within {k}",
+            )
+    body = plots.density_scatter(
+        t_in[live],
+        t_res[live],
+        "input tSNR (after drift)",
+        "residual tSNR (after the full model)",
+        markers=markers,
+    )
+    img = render.compose(
+        body,
+        f"tSNR before / after the model · {rec.label}",
+        f"{rec.tool}  ·  {int(live.sum()):,} fitted voxels  ·  rank {st.rank_full} design "
+        f"({st.rank_drift} drift), {st.n_kept} time points",
+        [(f"input {med_in:.1f}", None), (f"residual {med_res:.1f}", None), (f"x{gain:.2f}", None)],
+        "Each voxel once: tSNR of the series the model was given (drift removed) against tSNR "
+        "of what it left. Both SDs are divided by their own degrees of freedom, so the dashed "
+        "diagonal is what a model that explains nothing would give, however many columns it "
+        "has. Dots are the medians of the named voxel groups. Look for: the cloud lifted off "
+        "the diagonal where the regressors earn their place (more in grey matter than white "
+        "when it is task, everywhere when it is motion or physiology). A cloud ON the diagonal "
+        "means the regressors removed nothing; below it, they cost more than they explain.",
+    )
+    path = rec.figure_path(step, "tsnr_gain")
+    render.save_png(img, path)
+    rec.add_figure(step, "tsnr_gain", "tSNR before and after the model", path)
+
+    # --- carpet voxels: one subsample for the carpets and the held-out fit ---
+    total = sum(len(p) for p in gpos.values())
+    cap = int(min(CARPET_MAX_VOXELS, max(CARPET_MAX_ELEMENTS / max(n_time, 1), 2000)))
+    stride = max(1, -(-total // cap))
+    sub = {k: p[::stride] for k, p in gpos.items()}
+    allpos = np.concatenate(list(sub.values()))
+    flat = np.asarray(data).reshape(-1, n_time)
+    ts = np.ascontiguousarray(flat[voxels[allpos]], dtype=np.float32).T  # (time, voxels)
+    d, f, r = rs.fit_parts(ts, x, drift, keep)
+    pct = 100.0 / np.maximum(np.abs(st.mean[allpos]), 1e-12)
+    d, f, r = d * pct, f * pct, r * pct
+    if fstat is not None:
+        score = np.nan_to_num(np.asarray(fstat)[mask][allpos]).astype(np.float32)
+        order_words = "sorted within each group by the omnibus F, strongest at the top"
+    else:
+        sd = r.std(axis=0)
+        z = r / np.where(sd > 0, sd, 1.0)
+        pc, _ = plots._first_pc(z)
+        score = z.T @ pc
+        score = -score if score.sum() < 0 else score
+        order_words = "sorted within each group by loading on the residual's first PC"
+    gl, pos = [], 0
+    for k, p in sub.items():
+        gl.append((k, np.arange(pos, pos + len(p))))
+        pos += len(p)
+    cp_d = plots.carpet_rows(d, gl, standardize=False, score=score)
+    cp_f = plots.carpet_rows(f, gl, standardize=False, score=score, scale=cp_d.scale)
+    cp_r = plots.carpet_rows(r, gl, standardize=False, score=score, scale=cp_d.scale)
+    rec.metric(
+        "resid_gcor", cp_r.gcor, "", "GCOR of the residuals (mean pairwise voxel correlation)"
+    )
+    rec.metric(
+        "resid_pc1_frac",
+        cp_r.pc1_frac,
+        "",
+        "variance fraction of the residuals' first principal time course",
+    )
+    traces = [Trace("global (%)", r.mean(axis=1), style.AQUA)]
+    traces += _pc1_trace(cp_r)
+    body = plots.carpet(
+        [("data", cp_d.rows), ("fitted", cp_f.rows), ("residual", cp_r.rows)],
+        cp_d.blocks,
+        traces,
+        tr=tr,
+        keep=keep,
+        run_starts=run_starts,
+    )
+    bands = ", ".join(b[0] for b in cp_d.blocks)
+    img = render.compose(
+        body,
+        f"Model carpet · {rec.label}",
+        f"{rec.tool}  ·  data = fitted + residual, drift removed  ·  traces: the residual's "
+        f"global mean and first PC  ·  rows: {bands}"
+        + ("" if by_tissue else "  (no segmentation given)"),
+        [(f"residual GCOR {cp_r.gcor:.3f}", None), (f"PC1 {100 * cp_r.pc1_frac:.0f}%", None)],
+        f"Three carpets on ONE grey scale (+/-2 x {cp_d.scale:.2f}% signal) and the same rows: "
+        f"neighbouring voxels averaged, {order_words}. Units are percent of each voxel's mean, "
+        "not z-scores, so a tissue or a panel that fluctuates less is visibly dimmer. Yellow "
+        "lines are run boundaries; red ticks are censored time points, whose residual is what "
+        "the kept points' fit could not explain. Look for: the task as bands in 'fitted' at "
+        "the top of grey matter and NOT in 'residual' (bands left there are task the model "
+        "missed: wrong timing or response shape); vertical bands through every tissue in "
+        "'residual' (motion, breathing, a global change the nuisance regressors did not "
+        "catch); one run brighter than the rest.",
+    )
+    path = rec.figure_path(step + 1, "resid_carpet")
+    render.save_png(img, path)
+    rec.add_figure(step + 1, "resid_carpet", "Data, fit and residual carpets", path)
+
+    # --- per run: how well the other runs predict it -------------------------
+    run_r2 = np.full(n_runs, np.nan)
+    try:
+        run_r2 = rs.heldout_r2_by_run(ts.T, x, run_starts, task, nuis, keep, device)
+    except Exception as err:  # a summary number must never fail a finished fit
+        print(f"  QC: held-out R² per run skipped ({err})")
+    labels = list(run_labels or [])
+    labels += [f"run-{i + 1:02d}" for i in range(len(labels), n_runs)]
+    rec.add_series("run_tsnr_input", np.nan_to_num(run_in, nan=0.0))
+    rec.add_series("run_tsnr_resid", np.nan_to_num(run_res, nan=0.0))
+    if np.isfinite(run_r2).any():
+        rec.add_series("run_heldout_r2", np.nan_to_num(run_r2, nan=0.0))
+        rec.metric(
+            "heldout_r2_min",
+            float(np.nanmin(run_r2)),
+            "",
+            "lowest per-run held-out R² (other runs' task betas predicting this run, in "
+            "the voxels those runs rank in the top 5%)",
+        )
+
+    # --- sidecar: everything the across-run wheel draws for this fit ---------
+    ras_t, zooms = render.ras_volume(_fill(mask, t_res), affine)
+    ras_m, _ = render.ras_volume(mask.astype(np.float32), affine)
+    grid = render.Grid(ras_t, zooms, ras_m > 0.5, n_cut=3)
+    frac = rec.metrics.get("fstat_frac_sig")
+    meta = {
+        "label": rec.label,
+        "tool": rec.tool,
+        "runs": labels[:n_runs],
+        "run_kept": [int(v) for v in st.run_kept],
+        "run_tsnr_input": [_num(v) for v in run_in],
+        "run_tsnr_resid": [_num(v) for v in run_res],
+        "run_heldout_r2": [_num(v) for v in run_r2],
+        "tsnr_input_median": med_in,
+        "tsnr_resid_median": med_res,
+        "frac_sig": None if frac is None else frac.value,
+        "n_task": len(task),
+        "letter": grid.side_letter("axial"),
+    }
+    np.savez_compressed(
+        rec.sidecar_path(WHEEL_SIDECAR),
+        meta=json.dumps(meta),
+        tsnr=np.stack(grid.slices(ras_t, "axial")).astype(np.float16),
+        aspect=np.asarray(grid.aspect("axial")),
+    )
+
+
+def _num(v) -> float | None:
+    return float(v) if np.isfinite(v) else None
+
+
+def _fill(mask: np.ndarray, values: np.ndarray) -> np.ndarray:
+    vol = np.zeros(mask.shape, np.float32)
+    vol[mask] = values
+    return vol
 
 
 class _Overlay:

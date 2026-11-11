@@ -202,13 +202,13 @@ def _metrics_table(records: list[dict]) -> str:
 
 
 def build_report(qc_dir: str | os.PathLike, title: str = "", html_page: bool = True) -> dict:
-    from .summary import motion_summary, shared_tsnr
+    from .summary import motion_summary, session_wheel, shared_tsnr
 
     d = Path(qc_dir)
     records = load_records(d)
     tsv, txt = write_tables(d, records)
     # Cross-run figures: drawn before the page so it stitches them in.
-    summaries = motion_summary(d, records)
+    summaries = session_wheel(d, records) + motion_summary(d, records)
     out = {"records": len(records), "tsv": tsv, "txt": txt, "tsnr_shared": shared_tsnr(d)}
     out["summaries"] = [f["file"] for s in summaries for f in s["figures"]]
     if html_page:
