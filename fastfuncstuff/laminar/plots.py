@@ -53,6 +53,11 @@ def _depth_colours(k: int):
 
 
 def _blocks(fit: RoiFit) -> list[slice]:
+    # From the fitted rows: the two conditions' windows may differ in length.
+    if fit.rows is not None:
+        from fastfuncstuff.laminar.pipeline import condition_blocks
+
+        return [slice(a, b) for a, b in condition_blocks(fit.rows)]
     block, gap = int(fit.meta["block"]), int(fit.meta["gap"])
     return [slice(1, block), slice(block + gap + 1, block + gap + block)]
 

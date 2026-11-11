@@ -533,12 +533,13 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
     with open(paths[3], "w") as fh:
         fh.write("roi\tname\themi\tcondition\ttime\tneuronal_depth\tactivity\n")
         for f in fits:
-            tr, block, gap = f.meta["TR"], f.meta["block"], f.meta["gap"]
-            starts = {"1": 1, "2": block + gap + 1}
-            first_sample = dict(zip(starts, f.meta.get("start", (0.0, 0.0)), strict=True))
-            n_t = block - 1
-            for cond, s0 in starts.items():
-                for t in range(n_t):
+            tr = f.meta["TR"]
+            # Each condition's own extent: the two windows may differ in length.
+            spans = {str(i + 1): sl for i, sl in enumerate(_condition_slices(f.meta, f.rows))}
+            first_sample = dict(zip(spans, f.meta.get("start", (0.0, 0.0)), strict=True))
+            for cond, sl in spans.items():
+                s0 = sl.start
+                for t in range(sl.stop - sl.start):
                     for i, d in enumerate(depth_names(f.neuronal.shape[1])):
                         fh.write(
                             f"{f.roi}\t{f.name}\t{f.hemi}\t{cond}\t"

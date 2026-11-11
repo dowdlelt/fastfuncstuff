@@ -110,6 +110,14 @@ def test_peak_profiles_follow_the_second_conditions_own_window(tmp_path):
         second = [r for r in csv.DictReader(fh, delimiter="\t") if r["condition"] == "2"]
     assert all(float(r["measured_pct"]) == 3.0 for r in second)
     assert all(float(r["fit_pct"]) == 2.0 for r in second)
+    # The neuronal table and the figure follow each window too: the second condition has
+    # 11 samples here against the first one's 3, and both used to take the first's count.
+    with open(f"{prefix}_laminar_neuronal.tsv") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+    n_depths = fit.neuronal.shape[1]
+    assert sum(r["condition"] == "1" for r in rows) == 3 * n_depths
+    assert sum(r["condition"] == "2" for r in rows) == 11 * n_depths
+    plot_roi(fit, tmp_path / "unequal.png")
 
 
 def test_the_page_marks_a_warned_fit_and_missing_data_is_a_plain_error(tmp_path):
