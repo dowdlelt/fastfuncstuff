@@ -5644,6 +5644,12 @@ def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[st
         # Labelled by the bucket stem, so a blur variant or the phasereg refit is its
         # own QC row (a "/" in a folder stem becomes "_" in the file name).
         *([f'-qc {QC_DIR} -qc_label "{stem}task-{task}"'] if _qc_on(plan) else []),
+        # The results underlay stage10a cuts to the EPI FOV (anat resolution).
+        *(
+            ['-qc_underlay "stage10.anat_in_epi_fov.nii.gz"']
+            if _qc_on(plan) and _own_anat(opt)
+            else []
+        ),
         *_reml_shared(opt, task),
     ]
 

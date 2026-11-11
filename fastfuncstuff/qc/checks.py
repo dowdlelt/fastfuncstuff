@@ -768,6 +768,12 @@ def stack_check(
 # 1d_tool.py -show_cormat_warnings starts warning at |r| 0.4; past 0.5 a task
 # regressor shares enough with a nuisance one that its beta is partly motion.
 TASK_NUISANCE_R_WARN = 0.5
+# Display threshold for GLM maps: the conventional uncorrected voxelwise p that
+# afni_proc's review driver and most first-look QC use. Not an inference threshold.
+GLM_P_THR = 0.001
+# Coef colour range, in the bucket's units (percent signal change when scaled):
+# +/-7 holds nearly every real task effect without washing small ones out.
+COEF_LIM = 7.0
 
 
 def column_roles(design_info: dict) -> list[str]:
@@ -812,12 +818,26 @@ def glm_check(
     fstat=None,
     affine=None,
     fstat_label: str = "Full_Fstat",
+    fstat_dof: tuple[float, float] | None = None,
+    underlay=None,
+    underlay_affine=None,
+    coef=None,
+    tstat=None,
+    t_dof: float | None = None,
+    coef_label: str = "",
+    coef_why: str = "",
+    p_thr: float = GLM_P_THR,
+    coef_lim: float = COEF_LIM,
 ) -> None:
-    """Design-matrix picture, regressor correlations, and the omnibus F map.
+    """Design-matrix picture, regressor correlations, the omnibus F and one task Coef.
 
     Correlations are taken after removing each run's drift columns (the fit does
     the same), so two regressors that merely share a slow trend do not look
-    collinear. ``fstat`` is the omnibus statistic as a ``(z, y, x)`` array.
+    collinear. ``fstat`` is the omnibus statistic as a ``(z, y, x)`` array, drawn
+    at ``p_thr`` over ``underlay`` (any grid; the stats are resampled onto it).
+    ``coef`` / ``tstat`` are one estimate and its t, the Coef drawn where the t
+    passes ``p_thr`` two-sided. Missing dofs fall back to the design's own (task
+    columns, residual dof), which ignores any -adjust_dof.
     """
     X = np.asarray(design_info["matrix"], dtype=np.float64)
     n, p = X.shape
@@ -966,45 +986,179 @@ def glm_check(
     render.save_png(img, path)
     rec.add_figure(step, "design", "Design matrix", path)
 
-    # --- figure: omnibus F ---------------------------------------------------
+    # --- figure: omnibus F, thresholded on the anatomy ----------------------
     if fstat is None:
         return
-    f = fstat.detach().cpu().numpy() if hasattr(fstat, "detach") else np.asarray(fstat)
-    f = np.nan_to_num(np.asarray(f, np.float32))
+    f = _arr(fstat)
+    f = np.nan_to_num(f)
     mask = f != 0
     if not mask.any():
         return
+    from scipy import stats as sps
+
+    d1, d2 = fstat_dof if fstat_dof else (max(len(task), 1), max(dof, 1))
+    f_thr = float(sps.f.isf(p_thr, d1, d2))
     p99 = float(np.percentile(f[mask], 99))
+    frac = float((f[mask] >= f_thr).mean())
     rec.metric("fstat_p99", p99, "", f"99th percentile of {fstat_label} in the fitted voxels")
-    ras_f, zooms = render.ras_volume(f, affine)
-    ras_m, _ = render.ras_volume(mask.astype(np.float32), affine)
-    grid = render.Grid(ras_f, zooms, ras_m > 0.5, n_cut=7)
-    rows, letters = [], []
-    for plane in ("axial", "coronal", "sagittal"):
-        asp = grid.aspect(plane)
-        panels = []
-        for s, m in zip(grid.slices(ras_f, plane), grid.slices(ras_m, plane), strict=True):
-            rgb = render.colorize(s, 0, p99, "inferno")
-            # A faint silhouette where the fit ran, so the map has a brain to sit in.
-            rgb[(m > 0.5) & (s <= 0.02 * p99)] = style.hex_rgb("#2c2c2a")
-            rgb[m <= 0.5] = 0
-            panels.append(render.panel(rgb, asp, 220, smooth=False))
-        rows.append((plane, panels))
-        letters.append(grid.side_letter(plane))
-    body = render.montage(rows, side_letters=letters)
+    rec.metric(
+        "fstat_frac_sig",
+        frac,
+        "",
+        f"fraction of fitted voxels with {fstat_label} at p < {p_thr:g} (uncorrected)",
+    )
+    ov = _Overlay(mask, affine, underlay, underlay_affine)
+    f_hi = max(p99, 1.5 * f_thr)
+    body = ov.montage(
+        f,
+        f,
+        f_thr,
+        f_thr,
+        f_hi,
+        render.POS_LUT,
+        colorbar=render.colorbar(
+            render.POS_LUT,
+            f_thr,
+            f_hi,
+            "F",
+            ticks=np.linspace(f_thr, f_hi, 5),
+            fmt="{:.1f}",
+            note=f"F({d1:g}, {d2:g}) shown from p < {p_thr:g} (F >= {f_thr:.2f}) to the 99th "
+            f"percentile; weaker voxels hidden",
+        ),
+    )
     img = render.compose(
         body,
         f"Task response · {rec.label}",
-        f"{rec.tool}  ·  {fstat_label}, scaled 0 to its 99th percentile ({p99:.1f})",
-        [(f"F p99 {p99:.1f}", None)],
-        "The omnibus F: how much all task regressors together explain, per voxel. Look for: "
-        "high values in the regions the task should drive (visual cortex for visual stimuli, "
-        "motor cortex for button presses). Uniformly high F everywhere, or along the brain "
-        "edge, suggests the task is entangled with motion.",
+        f"{rec.tool}  ·  {fstat_label} at p < {p_thr:g} uncorrected, on {ov.under_name}",
+        [(f"{100 * frac:.1f}% of voxels p<{p_thr:g}", None), (f"F p99 {p99:.1f}", None)],
+        "The omnibus F: how much all task regressors together explain, per voxel, shown "
+        f"where p < {p_thr:g} (uncorrected) over the anatomy. Look for: clusters in the "
+        "regions the task should drive (visual cortex for visual stimuli, motor cortex for "
+        "button presses). F everywhere, or a rim along the brain edge, suggests the task is "
+        "entangled with motion; nothing anywhere suggests wrong timing or a failed run.",
     )
     path = rec.figure_path(step + 1, "fstat")
     render.save_png(img, path)
     rec.add_figure(step + 1, "fstat", "Omnibus F map", path)
+
+    # --- figure: one Coef, thresholded by its t ------------------------------
+    if coef is None or tstat is None:
+        return
+    c = np.nan_to_num(_arr(coef))
+    t = np.nan_to_num(_arr(tstat))
+    t_thr = float(sps.t.isf(p_thr / 2, t_dof if t_dof else max(dof, 1)))
+    sig = mask & (np.abs(t) >= t_thr)
+    rec.info["coef_shown"] = coef_label
+    rec.metric(
+        "coef_frac_sig",
+        float(sig.sum() / mask.sum()),
+        "",
+        f"fraction of fitted voxels where the shown Coef's |t| passes p < {p_thr:g} (two-sided)",
+    )
+    lut = render.diverging_overlay_lut()
+    body = ov.montage(
+        c,
+        t,
+        t_thr,
+        -coef_lim,
+        coef_lim,
+        lut,
+        two_sided=True,
+        colorbar=render.colorbar(
+            lut,
+            -coef_lim,
+            coef_lim,
+            "Coef",
+            ticks=np.linspace(-coef_lim, coef_lim, 5),
+            note=f"{coef_label}, shown where |t| >= {t_thr:.2f} (p < {p_thr:g} two-sided, "
+            f"dof {t_dof if t_dof else dof:g}); colour saturates at +/-{coef_lim:g}",
+        ),
+    )
+    img = render.compose(
+        body,
+        f"Task effect · {rec.label}",
+        "  ·  ".join(x for x in (rec.tool, coef_label, coef_why) if x),
+        [(f"{100 * sig.sum() / mask.sum():.1f}% of voxels |t| sig", None)],
+        "One task estimate in its own units (red-yellow positive, blue-cyan negative), drawn "
+        f"only where its t passes p < {p_thr:g} two-sided. Look for: the sign you expect "
+        "where you expect it (activation positive in the driven region, deactivation in the "
+        "default network); large coefficients along the edge or in ventricles are motion or "
+        "draining veins, not neurons.",
+    )
+    path = rec.figure_path(step + 2, "coef")
+    render.save_png(img, path)
+    rec.add_figure(step + 2, "coef", "Task coefficient", path)
+
+
+class _Overlay:
+    """Stat maps on the EPI grid drawn over an anatomy on its own grid.
+
+    The stats are resampled onto the underlay (linear, then thresholded), so the
+    picture has the anatomy's resolution. Without an underlay the fit mask is a
+    dark silhouette on the stats' own grid.
+    """
+
+    def __init__(self, mask, affine, underlay=None, underlay_affine=None, n_cut: int = 7):
+        self.affine = np.eye(4) if affine is None else np.asarray(affine, float)
+        if underlay is not None:
+            self.under = np.nan_to_num(_arr(underlay))
+            self.under_aff = (
+                self.affine if underlay_affine is None else np.asarray(underlay_affine, float)
+            )
+            self.under_name = "the anatomy"
+        else:
+            self.under = None
+            self.under_aff = self.affine
+            self.under_name = "the fit mask"
+        m = self._on_under(mask.astype(np.float32)) > 0.5
+        ras_m, zooms = render.ras_volume(m.astype(np.float32), self.under_aff)
+        self.ras_mask = ras_m > 0.5
+        if self.under is not None:
+            ras_u, _ = render.ras_volume(self.under, self.under_aff)
+            head = _head_mask(ras_u) | self.ras_mask
+            self.grid = render.Grid(ras_u, zooms, head, n_cut=n_cut)
+            self.win = render.window(ras_u, head)
+        else:
+            ras_u = np.where(self.ras_mask, 0.17, 0.0).astype(np.float32)
+            self.grid = render.Grid(ras_u, zooms, self.ras_mask, n_cut=n_cut)
+            self.win = (0.0, 1.0)
+        self.ras_under = ras_u
+
+    def _on_under(self, vol: np.ndarray, order: int = 1) -> np.ndarray:
+        if self.under is None:
+            return vol
+        same = vol.shape == self.under.shape and np.allclose(self.affine, self.under_aff, atol=1e-4)
+        if same:
+            return vol
+        return render.resample_like(vol, self.affine, self.under.shape, self.under_aff, order)
+
+    def montage(self, stat, gate, thr, lo, hi, table, colorbar, two_sided=False):
+        """Three planes of ``stat`` over the underlay, painted inside the fit mask where
+        ``gate`` passes ``thr`` (``|gate|`` when two-sided), ``colorbar`` beneath."""
+        ras_s, _ = render.ras_volume(self._on_under(stat), self.under_aff)
+        ras_g = (
+            ras_s if gate is stat else render.ras_volume(self._on_under(gate), self.under_aff)[0]
+        )
+        show = (np.abs(ras_g) if two_sided else ras_g) >= thr
+        show = show & self.ras_mask
+        rows, letters = [], []
+        for plane in ("axial", "coronal", "sagittal"):
+            asp = self.grid.aspect(plane)
+            panels = []
+            for u, s_, sh in zip(
+                self.grid.slices(self.ras_under, plane),
+                self.grid.slices(ras_s, plane),
+                self.grid.slices(show.astype(np.float32), plane),
+                strict=True,
+            ):
+                base = render.colorize(u, *self.win)
+                panels.append(
+                    render.panel(render.overlay(base, s_, sh > 0.5, lo, hi, table), asp, 220)
+                )
+            rows.append((plane, panels))
+            letters.append(self.grid.side_letter(plane))
+        return render.vstack([render.montage(rows, side_letters=letters), colorbar])
 
 
 # ---------------------------------------------------------------------------

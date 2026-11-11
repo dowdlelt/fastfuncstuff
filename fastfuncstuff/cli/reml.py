@@ -1199,6 +1199,13 @@ Examples:
     from fastfuncstuff.qc.record import add_qc_args
 
     add_qc_args(parser)
+    parser.add_argument(
+        "-qc_underlay",
+        default=None,
+        metavar="DSET",
+        help="Anatomy to draw the -qc F and Coef maps on (any grid in the same space: the "
+        "maps are resampled onto it). Without it they sit on a silhouette of the fit mask.",
+    )
     return parser
 
 
@@ -5447,7 +5454,7 @@ def _write_glm_qc(args, design_info: dict) -> None:
 
     import nibabel as nib
 
-    from fastfuncstuff.io.headers import read_brick_labels
+    from fastfuncstuff.io.headers import read_brick_labels, read_brick_stataux
     from fastfuncstuff.qc import checks
     from fastfuncstuff.qc.record import QCRecord
 
@@ -5456,16 +5463,85 @@ def _write_glm_qc(args, design_info: dict) -> None:
     if rec is None:
         return
     rec.info["bucket"] = buck
-    fstat = affine = None
+    kw: dict = {}
     if buck and ".nii" in buck:
         img = cast("nib.Nifti1Image", nib.load(buck))  # stub gap: FileBasedImage
         labels = read_brick_labels(img)
-        if "Full_Fstat" in labels and len(img.shape) >= 4:
-            vol = np.asanyarray(img.dataobj[..., labels.index("Full_Fstat")], dtype=np.float32)
-            fstat = np.ascontiguousarray(vol.reshape(vol.shape[:3]).transpose(2, 1, 0))
-            affine = img.affine
-    checks.glm_check(rec, 1, design_info, fstat=fstat, affine=affine)
+        if len(img.shape) >= 4 and "Full_Fstat" in labels:
+            stataux = read_brick_stataux(img)
+
+            def brick(i: int) -> np.ndarray:
+                vol = np.asanyarray(img.dataobj[..., i], dtype=np.float32)
+                return np.ascontiguousarray(vol.reshape(vol.shape[:3]).transpose(2, 1, 0))
+
+            fi = labels.index("Full_Fstat")
+            code, par = stataux.get(fi, (0, ()))
+            kw.update(
+                fstat=brick(fi),
+                affine=img.affine,
+                fstat_dof=(par[0], par[1]) if code == 4 and len(par) == 2 else None,
+            )
+            pick = _strongest_coef(labels, stataux, brick, kw["fstat"] != 0)
+            if pick is not None:
+                kw.update(pick)
+        und = getattr(args, "qc_underlay", None)
+        if und and kw:
+            try:
+                uimg = cast("nib.Nifti1Image", nib.load(und))
+                u = np.asanyarray(uimg.dataobj, dtype=np.float32)
+                u = u.reshape(u.shape[:3]) if u.ndim > 3 else u
+                kw.update(
+                    underlay=np.ascontiguousarray(u.transpose(2, 1, 0)), underlay_affine=uimg.affine
+                )
+            except Exception as err:  # QC must never fail a finished fit
+                print(f"  QC: could not read -qc_underlay {und} ({err}); drawing without it")
+    checks.glm_check(rec, 1, design_info, **kw)
     rec.write()
+
+
+def _strongest_coef(labels, stataux, brick, mask) -> dict | None:
+    """The ``*_Coef`` / ``*_Tstat`` pair with the most voxels past p < 0.001 (two-sided).
+
+    "Most suprathreshold voxels" rather than the largest peak: one vein can carry
+    the peak t, and the point of the QC figure is the effect that covers the most
+    brain. Each t is read and dropped in turn, so a 40-condition bucket costs one
+    volume of memory.
+    """
+    from scipy import stats as sps
+
+    from fastfuncstuff.qc.checks import GLM_P_THR
+
+    best = None
+    n_pairs = 0
+    for ti, lab in enumerate(labels):
+        if not lab.endswith("_Tstat"):
+            continue
+        name = lab[: -len("_Tstat")]
+        if f"{name}_Coef" not in labels:
+            continue
+        code, par = stataux.get(ti, (0, ()))
+        dof = float(par[0]) if code == 3 and par else None
+        t = brick(ti)
+        thr = float(sps.t.isf(GLM_P_THR / 2, dof)) if dof else 3.29  # z at p=.001
+        n = int((mask & (np.abs(t) >= thr)).sum())
+        n_pairs += 1
+        if best is None or n > best[0]:
+            best = (n, name, ti, dof)
+    if best is None:
+        return None
+    _, name, ti, dof = best
+    why = (
+        f"most voxels past p < {GLM_P_THR:g} of {n_pairs} Coef/Tstat pairs"
+        if n_pairs > 1
+        else "the bucket's only Coef/Tstat pair"
+    )
+    return {
+        "coef": brick(labels.index(f"{name}_Coef")),
+        "tstat": brick(ti),
+        "t_dof": dof,
+        "coef_label": f"{name}_Coef",
+        "coef_why": why,
+    }
 
 
 def _resolve_written_bucket(buck: str | None) -> str | None:

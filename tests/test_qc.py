@@ -324,6 +324,89 @@ def test_glm_check_flags_task_correlated_motion(tmp_path):
     assert {f["check"] for f in rec.figures} == {"design", "fstat"}
 
 
+def test_glm_maps_threshold_and_land_on_the_underlay(tmp_path):
+    """F and Coef are drawn at p < .001 over an anatomy on a FINER grid: the stats
+    must be resampled into place, and only suprathreshold voxels counted."""
+    info = {
+        "matrix": np.column_stack([np.ones(60), np.tile([0.0] * 5 + [1.0] * 5, 6)]),
+        "column_labels": ["Run#1Pol#0", "task#0"],
+        "column_groups": [-1, 1],
+        "run_starts": [0],
+    }
+    f = np.ones((6, 8, 8), np.float32)  # F(1, 58): p=.001 at F ~ 12.0
+    f[2:4, 2:6, 2:6] = 40.0
+    t = np.sign(f - 2) * np.sqrt(f)
+    t[3, 2:6, 2:6] *= -1  # half the active voxels negative: two-sided gate
+    coef = np.where(np.abs(t) > 3, 2.0 * np.sign(t), 0.1).astype(np.float32)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    und = np.zeros((12, 16, 16), np.float32)
+    und[2:10, 2:14, 2:14] = 100.0  # 1.5 mm anatomy over the same FOV
+    rec = _rec(tmp_path, "run-1", "reml")
+    checks.glm_check(
+        rec,
+        1,
+        info,
+        fstat=f,
+        affine=aff,
+        fstat_dof=(1, 58),
+        underlay=und,
+        underlay_affine=np.diag([1.5, 1.5, 1.5, 1.0]),
+        coef=coef,
+        tstat=t,
+        t_dof=58,
+        coef_label="task#0_Coef",
+    )
+    assert rec.metrics["fstat_frac_sig"].value == pytest.approx(32 / f.size)
+    assert rec.metrics["coef_frac_sig"].value == pytest.approx(32 / f.size)
+    assert [f["check"] for f in rec.figures] == ["design", "fstat", "coef"]
+    assert rec.figure_path(2, "fstat").exists() and rec.figure_path(3, "coef").exists()
+
+
+def _motion_run(tmp_path, label, scale, seed):
+    rng = np.random.default_rng(seed)
+    params = np.cumsum(scale * rng.standard_normal((40, 6)), axis=0)
+    enorm = np.r_[0, np.linalg.norm(np.diff(params, axis=0), axis=1)]
+    keep = (enorm < 0.5).astype(int)
+    rec = _rec(tmp_path, label)
+    checks.motion_check(rec, 1, params, tr=1.0, enorm=enorm, keep=keep, motion_limit=0.5)
+    rec.write(verb=0)
+    return enorm
+
+
+def test_report_draws_motion_across_runs(tmp_path):
+    for i, s in enumerate((0.02, 0.03, 0.3)):
+        e = _motion_run(tmp_path, f"run-{i + 1}", s, i)
+    (loaded,) = [r for r in load_records(tmp_path) if r["label"] == "run-3"]
+    assert loaded["series"]["enorm"] == pytest.approx(e, abs=1e-5)
+    out = build_report(tmp_path)
+    assert out["summaries"] == ["20.moco.00-motion_summary.runs.png"]
+    page = out["html"].read_text()
+    # The summary heads the moco section, before any single run's figure.
+    assert page.index("motion_summary.runs.png") < page.index("01-motion.run-1.png")
+    assert ">runs<" not in page  # figures only: no empty metrics row
+
+
+def test_report_puts_every_tsnr_on_one_scale(tmp_path):
+    for i, noise in enumerate((0.01, 0.04)):
+        checks.epi_check(
+            _rec(tmp_path, f"run-{i + 1}"),
+            2,
+            _brain_series(noise=noise),
+            np.diag([-3.0, -3.0, 3.0, 1.0]),
+            tr=2.0,
+            device="cpu",
+        )
+    from PIL import Image
+
+    def pixels(i):
+        return np.asarray(Image.open(tmp_path / f"20.moco.02-tsnr.run-{i}.png"), float)
+
+    before = pixels(2)
+    assert build_report(tmp_path)["tsnr_shared"] == 2
+    # Run 2 (4x the noise) was drawn on its own range; on the shared one it is dark.
+    assert pixels(2).mean() < before.mean()
+
+
 def test_column_roles_without_groups():
     info = {
         "matrix": np.zeros((5, 3)),
