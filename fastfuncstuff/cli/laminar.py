@@ -126,6 +126,30 @@ Read the tables in this order; each step decides whether the next one means anyt
    (sigma 0.13 Hz, B 2-5 Hz).  P(depth modulated) ignores the sign, so a
    comparison is non-directional however its two sides are ordered.
 
+TRANSFER (-transfer)
+
+  The default analysis says condition 2 is condition 1's INPUT with the self-
+  connection changed at some depths.  It has no way to say "the input arrived at
+  different depths": given such data it fits well and answers in gains of opposite
+  sign (simulated: drive moved from deep to superficial came back as B = +2.7,
+  -0.9, -13).  -transfer makes no claim about mechanism.  It fits condition 1 for
+  the physiology and the drive at each neuronal depth, then fits condition 2 for
+  its drive alone on that physiology, and reports both profiles and the difference.
+
+  Read it knowing that:
+    * condition 2's intervals assume condition 1's physiology is exactly right, so
+      they are too narrow, and are much narrower than condition 1's for that reason
+      alone.  Do not read the difference in widths as a difference in data quality.
+    * the neuronal time constant is carried too.  Condition 2 can differ in how
+      much input each depth gets and in nothing else; r2_2 well below r2_1 says the
+      carried model does not describe it.
+    * each profile on its own rests on the fitted vein slope (see WHAT NOT TO
+      BELIEVE).  The difference shares that error between its two sides and is the
+      safer thing to interpret.
+    * nothing here is a test.  There is no null model and no permutation p-value;
+      -models, -modulation, -free_energy, -hyperprior and the -null_* options do
+      not apply.
+
 THE DEVEINING OUTPUT
 
 _devein.tsv is the (N, K) pseudo-inverse of the fitted neuronal -> BOLD mixing.
@@ -260,6 +284,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "it. 'mu lam' fits an undershoot by neuronal inhibition, tau_* by slow venous "
                    "recovery, and data this short may not tell the two apart. Default: none, the "
                    "published model. F is comparable only between runs on the same curves.")  # fmt: skip
+    m.add_argument("-transfer", action="store_true",
+                   help="A different analysis, off by default: no modulation and no model "
+                   "comparison.  Fit the FIRST condition alone, then fit the second with the "
+                   "first one's physiology (vein slope, Grubb exponent, depth mapping, "
+                   "neuronal time constant) held fixed and only its drive at each depth "
+                   "free.  Writes {prefix}_laminar_transfer.tsv: a drive per depth for each "
+                   "condition and their difference.  For conditions that are not the same "
+                   "input at a different gain; see TRANSFER below.  Put the condition with "
+                   "more signal first.")  # fmt: skip
     m.add_argument("-free_energy", choices=("reference", "sum", "mean"), default="reference",
                    help="Which F an averaged model carries: 'reference' is the first K's, as "
                    "spm_dcm_bpa leaves it; 'sum'/'mean' accumulate over K.")  # fmt: skip
@@ -530,6 +563,70 @@ def _run_jobs(jobs, tasks, workers: int, verb: int, invert=_invert, summarise=_s
             bar.close()
 
 
+def _transfer_one(job):
+    from fastfuncstuff.laminar.transfer import fit_transfer
+
+    data_for_k, kernels, _targets, _names, kw = job
+    return fit_transfer(
+        data_for_k, kernels, free=kw["free"], max_iter=kw["max_iter"], rescue=kw["rescue"],
+        roi=kw["roi"], name=kw["name"], hemi=kw["hemi"],
+    )  # fmt: skip
+
+
+def _run_transfer(args, jobs, ks, t0: float) -> int:
+    """-transfer: one ROI per worker, since its second fit needs its first."""
+    from fastfuncstuff.laminar.transfer import write_transfer
+
+    workers = min(args.workers or max(1, __import__("os").cpu_count() // 2), len(jobs))
+    if args.verb >= 1:
+        print(f"ffs_laminar -transfer: {len(jobs)} ROI(s) x K = {ks}, two fits each")
+    bar = _inversion_bar(len(jobs), args.verb)
+    try:
+        if workers == 1:
+            _cpu_threads_only()
+            fits = []
+            for job in jobs:
+                fits.append(_transfer_one(job))
+                if bar is not None:
+                    bar.update(1)
+        else:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context(),
+                initializer=_cpu_worker,
+            ) as pool:  # fmt: skip
+                fits = []
+                for fit in pool.map(_transfer_one, jobs):
+                    fits.append(fit)
+                    if bar is not None:
+                        bar.update(1)
+    finally:
+        if bar is not None:
+            bar.close()
+    written = write_transfer(
+        args.prefix, fits,
+        provenance={"cond1": args.cond1, "cond2": args.cond2, "duration": args.duration,
+                    "K": ks, "free_params": args.free_params, "TE": args.TE, "B0": args.B0,
+                    "rescue": args.rescue, "hyperprior": "rows (each stage's own)",
+                    "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
+    )  # fmt: skip
+    for f in fits:
+        for w in f.warnings:
+            print(f"ffs_laminar: WARNING {f.name} ({f.hemi}): {w}", file=sys.stderr)
+    if args.verb >= 1:
+        for f in fits:
+            print(f"  {f.name} ({f.hemi}): drive difference (2 - 1) "
+                  + ", ".join(f"{d} {v:+.2f}±{e:.2f}" for d, v, e in zip(
+                      _names(args.N), f.difference, f.difference_sd, strict=True))
+                  + f"; r2 {f.r2[0].mean():.3f} / {f.r2[1].mean():.3f}")  # fmt: skip
+        for path in written:
+            print(f"  wrote {path}")
+        print(f"ffs_laminar: done in {time.time() - t0:.0f} s")
+    return 0
+
+
 def _cpu_threads_only() -> None:
     import torch
 
@@ -598,7 +695,24 @@ def main(argv: list[str] | None = None) -> int:
                 built.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
             return built
 
+        if args.transfer:
+            clash = [
+                flag for flag, on in (
+                    ("-models", bool(args.models)),
+                    ("-null_fit_prefix", bool(args.null_fit_prefix)),
+                    ("-null_cond1", bool(args.null_cond1)),
+                    ("-plots", args.plots),
+                    ("-modulation", args.modulation != ["event"]),
+                ) if on
+            ]  # fmt: skip
+            if clash:
+                raise ValueError(
+                    f"-transfer fits no modulation and compares no models, so "
+                    f"{', '.join(clash)} do not apply to it"
+                )
         jobs = build(one, two)
+        if args.transfer:
+            return _run_transfer(args, jobs, ks, t0)
         n_real = len(jobs)
         for job in jobs:  # the null replicates draw no curves
             job[4]["detail"] = args.plots
