@@ -21,6 +21,7 @@ be percent signal change (``ffs_deconvolve``'s default since it scales; not with
 from __future__ import annotations
 
 import csv
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,14 +134,56 @@ def _times_pair(
     return one, one
 
 
-def _scan_interval(t_first: np.ndarray, t_second: np.ndarray) -> float:
-    """The shared sample spacing, which is the model's scan interval.
+_P0_7T = P0()
 
-    Both grids must start at the event: it is placed on the response's first sample
-    (``onset_a = tr``), so a window that starts later would be modelled as if it
-    started at the onset. Refused rather than shifted -- the model integrates from
-    rest, so a curve whose beginning was never sampled is a tail it cannot generate,
-    not a delay it can absorb.
+#: Seconds of padding the reference puts between the two conditions (20 rows at its
+#: 1.6 s). The second block is modelled on top of whatever is left of the first
+#: response, while the data there is the second response alone, so the gap must be long
+#: enough for the first to have ended: counted in rows, knots 0.5 s apart left 10 s.
+MIN_GAP_SECONDS = 32.0
+REFERENCE_GAP_ROWS = 20
+
+#: The reference's microtime step (s). The model's own is the largest step no longer
+#: than this that divides the scan interval.
+MICROTIME_STEP = 0.05
+
+
+def _microtime_step(tr: float, starts: Sequence[float] = ()) -> float:
+    """The integration step for curves sampled ``tr`` apart and starting ``starts``
+    seconds after their events.
+
+    The integrator reads a scan at a whole number of steps and puts an event on one, so
+    a scan interval that is not a multiple of the step is read late by a different
+    amount at every sample: knots 0.67 s apart at the reference's 0.05 s were read
+    30-70 ms late in the first condition and 0-40 ms in the second, where a uniform
+    50 ms had cost 18 nats of free energy. The step is therefore ``tr / n`` -- exactly
+    the reference's whenever ``tr`` is a multiple of it -- with ``n`` raised a little
+    where that also lands the curves' start on a step (a window starting half a knot
+    spacing after the event wants an even ``n``).
+    """
+    n0 = max(1, math.ceil(tr / MICROTIME_STEP - 1e-9))
+    best, best_err = n0, math.inf
+    for n in range(n0, n0 + 8):
+        err = max((abs(s * n / tr - round(s * n / tr)) for s in starts), default=0.0)
+        if err < 1e-6:
+            best = n
+            break
+        if err < best_err:
+            best, best_err = n, err
+    dt = tr / best
+    return MICROTIME_STEP if abs(dt - MICROTIME_STEP) < 1e-12 else dt
+
+
+def _scan_interval(t_first: np.ndarray, t_second: np.ndarray) -> tuple[float, tuple[float, float]]:
+    """The shared sample spacing, which is the model's scan interval, and each grid's
+    first sample time after its event.
+
+    A grid need not start at the event. Knots aligned to the samples of a design whose
+    onsets all sit at one phase start a fraction of a TR after it, and the model reads
+    them there: the event is put that long before the first sample. A first sample more
+    than one spacing after the event is refused -- the model integrates from rest, so a
+    response whose rise was never sampled is a tail it has nothing to pin to. A grid
+    that starts before the event is fine; those samples are baseline.
     """
     steps = []
     for t in (t_first, t_second):
@@ -154,13 +197,19 @@ def _scan_interval(t_first: np.ndarray, t_second: np.ndarray) -> float:
             "scan interval of the model is the knot spacing, so it must be the same"
         )
     tr = steps[0]
+    starts = []
     for name, t in (("baseline", t_first), ("test", t_second)):
-        if abs(float(t[0])) > 1e-6 * max(tr, 1.0):
+        start = float(t[0])
+        if abs(start) <= 1e-6 * max(tr, 1.0):
+            start = 0.0
+        if start > tr * (1 + 1e-6):
             raise ValueError(
-                f"the {name} curves start {float(t[0]):g} s after the event, but the model "
-                "puts the event on the first sample; refit with a window that starts at 0"
+                f"the {name} curves start {start:g} s after the event, more than one sample "
+                f"spacing ({tr:g} s): the rise was never sampled; refit with a window that "
+                "starts at 0 (or within one spacing of the event)"
             )
-    return tr
+        starts.append(start)
+    return tr, (starts[0], starts[1])
 
 
 def _duration_pair(duration: float | Sequence[float]) -> tuple[float, float]:
@@ -186,7 +235,7 @@ def two_condition_data(
     *,
     duration: float | Sequence[float],
     n_neuronal: int = 3,
-    gap: int = 20,
+    gap: int | None = None,
     noise_sd: float = 0.1,
     seed: int = 20260918,
     delay_seconds: float | None = 0.0,
@@ -239,7 +288,7 @@ def two_condition_batch(
     *,
     duration: float | Sequence[float],
     n_neuronal: int = 3,
-    gap: int = 20,
+    gap: int | None = None,
     noise_sd: float = 0.1,
     seed: int = 20260918,
     delay_seconds: float | None = 0.0,
@@ -263,7 +312,8 @@ def two_condition_batch(
     ``times`` is one sample grid for both conditions, or ``(first, second)`` when
     they were sampled over different windows -- a 3 s and a 10 s stimulus need
     different lengths of response. The two must share a sample SPACING, which is the
-    model's scan interval, and both must start at the event. The blocks are then
+    model's scan interval, and start no more than one spacing after the event
+    (:func:`_scan_interval`). The blocks are then
     concatenated at their own lengths and ``rows`` marks each one's extent, so the
     second event's onset follows the first block's length rather than a shared one.
 
@@ -273,15 +323,21 @@ def two_condition_batch(
     is the published pulse, 0.1 s ending one sample after the event onset. In Faes et
     al. that is the fourth tone of a 1.6 s quartet at TR 1.6, the moment of the
     prediction violation: a property of that paradigm, needed only for parity.
-    ``(start, duration)`` gives seconds after the second onset."""
+    ``(start, duration)`` gives seconds after the second onset.
+
+    ``gap`` is the padding between the blocks in rows. Left ``None`` it is the
+    reference's 20, or as many as cover :data:`MIN_GAP_SECONDS` when the samples are
+    closer together than the reference's."""
     t_first, t_second = _times_pair(times)
-    tr = _scan_interval(t_first, t_second)
+    tr, (start_a, start_b) = _scan_interval(t_first, t_second)
     if first.shape[1] != len(t_first) or second.shape[1] != len(t_second):
         raise ValueError(
             f"curves of {first.shape[1]} and {second.shape[1]} samples do not match their "
             f"time grids of {len(t_first)} and {len(t_second)}"
         )
     n_b, _, k = first.shape
+    if gap is None:  # the reference's rows, or as many as cover its seconds
+        gap = max(REFERENCE_GAP_ROWS, math.ceil(MIN_GAP_SECONDS / tr - 1e-9))
     block = len(t_first) + 1  # one zero baseline row, then the first response
 
     rng = np.random.default_rng(seed)
@@ -296,14 +352,29 @@ def two_condition_batch(
     rows[1:block] = True
     rows[block + gap + 1 :] = True  # the rest is the second response, whatever its length
 
+    base_p0 = p0 if p0 is not None else P0()
+    if abs(B0 - 7.0) > 1e-6 and (base_p0.R2s_t, base_p0.R2s_v, base_p0.R2s_d, base_p0.r0v, base_p0.r0d) == (
+        _P0_7T.R2s_t, _P0_7T.R2s_v, _P0_7T.R2s_d, _P0_7T.r0v, _P0_7T.r0d
+    ):  # fmt: skip
+        import warnings
+
+        warnings.warn(
+            f"B0 = {B0:g} T scales only the susceptibility term of the BOLD equation; the "
+            "relaxation rates (R2s_t/v/d) and the intravascular slopes (r0v/r0d) are still "
+            "the 7 T values of Havlicek & Uludag (2020). Pass a P0 with that field's values.",
+            stacklevel=2,
+        )
     spec = ModelSpec(
         N=n_neuronal, K=k, n_inputs=2, n_mod=1, TE=TE, B0=B0, TR=tr, dtype=dtype,
-        p0=p0 if p0 is not None else P0(),  # e.g. pipeline.reference_p0(): the driver's baselines
+        dt=_microtime_step(tr, (start_a, start_b)),
+        p0=base_p0,  # e.g. pipeline.reference_p0(): the driver's baselines
     )  # fmt: skip
     from fastfuncstuff.laminar.integrate import build_input
 
-    onset_a = tr  # the event on the first response sample
-    onset_b = (block + gap + 1) * tr
+    # Row i is read at i * tr. The first response sample is row 1 (after the zero
+    # baseline row), `start` seconds after its event.
+    onset_a = tr - start_a
+    onset_b = (block + gap + 1) * tr - start_b
     n_micro = int(round(y.shape[1] * tr / spec.dt))
     dur_first, dur_test = _duration_pair(duration)
     if modulation == "event":
@@ -331,7 +402,7 @@ def two_condition_batch(
         u=u,
         spec=spec,
         integrate_kwargs=kwargs,
-        meta={"TR": tr, "K": k, "block": block, "gap": gap},
+        meta={"TR": tr, "K": k, "block": block, "gap": gap, "start": (start_a, start_b)},
     )
 
 

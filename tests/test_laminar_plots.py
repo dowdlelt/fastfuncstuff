@@ -87,6 +87,31 @@ def test_curve_pair_reads_each_condition_on_its_own_grid():
     assert np.array_equal(b["fit"][0], fit.detail.y_fine[29 * 4])
 
 
+def test_peak_profiles_follow_the_second_conditions_own_window(tmp_path):
+    from fastfuncstuff.laminar.pipeline import profile_pair, write_results
+
+    fit = fake_fit()
+    fit.rows[:] = False
+    fit.rows[1:4] = True
+    fit.rows[25:36] = True
+    fit.meta.update(block=4, gap=20)
+    fit.y_obs[:] = 0
+    fit.y_hat[:] = 0
+    # A late peak beyond the first condition's window must reach the profile table.
+    fit.y_obs[34] = 3.0
+    fit.y_hat[34] = 2.0
+    measured, _ = profile_pair(fit, 1)
+    np.testing.assert_array_equal(measured, 3.0)
+    prefix = str(tmp_path / "unequal")
+    write_results(prefix, [fit])
+    import csv
+
+    with open(f"{prefix}_laminar_profiles.tsv") as fh:
+        second = [r for r in csv.DictReader(fh, delimiter="\t") if r["condition"] == "2"]
+    assert all(float(r["measured_pct"]) == 3.0 for r in second)
+    assert all(float(r["fit_pct"]) == 2.0 for r in second)
+
+
 def test_the_page_marks_a_warned_fit_and_missing_data_is_a_plain_error(tmp_path):
     plot_roi(fake_fit(warn=True), tmp_path / "w.png")
     bare = fake_fit()

@@ -162,16 +162,95 @@ def test_duration_pair_is_validated():
         two_condition_batch(curves, curves, times, duration=(1.0, 0.0), gap=4)
 
 
-def test_a_window_that_starts_after_the_onset_is_refused():
-    """The event sits on the response's first sample, so a window starting at BOT > 0
-    used to produce a model bit-identical to the same curves at BOT = 0 -- the offset
-    was discarded and the response modelled as if it began at the event."""
+def test_a_window_that_starts_past_the_first_sample_is_refused():
+    """A first sample more than one spacing after the event leaves the rise unsampled.
+    (A start of BOT > 0 once produced a model bit-identical to BOT = 0: the offset was
+    discarded and the response modelled as if it began at the event.)"""
     from fastfuncstuff.laminar.io import two_condition_batch
 
     curves = np.zeros((1, 8, 3))
     two_condition_batch(curves, curves, np.arange(8) * 2.0, duration=1.0, gap=4)  # bot 0: fine
-    with pytest.raises(ValueError, match="start.*after the event|starts at 0"):
+    with pytest.raises(ValueError, match="more than one sample spacing"):
         two_condition_batch(curves, curves, np.arange(8) * 2.0 + 6.0, duration=1.0, gap=4)
+
+
+def _response(spec_like, seconds, duration, p0=None):
+    """The model's own response to one event, read every microtime step."""
+    from fastfuncstuff.laminar.experiment import faes_priors
+    from fastfuncstuff.laminar.integrate import build_input, integrate
+    from fastfuncstuff.laminar.params import ModelSpec
+
+    dt = spec_like.dt
+    fine = ModelSpec(N=3, K=spec_like.K, n_inputs=2, n_mod=1, TR=dt, dt=dt)
+    P = faes_priors(fine, (0, 0, 0)).pE
+    n = int(round(seconds / dt))
+    u = build_input(fine, [[], [0.0]], [[], [duration]], n)
+    return P, integrate(u, P, fine, n, delay_seconds=0.0, compile=False)
+
+
+@pytest.mark.parametrize("spacing", [0.67, 0.925, 1.6])
+def test_the_model_is_read_at_the_knot_times(spacing):
+    """Knots that are not a multiple of 50 ms apart were read at the next whole step,
+    30-70 ms late in the first block and 0-40 ms in the second at 0.67 s. The step now
+    divides the spacing, so the adapter's prediction is the response at the knot times."""
+    from fastfuncstuff.laminar.integrate import integrate
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    n_t = 4
+    curves = np.zeros((1, n_t, 3))
+    data = two_condition_batch(curves, curves, np.arange(n_t) * spacing, duration=1.0, gap=3)
+    steps = data.spec.TR / data.spec.dt
+    assert abs(steps - round(steps)) < 1e-9 and data.spec.dt <= 0.05 + 1e-12
+    if spacing == 1.6:
+        assert data.spec.dt == 0.05  # the reference's step, to the bit
+    P, fine = _response(data.spec, n_t * spacing, 1.0)
+    got = integrate(data.u, P, data.spec, data.y.shape[1], compile=False, **data.integrate_kwargs)
+    per = int(round(steps))
+    block = data.meta["block"]
+    want = fine[::per][:n_t]
+    torch.testing.assert_close(got[1:block], want, rtol=0, atol=1e-10)
+    # ... and the second event sits a whole number of steps before its own first sample
+    drive = data.u[:, 1].numpy()
+    second_onset = int(np.flatnonzero(np.diff(drive) > 0)[-1]) + 1
+    assert second_onset == (block + 3 + 1) * per
+
+
+def test_the_gap_between_conditions_is_long_enough_in_seconds():
+    """The padding is 20 rows in the reference, 32 s at its 1.6 s. Knots 0.5 s apart
+    made that 10 s, and the second block was fitted on top of the first response's
+    tail."""
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    curves = np.zeros((1, 6, 3))
+    assert two_condition_batch(curves, curves, np.arange(6) * 1.6, duration=1.0).meta["gap"] == 20
+    assert two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0).meta["gap"] == 20
+    fine = two_condition_batch(curves, curves, np.arange(6) * 0.5, duration=1.0)
+    assert fine.meta["gap"] == 64 and int((~fine.rows).sum()) == 64 + 2
+    # a count that was asked for is kept
+    assert (
+        two_condition_batch(curves, curves, np.arange(6) * 0.5, duration=1.0, gap=20).meta["gap"]
+        == 20
+    )
+
+
+def test_curves_may_start_a_fraction_of_a_sample_after_the_event():
+    """Knots aligned to the samples of an all-mid-TR design start half a TR after the
+    event. The event is put that long before the first sample, so the model is read at
+    the knots' true lags rather than as if the curve began at the onset."""
+    from fastfuncstuff.laminar.integrate import integrate
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    tr, n_t = 2.0, 3
+    times = tr / 2 + np.arange(n_t) * tr
+    curves = np.zeros((1, n_t, 3))
+    data = two_condition_batch(curves, curves, times, duration=1.0, gap=3)
+    assert data.meta["start"] == (1.0, 1.0)
+    P, fine = _response(data.spec, times[-1] + tr, 1.0)
+    got = integrate(data.u, P, data.spec, data.y.shape[1], compile=False, **data.integrate_kwargs)
+    at = np.round(times / data.spec.dt).astype(int)
+    block = data.meta["block"]
+    torch.testing.assert_close(got[1:block], fine[at], rtol=0, atol=1e-10)
+    assert float(got[1].abs().max()) > 1e-3  # half a TR in, the response has begun
 
 
 def test_two_conditions_can_be_sampled_over_different_windows():
@@ -221,3 +300,18 @@ def test_curves_must_match_their_time_grid():
             np.zeros((1, 8, 3)), np.zeros((1, 8, 3)),
             (np.arange(8) * 2.0, np.arange(13) * 2.0), duration=1.0, gap=4,
         )  # fmt: skip
+
+
+def test_another_field_strength_warns_that_the_relaxation_constants_are_7t():
+    """-B0 reaches only the susceptibility frequency; R2* and r0 stay Havlicek & Uludag's
+    7 T values, so another field without its own constants is an inconsistent model."""
+    import warnings
+
+    from fastfuncstuff.laminar.io import two_condition_batch
+
+    curves = np.zeros((1, 6, 3))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4)
+    with pytest.warns(UserWarning, match="7 T values"):
+        two_condition_batch(curves, curves, np.arange(6) * 2.0, duration=1.0, gap=4, B0=3.0)

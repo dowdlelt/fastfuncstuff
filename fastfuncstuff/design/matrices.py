@@ -850,10 +850,18 @@ def basis_tent(x: torch.Tensor, bot: float, mid: float, top: float) -> torch.Ten
 
 def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
     """
-    Cubic spline basis function (cardinal B-spline)
+    Cardinal cubic spline basis function centred at ``knots[idx]`` (AFNI CSPLIN).
 
-    Evaluates a cubic B-spline basis centered at knots[idx].
-    This is a piecewise cubic polynomial with C² continuity.
+    A port of ``hh_csplin`` / ``basis_csplin`` in AFNI's ``3dDeconvolve.c``: the cubic
+    convolution kernel with slope -1/2 at one knot spacing from its centre. It is 1 at
+    its own knot and 0 at every other knot, so a coefficient IS the response at that
+    knot's time, as with TENT. Support is two knot spacings either side, cut at the ends
+    of the knot range (the response is zero outside its window).
+
+    Bug of record: until 2026-11-10 this was a cubic B-spline scaled by 1.5. That is 1
+    at its own knot but 0.25 at each neighbour, so the fitted curve at a knot was
+    ``b[k] + 0.25 * (b[k-1] + b[k+1])`` and the coefficients written as the response
+    read about 2/3 of it (0.66-0.85 of the true peak in simulation).
 
     Parameters
     ----------
@@ -863,66 +871,44 @@ def basis_csplin(x: torch.Tensor, knots: list[float], idx: int) -> torch.Tensor:
         All knot positions (must be equally spaced)
     idx : int
         Index of center knot for this basis function
-
-    Returns
-    -------
-    values : torch.Tensor
-        Cubic spline basis values at each x
-
-    Notes
-    -----
-    Cubic B-spline basis has support over 4 intervals:
-    - Non-zero from knots[idx-2] to knots[idx+2]
-    - Value = 1 at knots[idx]
-    - C² continuous everywhere
-
-    This provides smoother interpolation than TENT (piecewise linear).
-    Parameters still represent HRF values at knots (cardinal interpolation).
-
-    References
-    ----------
-    AFNI 3dDeconvolve CSPLIN implementation
-    de Boor, "A Practical Guide to Splines" (2001)
     """
     n_knots = len(knots)
-
-    # Handle edge cases
-    if idx < 0 or idx >= n_knots:
+    if idx < 0 or idx >= n_knots or n_knots < 2:
         return torch.zeros_like(x)
 
-    # Get knot spacing (assume uniform)
-    if n_knots > 1:
-        dx = knots[1] - knots[0]
-    else:
-        return torch.zeros_like(x)
+    dx = knots[1] - knots[0]
+    y = torch.abs((x - knots[idx]) / dx)
+    ca = 0.5  # AFNI's CA: the negative of the kernel's slope at |y| = 1
+    inner = 1.0 + y * y * ((2.0 - ca) * y - (3.0 - ca))
+    outer = -ca * (-4.0 + y * (8.0 + y * (-5.0 + y)))
+    val = torch.where(y < 1.0, inner, torch.where(y < 2.0, outer, torch.zeros_like(y)))
+    # AFNI's edge flags cut each function at the first and last knot, with its tolerance.
+    tol = 0.0009 * dx
+    inside = (x >= knots[0] - tol) & (x <= knots[-1] + tol)
+    return torch.where(inside, val, torch.zeros_like(val))
 
-    # Center position
-    x_center = knots[idx]
 
-    # Normalized distance from center: t = (x - x_center) / dx
-    t = (x - x_center) / dx
-
-    # Cubic B-spline is non-zero for |t| < 2
-    val = torch.zeros_like(x)
-
-    # Use standard cubic B-spline formula (normalized)
-    # Split into 4 regions based on |t|
-
-    # Region 1: 0 <= |t| < 1 (central peak)
-    mask1 = torch.abs(t) < 1.0
-    t1 = torch.abs(t[mask1])
-    val[mask1] = (2.0 / 3.0) - t1**2 + 0.5 * t1**3
-
-    # Region 2: 1 <= |t| < 2 (tails)
-    mask2 = (torch.abs(t) >= 1.0) & (torch.abs(t) < 2.0)
-    t2 = torch.abs(t[mask2])
-    val[mask2] = (2.0 - t2) ** 3 / 6.0
-
-    # Normalize so peak value = 1.0 (for cardinal interpolation)
-    # Peak of cubic B-spline is 2/3, so multiply by 3/2
-    val = val * 1.5
-
-    return val
+def _event_knot_coordinates(
+    onsets: list[float],
+    bot: float,
+    knot_dt: float,
+    tr: float,
+    n_timepoints: int,
+    microtime_offset: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Event-relative sample times, in knot spacings from the window start."""
+    # Subtracting float32 absolute times erodes late-run precision; at AFNI's
+    # narrow edge tents this attenuated aligned coefficients by 13% at TR 4000.
+    # Split the clock on the host, then subtract integer sample indices before
+    # scaling on-device. This also keeps MPS in float32 without losing alignment.
+    clock = (np.asarray(onsets, dtype=np.float64) + bot - microtime_offset) / tr
+    anchor = np.rint(clock)
+    phase = (clock - anchor) * (tr / knot_dt)
+    samples = torch.arange(n_timepoints, device=device, dtype=torch.float32)
+    anchors = torch.tensor(anchor, device=device, dtype=torch.float32)
+    phases = torch.tensor(phase, device=device, dtype=torch.float32)
+    return (samples[:, None] - anchors[None, :]) * (tr / knot_dt) - phases[None, :]
 
 
 def make_tent_design(
@@ -1036,11 +1022,6 @@ def make_tent_design(
     # Pre-allocate design matrix
     design = torch.zeros(n_timepoints, n_actual_basis, device=device)
 
-    # Create time vector for each TR (in seconds)
-    tr_times = (
-        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
-    )
-
     # Combine all onset times from all conditions
     all_onset_times = []
     for onset_array in onset_times_list:
@@ -1049,8 +1030,9 @@ def make_tent_design(
     if len(all_onset_times) == 0:
         return design
 
-    # Convert to tensor
-    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
+    rel_times = _event_knot_coordinates(
+        all_onset_times, bot, dt, tr, n_timepoints, microtime_offset, device
+    )
 
     # For each basis function
     basis_col_idx = 0
@@ -1058,24 +1040,19 @@ def make_tent_design(
         # Tent edges (matching AFNI exactly)
         if basis_idx == 0:
             # First tent: slightly before bot to bot+dt
-            tent_bot = bot - 0.00111 * dt
-            tent_mid = bot
-            tent_top = bot + dt
+            tent_bot = -0.00111
+            tent_mid = 0.0
+            tent_top = 1.0
         elif basis_idx == n_basis - 1:
             # Last tent: (top-dt) to slightly after top
-            tent_bot = top - dt
-            tent_mid = top
-            tent_top = top + 0.00111 * dt
+            tent_bot = n_basis - 2.0
+            tent_mid = n_basis - 1.0
+            tent_top = n_basis - 1.0 + 0.00111
         else:
             # Middle tents: standard spacing
-            tent_bot = bot + (basis_idx - 1) * dt
-            tent_mid = bot + basis_idx * dt
-            tent_top = bot + (basis_idx + 1) * dt
-
-        # Vectorized: compute relative time for every (TR, onset) pair at once
-        # tr_times: (n_tp,), onset_times_tensor: (n_onsets,)
-        # rel_times: (n_tp, n_onsets) - time of each TR relative to each onset
-        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
+            tent_bot = basis_idx - 1.0
+            tent_mid = float(basis_idx)
+            tent_top = basis_idx + 1.0
 
         # Evaluate tent basis on the full (n_tp, n_onsets) matrix, sum over onsets
         design[:, basis_col_idx] = basis_tent(rel_times, tent_bot, tent_mid, tent_top).sum(dim=1)
@@ -1165,7 +1142,7 @@ def make_csplin_design(
     dx = (top - bot) / (n_basis - 1)
 
     # Create knot positions
-    knots = [bot + i * dx for i in range(n_basis)]
+    knots = [float(i) for i in range(n_basis)]
 
     # Determine actual number of basis functions
     if zero_edges:
@@ -1188,20 +1165,13 @@ def make_csplin_design(
     if len(all_onset_times) == 0:
         return design
 
-    onset_times_tensor = torch.tensor(all_onset_times, device=device, dtype=torch.float32)
-
-    # Create time vector for each TR (in seconds)
-    tr_times = (
-        torch.arange(n_timepoints, device=device, dtype=torch.float32) * tr + microtime_offset
+    rel_times = _event_knot_coordinates(
+        all_onset_times, bot, dx, tr, n_timepoints, microtime_offset, device
     )
 
     # For each basis function
     basis_col_idx = 0
     for basis_idx in range(first_basis_idx, last_basis_idx):
-        # Vectorized: compute relative time for every (TR, onset) pair at once
-        # rel_times: (n_tp, n_onsets)
-        rel_times = tr_times.unsqueeze(1) - onset_times_tensor.unsqueeze(0)
-
         # Evaluate cubic spline basis on full matrix, sum over onsets
         design[:, basis_col_idx] = basis_csplin(rel_times, knots, basis_idx).sum(dim=1)
 

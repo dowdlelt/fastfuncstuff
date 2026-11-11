@@ -114,7 +114,9 @@ class RoiFit:
     model_local: np.ndarray | None = None
 
 
-def _condition_slices(meta: dict) -> list[slice]:
+def _condition_slices(meta: dict, rows: np.ndarray | None = None) -> list[slice]:
+    if rows is not None:
+        return [slice(start, stop) for start, stop in condition_blocks(rows)]
     block, gap = int(meta["block"]), int(meta["gap"])
     return [slice(1, block), slice(block + gap + 1, block + gap + block)]
 
@@ -138,7 +140,10 @@ def _model_local(data: LaminarData, res, kernel, ikw: dict) -> np.ndarray:
     fit = res.y_pred.numpy()
     k = np.arange(fit.shape[1])
     return np.stack(
-        [own[sl.start + np.abs(fit[sl]).argmax(axis=0), k] for sl in _condition_slices(data.meta)]
+        [
+            own[sl.start + np.abs(fit[sl]).argmax(axis=0), k]
+            for sl in _condition_slices(data.meta, data.rows.numpy())
+        ]
     )
 
 
@@ -281,7 +286,7 @@ def summarise_roi(
         p_model=p_model, p_depth=p_depth, best=best, B_mean=b_mean, B_sd=b_sd, B_p=b_p,
         r2=r2, neuronal=dev.neuronal.numpy(), W=W.numpy(), W_inv=W_inv.numpy(),
         meta={"TR": first.meta.get("TR"), "block": first.meta.get("block"),
-              "gap": first.meta.get("gap"), "converged": [bool(r[0].converged) for r in per_k],
+              "gap": first.meta.get("gap"), "start": first.meta.get("start", (0.0, 0.0)), "converged": [bool(r[0].converged) for r in per_k],
               "posterior": _time_constants(spec0, res0.Ep)},
         y_obs=first.y.numpy().copy(), y_hat=res0.y_pred.numpy().copy(), rows=rows.copy(),
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
@@ -422,7 +427,7 @@ def profile_pair(fit: RoiFit, which: int) -> tuple[np.ndarray, np.ndarray]:
     """
     from fastfuncstuff.laminar.devein import local_contribution
 
-    sl = _condition_slices(fit.meta)[which]
+    sl = _condition_slices(fit.meta, fit.rows)[which]
     if fit.y_obs is None:
         raise ValueError("this fit kept no data; profiles need y_obs")
     measured = _peak(fit.y_obs[sl])
@@ -455,9 +460,10 @@ def curve_pair(fit: RoiFit, which: int) -> dict[str, np.ndarray]:
     knots = d.y_obs[start:stop]
     line = d.y_fine[start * m : (stop - 1) * m + 1]
     tr = float(fit.meta["TR"])
+    t0 = float(fit.meta.get("start", (0.0, 0.0))[which])
     return {
-        "t_knots": np.arange(len(knots)) * tr,
-        "t_fine": np.arange(len(line)) * tr / m,
+        "t_knots": t0 + np.arange(len(knots)) * tr,
+        "t_fine": t0 + np.arange(len(line)) * tr / m,
         "measured": knots,
         "measured_deveined": local_contribution(d.W, knots, d.W_inv),
         "fit": line,
@@ -529,12 +535,14 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
         for f in fits:
             tr, block, gap = f.meta["TR"], f.meta["block"], f.meta["gap"]
             starts = {"1": 1, "2": block + gap + 1}
+            first_sample = dict(zip(starts, f.meta.get("start", (0.0, 0.0)), strict=True))
             n_t = block - 1
             for cond, s0 in starts.items():
                 for t in range(n_t):
                     for i, d in enumerate(depth_names(f.neuronal.shape[1])):
                         fh.write(
-                            f"{f.roi}\t{f.name}\t{f.hemi}\t{cond}\t{t * tr:.6g}\t{d}\t"
+                            f"{f.roi}\t{f.name}\t{f.hemi}\t{cond}\t"
+                            f"{first_sample[cond] + t * tr:.6g}\t{d}\t"
                             f"{f.neuronal[s0 + t, i]:.6g}\n"
                         )
     # Peak depth profile, measured and deveined, both in percent -- the eyeball check
@@ -549,7 +557,7 @@ def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = Non
             for which in (0, 1):
                 meas, dev = profile_pair(f, which)
                 k = len(meas)
-                fitted = _peak(f.y_hat[_condition_slices(f.meta)[which]])
+                fitted = _peak(f.y_hat[_condition_slices(f.meta, f.rows)[which]])
                 for i in range(k):  # array index 0 is superficial; depth K is pial
                     frac = 1.0 - i / max(k - 1, 1)  # 0 at white matter, 1 at pial
                     fh.write(

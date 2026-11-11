@@ -88,6 +88,49 @@ class TestBasisCsplin:
         val = basis_csplin(x, knots, idx=2)
         assert abs(val.item() - 1.0) < 0.01
 
+    def test_cardinal_at_every_knot(self):
+        """1 at its own knot and 0 at the others, so coefficients are curve values.
+
+        The basis used to be a scaled B-spline, 0.25 at each neighbouring knot, and the
+        coefficients written as the response read about 2/3 of the fitted curve."""
+        knots = [0.0, 1.5, 3.0, 4.5, 6.0, 7.5]
+        x = torch.tensor(knots, dtype=torch.float64)
+        got = torch.stack([basis_csplin(x, knots, idx=i) for i in range(len(knots))])
+        torch.testing.assert_close(
+            got, torch.eye(len(knots), dtype=torch.float64), rtol=0, atol=1e-12
+        )
+
+    def test_matches_afni_kernel(self):
+        """hh_csplin of 3dDeconvolve.c (CA = 0.5), and its cut at the window's ends."""
+        knots = [0.0, 1.0, 2.0, 3.0, 4.0]
+        x = torch.tensor([1.5, 2.5, 3.5, 0.5, -0.5, 4.5], dtype=torch.float64)
+        val = basis_csplin(x, knots, idx=2)
+        # |y| = 0.5 -> 1 + .25*(1.5*.5 - 2.5) = 0.5625 ; |y| = 1.5 -> -.5*(-4+1.5*(8+1.5*-3.5)) = -0.0625
+        want = torch.tensor([0.5625, 0.5625, -0.0625, -0.0625, 0.0, 0.0], dtype=torch.float64)
+        torch.testing.assert_close(val, want, rtol=0, atol=1e-12)
+        # the edge function is one-sided: nothing before the first knot
+        edge = basis_csplin(torch.tensor([-0.5, 0.5], dtype=torch.float64), knots, idx=0)
+        torch.testing.assert_close(
+            edge, torch.tensor([0.0, 0.5625], dtype=torch.float64), rtol=0, atol=1e-12
+        )
+
+    def test_fitted_coefficients_are_the_curve(self):
+        """A smooth response fitted through the design comes back at its knot values."""
+        knots = np.linspace(0.0, 12.0, 9)
+        onsets = [np.arange(40) * 15.0 + np.random.default_rng(0).uniform(0, 3, 40)]
+        tr, n_tp = 1.0, 620
+        design = make_csplin_design(
+            onsets, bot=0.0, top=12.0, tr=tr, n_timepoints=n_tp, n_basis=9, device=DEVICE
+        ).double()
+
+        def h(t):
+            return np.where((t >= 0) & (t <= 12), np.sin(np.pi * t / 12.0) ** 2, 0.0)
+
+        t = np.arange(n_tp) * tr
+        y = torch.as_tensor(sum(h(t - o) for o in onsets[0]))
+        beta = torch.linalg.lstsq(design, y[:, None]).solution[:, 0]
+        assert np.abs(beta.numpy() - h(knots)).max() < 0.03
+
     def test_zero_far_from_center(self):
         """Should be zero far from the center knot."""
         knots = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]

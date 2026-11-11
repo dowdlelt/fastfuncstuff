@@ -214,10 +214,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "The two responses are fitted as one series, separated by rows of noise the fit "
         "ignores: the padding exists so the model returns to baseline between the "
         "responses instead of bridging them.  Each row is one sample of the curves (the "
-        "TENT knot spacing), so the default 20 rows is 20 knots of quiet.",
+        "TENT knot spacing): 20 rows by default, as in the reference, or as many as cover "
+        "its 32 s when the knots are closer together than its 1.6 s.",
     )
-    pad.add_argument("-pad_rows", "-gap", dest="pad_rows", type=int, default=20, metavar="N",
-                     help="Rows of padding between the conditions (default 20, the reference's).")  # fmt: skip
+    pad.add_argument("-pad_rows", "-gap", dest="pad_rows", type=int, default=None, metavar="N",
+                     help="Rows of padding between the conditions (default: 20, the reference's, "
+                     "or enough to cover 32 s).  The second response is modelled on top of what is "
+                     "left of the first, so too short a gap biases it.")  # fmt: skip
     pad.add_argument("-pad_sd", type=float, default=0.1, metavar="PCT",
                      help="Standard deviation of the padding noise, in percent signal change "
                      "(default 0.1, the reference's).")  # fmt: skip
@@ -634,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
                     "K": ks, "psf": psf, "psf_matrix": args.psf_matrix,
                     "psf_kernel": args.psf_kernel, "psf_variance": args.psf_variance,
                     "psf_raw": args.psf_raw, "models": names,
-                    "padding": {"rows": args.pad_rows, "sd": args.pad_sd, "seed": args.pad_seed,
+                    "padding": {"rows": fits[0].meta.get("gap") if fits else args.pad_rows, "sd": args.pad_sd, "seed": args.pad_seed,
                                 "hyperprior": args.hyperprior}, "free_energy": args.free_energy,
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
                     "modulation": modulation, "free_params": args.free_params,

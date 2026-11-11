@@ -569,9 +569,11 @@ def choose_global_lambda(
     OLS or under ``rule`` (REML/GCV, lambda from the training runs only), so
     neither the smoothed nor the unsmoothed fit decides alone.  Taking the
     median over them keeps the choice from being set by the noise voxels,
-    which outnumber them and all prefer heavy smoothing.  One scalar chosen
-    from many voxels carries negligible selection bias, and applying it
-    everywhere makes the fit a linear estimator.  One pass over the data:
+    which outnumber them and all prefer heavy smoothing. Conditional on the
+    selected lambda, the fit is linear and uses the same operator for every
+    voxel. Selection itself is data-dependent: the whole procedure is not
+    linear, and a shared lambda does not guarantee unbiased depth profiles.
+    One pass over the data:
     every fold's held-out error at every grid lambda is a closed form.
     """
     if device is not None:

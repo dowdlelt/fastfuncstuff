@@ -1,0 +1,209 @@
+{
+  "architecture": {
+    "ref_arch_id": "linux-x86_64",
+    "ffs_arch_id": "cpu",
+    "requested_device": "auto",
+    "os": "linux",
+    "cpu_arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) W-2133 CPU @ 3.60GHz",
+    "n_logical_cores": 12,
+    "n_physical_cores": 6,
+    "python": "3.14.6",
+    "torch": "2.14.1+cu130",
+    "omp_num_threads": "4"
+  },
+  "git": {
+    "commit": "f06340fbef2a61856a49ebd37fb5809e8dab4b73",
+    "commit_short": "f06340fb",
+    "branch": "review/laminar-curves",
+    "message": "Respect each laminar condition window when reporting peaks",
+    "dirty": true,
+    "source_root": "/home/logan/Dropbox/Resources/code/fastfuncstuff"
+  },
+  "stages": {
+    "glm_tent": {
+      "passed": true,
+      "summary": "temporal median_r min=1.0000 (thr=0.95), spatial_mid min_r=1.0000 (thr=0.95)",
+      "ref_seconds": 26.955588525161147,
+      "ffs_seconds": 9.476311856880784,
+      "validation": {
+        "passed": true,
+        "summary": "temporal median_r min=1.0000 (thr=0.95), spatial_mid min_r=1.0000 (thr=0.95)",
+        "per_condition": {
+          "faces": {
+            "temporal_median_r": 0.9999998807907104,
+            "spatial_middle_r": 0.9999999789266596,
+            "n_basis_a": 11,
+            "n_basis_b": 11,
+            "n_voxels": 67082
+          },
+          "bodies": {
+            "temporal_median_r": 0.9999998807907104,
+            "spatial_middle_r": 0.9999999824056593,
+            "n_basis_a": 11,
+            "n_basis_b": 11,
+            "n_voxels": 67082
+          },
+          "objects": {
+            "temporal_median_r": 0.9999998211860657,
+            "spatial_middle_r": 0.9999999771559451,
+            "n_basis_a": 11,
+            "n_basis_b": 11,
+            "n_voxels": 67082
+          },
+          "scenes": {
+            "temporal_median_r": 0.9999998211860657,
+            "spatial_middle_r": 0.9999999749246011,
+            "n_basis_a": 11,
+            "n_basis_b": 11,
+            "n_voxels": 67082
+          },
+          "scrambled": {
+            "temporal_median_r": 0.9999998211860657,
+            "spatial_middle_r": 0.9999999815632231,
+            "n_basis_a": 11,
+            "n_basis_b": 11,
+            "n_voxels": 67082
+          }
+        },
+        "temporal_medians": [
+          0.9999998807907104,
+          0.9999998807907104,
+          0.9999998211860657,
+          0.9999998211860657,
+          0.9999998211860657
+        ],
+        "spatial_middles": [
+          0.9999999789266596,
+          0.9999999824056593,
+          0.9999999771559451,
+          0.9999999749246011,
+          0.9999999815632231
+        ]
+      },
+      "errors": [],
+      "metrics": {
+        "per_condition.faces.temporal_median_r": 0.9999998807907104,
+        "per_condition.faces.spatial_middle_r": 0.9999999789266596,
+        "per_condition.faces.n_basis_a": 11.0,
+        "per_condition.faces.n_basis_b": 11.0,
+        "per_condition.faces.n_voxels": 67082.0,
+        "per_condition.bodies.temporal_median_r": 0.9999998807907104,
+        "per_condition.bodies.spatial_middle_r": 0.9999999824056593,
+        "per_condition.bodies.n_basis_a": 11.0,
+        "per_condition.bodies.n_basis_b": 11.0,
+        "per_condition.bodies.n_voxels": 67082.0,
+        "per_condition.objects.temporal_median_r": 0.9999998211860657,
+        "per_condition.objects.spatial_middle_r": 0.9999999771559451,
+        "per_condition.objects.n_basis_a": 11.0,
+        "per_condition.objects.n_basis_b": 11.0,
+        "per_condition.objects.n_voxels": 67082.0,
+        "per_condition.scenes.temporal_median_r": 0.9999998211860657,
+        "per_condition.scenes.spatial_middle_r": 0.9999999749246011,
+        "per_condition.scenes.n_basis_a": 11.0,
+        "per_condition.scenes.n_basis_b": 11.0,
+        "per_condition.scenes.n_voxels": 67082.0,
+        "per_condition.scrambled.temporal_median_r": 0.9999998211860657,
+        "per_condition.scrambled.spatial_middle_r": 0.9999999815632231,
+        "per_condition.scrambled.n_basis_a": 11.0,
+        "per_condition.scrambled.n_basis_b": 11.0,
+        "per_condition.scrambled.n_voxels": 67082.0,
+        "temporal_medians[0]": 0.9999998807907104,
+        "temporal_medians[1]": 0.9999998807907104,
+        "temporal_medians[2]": 0.9999998211860657,
+        "temporal_medians[3]": 0.9999998211860657,
+        "temporal_medians[4]": 0.9999998211860657,
+        "temporal_medians.mean": 0.9999998450279236,
+        "temporal_medians.min": 0.9999998211860657,
+        "temporal_medians.max": 0.9999998807907104,
+        "spatial_middles[0]": 0.9999999789266596,
+        "spatial_middles[1]": 0.9999999824056593,
+        "spatial_middles[2]": 0.9999999771559451,
+        "spatial_middles[3]": 0.9999999749246011,
+        "spatial_middles[4]": 0.9999999815632231,
+        "spatial_middles.mean": 0.9999999789952178,
+        "spatial_middles.min": 0.9999999749246011,
+        "spatial_middles.max": 0.9999999824056593
+      }
+    }
+  },
+  "config": {
+    "dataset_id": "ds005165",
+    "subject": "01",
+    "session": "01",
+    "tasks": {
+      "localizer": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "rest": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "stages": [
+      "moco",
+      "slicetime",
+      "crossalign",
+      "align",
+      "warp",
+      "glm",
+      "build_design",
+      "ica",
+      "ica_single",
+      "automask",
+      "glmsingle_prep",
+      "glmsingle_matlab",
+      "glmsingle_hrf",
+      "glmsingle_denoise",
+      "glmsingle_ridge",
+      "glm_tent",
+      "glm_im",
+      "glm_im_reml",
+      "phasereg"
+    ],
+    "stage_params": {
+      "glm": {
+        "primary_task": "localizer",
+        "stim_labels": [
+          "faces",
+          "bodies",
+          "objects",
+          "scenes",
+          "scrambled"
+        ],
+        "glts": [
+          [
+            "faces_vs_objects",
+            "+1*faces -1*objects"
+          ],
+          [
+            "faces_vs_scenes",
+            "+1*faces -1*scenes"
+          ],
+          [
+            "faces_vs_scrambled",
+            "+1*faces -1*scrambled"
+          ]
+        ],
+        "hrf_model": "SPMG1(3)"
+      },
+      "ica": {
+        "tasks": [
+          "rest",
+          "localizer"
+        ]
+      },
+      "crossalign": {
+        "reference_task": "localizer",
+        "reference_run": 1
+      }
+    }
+  }
+}

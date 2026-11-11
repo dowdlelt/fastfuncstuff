@@ -484,7 +484,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "their best point. On real columns half stalled somewhere without it, and a "
                    "stalled model can score hundreds of nats below a model it contains. 0 is "
                    "the published scheme (ffs_laminar's default).")  # fmt: skip
-    m.add_argument("-pad_rows", type=int, default=20, metavar="N")
+    m.add_argument("-pad_rows", type=int, default=None, metavar="N",
+                   help="Rows of padding between the conditions (default: 20, or enough to "
+                   "cover 32 s when the knots are closer together than 1.6 s).")  # fmt: skip
     m.add_argument("-pad_sd", type=float, default=0.1, metavar="PCT")
     m.add_argument("-pad_seed", type=int, default=20260918, metavar="N")
     m.add_argument("-hyperprior", choices=("reference", "rows"), default="reference")
