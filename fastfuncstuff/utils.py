@@ -661,6 +661,75 @@ def to_tensor(
     return x
 
 
+def cgroup_cpu_quota(
+    proc_cgroup: str = "/proc/self/cgroup", root: str = "/sys/fs/cgroup"
+) -> float | None:
+    """CPUs of *time* the kernel will give this process, or ``None`` if unlimited.
+
+    A container (Kubernetes, Docker ``--cpus``, a systemd slice) limits CPU by
+    quota, not by hiding cores: ``nproc`` and the affinity mask still show the
+    whole node. Threads beyond the quota do not run slower, they get the whole
+    process frozen until the next period, and OpenMP workers spinning at a
+    barrier burn the quota while they wait. Measured on ffs_moco with a 4-CPU
+    quota: 4 threads 4.2 s, 12 threads 20.9 s; with a 2-CPU quota and 12
+    threads a 16 s run took 371 s.
+
+    Reads cgroup v2 ``cpu.max`` at every level from this process's group up to
+    the root (the tightest ancestor binds), else the v1 ``cpu.cfs_quota_us``.
+    """
+    try:
+        with open(proc_cgroup) as fh:
+            lines = [ln.strip().split(":", 2) for ln in fh if ln.count(":") >= 2]
+    except OSError:
+        return None
+
+    def _walk(base: str, rel: str, read) -> float | None:
+        best: float | None = None
+        parts = [seg for seg in rel.split("/") if seg]
+        for depth in range(len(parts), -1, -1):
+            q = read(os.path.join(base, *parts[:depth]))
+            if q is not None and (best is None or q < best):
+                best = q
+        return best
+
+    def _v2(d: str) -> float | None:
+        try:
+            with open(os.path.join(d, "cpu.max")) as fh:
+                quota, period = fh.read().split()[:2]
+            return None if quota == "max" else float(quota) / float(period)
+        except (OSError, ValueError, ZeroDivisionError):
+            return None
+
+    def _v1(d: str) -> float | None:
+        try:
+            with open(os.path.join(d, "cpu.cfs_quota_us")) as fh:
+                quota = float(fh.read())
+            with open(os.path.join(d, "cpu.cfs_period_us")) as fh:
+                period = float(fh.read())
+            return quota / period if quota > 0 and period > 0 else None
+        except (OSError, ValueError):
+            return None
+
+    for hier, controllers, rel in lines:
+        if hier == "0" and controllers == "":
+            return _walk(root, rel, _v2)
+    for _hier, controllers, rel in lines:
+        if "cpu" in controllers.split(","):
+            for name in ("cpu,cpuacct", "cpu"):
+                base = os.path.join(root, name)
+                if os.path.isdir(base):
+                    return _walk(base, rel, _v1)
+    return None
+
+
+def _cap_to_quota(n: int, source: str) -> tuple[int, str]:
+    quota = cgroup_cpu_quota()
+    # Floor, not round: 2.5 CPUs of quota with 3 busy threads is throttled.
+    if quota is not None and int(quota) < n:
+        return max(1, int(quota)), f"cgroup CPU quota ({quota:g} CPUs; was {n} from {source})"
+    return n, source
+
+
 def resolve_cpu_threads(requested: int | None = None) -> tuple[int, str]:
     """How many CPU threads this process may use, and why.
 
@@ -674,8 +743,10 @@ def resolve_cpu_threads(requested: int | None = None) -> tuple[int, str]:
     2. ``FFS_NUM_THREADS`` — ours, for when a site wants to cap only us.
     3. ``OMP_NUM_THREADS`` — the standard knob, which torch itself honours.
     4. ``SLURM_CPUS_PER_TASK`` — what the scheduler actually granted.
-    5. CPU affinity (``sched_getaffinity``), which respects cpusets, taskset
-       and containers, falling back to ``os.cpu_count()``.
+    5. CPU affinity (``sched_getaffinity``), which respects cpusets and
+       taskset, falling back to ``os.cpu_count()`` -- then capped by the
+       container's CPU *quota* (:func:`cgroup_cpu_quota`), which affinity
+       does not show. An explicit choice in 1-4 is never capped.
 
     In case 5 only, and only when nothing has narrowed the affinity mask, the
     count drops to *physical* cores: hyperthread siblings share an FPU and
@@ -706,17 +777,17 @@ def resolve_cpu_threads(requested: int | None = None) -> tuple[int, str]:
     if n_avail < n_logical:
         # Something restricted us (cpuset/taskset/container) — take it at
         # face value rather than second-guessing it with core topology.
-        return max(1, n_avail), "CPU affinity"
+        return _cap_to_quota(max(1, n_avail), "CPU affinity")
 
     try:
         import psutil
 
         physical = psutil.cpu_count(logical=False)
         if physical and physical < n_logical:
-            return max(1, physical), f"physical cores ({n_logical} logical)"
+            return _cap_to_quota(max(1, physical), f"physical cores ({n_logical} logical)")
     except ImportError:
         pass
-    return max(1, n_logical), "all CPUs"
+    return _cap_to_quota(max(1, n_logical), "all CPUs")
 
 
 REGISTRATION_TF32 = False

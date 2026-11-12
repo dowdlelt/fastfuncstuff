@@ -49,7 +49,7 @@ On CPU, the tools pick their thread count in this order (first match wins):
 3. `$OMP_NUM_THREADS`
 4. `$SLURM_CPUS_PER_TASK`
 5. otherwise every core the process may run on (physical cores only, if nothing has
-   restricted it)
+   restricted it), capped at the container's CPU quota when there is one
 
 To see what you will get, and why:
 
@@ -66,9 +66,12 @@ Two common causes:
   ffs follows it on purpose, so it doesn't take over a shared machine.
 - **A container CPU quota (Kubernetes and other managed servers).** If `cpu.max` prints
   something like `800000 100000`, the container gets 800000 / 100000 = **8 CPUs** of time,
-  even when `nproc` shows 64. ffs doesn't read this quota. With 64 threads on an 8-CPU quota,
-  the kernel pauses the process each time the quota runs out (throttling). That is slower
-  than 8 threads, and in `top` it looks as if almost nothing is running.
+  even when `nproc` shows 64. With 64 threads on an 8-CPU quota, the kernel pauses the
+  process each time the quota runs out (throttling). That is far slower than 8 threads
+  (`ffs_moco`, 2-CPU quota, 12 threads: 371 s for a run that takes 16 s), and in `top` it
+  looks as if almost nothing is running. ffs reads the quota and caps its default thread
+  count to it, but a thread count you set yourself (rules 1-4) is taken as given, so an
+  `OMP_NUM_THREADS=64` baked into an image still overrides it.
 
 Fix: set the thread count to the quota, or to what you want to give ffs:
 
