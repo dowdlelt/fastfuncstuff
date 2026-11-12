@@ -116,6 +116,79 @@ def build_parser() -> FfsArgumentParser:
         help="MEMA: skip the Hartung-Knapp variance adjustment (3dMEMA's default is on).",
     )
 
+    inf = p.add_argument_group("Cluster inference (permutation; -model ols)")
+    inf.add_argument(
+        "-clustsim",
+        action="store_true",
+        help="Attach a 3dClustSim-format cluster-size table built from the "
+        "permutation null of the main test (3dttest++ -Clustsim) to the output "
+        "header.  ffs_viewer and AFNI then report each cluster's corrected alpha "
+        "as you move the threshold.",
+    )
+    inf.add_argument(
+        "-etac",
+        action="store_true",
+        help="Global ETAC (3dttest++ -ETAC): several p-thresholds, figures of merit "
+        "and blurs thresholded jointly at one family-wise FPR.  Writes "
+        "PREFIX.ETACmask.global.SIDE.Nperc (survivors), PREFIX.ETACmaskALL... "
+        "(one volume per blur x pthr sub-test) and PREFIX.ETAC.thresholds.json.",
+    )
+    inf.add_argument(
+        "-etac_blur",
+        nargs="+",
+        type=float,
+        metavar="FWHM",
+        help="Extra Gaussian blurs (mm FWHM, inside the mask), one ETAC case "
+        "each; 0 is the unblurred input.  Default: 0 only.  Blur adds in "
+        "quadrature to what the inputs already have.",
+    )
+    inf.add_argument(
+        "-etac_pthr",
+        nargs="+",
+        type=float,
+        metavar="P",
+        help="Voxelwise p-thresholds (default 0.010 0.009 ... 0.001, 3dXClustSim's).",
+    )
+    inf.add_argument(
+        "-etac_hpow",
+        nargs="+",
+        type=int,
+        choices=(0, 1, 2),
+        default=[2],
+        help="Figures of merit: sum |z|^h over the cluster; 0 is size (default 2).",
+    )
+    inf.add_argument("-etac_nn", type=int, choices=(1, 2, 3), default=2, help="Connectivity.")
+    inf.add_argument(
+        "-etac_sid",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="2: two-sided, clusters join both signs (one mask, 2sid).  1: "
+        "one-sided, positive and negative masks (1pos, 1neg) each at the FPR.",
+    )
+    inf.add_argument(
+        "-etac_fpr",
+        nargs="+",
+        type=float,
+        default=[5.0],
+        metavar="PCT",
+        help="Family-wise false-positive goal(s) in percent (default 5).",
+    )
+    inf.add_argument(
+        "-etac_splitfrac",
+        type=float,
+        default=0.0,
+        help="Set thresholds on the first fraction of iterations and measure the "
+        "FPR on the rest (0.2-0.8); 0, the default as in AFNI, uses all for both.",
+    )
+    inf.add_argument(
+        "-niter",
+        type=int,
+        default=10080,
+        help="Permutations for -clustsim / -etac (default 10080, as 3dttest++).",
+    )
+    inf.add_argument("-seed", type=int, default=0, help="Permutation seed.")
+
     out = p.add_argument_group("Output")
     out.add_argument("-prefix", required=True, help="Output bucket (.nii.gz by default).")
     out.add_argument("-overwrite", action="store_true", help="Replace an existing output.")
@@ -272,6 +345,11 @@ def run(args) -> None:
     if not mema and (args.no_HKtest or args.mema_reml != "always"):
         raise ValueError("-no_HKtest and -mema_reml apply to -model mema only")
     center = args.center or ("SAME" if mema else "DIFF")
+    if (args.etac or args.clustsim) and (mema or args.unpooled):
+        raise ValueError("-etac / -clustsim are implemented for the pooled -model ols test so far")
+    etac_extras = (args.etac_blur, args.etac_pthr)
+    if not args.etac and any(v is not None for v in etac_extras):
+        raise ValueError("-etac_* options need -etac")
     k = 2 if mema else 1
 
     la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, k)
@@ -386,6 +464,112 @@ def run(args) -> None:
     )
     if args.verb:
         print(f"[ffs_group] wrote {out_path} ({len(bricks)} sub-bricks)", file=sys.stderr)
+
+    if args.clustsim or args.etac:
+        voxdims = tuple(float(abs(z)) for z in ref_img.header.get_zooms()[:3])
+        ya, yb = stack(vols_a, 0), stack(vols_b, 0) if vols_b else None
+        if args.clustsim:
+            _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path)
+        if args.etac:
+            _run_etac(args, design, ya, yb, mask, voxdims, prefix.stem, prefix.nifti_ext,
+                      ref_img)  # fmt: skip
+
+
+def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path) -> None:
+    from fastfuncstuff.stats.clustsim import attach_clustsim_tables
+    from fastfuncstuff.stats.group_ttest import OlsNull, PermutationFields, main_test
+
+    y, x, c = main_test(design, ya, yb)
+    permute = design.two_sets and not design.paired
+    null = OlsNull(y.float(), x, c, n_iter=args.niter, seed=args.seed, permute=permute)
+    _warn_distinct(args, null.n_distinct)
+    stem = Path(str(out_path).removesuffix("".join(out_path.suffixes)))
+    attach_clustsim_tables(
+        mask,
+        voxdims,
+        None,
+        prefix=Path(f"{stem}.CSim"),
+        refit=out_path,
+        n_iter=args.niter,
+        device=y.device,
+        seed=args.seed,
+        commandline=" ".join(sys.argv),
+        verbose=args.verb >= 1,
+        simulator=PermutationFields(null, mask),
+    )
+
+
+def _warn_distinct(args, n_distinct: float) -> None:
+    if args.verb and n_distinct < args.niter:
+        print(
+            f"[ffs_group] note: only {n_distinct:.0f} distinct relabelings exist for "
+            f"this design; {args.niter} iterations repeat some of them",
+            file=sys.stderr,
+        )
+
+
+def _run_etac(args, design, ya, yb, mask, voxdims, stem, ext, ref_img) -> None:
+    import json
+
+    import numpy as np
+
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.etac import DEFAULT_PTHR, EtacOptions, run_group_etac
+
+    opts = EtacOptions(
+        pthr=tuple(args.etac_pthr) if args.etac_pthr else DEFAULT_PTHR,
+        hpows=tuple(sorted(set(args.etac_hpow))),
+        nn=args.etac_nn,
+        sided=args.etac_sid,
+        fpr=tuple(args.etac_fpr),
+        splitfrac=args.etac_splitfrac,
+    )
+    blurs = tuple(args.etac_blur) if args.etac_blur else (0.0,)
+    res = run_group_etac(design, ya, yb, mask, voxdims, blurs=blurs, opts=opts,
+                         n_iter=args.niter, seed=args.seed, device=ya.device,
+                         verbose=args.verb >= 1)  # fmt: skip
+    _warn_distinct(args, res.n_distinct)
+    shape = mask.shape
+    sub_labels = [f"{c}_p{p:.4g}" for c in res.case_labels for p in opts.pthr]
+    for (goal, side), (union, per) in res.masks.items():
+        tag = f"global.{side}.{goal:g}perc"
+        vol = np.zeros(shape, dtype=np.float32)
+        vol[mask] = union
+        save_nifti(vol, f"{stem}.ETACmask.{tag}{ext}", affine=ref_img.affine)
+        allv = np.zeros((*shape, per.shape[0]), dtype=np.float32)
+        for k in range(per.shape[0]):
+            allv[..., k][mask] = per[k]
+        save_nifti(allv, f"{stem}.ETACmaskALL.{tag}{ext}", affine=ref_img.affine,
+                   brick_labels=sub_labels)  # fmt: skip
+        if args.verb:
+            print(f"[ffs_group] ETAC {side} FPR {goal:g}%: {int(union.sum())} voxels survive",
+                  file=sys.stderr)  # fmt: skip
+    record = {
+        "n_iter": res.n_iter,
+        "seed": args.seed,
+        "nn": opts.nn,
+        "sided": opts.sided,
+        "min_clust": opts.min_clust,
+        "hpow": list(opts.hpows),
+        "pthr": list(opts.pthr),
+        "zthr": [float(z) for z in opts.zthr],
+        "cases": list(res.case_labels),
+        "goals": [
+            {
+                "fpr_goal": t.fpr_goal,
+                "fpr_achieved": t.fpr,
+                "tfrac": t.tfrac,
+                "thresholds": {
+                    c: {f"{p:.4g}": {f"h{h}": float(t.thr[ic, ip, ih])
+                                     for ih, h in enumerate(opts.hpows)}
+                        for ip, p in enumerate(opts.pthr)}
+                    for ic, c in enumerate(res.case_labels)
+                },
+            }
+            for t in res.thresholds
+        ],
+    }  # fmt: skip
+    Path(f"{stem}.ETAC.thresholds.json").write_text(json.dumps(record, indent=1))
 
 
 if __name__ == "__main__":

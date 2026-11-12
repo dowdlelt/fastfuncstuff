@@ -100,3 +100,19 @@ def test_mema_only_flags_are_refused_for_ols(tmp_path, capsys):
         main(["-setA", *[f"{p}[1]" for p in a], "-no_HKtest", "-prefix", str(tmp_path / "x"),
               "-device", "cpu"])  # fmt: skip
     assert "-model mema only" in capsys.readouterr().err
+
+
+def test_clustsim_and_etac_outputs(tmp_path):
+    from fastfuncstuff.stats.clustsim import read_clustsim_tables_from
+
+    a, b = _write_sets(tmp_path, na=8, nb=7, shape=(9, 8, 7))
+    out = tmp_path / "g.nii.gz"
+    main(["-setA", *[f"{p}[1]" for p in a], "-setB", *[f"{p}[1]" for p in b], "-prefix",
+          str(out), "-device", "cpu", "-verb", "0", "-clustsim", "-etac", "-etac_blur", "0",
+          "3", "-etac_pthr", "0.01", "0.001", "-niter", "200"])  # fmt: skip
+    assert (2, "bi-sided") in read_clustsim_tables_from(out)
+    allm = tmp_path / "g.ETACmaskALL.global.2sid.5perc.nii.gz"
+    assert read_brick_labels(nib.load(allm)) == ["B0.0_p0.01", "B0.0_p0.001", "B3.0_p0.01",
+                                                 "B3.0_p0.001"]  # fmt: skip
+    assert (tmp_path / "g.ETACmask.global.2sid.5perc.nii.gz").exists()
+    assert (tmp_path / "g.ETAC.thresholds.json").exists()

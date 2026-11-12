@@ -156,6 +156,30 @@ class MaskedGaussian:
         self._denom = gaussian3d_batched(self._m, self._sigma).clamp_min(1e-6)
         self._blur = gaussian3d_batched
 
+    def rows(self, x):
+        """Blur in-mask rows ``[k, V_mask]`` already on the device; same shape back.
+
+        For callers that hold their data compacted to the mask (one map per
+        subject at group level) and want to stay on the device.
+        """
+        import torch
+
+        if self.fwhm <= 0:
+            return x
+        n_grid = int(np.prod(self.shape))
+        out = torch.empty_like(x)
+        per = 5 * n_grid * 4  # grid copy, padded copy, blurred, divided, slack
+        from fastfuncstuff.memory import get_available_memory
+
+        chunk = max(1, int(get_available_memory(self.device, empty_cache=False) // per))
+        for k0 in range(0, x.shape[0], chunk):
+            blk = x[k0 : k0 + chunk]
+            grid = torch.zeros((blk.shape[0], n_grid), dtype=torch.float32, device=x.device)
+            grid[:, self._idx] = blk.to(torch.float32)
+            sm = self._blur(grid.view(-1, *self.shape) * self._m, self._sigma) / self._denom
+            out[k0 : k0 + chunk] = sm.reshape(blk.shape[0], -1)[:, self._idx].to(x.dtype)
+        return out
+
     def __call__(self, data: np.ndarray) -> np.ndarray:
         import torch
 

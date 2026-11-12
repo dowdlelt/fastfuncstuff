@@ -400,3 +400,30 @@ class OlsNull:
     def __call__(self, start: int, nb: int) -> Tensor:
         """A :data:`cluster_inference.NullSource`: ``[nb, V]`` null z-maps."""
         return self._toz(self.t_maps(start, nb))
+
+
+class PermutationFields:
+    """An :class:`OlsNull` dressed as a ClustSim field simulator.
+
+    ``clustsim.attach_clustsim_tables`` takes any object with ``mask``,
+    ``device``, ``generate(n)`` and ``bytes_per_field()``; handing it the
+    permutation null gives the 3dttest++ ``-Clustsim`` table (thresholds in z)
+    through exactly the code ``ffs_clustsim`` uses, so the viewer reads it the
+    same way.
+    """
+
+    def __init__(self, null: OlsNull, mask: np.ndarray):
+        self.null = null
+        self.mask = np.ascontiguousarray(np.asarray(mask, bool))
+        self.device = null.y.device
+        self._next = 0
+
+    def bytes_per_field(self) -> int:
+        return self.null.bytes_per_map()
+
+    def generate(self, n: int) -> Tensor:
+        if self._next + n > self.null.n_iter:
+            raise ValueError("asked for more null fields than were planned")
+        out = self.null(self._next, n)
+        self._next += n
+        return out
