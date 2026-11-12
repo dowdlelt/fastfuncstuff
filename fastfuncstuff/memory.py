@@ -739,10 +739,17 @@ def bytes_per_volume_cluster_fom(n_voxels: int, n_fom: int = 1) -> int:
     return int(n_voxels * (48 + 8 * max(0, n_fom - 1)))
 
 
-def cluster_fom_batch(n_voxels: int, n_fom: int, device: torch.device, cap: int = 4096) -> int:
-    """Volumes per batch for :func:`bytes_per_volume_cluster_fom` passes."""
+def cluster_fom_batch(
+    n_voxels: int, n_fom: int, device: torch.device, cap: int = 4096, source_bytes: int = 0
+) -> int:
+    """Volumes per batch for :func:`bytes_per_volume_cluster_fom` passes.
+
+    ``source_bytes`` is what producing one null map costs on top -- for a
+    permutation null that refits a model per map (MEMA) it dwarfs the
+    clustering, and leaving it out OOM'd a MEMA ETAC run.
+    """
     avail = get_available_memory(device, empty_cache=False)
-    n = avail // max(1, bytes_per_volume_cluster_fom(n_voxels, n_fom))
+    n = avail // max(1, bytes_per_volume_cluster_fom(n_voxels, n_fom) + int(source_bytes))
     return int(max(2, min(cap, n)))
 
 

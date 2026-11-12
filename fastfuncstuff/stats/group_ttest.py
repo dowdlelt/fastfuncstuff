@@ -403,6 +403,7 @@ class OlsNull:
     def __post_init__(self) -> None:
         n, p = self.x.shape
         self.dof = n - p
+        self.device = self.y.device
         dev, dt = self.y.device, torch.float32
         q, r = np.linalg.qr(self.x)
         w = np.linalg.solve(r.T, self.c)  # R^-T c
@@ -453,6 +454,93 @@ class OlsNull:
         return self._toz(self.t_maps(start, nb))
 
 
+class TToZ2D:
+    """t → z when the dof varies per voxel (Welch), by bilinear table lookup.
+
+    Uniform in ``asinh|t|`` and in ``1/dof`` between the smallest and largest
+    dof the design allows; z is smooth in both, and 1/dof keeps the large-dof
+    end (nearly normal) from wasting rows.
+    """
+
+    def __init__(self, dof_lo: float, dof_hi: float, device, n_t: int = 4096, n_d: int = 96,
+                 t_max: float = 60.0):  # fmt: skip
+        self._u = np.linspace(0.0, np.arcsinh(t_max), n_t)
+        self._w = np.linspace(1.0 / dof_hi, 1.0 / max(dof_lo, 1e-3), n_d)
+        tab = np.stack([t_to_z_np(np.sinh(self._u), 1.0 / w) for w in self._w])  # [n_d, n_t]
+        self._z = torch.as_tensor(tab, dtype=torch.float32, device=device)
+        self._du = float(self._u[1] - self._u[0])
+        self._w0 = float(self._w[0])
+        self._dw = float(self._w[1] - self._w[0]) if n_d > 1 else 1.0
+        self._nt, self._nd = n_t, n_d
+
+    def __call__(self, t: Tensor, dof: Tensor) -> Tensor:
+        u = (torch.asinh(t.abs()) / self._du).clamp(max=self._nt - 1.001)
+        w = ((1.0 / dof - self._w0) / self._dw).clamp(0, self._nd - 1.001)
+        i, j = u.floor(), w.floor()
+        fu, fw = u - i, w - j
+        i, j = i.long(), j.long()
+        z = self._z
+        z00, z01 = z[j, i], z[j, i + 1]
+        z10, z11 = z[j + 1, i], z[j + 1, i + 1]
+        zz = (z00 * (1 - fu) + z01 * fu) * (1 - fw) + (z10 * (1 - fu) + z11 * fu) * fw
+        return torch.copysign(zz, t)
+
+
+@dataclass
+class WelchNull:
+    """Null z-maps for the Welch (``-unpooled``) A-B test, by sign flips.
+
+    Each set's residuals are centred on its own mean and their signs flipped
+    at random; flips never move a subject between sets, so each set keeps its
+    own variance and the null stays exact under unequal variances (a label
+    permutation would not).  Within a set, sum r^2 is flip-invariant, so the
+    flipped means and variances come from two GEMMs.
+    """
+
+    ya: Tensor
+    yb: Tensor
+    n_iter: int
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        dt = torch.float32
+        self.device = self.ya.device
+        self._ra = (self.ya - self.ya.mean(0)).to(dt)
+        self._rb = (self.yb - self.yb.mean(0)).to(dt)
+        self._ssa = (self._ra * self._ra).sum(0)
+        self._ssb = (self._rb * self._rb).sum(0)
+        na, nb = self._ra.shape[0], self._rb.shape[0]
+        rng = np.random.default_rng(self.seed)
+        self._signs = rng.choice(
+            np.array([-1.0, 1.0], dtype=np.float32), size=(self.n_iter, na + nb)
+        )
+        self._toz = TToZ2D(min(na, nb) - 1, na + nb - 2, self.device)
+
+    @property
+    def n_distinct(self) -> float:
+        return float(2.0 ** min(self._signs.shape[1], 1000))
+
+    def bytes_per_map(self) -> int:
+        return 4 * int(self._ra.shape[1]) * 10
+
+    def t_maps(self, start: int, nb_: int) -> tuple[Tensor, Tensor]:
+        s = torch.as_tensor(self._signs[start : start + nb_], device=self.device)
+        na, nb = self._ra.shape[0], self._rb.shape[0]
+        ma = (s[:, :na] @ self._ra) / na
+        mb = (s[:, na:] @ self._rb) / nb
+        va = ((self._ssa - na * ma * ma) / (na - 1)).clamp_min(0) / na
+        vb = ((self._ssb - nb * mb * mb) / (nb - 1)).clamp_min(0) / nb
+        se2 = va + vb
+        ok = se2 > 0
+        t = torch.where(ok, (ma - mb) / torch.sqrt(torch.where(ok, se2, 1.0)), 0.0)
+        den = va * va / (na - 1) + vb * vb / (nb - 1)
+        dof = torch.where(den > 0, se2 * se2 / torch.where(den > 0, den, 1.0), float(na + nb - 2))
+        return t, dof
+
+    def __call__(self, start: int, nb_: int) -> Tensor:
+        return self._toz(*self.t_maps(start, nb_))
+
+
 class PermutationFields:
     """An :class:`OlsNull` dressed as a ClustSim field simulator.
 
@@ -466,7 +554,7 @@ class PermutationFields:
     def __init__(self, null: OlsNull, mask: np.ndarray):
         self.null = null
         self.mask = np.ascontiguousarray(np.asarray(mask, bool))
-        self.device = null.y.device
+        self.device = null.device
         self._next = 0
 
     def bytes_per_field(self) -> int:

@@ -133,7 +133,9 @@ def build_parser() -> FfsArgumentParser:
         "one table set, so the output bucket's tables are for its main test (A-B, "
         "or the one-sample mean); every other t brick is also written to its own "
         "PREFIX.<label> file (e.g. PREFIX.G1_mean, PREFIX.G1-G2_age) carrying "
-        "tables from that test's own null.",
+        "tables from that test's own null.  The .1D/.niml side files go in "
+        "PREFIX.clustsim/.  Works for every model: with -model mema each "
+        "permutation refits tau^2 (minutes rather than seconds at full brain size).",
     )
     inf.add_argument(
         "-etac",
@@ -442,21 +444,21 @@ def run(args) -> None:
     from fastfuncstuff.stats.group_ttest import TtestDesign, run_ttest, to_z_bricks
 
     prefix = parse_prefix(args.prefix)
+    args.prefix_stem = prefix.stem
     out_path = Path(prefix.stem + prefix.nifti_ext)
     if out_path.exists() and not args.overwrite:
         raise ValueError(f"{out_path} exists (use -overwrite)")
     if (args.paired or args.unpooled) and not args.setB:
         raise ValueError("-paired and -unpooled need -setB")
     mema = args.model == "mema"
-    if mema and args.unpooled:
-        raise ValueError(
-            "-model mema with separate per-set tau^2 (-unpooled) is not implemented yet"
-        )
     if not mema and (args.no_HKtest or args.mema_reml != "always"):
         raise ValueError("-no_HKtest and -mema_reml apply to -model mema only")
     center = args.center or ("SAME" if mema else "DIFF")
-    if (args.etac or args.clustsim) and (mema or args.unpooled):
-        raise ValueError("-etac / -clustsim are implemented for the pooled -model ols test so far")
+    if mema and any(b > 0 for b in (args.etac_blur or ())):
+        raise ValueError(
+            "-etac_blur > 0 is OLS-only: blurring a beta changes its within-subject "
+            "variance in a way its t map does not record"
+        )
     if not args.etac and args.etac_pthr is not None:
         raise ValueError("-etac_pthr needs -etac")
     if not (args.etac or args.clustsim) and args.etac_blur is not None:
@@ -577,72 +579,81 @@ def run(args) -> None:
     if args.clustsim or args.etac:
         voxdims = tuple(float(abs(z)) for z in ref_img.header.get_zooms()[:3])
         ya, yb = stack(vols_a, 0), stack(vols_b, 0) if vols_b else None
+        ta = stack(vols_a, 1) if mema else None
+        tb = stack(vols_b, 1) if mema and vols_b else None
+        model_kw = dict(model=args.model, ta=ta, tb=tb, knha=not args.no_HKtest,
+                        reml=args.mema_reml)  # fmt: skip
         if args.clustsim:
-            _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path)
-            _clustsim_per_brick(args, design, ya, yb, mask, voxdims, bricks, prefix, ref_img)
-            for fwhm in sorted(set(args.etac_blur or ())):
-                if fwhm > 0:
-                    _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix,
-                                        ref_img)  # fmt: skip
-        if args.etac:
-            _run_etac(args, design, ya, yb, mask, voxdims, prefix.stem, prefix.nifti_ext,
+            _clustsim(args, design, ya, yb, model_kw, mask, voxdims, bricks, out_path, prefix,
                       ref_img)  # fmt: skip
+        if args.etac:
+            _run_etac(args, design, ya, yb, model_kw, mask, voxdims, prefix.stem,
+                      prefix.nifti_ext, ref_img)  # fmt: skip
 
 
-def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path, spec=None) -> None:
-    from fastfuncstuff.stats.clustsim import attach_clustsim_tables
-    from fastfuncstuff.stats.group_ttest import OlsNull, PermutationFields, main_test
+def _clustsim(args, design, ya, yb, model_kw, mask, voxdims, bricks, out_path, prefix,
+              ref_img) -> None:  # fmt: skip
+    """Tables for every t brick: the main test in the bucket, the rest in their own files.
 
-    if spec is None:
-        y, x, c = main_test(design, ya, yb)
-        permute = design.two_sets and not design.paired
-    else:
-        y, x, c, permute = spec.y, spec.x, spec.c, spec.permute
-    null = OlsNull(y.float(), x, c, n_iter=args.niter, seed=args.seed, permute=permute)
-    _warn_distinct(args, null.n_distinct)
-    stem = Path(str(out_path).removesuffix("".join(out_path.suffixes)))
-    attach_clustsim_tables(
-        mask,
-        voxdims,
-        None,
-        prefix=Path(f"{stem}.CSim"),
-        refit=out_path,
-        n_iter=args.niter,
-        device=y.device,
-        seed=args.seed,
-        commandline=" ".join(sys.argv),
-        verbose=args.verb >= 1,
-        simulator=PermutationFields(null, mask),
-    )
-
-
-def _clustsim_per_brick(args, design, ya, yb, mask, voxdims, bricks, prefix, ref_img) -> None:
-    """PREFIX.<label>: each non-main t brick with tables from its own null.
-
-    A dataset carries one ClustSim table set, so the main bucket's tables can
-    only describe its main test.  Every other (estimate, t) pair -- the per-set
-    tests, the covariate slopes -- goes to its own file whose name says which
-    test the tables belong to.
+    A dataset carries one ClustSim table set, so the bucket's tables describe
+    its main test; every other (estimate, t) pair goes to PREFIX.<label>, whose
+    name says which test its tables belong to.  Each null comes from the same
+    estimator as its brick (pooled / Welch OLS, MEMA refitting tau^2).
     """
     import numpy as np
 
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.stats.group_ttest import t_tests
+    from fastfuncstuff.stats.group_inference import brick_nulls
 
-    for spec in t_tests(design, ya, yb)[1:]:
-        pair = bricks[spec.brick : spec.brick + 2]
-        safe = re.sub(r"[^A-Za-z0-9._+-]", "_", spec.label)
-        path = Path(f"{prefix.stem}.{safe}{prefix.nifti_ext}")
-        out = np.zeros((*mask.shape, 2), dtype=np.float32)
-        for kb, b in enumerate(pair):
-            out[..., kb][mask] = b.data.detach().cpu().numpy()
-        save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
-                   brick_labels=[b.label for b in pair],
-                   brick_stataux={1: pair[1].stat} if pair[1].stat else None)  # fmt: skip
-        _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, path, spec=spec)
-        if args.verb:
-            print(f"[ffs_group] {path}: {spec.label} with its own ClustSim tables",
-                  file=sys.stderr)  # fmt: skip
+    if args.verb and model_kw["model"] == "mema":
+        print("[ffs_group] MEMA null: tau^2 refitted for every permutation", file=sys.stderr)
+    nulls = brick_nulls(design, ya=ya, yb=yb, n_iter=args.niter, seed=args.seed, **model_kw)
+    for bn in nulls:
+        if bn.main:
+            path = out_path
+        else:
+            pair = bricks[bn.brick : bn.brick + 2]
+            safe = re.sub(r"[^A-Za-z0-9._+-]", "_", pair[0].label.replace(":b", ""))
+            path = Path(f"{prefix.stem}.{safe}{prefix.nifti_ext}")
+            out = np.zeros((*mask.shape, 2), dtype=np.float32)
+            for kb, b in enumerate(pair):
+                out[..., kb][mask] = b.data.detach().cpu().numpy()
+            save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
+                       brick_labels=[b.label for b in pair],
+                       brick_stataux={1: pair[1].stat} if pair[1].stat else None)  # fmt: skip
+        _attach_tables(args, bn.source, mask, voxdims, path)
+        if args.verb and not bn.main:
+            print(f"[ffs_group] {path}: {bn.label} with its own ClustSim tables", file=sys.stderr)
+    for fwhm in sorted(set(args.etac_blur or ())):
+        if fwhm > 0:
+            _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img)
+
+
+def _attach_tables(args, source, mask, voxdims, path) -> None:
+    from fastfuncstuff.stats.clustsim import attach_clustsim_tables
+    from fastfuncstuff.stats.group_ttest import PermutationFields
+
+    _warn_distinct(args, source.n_distinct)
+    # The .1D / .niml / .mask / 3drefit side files (18 per table set) go in one
+    # PREFIX.clustsim/ folder; the tables themselves live in each NIfTI header.
+    path = Path(path)
+    # Only the NIfTI extension: Path.suffixes also counts ".G1_mean", which
+    # once named every per-brick table set "PREFIX.CSim" and let them overwrite.
+    name = re.sub(r"\.nii(\.gz|\.zst)?$", "", path.name)
+    folder = Path(str(args.prefix_stem) + ".clustsim")
+    attach_clustsim_tables(
+        mask,
+        voxdims,
+        None,
+        prefix=folder / f"{name}.CSim",
+        refit=path,
+        n_iter=args.niter,
+        device=source.device,
+        seed=args.seed,
+        commandline=" ".join(sys.argv),
+        verbose=args.verb >= 1,
+        simulator=PermutationFields(source, mask),
+    )
 
 
 def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img) -> None:
@@ -665,7 +676,11 @@ def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_i
     save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
                brick_labels=[b.label for b in bricks],
                brick_stataux={kb: b.stat for kb, b in enumerate(bricks) if b.stat})  # fmt: skip
-    _attach_permutation_clustsim(args, design, ya_b, yb_b, mask, voxdims, path)
+    from fastfuncstuff.stats.group_inference import brick_nulls
+
+    (bn,) = brick_nulls(design, model="ols", ya=ya_b, yb=yb_b, n_iter=args.niter,
+                        seed=args.seed, main_only=True)  # fmt: skip
+    _attach_tables(args, bn.source, mask, voxdims, path)
 
 
 def _warn_distinct(args, n_distinct: float) -> None:
@@ -677,7 +692,7 @@ def _warn_distinct(args, n_distinct: float) -> None:
         )
 
 
-def _run_etac(args, design, ya, yb, mask, voxdims, stem, ext, ref_img) -> None:
+def _run_etac(args, design, ya, yb, model_kw, mask, voxdims, stem, ext, ref_img) -> None:
     import json
 
     import numpy as np
@@ -696,7 +711,7 @@ def _run_etac(args, design, ya, yb, mask, voxdims, stem, ext, ref_img) -> None:
     blurs = tuple(args.etac_blur) if args.etac_blur else (0.0,)
     res = run_group_etac(design, ya, yb, mask, voxdims, blurs=blurs, opts=opts,
                          n_iter=args.niter, seed=args.seed, device=ya.device,
-                         verbose=args.verb >= 1)  # fmt: skip
+                         verbose=args.verb >= 1, **model_kw)  # fmt: skip
     _warn_distinct(args, res.n_distinct)
     shape = mask.shape
     sub_labels = [f"{c}_p{p:.4g}" for c in res.case_labels for p in opts.pthr]

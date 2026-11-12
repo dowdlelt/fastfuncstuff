@@ -139,7 +139,10 @@ def build_null(
             hpows=opts.hpows,
             min_clust=opts.min_clust,
             device=device,
-            batch=_even_batch(rows, mask, opts, device) if opts.sided == 1 else None,
+            batch=_even_batch(rows, mask, opts, device, _src_bytes(src))
+            if opts.sided == 1
+            else None,
+            source_bytes=_src_bytes(src),
             desc=f"ETAC null {label}",
             verbose=verbose,
         )
@@ -154,11 +157,18 @@ def build_null(
     return EtacNull(fom, tuple(sources), opts, n_train, test)
 
 
-def _even_batch(rows: int, mask: np.ndarray, opts: EtacOptions, device: torch.device) -> int:
+def _src_bytes(src) -> int:
+    per_map = getattr(src, "bytes_per_map", None)
+    return int(per_map()) if callable(per_map) else 0
+
+
+def _even_batch(
+    rows: int, mask: np.ndarray, opts: EtacOptions, device: torch.device, source_bytes: int = 0
+) -> int:
     """1-sided batches must hold whole (z, -z) pairs."""
     from fastfuncstuff.memory import cluster_fom_batch
 
-    b = cluster_fom_batch(int(mask.sum()), len(opts.hpows), device)
+    b = cluster_fom_batch(int(mask.sum()), len(opts.hpows), device, source_bytes=source_bytes // 2)
     return max(2, min(rows, b) // 2 * 2)
 
 
@@ -312,55 +322,18 @@ def case_label(fwhm: float) -> str:
     return f"B{fwhm:.1f}"
 
 
-def run_group_etac(
-    design,
-    ya: torch.Tensor,
-    yb: torch.Tensor | None,
+def run_etac(
+    cases: dict[str, tuple[torch.Tensor, NullSource]],
     mask: np.ndarray,
-    voxdims: tuple[float, float, float],
-    *,
-    blurs: tuple[float, ...] = (0.0,),
-    opts: EtacOptions | None = None,
-    n_iter: int = DEFAULT_NITER,
-    seed: int = 0,
+    opts: EtacOptions,
+    n_iter: int,
     device: torch.device,
     verbose: bool = True,
+    n_distinct: float = math.inf,
 ) -> EtacResult:
-    """Global ETAC for the main test of a :class:`group_ttest.TtestDesign`.
-
-    Each blur case blurs the subject maps inside the mask (3dttest++
-    ``-ETAC_blur``, applied on the device) and then shares one set of sign
-    flips — and, for two independent sets, label permutations — so the cases
-    see the same relabelings, as 3dttest++ does with a common ``-seed``.
-    """
-    from fastfuncstuff.stats.blur_to import MaskedGaussian
-    from fastfuncstuff.stats.group_ttest import OlsNull, main_test, ols_contrasts, t_to_z_np
-
-    opts = opts or EtacOptions()
-    if design.unpooled:
-        raise ValueError("ETAC with -unpooled is not implemented (use the pooled test)")
-    permute = design.two_sets and not design.paired
-    sources: dict[str, NullSource] = {}
-    z_obs: dict[str, torch.Tensor] = {}
-    n_distinct = math.inf
-    for fwhm in blurs:
-        label = case_label(fwhm)
-        if label in sources:
-            raise ValueError(f"blur {fwhm} given twice")
-        if fwhm > 0:
-            g = MaskedGaussian(mask, voxdims, fwhm, device=device)
-            ya_b = g.rows(ya)
-            yb_b = g.rows(yb) if yb is not None else None
-        else:
-            ya_b, yb_b = ya, yb
-        y, x, c = main_test(design, ya_b, yb_b)
-        null = OlsNull(y.float(), x, c, n_iter=n_iter, seed=seed, permute=permute)
-        n_distinct = null.n_distinct
-        fit = ols_contrasts(y.double(), x, c[None])
-        z = t_to_z_np(fit.t[0].cpu().numpy(), fit.dof)
-        z_obs[label] = torch.as_tensor(z, dtype=torch.float32, device=device)
-        sources[label] = null
-
+    """Global ETAC over ready-made cases: ``{label: (observed z [V], null source)}``."""
+    sources = {k: src for k, (_, src) in cases.items()}
+    z_obs = {k: z for k, (z, _) in cases.items()}
     null_fom = build_null(sources, n_iter, mask, opts, device, verbose=verbose)
     thresholds, masks = [], {}
     sides = [("2sid", 1)] if opts.sided == 2 else [("1pos", 1), ("1neg", -1)]
@@ -378,3 +351,65 @@ def run_group_etac(
         thresholds=thresholds,
         masks=masks,
     )
+
+
+def run_group_etac(
+    design,
+    ya: torch.Tensor,
+    yb: torch.Tensor | None,
+    mask: np.ndarray,
+    voxdims: tuple[float, float, float],
+    *,
+    model: str = "ols",
+    ta: torch.Tensor | None = None,
+    tb: torch.Tensor | None = None,
+    knha: bool = True,
+    reml: str = "always",
+    blurs: tuple[float, ...] = (0.0,),
+    opts: EtacOptions | None = None,
+    n_iter: int = DEFAULT_NITER,
+    seed: int = 0,
+    device: torch.device,
+    verbose: bool = True,
+) -> EtacResult:
+    """Global ETAC for the main test of a group model (``ols`` or ``mema``).
+
+    Each blur case blurs the subject maps inside the mask (3dttest++
+    ``-ETAC_blur``, on the device) and shares one set of relabelings with the
+    other cases, as 3dttest++ does with a common ``-seed``.  MEMA takes no
+    blur: blurring a beta changes its within-subject variance in a way the t
+    map does not record.
+    """
+    from fastfuncstuff.stats.blur_to import MaskedGaussian
+    from fastfuncstuff.stats.group_inference import brick_nulls, brick_to_z
+
+    opts = opts or EtacOptions()
+    if model == "mema" and any(b > 0 for b in blurs):
+        raise ValueError("ETAC blur cases are OLS-only (blurring betas changes their variances)")
+    cases: dict[str, tuple[torch.Tensor, NullSource]] = {}
+    n_distinct = math.inf
+    for fwhm in blurs:
+        label = case_label(fwhm)
+        if label in cases:
+            raise ValueError(f"blur {fwhm} given twice")
+        if fwhm > 0:
+            g = MaskedGaussian(mask, voxdims, fwhm, device=device)
+            ya_b, yb_b = g.rows(ya), (g.rows(yb) if yb is not None else None)
+        else:
+            ya_b, yb_b = ya, yb
+        bricks = _bricks(design, model, ya_b, yb_b, ta, tb, knha, reml)
+        (bn,) = brick_nulls(design, model=model, ya=ya_b, yb=yb_b, ta=ta, tb=tb, n_iter=n_iter,
+                            seed=seed, knha=knha, reml=reml, main_only=True)  # fmt: skip
+        cases[label] = (brick_to_z(bricks[bn.brick + 1]).to(device), bn.source)
+        n_distinct = bn.source.n_distinct
+    return run_etac(cases, mask, opts, n_iter, device, verbose, n_distinct)
+
+
+def _bricks(design, model, ya, yb, ta, tb, knha, reml):
+    if model == "mema":
+        from fastfuncstuff.stats.group_mema import run_mema
+
+        return run_mema(design, ya, ta, yb, tb, knha=knha, reml=reml)[0]
+    from fastfuncstuff.stats.group_ttest import run_ttest
+
+    return run_ttest(design, ya, yb)

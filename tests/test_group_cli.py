@@ -121,6 +121,10 @@ def test_clustsim_and_etac_outputs(tmp_path):
                                                  "B3.0_p0.001"]  # fmt: skip
     assert (tmp_path / "g.ETACmask.global.2sid.5perc.nii.gz").exists()
     assert (tmp_path / "g.ETAC.thresholds.json").exists()
+    # Side files in one folder, none at the top level.
+    assert (tmp_path / "g.clustsim" / "g.CSim.NN2_bisided.niml").exists()
+    assert (tmp_path / "g.clustsim" / "g.SetA_mean.CSim.NN2_bisided.niml").exists()
+    assert not list(tmp_path.glob("*.CSim.*"))
 
 
 def _write_buckets(tmp_path, n=6, labels=("vis#0_Coef", "vis#0_Tstat"), tstat_aux=True):
@@ -177,3 +181,31 @@ def test_clustsim_blur_cases_get_their_own_files_and_tables(tmp_path):
     assert read_brick_labels(nib.load(blurred)) == ["SetA_mean", "SetA_Tstat"]
     # Blurring makes null clusters bigger, so the blurred table asks for more voxels.
     assert t2.sizes[0, 1] > t0.sizes[0, 1]
+
+
+@pytest.mark.parametrize(
+    "extra", [["-model", "mema"], ["-model", "mema", "-unpooled"], ["-unpooled"]]
+)
+def test_clustsim_and_etac_for_every_model(tmp_path, extra):
+    from fastfuncstuff.stats.clustsim import read_clustsim_tables_from
+
+    paths = _write_buckets(tmp_path, n=14)
+    a, b = paths[:8], paths[8:]
+    out = tmp_path / "m.nii.gz"
+    main(["-setA", *map(str, a), "-setB", *map(str, b), "-brick", "vis#0_Coef", *extra,
+          "-prefix", str(out), "-device", "cpu", "-verb", "0", "-clustsim", "-etac",
+          "-etac_pthr", "0.01", "0.002", "-niter", "60"])  # fmt: skip
+    assert (2, "bi-sided") in read_clustsim_tables_from(out)
+    assert (tmp_path / "m.ETACmask.global.2sid.5perc.nii.gz").exists()
+    side = sorted(p.name for p in tmp_path.glob("m.*.nii.gz") if "ETAC" not in p.name)
+    assert len(side) == 2  # the two per-set tests, each with its own tables
+    for name in side:
+        assert (2, "bi-sided") in read_clustsim_tables_from(tmp_path / name)
+
+
+def test_mema_refuses_etac_blur(tmp_path, capsys):
+    paths = _write_buckets(tmp_path, n=6)
+    with pytest.raises(SystemExit):
+        main(["-model", "mema", "-setA", *map(str, paths), "-brick", "0", "-etac",
+              "-etac_blur", "0", "4", "-prefix", str(tmp_path / "x"), "-device", "cpu"])  # fmt: skip
+    assert "OLS-only" in capsys.readouterr().err

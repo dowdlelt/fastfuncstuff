@@ -37,6 +37,7 @@ def max_fom_null(
     min_clust: int = 1,
     device: torch.device,
     batch: int | None = None,
+    source_bytes: int | None = None,
     desc: str = "cluster null",
     verbose: bool = True,
 ) -> dict[tuple[str, int, int], np.ndarray]:
@@ -44,13 +45,18 @@ def max_fom_null(
 
     ``tcrits[sided]`` are the cluster-forming thresholds in the caller's order;
     columns come back in that order.  FOM ``h=0`` is the voxel count, ``1`` the
-    mass, ``2`` the sum of squares (3dXClustSim).  Only one batch is resident.
+    mass, ``2`` the sum of squares (3dXClustSim).  Only one batch is resident;
+    its size counts ``source_bytes`` per map (default: the source's own
+    ``bytes_per_map()`` when it has one).
     """
     from fastfuncstuff.stats.cluster_gpu import build_neighbor_table, cluster_fom_batched
 
     n_vox = int(mask.sum())
+    if source_bytes is None:
+        per_map = getattr(source, "bytes_per_map", None)
+        source_bytes = int(per_map()) if callable(per_map) else 0
     if batch is None:
-        batch = cluster_fom_batch(n_vox, len(hpows), device)
+        batch = cluster_fom_batch(n_vox, len(hpows), device, source_bytes=source_bytes)
     batch = int(max(1, min(batch, n_iter)))
 
     # The batched labeller wants thresholds tightest-first.
