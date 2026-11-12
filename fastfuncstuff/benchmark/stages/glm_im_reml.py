@@ -29,6 +29,9 @@ THRESHOLDS = {
     "min_r": 0.9,
     "temporal_min_median_r": 0.9,
     "fstat_floor_r": 0.75,
+    # Median voxelwise ffs/AFNI Full-F; measured 1.0000 (2026-11-12). The
+    # ARMA differences spread individual voxels, not the median.
+    "fstat_ratio_band": (0.95, 1.05),
 }
 
 
@@ -184,6 +187,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     )
 
     fstat_r = result["fstat"]["r"]
+    fstat_ratio = result["fstat"]["median_ratio"]
+    lo, hi = THRESHOLDS["fstat_ratio_band"]
     beta_min_r = result["betas"]["min_r"]
     beta_temp_r = result["betas"]["temporal_median_r"]
     tstat_min_r = result["tstats"]["min_r"]
@@ -197,10 +202,11 @@ def validate(ctx: BenchmarkContext) -> dict:
         and tstat_min_r >= THRESHOLDS["min_r"]
         and tstat_temp_r >= THRESHOLDS["temporal_min_median_r"]
         and fstat_r >= THRESHOLDS["fstat_floor_r"]
+        and lo <= fstat_ratio <= hi
     )
 
     summary = (
-        f"F_r={fstat_r:.3f} (diagnostic, floor {THRESHOLDS['fstat_floor_r']}) "
+        f"F_r={fstat_r:.3f} F_ratio={fstat_ratio:.3f} (diagnostic, floor {THRESHOLDS['fstat_floor_r']}) "
         f"beta min_r={beta_min_r:.3f} temp_r={beta_temp_r:.3f} "
         f"tstat min_r={tstat_min_r:.3f} temp_r={tstat_temp_r:.3f} "
         f"(gate {THRESHOLDS['min_r']})"

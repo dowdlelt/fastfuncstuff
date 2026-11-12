@@ -632,8 +632,14 @@ def compare_im_bucket(
         r_vox = (a_z[:, valid] * b_z[:, valid]).sum(0) / (std_a[valid] * std_b[valid] * n_t)
         return float(np.median(r_vox.numpy()))
 
-    # F-stat (vol 0)
-    fstat = {"r": _spatial_r(a[0], b[0])}
+    # F-stat (vol 0). The median ratio catches a scale error the correlation
+    # cannot: an IM Full-F once ran ~5x AFNI's at r ~1 (wrong df partition).
+    fa, fb = a[0][mask].double(), b[0][mask].double()
+    both = (fa > 0) & (fb > 0)
+    fstat = {
+        "r": _spatial_r(a[0], b[0]),
+        "median_ratio": float((fb[both] / fa[both]).median()) if both.any() else 0.0,
+    }
 
     # Separate even/odd sub-bricks (starting from vol 1)
     beta_idx = list(range(1, n, 2))  # 1, 3, 5, ...

@@ -17,6 +17,9 @@ THRESHOLDS = {
     "min_r": 0.95,
     # Voxelwise "temporal" r across the beta / t-stat stack
     "temporal_min_median_r": 0.95,
+    # Median voxelwise ffs/AFNI Full-F; measured 1.0000 (2026-11-12) on the
+    # shared xmat.
+    "fstat_ratio_band": (0.98, 1.02),
 }
 
 
@@ -194,6 +197,8 @@ def validate(ctx: BenchmarkContext) -> dict:
     )
 
     fstat_r = result["fstat"]["r"]
+    fstat_ratio = result["fstat"]["median_ratio"]
+    lo, hi = THRESHOLDS["fstat_ratio_band"]
     beta_min_r = result["betas"]["min_r"]
     beta_temp_r = result["betas"]["temporal_median_r"]
     tstat_min_r = result["tstats"]["min_r"]
@@ -201,6 +206,7 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     passed = (
         fstat_r >= THRESHOLDS["min_r"]
+        and lo <= fstat_ratio <= hi
         and beta_min_r >= THRESHOLDS["min_r"]
         and beta_temp_r >= THRESHOLDS["temporal_min_median_r"]
         and tstat_min_r >= THRESHOLDS["min_r"]
@@ -208,7 +214,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     )
 
     summary = (
-        f"F_r={fstat_r:.3f} "
+        f"F_r={fstat_r:.3f} F_ratio={fstat_ratio:.3f} "
         f"beta min_r={beta_min_r:.3f} temp_r={beta_temp_r:.3f} "
         f"tstat min_r={tstat_min_r:.3f} temp_r={tstat_temp_r:.3f}"
     )
