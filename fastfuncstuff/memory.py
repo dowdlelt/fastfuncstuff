@@ -728,6 +728,24 @@ def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device)
     return int(max(1024, min(n_voxels, chunk)))
 
 
+def bytes_per_volume_cluster_fom(n_voxels: int, n_fom: int = 1) -> int:
+    """Per-volume peak of batched null clustering (``cluster_gpu``).
+
+    Measured ~48 bytes per (volume x mask voxel) for the extent-only labelling
+    (field, |field|, the volume->compact-id scratch, the ``[K, T]`` adjacency
+    and labels; see ``clustsim._plan_batch``).  Each extra FOM power adds a
+    float32 weight and a float32 per-label sum over the active set, ~8 bytes.
+    """
+    return int(n_voxels * (48 + 8 * max(0, n_fom - 1)))
+
+
+def cluster_fom_batch(n_voxels: int, n_fom: int, device: torch.device, cap: int = 4096) -> int:
+    """Volumes per batch for :func:`bytes_per_volume_cluster_fom` passes."""
+    avail = get_available_memory(device, empty_cache=False)
+    n = avail // max(1, bytes_per_volume_cluster_fom(n_voxels, n_fom))
+    return int(max(2, min(cap, n)))
+
+
 def bytes_per_voxel_finite_scan(n_timepoints: int) -> int:
     """Per-voxel peak of a whole-timeseries validity scan (non-finite, all-zero).
 

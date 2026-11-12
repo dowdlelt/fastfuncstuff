@@ -507,6 +507,7 @@ def accumulate_cluster_null(
     verbose: bool = True,
     fast: bool = True,
     tcrits_override: dict[str, np.ndarray] | None = None,
+    device: torch.device | None = None,
 ) -> ClusterNull:
     """Build the ``ClusterNull`` over all permutations, in parallel.
 
@@ -522,10 +523,43 @@ def accumulate_cluster_null(
         ``fast``: Numba threads (``None`` → all of them).  Otherwise process-pool
         workers (``None`` → ``os.cpu_count() - 1``, capped at P; ``1`` runs
         single-process for debuggability).
+    device : torch.device or None
+        On CUDA the null is labelled on the card through the shared
+        :func:`cluster_inference.max_fom_null` (extent and, unless ``fast``,
+        mass as the h=1 FOM).  Otherwise the CPU paths below.
     """
     n_perms, _ = t.shape
     null = ClusterNull(pthr=pthr, athr=athr, nns=nns, sideds=sideds)
     null.init_storage(n_perms)
+
+    if device is not None and device.type == "cuda":
+        from fastfuncstuff.stats.cluster_inference import max_fom_null, rows_source
+
+        tcrits = {
+            s: (
+                np.asarray(tcrits_override[s], dtype=np.float64)
+                if tcrits_override is not None
+                else np.array([_t_critical(p, dof, s) for p in pthr], dtype=np.float64)
+            )
+            for s in sideds
+        }
+        foms = max_fom_null(
+            rows_source(t, device),
+            n_perms,
+            mask,
+            tcrits,
+            nns=nns,
+            sideds=sideds,
+            hpows=(0,) if fast else (0, 1),
+            device=device,
+            verbose=verbose,
+        )
+        for (s, nn, h), tab in foms.items():
+            if h == 0:
+                null.max_extent[(s, nn)][:] = tab.astype(np.int64)
+            else:
+                null.max_mass[(s, nn)][:] = tab.astype(np.float64)
+        return null
 
     if fast:
         # One threaded Numba pass (cluster_fast.cluster_extent_null_batch): the

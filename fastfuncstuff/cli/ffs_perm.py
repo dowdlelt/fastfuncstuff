@@ -499,6 +499,7 @@ def _accumulate_cluster_null(
     save_masks: bool,
     pseudo_t_pv: torch.Tensor | None = None,
     tcrits_override: dict[str, np.ndarray] | None = None,
+    device: torch.device | None = None,
 ) -> tuple[ClusterNull, dict | None]:
     """Build the null in parallel; capture observed masks on the main process.
 
@@ -530,6 +531,7 @@ def _accumulate_cluster_null(
         verbose=args.verb >= 1,
         fast=not args.with_mass,
         tcrits_override=tcrits_override,
+        device=device,
     )
     return null, obs_masks
 
@@ -729,6 +731,7 @@ def main() -> None:
         save_masks=args.save_clust_masks,
         pseudo_t_pv=pseudo_t_pv,
         tcrits_override=pseudo_tcrits,
+        device=device,
     )
     if args.verb >= 1:
         print(f"[ffs_perm] cluster null pass: {time.time() - t0:.2f}s", file=sys.stderr)

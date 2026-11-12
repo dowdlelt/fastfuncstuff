@@ -96,14 +96,8 @@ def _neighbor_min(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
     return neighbor_min_torch(lab, adj_t, big)
 
 
-def _connected_max_sizes(
-    active_flat: Tensor,  # [T] int64, indices into the flattened [B*V] batch
-    batch_id: Tensor,  # [T] int64
-    adj_t: Tensor,  # [K, T] int32, compact neighbour ids or -1
-    n_batch: int,
-    max_rounds: int = 32,
-) -> Tensor:
-    """Per-volume largest component size, from a compacted adjacency.
+def _label_components(adj_t: Tensor, n_act: int, max_rounds: int = 32) -> Tensor:
+    """``[T]`` int32 component label per active voxel (the smallest member id).
 
     Shiloach-Vishkin: hook every root onto the smallest label that reaches it,
     then pointer-jump to compress the resulting forest.  The jumping is what
@@ -111,10 +105,8 @@ def _connected_max_sizes(
     diameter — on this null it converges in about four rounds even where the
     p=0.05 set percolates.
     """
-    n_act = int(active_flat.numel())
-    device = active_flat.device
+    device = adj_t.device
     lab = torch.arange(n_act, device=device, dtype=torch.int32)
-
     for _ in range(max_rounds):
         m = _neighbor_min(lab, adj_t, n_act)
         new = lab.clone()
@@ -127,10 +119,55 @@ def _connected_max_sizes(
         if torch.equal(new, lab):
             break
         lab = new
+    return lab
 
+
+def _connected_max_sizes(
+    active_flat: Tensor,  # [T] int64, indices into the flattened [B*V] batch
+    batch_id: Tensor,  # [T] int64
+    adj_t: Tensor,  # [K, T] int32, compact neighbour ids or -1
+    n_batch: int,
+    max_rounds: int = 32,
+) -> Tensor:
+    """Per-volume largest component size, from a compacted adjacency."""
+    n_act = int(active_flat.numel())
+    lab = _label_components(adj_t, n_act, max_rounds)
     counts = torch.bincount(lab.long(), minlength=n_act)
-    out = torch.zeros(n_batch, device=device, dtype=torch.int64)
+    out = torch.zeros(n_batch, device=active_flat.device, dtype=torch.int64)
     out.scatter_reduce_(0, batch_id, counts, reduce="amax")
+    return out
+
+
+def _connected_max_foms(
+    batch_id: Tensor,  # [T] int64
+    adj_t: Tensor,  # [K, T] int32
+    absval: Tensor,  # [T] float32, |stat| at each active voxel
+    n_batch: int,
+    hpows: tuple[int, ...],
+    min_clust: int,
+) -> dict[int, Tensor]:
+    """``{h: [B]}`` per-volume largest cluster FOM, FOM = sum |stat|^h.
+
+    A label is a member index, so per-label sums indexed by label line up with
+    ``batch_id`` exactly as the size reduction above does.  Clusters smaller
+    than ``min_clust`` voxels are dropped before the maximum (3dXClustSim's
+    ``MIN_CLUST``), so they can neither set nor pass a threshold.
+    """
+    n_act = int(batch_id.numel())
+    lab = _label_components(adj_t, n_act).long()
+    counts = torch.bincount(lab, minlength=n_act)
+    keep = counts >= max(int(min_clust), 1)
+    out: dict[int, Tensor] = {}
+    for h in hpows:
+        if h == 0:
+            fom = counts.to(torch.float32)
+        else:
+            w = absval if h == 1 else absval.pow(h)
+            fom = torch.bincount(lab, weights=w, minlength=n_act).to(torch.float32)
+        fom = torch.where(keep, fom, torch.zeros_like(fom))
+        o = torch.zeros(n_batch, device=batch_id.device, dtype=torch.float32)
+        o.scatter_reduce_(0, batch_id, fom, reduce="amax")
+        out[h] = o
     return out
 
 
@@ -180,6 +217,79 @@ def _adjacency(
     return out.to(torch.int32)
 
 
+def _active_sets(
+    fields: Tensor,
+    nbr_by_nn: dict[int, Tensor],
+    nns: tuple[int, ...],
+    sideds: tuple[str, ...],
+    tcrits_by_sided: dict[str, Tensor],
+    rank_scratch: Tensor,
+):
+    """Yield ``(sided, nn, ip, active_flat, batch_id, adj, merge)`` per labelling.
+
+    The one place that decides which voxels are suprathreshold and which of
+    them may join, so every reduction (sizes, FOMs, labels) sees the identical
+    clusters.  ``merge`` is True for the per-tail fallback of bi-sided, whose
+    two yields must be combined with a maximum rather than assigned.
+    ``rank_scratch`` holds the compaction while a yield is live; do not keep
+    ``adj`` past the next iteration.
+    """
+    n_batch, n_vox = fields.shape
+    want_pos = "1-sided" in sideds
+    want_abs = ("2-sided" in sideds) or ("bi-sided" in sideds)
+    n_pthr = int(next(iter(tcrits_by_sided.values())).numel())
+    eff_abs = fields.abs() if want_abs else None
+    positive = fields > 0 if "bi-sided" in sideds else None
+
+    for ip in range(n_pthr):
+        if want_pos:
+            got = _compact(fields, tcrits_by_sided["1-sided"][ip], rank_scratch, n_vox)
+            if got is not None:
+                active_flat, batch_id, vox, _ = got
+                for nn in nns:
+                    adj = _adjacency(nbr_by_nn[nn], vox, batch_id, rank_scratch, n_vox)
+                    yield "1-sided", nn, ip, active_flat, batch_id, adj, False
+                _uncompact(active_flat, rank_scratch)
+
+        if not want_abs:
+            continue
+        assert eff_abs is not None
+        tc = tcrits_by_sided["2-sided" if "2-sided" in sideds else "bi-sided"][ip]
+        want_bi = "bi-sided" in sideds
+        # The sign-split shortcut needs a non-negative threshold; below zero
+        # the two tails overlap and each must be labelled on its own.
+        split_ok = want_bi and bool(tc >= 0)
+
+        got = _compact(eff_abs, tc, rank_scratch, n_vox)
+        if got is not None:
+            active_flat, batch_id, vox, _ = got
+            sign = (
+                positive.reshape(-1)[active_flat] if (split_ok and positive is not None) else None
+            )
+            for nn in nns:
+                adj = _adjacency(nbr_by_nn[nn], vox, batch_id, rank_scratch, n_vox)
+                if "2-sided" in sideds:
+                    yield "2-sided", nn, ip, active_flat, batch_id, adj, False
+                if sign is not None:
+                    same = sign.unsqueeze(0) == torch.where(
+                        adj >= 0, sign[adj.clamp(min=0).long()], ~sign.unsqueeze(0)
+                    )
+                    adj_bi = torch.where(same, adj, torch.full_like(adj, -1))
+                    yield "bi-sided", nn, ip, active_flat, batch_id, adj_bi, False
+            _uncompact(active_flat, rank_scratch)
+
+        if want_bi and not split_ok:
+            for tail in (fields, -fields):
+                got_t = _compact(tail, tc, rank_scratch, n_vox)
+                if got_t is None:
+                    continue
+                af_t, bid_t, vox_t, _ = got_t
+                for nn in nns:
+                    adj_t = _adjacency(nbr_by_nn[nn], vox_t, bid_t, rank_scratch, n_vox)
+                    yield "bi-sided", nn, ip, af_t, bid_t, adj_t, True
+                _uncompact(af_t, rank_scratch)
+
+
 def cluster_extent_batched(
     fields: Tensor,  # [B, V] float32 on device
     nbr_by_nn: dict[int, Tensor],
@@ -214,75 +324,102 @@ def cluster_extent_batched(
     device = fields.device
     if rank_scratch is None:
         rank_scratch = torch.full((n_batch * n_vox,), -1, device=device, dtype=torch.int32)
-
-    want_pos = "1-sided" in sideds
-    want_abs = ("2-sided" in sideds) or ("bi-sided" in sideds)
     n_pthr = int(next(iter(tcrits_by_sided.values())).numel())
     out = {
         (s, nn): torch.zeros((n_batch, n_pthr), device=device, dtype=torch.int64)
         for s in sideds
         for nn in nns
     }
-    eff_abs = fields.abs() if want_abs else None
-    positive = fields > 0 if "bi-sided" in sideds else None
-
-    for ip in range(n_pthr):
-        if want_pos:
-            got = _compact(fields, tcrits_by_sided["1-sided"][ip], rank_scratch, n_vox)
-            if got is not None:
-                active_flat, batch_id, vox, _ = got
-                for nn in nns:
-                    adj = _adjacency(nbr_by_nn[nn], vox, batch_id, rank_scratch, n_vox)
-                    out[("1-sided", nn)][:, ip] = _connected_max_sizes(
-                        active_flat, batch_id, adj, n_batch
-                    )
-                _uncompact(active_flat, rank_scratch)
-
-        if not want_abs:
-            continue
-        assert eff_abs is not None
-        tc = tcrits_by_sided["2-sided" if "2-sided" in sideds else "bi-sided"][ip]
-        want_bi = "bi-sided" in sideds
-        # The sign-split shortcut needs a non-negative threshold; below zero
-        # the two tails overlap and each must be labelled on its own.
-        split_ok = want_bi and bool(tc >= 0)
-
-        got = _compact(eff_abs, tc, rank_scratch, n_vox)
-        if got is not None:
-            active_flat, batch_id, vox, _ = got
-            sign = (
-                positive.reshape(-1)[active_flat] if (split_ok and positive is not None) else None
-            )
-            for nn in nns:
-                adj = _adjacency(nbr_by_nn[nn], vox, batch_id, rank_scratch, n_vox)
-                if "2-sided" in sideds:
-                    out[("2-sided", nn)][:, ip] = _connected_max_sizes(
-                        active_flat, batch_id, adj, n_batch
-                    )
-                if sign is not None:
-                    same = sign.unsqueeze(0) == torch.where(
-                        adj >= 0, sign[adj.clamp(min=0).long()], ~sign.unsqueeze(0)
-                    )
-                    out[("bi-sided", nn)][:, ip] = _connected_max_sizes(
-                        active_flat,
-                        batch_id,
-                        torch.where(same, adj, torch.full_like(adj, -1)),
-                        n_batch,
-                    )
-            _uncompact(active_flat, rank_scratch)
-
-        if want_bi and not split_ok:
-            for tail in (fields, -fields):
-                got_t = _compact(tail, tc, rank_scratch, n_vox)
-                if got_t is None:
-                    continue
-                af_t, bid_t, vox_t, _ = got_t
-                for nn in nns:
-                    adj_t = _adjacency(nbr_by_nn[nn], vox_t, bid_t, rank_scratch, n_vox)
-                    out[("bi-sided", nn)][:, ip] = torch.maximum(
-                        out[("bi-sided", nn)][:, ip],
-                        _connected_max_sizes(af_t, bid_t, adj_t, n_batch),
-                    )
-                _uncompact(af_t, rank_scratch)
-
+    for sided, nn, ip, active_flat, batch_id, adj, merge in _active_sets(
+        fields, nbr_by_nn, nns, sideds, tcrits_by_sided, rank_scratch
+    ):
+        got = _connected_max_sizes(active_flat, batch_id, adj, n_batch)
+        col = out[(sided, nn)]
+        col[:, ip] = torch.maximum(col[:, ip], got) if merge else got
     return out
+
+
+def cluster_fom_batched(
+    fields: Tensor,  # [B, V] float32 on device
+    nbr_by_nn: dict[int, Tensor],
+    nns: tuple[int, ...],
+    sideds: tuple[str, ...],
+    tcrits_by_sided: dict[str, Tensor],
+    hpows: tuple[int, ...] = (0,),
+    min_clust: int = 1,
+    rank_scratch: Tensor | None = None,
+) -> dict[tuple[str, int, int], Tensor]:
+    """``{(sided, nn, h): [B, npthr]}`` largest cluster FOM, FOM = sum |stat|^h.
+
+    The 3dXClustSim figure of merit: ``h=0`` is the voxel count, ``h=1`` the
+    cluster mass, ``h=2`` the sum of squares (``mri_threshX.c``).  Columns are
+    in the order of ``tcrits_by_sided`` and clusters under ``min_clust`` voxels
+    are ignored.  Same clusters as :func:`cluster_extent_batched` — both read
+    :func:`_active_sets`.
+    """
+    n_batch, n_vox = fields.shape
+    device = fields.device
+    if rank_scratch is None:
+        rank_scratch = torch.full((n_batch * n_vox,), -1, device=device, dtype=torch.int32)
+    n_pthr = int(next(iter(tcrits_by_sided.values())).numel())
+    out = {
+        (s, nn, h): torch.zeros((n_batch, n_pthr), device=device, dtype=torch.float32)
+        for s in sideds
+        for nn in nns
+        for h in hpows
+    }
+    flat = fields.reshape(-1)
+    for sided, nn, ip, active_flat, batch_id, adj, merge in _active_sets(
+        fields, nbr_by_nn, nns, sideds, tcrits_by_sided, rank_scratch
+    ):
+        absval = flat[active_flat].abs()
+        got = _connected_max_foms(batch_id, adj, absval, n_batch, hpows, min_clust)
+        for h, v in got.items():
+            col = out[(sided, nn, h)]
+            col[:, ip] = torch.maximum(col[:, ip], v) if merge else v
+    return out
+
+
+def cluster_labels(
+    field: Tensor,  # [V] float32, one map
+    nbr: Tensor,
+    sided: str,
+    tcrit: float,
+    min_clust: int = 1,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Label one map: ``(active, label, (size, mass, sumsq) per active voxel)``.
+
+    ``active`` are in-mask voxel indices above threshold, ``label`` their
+    component id (clusters under ``min_clust`` dropped from ``active``), and
+    the last tensor ``[3, n]`` holds the FOM for h=0,1,2 of each voxel's own
+    cluster, so a caller can keep the voxels whose cluster passes any FOM
+    threshold without a second pass.
+    """
+    n_vox = int(field.numel())
+    device = field.device
+    scratch = torch.full((n_vox,), -1, device=device, dtype=torch.int32)
+    tc = torch.tensor([tcrit], device=device, dtype=torch.float32)
+    sets = list(
+        (af.clone(), adj.clone())
+        for _, _, _, af, _, adj, _ in _active_sets(
+            field.unsqueeze(0), {0: nbr}, (0,), (sided,), {sided: tc}, scratch
+        )
+    )
+    empty_i = torch.zeros(0, device=device, dtype=torch.int64)
+    if not sets:
+        return empty_i, empty_i, torch.zeros((3, 0), device=device)
+    actives, labels, foms = [], [], []
+    offset = 0
+    for af, adj in sets:
+        n_act = int(af.numel())
+        lab = _label_components(adj, n_act).long()
+        a = field[af].abs()
+        counts = torch.bincount(lab, minlength=n_act)
+        mass = torch.bincount(lab, weights=a, minlength=n_act)
+        sq = torch.bincount(lab, weights=a * a, minlength=n_act)
+        keep = counts[lab] >= max(int(min_clust), 1)
+        actives.append(af[keep])
+        labels.append(lab[keep] + offset)
+        foms.append(torch.stack([counts[lab].float(), mass[lab].float(), sq[lab].float()])[:, keep])
+        offset += n_act
+    return torch.cat(actives), torch.cat(labels), torch.cat(foms, dim=1)

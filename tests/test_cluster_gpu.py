@@ -179,3 +179,79 @@ def test_on_device_driver_matches_the_worker_pool():
     )
     for key in gpu.max_extent:
         np.testing.assert_array_equal(gpu.max_extent[key], cpu.max_extent[key], err_msg=str(key))
+
+
+# --- FOM (3dXClustSim figure of merit) -------------------------------------
+
+import cc3d  # noqa: E402
+
+from fastfuncstuff.stats.cluster_gpu import cluster_fom_batched, cluster_labels  # noqa: E402
+
+_CONN = {1: 6, 2: 18, 3: 26}
+
+
+def _cc3d_foms(stat3d, tcrit, sided, nn, min_clust):
+    """Per-cluster (size, mass, sumsq) from cc3d, AFNI's sidedness rules."""
+    if sided == "1-sided":
+        tails = [stat3d > tcrit]
+    elif sided == "2-sided":
+        tails = [np.abs(stat3d) > tcrit]
+    else:
+        tails = [stat3d > tcrit, stat3d < -tcrit]
+    out = []
+    for binv in tails:
+        lab = cc3d.connected_components(binv.astype(np.uint8), connectivity=_CONN[nn])
+        for k in range(1, int(lab.max()) + 1):
+            a = np.abs(stat3d[lab == k]).astype(np.float64)
+            if a.size >= min_clust:
+                out.append((a.size, a.sum(), (a * a).sum()))
+    return out
+
+
+@pytest.mark.parametrize("min_clust", [1, 5])
+def test_fom_matches_cc3d(min_clust):
+    mask, fields, tcrits, device = _setup(seed=3)
+    nbr = {nn: build_neighbor_table(mask, nn, device) for nn in NNS}
+    tc = {s: torch.from_numpy(v).to(device, torch.float32) for s, v in tcrits.items()}
+    got = cluster_fom_batched(
+        torch.from_numpy(fields), nbr, NNS, SIDEDS, tc, hpows=(0, 1, 2), min_clust=min_clust
+    )
+    stat3d = np.zeros(mask.shape, np.float32)
+    for i in range(fields.shape[0]):
+        stat3d[:] = 0.0
+        stat3d[mask] = fields[i]
+        for s in SIDEDS:
+            for nn in NNS:
+                for ip, t in enumerate(tcrits[s]):
+                    ref = _cc3d_foms(stat3d, t, s, nn, min_clust)
+                    for h in (0, 1, 2):
+                        want = max((c[h] for c in ref), default=0.0)
+                        assert got[(s, nn, h)][i, ip].item() == pytest.approx(want, rel=1e-5)
+
+
+def test_fom_h0_equals_extent_without_min_clust():
+    mask, fields, tcrits, device = _setup(seed=4)
+    ext = _run_batched(mask, fields, tcrits, device)
+    nbr = {nn: build_neighbor_table(mask, nn, device) for nn in NNS}
+    tc = {s: torch.from_numpy(v).to(device, torch.float32) for s, v in tcrits.items()}
+    fom = cluster_fom_batched(torch.from_numpy(fields), nbr, NNS, SIDEDS, tc, hpows=(0,))
+    for (s, nn), v in ext.items():
+        assert torch.equal(fom[(s, nn, 0)].long(), v)
+
+
+@pytest.mark.parametrize("sided", SIDEDS)
+def test_cluster_labels_reproduce_cc3d_clusters(sided):
+    mask, fields, _, device = _setup(seed=6, n_vol=1)
+    nbr = build_neighbor_table(mask, 2, device)
+    active, label, foms = cluster_labels(torch.from_numpy(fields[0]), nbr, sided, 1.1, 5)
+    stat3d = np.zeros(mask.shape, np.float32)
+    stat3d[mask] = fields[0]
+    ref = sorted(_cc3d_foms(stat3d, 1.1, sided, 2, 5))
+    # One FOM triple per distinct cluster.
+    lab = label.numpy()
+    _, first = np.unique(lab, return_index=True)
+    got = sorted(tuple(foms[:, j].double().tolist()) for j in first)
+    assert len(got) == len(ref)
+    for g, r in zip(got, ref, strict=True):
+        assert g == pytest.approx(r, rel=1e-5)
+    assert active.numel() == sum(int(r[0]) for r in ref)

@@ -634,39 +634,25 @@ def _simulate_on_device(
     verbose: bool,
 ) -> ClusterNull:
     """Generate and label entirely on the accelerator."""
-    from fastfuncstuff.stats.cluster_gpu import build_neighbor_table, cluster_extent_batched
+    from fastfuncstuff.stats.cluster_inference import max_fom_null
 
-    dev = sim.device
-    n_vox = int(sim.mask.sum())
     if batch is None:
         batch = _plan_batch(sim, n_iter)
-
-    # Both paths want thresholds tightest-first; remember how to put the
-    # columns back in the caller's pthr order.
-    tc_dev: dict[str, torch.Tensor] = {}
-    order: dict[str, np.ndarray] = {}
-    for s in sideds:
-        arr = np.asarray(tcrits[s], dtype=np.float64)
-        idx = np.argsort(-arr)
-        order[s] = idx
-        tc_dev[s] = torch.from_numpy(arr[idx].copy()).to(dev, torch.float32)
-
-    nbr = {nn: build_neighbor_table(sim.mask, nn, dev) for nn in nns}
-    scratch = torch.full((batch * n_vox,), -1, device=dev, dtype=torch.int32)
-
-    bar = tqdm(total=n_iter, desc="clustsim", leave=True, disable=not verbose)
-    try:
-        for start in range(0, n_iter, batch):
-            nb = min(batch, n_iter - start)
-            fields = sim.generate(nb)
-            view = scratch[: nb * n_vox] if nb != batch else scratch
-            res = cluster_extent_batched(fields, nbr, nns, sideds, tc_dev, view)
-            del fields
-            for (sided, nn), tab in res.items():
-                null.max_extent[(sided, nn)][start : start + nb, order[sided]] = tab.cpu().numpy()
-            bar.update(nb)
-    finally:
-        bar.close()
+    foms = max_fom_null(
+        lambda _start, nb: sim.generate(nb),
+        n_iter,
+        sim.mask,
+        tcrits,
+        nns=nns,
+        sideds=sideds,
+        hpows=(0,),
+        device=sim.device,
+        batch=batch,
+        desc="clustsim",
+        verbose=verbose,
+    )
+    for (sided, nn, _h), tab in foms.items():
+        null.max_extent[(sided, nn)][:] = tab.astype(np.int64)
     return null
 
 
