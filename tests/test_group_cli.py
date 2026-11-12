@@ -157,3 +157,18 @@ def test_mema_refuses_t_bricks_as_betas_and_cross_file_pairs(tmp_path):
     items = [x for p in paths for x in (f"{p}[0]", f"{p}[vis#0_Tstat]")]
     _, subj, groups = parse_set(items, "SetA", None, True)
     assert len(groups) == len(paths) and groups[2][1] == f"{paths[2]}[vis#0_Tstat]"
+
+
+def test_clustsim_blur_cases_get_their_own_files_and_tables(tmp_path):
+    from fastfuncstuff.stats.clustsim import read_clustsim_tables_from
+
+    a, _ = _write_sets(tmp_path, na=8, nb=0, shape=(9, 8, 7))
+    out = tmp_path / "c.nii.gz"
+    main(["-setA", *[f"{p}[1]" for p in a], "-prefix", str(out), "-device", "cpu", "-verb",
+          "0", "-clustsim", "-etac_blur", "0", "2", "-niter", "200"])  # fmt: skip
+    blurred = tmp_path / "c.B2.0.nii.gz"
+    t0 = read_clustsim_tables_from(out)[(2, "bi-sided")]
+    t2 = read_clustsim_tables_from(blurred)[(2, "bi-sided")]
+    assert read_brick_labels(nib.load(blurred)) == ["SetA_mean", "SetA_Tstat"]
+    # Blurring makes null clusters bigger, so the blurred table asks for more voxels.
+    assert t2.sizes[0, 1] > t0.sizes[0, 1]

@@ -147,7 +147,10 @@ def build_parser() -> FfsArgumentParser:
         metavar="FWHM",
         help="Extra Gaussian blurs (mm FWHM, inside the mask), one ETAC case "
         "each; 0 is the unblurred input.  Default: 0 only.  Blur adds in "
-        "quadrature to what the inputs already have.",
+        "quadrature to what the inputs already have.  With -clustsim, each "
+        "nonzero blur also writes PREFIX.B<fwhm> -- the same test on the blurred "
+        "inputs -- carrying its own ClustSim tables (3dttest++'s layout); the "
+        "main output's tables are for the unblurred data.",
     )
     inf.add_argument(
         "-etac_pthr",
@@ -451,9 +454,10 @@ def run(args) -> None:
     center = args.center or ("SAME" if mema else "DIFF")
     if (args.etac or args.clustsim) and (mema or args.unpooled):
         raise ValueError("-etac / -clustsim are implemented for the pooled -model ols test so far")
-    etac_extras = (args.etac_blur, args.etac_pthr)
-    if not args.etac and any(v is not None for v in etac_extras):
-        raise ValueError("-etac_* options need -etac")
+    if not args.etac and args.etac_pthr is not None:
+        raise ValueError("-etac_pthr needs -etac")
+    if not (args.etac or args.clustsim) and args.etac_blur is not None:
+        raise ValueError("-etac_blur needs -etac or -clustsim")
     la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, mema, args.brick)
     lb, subj_b, dsets_b = (None, [], [])
     if args.setB:
@@ -572,6 +576,10 @@ def run(args) -> None:
         ya, yb = stack(vols_a, 0), stack(vols_b, 0) if vols_b else None
         if args.clustsim:
             _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path)
+            for fwhm in sorted(set(args.etac_blur or ())):
+                if fwhm > 0:
+                    _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix,
+                                        ref_img)  # fmt: skip
         if args.etac:
             _run_etac(args, design, ya, yb, mask, voxdims, prefix.stem, prefix.nifti_ext,
                       ref_img)  # fmt: skip
@@ -599,6 +607,29 @@ def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path) 
         verbose=args.verb >= 1,
         simulator=PermutationFields(null, mask),
     )
+
+
+def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img) -> None:
+    """PREFIX.B<fwhm>: the test re-run on blurred inputs, with its own tables."""
+    import numpy as np
+
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.blur_to import MaskedGaussian
+    from fastfuncstuff.stats.etac import case_label
+    from fastfuncstuff.stats.group_ttest import run_ttest
+
+    g = MaskedGaussian(mask, voxdims, fwhm, device=ya.device)
+    ya_b = g.rows(ya)
+    yb_b = g.rows(yb) if yb is not None else None
+    bricks = run_ttest(design, ya_b, yb_b, toz=args.toz)
+    path = Path(f"{prefix.stem}.{case_label(fwhm)}{prefix.nifti_ext}")
+    out = np.zeros((*mask.shape, len(bricks)), dtype=np.float32)
+    for kb, b in enumerate(bricks):
+        out[..., kb][mask] = b.data.detach().cpu().numpy()
+    save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
+               brick_labels=[b.label for b in bricks],
+               brick_stataux={kb: b.stat for kb, b in enumerate(bricks) if b.stat})  # fmt: skip
+    _attach_permutation_clustsim(args, design, ya_b, yb_b, mask, voxdims, path)
 
 
 def _warn_distinct(args, n_distinct: float) -> None:
