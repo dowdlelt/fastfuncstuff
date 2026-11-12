@@ -54,6 +54,13 @@ def build_parser() -> FfsArgumentParser:
     inp.add_argument("-labelA", help="Set A's label for the short form (default SetA).")
     inp.add_argument("-labelB", help="Set B's label for the short form (default SetB).")
     inp.add_argument(
+        "-brick",
+        metavar="SEL",
+        help="Sub-brick to read from every dataset that has no [..] of its own: an "
+        "index or a label, e.g. -brick 'vis#0_Coef'.  Saves quoting a selector on "
+        "every file of a glob.",
+    )
+    inp.add_argument(
         "-mask",
         help="Analysis mask.  Default: every voxel nonzero in at least one input.",
     )
@@ -225,37 +232,134 @@ def short_label(spec: str) -> str:
     return name[:12]
 
 
-def parse_set(items: list[str], default_label: str, label_flag: str | None, per_subject: int = 1):
-    """``(set_label, [subject labels], [[dataset spec] * per_subject])`` from -setX.
+def with_brick(spec: str, brick: str | None) -> str:
+    """Apply the ``-brick`` default to a spec that has no selector of its own."""
+    if brick is None or _split_selector(spec)[1] is not None:
+        return spec
+    return f"{spec}[{brick}]"
 
-    ``per_subject`` is 1 for the t-test and 2 (beta, t) for MEMA.  Long form:
-    ``LABEL subj d1 [d2] subj d1 [d2] ...``; short form: ``d1 [d2] d1 [d2] ...``
-    with each subject labelled by its first dataset's file name.
+
+def parse_set(
+    items: list[str],
+    default_label: str,
+    label_flag: str | None,
+    want_t: bool = False,
+    brick: str | None = None,
+):
+    """``(set_label, [subject labels], [[spec] or [beta, t]])`` from a -setX value.
+
+    Long form ``LABEL subj d [t] subj d [t] ...``; short form ``d [t] d [t] ...``
+    with each subject labelled by its first dataset's file name.  With
+    ``want_t`` (MEMA) a subject's t-stat may be given explicitly — the dataset
+    right after its beta — or left out, and then it is found in the beta's own
+    bucket (:func:`find_tstat`).
     """
-    k = per_subject
-    what = "subj dset" if k == 1 else "subj beta tstat"
-    if not _exists(items[0]):
+    items = list(items)
+    long_form = not _exists(items[0])
+    if long_form:
         label, rest = items[0], items[1:]
         if label_flag:
             raise ValueError(f"set {label!r} is in long form: drop -label{default_label[-1]}")
-        if len(rest) < k + 1 or len(rest) % (k + 1):
+    else:
+        label, rest = label_flag or default_label, items
+
+    subj: list[str] = []
+    groups: list[list[str]] = []
+    k = 0
+    while k < len(rest):
+        if long_form:
+            if k + 1 >= len(rest):
+                raise ValueError(f"set {label!r}: subject {rest[k]!r} has no dataset")
+            name, k = rest[k], k + 1
+        else:
+            name = None
+        d = rest[k]
+        if not _exists(d):
+            raise ValueError(f"set {label!r}: no such dataset {d!r}")
+        grp = [with_brick(d, brick)]
+        k += 1
+        if want_t and _is_tstat(grp[0]):
             raise ValueError(
-                f"set {label!r}: long form needs 'LABEL {what} {what} ...' "
-                f"(got {len(rest)} items after the label)"
+                f"set {label!r}: {grp[0]} is marked as a t statistic; MEMA needs the "
+                "coefficient (its t-stat is found from it)"
             )
-        subj = rest[0 :: k + 1]
-        dsets = [rest[s + 1 : s + 1 + k] for s in range(0, len(rest), k + 1)]
-        missing = [d for grp in dsets for d in grp if not _exists(d)]
-        if missing:
-            raise ValueError(f"set {label!r}: no such dataset {missing[0]!r}")
-        return label, list(subj), dsets
-    missing = [d for d in items if not _exists(d)]
-    if missing:
-        raise ValueError(f"no such dataset {missing[0]!r}")
-    if len(items) % k:
-        raise ValueError(f"short form needs {k} datasets per subject (beta then t)")
-    dsets = [items[s : s + k] for s in range(0, len(items), k)]
-    return label_flag or default_label, [short_label(g[0]) for g in dsets], dsets
+        if want_t and k < len(rest) and _exists(rest[k]):
+            # Short form pairs only a t from the beta's own file: two adjacent
+            # betas from different subjects must never be read as (beta, t).
+            same_file = _split_selector(rest[k])[0] == _split_selector(d)[0]
+            if long_form or (same_file and _is_tstat(rest[k])):
+                grp.append(rest[k])
+                k += 1
+        subj.append(name if name is not None else short_label(d))
+        groups.append(grp)
+    if not groups:
+        raise ValueError(f"set {label!r} is empty")
+    if want_t:
+        groups = [g if len(g) == 2 else [g[0], find_tstat(g[0])] for g in groups]
+    return label, subj, groups
+
+
+def _brick_meta(path: str):
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.headers import read_brick_labels, read_brick_stataux
+
+    img = load_nifti(path)
+    return read_brick_labels(img), read_brick_stataux(img), img
+
+
+def _resolve_index(spec: str) -> tuple[str, int | None, list[str], dict]:
+    """``(path, sub-brick index or None, labels, stataux)`` of a spec."""
+    import numpy as np
+
+    path, sel = _split_selector(spec)
+    labels, aux, img = _brick_meta(path)
+    if sel is None:
+        n = int(np.prod(img.shape[3:])) if len(img.shape) > 3 else 1
+        return path, (0 if n == 1 else None), labels, aux
+    if re.fullmatch(r"\s*\d+\s*", sel):
+        return path, int(sel), labels, aux
+    if sel in labels:
+        return path, labels.index(sel), labels, aux
+    raise ValueError(f"{path}: no sub-brick labelled {sel!r}")
+
+
+def _is_tstat(spec: str) -> bool:
+    """Whether a spec names a t-statistic brick (stat code fitt, or *Tstat label)."""
+    try:
+        _, idx, labels, aux = _resolve_index(spec)
+    except (ValueError, OSError):
+        return False
+    if idx is None:
+        return False
+    if idx in aux:
+        return aux[idx][0] == 3
+    return idx < len(labels) and labels[idx].endswith("Tstat")
+
+
+def find_tstat(beta_spec: str) -> str:
+    """The t-stat brick that goes with a coefficient brick, from the same bucket.
+
+    By label first (``X_Coef`` → ``X_Tstat``, the 3dDeconvolve / 3dREMLfit /
+    ffs_reml convention), else the next sub-brick if the header says it is a t
+    statistic.  Anything else is refused — guessing a brick is how a group
+    analysis silently runs on the wrong numbers.
+    """
+    path, idx, labels, aux = _resolve_index(beta_spec)
+    if idx is None:
+        raise ValueError(f"{beta_spec}: several sub-bricks; select the coefficient (or use -brick)")
+    lab = labels[idx] if idx < len(labels) else ""
+    if lab.endswith("_Coef"):
+        want = lab[: -len("_Coef")] + "_Tstat"
+        if want in labels:
+            return f"{path}[{labels.index(want)}]"
+    nxt = idx + 1
+    if aux.get(nxt, (None,))[0] == 3:
+        return f"{path}[{nxt}]"
+    found = f"label {lab!r}" if lab else f"sub-brick {idx}"
+    raise ValueError(
+        f"{beta_spec}: cannot find its t-stat ({found}; no matching _Tstat label and "
+        f"sub-brick {nxt} is not marked as a t statistic).  Give it explicitly after the beta."
+    )
 
 
 def load_volume(spec: str):
@@ -350,12 +454,10 @@ def run(args) -> None:
     etac_extras = (args.etac_blur, args.etac_pthr)
     if not args.etac and any(v is not None for v in etac_extras):
         raise ValueError("-etac_* options need -etac")
-    k = 2 if mema else 1
-
-    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, k)
+    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, mema, args.brick)
     lb, subj_b, dsets_b = (None, [], [])
     if args.setB:
-        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB, k)
+        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB, mema, args.brick)
         if lb == la:
             raise ValueError(f"both sets are labelled {la!r}")
 

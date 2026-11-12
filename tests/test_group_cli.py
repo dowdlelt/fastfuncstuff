@@ -59,7 +59,7 @@ def test_set_parsing_rules(tmp_path):
     assert short_label("/x/Elvis_Presley_long.nii.gz[3]") == "Elvis_Presle"
     lab, subj, ds = parse_set([str(p) for p in a], "SetA", None)
     assert (lab, subj) == ("SetA", ["a0", "a1"])
-    with pytest.raises(ValueError, match="long form"):
+    with pytest.raises(ValueError, match="'s1' has no dataset"):
         parse_set(["G", "s0", str(a[0]), "s1"], "SetA", None)
     with pytest.raises(ValueError, match="drop -labelA"):
         parse_set(["G", "s0", str(a[0])], "SetA", "X")
@@ -116,3 +116,44 @@ def test_clustsim_and_etac_outputs(tmp_path):
                                                  "B3.0_p0.001"]  # fmt: skip
     assert (tmp_path / "g.ETACmask.global.2sid.5perc.nii.gz").exists()
     assert (tmp_path / "g.ETAC.thresholds.json").exists()
+
+
+def _write_buckets(tmp_path, n=6, labels=("vis#0_Coef", "vis#0_Tstat"), tstat_aux=True):
+    rng = np.random.default_rng(2)
+    paths = []
+    for i in range(n):
+        b = rng.normal(0.5, 1.0, (5, 4, 3))
+        t = b / rng.uniform(0.3, 1.0, b.shape)
+        p = tmp_path / f"sub{i}_stats.nii.gz"
+        aux = {1: (3, (40.0,))} if tstat_aux else None
+        save_nifti(np.stack([b, t], -1).astype(np.float32), p, affine=np.eye(4),
+                   brick_labels=list(labels), brick_stataux=aux)  # fmt: skip
+        paths.append(p)
+    return paths
+
+
+def test_mema_finds_the_tstat_by_label_and_with_brick(tmp_path):
+    paths = _write_buckets(tmp_path)
+    label, subj, groups = parse_set([str(p) for p in paths], "SetA", None, True, "vis#0_Coef")
+    assert subj[0] == "sub0_stats"
+    assert groups[0] == [f"{paths[0]}[vis#0_Coef]", f"{paths[0]}[1]"]
+
+
+def test_mema_falls_back_to_next_brick_only_if_marked_t(tmp_path):
+    paths = _write_buckets(tmp_path, labels=("beta", "stat"))
+    _, _, groups = parse_set([f"{p}[0]" for p in paths], "SetA", None, True)
+    assert groups[0][1] == f"{paths[0]}[1]"
+    bare = _write_buckets(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path,
+                          labels=("beta", "stat"), tstat_aux=False)  # fmt: skip
+    with pytest.raises(ValueError, match="cannot find its t-stat"):
+        parse_set([f"{p}[0]" for p in bare], "SetA", None, True)
+
+
+def test_mema_refuses_t_bricks_as_betas_and_cross_file_pairs(tmp_path):
+    paths = _write_buckets(tmp_path)
+    with pytest.raises(ValueError, match="marked as a t statistic"):
+        parse_set([f"{p}[1]" for p in paths], "SetA", None, True)
+    # Explicit pairs from the same file are honoured in short form.
+    items = [x for p in paths for x in (f"{p}[0]", f"{p}[vis#0_Tstat]")]
+    _, subj, groups = parse_set(items, "SetA", None, True)
+    assert len(groups) == len(paths) and groups[2][1] == f"{paths[2]}[vis#0_Tstat]"
