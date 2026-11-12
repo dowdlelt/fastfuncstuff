@@ -417,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         from fastfuncstuff.viz.dataviz.app import launch
     except ImportError as exc:
         print(
-            f"ffs_dataviz needs the GUI extra: pip install 'fastfuncstuff[viewer]'\n  ({exc})",
+            f"ffs_dataviz could not import Qt (PySide6); reinstall with: pip install 'PySide6>=6.7'\n  ({exc})",
             file=sys.stderr,
         )
         return 1

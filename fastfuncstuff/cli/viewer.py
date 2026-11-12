@@ -339,9 +339,9 @@ def main(argv: list[str] | None = None) -> int:
     _say("importing the viewer window...")
     try:
         from fastfuncstuff.viewer.ui.window import launch
-    except ImportError as exc:  # PySide6 is an extra, not a core dependency
+    except ImportError as exc:  # a broken or missing Qt install
         print(
-            f"ffs_viewer needs the GUI extra: pip install 'fastfuncstuff[viewer]'\n  ({exc})",
+            f"ffs_viewer could not import Qt (PySide6); reinstall with: pip install 'PySide6>=6.7'\n  ({exc})",
             file=sys.stderr,
         )
         return 1

@@ -43,8 +43,7 @@ uv pip install -e .
 
 `-e` editable preferred because this updates frequently.
 Add `".[dev]"` instead of `.` for tests + linters. A machine that only *runs* the tools doesn't
-need `[dev]` (pytest, ruff, and PySide6 at a few hundred MB); use `.[viewer]` if it needs
-`ffs_viewer`.
+need `[dev]` (pytest, xdist, scikit-learn, ruff). The viewer (PySide6) is installed either way.
 
 ### CPU-only Linux: skip the CUDA wheels
 
@@ -120,7 +119,7 @@ With no `-suma` and no `-fs_subj`, a pipeline needs FreeSurfer only for `mri_syn
 | `ffs_megre`, `ffs_util_b0fmap` | **ROMEO** binary (from [MRItools](https://github.com/korbinian90/MRItools/releases)) | On `PATH`, or `-romeo PATH` on `ffs_megre`. `ffs_medic` does not need it: it uses `warpkit`, a pip dependency with ROMEO built in. |
 | `.nii.zst` read/write | `zstd` (and `pzstd`) | **Required for `.nii.zst`**; see [zstd](#zstd-niizst-support) above. `.nii.gz` writes use `pigz` when found, else zlib. |
 | `ffs_dataviz` movies | `ffmpeg` | GIFs fall back to `imageio` (extra `viz`). |
-| `ffs_viewer` | PySide6 (extra `viewer`) | `fd` is optional and makes browsing large result trees faster. |
+| `ffs_viewer` | PySide6 (installed by default) | `fd` is optional and makes browsing large result trees faster. |
 | Benchmark (`ffs_benchmark`) | `aws` CLI; AFNI; MATLAB; FSL `melodic` | `aws` downloads the OpenNeuro datasets (`ds005165`, `ds003427`) from `s3://openneuro.org` with `--no-sign-request` into `$FFS_BENCHMARK_DATA_DIR` (default `test_data/`). AFNI (`3dvolreg`, `3dDeconvolve`, `3dREMLfit`, ...), MATLAB (NORDIC, GLMsingle) and `melodic` are the *reference* implementations. A stage whose reference is missing is skipped. |
 
 **Templates**
