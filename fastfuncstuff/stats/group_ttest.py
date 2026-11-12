@@ -322,6 +322,57 @@ def run_ttest(
     return out
 
 
+@dataclass
+class TestSpec:
+    """One t brick of :func:`run_ttest` as a model, for building its own null."""
+
+    label: str  # the estimate brick's label, e.g. "G1-G2_age"
+    brick: int  # index of the estimate brick (the t brick is the next one)
+    y: Tensor
+    x: np.ndarray
+    c: np.ndarray
+    permute: bool  # label permutation is meaningful (independent sets, A-B block)
+
+
+def t_tests(design: TtestDesign, ya: Tensor, yb: Tensor | None = None) -> list[TestSpec]:
+    """Every t brick :func:`run_ttest` writes, in its order, as (y, X, c).
+
+    Index 0 is the main test (:func:`main_test`).  Not defined for -unpooled,
+    whose Welch statistic is not a contrast of one linear model.
+    """
+    if design.unpooled:
+        raise ValueError("per-brick models are not defined for -unpooled")
+    ca, cb = design.centered_covariates()
+    names = ["mean", *design.cov_names]
+    p1 = len(names)
+    blocks: list[tuple[str, Tensor, np.ndarray, list[np.ndarray], bool]] = []
+
+    def one(label, y, cov):
+        x = one_sample_matrix(cov, y.shape[0])
+        return (label, y, x, list(np.eye(p1)), False)
+
+    if not design.two_sets:
+        blocks.append(one(design.label_a, ya, ca))
+    else:
+        assert yb is not None
+        diff = f"{design.label_a}-{design.label_b}"
+        if design.paired:
+            blocks.append(one(diff, ya - yb, ca))
+        else:
+            x = two_sample_matrix(ca, cb, design.n_a, design.n_b)
+            e = np.eye(2 * p1)
+            blocks.append(
+                (diff, torch.cat([ya, yb]), x, [e[k] - e[p1 + k] for k in range(p1)], True)
+            )
+        blocks.append(one(design.label_a, ya, ca))
+        blocks.append(one(design.label_b, yb, cb))
+    out = []
+    for j, (prefix, y, x, cons, perm) in enumerate(blocks):
+        for k, c in enumerate(cons):
+            out.append(TestSpec(f"{prefix}_{names[k]}", 2 * (j * p1 + k), y, x, c, perm))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Null maps for cluster inference
 # ---------------------------------------------------------------------------

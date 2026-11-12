@@ -111,6 +111,11 @@ def test_clustsim_and_etac_outputs(tmp_path):
           str(out), "-device", "cpu", "-verb", "0", "-clustsim", "-etac", "-etac_blur", "0",
           "3", "-etac_pthr", "0.01", "0.001", "-niter", "200"])  # fmt: skip
     assert (2, "bi-sided") in read_clustsim_tables_from(out)
+    # Every non-main t brick gets its own file and its own tables.
+    for lab in ("SetA_mean", "SetB_mean"):
+        f = tmp_path / f"g.{lab}.nii.gz"
+        assert read_brick_labels(nib.load(f)) == [lab, lab.replace("mean", "Tstat")]
+        assert (2, "bi-sided") in read_clustsim_tables_from(f)
     allm = tmp_path / "g.ETACmaskALL.global.2sid.5perc.nii.gz"
     assert read_brick_labels(nib.load(allm)) == ["B0.0_p0.01", "B0.0_p0.001", "B3.0_p0.01",
                                                  "B3.0_p0.001"]  # fmt: skip

@@ -127,10 +127,13 @@ def build_parser() -> FfsArgumentParser:
     inf.add_argument(
         "-clustsim",
         action="store_true",
-        help="Attach a 3dClustSim-format cluster-size table built from the "
-        "permutation null of the main test (3dttest++ -Clustsim) to the output "
-        "header.  ffs_viewer and AFNI then report each cluster's corrected alpha "
-        "as you move the threshold.",
+        help="Attach 3dClustSim-format cluster-size tables built from a "
+        "permutation null (3dttest++ -Clustsim); ffs_viewer and AFNI then report "
+        "each cluster's corrected alpha as you move the threshold.  A dataset holds "
+        "one table set, so the output bucket's tables are for its main test (A-B, "
+        "or the one-sample mean); every other t brick is also written to its own "
+        "PREFIX.<label> file (e.g. PREFIX.G1_mean, PREFIX.G1-G2_age) carrying "
+        "tables from that test's own null.",
     )
     inf.add_argument(
         "-etac",
@@ -576,6 +579,7 @@ def run(args) -> None:
         ya, yb = stack(vols_a, 0), stack(vols_b, 0) if vols_b else None
         if args.clustsim:
             _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path)
+            _clustsim_per_brick(args, design, ya, yb, mask, voxdims, bricks, prefix, ref_img)
             for fwhm in sorted(set(args.etac_blur or ())):
                 if fwhm > 0:
                     _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix,
@@ -585,12 +589,15 @@ def run(args) -> None:
                       ref_img)  # fmt: skip
 
 
-def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path) -> None:
+def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path, spec=None) -> None:
     from fastfuncstuff.stats.clustsim import attach_clustsim_tables
     from fastfuncstuff.stats.group_ttest import OlsNull, PermutationFields, main_test
 
-    y, x, c = main_test(design, ya, yb)
-    permute = design.two_sets and not design.paired
+    if spec is None:
+        y, x, c = main_test(design, ya, yb)
+        permute = design.two_sets and not design.paired
+    else:
+        y, x, c, permute = spec.y, spec.x, spec.c, spec.permute
     null = OlsNull(y.float(), x, c, n_iter=args.niter, seed=args.seed, permute=permute)
     _warn_distinct(args, null.n_distinct)
     stem = Path(str(out_path).removesuffix("".join(out_path.suffixes)))
@@ -607,6 +614,35 @@ def _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, out_path) 
         verbose=args.verb >= 1,
         simulator=PermutationFields(null, mask),
     )
+
+
+def _clustsim_per_brick(args, design, ya, yb, mask, voxdims, bricks, prefix, ref_img) -> None:
+    """PREFIX.<label>: each non-main t brick with tables from its own null.
+
+    A dataset carries one ClustSim table set, so the main bucket's tables can
+    only describe its main test.  Every other (estimate, t) pair -- the per-set
+    tests, the covariate slopes -- goes to its own file whose name says which
+    test the tables belong to.
+    """
+    import numpy as np
+
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.group_ttest import t_tests
+
+    for spec in t_tests(design, ya, yb)[1:]:
+        pair = bricks[spec.brick : spec.brick + 2]
+        safe = re.sub(r"[^A-Za-z0-9._+-]", "_", spec.label)
+        path = Path(f"{prefix.stem}.{safe}{prefix.nifti_ext}")
+        out = np.zeros((*mask.shape, 2), dtype=np.float32)
+        for kb, b in enumerate(pair):
+            out[..., kb][mask] = b.data.detach().cpu().numpy()
+        save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
+                   brick_labels=[b.label for b in pair],
+                   brick_stataux={1: pair[1].stat} if pair[1].stat else None)  # fmt: skip
+        _attach_permutation_clustsim(args, design, ya, yb, mask, voxdims, path, spec=spec)
+        if args.verb:
+            print(f"[ffs_group] {path}: {spec.label} with its own ClustSim tables",
+                  file=sys.stderr)  # fmt: skip
 
 
 def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img) -> None:

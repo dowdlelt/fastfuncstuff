@@ -144,3 +144,27 @@ def test_null_is_independent_of_batching():
     whole = null(0, 10)
     parts = torch.cat([null(0, 3), null(3, 4), null(7, 3)])
     torch.testing.assert_close(whole, parts, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("kind", ["one_cov", "two_cov", "paired"])
+def test_per_brick_specs_reproduce_run_ttest(kind):
+    from fastfuncstuff.stats.group_ttest import t_tests
+
+    ya, yb = _data(7)
+    rng = np.random.default_rng(8)
+    if kind == "one_cov":
+        des, yb = TtestDesign(9, cov_a=rng.standard_normal((9, 2)), cov_names=("a", "b")), None
+    elif kind == "two_cov":
+        des = TtestDesign(9, 7, cov_a=rng.standard_normal((9, 1)), cov_b=rng.standard_normal((7, 1)),
+                          cov_names=("a",))  # fmt: skip
+    else:
+        des, ya, yb = TtestDesign(7, 7, paired=True), ya[:7], yb
+    bricks = run_ttest(des, ya, yb)
+    specs = t_tests(des, ya, yb)
+    assert len(specs) * 2 == len(bricks)
+    for sp in specs:
+        assert bricks[sp.brick].label == sp.label
+        fit = ols_contrasts(sp.y, sp.x, sp.c[None])
+        np.testing.assert_allclose(fit.t[0], bricks[sp.brick + 1].data, rtol=1e-10)
+    y, x, c = main_test(des, ya, yb)
+    np.testing.assert_allclose(specs[0].c, c)
