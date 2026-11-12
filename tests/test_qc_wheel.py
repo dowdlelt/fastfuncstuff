@@ -182,6 +182,26 @@ def test_residual_check_names_the_bad_run(tmp_path):
         meta = json.loads(str(z["meta"]))
         assert z["tsnr"].ndim == 3
     assert meta["runs"] == ["run-01", "run-02", "run-03"] and meta["frac_sig"] == 0.2
+    for q, med in zip(meta["run_tsnr_input_q"], meta["run_tsnr_input"], strict=True):
+        assert q == sorted(q) and q[2] == med and q[0] < q[4]
+
+
+def test_a_few_large_frames_stay_visible_in_the_motion_ring():
+    """A still run that lurched 3 times in 300 frames: by share alone the lurches
+    are 1% of the volumes, a sliver. They must still be marked as present, at
+    their own value, and nowhere between them and the still frames."""
+    rng = np.random.default_rng(0)
+    still = 0.03 * np.exp(0.2 * rng.standard_normal(297))
+    motion = np.r_[still, 1.5, 1.6, 1.4]
+    grid = np.linspace(*np.log10(wheel.MOTION_AXIS), 97)
+    dens, seen = wheel.enorm_density(motion, grid)
+    at = lambda mm: np.argmin(np.abs(grid - np.log10(mm)))  # noqa: E731
+    assert dens[at(1.5)] / wheel.ENORM_DENS_FULL < wheel.SEEN_WIDTH  # too thin alone
+    assert seen[at(1.5)] and not seen[at(0.4)] and seen[at(0.03)]
+    frac = np.r_[np.zeros(10), np.full(287, 0.002), 0.2, 0.25, 0.3]
+    h = wheel.outlier_hist(frac)
+    assert np.isclose(h.sum(), 1.0) and h[0] == 10 / 300  # zeros land in the first bin
+    assert (h[-4:] > 0).any()
 
 
 def test_wheel_layout_is_fixed_whatever_the_data():
@@ -222,8 +242,10 @@ def test_report_draws_one_wheel_per_variant_and_finds_each_runs_motion(tmp_path)
                 params,
                 tr=1.0,
                 enorm=enorm,
+                outlier_frac=np.minimum(enorm / 10, 1.0),
                 keep=(enorm < 0.3).astype(int),
                 motion_limit=0.3,
+                outlier_limit=0.05,
             )
             rec.write(verb=0)
     out = build_report(tmp_path)
@@ -251,6 +273,8 @@ def test_report_draws_one_wheel_per_variant_and_finds_each_runs_motion(tmp_path)
     assert slots == ["moco"]
     bad = tasks[0].runs[2]
     assert bad.motion is not None and bad.motion.size == NR and bad.motion_limit == 0.3
+    assert bad.outlier is not None and bad.outlier.size == NR and bad.outlier_limit == 0.05
+    assert bad.tsnr_in_q is not None and bad.tsnr_in_q[2] == bad.tsnr_in
     assert np.nanmean(bad.motion) > 5 * np.nanmean(tasks[0].runs[0].motion)
     assert bad.status == {"moco": "warn"} and tasks[1].runs[0].status == {"moco": "ok"}
     assert any(f.startswith("a r3: moco censor_frac") for f in flags)

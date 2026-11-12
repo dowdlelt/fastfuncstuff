@@ -111,9 +111,11 @@ def motion_check(
         if of[0] > PRE_STEADY_LIMIT:
             stats.append(("pre-steady-state vol 0", "warn"))
 
-    for name, trace in (("enorm", enorm), ("fd", fd)):
+    for name, trace in (("enorm", enorm), ("fd", fd), ("outlier", outlier_frac)):
         if trace is not None:
             rec.add_series(name, np.asarray(trace, float))
+    if outlier_limit is not None:
+        rec.info["outlier_limit"] = outlier_limit
     if keep is not None:
         rec.add_series("keep", np.asarray(keep))
     if motion_limit is not None:
@@ -1054,6 +1056,7 @@ def glm_check(
 CARPET_MAX_VOXELS = 30000
 CARPET_MAX_ELEMENTS = 24e6
 WHEEL_SIDECAR = "wheel"
+WHEEL_TSNR_Q = (5, 25, 50, 75, 95)  # whisker, box, median, box, whisker
 
 
 def _shell_interior(mask: np.ndarray) -> dict[str, np.ndarray]:
@@ -1138,11 +1141,14 @@ def residual_check(
         "median per-voxel ratio residual tSNR / input tSNR; 1 = the regressors removed "
         "no more variance than their degrees of freedom cost",
     )
-    run_in = np.array([np.median(v[live]) for v in st.run_tsnr(st.run_sd_in)])
-    run_res = np.array([np.median(v[live]) for v in st.run_tsnr(st.run_sd_res)])
+    # Per run, the spread of voxel tSNR as well as its median: the wheel draws a
+    # box per run, so one run sitting low in part of the brain shows.
+    q_in = np.array([np.percentile(v[live], WHEEL_TSNR_Q) for v in st.run_tsnr(st.run_sd_in)])
+    q_res = np.array([np.percentile(v[live], WHEEL_TSNR_Q) for v in st.run_tsnr(st.run_sd_res)])
     empty = st.run_kept == 0
-    run_in[empty] = np.nan
-    run_res[empty] = np.nan
+    q_in[empty] = np.nan
+    q_res[empty] = np.nan
+    run_in, run_res = q_in[:, 2], q_res[:, 2]
 
     # --- groups: tissue classes when a segmentation is at hand ---------------
     groups = {k: np.asarray(v, bool) & mask for k, v in (tissue or {}).items()}
@@ -1298,6 +1304,8 @@ def residual_check(
         "run_kept": [int(v) for v in st.run_kept],
         "run_tsnr_input": [_num(v) for v in run_in],
         "run_tsnr_resid": [_num(v) for v in run_res],
+        "run_tsnr_input_q": [[_num(v) for v in q] for q in q_in],
+        "run_tsnr_resid_q": [[_num(v) for v in q] for q in q_res],
         "run_heldout_r2": [_num(v) for v in run_r2],
         "tsnr_input_median": med_in,
         "tsnr_resid_median": med_res,

@@ -10,12 +10,21 @@ One sector per run, runs grouped by task (the F statistic is a task's, pooled
 over its runs). **Nothing autoscales.** Every axis, every reference circle and
 every slot is fixed, so flipping through subjects shows differences in the data
 and never differences in the drawing: a quiet session is the same quiet shape
-each time and a bad run breaks it. That is also why the motion ring is a
-histogram and not a trace: a distribution has the same width for a 100-volume
+each time and a bad run breaks it. That is also why the motion ring holds
+distributions and not traces: a distribution has the same width for a 100-volume
 run and a 1000-volume one.
 
+The motion ring is two distributions side by side, the outlier fraction
+(3dToutcount) and enorm, each on its own log axis and each coloured by its
+value. Width alone would hide a mostly still run that lurched a few times (five
+frames of 316 are a sliver), so every value that occurs at all gets a minimum
+width: the lurch shows as a spot of hot colour out at the rim. The tSNR ring is
+a box per run for the GLM's input and its residual, filled through the same
+colour scale as the centre brain, so a run whose lower quartile sits low is a
+box that starts darker and further in than its neighbours'.
+
 Length carries what is compared by size (motion, tSNR, fit, significance);
-colour carries only pass / over-a-limit, and the key says so in words.
+the checks ring's colour carries only pass / over-a-limit.
 """
 
 from __future__ import annotations
@@ -32,8 +41,16 @@ from . import render, style
 # enorm from a still head (~0.01 mm) to a lurch of millimetres.
 TSNR_AXIS = (5.0, 300.0)
 MOTION_AXIS = (0.01, 3.0)
-MOTION_BINS = 16
-MOTION_FULL = 0.35  # a bin holding this share of a run's volumes spans the sector
+# 3dToutcount fraction: a still run sits at 1e-4 to 1e-2, afni_proc censors at 0.05.
+OUTLIER_AXIS = (0.0001, 0.3)  # 0 is clipped into the first bin
+OUTLIER_BINS = 24
+OUTLIER_FULL = 0.5  # a bin holding this share of a run's volumes spans its half
+ENORM_DENS_FULL = 2.5  # enorm density (share per decade) that spans its half
+ENORM_BW = 0.06  # smoothing bandwidth of the enorm curve, decades
+SEEN_WIDTH = 0.14  # minimum width (share of a half) of any value that occurs at all
+ENORM_CMAP = "turbo"
+OUTLIER_CMAP = "hot"
+OUTLIER_CMAP_FROM = 0.3  # hot starts at black, which vanishes on the dark panel
 R2_TOP = 0.5
 FRAC_TOP = 0.5
 
@@ -53,10 +70,14 @@ class WheelRun:
     label: str
     motion: np.ndarray | None = None  # per-volume enorm (or FD), mm
     motion_limit: float | None = None
+    outlier: np.ndarray | None = None  # per-volume outlier fraction
+    outlier_limit: float | None = None
     status: dict[str, str] = field(default_factory=dict)  # slot -> 'ok' | 'warn'
     tsnr_in: float | None = None
     tsnr_res: float | None = None
     r2: float | None = None
+    tsnr_in_q: tuple[float, ...] | None = None  # 5, 25, 50, 75, 95th percentiles
+    tsnr_res_q: tuple[float, ...] | None = None
 
 
 @dataclass
@@ -75,10 +96,42 @@ def short_run_label(label: str, index: int) -> str:
     return f"s{ses.group(1)} {r}" if ses else r
 
 
-def _log_radius(v: float, axis: tuple[float, float], ring: tuple[float, float]) -> float:
+def _log_t(v, axis: tuple[float, float]):
     lo, hi = axis
-    t = (np.log(np.clip(v, lo, hi)) - np.log(lo)) / (np.log(hi) - np.log(lo))
-    return float(ring[0] + t * (ring[1] - ring[0]))
+    return (np.log(np.clip(v, lo, hi)) - np.log(lo)) / (np.log(hi) - np.log(lo))
+
+
+def _log_radius(v: float, axis: tuple[float, float], ring: tuple[float, float]) -> float:
+    return float(ring[0] + _log_t(v, axis) * (ring[1] - ring[0]))
+
+
+def _cmap(name: str, t: float, start: float = 0.0) -> tuple[float, float, float]:
+    """Colour at ``t`` in [0, 1] of a matplotlib map, its bottom ``start`` skipped."""
+    table = render.lut(name)
+    k = int(np.clip(start + (1 - start) * t, 0, 1) * 255)
+    r, g, b = (float(c) / 255 for c in table[k])
+    return r, g, b
+
+
+def outlier_hist(frac: np.ndarray) -> np.ndarray:
+    """Share of volumes in each of :data:`OUTLIER_BINS` log bins of :data:`OUTLIER_AXIS`."""
+    v = np.asarray(frac, float)
+    v = np.clip(v[np.isfinite(v)], *OUTLIER_AXIS)
+    edges = np.geomspace(*OUTLIER_AXIS, OUTLIER_BINS + 1)
+    return np.histogram(v, edges)[0] / max(v.size, 1)
+
+
+def enorm_density(motion: np.ndarray, grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Gaussian density of log10 enorm on ``grid`` (log10 mm), in share per decade,
+    and whether any volume lies within reach of each grid point (one volume's
+    kernel above a quarter of its own peak)."""
+    v = np.asarray(motion, float)
+    v = np.log10(np.clip(v[np.isfinite(v)], *MOTION_AXIS))
+    if not v.size:
+        return np.zeros_like(grid), np.zeros(grid.shape, bool)
+    k = np.exp(-0.5 * ((grid[:, None] - v[None]) / ENORM_BW) ** 2)
+    dens = k.sum(1) / (v.size * ENORM_BW * np.sqrt(2 * np.pi))
+    return dens, k.max(1) > 0.25
 
 
 def _xy(r: float, a: float) -> tuple[float, float]:
@@ -166,15 +219,27 @@ def wheel(
                 fontsize=8,
                 color=style.MUTED,
             )
+        # Motion: outlier fraction on the left of the gap, enorm on the right,
+        # each number in its own map's colour.
+        for v in (0.001, 0.01, 0.1):
+            ax.text(
+                -0.075,
+                _log_radius(v, OUTLIER_AXIS, R_MOTION),
+                f"{v:g}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=_cmap(OUTLIER_CMAP, float(_log_t(v, OUTLIER_AXIS)), OUTLIER_CMAP_FROM),
+            )
         for v in (0.03, 0.3, 3):
             ax.text(
-                0,
+                0.075,
                 _log_radius(v, MOTION_AXIS, R_MOTION) - (0.012 if v == 3 else 0),
                 f"{v:g}",
                 ha="center",
                 va="center",
                 fontsize=8,
-                color=style.MUTED,
+                color=_cmap(ENORM_CMAP, float(_log_t(v, MOTION_AXIS))),
             )
         ax.text(
             0,
@@ -186,11 +251,15 @@ def wheel(
             color=style.MUTED,
         )
         ax.text(0, R_FIT[0] + 0.012, "0", ha="center", va="center", fontsize=8, color=style.MUTED)
-        for name, r in (("mm", 1.045), ("tSNR", R_TSNR[1] + 0.022), ("R²", R_FIT[1] + 0.022)):
-            ax.text(0, r, name, ha="center", va="center", fontsize=8, color=style.INK2)
+        for x, name, r in (
+            (-0.075, "outl.", 1.045),
+            (0.075, "mm", 1.045),
+            (0, "tSNR", R_TSNR[1] + 0.022),
+            (0, "R²", R_FIT[1] + 0.022),
+        ):
+            ax.text(x, r, name, ha="center", va="center", fontsize=8, color=style.INK2)
 
         n_slots = max(len(slots), 1)
-        edges = np.geomspace(*MOTION_AXIS, MOTION_BINS + 1)
         for task, tspans in zip(tasks, spans, strict=True):
             if not task.runs:
                 continue
@@ -199,47 +268,29 @@ def wheel(
                 pad = min(0.9, 0.08 * w)
                 b0, b1 = a0 + pad, a1 - pad
                 mid = (a0 + a1) / 2
-                # --- motion: a histogram along the radius ---------------------
+                # --- motion: outlier fraction | enorm, each on its own axis --
                 wedge(b0, b1, *R_MOTION, style.PANEL)
-                if run.motion is not None and np.isfinite(run.motion).any():
-                    v = np.clip(run.motion[np.isfinite(run.motion)], *MOTION_AXIS)
-                    frac = np.histogram(v, edges)[0] / max(v.size, 1)
-                    for k in np.flatnonzero(frac > 0):
-                        half = 0.5 * (b1 - b0) * min(1.0, frac[k] / MOTION_FULL)
-                        over = run.motion_limit is not None and edges[k] >= run.motion_limit
-                        wedge(
-                            mid - half,
-                            mid + half,
-                            _log_radius(edges[k], MOTION_AXIS, R_MOTION),
-                            _log_radius(edges[k + 1], MOTION_AXIS, R_MOTION),
-                            style.STATUS["fail"] if over else style.BLUE,
-                        )
-                    if run.motion_limit:
-                        arc(
-                            b0,
-                            b1,
-                            _log_radius(run.motion_limit, MOTION_AXIS, R_MOTION),
-                            style.INK2,
-                            1.0,
-                            (0, (3, 2)),
-                        )
+                gap = min(0.5, 0.04 * w)
+                halves = ((b0, mid - gap), (mid + gap, b1))
+                _draw_outliers(wedge, arc, run, *halves[0])
+                _draw_enorm(wedge, arc, run, *halves[1])
                 # --- checks: one cell per tool --------------------------------
                 cw = (b1 - b0) / n_slots
                 for k, slot in enumerate(slots or [""]):
                     state = run.status.get(slot)
                     color = style.STATUS[state] if state else style.GRID
                     wedge(b0 + k * cw + 0.06 * cw, b0 + (k + 1) * cw - 0.06 * cw, *R_STATUS, color)
-                # --- tSNR: input (hollow) to residual (filled) ----------------
+                # --- tSNR: a box for the input, a box for the residual -------
                 wedge(b0, b1, *R_TSNR, style.PANEL, alpha=0.55)
-                if run.tsnr_in and run.tsnr_res:
-                    r_in = _log_radius(run.tsnr_in, TSNR_AXIS, R_TSNR)
-                    r_res = _log_radius(run.tsnr_res, TSNR_AXIS, R_TSNR)
-                    color = style.AQUA if run.tsnr_res >= run.tsnr_in else style.ORANGE
-                    (x0, y0), (x1, y1) = _xy(r_in, mid), _xy(r_res, mid)
-                    ms = float(np.clip(1.1 * w, 4.5, 9.0))
-                    ax.plot([x0, x1], [y0, y1], color=color, lw=2.2, solid_capstyle="butt")
-                    ax.plot(x0, y0, "o", ms=ms, mfc=style.SURFACE, mec=color, mew=1.6)
-                    ax.plot(x1, y1, "o", ms=ms, mfc=color, mec=color)
+                q = 0.1 * (b1 - b0)
+                for (c0, c1), quant, med, alpha in (
+                    ((b0 + q, mid - gap), run.tsnr_in_q, run.tsnr_in, 0.5),
+                    ((mid + gap, b1 - q), run.tsnr_res_q, run.tsnr_res, 1.0),
+                ):
+                    if quant is None and med:
+                        quant = (med,) * 5
+                    if quant is not None:
+                        _draw_box(ax, wedge, arc, c0, c1, quant, alpha)
                 # --- fit: held-out R2 as a bar ---------------------------------
                 wedge(b0, b1, *R_FIT, style.PANEL)
                 if run.r2 is not None:
@@ -308,6 +359,83 @@ def wheel(
         return render.figure_image(fig)
 
 
+def _draw_outliers(wedge, arc, run: WheelRun, a0: float, a1: float) -> None:
+    """Outlier-fraction histogram in ``[a0, a1]``: baseline at ``a0``, bars grow
+    clockwise, each bin in the heat colour of its own value."""
+    wedge(a0, a0 + 0.15, *R_MOTION, style.GRID)
+    if run.outlier is None or not np.isfinite(run.outlier).any():
+        return
+    frac = outlier_hist(run.outlier)
+    edges = np.geomspace(*OUTLIER_AXIS, OUTLIER_BINS + 1)
+    for k in np.flatnonzero(frac > 0):
+        share = max(min(1.0, frac[k] / OUTLIER_FULL), SEEN_WIDTH)
+        t = float(_log_t(np.sqrt(edges[k] * edges[k + 1]), OUTLIER_AXIS))
+        wedge(
+            a0,
+            a0 + share * (a1 - a0),
+            _log_radius(edges[k], OUTLIER_AXIS, R_MOTION),
+            _log_radius(edges[k + 1], OUTLIER_AXIS, R_MOTION),
+            _cmap(OUTLIER_CMAP, t, OUTLIER_CMAP_FROM),
+        )
+    if run.outlier_limit:
+        r = _log_radius(run.outlier_limit, OUTLIER_AXIS, R_MOTION)
+        arc(a0, a1, r, style.INK2, 1.0, (0, (3, 2)))
+
+
+def _draw_enorm(wedge, arc, run: WheelRun, a0: float, a1: float, n: int = 96) -> None:
+    """Smoothed enorm density in ``[a0, a1]``, coloured through turbo by radius."""
+    wedge(a0, a0 + 0.15, *R_MOTION, style.GRID)
+    if run.motion is None or not np.isfinite(run.motion).any():
+        return
+    lo, hi = np.log10(MOTION_AXIS)
+    bounds = np.linspace(lo, hi, n + 1)
+    dens, seen = enorm_density(run.motion, 0.5 * (bounds[1:] + bounds[:-1]))
+    r_edge = R_MOTION[0] + (bounds - lo) / (hi - lo) * (R_MOTION[1] - R_MOTION[0])
+    for k in range(n):
+        share = min(1.0, dens[k] / ENORM_DENS_FULL)
+        if seen[k]:
+            share = max(share, SEEN_WIDTH)
+        if share <= 0.004:
+            continue
+        wedge(
+            a0,
+            a0 + share * (a1 - a0),
+            r_edge[k],
+            r_edge[k + 1],
+            _cmap(ENORM_CMAP, (k + 0.5) / n),
+        )
+    if run.motion_limit:
+        r = _log_radius(run.motion_limit, MOTION_AXIS, R_MOTION)
+        arc(a0, a1, r, style.INK2, 1.0, (0, (3, 2)))
+
+
+def _draw_box(ax, wedge, arc, a0: float, a1: float, quant, alpha: float, n: int = 24) -> None:
+    """A radial box plot of voxel tSNR: whisker 5-95%, box 25-75% filled through
+    inferno by radius (the centre's scale), median as a bright arc."""
+    p5, p25, p50, p75, p95 = quant
+    mid = 0.5 * (a0 + a1)
+    r5, r95 = (_log_radius(v, TSNR_AXIS, R_TSNR) for v in (p5, p95))
+    (x0, y0), (x1, y1) = _xy(r5, mid), _xy(r95, mid)
+    ax.plot([x0, x1], [y0, y1], color=style.MUTED, lw=1.1, alpha=max(alpha, 0.7))
+    cap = 0.25 * (a1 - a0)
+    for r in (r5, r95):
+        arc(mid - cap, mid + cap, r, style.MUTED, 1.1)
+    t25, t75 = (float(_log_t(v, TSNR_AXIS)) for v in (p25, p75))
+    edges = np.linspace(t25, t75, n + 1)
+    for k in range(n):
+        if edges[k + 1] <= edges[k]:
+            continue
+        wedge(
+            a0,
+            a1,
+            R_TSNR[0] + edges[k] * (R_TSNR[1] - R_TSNR[0]),
+            R_TSNR[0] + edges[k + 1] * (R_TSNR[1] - R_TSNR[0]),
+            _cmap("inferno", 0.5 * (edges[k] + edges[k + 1])),
+            alpha=alpha,
+        )
+    arc(a0, a1, _log_radius(p50, TSNR_AXIS, R_TSNR), style.INK, 2.0)
+
+
 def _key(fig, left: float, slots, headline, flags) -> None:
     """The right-hand panel: headline numbers, how to read each ring, what to check."""
     from matplotlib.patches import Rectangle
@@ -334,10 +462,12 @@ def _key(fig, left: float, slots, headline, flags) -> None:
     checks = ", ".join(slots) if slots else "none reported"
     rows = [
         (
-            style.BLUE,
+            _cmap(ENORM_CMAP, 0.75),
             "motion",
-            f"share of volumes at each enorm, {MOTION_AXIS[0]:g} (inner) to {MOTION_AXIS[1]:g} mm "
-            "(outer), log. Dashed arc: censor limit; red: beyond it.",
+            f"left: outlier fraction ({OUTLIER_AXIS[0]:g}-{OUTLIER_AXIS[1]:g}, heat); right: "
+            f"enorm ({MOTION_AXIS[0]:g}-{MOTION_AXIS[1]:g} mm, turbo). Radius = value (log), "
+            "width = share of volumes, but any value that occurs gets a minimum width: a "
+            "few big frames are a spot of hot colour at the rim. Dashed: censor limit.",
         ),
         (
             style.STATUS["ok"],
@@ -346,10 +476,11 @@ def _key(fig, left: float, slots, headline, flags) -> None:
             "Amber: over one (listed below). Grey: not reported.",
         ),
         (
-            style.AQUA,
+            _cmap("inferno", 0.6),
             "tSNR",
-            f"hollow: the GLM's input; filled: its residual. {TSNR_AXIS[0]:g} to "
-            f"{TSNR_AXIS[1]:g}, log. The bar between them is what the model removed.",
+            f"voxel tSNR, {TSNR_AXIS[0]:g}-{TSNR_AXIS[1]:g}, log, in the centre's colours. "
+            "Faint left box: the GLM's input; right: its residual. Box 25-75%, whiskers "
+            "5-95%, white arc the median.",
         ),
         (
             style.VIOLET,

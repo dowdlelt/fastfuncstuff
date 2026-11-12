@@ -160,6 +160,13 @@ def _series(rec: dict, key: str) -> np.ndarray | None:
     return None if v is None else np.array([np.nan if x is None else x for x in v], float)
 
 
+def _quantiles(table, i: int) -> tuple[float, ...] | None:
+    """Run ``i``'s tSNR quantiles from a sidecar (absent before they were stored)."""
+    if not table or i >= len(table) or any(v is None for v in table[i]):
+        return None
+    return tuple(float(v) for v in table[i])
+
+
 def session_wheel(qc_dir: Path, records: list[dict]) -> list[dict]:
     """One wheel per fitted variant, from the GLM sidecars and every run-level record.
 
@@ -208,11 +215,15 @@ def session_wheel(qc_dir: Path, records: list[dict]) -> list[dict]:
                     tsnr_in=meta["run_tsnr_input"][i],
                     tsnr_res=meta["run_tsnr_resid"][i],
                     r2=meta["run_heldout_r2"][i],
+                    tsnr_in_q=_quantiles(meta.get("run_tsnr_input_q"), i),
+                    tsnr_res_q=_quantiles(meta.get("run_tsnr_resid_q"), i),
                 )
                 if mine is not None:
                     key = mine.get("info", {}).get("motion_metric") or "enorm"
                     run.motion = _series(mine, key if key in mine["series"] else "fd")
                     run.motion_limit = mine.get("info", {}).get("motion_limit")
+                    run.outlier = _series(mine, "outlier")
+                    run.outlier_limit = mine.get("info", {}).get("outlier_limit")
                 for rec in others:
                     if frag not in rec["label"] and rec["label"] not in label:
                         continue
