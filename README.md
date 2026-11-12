@@ -28,6 +28,7 @@ pip install -e .          # Python >= 3.11; add ".[dev]" for tests + linters
 ```
 
 See **[INSTALL.md](INSTALL.md)** for details about conda / uv,  `zstd` needed for `.nii.zst`, Bash requirements for `ffs_autoproc` scripts, FreeSurfer / AFNI / ROMEO / SPM-template expectations, and a list of the environment variable the tools read.
+If something fails at install or launch time, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
 
 ### File formats
 
