@@ -50,7 +50,11 @@ ENORM_BW = 0.06  # smoothing bandwidth of the enorm curve, decades
 SEEN_WIDTH = 0.14  # minimum width (share of a half) of any value that occurs at all
 ENORM_CMAP = "turbo"
 OUTLIER_CMAP = "hot"
-OUTLIER_CMAP_FROM = 0.3  # hot starts at black, which vanishes on the dark panel
+OUTLIER_CMAP_FROM = 0.15  # hot starts at black, which vanishes on the dark panel
+# hot is yellow by 3/4 of its range, which would paint a mild 0.02 like a 0.2. Squaring
+# the axis position keeps the bulk (1e-4 to 1e-2) dark red and saves yellow and white
+# for the censor range (0.05 up).
+OUTLIER_GAMMA = 2.0
 R2_TOP = 0.5
 FRAC_TOP = 0.5
 
@@ -103,6 +107,11 @@ def _log_t(v, axis: tuple[float, float]):
 
 def _log_radius(v: float, axis: tuple[float, float], ring: tuple[float, float]) -> float:
     return float(ring[0] + _log_t(v, axis) * (ring[1] - ring[0]))
+
+
+def _outlier_colour(v: float) -> tuple[float, float, float]:
+    t = float(_log_t(v, OUTLIER_AXIS)) ** OUTLIER_GAMMA
+    return _cmap(OUTLIER_CMAP, t, OUTLIER_CMAP_FROM)
 
 
 def _cmap(name: str, t: float, start: float = 0.0) -> tuple[float, float, float]:
@@ -229,7 +238,7 @@ def wheel(
                 ha="center",
                 va="center",
                 fontsize=8,
-                color=_cmap(OUTLIER_CMAP, float(_log_t(v, OUTLIER_AXIS)), OUTLIER_CMAP_FROM),
+                color=_outlier_colour(v),
             )
         for v in (0.03, 0.3, 3):
             ax.text(
@@ -369,13 +378,12 @@ def _draw_outliers(wedge, arc, run: WheelRun, a0: float, a1: float) -> None:
     edges = np.geomspace(*OUTLIER_AXIS, OUTLIER_BINS + 1)
     for k in np.flatnonzero(frac > 0):
         share = max(min(1.0, frac[k] / OUTLIER_FULL), SEEN_WIDTH)
-        t = float(_log_t(np.sqrt(edges[k] * edges[k + 1]), OUTLIER_AXIS))
         wedge(
             a0,
             a0 + share * (a1 - a0),
             _log_radius(edges[k], OUTLIER_AXIS, R_MOTION),
             _log_radius(edges[k + 1], OUTLIER_AXIS, R_MOTION),
-            _cmap(OUTLIER_CMAP, t, OUTLIER_CMAP_FROM),
+            _outlier_colour(np.sqrt(edges[k] * edges[k + 1])),
         )
     if run.outlier_limit:
         r = _log_radius(run.outlier_limit, OUTLIER_AXIS, R_MOTION)
@@ -499,8 +507,8 @@ def _key(fig, left: float, slots, headline, flags) -> None:
         ax.add_patch(Rectangle((0, y - 0.022), 0.03, 0.02, fc=color, lw=0))
         ax.text(0.05, y, name, fontsize=10.5, fontweight="bold", color=style.INK, va="top")
         wrapped = _wrap_chars(text, 62)
-        ax.text(0.05, y - 0.028, wrapped, fontsize=9.5, color=style.INK2, va="top", linespacing=1.4)
-        y -= 0.04 + 0.027 * (wrapped.count("\n") + 1)
+        ax.text(0.05, y - 0.026, wrapped, fontsize=9.5, color=style.INK2, va="top", linespacing=1.3)
+        y -= 0.033 + 0.025 * (wrapped.count("\n") + 1)
     # centre + its colour bar
     ax.text(0.05, y, "centre", fontsize=10.5, fontweight="bold", color=style.INK, va="top")
     ax.text(
