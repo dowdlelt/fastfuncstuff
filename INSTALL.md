@@ -42,7 +42,25 @@ uv pip install -e .
 
 
 `-e` editable preferred because this updates frequently.
-Add `".[dev]"` instead of `.` for tests + linters.
+Add `".[dev]"` instead of `.` for tests + linters. A machine that only *runs* the tools doesn't
+need `[dev]` (pytest, ruff, and PySide6 at a few hundred MB); use `.[viewer]` if it needs
+`ffs_viewer`.
+
+### CPU-only Linux: skip the CUDA wheels
+
+On Linux, torch from PyPI is the CUDA build and pulls several GB of `nvidia-*` / `cuda-*`
+packages. pip can't detect a GPU (dependency markers see OS, CPU architecture and Python version,
+not hardware), and the CPU build lives on PyTorch's own index, which `pyproject.toml` can't name.
+On a machine without a GPU, install CPU torch **first**. The package's `torch` requirement is then
+already met, and pip leaves it alone:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+```
+
+uv can make this choice itself: `uv pip install -e . --torch-backend=auto` looks for an NVIDIA
+driver and picks the CUDA or CPU wheel to match. macOS needs neither; its PyPI wheels have no CUDA.
 
 ## zstd (`.nii.zst` support)
 

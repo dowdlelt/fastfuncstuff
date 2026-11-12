@@ -93,3 +93,6 @@ To switch to the much smaller CPU build:
 pip uninstall -y torch triton $(pip list --format=freeze | grep -E '^(nvidia-|cuda-)' | cut -d= -f1)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
+
+To avoid it on a fresh install, install CPU torch before the package. See
+[INSTALL.md](INSTALL.md#cpu-only-linux-skip-the-cuda-wheels).
