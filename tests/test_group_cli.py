@@ -73,3 +73,30 @@ def test_missing_covariate_row_is_an_error(tmp_path, capsys):
         main(["-setA", *[f"{p}[1]" for p in a], "-covariates", str(cov), "-prefix",
               str(tmp_path / "x"), "-device", "cpu"])  # fmt: skip
     assert "no row for subject" in capsys.readouterr().err
+
+
+def test_mema_short_form_beta_t_pairs(tmp_path):
+    rng = np.random.default_rng(1)
+    shape = (5, 4, 3)
+    specs = []
+    for i in range(7):
+        b = rng.normal(0.5, 1.0, shape)
+        t = b / rng.uniform(0.3, 1.0, shape)
+        p = tmp_path / f"s{i}.nii.gz"
+        save_nifti(np.stack([b, t], -1).astype(np.float32), p, affine=np.eye(4),
+                   brick_labels=["c#0_Coef", "c#0_Tstat"])  # fmt: skip
+        specs += [f"{p}[c#0_Coef]", f"{p}[c#0_Tstat]"]
+    out = tmp_path / "mema.nii.gz"
+    main(["-model", "mema", "-setA", *specs, "-labelA", "c", "-prefix", str(out),
+          "-device", "cpu", "-verb", "0"])  # fmt: skip
+    img = nib.load(out)
+    assert read_brick_labels(img) == ["c:b", "c:t", "I2", "tau", "QE:Chisq"]
+    assert read_brick_stataux(img)[1] == (3, (6.0,))
+
+
+def test_mema_only_flags_are_refused_for_ols(tmp_path, capsys):
+    a, _ = _write_sets(tmp_path, nb=0)
+    with pytest.raises(SystemExit):
+        main(["-setA", *[f"{p}[1]" for p in a], "-no_HKtest", "-prefix", str(tmp_path / "x"),
+              "-device", "cpu"])  # fmt: skip
+    assert "-model mema only" in capsys.readouterr().err

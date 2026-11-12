@@ -245,6 +245,19 @@ def _block(prefix: str, fit: OlsFit, cov_names, toz: bool) -> list[Brick]:
     return out
 
 
+def to_z_bricks(bricks: list[Brick]) -> list[Brick]:
+    """``-toz``: every t brick rewritten as the z with the same tail probability."""
+    out = []
+    for b in bricks:
+        if b.stat is not None and b.stat[0] == FITT:
+            z = t_to_z_np(b.data.detach().cpu().numpy(), b.stat[1][0])
+            data = torch.as_tensor(z, dtype=b.data.dtype, device=b.data.device)
+            out.append(Brick(b.label.replace("Tstat", "Zscr"), data, (FIZT, ())))
+        else:
+            out.append(b)
+    return out
+
+
 def one_sample_fit(y: Tensor, cov: np.ndarray | None) -> OlsFit:
     x = one_sample_matrix(cov, y.shape[0])
     return ols_contrasts(y, x, np.eye(x.shape[1]))

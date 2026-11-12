@@ -82,13 +82,39 @@ def build_parser() -> FfsArgumentParser:
     test.add_argument(
         "-center",
         choices=("DIFF", "SAME", "NONE"),
-        default="DIFF",
         type=str.upper,
         help="Covariate centering: DIFF removes each set's own mean, SAME the "
         "mean over both sets, NONE nothing (the mean bricks are then the value "
-        "at covariate = 0).",
+        "at covariate = 0).  Default DIFF for -model ols (3dttest++), SAME for "
+        "-model mema (3dMEMA).",
     )
     test.add_argument("-toz", action="store_true", help="Write t statistics as z.")
+
+    model = p.add_argument_group("Model")
+    model.add_argument(
+        "-model",
+        choices=("ols", "mema"),
+        default="ols",
+        help="ols: the 3dttest++ t-test on one map per subject.  mema: the 3dMEMA "
+        "mixed-effects model, which weights each subject by its own precision "
+        "(beta and t per subject) plus a between-subject variance tau^2 per voxel.  "
+        "MEMA's two-set model has one tau^2 and shared covariate slopes; its "
+        "difference is reported as A-B (3dMEMA itself writes B-A).",
+    )
+    model.add_argument(
+        "-mema_reml",
+        choices=("always", "shortcut", "never"),
+        default="always",
+        help="Where MEMA estimates tau^2 by REML.  3dMEMA uses REML only where a "
+        "moments-estimate |z| > 1.3 and keeps the moments estimate elsewhere, which "
+        "puts a seam in the map at 1.3; 'always' removes it (cost: a few REML "
+        "iterations per voxel).  'shortcut' reproduces 3dMEMA to float precision.",
+    )
+    model.add_argument(
+        "-no_HKtest",
+        action="store_true",
+        help="MEMA: skip the Hartung-Knapp variance adjustment (3dMEMA's default is on).",
+    )
 
     out = p.add_argument_group("Output")
     out.add_argument("-prefix", required=True, help="Output bucket (.nii.gz by default).")
@@ -126,27 +152,37 @@ def short_label(spec: str) -> str:
     return name[:12]
 
 
-def parse_set(items: list[str], default_label: str, label_flag: str | None):
-    """``(set_label, [subject labels], [dataset specs])`` from a -setX value."""
+def parse_set(items: list[str], default_label: str, label_flag: str | None, per_subject: int = 1):
+    """``(set_label, [subject labels], [[dataset spec] * per_subject])`` from -setX.
+
+    ``per_subject`` is 1 for the t-test and 2 (beta, t) for MEMA.  Long form:
+    ``LABEL subj d1 [d2] subj d1 [d2] ...``; short form: ``d1 [d2] d1 [d2] ...``
+    with each subject labelled by its first dataset's file name.
+    """
+    k = per_subject
+    what = "subj dset" if k == 1 else "subj beta tstat"
     if not _exists(items[0]):
-        # Long form: LABEL then subject/dataset pairs.
         label, rest = items[0], items[1:]
         if label_flag:
             raise ValueError(f"set {label!r} is in long form: drop -label{default_label[-1]}")
-        if len(rest) < 2 or len(rest) % 2:
+        if len(rest) < k + 1 or len(rest) % (k + 1):
             raise ValueError(
-                f"set {label!r}: long form needs 'LABEL subj dset subj dset ...' "
+                f"set {label!r}: long form needs 'LABEL {what} {what} ...' "
                 f"(got {len(rest)} items after the label)"
             )
-        subj, dsets = rest[0::2], rest[1::2]
-        missing = [d for d in dsets if not _exists(d)]
+        subj = rest[0 :: k + 1]
+        dsets = [rest[s + 1 : s + 1 + k] for s in range(0, len(rest), k + 1)]
+        missing = [d for grp in dsets for d in grp if not _exists(d)]
         if missing:
             raise ValueError(f"set {label!r}: no such dataset {missing[0]!r}")
-        return label, list(subj), list(dsets)
+        return label, list(subj), dsets
     missing = [d for d in items if not _exists(d)]
     if missing:
         raise ValueError(f"no such dataset {missing[0]!r}")
-    return label_flag or default_label, [short_label(d) for d in items], list(items)
+    if len(items) % k:
+        raise ValueError(f"short form needs {k} datasets per subject (beta then t)")
+    dsets = [items[s : s + k] for s in range(0, len(items), k)]
+    return label_flag or default_label, [short_label(g[0]) for g in dsets], dsets
 
 
 def load_volume(spec: str):
@@ -220,7 +256,7 @@ def run(args) -> None:
 
     from fastfuncstuff.cli_utils import parse_prefix, setup_device
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.stats.group_ttest import TtestDesign, run_ttest
+    from fastfuncstuff.stats.group_ttest import TtestDesign, run_ttest, to_z_bricks
 
     prefix = parse_prefix(args.prefix)
     out_path = Path(prefix.stem + prefix.nifti_ext)
@@ -228,22 +264,33 @@ def run(args) -> None:
         raise ValueError(f"{out_path} exists (use -overwrite)")
     if (args.paired or args.unpooled) and not args.setB:
         raise ValueError("-paired and -unpooled need -setB")
+    mema = args.model == "mema"
+    if mema and args.unpooled:
+        raise ValueError(
+            "-model mema with separate per-set tau^2 (-unpooled) is not implemented yet"
+        )
+    if not mema and (args.no_HKtest or args.mema_reml != "always"):
+        raise ValueError("-no_HKtest and -mema_reml apply to -model mema only")
+    center = args.center or ("SAME" if mema else "DIFF")
+    k = 2 if mema else 1
 
-    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA)
+    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, k)
     lb, subj_b, dsets_b = (None, [], [])
     if args.setB:
-        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB)
+        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB, k)
         if lb == la:
             raise ValueError(f"both sets are labelled {la!r}")
 
     device = setup_device(args.device)
-    vols_a = [load_volume(d) for d in dsets_a]
-    vols_b = [load_volume(d) for d in dsets_b]
-    ref_img = vols_a[0][1]
-    shape = vols_a[0][0].shape
-    for spec, (v, _) in zip(dsets_a + dsets_b, vols_a + vols_b, strict=True):
-        if v.shape != shape:
-            raise ValueError(f"{spec}: grid {v.shape} differs from {shape}")
+    # vols[s][j]: subject s, dataset j (j=0 the map/beta, j=1 MEMA's t).
+    vols_a = [[load_volume(d) for d in grp] for grp in dsets_a]
+    vols_b = [[load_volume(d) for d in grp] for grp in dsets_b]
+    ref_img = vols_a[0][0][1]
+    shape = vols_a[0][0][0].shape
+    for grp, vols in zip(dsets_a + dsets_b, vols_a + vols_b, strict=True):
+        for spec, (v, _) in zip(grp, vols, strict=True):
+            if v.shape != shape:
+                raise ValueError(f"{spec}: grid {v.shape} differs from {shape}")
 
     if args.mask:
         mask_vol, _ = load_volume(args.mask)
@@ -252,17 +299,21 @@ def run(args) -> None:
         mask = mask_vol != 0
     else:
         mask = np.zeros(shape, dtype=bool)
-        for v, _ in vols_a + vols_b:
-            mask |= v != 0
+        for vols in vols_a + vols_b:
+            mask |= vols[0][0] != 0
     n_vox = int(mask.sum())
     if n_vox == 0:
         raise ValueError("empty mask")
 
-    def stack(vols):
-        return torch.as_tensor(np.stack([v[mask] for v, _ in vols]), device=device)
+    # MEMA's REML wants float64 (on MPS that means the CPU: linalg_device).
+    from fastfuncstuff.utils import linalg_device
 
-    ya = stack(vols_a)
-    yb = stack(vols_b) if vols_b else None
+    dev = linalg_device(device) if mema else device
+    dt = torch.float64 if mema else torch.float32
+
+    def stack(vols, j):
+        arr = np.stack([v[j][0][mask] for v in vols])
+        return torch.as_tensor(arr, device=dev).to(dt)
 
     cov_a = cov_b = None
     names: tuple[str, ...] = ()
@@ -281,7 +332,7 @@ def run(args) -> None:
         cov_a=cov_a,
         cov_b=cov_b,
         cov_names=names,
-        center=args.center,
+        center=center,
     )
     if args.verb:
         kind = (
@@ -289,20 +340,42 @@ def run(args) -> None:
             if design.two_sets
             else "one-sample"
         )
-        cov = f", covariates {', '.join(names)} (center {args.center})" if names else ""
+        cov = f", covariates {', '.join(names)} (center {center})" if names else ""
         print(
-            f"[ffs_group] {kind}: {la} n={design.n_a}"
+            f"[ffs_group] {args.model} {kind}: {la} n={design.n_a}"
             + (f", {lb} n={design.n_b}" if design.two_sets else "")
             + f", {n_vox} voxels{cov}",
             file=sys.stderr,
         )
 
-    bricks = run_ttest(design, ya, yb, toz=args.toz)
+    if mema:
+        from fastfuncstuff.stats.group_mema import run_mema
+
+        bricks, fit = run_mema(
+            design,
+            stack(vols_a, 0),
+            stack(vols_a, 1),
+            stack(vols_b, 0) if vols_b else None,
+            stack(vols_b, 1) if vols_b else None,
+            knha=not args.no_HKtest,
+            reml=args.mema_reml,
+        )
+        if args.toz:
+            bricks = to_z_bricks(bricks)
+        if args.verb and args.mema_reml != "never":
+            n_bad = int((~fit.converged).sum())
+            msg = f"[ffs_group] REML on {int(fit.reml.sum())}/{n_vox} voxels"
+            if n_bad:
+                msg += f"; {n_bad} did not converge in 200 iterations and keep the moments tau^2"
+            print(msg, file=sys.stderr)
+    else:
+        bricks = run_ttest(design, stack(vols_a, 0), stack(vols_b, 0) if vols_b else None,
+                           toz=args.toz)  # fmt: skip
 
     out = np.zeros((*shape, len(bricks)), dtype=np.float32)
-    for k, b in enumerate(bricks):
-        out[..., k][mask] = b.data.detach().cpu().numpy()
-    stataux = {k: b.stat for k, b in enumerate(bricks) if b.stat is not None}
+    for kb, b in enumerate(bricks):
+        out[..., kb][mask] = b.data.detach().cpu().numpy()
+    stataux = {kb: b.stat for kb, b in enumerate(bricks) if b.stat is not None}
     save_nifti(
         out,
         out_path,
