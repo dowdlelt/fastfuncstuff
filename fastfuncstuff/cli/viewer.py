@@ -177,7 +177,8 @@ def build_parser() -> FfsArgumentParser:
         default=[],
         help="A FreeSurfer surface file to outline, no subject directory needed; "
         "repeat for more. Hemisphere and white/pial are read from the name "
-        "(lh.pial, rh.smoothwm...). With only one of white and pial, depth "
+        "(lh.pial, rh.smoothwm...); a midthickness stands in for both. With only "
+        "one of white and pial, depth "
         "sampling collapses onto that surface; load the other to get the ribbon "
         "back. After -surfaces, files are added to the subject's mesh list.",
     )
@@ -191,7 +192,9 @@ def build_parser() -> FfsArgumentParser:
         "drawn on its own vertices in a surface window, and set by the same controls as "
         "any layer (threshold, p, sub-bricks, clusters). It must be on a loaded mesh "
         "(-surfaces, or -mesh PREFIX.SPACE.lh.white.surf.gii and pial), matched by "
-        "fingerprint; the other hemisphere's file beside it (.lh. / .rh.) joins the "
+        "fingerprint -- or, for a hemisphere with nothing loaded, the mesh the file "
+        "names in its own 'geometry' metadata (ffs_group and ffs_reml write it) is "
+        "loaded for it. The other hemisphere's file beside it (.lh. / .rh.) joins the "
         "same layer. Repeat for more.",
     )
     add_device_arg(p, default="auto")
@@ -218,12 +221,18 @@ def _surf_data_commands(paths: list[str]):
 
 
 def _mesh_commands(paths: list[str]):
+    from pathlib import Path
+
     from fastfuncstuff.viewer.meshlist import infer_label
     from fastfuncstuff.viewer.vocab import LoadMesh
 
     out = []
     for path in paths:
         hemi, kind = infer_label(path)
+        if kind is None and "midthick" in Path(path).name.lower():
+            # A midthickness (fs_LR, group templates) stands in for both white and
+            # pial: the hemisphere is made from it and the ribbon collapses onto it.
+            kind = "white"
         if hemi is None or kind is None:
             raise SystemExit(
                 f"ffs_viewer: -mesh {path}: can't tell "

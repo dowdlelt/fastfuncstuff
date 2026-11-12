@@ -418,9 +418,23 @@ class ViewerSession:
         hemisphere's file joins the same layer when it sits beside it. The grid is
         the display grid when there is one, else a 1 mm box around the meshes.
         """
-        from fastfuncstuff.viewer.surfacelayers import SurfaceLayerData, open_surface_parts
+        from fastfuncstuff.viewer.surfacelayers import (
+            SurfaceLayerData,
+            open_surface_parts,
+            sibling_path,
+        )
 
-        parts = open_surface_parts(path, self.surfaces.place_data)
+        try:
+            parts = open_surface_parts(path, self.surfaces.place_data)
+        except ValueError:
+            # No loaded mesh fits: a result that names its own mesh (GIfTI
+            # 'geometry', fingerprint-checked) brings it -- group results on
+            # fs_LR or any template usually come with only a midthickness.
+            sib = sibling_path(path)
+            adopted = [self._adopt_data_mesh(p) for p in (path, sib) if p is not None]
+            if not any(adopted):
+                raise
+            parts = open_surface_parts(path, self.surfaces.place_data)
         if self.state.grid is not None:
             shape, affine = self.state.grid.shape, np.asarray(self.state.grid.affine)
         else:
@@ -448,6 +462,37 @@ class ViewerSession:
             range_lo=lo,
             range_hi=hi,
         )
+
+    def _adopt_data_mesh(self, path) -> bool:
+        """Load the mesh a surface result names in its metadata, for an empty hemisphere.
+
+        Only fills a hemisphere nothing is loaded for (never replaces a subject's
+        mesh), and only with the mesh the data were made on: the vertex count and
+        fingerprint are checked by :func:`io.gifti.data_geometry`.  One surface
+        stands in as both white and pial, so the ribbon collapses onto it.
+        """
+        from fastfuncstuff.io.freesurfer import infer_label
+        from fastfuncstuff.io.gifti import data_geometry
+        from fastfuncstuff.surface.statmap import load_surface_data
+        from fastfuncstuff.viewer.vocab import LoadMesh
+
+        p = Path(path)
+        if not p.exists():
+            return False
+        data = load_surface_data(p)
+        geom_name = (data.meta or {}).get("geometry")
+        if not geom_name:
+            return False
+        try:
+            data_geometry(p, data.meta, data.n_vertices)
+        except ValueError:
+            return False
+        geom = Path(geom_name) if Path(geom_name).is_absolute() else p.parent / geom_name
+        hemi = infer_label(str(p))[0] or infer_label(str(geom))[0]
+        if hemi is None or hemi in self.surfaces.hemis:
+            return False
+        self.do(LoadMesh(str(geom), hemi, "white"))
+        return True
 
     def layer_sampler(self, key: str, index: int, mode: str = "linear"):
         """A point sampler of one sub-brick of a layer (scanner mm in, values out).

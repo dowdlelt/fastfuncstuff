@@ -106,6 +106,22 @@ class EditLog:
     entries: list[dict] = field(default_factory=list)
 
 
+def _shell(surface: np.ndarray, topo, affine: np.ndarray):
+    """A one-voxel-thick (white, pial) pair around a single surface.
+
+    With only one surface loaded (a midthickness, or a lone white) white and pial
+    coincide, the ribbon has no thickness and paints no voxel -- the slices stay
+    empty and every cluster reads as zero voxels.  Offsetting half a voxel either
+    way along the vertex normals gives the ribbon map something to fill; areas
+    are still measured on the surface itself.
+    """
+    from fastfuncstuff.surface.mesh import vertex_normals
+
+    half = 0.5 * float(np.linalg.norm(np.asarray(affine)[:3, :3], axis=0).max())
+    n = vertex_normals(np.asarray(surface, np.float64), topo)
+    return surface - half * n, surface + half * n
+
+
 class SurfaceStore:
     """The loaded hemispheres, slice indices cached per display grid, and edits."""
 
@@ -320,11 +336,16 @@ class SurfaceStore:
         grid = (tuple(int(x) for x in shape), aff.round(6).tobytes())
         keys = {h: (h, self.version.get(h, 0), *grid) for h in hemis}
         missing = [h for h in hemis if keys[h] not in self._ribbons]
+        # The shell for a one-surface hemisphere needs its topology; build those
+        # here, on this thread, for the same reason the cache is written here.
+        topos = {h: self.topology(h) for h in missing}
 
         def build(hemi):
             h = self.hemis[hemi]
             white = np.asarray(h.states["white"])
             pial = np.asarray(h.states.get("pial", white))
+            if pial is white or np.array_equal(pial, white):
+                white, pial = _shell(white, topos[hemi], aff)
             # ribbon-2: the fractional ribbon (edge voxels >= 10% GM), and its shares.
             disk = diskcache.content_key("ribbon-2", white, pial, np.asarray(h.faces), *grid)
             got = diskcache.load("ribbon_maps", disk)
