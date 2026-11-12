@@ -96,7 +96,7 @@ def test_surface_outputs_and_their_siblings_stay_gifti(tmp_path, world, monkeypa
         "-Rbuck", "r", "-Obuck", "o", "-Rbeta", "rb.func.gii", "-Rerrts", "re",
         "-rpartial", "full", "-r2semipartial", "full",
     )  # fmt: skip
-    # -Obeta and OLS single trials are written only on an OLS-only run.
+    # -Obeta and OLS single trials on an OLS-only run.
     _reml(
         monkeypatch, *common, "-Obuck", "o2", "-Obeta", "ob", "-single_trials", "st"
     )  # fmt: skip

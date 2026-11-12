@@ -238,6 +238,39 @@ def reconstruct_partial_timeseries(
     return b[:, idx] @ x[:, idx].T
 
 
+def recover_full_betas(
+    task_betas: np.ndarray | torch.Tensor,
+    predicted: np.ndarray | torch.Tensor,
+    design: np.ndarray | torch.Tensor,
+    task_indices: Sequence[int],
+) -> np.ndarray:
+    """Rebuild full-design betas from a fit that stored only the task columns.
+
+    A StimBots/StimTops fit solves the *full* design and keeps only the task
+    betas, so the nuisance betas are gone but the full fitted signal
+    ``predicted = X @ beta`` is not. The nuisance part of it,
+    ``predicted - X_task @ beta_task``, lies in the column space of ``X_nuis``,
+    so ``pinv(X_nuis)`` recovers ``beta_nuis`` exactly when ``X_nuis`` has full
+    column rank, and the minimum-norm betas with the same fitted signal when it
+    does not. One ``(n_nuis, n_time)`` pseudo-inverse, no refit.
+    """
+    b_task = _ensure_numpy(task_betas).astype(np.float64)
+    pred = _ensure_numpy(predicted)
+    x = _ensure_numpy(design).astype(np.float64)
+    n_vox, p = pred.shape[0], x.shape[1]
+    task = np.asarray(list(task_indices), dtype=np.int64)
+    nuis = np.setdiff1d(np.arange(p), task)
+    full = np.zeros((n_vox, p), dtype=np.float32)
+    full[:, task] = b_task
+    if nuis.size:
+        nuis_fit = pred - b_task @ x[:, task].T
+        # The design reached us as float32, so a column that is an exact
+        # combination of others is only redundant to ~1e-7 after rounding; the
+        # default cutoff would treat it as real and amplify the rounding.
+        full[:, nuis] = nuis_fit @ np.linalg.pinv(x[:, nuis], rtol=1e-6).T
+    return full
+
+
 def find_baseline_columns(
     design: np.ndarray | torch.Tensor,
     candidate_indices: Sequence[int] | np.ndarray | torch.Tensor,

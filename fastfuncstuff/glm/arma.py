@@ -193,6 +193,7 @@ VOXEL_SCATTER_ATTRS = [
     "contrast_r2_semipartial",
     "dsort_betas",
     "dsort_tstats",
+    "ljung_box",
 ]
 
 # The GLMResults equivalent of VOXEL_SCATTER_ATTRS (OLS has stderr/meanvol/r2_run
@@ -3068,6 +3069,7 @@ def fit_glm_arma11_grouped(
 
     # Contrast labels (scalar metadata, same across HRFs)
     merged.contrast_labels = template.contrast_labels
+    merged.ljung_box_dof = getattr(template, "ljung_box_dof", None)
 
     # -dsort: scatter the no-dsort snapshot (if produced) and carry labels.
     merged.dsort_labels = template.dsort_labels

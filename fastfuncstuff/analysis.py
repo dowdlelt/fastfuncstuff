@@ -412,6 +412,7 @@ def analyze_from_design_matrix(
     want_ols_residuals: bool = False,
     want_ols_predicted: bool = False,
     ols_output_path: str | Path | None = None,
+    ols_writer=None,
     device: torch.device | None = None,
     mask_file: str | Path | None = None,
     mask_threshold: float = 0.0,
@@ -439,6 +440,7 @@ def analyze_from_design_matrix(
     censor_file: str | Path | None = None,
     censor_trim=None,
     want_residuals: bool = False,
+    want_predicted: bool = False,
     want_ljung_box: bool = False,
     run_validity=None,
     handle_missing: bool = False,
@@ -489,6 +491,12 @@ def analyze_from_design_matrix(
         Also compute OLS baseline for comparison (only used if method='arma11')
         When True, adds `ols_results` attribute to returned ARMA11Results object
         Useful for validating ARMA improvement over OLS
+    ols_writer : callable, optional
+        ``callback(ols_results, original_shape, affine)`` that writes the OLS
+        baseline of an ARMA fit. Replaces the built-in writer, which only writes
+        the ``ols_output_path`` bucket.
+    want_predicted : bool, default=False
+        Keep the fitted signal ``X @ beta`` in original units as ``results.predicted``.
     device : torch.device, optional
         Device for computation
     mask_file : str or Path, optional
@@ -1103,6 +1111,7 @@ def analyze_from_design_matrix(
             r2_semipartial_mode=r2_semipartial_mode,
             debug_memory=debug_memory,
             want_residuals=want_residuals,
+            want_predicted=want_predicted,
             want_ljung_box=want_ljung_box,
             run_starts=arma_run_starts,
             tau=arma_tau,
@@ -1142,6 +1151,7 @@ def analyze_from_design_matrix(
             r2_semipartial_mode=r2_semipartial_mode,
             debug_memory=debug_memory,
             want_residuals=want_residuals,
+            want_predicted=want_predicted,
             want_ljung_box=want_ljung_box,
             run_starts=arma_run_starts,
             tau=arma_tau,
@@ -1169,6 +1179,7 @@ def analyze_from_design_matrix(
             r2_semipartial_mode=r2_semipartial_mode,
             debug_memory=debug_memory,
             want_residuals=want_residuals,
+            want_predicted=want_predicted,
         )
 
     elif method == "arma11":
@@ -1182,8 +1193,8 @@ def analyze_from_design_matrix(
                 _, arma_b_grid = get_default_arma_grids(device)
 
         # Create simple OLS write callback if output path provided
-        ols_write_callback = None
-        if ols_output_path is not None:
+        ols_write_callback = ols_writer
+        if ols_write_callback is None and ols_output_path is not None:
             from fastfuncstuff.cli_utils import output_file
             from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
@@ -1464,6 +1475,9 @@ def analyze_from_design_matrix(
                 dsort_labels=dsort_labels,
                 dsort_run_bounds=dsort_run_bounds,
                 want_dsort_nods=want_dsort_nods,
+                want_residuals=want_residuals,
+                want_predicted=want_predicted,
+                want_ljung_box=want_ljung_box,
             )
 
         else:
@@ -1501,6 +1515,7 @@ def analyze_from_design_matrix(
                 dsort_run_bounds=dsort_run_bounds,
                 want_dsort_nods=want_dsort_nods,
                 want_residuals=want_residuals,
+                want_predicted=want_predicted,
                 want_ljung_box=want_ljung_box,
             )
 
@@ -1548,6 +1563,7 @@ def analyze_from_design_matrix(
             want_r2_semipartial=want_r2_semipartial,
             r2_semipartial_mode=r2_semipartial_mode,
             want_residuals=want_residuals,
+            want_predicted=want_predicted,
         )
         if method == "ols":
             fam_fit_kwargs = dict(

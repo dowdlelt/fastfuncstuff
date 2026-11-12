@@ -3427,9 +3427,16 @@ def main():
             else:
                 stim_labels = callback_design_info.get("column_labels")
 
-            # Set spatial metadata on OLS results for writing
-            ols_results.original_shape = original_shape
-            ols_results.affine = affine
+            # Set spatial metadata on OLS results for writing. The REML route
+            # passes None for flattened data after already attaching the real
+            # shape and affine, so only fill in what is given.
+            if original_shape is not None:
+                ols_results.original_shape = original_shape
+            if affine is not None:
+                ols_results.affine = affine
+            from fastfuncstuff.glm.conjunction import apply_conjunctions
+
+            apply_conjunctions(ols_results, callback_design_info.get("glt_conjunctions"))
 
             # Voxel-wise (-dsort) coefficients: appended as trailing beta/t-stat
             # sub-bricks only on -dsort_betas yes (default: dsort is a nuisance whose
@@ -3577,46 +3584,37 @@ def main():
                         "  ⚠️  Skipping single-trial output: No stimulus columns found (StimBots/StimTops)"
                     )
 
-            # Write partial R² if requested and available
-            if (
-                args.rpartial
-                and hasattr(ols_results, "r2_partial")
-                and ols_results.r2_partial is not None
+            # Partial and semi-partial R² siblings of the bucket, if requested.
+            from fastfuncstuff.glm.outputs import (
+                _get_voxel_mask,
+                _resolve_shape,
+                write_partial_r2_with_labels,
+            )
+
+            for r2_mode, attr, kind, title in (
+                (args.rpartial, "r2_partial", "partialR2", "partial"),
+                (args.r2semipartial, "r2_semipartial", "semipartialR2", "semi-partial"),
             ):
-                # Generate output path by inserting _partialR2 before extension
-                partial_r2_path = output_file(args.Obuck or "OLS", out_ext).with_suffix("partialR2")
-                print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
-
-                from fastfuncstuff.glm.outputs import (
-                    _get_voxel_mask,
-                    _resolve_shape,
-                    write_partial_r2_with_labels,
-                )
-
-                # Get metadata for AFNI stat params
-                n_timepoints_ols = callback_design_info.get("n_timepoints")
-                n_regressors_ols = callback_design_info.get("n_regressors")
-
-                # Get mode from args (captured in closure)
-                r2_mode = args.rpartial if args.rpartial else "full"
-
+                r2_map = getattr(ols_results, attr, None)
+                if not r2_mode or r2_map is None:
+                    continue
+                r2_path = output_file(args.Obuck or "OLS", out_ext).with_suffix(kind)
+                print(f"  • Writing OLS {title} R² per condition: {r2_path}")
                 write_partial_r2_with_labels(
-                    ols_results.r2_partial,
-                    partial_r2_path,
+                    r2_map,
+                    r2_path,
                     condition_labels=stim_labels,
                     volume_shape=_resolve_shape(ols_results, None),
                     voxel_mask=_get_voxel_mask(ols_results),
                     affine=getattr(ols_results, "affine", None),
                     header=getattr(ols_results, "nifti_header", None),
-                    n_timepoints=n_timepoints_ols,
-                    n_regressors=n_regressors_ols,
+                    n_timepoints=callback_design_info.get("n_timepoints"),
+                    n_regressors=callback_design_info.get("n_regressors"),
                     apply_afni_metadata=True,
                     mode=r2_mode,  # "full" or "task"
                 )
-
-                # Print labels for reference
-                suffix = "_partialR2_task" if r2_mode == "task" else "_partialR2"
-                print("     Sub-bricks (partial R² with AFNI stat params):")
+                suffix = f"_{kind}_task" if r2_mode == "task" else f"_{kind}"
+                print(f"     Sub-bricks ({title} R² with AFNI stat params):")
                 for idx, label in enumerate(stim_labels):
                     print(f"       [{idx}] {label}{suffix}")
 
@@ -4252,6 +4250,27 @@ def main():
         # Early exit - don't run standard pipeline
         return
 
+    # Refuse, before the fit, outputs the fit cannot produce. A design with
+    # stimulus columns (StimBots/StimTops, every -events/-onsets design) keeps
+    # only the task betas and t-stats, so there is nothing to put in a nuisance
+    # bucket; and a per-voxel HRF has no single design to rebuild the -save_*
+    # series against.
+    _has_stim = bool(design_info.get("stim_indices") or design_info.get("stim_bots"))
+    _nuis_flags = [f for f in ("Rnuisance", "Onuisance") if getattr(args, f, None)]
+    if _has_stim and _nuis_flags:
+        sys.exit(
+            f"ERROR: -{' / -'.join(_nuis_flags)} needs a fit of the full design, and this "
+            "design marks stimulus columns, so only their betas are kept. Use "
+            "-save_nuisance for the nuisance time series, or a -matrix without "
+            "StimBots/StimTops for nuisance betas."
+        )
+    _save_flags = [f for f in ("save_clean", "save_nuisance", "save_taskfit") if getattr(args, f)]
+    if _save_flags and locals().get("full_designs_by_hrf") is not None:
+        sys.exit(
+            f"ERROR: -{' / -'.join(_save_flags)} cannot be rebuilt under a per-voxel HRF: "
+            "each voxel has its own design. Use -Rerrts / -Rfitts instead."
+        )
+
     # Run analysis
     try:
         # Determine analysis method from requested outputs
@@ -4375,6 +4394,10 @@ def main():
             want_ols_residuals=bool(args.Oerrts),
             want_ols_predicted=bool(args.Ofitts),
             ols_output_path=ols_output_path,
+            # The CLI's writer, so -Obeta/-Oerrts/-Ofitts/single trials come out of
+            # a REML run the same as an OLS-only one (analysis's own writer only
+            # knows the bucket).
+            ols_writer=_ols_write_callback if analysis_method == "arma11" else None,
             device=device,
             mask_file=args.mask,
             cache_file=args.cache if (args.cache and cache_metadata is None) else None,
@@ -4403,7 +4426,13 @@ def main():
             censor_trim=trim,
             want_residuals=bool(args.Rerrts)
             or bool(args.save_clean)
+            or (analysis_method == "ols" and bool(args.Oerrts))
             or (want_diag and bool(args.save_tsnr or want_acf)),
+            # The -save_* family needs the full fitted signal to recover the
+            # nuisance betas a StimBots/StimTops fit does not keep.
+            want_predicted=bool(args.Rfitts)
+            or bool(args.save_clean or args.save_nuisance or args.save_taskfit)
+            or (analysis_method == "ols" and bool(args.Ofitts)),
             want_ljung_box=bool(args.Rvar),
             run_validity=guard_validity,
             handle_missing=args.handle_missing,
@@ -5312,14 +5341,13 @@ def main():
         )
 
         # All three reconstruct from the full-design betas. StimBots/StimTops
-        # filtering keeps stimulus columns only, so results.betas no longer aligns
-        # with the full design's columns and there are no nuisance betas — bail like
-        # -Rnuisance.
+        # filtering stores only the stimulus columns' betas, so those are
+        # recovered from the fitted signal below.
         design_mat = design_info.get("matrix", design_info.get("design_matrix"))
-        if fitted_column_indices is not None or design_mat is None:
+        if design_mat is None or (fitted_column_indices is not None and results.predicted is None):
             print(
-                "  ⚠️  Skipping -save_clean/-save_nuisance/-save_taskfit: needs the full "
-                "design (fit was filtered to stimulus columns, or design matrix unavailable)."
+                "  ⚠️  Skipping -save_clean/-save_nuisance/-save_taskfit: the design "
+                "matrix or the fitted signal is unavailable."
             )
         else:
             all_indices = list(range(len(full_labels)))
@@ -5328,8 +5356,17 @@ def main():
             affine = getattr(results, "affine", np.eye(4))
             volume_shape = _resolve_shape(results, None)
             voxel_mask = _get_voxel_mask(results)
-            betas_np = _ensure_numpy(results.betas)
             design_np = _ensure_numpy(design_mat)
+            if fitted_column_indices is not None:
+                # The fit kept only the task betas; rebuild the rest from its
+                # fitted signal so every column below indexes the full design.
+                from fastfuncstuff.glm.outputs import recover_full_betas
+
+                betas_np = recover_full_betas(
+                    results.betas, results.predicted, design_np, fitted_column_indices
+                )
+            else:
+                betas_np = _ensure_numpy(results.betas)
 
             if args.save_nuisance:
                 print(f"  • Writing REML nuisance-only timeseries: {args.save_nuisance}")
