@@ -39,7 +39,7 @@ import numpy as np
 import torch
 from scipy.stats import norm
 
-from fastfuncstuff.stats.cluster_inference import NullSource, max_fom_null
+from fastfuncstuff.stats.cluster_inference import NullSource, Where, max_fom_null
 
 DEFAULT_PTHR = (0.010, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004, 0.003, 0.002, 0.001)
 DEFAULT_NITER = 10080  # 3dttest++ NCSIM_NORM
@@ -106,7 +106,7 @@ class EtacNull:
 def build_null(
     sources: dict[str, NullSource],
     n_iter: int,
-    mask: np.ndarray,
+    mask: Where,
     opts: EtacOptions,
     device: torch.device,
     verbose: bool = True,
@@ -163,12 +163,14 @@ def _src_bytes(src) -> int:
 
 
 def _even_batch(
-    rows: int, mask: np.ndarray, opts: EtacOptions, device: torch.device, source_bytes: int = 0
+    rows: int, mask: Where, opts: EtacOptions, device: torch.device, source_bytes: int = 0
 ) -> int:
     """1-sided batches must hold whole (z, -z) pairs."""
     from fastfuncstuff.memory import cluster_fom_batch
+    from fastfuncstuff.stats.cluster_inference import as_geometry
 
-    b = cluster_fom_batch(int(mask.sum()), len(opts.hpows), device, source_bytes=source_bytes // 2)
+    n = as_geometry(mask).n
+    b = cluster_fom_batch(n, len(opts.hpows), device, source_bytes=source_bytes // 2)
     return max(2, min(rows, b) // 2 * 2)
 
 
@@ -265,7 +267,7 @@ def search(null: EtacNull, fpr_goal: float, n_steps: int = 60) -> EtacThresholds
 
 def apply(
     z_obs: dict[str, torch.Tensor],
-    mask: np.ndarray,
+    mask: Where,
     opts: EtacOptions,
     res: EtacThresholds,
     sign: int = 1,
@@ -276,18 +278,21 @@ def apply(
     mask).  A voxel passes a (case, pthr) sub-test if its cluster's FOM for
     any requested h reaches that sub-test's threshold.
     """
-    from fastfuncstuff.stats.cluster_gpu import build_neighbor_table, cluster_labels
+    from fastfuncstuff.stats.cluster_gpu import cluster_labels
+    from fastfuncstuff.stats.cluster_inference import as_geometry
 
-    n_vox = int(mask.sum())
+    geom = as_geometry(mask)
+    n_vox = geom.n
     cases = list(z_obs)
     all_mask = np.zeros((len(cases) * len(opts.pthr), n_vox), dtype=bool)
     hcol = {0: 0, 1: 1, 2: 2}
     for ic, case in enumerate(cases):
         z = z_obs[case] * sign
-        nbr = build_neighbor_table(mask, opts.nn, z.device)
+        nbr = geom.neighbors(opts.nn, z.device)
+        weight = geom.weights(z.device)
         for ip, zt in enumerate(opts.zthr):
             active, _, foms = cluster_labels(
-                z.float(), nbr, opts.sided_key, float(zt), opts.min_clust
+                z.float(), nbr, opts.sided_key, float(zt), opts.min_clust, weight
             )
             if active.numel() == 0:
                 continue
@@ -324,7 +329,7 @@ def case_label(fwhm: float) -> str:
 
 def run_etac(
     cases: dict[str, tuple[torch.Tensor, NullSource]],
-    mask: np.ndarray,
+    mask: Where,
     opts: EtacOptions,
     n_iter: int,
     device: torch.device,
@@ -357,8 +362,8 @@ def run_group_etac(
     design,
     ya: torch.Tensor,
     yb: torch.Tensor | None,
-    mask: np.ndarray,
-    voxdims: tuple[float, float, float],
+    mask: Where,
+    voxdims: tuple[float, float, float] | None,
     *,
     model: str = "ols",
     ta: torch.Tensor | None = None,
@@ -380,8 +385,12 @@ def run_group_etac(
     blur: blurring a beta changes its within-subject variance in a way the t
     map does not record.
     """
-    from fastfuncstuff.stats.blur_to import MaskedGaussian
+    from fastfuncstuff.stats.cluster_inference import VolumeGeometry, as_geometry
     from fastfuncstuff.stats.group_inference import brick_nulls, brick_to_z
+
+    geom = as_geometry(mask)
+    if isinstance(geom, VolumeGeometry) and voxdims is not None:
+        geom = VolumeGeometry(geom.mask, voxdims)
 
     opts = opts or EtacOptions()
     if model == "mema" and any(b > 0 for b in blurs):
@@ -393,8 +402,8 @@ def run_group_etac(
         if label in cases:
             raise ValueError(f"blur {fwhm} given twice")
         if fwhm > 0:
-            g = MaskedGaussian(mask, voxdims, fwhm, device=device)
-            ya_b, yb_b = g.rows(ya), (g.rows(yb) if yb is not None else None)
+            blur = geom.smoother(fwhm, device)
+            ya_b, yb_b = blur(ya), (blur(yb) if yb is not None else None)
         else:
             ya_b, yb_b = ya, yb
         bricks = _bricks(design, model, ya_b, yb_b, ta, tb, knha, reml)
@@ -402,7 +411,7 @@ def run_group_etac(
                             seed=seed, knha=knha, reml=reml, main_only=True)  # fmt: skip
         cases[label] = (brick_to_z(bricks[bn.brick + 1]).to(device), bn.source)
         n_distinct = bn.source.n_distinct
-    return run_etac(cases, mask, opts, n_iter, device, verbose, n_distinct)
+    return run_etac(cases, geom, opts, n_iter, device, verbose, n_distinct)
 
 
 def _bricks(design, model, ya, yb, ta, tb, knha, reml):

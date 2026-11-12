@@ -13,6 +13,11 @@ an AFNI workflow unchanged::
     ffs_group -setA ctl/*.nii.gz -setB pat/*.nii.gz -labelA ctl -labelB pat \\
               -covariates covs.txt -center SAME -prefix ctl_vs_pat
 
+Surface data (.gii) work the same way: the mesh comes from the data's own
+geometry metadata (or -surf_geom), clusters follow mesh edges and are measured
+in mm^2, -etac_blur is a heat-kernel FWHM along the surface, and ClustSim
+tables go into each GIfTI's metadata where ffs_viewer reads them.
+
 Sets come in 3dttest++'s two forms: the long form (``-setA LABEL subj dset
 subj dset ...``) names every subject, which ``-covariates`` matches on; the
 short form (``-setA dset dset ...``) labels each subject by its file name,
@@ -63,6 +68,15 @@ def build_parser() -> FfsArgumentParser:
     inp.add_argument(
         "-mask",
         help="Analysis mask.  Default: every voxel nonzero in at least one input.",
+    )
+    inp.add_argument(
+        "-surf_geom",
+        metavar="MESH",
+        help="Surface input (.gii): the mesh the data live on, ideally the "
+        "midthickness (?h.midthickness.surf.gii).  Default: the data's own "
+        "'geometry' metadata, checked against its mesh fingerprint.  Clusters are "
+        "then connected over mesh edges and measured in mm^2, and -etac_blur is a "
+        "heat-kernel FWHM along the surface.",
     )
 
     test = p.add_argument_group("Test")
@@ -172,7 +186,13 @@ def build_parser() -> FfsArgumentParser:
         default=[2],
         help="Figures of merit: sum |z|^h over the cluster; 0 is size (default 2).",
     )
-    inf.add_argument("-etac_nn", type=int, choices=(1, 2, 3), default=2, help="Connectivity.")
+    inf.add_argument(
+        "-etac_nn",
+        type=int,
+        choices=(1, 2, 3),
+        default=2,
+        help="Voxel connectivity (volumes; on a surface clusters follow the mesh edges).",
+    )
     inf.add_argument(
         "-etac_sid",
         type=int,
@@ -443,7 +463,8 @@ def run(args) -> None:
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.stats.group_ttest import TtestDesign, run_ttest, to_z_bricks
 
-    prefix = parse_prefix(args.prefix)
+    surface = any(_split_selector(t)[0].endswith(".gii") for t in args.setA)
+    prefix = parse_prefix(args.prefix, default_ext=".func.gii" if surface else ".nii.gz")
     args.prefix_stem = prefix.stem
     out_path = Path(prefix.stem + prefix.nifti_ext)
     if out_path.exists() and not args.overwrite:
@@ -493,6 +514,7 @@ def run(args) -> None:
     n_vox = int(mask.sum())
     if n_vox == 0:
         raise ValueError("empty mask")
+    geom = _geometry(args, surface, dsets_a[0][0], ref_img, mask)
 
     # MEMA's REML wants float64 (on MPS that means the CPU: linalg_device).
     from fastfuncstuff.utils import linalg_device
@@ -577,21 +599,36 @@ def run(args) -> None:
         print(f"[ffs_group] wrote {out_path} ({len(bricks)} sub-bricks)", file=sys.stderr)
 
     if args.clustsim or args.etac:
-        voxdims = tuple(float(abs(z)) for z in ref_img.header.get_zooms()[:3])
         ya, yb = stack(vols_a, 0), stack(vols_b, 0) if vols_b else None
         ta = stack(vols_a, 1) if mema else None
         tb = stack(vols_b, 1) if mema and vols_b else None
         model_kw = dict(model=args.model, ta=ta, tb=tb, knha=not args.no_HKtest,
                         reml=args.mema_reml)  # fmt: skip
         if args.clustsim:
-            _clustsim(args, design, ya, yb, model_kw, mask, voxdims, bricks, out_path, prefix,
+            _clustsim(args, design, ya, yb, model_kw, mask, geom, bricks, out_path, prefix,
                       ref_img)  # fmt: skip
         if args.etac:
-            _run_etac(args, design, ya, yb, model_kw, mask, voxdims, prefix.stem,
+            _run_etac(args, design, ya, yb, model_kw, mask, geom, prefix.stem,
                       prefix.nifti_ext, ref_img)  # fmt: skip
 
 
-def _clustsim(args, design, ya, yb, model_kw, mask, voxdims, bricks, out_path, prefix,
+def _geometry(args, surface, spec, ref_img, mask):
+    """Volume grid, or the mesh a surface input lives on (fingerprint-checked)."""
+    from fastfuncstuff.stats.cluster_inference import SurfaceGeometry, VolumeGeometry
+
+    if not surface:
+        if args.surf_geom:
+            raise ValueError("-surf_geom is for surface (.gii) input")
+        return VolumeGeometry(mask, ref_img.header.get_zooms()[:3])
+    from fastfuncstuff.io.gifti import data_geometry, surface_meta
+
+    path = _split_selector(spec)[0]
+    vertices, faces = data_geometry(path, surface_meta(ref_img.header), mask.size,
+                                    args.surf_geom)  # fmt: skip
+    return SurfaceGeometry(vertices, faces, mask.reshape(-1))
+
+
+def _clustsim(args, design, ya, yb, model_kw, mask, geom, bricks, out_path, prefix,
               ref_img) -> None:  # fmt: skip
     """Tables for every t brick: the main test in the bucket, the rest in their own files.
 
@@ -621,29 +658,39 @@ def _clustsim(args, design, ya, yb, model_kw, mask, voxdims, bricks, out_path, p
             save_nifti(out, path, affine=ref_img.affine, header=ref_img.header,
                        brick_labels=[b.label for b in pair],
                        brick_stataux={1: pair[1].stat} if pair[1].stat else None)  # fmt: skip
-        _attach_tables(args, bn.source, mask, voxdims, path)
+        _attach_tables(args, bn.source, geom, path)
         if args.verb and not bn.main:
             print(f"[ffs_group] {path}: {bn.label} with its own ClustSim tables", file=sys.stderr)
     for fwhm in sorted(set(args.etac_blur or ())):
         if fwhm > 0:
-            _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img)
+            _clustsim_blur_case(args, design, ya, yb, mask, geom, fwhm, prefix, ref_img)
 
 
-def _attach_tables(args, source, mask, voxdims, path) -> None:
+def _attach_tables(args, source, geom, path) -> None:
     from fastfuncstuff.stats.clustsim import attach_clustsim_tables
     from fastfuncstuff.stats.group_ttest import PermutationFields
 
     _warn_distinct(args, source.n_distinct)
     # The .1D / .niml / .mask / 3drefit side files (18 per table set) go in one
-    # PREFIX.clustsim/ folder; the tables themselves live in each NIfTI header.
+    # PREFIX.clustsim/ folder; the tables themselves live in each file's header.
     path = Path(path)
+    folder = Path(str(args.prefix_stem) + ".clustsim")
+    if geom.kind == "surface":
+        from fastfuncstuff.stats.surface_clustsim import (
+            permutation_area_tables,
+            write_area_tables,
+        )
+
+        res = permutation_area_tables(source, args.niter, geom, device=source.device,
+                                      verbose=args.verb >= 1)  # fmt: skip
+        write_area_tables(path, res, folder)
+        return
     # Only the NIfTI extension: Path.suffixes also counts ".G1_mean", which
     # once named every per-brick table set "PREFIX.CSim" and let them overwrite.
     name = re.sub(r"\.nii(\.gz|\.zst)?$", "", path.name)
-    folder = Path(str(args.prefix_stem) + ".clustsim")
     attach_clustsim_tables(
-        mask,
-        voxdims,
+        geom.mask,
+        geom.voxdims,
         None,
         prefix=folder / f"{name}.CSim",
         refit=path,
@@ -652,22 +699,21 @@ def _attach_tables(args, source, mask, voxdims, path) -> None:
         seed=args.seed,
         commandline=" ".join(sys.argv),
         verbose=args.verb >= 1,
-        simulator=PermutationFields(source, mask),
+        simulator=PermutationFields(source, geom.mask),
     )
 
 
-def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_img) -> None:
+def _clustsim_blur_case(args, design, ya, yb, mask, geom, fwhm, prefix, ref_img) -> None:
     """PREFIX.B<fwhm>: the test re-run on blurred inputs, with its own tables."""
     import numpy as np
 
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.stats.blur_to import MaskedGaussian
     from fastfuncstuff.stats.etac import case_label
     from fastfuncstuff.stats.group_ttest import run_ttest
 
-    g = MaskedGaussian(mask, voxdims, fwhm, device=ya.device)
-    ya_b = g.rows(ya)
-    yb_b = g.rows(yb) if yb is not None else None
+    blur = geom.smoother(fwhm, ya.device)
+    ya_b = blur(ya)
+    yb_b = blur(yb) if yb is not None else None
     bricks = run_ttest(design, ya_b, yb_b, toz=args.toz)
     path = Path(f"{prefix.stem}.{case_label(fwhm)}{prefix.nifti_ext}")
     out = np.zeros((*mask.shape, len(bricks)), dtype=np.float32)
@@ -680,7 +726,7 @@ def _clustsim_blur_case(args, design, ya, yb, mask, voxdims, fwhm, prefix, ref_i
 
     (bn,) = brick_nulls(design, model="ols", ya=ya_b, yb=yb_b, n_iter=args.niter,
                         seed=args.seed, main_only=True)  # fmt: skip
-    _attach_tables(args, bn.source, mask, voxdims, path)
+    _attach_tables(args, bn.source, geom, path)
 
 
 def _warn_distinct(args, n_distinct: float) -> None:
@@ -692,7 +738,7 @@ def _warn_distinct(args, n_distinct: float) -> None:
         )
 
 
-def _run_etac(args, design, ya, yb, model_kw, mask, voxdims, stem, ext, ref_img) -> None:
+def _run_etac(args, design, ya, yb, model_kw, mask, geom, stem, ext, ref_img) -> None:
     import json
 
     import numpy as np
@@ -709,7 +755,7 @@ def _run_etac(args, design, ya, yb, model_kw, mask, voxdims, stem, ext, ref_img)
         splitfrac=args.etac_splitfrac,
     )
     blurs = tuple(args.etac_blur) if args.etac_blur else (0.0,)
-    res = run_group_etac(design, ya, yb, mask, voxdims, blurs=blurs, opts=opts,
+    res = run_group_etac(design, ya, yb, geom, None, blurs=blurs, opts=opts,
                          n_iter=args.niter, seed=args.seed, device=ya.device,
                          verbose=args.verb >= 1, **model_kw)  # fmt: skip
     _warn_distinct(args, res.n_distinct)
@@ -719,19 +765,21 @@ def _run_etac(args, design, ya, yb, model_kw, mask, voxdims, stem, ext, ref_img)
         tag = f"global.{side}.{goal:g}perc"
         vol = np.zeros(shape, dtype=np.float32)
         vol[mask] = union
-        save_nifti(vol, f"{stem}.ETACmask.{tag}{ext}", affine=ref_img.affine)
+        save_nifti(vol, f"{stem}.ETACmask.{tag}{ext}", affine=ref_img.affine, header=ref_img.header)
         allv = np.zeros((*shape, per.shape[0]), dtype=np.float32)
         for k in range(per.shape[0]):
             allv[..., k][mask] = per[k]
         save_nifti(allv, f"{stem}.ETACmaskALL.{tag}{ext}", affine=ref_img.affine,
-                   brick_labels=sub_labels)  # fmt: skip
+                   header=ref_img.header, brick_labels=sub_labels)  # fmt: skip
         if args.verb:
             print(f"[ffs_group] ETAC {side} FPR {goal:g}%: {int(union.sum())} voxels survive",
                   file=sys.stderr)  # fmt: skip
     record = {
         "n_iter": res.n_iter,
         "seed": args.seed,
-        "nn": opts.nn,
+        "nn": opts.nn if geom.kind == "volume" else "mesh edges",
+        "space": geom.kind,
+        "fom_unit": "voxels" if geom.kind == "volume" else "mm2 (area-weighted)",
         "sided": opts.sided,
         "min_clust": opts.min_clust,
         "hpow": list(opts.hpows),

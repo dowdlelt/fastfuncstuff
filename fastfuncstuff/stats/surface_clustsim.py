@@ -271,7 +271,7 @@ class SurfClustSimResult:
     pthr: tuple[float, ...]
     max_areas: dict[str, np.ndarray]  # sided -> (niter, npthr)
     niter: int
-    acf: ACF
+    acf: ACF | None  # None: a permutation null (ffs_group), not a simulated field
     weights: list[float] = field(default_factory=list)
     fit_rms: float = float("nan")
     cached: bool = False
@@ -371,7 +371,11 @@ def table_text(res: SurfClustSimResult, sided: str, athr=DEFAULT_CS_ATHR) -> str
     t = res.table(sided, athr)
     lines = [
         f"# {sided} thresholding, surface",
-        f"# ACF a={res.acf.a:.4f} b={res.acf.b:.3f} c={res.acf.c:.3f}; {res.niter} iterations",
+        (
+            f"# permutation null; {res.niter} iterations"
+            if res.acf is None
+            else f"# ACF a={res.acf.a:.4f} b={res.acf.b:.3f} c={res.acf.c:.3f}; {res.niter} iterations"
+        ),
         "# CLUSTER AREA THRESHOLD(pthr,alpha) in mm^2",
         "#  pthr  |" + "".join(f" {_prob6(a)}" for a in athr),
         "# ------ |" + " ------" * len(athr),
@@ -381,3 +385,62 @@ def table_text(res: SurfClustSimResult, sided: str, athr=DEFAULT_CS_ATHR) -> str
             f"{_prob9(p)} " + "".join(f"{x:7.1f}" if x <= 9999.9 else f"{x:7.0f}" for x in t[i])
         )
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Permutation nulls (ffs_group): same tables, a null from the data's relabelings
+# ---------------------------------------------------------------------------
+
+
+def permutation_area_tables(
+    source,
+    n_iter: int,
+    geometry,
+    *,
+    device,
+    pthr: tuple[float, ...] = DEFAULT_CS_PTHR,
+    sideds: tuple[str, ...] = SIDEDS,
+    desc: str = "SurfClustSim (permutation)",
+    verbose: bool = True,
+) -> SurfClustSimResult:
+    """Max cluster areas from a permutation null instead of a simulated ACF field.
+
+    ``source(start, nb)`` returns null z-maps over the geometry's in-mask
+    vertices (a :class:`group_ttest.OlsNull` and friends); clustering is the
+    shared batched driver on a :class:`cluster_inference.SurfaceGeometry`, so
+    the result is the same object -- and :meth:`SurfClustSimResult.table` the
+    same tables -- as the ACF route, and the viewer reads them identically.
+    """
+    from fastfuncstuff.stats.cluster_inference import max_fom_null
+
+    tc = zthresholds(tuple(pthr), tuple(sideds))
+    got = max_fom_null(source, n_iter, geometry, tc, nns=(1,), sideds=tuple(sideds), hpows=(0,),
+                       device=device, desc=desc, verbose=verbose)  # fmt: skip
+    areas = {s: got[(s, 1, 0)].astype(np.float64) for s in sideds}
+    return SurfClustSimResult(tuple(pthr), areas, n_iter, None)
+
+
+def write_area_tables(
+    gii_path, res: SurfClustSimResult, out_dir, athr=DEFAULT_CS_ATHR, null: str = "permutation"
+) -> None:
+    """Put the tables in a GIfTI's metadata (``ClustSim_<sided>``, what
+    ``surface.statmap`` and the viewer read) and beside it as text."""
+    import nibabel as nib
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = nib.load(gii_path)
+    assert isinstance(img, nib.gifti.GiftiImage), f"{gii_path} is not a GIfTI"
+    stem = Path(gii_path).name
+    for suf in (".func.gii", ".shape.gii", ".gii"):
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    for sided in res.max_areas:
+        (out_dir / f"{stem}.surfclustsim.{sided}.1D").write_text(table_text(res, sided, athr))
+        img.meta[f"ClustSim_{sided}"] = json.dumps({
+            "pthr": list(res.pthr), "athr": list(athr),
+            "area_mm2": res.table(sided, athr).round(2).tolist(),
+            "niter": res.niter, "null": null,
+        })  # fmt: skip
+    nib.save(img, gii_path)

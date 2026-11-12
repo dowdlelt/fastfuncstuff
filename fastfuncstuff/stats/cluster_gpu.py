@@ -145,13 +145,16 @@ def _connected_max_foms(
     n_batch: int,
     hpows: tuple[int, ...],
     min_clust: int,
+    weight: Tensor | None = None,  # [T] per-element measure (vertex area), or None
 ) -> dict[int, Tensor]:
-    """``{h: [B]}`` per-volume largest cluster FOM, FOM = sum |stat|^h.
+    """``{h: [B]}`` per-volume largest cluster FOM, FOM = sum w |stat|^h.
 
-    A label is a member index, so per-label sums indexed by label line up with
-    ``batch_id`` exactly as the size reduction above does.  Clusters smaller
-    than ``min_clust`` voxels are dropped before the maximum (3dXClustSim's
-    ``MIN_CLUST``), so they can neither set nor pass a threshold.
+    ``w`` is 1 for voxels (h=0 is the voxel count) or each vertex's area on a
+    surface (h=0 is the cluster area in mm^2).  A label is a member index, so
+    per-label sums indexed by label line up with ``batch_id`` exactly as the
+    size reduction above does.  Clusters with fewer than ``min_clust`` members
+    are dropped before the maximum (3dXClustSim's ``MIN_CLUST``), so they can
+    neither set nor pass a threshold.
     """
     n_act = int(batch_id.numel())
     lab = _label_components(adj_t, n_act).long()
@@ -159,10 +162,12 @@ def _connected_max_foms(
     keep = counts >= max(int(min_clust), 1)
     out: dict[int, Tensor] = {}
     for h in hpows:
-        if h == 0:
+        if h == 0 and weight is None:
             fom = counts.to(torch.float32)
         else:
-            w = absval if h == 1 else absval.pow(h)
+            w = torch.ones_like(absval) if h == 0 else (absval if h == 1 else absval.pow(h))
+            if weight is not None:
+                w = w * weight
             fom = torch.bincount(lab, weights=w, minlength=n_act).to(torch.float32)
         fom = torch.where(keep, fom, torch.zeros_like(fom))
         o = torch.zeros(n_batch, device=batch_id.device, dtype=torch.float32)
@@ -348,6 +353,7 @@ def cluster_fom_batched(
     hpows: tuple[int, ...] = (0,),
     min_clust: int = 1,
     rank_scratch: Tensor | None = None,
+    weight: Tensor | None = None,  # [V] per-element measure (vertex area), or None
 ) -> dict[tuple[str, int, int], Tensor]:
     """``{(sided, nn, h): [B, npthr]}`` largest cluster FOM, FOM = sum |stat|^h.
 
@@ -373,7 +379,8 @@ def cluster_fom_batched(
         fields, nbr_by_nn, nns, sideds, tcrits_by_sided, rank_scratch
     ):
         absval = flat[active_flat].abs()
-        got = _connected_max_foms(batch_id, adj, absval, n_batch, hpows, min_clust)
+        w = None if weight is None else weight[active_flat - batch_id * n_vox]
+        got = _connected_max_foms(batch_id, adj, absval, n_batch, hpows, min_clust, w)
         for h, v in got.items():
             col = out[(sided, nn, h)]
             col[:, ip] = torch.maximum(col[:, ip], v) if merge else v
@@ -386,8 +393,12 @@ def cluster_labels(
     sided: str,
     tcrit: float,
     min_clust: int = 1,
+    weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Label one map: ``(active, label, (size, mass, sumsq) per active voxel)``.
+
+    With ``weight`` (vertex areas) the three FOMs are area-weighted: size is the
+    cluster area.
 
     ``active`` are in-mask voxel indices above threshold, ``label`` their
     component id (clusters under ``min_clust`` dropped from ``active``), and
@@ -414,12 +425,14 @@ def cluster_labels(
         n_act = int(af.numel())
         lab = _label_components(adj, n_act).long()
         a = field[af].abs()
+        w = torch.ones_like(a) if weight is None else weight[af].to(a.dtype)
         counts = torch.bincount(lab, minlength=n_act)
-        mass = torch.bincount(lab, weights=a, minlength=n_act)
-        sq = torch.bincount(lab, weights=a * a, minlength=n_act)
+        size = torch.bincount(lab, weights=w, minlength=n_act)
+        mass = torch.bincount(lab, weights=w * a, minlength=n_act)
+        sq = torch.bincount(lab, weights=w * a * a, minlength=n_act)
         keep = counts[lab] >= max(int(min_clust), 1)
         actives.append(af[keep])
         labels.append(lab[keep] + offset)
-        foms.append(torch.stack([counts[lab].float(), mass[lab].float(), sq[lab].float()])[:, keep])
+        foms.append(torch.stack([size[lab].float(), mass[lab].float(), sq[lab].float()])[:, keep])
         offset += n_act
     return torch.cat(actives), torch.cat(labels), torch.cat(foms, dim=1)
