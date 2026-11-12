@@ -307,6 +307,18 @@ def load_canonical_hrf_basic(
     return to_tensor(hrf_final, device=device, dtype=torch.float32)
 
 
+def _tr_locked_grid(tr: float) -> tuple[int, float]:
+    """A ~0.1 s high-res step that divides ``tr`` exactly, and the steps per TR.
+
+    A fixed 0.1 s grid strided by the truncated TR/step ratio sampled TR 0.72
+    every 0.7 s and divided by zero for a microtime step under 0.1 s. The 1e-9
+    keeps 2.0 / 0.1 = 20.000000000000004 at 20 steps, so 0.1-multiple TRs are
+    unchanged.
+    """
+    steps = max(1, int(np.ceil(tr / 0.1 - 1e-9)))
+    return steps, tr / steps
+
+
 def get_canonical_hrf(
     stim_duration: float,
     tr: float,
@@ -335,8 +347,7 @@ def get_canonical_hrf(
     if device is None:
         device = get_device()
 
-    # Time vector
-    dt = 0.1  # High-res sampling
+    steps_per_tr, dt = _tr_locked_grid(tr)
     t_highres = np.arange(0, duration, dt)
 
     # SPM canonical HRF parameters (from Glover 1999 / Friston 1998)
@@ -363,7 +374,7 @@ def get_canonical_hrf(
     # Convolve with stimulus duration
     if stim_duration > 0:
         boxcar = np.zeros_like(t_highres)
-        stim_samples = int(stim_duration / dt)
+        stim_samples = int(round(stim_duration / dt))
         boxcar[:stim_samples] = 1
         hrf = np.convolve(hrf, boxcar, mode="full")[: len(t_highres)]
 
@@ -371,7 +382,7 @@ def get_canonical_hrf(
     hrf = hrf / np.max(hrf)
 
     # Downsample to TR
-    sample_indices = np.arange(0, len(t_highres), int(tr / dt))
+    sample_indices = np.arange(0, len(t_highres), steps_per_tr)
     hrf_downsampled = hrf[sample_indices]
 
     return to_tensor(hrf_downsampled, device=device, dtype=torch.float32)
@@ -703,7 +714,7 @@ def get_canonical_hrf_library(
         device = get_device()
 
     duration = 32.0
-    dt = 0.1
+    steps_per_tr, dt = _tr_locked_grid(tr)
     t_highres = np.arange(0, duration, dt)
 
     # Parameter ranges (based on Natural Scenes Dataset / GLMsingle)
@@ -732,7 +743,7 @@ def get_canonical_hrf_library(
         # Convolve with stimulus
         if stim_duration > 0:
             boxcar = np.zeros_like(t_highres)
-            stim_samples = int(stim_duration / dt)
+            stim_samples = int(round(stim_duration / dt))
             boxcar[:stim_samples] = 1
             hrf = np.convolve(hrf, boxcar, mode="full")[: len(t_highres)]
 
@@ -740,7 +751,7 @@ def get_canonical_hrf_library(
         hrf = hrf / np.max(hrf)
 
         # Downsample
-        sample_indices = np.arange(0, len(t_highres), int(tr / dt))
+        sample_indices = np.arange(0, len(t_highres), steps_per_tr)
         hrf_downsampled = hrf[sample_indices]
 
         hrfs.append(hrf_downsampled)
