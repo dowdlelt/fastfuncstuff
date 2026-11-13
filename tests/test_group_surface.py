@@ -119,8 +119,13 @@ def test_cli_surface_clustsim_etac_and_blur(tmp_path, mesh):
     # The blur case carries its own (larger) area tables.
     blurred = load_surface_data(tmp_path / "grp.B6.0.func.gii").tables["bi-sided"]
     assert blurred["area_mm2"][0][1] > tab["area_mm2"][0][1]
-    union = load_surface_data(tmp_path / "grp.ETACmask.global.2sid.5perc.func.gii").values[:, 0]
+    union = load_surface_data(tmp_path / "grp.etac" / "grp.ETACmask.global.2sid.5perc.func.gii").values[:, 0]  # fmt: skip
     assert union[0] == 1.0  # the blob's centre survives
+    res = load_surface_data(tmp_path / "grp.ETAC.func.gii")
+    assert res.labels == ["Z_B0.0", "ETAC_FWE_Z", "ETAC_FWE_p", "ETAC_clust_5perc"]
+    assert np.array_equal(res.values[:, 2] <= 0.05, union > 0)
+    rows = (tmp_path / "grp.ETAC.clusters.tsv").read_text().splitlines()
+    assert rows[0].split("\t")[3:5] == ["n_vert", "area_mm2"] and len(rows) > 1
     assert (tmp_path / "grp.clustsim").is_dir()
 
 

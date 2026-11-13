@@ -156,8 +156,12 @@ def build_parser() -> FfsArgumentParser:
         action="store_true",
         help="Global ETAC (3dttest++ -ETAC): several p-thresholds, figures of merit "
         "and blurs thresholded jointly at one family-wise FPR.  Writes "
-        "PREFIX.ETACmask.global.SIDE.Nperc (survivors), PREFIX.ETACmaskALL... "
-        "(one volume per blur x pthr sub-test) and PREFIX.ETAC.thresholds.json.",
+        "PREFIX.ETAC, the result: the z map, ETAC_FWE_Z (a z whose p is the "
+        "family-wise p, so a viewer p threshold of 0.05 shows the 5%% "
+        "survivors), ETAC_FWE_p, and a cluster-id brick per -etac_fpr goal; "
+        "PREFIX.ETAC.clusters.tsv (extent, peak, centre of mass in RAS mm, FWE "
+        "p, the sub-tests each cluster passed); and PREFIX.etac/ with "
+        "3dttest++'s 0/1 ETACmask / ETACmaskALL files and the thresholds.",
     )
     inf.add_argument(
         "-etac_blur",
@@ -739,12 +743,29 @@ def _warn_distinct(args, n_distinct: float) -> None:
 
 
 def _run_etac(args, design, ya, yb, model_kw, mask, geom, stem, ext, ref_img) -> None:
+    """Write PREFIX.ETAC (the result), PREFIX.ETAC.clusters.tsv, and PREFIX.etac/.
+
+    The bucket is what gets opened: the z map, thresholded in the viewer by
+    ETAC_FWE_Z, a z-equivalent of the family-wise p whose two-tailed p *is*
+    that FWE p -- so a p box at 0.05 shows exactly the 5% ETAC survivors, at
+    any goal, without a second run.  The AFNI-named 0/1 masks and the
+    threshold record go in the side folder.
+    """
     import json
 
     import numpy as np
+    import torch
+    from nibabel.affines import apply_affine
+    from scipy.stats import norm
 
-    from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.stats.etac import DEFAULT_PTHR, EtacOptions, run_group_etac
+    from fastfuncstuff.io.afni import save_nifti, stat_type_to_stataux
+    from fastfuncstuff.stats.etac import (
+        DEFAULT_PTHR,
+        EtacOptions,
+        describe_clusters,
+        run_group_etac,
+        survivor_labels,
+    )
 
     opts = EtacOptions(
         pthr=tuple(args.etac_pthr) if args.etac_pthr else DEFAULT_PTHR,
@@ -760,26 +781,109 @@ def _run_etac(args, design, ya, yb, model_kw, mask, geom, stem, ext, ref_img) ->
                          verbose=args.verb >= 1, **model_kw)  # fmt: skip
     _warn_distinct(args, res.n_distinct)
     shape = mask.shape
+    surface = geom.kind == "surface"
+    folder = Path(f"{stem}.etac")
+    folder.mkdir(parents=True, exist_ok=True)
+    name = Path(stem).name
+    geo = dict(affine=ref_img.affine, header=ref_img.header)
+
+    def grid(vals, dtype=np.float32):
+        out = np.zeros((*shape, len(vals)), dtype=dtype)
+        for k, v in enumerate(vals):
+            out[..., k][mask] = v
+        return out
+
+    # AFNI's own files, as uint8: the masks 3dttest++ -ETAC writes.
     sub_labels = [f"{c}_p{p:.4g}" for c in res.case_labels for p in opts.pthr]
     for (goal, side), (union, per) in res.masks.items():
         tag = f"global.{side}.{goal:g}perc"
-        vol = np.zeros(shape, dtype=np.float32)
-        vol[mask] = union
-        save_nifti(vol, f"{stem}.ETACmask.{tag}{ext}", affine=ref_img.affine, header=ref_img.header)
-        allv = np.zeros((*shape, per.shape[0]), dtype=np.float32)
-        for k in range(per.shape[0]):
-            allv[..., k][mask] = per[k]
-        save_nifti(allv, f"{stem}.ETACmaskALL.{tag}{ext}", affine=ref_img.affine,
-                   header=ref_img.header, brick_labels=sub_labels)  # fmt: skip
+        save_nifti(grid([union], np.uint8)[..., 0], folder / f"{name}.ETACmask.{tag}{ext}", **geo)
+        save_nifti(grid(list(per), np.uint8), folder / f"{name}.ETACmaskALL.{tag}{ext}",
+                   brick_labels=sub_labels, **geo)  # fmt: skip
+
+    # The result bucket.
+    p = res.fwe_p
+    fwe_z = res.fwe_sign * norm.isf(np.clip(p, 1e-300, 1.0) / 2.0)
+    goals = list(opts.fpr)
+    labels = {g: survivor_labels(res, g, geom) for g in goals}
+    bricks = [res.z_obs[res.display_case].float().cpu().numpy(), fwe_z, p,
+              *(labels[g] for g in goals)]  # fmt: skip
+    names = [f"Z_{res.display_case}", "ETAC_FWE_Z", "ETAC_FWE_p",
+             *(f"ETAC_clust_{g:g}perc" for g in goals)]  # fmt: skip
+    fizt = stat_type_to_stataux("fizt", ())
+    bucket = Path(f"{stem}.ETAC{ext}")
+    save_nifti(grid(bricks), bucket, brick_labels=names, brick_stataux={0: fizt, 1: fizt}, **geo)
+
+    # The cluster table.
+    if surface:
+        coords = geom.vertices[geom.mask]
+        weight = geom.weights(torch.device("cpu")).double().numpy()
+        index = np.flatnonzero(geom.mask).astype(str)
+        n_col, size_col, idx_col = "n_vert", "area_mm2", "peak_vertex"
+    else:
+        ijk = np.argwhere(mask)
+        coords = apply_affine(ref_img.affine, ijk)
+        weight = np.full(len(ijk), float(np.prod(geom.voxdims)))
+        index = np.array([",".join(map(str, v)) for v in ijk])
+        n_col, size_col, idx_col = "n_vox", "size_mm3", "peak_ijk"
+    cols = [
+        "fpr_goal",
+        "cluster",
+        "sign",
+        n_col,
+        size_col,
+        "z_peak",
+        idx_col,
+        "peak_R",
+        "peak_A",
+        "peak_S",
+        "cm_R",
+        "cm_A",
+        "cm_S",
+        "fwe_p",
+        "strictest_pthr",
+        "subtests",
+    ]
+    lines = ["\t".join(cols)]
+    for g in goals:
+        rows = describe_clusters(res, g, labels[g], coords, weight)
+        for r in rows:
+            lines.append("\t".join([
+                f"{g:g}", str(r["cluster"]), r["sign"], str(r["n"]), f"{r['size']:.1f}",
+                f"{r['z_peak']:.3f}", index[r["peak"]], *(f"{v:.1f}" for v in r["peak_mm"]),
+                *(f"{v:.1f}" for v in r["cm_mm"]), f"{r['fwe_p']:.4g}",
+                f"{r['strictest_pthr']:.4g}", ";".join(r["subtests"]),
+            ]))  # fmt: skip
         if args.verb:
-            print(f"[ffs_group] ETAC {side} FPR {goal:g}%: {int(union.sum())} voxels survive",
+            print(f"[ffs_group] ETAC FPR {g:g}%: {len(rows)} clusters, "
+                  f"{int((labels[g] > 0).sum())} {'vertices' if surface else 'voxels'}",
                   file=sys.stderr)  # fmt: skip
+    table = Path(f"{stem}.ETAC.clusters.tsv")
+    table.write_text("\n".join(lines) + "\n")
+
     record = {
+        "outputs": {
+            "result": bucket.name,
+            "result_bricks": names,
+            "clusters": table.name,
+            "afni_masks": folder.name,
+        },
+        "fwe_p": {
+            "meaning": "smallest family-wise FPR at which ETAC keeps the voxel; "
+            "threshold at q to get the mask for an FPR goal of q",
+            "floor": 1.0 / res.n_test,
+            "n_test": res.n_test,
+            "unreached": "1.0: no cluster through the voxel passes even at the "
+            "most lenient tail fraction the search may use",
+        },
+        "coordinates": "mm, RAS+ (NIfTI); cm = centre of mass"
+        + (" over vertex areas" if surface else ""),
+        "display_case": res.display_case,
         "n_iter": res.n_iter,
         "seed": args.seed,
-        "nn": opts.nn if geom.kind == "volume" else "mesh edges",
+        "nn": opts.nn if not surface else "mesh edges",
         "space": geom.kind,
-        "fom_unit": "voxels" if geom.kind == "volume" else "mm2 (area-weighted)",
+        "fom_unit": "voxels" if not surface else "mm2 (area-weighted)",
         "sided": opts.sided,
         "min_clust": opts.min_clust,
         "hpow": list(opts.hpows),
@@ -801,7 +905,10 @@ def _run_etac(args, design, ya, yb, model_kw, mask, geom, stem, ext, ref_img) ->
             for t in res.thresholds
         ],
     }  # fmt: skip
-    Path(f"{stem}.ETAC.thresholds.json").write_text(json.dumps(record, indent=1))
+    (folder / f"{name}.ETAC.thresholds.json").write_text(json.dumps(record, indent=1))
+    if args.verb:
+        print(f"[ffs_group] wrote {bucket} (open it; threshold ETAC_FWE_Z at p 0.05) "
+              f"and {table}", file=sys.stderr)  # fmt: skip
 
 
 if __name__ == "__main__":

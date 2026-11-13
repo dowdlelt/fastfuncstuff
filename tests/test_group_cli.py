@@ -116,11 +116,21 @@ def test_clustsim_and_etac_outputs(tmp_path):
         f = tmp_path / f"g.{lab}.nii.gz"
         assert read_brick_labels(nib.load(f)) == [lab, lab.replace("mean", "Tstat")]
         assert (2, "bi-sided") in read_clustsim_tables_from(f)
-    allm = tmp_path / "g.ETACmaskALL.global.2sid.5perc.nii.gz"
+    # AFNI's ETAC masks, as uint8, in their side folder.
+    allm = tmp_path / "g.etac" / "g.ETACmaskALL.global.2sid.5perc.nii.gz"
     assert read_brick_labels(nib.load(allm)) == ["B0.0_p0.01", "B0.0_p0.001", "B3.0_p0.01",
                                                  "B3.0_p0.001"]  # fmt: skip
-    assert (tmp_path / "g.ETACmask.global.2sid.5perc.nii.gz").exists()
-    assert (tmp_path / "g.ETAC.thresholds.json").exists()
+    assert nib.load(allm).get_data_dtype() == np.uint8
+    union = nib.load(tmp_path / "g.etac" / "g.ETACmask.global.2sid.5perc.nii.gz").get_fdata()
+    assert (tmp_path / "g.etac" / "g.ETAC.thresholds.json").exists()
+    # The result bucket: z, FWE z (a fizt the viewer reads as the FWE p), p, clusters.
+    res = nib.load(tmp_path / "g.ETAC.nii.gz")
+    assert read_brick_labels(res) == ["Z_B0.0", "ETAC_FWE_Z", "ETAC_FWE_p", "ETAC_clust_5perc"]
+    vol = res.get_fdata()
+    assert np.array_equal(vol[..., 2] <= 0.05, union > 0)
+    assert np.array_equal(vol[..., 3] > 0, union > 0)
+    head = (tmp_path / "g.ETAC.clusters.tsv").read_text().splitlines()[0].split("\t")
+    assert head[:4] == ["fpr_goal", "cluster", "sign", "n_vox"] and "fwe_p" in head
     # Side files in one folder, none at the top level.
     assert (tmp_path / "g.clustsim" / "g.CSim.NN2_bisided.niml").exists()
     assert (tmp_path / "g.clustsim" / "g.SetA_mean.CSim.NN2_bisided.niml").exists()
@@ -196,7 +206,8 @@ def test_clustsim_and_etac_for_every_model(tmp_path, extra):
           "-prefix", str(out), "-device", "cpu", "-verb", "0", "-clustsim", "-etac",
           "-etac_pthr", "0.01", "0.002", "-niter", "60"])  # fmt: skip
     assert (2, "bi-sided") in read_clustsim_tables_from(out)
-    assert (tmp_path / "m.ETACmask.global.2sid.5perc.nii.gz").exists()
+    assert (tmp_path / "m.etac" / "m.ETACmask.global.2sid.5perc.nii.gz").exists()
+    assert (tmp_path / "m.ETAC.nii.gz").exists()
     side = sorted(p.name for p in tmp_path.glob("m.*.nii.gz") if "ETAC" not in p.name)
     assert len(side) == 2  # the two per-set tests, each with its own tables
     for name in side:

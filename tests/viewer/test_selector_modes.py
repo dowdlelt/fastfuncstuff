@@ -729,6 +729,27 @@ def test_negative_tail_reads_the_negative_values(session, tmp_path):
     assert session.negative_tail(session.state.layers.overlay.key, 0) is None
 
 
+def test_an_etac_result_opens_cut_on_its_familywise_p(session, tmp_path):
+    """ffs_group -etac: show the z, threshold on ETAC_FWE_Z at FWE p 0.05."""
+    from scipy.stats import norm
+
+    from fastfuncstuff.io.afni import save_nifti, stat_type_to_stataux
+
+    rng = np.random.default_rng(0)
+    vol = rng.normal(size=(8, 8, 6, 4)).astype(np.float32)
+    fizt = stat_type_to_stataux("fizt", ())
+    save_nifti(vol, tmp_path / "g.ETAC.nii.gz", affine=np.eye(4) * 3,
+               brick_labels=["Z_B0.0", "ETAC_FWE_Z", "ETAC_FWE_p", "ETAC_clust_5perc"],
+               brick_stataux={0: fizt, 1: fizt})  # fmt: skip
+    _write(tmp_path, "anat.nii.gz", np.ones((8, 8, 6)))
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "g.ETAC.nii.gz")))
+    ov = session.state.layers.overlay
+    assert ov.volume_index == 0 and ov.threshold_index == 1
+    assert ov.threshold_p == pytest.approx(0.05)
+    assert ov.threshold == pytest.approx(norm.isf(0.025))
+
+
 def test_the_underlay_stays_opaque(session, datadir):
     """The base image is the base image; it must not be thresholded away."""
     session.do(SetUnderlay(str(datadir / "anat.nii.gz")))

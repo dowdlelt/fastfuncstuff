@@ -19,9 +19,11 @@ from fastfuncstuff.stats.etac import (
     EtacOptions,
     apply,
     build_null,
+    describe_clusters,
     fpr_at,
     run_group_etac,
     search,
+    survivor_labels,
     thresholds_at,
 )
 from fastfuncstuff.stats.group_ttest import OlsNull, TtestDesign, main_test
@@ -103,6 +105,40 @@ def test_familywise_rate_on_fresh_null_datasets():
         hits += bool(r.masks[(10.0, "2sid")][0].any())
     # 10% goal: 4 of 40 expected; binomial 99% interval is about 0-10.
     assert hits <= 10
+
+
+@pytest.mark.parametrize("sided", [2, 1])
+def test_fwe_p_map_reproduces_every_goal_mask(sided):
+    # The point of the p map: thresholding it at q is the mask ETAC writes for
+    # an FPR goal of q, so one run answers every goal.  Signal of mixed size,
+    # so the goals cut through different clusters.
+    goals = (1.0, 2.0, 5.0, 10.0, 20.0)
+    mask, y = _subjects(14, 5, effect=1.2)
+    opts = EtacOptions(pthr=(0.01, 0.005, 0.001), hpows=(0, 2), fpr=goals, sided=sided)
+    r = run_group_etac(TtestDesign(14), y, None, mask, (3, 3, 3), blurs=(0.0, 4.0),
+                       opts=opts, n_iter=400, device=CPU, verbose=False)  # fmt: skip
+    assert r.fwe_p.min() < 0.05
+    for g in goals:
+        assert np.array_equal(r.survivors(g), r.fwe_p <= g / 100), g
+    assert r.fwe_p.min() >= 1.0 / r.n_test
+
+
+def test_survivor_clusters_are_ranked_and_described():
+    mask, y = _subjects(14, 3, effect=2.5)
+    opts = EtacOptions(pthr=(0.01, 0.001), hpows=(2,))
+    r = run_group_etac(TtestDesign(14), y, None, mask, (3, 3, 3), opts=opts, n_iter=300,
+                       device=CPU, verbose=False)  # fmt: skip
+    lab = survivor_labels(r, 5.0, mask)
+    assert np.array_equal(lab > 0, r.survivors(5.0))
+    coords = np.argwhere(mask).astype(float)
+    rows = describe_clusters(r, 5.0, lab, coords)
+    assert [row["cluster"] for row in rows] == list(range(1, len(rows) + 1))
+    assert all(a["n"] >= b["n"] for a, b in zip(rows, rows[1:], strict=False))
+    top = rows[0]
+    # The planted blob sits at (6, 7, 6); its peak and centre are near it.
+    assert np.abs(np.array(top["peak_mm"]) - (6, 7, 6)).max() <= 2
+    assert top["fwe_p"] <= 0.05 and top["sign"] == "+"
+    assert top["subtests"] and top["strictest_pthr"] in opts.pthr
 
 
 def test_options_are_validated():

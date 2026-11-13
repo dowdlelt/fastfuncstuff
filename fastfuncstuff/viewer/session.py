@@ -51,6 +51,9 @@ AUTORANGE_PERCENTILES = (2.0, 98.0)
 
 #: Where a statistic's threshold starts, as a p (two-sided for t/z, upper tail for F).
 OVERLAY_START_P = 1e-3
+#: ffs_group -etac writes its family-wise p as this z brick (two-tailed p = FWE p).
+ETAC_CUT_LABEL = "ETAC_FWE_Z"
+ETAC_START_P = 0.05
 #: A signed map is mirrored about zero only when each sign holds at least this
 #: share of its non-zero voxels -- real mass on both sides, not a few ringing
 #: voxels, before half the bar goes to one of them ...
@@ -906,6 +909,16 @@ class ViewerSession:
         from fastfuncstuff.viewer.vocab import _threshold_at_p
 
         threshold_p = OVERLAY_START_P if layer.stataux else None
+        cut: dict[str, object] = {}
+        if ETAC_CUT_LABEL in layer.labels:
+            # An ffs_group -etac result: show the z, cut on the brick whose p is
+            # the family-wise p, at the level ETAC is normally run at.
+            import dataclasses
+
+            cut = {"threshold_index": layer.labels.index(ETAC_CUT_LABEL),
+                   "threshold_follow": "fixed"}  # fmt: skip
+            layer = dataclasses.replace(layer, **cut)  # type: ignore[arg-type]
+            threshold_p = ETAC_START_P
         at_p = _threshold_at_p(layer, threshold_p)
         if (
             at_p is None
@@ -923,6 +936,7 @@ class ViewerSession:
             key,
             threshold=0.0 if at_p is None else at_p,
             threshold_p=threshold_p,
+            **cut,
             **self.overlay_look(key, 0, colormap="hot" if stats or coef else "gray"),
         )
 
