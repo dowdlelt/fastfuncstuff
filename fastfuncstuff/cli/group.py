@@ -517,7 +517,10 @@ def run(args) -> None:
                 "-brickA / -brickB (or [..] selectors)"
             )
 
-    device = setup_device(args.device)
+    # No TF32: every product here contracts over the N subjects, so it buys nothing,
+    # and its 10-bit mantissa moved covariate / pooled two-sample t by up to 9e-3
+    # against 3dttest++ on CUDA (exact on the CPU), nulls included.
+    device = setup_device(args.device, tf32=False)
     # vols[s][j]: subject s, dataset j (j=0 the map/beta, j=1 MEMA's t).
     vols_a = [[load_volume(d) for d in grp] for grp in dsets_a]
     vols_b = [[load_volume(d) for d in grp] for grp in dsets_b]

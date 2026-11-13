@@ -41,6 +41,53 @@ def test_two_sample_with_label_selector_and_covariates(tmp_path):
     assert read_brick_stataux(img)[1] == (3, (7.0,))  # 11 - 2 - 2*1
 
 
+def test_tf32_false_undoes_an_earlier_high_precision_setting():
+    # ffs_group relies on this: an in-process caller that left "high" behind would
+    # otherwise put TF32 into its design-matrix products on CUDA.
+    import torch
+
+    from fastfuncstuff.utils import configure_torch_backends
+
+    torch.set_float32_matmul_precision("high")
+    configure_torch_backends(torch.device("cpu"), tf32=False)
+    assert torch.get_float32_matmul_precision() == "highest"
+
+
+@pytest.mark.gpu
+def test_covariate_fit_on_cuda_matches_float64(tmp_path):
+    # Bug of record: under TF32 the covariate / pooled paths (pinv @ y) were off
+    # 3dttest++ by up to 9e-3 in t on real data, while the CPU matched to 2e-6.
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    torch.set_float32_matmul_precision("high")
+    rng = np.random.default_rng(1)
+    n, shape = 12, (16, 16, 8)
+    y = rng.normal(10.0, 1.0, (n, *shape))  # an offset is what TF32 rounds badly
+    age = rng.uniform(20, 40, n)
+    seta = ["A"]
+    for k in range(n):
+        p = tmp_path / f"s{k}.nii.gz"
+        save_nifti(y[k].astype(np.float32), p, affine=np.eye(4))
+        seta += [f"s{k}", str(p)]
+    cov = tmp_path / "cov.txt"
+    cov.write_text("subj age\n" + "\n".join(f"s{k} {a:.6f}" for k, a in enumerate(age)) + "\n")
+    out = tmp_path / "c.nii.gz"
+    main(["-setA", *seta, "-covariates", str(cov), "-prefix", str(out),
+          "-device", "cuda", "-verb", "0"])  # fmt: skip
+    got = np.asarray(nib.load(out).dataobj).reshape(-1, 4)
+
+    x = np.c_[np.ones(n), np.round(age, 6) - np.round(age, 6).mean()]
+    yy = y.astype(np.float32).astype(np.float64).reshape(n, -1)
+    beta = np.linalg.lstsq(x, yy, rcond=None)[0]
+    s2 = ((yy - x @ beta) ** 2).sum(0) / (n - 2)
+    se = np.sqrt(np.outer(np.diag(np.linalg.inv(x.T @ x)), s2))
+    np.testing.assert_allclose(got[:, 0], beta[0], rtol=1e-5)
+    np.testing.assert_allclose(got[:, 1], beta[0] / se[0], rtol=1e-4)
+    np.testing.assert_allclose(got[:, 3], beta[1] / se[1], rtol=1e-4, atol=1e-4)
+
+
 def test_short_form_one_sample_matches_scipy(tmp_path):
     a, _ = _write_sets(tmp_path)
     out = tmp_path / "one.nii.gz"

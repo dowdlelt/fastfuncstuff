@@ -848,7 +848,8 @@ def configure_torch_backends(
     Call once at the start of a CLI entry-point after selecting the device.
 
     Sets:
-      - float32 matmul precision to 'high' (use TF32 on Ampere+), when ``tf32``
+      - float32 matmul precision to 'high' (use TF32 on Ampere+) when ``tf32``,
+        else 'highest'
       - cudnn.benchmark = True (autotuner for convolutions)
       - CPU thread count from :func:`resolve_cpu_threads` (for CPU and MPS
         fallback paths), which honours ``FFS_NUM_THREADS`` / ``OMP_NUM_THREADS``
@@ -864,8 +865,9 @@ def configure_torch_backends(
     ``allow_tf32`` deliberately and narrowly where it does pay. The thread count
     is the part every CLI needs either way.
     """
-    if tf32:
-        torch.set_float32_matmul_precision("high")
+    # Set both ways: the switch is process-global, so tf32=False must undo an
+    # earlier in-process caller's "high" rather than inherit it.
+    torch.set_float32_matmul_precision("high" if tf32 else "highest")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         # Our convolutions are filters (box/Gaussian smoothing, local correlation), not
