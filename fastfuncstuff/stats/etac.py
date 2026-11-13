@@ -21,6 +21,15 @@ What this does differently from ``3dXClustSim`` (read from its source):
 * For 1-sided tests AFNI draws its null alternately from the positive and the
   negative tail of successive iterations; here both tails of every iteration
   are used (twice the null clusters for the same permutations).
+* 3dXClustSim's false-alarm test passes the size, sum|z| and sum z^2
+  thresholds whatever ``-hpow`` asked for (``mri_threshX.c:430``), so its
+  FPR is calibrated on the union of all three FOMs while only the requested
+  ones are applied: conservative.  Here the FPR is counted on the FOMs
+  that are applied.  Counting the union instead reproduces 3dXClustSim's
+  FPR and thresholds exactly on its own null maps (2026-11-13).
+* 3dttest++ ``-ETAC`` silently lowers the dof by ``rint(0.1 N)`` for the
+  observed map and the null (``3dttest++.c:4685``), i.e. slightly stricter
+  t cut-offs per pthr.  Not reproduced; the test is valid either way.
 
 Kept identical: thresholds as ranked maxima with AFNI's plotting positions
 and Gumbel interpolation (``inverse_interp_extreme``), the 5-voxel minimum
