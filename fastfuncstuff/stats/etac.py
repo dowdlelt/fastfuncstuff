@@ -387,7 +387,7 @@ def fwe_pvalues(
                 continue
             lab = label.cpu().numpy()
             _, first, inv = np.unique(lab, return_index=True, return_inverse=True)
-            fo = foms.double().cpu().numpy()[:, first]
+            fo = foms.cpu().double().numpy()[:, first]
             tf_c = np.full(first.size, np.inf)
             for ih, h in enumerate(opts.hpows):
                 tf_c = np.minimum(tf_c, _first_pass(null.ranked((ic, ip, ih)), n, fo[hcol[h]]))
