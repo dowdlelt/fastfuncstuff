@@ -3553,20 +3553,30 @@ def _stage_mni(plan: Plan) -> str:
     )
 
 
+def _dq_escape(text: str) -> str:
+    """``text`` made literal inside a bash double-quoted string."""
+    for ch in ("\\", '"', "$", "`"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _mni_template_ref(opt) -> str:
+    """The MNI template's skull-off volume, shell-quoted. Sub-brick 0 of AFNI's SSW
+    template is the skull-off volume; a plain template has one volume and [0] is
+    still it. Quoted whole: the selector's brackets are a glob to the shell and
+    belong to the tool."""
+    if opt.mni_template:
+        return shlex.quote(f"{opt.mni_template}[0]")
+    return '"${FFS_MNI_TEMPLATE:?set -mni_template}[0]"'
+
+
 def _mni_estimate(plan: Plan) -> str:
     """The anat → MNI affine + warp. Estimated on the anat alone, so a multi-family
     script runs it once and every family reaches MNI through the same warp."""
     opt = plan.options
     if not (opt.do_mni and opt.go_to_anat and not opt.grand_reference):
         return ""
-    # Sub-brick 0 of AFNI's SSW template is the skull-off volume; a plain template
-    # has one volume and [0] is still it. Quoted whole: the selector's brackets are
-    # a glob to the shell and belong to the tool.
-    base = (
-        shlex.quote(f"{opt.mni_template}[0]")
-        if opt.mni_template
-        else '"${FFS_MNI_TEMPLATE:?set -mni_template}[0]"'
-    )
+    base = _mni_template_ref(opt)
     lin = _ffs(
         "ffs_allineate",
         [
@@ -4104,7 +4114,8 @@ def _anat_nl_anchor_call(plan: Plan) -> str:
 
 def _final_master(plan: Plan) -> str:
     """The dataset whose grid (space/FOV) the final output inherits — before the
-    warpmaster autoboxes it to the EPI coverage and drops it to the EPI voxel size."""
+    warpmaster autoboxes it and drops it to the EPI voxel size. In anat space that
+    box is the EPI coverage; under -do_mni it is the template's brain."""
     opt = plan.options
     if not opt.go_to_anat:
         return _grandmean()
@@ -4132,7 +4143,16 @@ def _final_master(plan: Plan) -> str:
             f'{gr}/stage09.anat.nii*; do [ -e "$f" ] && {{ echo "$f"; break; }}; done; true)'
         )
     if opt.do_mni:
-        return _al_mni(plan)
+        # The template, not this subject's _al_mni: autoboxing a subject's own
+        # coverage gives every subject a different MNI box AND lattice (the -dxyz
+        # resample lays the grid out from each box's corner), so no two land on the
+        # same voxels and a group analysis refuses them. The template box is the
+        # same for everyone, and shares anat_mni's lattice so the underlay crop
+        # below stays a pure crop. Unquoted: this lands inside MASTER="..." already,
+        # where the selector's brackets are not a glob.
+        if opt.mni_template:
+            return _dq_escape(f"{opt.mni_template}[0]")
+        return "${FFS_MNI_TEMPLATE:?set -mni_template}[0]"
     if plan.xfam_root is not None:
         return _xfam_nl_anchor() if plan.options.xfam_nonlin else _xfam_image()
     return _anat_anchor(plan)
@@ -4384,6 +4404,11 @@ def _stage_warpmaster(plan: Plan) -> str:
         "# the EPI voxel size; stage10 lands every run on it (-master). The analysis",
         "# masks come after the data does, in stage10b.",
     ]
+    if opt.do_mni and opt.go_to_anat and not (opt.grand_reference or opt.ref_file):
+        out += [
+            "# -do_mni: the box is the MNI template's brain, not this subject's coverage,",
+            "# so every subject lands on the same grid.",
+        ]
     if _own_anat(opt):
         out += [
             "# stage10.anat_in_epi_fov is the anat on that same FOV at anat resolution —",

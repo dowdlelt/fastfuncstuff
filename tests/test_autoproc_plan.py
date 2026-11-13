@@ -2392,10 +2392,35 @@ def test_do_mni_moves_the_final_grid_and_underlay_into_mni():
     """The warpmaster is cut out of the anchor in the OUTPUT space. If it stayed in
     anat space the data would land on a grid one warp away from where it is."""
     s = _skull_script(anat_skull=True, do_mni=True, mni_template="/t/MNI.nii.gz")
-    assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_mni.nii$FMT}"' in s
+    assert 'MASTER="${FFS_MASTER:-/t/MNI.nii.gz[0]}"' in s
     assert '-input "stage09.anat_mni.nii.gz"' in s  # underlay ancestor
     # and the anchor gets there through the same head-of-chain the data does
     assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D stage09.anat.aff12.1D"' in s
+
+
+def test_do_mni_final_grid_is_the_template_not_the_subject():
+    """Autoboxing each subject's own MNI-warped EPI gave every subject a different
+    box and lattice, and ffs_group refused to stack them. The box must come from
+    something every subject shares — the template — and MASTER must expand to the
+    bare path in bash (no stray quotes from nesting inside MASTER="...")."""
+    import subprocess
+
+    for tmpl, env, want in [
+        ("/t/my MNI$x.nii.gz", {}, "/t/my MNI$x.nii.gz[0]"),
+        (None, {"FFS_MNI_TEMPLATE": "/e/MNI.nii.gz"}, "/e/MNI.nii.gz[0]"),
+    ]:
+        s = _skull_script(anat_skull=True, do_mni=True, mni_template=tmpl)
+        stage10a = s[s.index("stage10a: warpmaster") : s.index("stage10: final")]
+        assert "_al_mni" not in stage10a
+        line = next(ln for ln in stage10a.splitlines() if ln.startswith("MASTER="))
+        got = subprocess.run(
+            ["bash", "-c", f'{line}; printf %s "$MASTER"'],
+            env={"PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert got == want
 
 
 def test_do_mni_coexists_with_anat_nonlin():
