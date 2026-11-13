@@ -137,6 +137,59 @@ def test_clustsim_and_etac_outputs(tmp_path):
     assert not list(tmp_path.glob("*.CSim.*"))
 
 
+def _write_two_conditions(tmp_path, n=8, shape=(5, 4, 3)):
+    """One bucket per subject holding two conditions (coef + t each)."""
+    rng = np.random.default_rng(5)
+    labels = ["face#0_Coef", "face#0_Tstat", "house#0_Coef", "house#0_Tstat"]
+    paths, face, house = [], [], []
+    for i in range(n):
+        f = rng.normal(1.0, 1.0, shape)
+        h = f - rng.normal(0.4, 0.5, shape)  # paired: house tracks face
+        vol = np.stack([f, f / 0.5, h, h / 0.5], -1).astype(np.float32)
+        p = tmp_path / f"sub{i}_stats.nii.gz"
+        save_nifti(vol, p, affine=np.eye(4), brick_labels=labels,
+                   brick_stataux={1: (3, (40.0,)), 3: (3, (40.0,))})  # fmt: skip
+        paths.append(p)
+        face.append(vol[..., 0])
+        house.append(vol[..., 2])
+    return paths, np.stack(face), np.stack(house)
+
+
+def test_paired_conditions_from_the_same_buckets_with_brickA_brickB(tmp_path):
+    paths, face, house = _write_two_conditions(tmp_path)
+    out = tmp_path / "pr.nii.gz"
+    main(["-setA", *map(str, paths), "-setB", *map(str, paths), "-brickA", "face#0_Coef",
+          "-brickB", "house#0_Coef", "-paired", "-prefix", str(out), "-device", "cpu",
+          "-verb", "0"])  # fmt: skip
+    vol = nib.load(out).get_fdata()
+    t_ref = stats.ttest_rel(face, house, axis=0).statistic
+    np.testing.assert_allclose(vol[..., 0], (face - house).mean(0), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(vol[..., 1], t_ref, rtol=1e-4, atol=1e-5)
+    # -brick is the default for both sets; -brickB overrides it for B only.
+    out2 = tmp_path / "pr2.nii.gz"
+    main(["-setA", *map(str, paths), "-setB", *map(str, paths), "-brick", "face#0_Coef",
+          "-brickB", "house#0_Coef", "-paired", "-prefix", str(out2), "-device", "cpu",
+          "-verb", "0"])  # fmt: skip
+    np.testing.assert_allclose(nib.load(out2).get_fdata(), vol, rtol=1e-6, atol=1e-6)
+
+
+def test_mema_brickA_brickB_find_each_conditions_own_t(tmp_path):
+    paths, _, _ = _write_two_conditions(tmp_path, n=3)
+    _, _, ga = parse_set([str(p) for p in paths], "SetA", None, True, "face#0_Coef")
+    _, _, gb = parse_set([str(p) for p in paths], "SetB", None, True, "house#0_Coef")
+    # Each condition's own t (bricks 1 and 3), not the bucket's first t.
+    assert ga[0] == [f"{paths[0]}[face#0_Coef]", f"{paths[0]}[1]"]
+    assert gb[0] == [f"{paths[0]}[house#0_Coef]", f"{paths[0]}[3]"]
+
+
+def test_same_bricks_in_both_sets_are_refused(tmp_path, capsys):
+    paths, _, _ = _write_two_conditions(tmp_path, n=4)
+    with pytest.raises(SystemExit):
+        main(["-setA", *map(str, paths), "-setB", *map(str, paths), "-brick", "face#0_Coef",
+              "-paired", "-prefix", str(tmp_path / "x"), "-device", "cpu"])  # fmt: skip
+    assert "-brickA / -brickB" in capsys.readouterr().err
+
+
 def _write_buckets(tmp_path, n=6, labels=("vis#0_Coef", "vis#0_Tstat"), tstat_aux=True):
     rng = np.random.default_rng(2)
     paths = []

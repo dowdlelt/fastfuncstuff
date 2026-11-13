@@ -63,7 +63,19 @@ def build_parser() -> FfsArgumentParser:
         metavar="SEL",
         help="Sub-brick to read from every dataset that has no [..] of its own: an "
         "index or a label, e.g. -brick 'vis#0_Coef'.  Saves quoting a selector on "
-        "every file of a glob.",
+        "every file of a glob.  Both sets use it unless -brickA / -brickB say otherwise.",
+    )
+    inp.add_argument(
+        "-brickA",
+        metavar="SEL",
+        help="As -brick, for set A only (overrides -brick there).  For a paired test "
+        "of two conditions in the same buckets: -setA sub*.nii.gz -setB "
+        "sub*.nii.gz -brickA 'face#0_Coef' -brickB 'house#0_Coef' -paired.",
+    )
+    inp.add_argument(
+        "-brickB",
+        metavar="SEL",
+        help="As -brick, for set B only (overrides -brick there).",
     )
     inp.add_argument(
         "-mask",
@@ -488,12 +500,22 @@ def run(args) -> None:
         raise ValueError("-etac_pthr needs -etac")
     if not (args.etac or args.clustsim) and args.etac_blur is not None:
         raise ValueError("-etac_blur needs -etac or -clustsim")
-    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, mema, args.brick)
+    if args.brickB is not None and not args.setB:
+        raise ValueError("-brickB needs -setB")
+    brick_a = args.brick if args.brickA is None else args.brickA
+    brick_b = args.brick if args.brickB is None else args.brickB
+    la, subj_a, dsets_a = parse_set(args.setA, "SetA", args.labelA, mema, brick_a)
     lb, subj_b, dsets_b = (None, [], [])
     if args.setB:
-        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB, mema, args.brick)
+        lb, subj_b, dsets_b = parse_set(args.setB, "SetB", args.labelB, mema, brick_b)
         if lb == la:
             raise ValueError(f"both sets are labelled {la!r}")
+        if dsets_a == dsets_b:
+            # The same files with no per-set brick: A-B would be zero everywhere.
+            raise ValueError(
+                "-setA and -setB read the same sub-bricks; give each its own with "
+                "-brickA / -brickB (or [..] selectors)"
+            )
 
     device = setup_device(args.device)
     # vols[s][j]: subject s, dataset j (j=0 the map/beta, j=1 MEMA's t).
