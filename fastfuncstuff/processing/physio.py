@@ -31,6 +31,8 @@ import numpy as np
 import torch
 from scipy import signal
 
+from fastfuncstuff import policy_linalg as plinalg
+
 from ..glm.core import construct_polynomial_matrix
 
 CARDIAC_BAND = (0.6, 2.0)  # Hz: 36-120 bpm
@@ -142,7 +144,7 @@ def excitation_traces(
         mask = mean_img > thr
     deg = _drift_degree(nt, tr)
     L = construct_polynomial_matrix(nt, deg, device=device)
-    proj = L @ torch.linalg.pinv(L)  # (nt, nt) projector onto the drift space
+    proj = L @ plinalg.pinv(L)  # (nt, nt) projector onto the drift space
     per_slice_m = np.zeros((nt, nz))
     per_slice_p = np.zeros((nt, nz))
     count_m = np.zeros(nz)
