@@ -4334,3 +4334,50 @@ def test_qc_folder_wired_into_nordic():
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
     s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root="/bids")
     assert '-qc qc -qc_label "stage00.nordic.${FRAG[$k]}${esfx}"' in s
+
+
+def _section(script: str, start: str, end: str = "\n# =====") -> str:
+    tail = script.split(start, 1)[1]
+    return tail.split(end, 1)[0]
+
+
+@pytest.mark.parametrize("nordic", [False, True])
+def test_physio_stage_cleans_the_series_everything_downstream_reads(tmp_path, nordic):
+    """-physio must sit between the source and every consumer of it: the stage reads
+    the NORDIC output (noise already trimmed) or the BIDS magnitude with -drop_last
+    NOISE, and moco and the final resample read its cleaned output -- or the
+    regression happened for nothing."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(
+        build_plan(subj, Options(physio=True, want_nordic=nordic)), "wd", bids_root=str(tmp_path)
+    )
+    stage = _section(s, "stage00: physio ====")
+    assert "ffs_physio" in stage and '-clean "$outf"' in stage
+    assert 'outf="stage00.physio.${FRAG[$k]}.nii$FMT"' in stage
+    if nordic:
+        assert 'mag="stage00.nordic.${FRAG[$k]}${E1[$k]:-}.nii$FMT"; drop=0' in stage
+    else:
+        assert 'mag="${MAG[$k]}"; drop="${NOISE[$k]}"' in stage
+    assert s.index("stage00: physio ====") > s.index("stage00: NORDIC") if nordic else True
+    cleaned = 'raw="stage00.physio.${FRAG[$k]}.nii$FMT"'
+    assert cleaned in _section(s, "stage02: moco")
+    assert cleaned in s.split("stage10", 1)[1]
+    assert "skip_physio=1" in s
+    assert "ffs_physio" in s.split("for t in", 1)[1].split("\n", 1)[0]  # preflight checks it
+
+
+def test_without_physio_nothing_reads_a_physio_output(tmp_path):
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root=str(tmp_path))
+    assert "stage00.physio" not in s and "ffs_physio" not in s  # not even in the preflight
+
+
+def test_physio_refuses_3d_and_warns_without_phase(tmp_path):
+    from fastfuncstuff.cli.autoproc import _physio_errors
+
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    warnings: list[str] = []
+    assert _physio_errors(Options(physio=True), subj, warnings) == []
+    assert warnings and "no phase" in warnings[0]
+    assert _physio_errors(Options(physio=True, acq_3d=True), subj, [])
+    assert _physio_errors(Options(), subj, []) == []

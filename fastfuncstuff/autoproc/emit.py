@@ -1327,7 +1327,7 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   recipe            : {opt.recipe or "(none)"}
 #   reference session : {plan.ref_session}
 #   sessions          : {"multi" if plan.multi_session else "single"}
-#   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {
+#   NORDIC : {opt.want_nordic}   physio : {opt.physio}   locomoco : {opt.locomoco}   distortion : {
         opt.distortion
     }   slice-timing : {opt.slicetiming_method}
 #   phase  : {_phase_on(plan)}   MEDIC : {_medic_on(plan)}{_timing_header_note(plan)}{
@@ -1385,7 +1385,7 @@ trap _ffs_toc EXIT
 
 # ---- coarse per-stage re-run toggles (1 = skip stage output if it exists) ---
 # The batched moco + final stages pass their toggle to the tool as -batch_skip.
-skip_nordic=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
+skip_nordic=1 skip_physio=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
 skip_xfmap=1  skip_xrun=1 skip_runmean=1 skip_xses=1 skip_anat=1
 skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
 """
@@ -1605,6 +1605,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         if on
     ]
     tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
+    if opt.physio:
+        tools = [*tools, "ffs_physio"]
     if _phase_on(plan):
         tools = [*tools, "ffs_phase_unwrap"]
         if opt.phase_drift:
@@ -1634,7 +1636,21 @@ echo '   ok'
 """
 
 
+def _physio_out() -> str:
+    """The physio-cleaned magnitude: what everything downstream reads with -physio."""
+    return "stage00.physio.${FRAG[$k]}.nii$FMT"
+
+
 def _pre_stc_source(plan: Plan, indent: str = "  ") -> str:
+    """Bash setting ``raw`` to the series slice timing / moco / the final resample
+    start from: the physio-cleaned magnitude when -physio is on (noise volumes
+    already gone), else :func:`_pre_physio_source`."""
+    if plan.options.physio:
+        return f'{indent}raw="{_physio_out()}"'
+    return _pre_physio_source(plan, indent)
+
+
+def _pre_physio_source(plan: Plan, indent: str = "  ") -> str:
     """Bash setting ``raw`` to the series BEFORE any up-front slice timing — the
     NORDIC output, or the original BIDS magnitude read in place with an inline
     noise-vol sub-brick selector (no whole-dataset copy)."""
@@ -1798,6 +1814,55 @@ def _numcomps_final(frag: str) -> str:
 
 def _task_dofloss(task: str) -> str:
     return f"stage11.dofloss.task-{task}.nii$FMT"
+
+
+def _stage_physio(plan: Plan) -> str:
+    """stage00 physio: cardiac/respiratory regressors from the data, regressed out of
+    each voxel on the raw slices (ffs_physio -clean), as afni_proc's ricor block does
+    with recorded physio. Reads the NORDIC magnitude when NORDIC ran (noise volumes
+    already trimmed), else the BIDS magnitude with -drop_last NOISE; the raw phase,
+    when the run has one, gives the respiratory trace."""
+    opt = plan.options
+    if not opt.physio:
+        return ""
+    if opt.want_nordic:
+        src = f'  mag="{_nordic_mag(plan)}"; drop=0'
+    else:
+        src = '  mag="${MAG[$k]}"; drop="${NOISE[$k]}"'
+    cmd = _ffs(
+        "ffs_physio",
+        [
+            '-input "$mag"',
+            '"${phase_arg[@]}"',
+            f"-tpattern {_tpattern(plan)}",
+            '-TR "${TR[$k]}"',
+            '-drop_last "$drop"',
+            '-prefix "stage00.physio.${FRAG[$k]}.regs"',
+            '-clean "$outf"',
+            '-device "$DEVICE"',
+        ],
+    )
+    return f"""
+# ============================ stage00: physio ===============================
+# Cardiac (from magnitude) and respiratory (from phase) regressors estimated from
+# the data itself: every multiband excitation is one sample, so the run read in
+# acquisition order is a trace at excitations/TR -- fast enough for the heartbeat
+# the volume rate aliases. 13 regressors per slice (RVT x5, RETROICOR card/resp
+# x4 each) at each slice's own acquisition time, regressed out of each voxel with
+# drift, mean and drift kept. Side files: .regs.slibase.1D (afni_proc
+# -ricor_regs layout), .regs.rates.tsv, .regs.qc.png (spectrogram + tracked
+# rates), .regs.json; _physio_removed = variance taken per voxel. The regression
+# spends 13 dof per voxel that the GLM does not charge. Validated against belt +
+# pulse RETROICOR on TASKFORCE (wiki: Physiological noise from the data).
+echo '== stage00: physio =='
+for k in "${{RUN_KEYS[@]}}"; do
+  outf="{_physio_out()}"
+  [ "$skip_physio" -eq 1 ] && [ -f "$outf" ] && continue
+{src}
+  if [ -n "${{PHASE[$k]:-}}" ]; then phase_arg=(-phase "${{PHASE[$k]}}"); else phase_arg=(); fi
+{cmd}
+done
+"""
 
 
 def _stage_nordic(plan: Plan) -> str:
@@ -6224,6 +6289,7 @@ def _pipeline_body(plan: Plan, bids_root: str | None, script_stem: str, header: 
         _preflight(plan, bids_root),
         _qc_helper(plan, script_stem),
         _stage_nordic(plan),
+        _stage_physio(plan),
         _stage_unwrap(plan),
         _stage_tshift(plan),
         _stage_medic(plan),

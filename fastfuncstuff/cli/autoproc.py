@@ -473,6 +473,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run NORDIC (needs phase)",
     )
+    g.add_argument(
+        "-physio",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Data-derived physiological noise regression (ffs_physio -clean) on the "
+        "raw slices, before slice timing and moco: cardiac from magnitude, respiration "
+        "from phase (when the runs have it), sampled once per multiband excitation. "
+        "Single-echo 2-D runs only. Costs 13 dof per voxel that the GLM does not "
+        "charge, as afni_proc's ricor block does.",
+    )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
     g.add_argument(
         "-cut_task_vols",
@@ -1559,6 +1570,28 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
     return errs
 
 
+def _physio_errors(opt, subject, warnings: list[str]) -> list[str]:
+    """-physio reads one physiological sample per multiband excitation of a 2-D,
+    single-echo run; refuse what that does not describe, warn where phase is missing."""
+    if not opt.physio:
+        return []
+    errors: list[str] = []
+    runs = [r for s in subject.sessions for r in s.bold_runs]
+    if opt.acq_3d:
+        errors.append(
+            "-physio needs 2-D (slice-by-slice) EPI; a 3-D acquisition has no excitation-rate samples."
+        )
+    if any(r.is_multiecho for r in runs):
+        errors.append("-physio: multi-echo runs are not supported yet (single-echo only).")
+    no_phase = [f"{r.session or '-'}/{r.task}/{r.run or '-'}" for r in runs if r.phase_path is None]
+    if no_phase:
+        warnings.append(
+            "-physio: no phase for " + ", ".join(no_phase) + " -- respiration is read from "
+            "magnitude there, which was unreliable on task runs."
+        )
+    return errors
+
+
 def _medic_errors(opt: Options, subject) -> list[str]:
     """-medic needs, for every run, what the frame-wise field and its warp are made of:
     multi-echo phase, the readout time and the PE direction. Nothing is guessed."""
@@ -1856,6 +1889,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "sidecar. Pass -TR SECONDS (volume TR) or -slicetiming_method none."
             )
     errors += _multiecho_errors(opt, subject)
+    errors += _physio_errors(opt, subject, warnings)
     errors += _medic_errors(opt, subject)
     errors += _locomoco_phase_errors(opt, subject)
     errors += _phasereg_me_errors(opt)
@@ -3055,6 +3089,7 @@ def main(argv: list[str] | None = None) -> int:
     opt = Options(
         recipe=args.recipe,
         want_nordic=eff(args.want_nordic, "want_nordic"),
+        physio=eff(args.physio, "physio"),
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
         medic=args.medic,
