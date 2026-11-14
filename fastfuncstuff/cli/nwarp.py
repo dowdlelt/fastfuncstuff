@@ -515,6 +515,32 @@ Examples:
         "a static 3dTshift-then-motion two-step.",
     )
 
+    st_group.add_argument(
+        "-slice_pose",
+        dest="slice_pose",
+        action="store_true",
+        default=True,
+        help="(default, with -tfollow) Locate every tissue sample with the pose the "
+        "head had when ITS slice was acquired, read off the per-volume motion "
+        "matrices by interpolation. The head moves while a volume is acquired; one "
+        "pose per volume misplaces every slice but one.",
+    )
+    st_group.add_argument(
+        "-volume_pose",
+        dest="slice_pose",
+        action="store_false",
+        help="One pose per volume for every slice (the behaviour before 2026-11).",
+    )
+    st_group.add_argument(
+        "-pose_time",
+        type=float,
+        default=None,
+        help="Time within the TR (seconds) that the per-volume motion matrices "
+        "describe. Default: the mean slice time, which is what a rigid fit to a raw "
+        "(not slice-timed) volume gives. If motion was estimated on slice-timed "
+        "data, pass the -tzero it was slice-timed to.",
+    )
+
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
         hw_group,
@@ -794,6 +820,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         tzero=args.tzero,
         tinterp=args.tinterp,
         follow_tissue=args.follow_tissue,
+        slice_pose=args.slice_pose,
+        pose_time=args.pose_time,
         jac_axis=jac_axis,
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=verb >= 1),
@@ -879,6 +907,7 @@ def _dispatch_roi(
         interp=args.interp, device=device, time_range=time_range, debug=args.debug,
         no_neg=args.no_neg, ainterp=ainterp, slice_times=slice_times, tr=tr,
         tzero=args.tzero, tinterp=args.tinterp, follow_tissue=args.follow_tissue,
+        slice_pose=args.slice_pose, pose_time=args.pose_time,
         jac_axis=jac_axis, jac_match=jac_match, verb=args.verb,
         progress=lambda message: spinner(message, enabled=args.verb >= 1),
         chain_base=args.chain_base,
@@ -980,6 +1009,8 @@ def _dispatch_surface(
         tzero=args.tzero,
         tinterp=args.tinterp,
         follow_tissue=args.follow_tissue,
+        slice_pose=args.slice_pose,
+        pose_time=args.pose_time,
         jac_axis=jac_axis,
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=args.verb >= 1),

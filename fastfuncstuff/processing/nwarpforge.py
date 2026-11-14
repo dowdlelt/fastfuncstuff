@@ -1970,6 +1970,8 @@ def nwarpforge(
     tzero: float | None = None,
     tinterp: str = "heptic",
     follow_tissue: bool = True,
+    slice_pose: bool = True,
+    pose_time: float | None = None,
     jac_axis: int | None = None,
     jac_match: str | None = None,
     progress: Callable[[str], AbstractContextManager[None]] | None = None,
@@ -2062,6 +2064,13 @@ def nwarpforge(
         jac_match: Substring/filename selecting which -nwarp entry is the fieldmap for
             ``jac_axis`` (see :func:`match_nwarp_spec`). Required to modulate correctly
             through a multi-transform chain.
+        slice_pose: With ``follow_tissue``, locate each tissue sample with the pose
+            the head had when its slice was acquired, read off the per-volume poses
+            by interpolation (spacetime.py:TissueFollowingSampler). False uses one
+            pose per volume.
+        pose_time: Time within the TR (seconds) the per-volume poses describe.
+            Defaults to the mean of ``slice_times``, which is what a rigid fit to a
+            raw (not slice-timed) volume returns.
         follow_tissue: On the joint slice-timing path, sample each temporal
             neighbour at *its own* pose (tissue-following, the default) instead of
             freezing the output frame's pose (the slow-motion assumption). Recovers
@@ -2635,6 +2644,11 @@ def nwarpforge(
             no_neg=st_channel_no_neg,
             n_out=t_end - t_start,
             verb=verb,
+            pose_time=(
+                (pose_time if pose_time is not None else float(slice_times_t.mean()))
+                if slice_pose
+                else None
+            ),
         )
 
     # Jacobian intensity modulation (-jac): multiply the warped magnitude by

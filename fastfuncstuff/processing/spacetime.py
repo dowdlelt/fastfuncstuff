@@ -291,6 +291,18 @@ class TissueFollowingSampler:
 
     with ``sz_f`` the scanner slice of ``T_f(u)``.
 
+    Slice pose (``pose_time``). The head moves *during* a volume -- measured on
+    multiband data, see the wiki note *Within-volume motion* -- so one pose per
+    volume puts every slice but one in the wrong place. With ``pose_time`` set,
+    the tissue at ``u`` is located in frame ``f`` with the pose the head had when
+    the slice it sits in was acquired: the per-volume poses describe time
+    ``f*TR + pose_time``, and the coordinates move from there at the head's rate of
+    motion through frame ``f`` for ``(Delta(sz) - pose_time) / TR`` volumes. The
+    rate is a slope-limited central difference of the neighbouring poses, so a
+    still volume beside an abrupt move is left still. ``sz`` depends on that pose, so the two are
+    solved together by a short fixed-point iteration. Every tap is then the right
+    tissue, at the place and the time it was actually imaged.
+
     Non-uniform taps (the bookkeeping that makes this correct).
         Following the tissue buys the right anatomy but costs the *uniform time
         grid*: ``Delta`` is read at a different scanner slice each frame, so the
@@ -351,6 +363,7 @@ class TissueFollowingSampler:
         no_neg: bool | Sequence[bool] = False,
         n_out: int | None = None,
         verb: int = 0,
+        pose_time: float | None = None,
     ) -> None:
         # ``source`` may be several co-registered channels (e.g. real/imag of complex
         # phase data): the pose and temporal weights are shared, so we warp each
@@ -371,6 +384,7 @@ class TissueFollowingSampler:
         self.interp = interp
         self.nt = self.sources[0].shape[0]
         self.half = _KERNEL_HALFWIDTH[tinterp]
+        self.pose_time = pose_time
 
         onz, ony, onx = output_shape
         self.kk, self.jj, self.ii = torch.meshgrid(
@@ -381,9 +395,11 @@ class TissueFollowingSampler:
         )
         self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
         self._valid: dict[int, Tensor] = {}
+        self._valid_volume: dict[int, Tensor] = {}
         self._delta: dict[int, Tensor] = {}
         self._srcs: dict[int, tuple[Tensor, ...]] = {}
         self._warped: dict[int, list[Tensor]] = {}
+        self._slice_coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
 
         # Decide whether the window's source frames fit alongside the coordinate
         # cache and the transient warp-composition workspace. Completed output
@@ -428,9 +444,11 @@ class TissueFollowingSampler:
             if fc not in fcs:
                 del self._coords[fc]
                 self._valid.pop(fc, None)
+                self._valid_volume.pop(fc, None)
                 self._delta.pop(fc, None)
                 self._srcs.pop(fc, None)
                 self._warped.pop(fc, None)
+                self._slice_coords.pop(fc, None)
         for fc in fcs:
             if fc not in self._coords:
                 self._coords[fc] = self.coords_fn(fc)
@@ -439,17 +457,70 @@ class TissueFollowingSampler:
                         src[fc].to(self.device, dtype=torch.float32) for src in self.sources
                     )
 
-    def _inside(self, f: int) -> Tensor:
+    def _where(self, f: int) -> tuple[Tensor, Tensor, Tensor]:
+        """Source coordinates of the tissue at every output voxel, as frame ``f`` imaged it.
+
+        With ``pose_time`` unset this is the volume's own pose. With it set, each
+        voxel uses the pose at the acquisition time of the slice it lands in (see
+        the class docstring); the neighbouring frames' coordinates must already be
+        composed.
+        """
+        fc = self._clamp(f)
+        here = self._coords[fc]
+        if self.pose_time is None:
+            return here
+        found = self._slice_coords.get(fc)
+        if found is None:
+            prev = self._coords[self._clamp(fc - 1)]
+            nxt = self._coords[self._clamp(fc + 1)]
+            # The head's rate of motion through this frame, per coordinate. A
+            # monotonized-central limiter: the central difference where the motion
+            # before and after agree (smooth drift, breathing), shrinking to zero
+            # where they disagree -- beside an abrupt move one side is still, and
+            # extrapolating the jump into a still volume would misplace half its
+            # slices.
+            rate = []
+            for h, n, p in zip(here, nxt, prev, strict=True):
+                back, fwd = h - p, n - h
+                same = (back * fwd) > 0
+                mag = torch.minimum(
+                    torch.minimum(2 * back.abs(), 2 * fwd.abs()), (0.5 * (back + fwd)).abs()
+                )
+                rate.append(torch.where(same, mag * torch.sign(fwd), torch.zeros_like(h)))
+            sx, sy, sz = here
+            # Delta is piecewise linear in sz and a fraction of a volume moves the
+            # head a fraction of a voxel, so three passes settle well below 1e-3 vox.
+            for _ in range(3):
+                frac = (interp_slice_times(sz, self.slice_times) - self.pose_time) / self.tr
+                sx, sy, sz = (h + frac * r for h, r in zip(here, rate, strict=True))
+            # A slice pose may move an edge sample a fraction of a voxel past the
+            # volume where the volume pose had it inside. Hold it on the edge there,
+            # as the plain resample does, so slice timing never loses coverage.
+            nz, ny, nx = self.sources[0].shape[-3:]
+            inside = self._inside(fc, volume_pose=True) > 0
+            sx, sy, sz = (
+                torch.where(inside, c.clamp(-0.5, n - 0.5), c)
+                for c, n in ((sx, nx), (sy, ny), (sz, nz))
+            )
+            found = (sx, sy, sz)
+            self._slice_coords[fc] = found
+        return found
+
+    def _inside(self, f: int, volume_pose: bool = False) -> Tensor:
         """Where frame ``f``'s own pose samples inside the source volume (float 0/1).
 
         A tap that lands outside reads the zero padding, which is not data: weighted
         in, it dims the edge of the magnitude and drags a directly interpolated phase
         toward 0 (or past its true value, under a kernel's negative lobes).
+        ``volume_pose`` tests the volume's single pose instead of the slice poses:
+        the output's coverage is decided that way, so that slice timing covers
+        exactly the voxels the plain resample does.
         """
         fc = self._clamp(f)
-        found = self._valid.get(fc)
+        cache = self._valid_volume if volume_pose else self._valid
+        found = cache.get(fc)
         if found is None:
-            sx, sy, sz = self._coords[fc]
+            sx, sy, sz = self._coords[fc] if volume_pose else self._where(fc)
             nz, ny, nx = self.sources[0].shape[-3:]
             # The resampler's own coverage: a sample within half a voxel of the edge
             # reads the (clamped) edge voxel, beyond that the zero padding.  The same
@@ -462,7 +533,7 @@ class TissueFollowingSampler:
                 & (sz >= -0.5)
                 & (sz <= nz - 0.5)
             ).to(sx.dtype)
-            self._valid[fc] = found
+            cache[fc] = found
         return found
 
     def _delta_of(self, f: int) -> Tensor:
@@ -475,7 +546,7 @@ class TissueFollowingSampler:
         fc = self._clamp(f)
         found = self._delta.get(fc)
         if found is None:
-            found = interp_slice_times(self._coords[fc][2], self.slice_times)
+            found = interp_slice_times(self._where(fc)[2], self.slice_times)
             self._delta[fc] = found
         return found
 
@@ -485,7 +556,7 @@ class TissueFollowingSampler:
         fc = self._clamp(f)  # edge-extend pose + data past the series ends
         if fc in self._warped:
             return self._warped[fc]
-        sx, sy, sz = self._coords[fc]
+        sx, sy, sz = self._where(fc)
         frames = (
             self._srcs[fc]
             if self.cache_source
@@ -512,7 +583,9 @@ class TissueFollowingSampler:
         # of half-width H reaches at most H+1 frames each side of j.
         f_lo, f_hi = frame_idx - (self.half + 1), frame_idx + (self.half + 1)
         frames = list(range(f_lo, f_hi + 1))
-        self._ensure({self._clamp(f) for f in frames})
+        # The slice pose of a tap reads its neighbours' poses: compose one more each side.
+        reach = 1 if self.pose_time is not None else 0
+        self._ensure({self._clamp(f) for f in range(f_lo - reach, f_hi + reach + 1)})
 
         # Per-tap acquisition offset, and the nominal (uniform) grid: the output
         # frame's own offset, which is exactly the frozen path's time grid.
@@ -573,7 +646,7 @@ class TissueFollowingSampler:
                 del cache[stale]
 
         # Covered where the output frame's own pose is, as on the frozen path.
-        own = self._inside(frame_idx)
+        own = self._inside(frame_idx, volume_pose=True)
         outs = [
             (acc / wsum.clamp_min(1e-8)).clamp_min(0.0) * own
             if self.no_neg_ch[c]

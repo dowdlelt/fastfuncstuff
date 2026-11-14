@@ -530,3 +530,91 @@ def test_taps_outside_the_volume_drop_out_instead_of_reading_zero():
     assert own.any() and (~own).any()
     np.testing.assert_allclose(got[own].numpy(), 0.7, atol=1e-5)
     assert float(got[~own].abs().max()) == 0.0
+
+
+def _physical_case(st, tzero, pose, modes, nf=48, shape=(8, 8, 24), interp="wsinc5"):
+    """nRMSE of ffs_nwarp against analytic truth when the head moves DURING a volume.
+
+    ``pose(t)`` is the through-plane position (slices) at continuous time ``t`` (TR
+    units). Slice ``k`` of volume ``f`` is acquired at ``f + st[k]`` and images the
+    tissue that was under it *at that moment* -- not at a pose frozen for the whole
+    volume, which is what the older tests in this file build, and which cannot
+    happen in a gapless acquisition. The matrices handed to ffs_nwarp are the true
+    pose at the mean slice time: a perfect per-volume fit. ``modes`` maps a name to
+    the extra flags for that run.
+    """
+    from fastfuncstuff.cli.nwarp import main as nwarp_main
+
+    nz = shape[2]
+
+    def sig(z, t):
+        z = np.asarray(z, dtype=float)
+        return (1.0 + 0.3 * np.cos(z / 3.0)) * (1.0 + 0.3 * np.sin(2 * np.pi * t / 12.0 + 0.2 * z))
+
+    acq = np.zeros((*shape, nf), np.float32)
+    ideal = np.zeros((*shape, nf), np.float32)
+    for f in range(nf):
+        for k in range(nz):
+            t = f + st[k]
+            acq[:, :, k, f] = sig(k - pose(t), t)
+            ideal[:, :, k, f] = sig(k, f + tzero)
+
+    work = tempfile.mkdtemp()
+    src, mp, stp = (os.path.join(work, n) for n in ("acq.nii.gz", "m.1D", "st.1D"))
+    nib.save(nib.Nifti1Image(acq, np.eye(4)), src)
+    with open(mp, "w") as fh:
+        for f in range(nf):
+            M = np.eye(4)
+            M[2, 3] = pose(f + float(np.mean(st)))
+            fh.write(" ".join(f"{v:.8f}" for v in M[:3, :].reshape(-1)) + "\n")
+    np.savetxt(stp, st)
+    err = {}
+    for name, flags in modes.items():
+        p = os.path.join(work, f"{name}.nii.gz")
+        nwarp_main(
+            ["-source", src, "-nwarp", mp, "-tpattern", stp, "-TR", "1.0", "-tzero", str(tzero),
+             "-interp", interp, "-master", src, "-device", "cpu", "-verb", "0", "-prefix", p, *flags]
+        )  # fmt: skip
+        out = np.asarray(nib.load(p).dataobj).astype(np.float32)
+        sl = (slice(None), slice(None), slice(6, nz - 6), slice(8, nf - 8))
+        err[name] = float(np.sqrt(((out[sl] - ideal[sl]) ** 2).mean()) / ideal[sl].std())
+    return err
+
+
+_POSES = {"slice": ["-tfollow"], "volume": ["-tfollow", "-volume_pose"]}
+
+
+@pytest.mark.parametrize("tzero", [None, 0.0])
+def test_slice_pose_corrects_motion_within_a_volume(tzero):
+    """The head drifts while each volume is acquired (measured on real multiband
+    data: late-minus-early pose is ~0.6-0.75 of the between-volume velocity). One
+    pose per volume then misplaces every slice but the one at the pose's own time.
+    Reading each slice's pose at its own acquisition time removes that, and does
+    not care where -tzero sits relative to the time the poses describe.
+    Measured: slice pose 0.0003, volume pose 0.008.
+    """
+    st = np.arange(24) / 24
+    tz = float(st.mean()) if tzero is None else tzero
+    pose = lambda t: 1.5 * np.sin(2 * np.pi * np.asarray(t) / 40.0)  # noqa: E731
+    err = _physical_case(st, tz, pose, _POSES)
+    assert err["slice"] < 0.002, err
+    assert err["slice"] < 0.2 * err["volume"], err
+
+
+def test_slice_pose_leaves_volumes_beside_an_abrupt_move_alone():
+    """Quick jumps are common and large. The head's rate of motion is slope-limited,
+    so a still volume next to a jump keeps its own pose rather than having half the
+    jump extrapolated into it -- which an unlimited interpolation did, measured
+    1.7x worse than one pose per volume around the move in the 3-D simulation.
+    """
+    st = np.arange(24) / 24
+    pose = lambda t: 2.0 / (1 + np.exp(-(np.asarray(t) - 24.4) / 0.04))  # noqa: E731
+    err = _physical_case(st, float(st.mean()), pose, _POSES)
+    assert err["slice"] <= 1.05 * err["volume"], err
+
+
+def test_slice_pose_is_a_no_op_without_motion():
+    """No motion: every slice pose equals the volume pose, bit for bit in effect."""
+    st = _interleaved_slice_times(24, 1.0)
+    err = _physical_case(st, float(st.mean()), lambda t: 0.0 * np.asarray(t), _POSES)
+    assert abs(err["slice"] - err["volume"]) < 1e-6, err
