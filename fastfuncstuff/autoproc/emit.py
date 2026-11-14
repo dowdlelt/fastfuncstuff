@@ -1637,20 +1637,11 @@ echo '   ok'
 
 
 def _physio_out() -> str:
-    """The physio-cleaned magnitude: what everything downstream reads with -physio."""
-    return "stage00.physio.${FRAG[$k]}.nii$FMT"
+    """The per-run GLM nuisance stage00 physio writes (glob'd by -glm_ortvec physio)."""
+    return "stage00.physio.${FRAG[$k]}.regs.nuisance.1D"
 
 
 def _pre_stc_source(plan: Plan, indent: str = "  ") -> str:
-    """Bash setting ``raw`` to the series slice timing / moco / the final resample
-    start from: the physio-cleaned magnitude when -physio is on (noise volumes
-    already gone), else :func:`_pre_physio_source`."""
-    if plan.options.physio:
-        return f'{indent}raw="{_physio_out()}"'
-    return _pre_physio_source(plan, indent)
-
-
-def _pre_physio_source(plan: Plan, indent: str = "  ") -> str:
     """Bash setting ``raw`` to the series BEFORE any up-front slice timing — the
     NORDIC output, or the original BIDS magnitude read in place with an inline
     noise-vol sub-brick selector (no whole-dataset copy)."""
@@ -1817,11 +1808,15 @@ def _task_dofloss(task: str) -> str:
 
 
 def _stage_physio(plan: Plan) -> str:
-    """stage00 physio: cardiac/respiratory regressors from the data, regressed out of
-    each voxel on the raw slices (ffs_physio -clean), as afni_proc's ricor block does
-    with recorded physio. Reads the NORDIC magnitude when NORDIC ran (noise volumes
-    already trimmed), else the BIDS magnitude with -drop_last NOISE; the raw phase,
-    when the run has one, gives the respiratory trace."""
+    """stage00 physio: cardiac/respiratory models from the raw slices (ffs_physio), and
+    from them RVT + respiratory regressors at tzero for the GLM (-glm_ortvec physio).
+
+    Nothing is regressed out of the series: done before motion correction and slice
+    timing (afni_proc's ricor order) the terms fit breathing-locked apparent motion
+    that those steps remove anyway, and held-out R2 FELL; as a nuisance on the
+    resampled data it rose. Reads the NORDIC magnitude when NORDIC ran (noise volumes
+    trimmed), else the BIDS magnitude with -drop_last NOISE; the raw phase, when the
+    run has one, gives the respiratory trace."""
     opt = plan.options
     if not opt.physio:
         return ""
@@ -1838,22 +1833,24 @@ def _stage_physio(plan: Plan) -> str:
             '-TR "${TR[$k]}"',
             '-drop_last "$drop"',
             '-prefix "stage00.physio.${FRAG[$k]}.regs"',
-            '-clean "$outf"',
+            f"-tzero {opt.tzero:g}",
             '-device "$DEVICE"',
         ],
     )
     return f"""
 # ============================ stage00: physio ===============================
-# Cardiac (from magnitude) and respiratory (from phase) regressors estimated from
-# the data itself: every multiband excitation is one sample, so the run read in
-# acquisition order is a trace at excitations/TR -- fast enough for the heartbeat
-# the volume rate aliases. 13 regressors per slice (RVT x5, RETROICOR card/resp
-# x4 each) at each slice's own acquisition time, regressed out of each voxel with
-# drift, mean and drift kept. Side files: .regs.slibase.1D (afni_proc
-# -ricor_regs layout), .regs.rates.tsv, .regs.qc.png (spectrogram + tracked
-# rates), .regs.json; _physio_removed = variance taken per voxel. The regression
-# spends 13 dof per voxel that the GLM does not charge. Validated against belt +
-# pulse RETROICOR on TASKFORCE (wiki: Physiological noise from the data).
+# Cardiac (from magnitude) and respiratory (from phase) models estimated from the
+# data itself: every multiband excitation is one sample, so the run read in
+# acquisition order is a trace at excitations/TR. The GLM gets RVT (5 lags) +
+# respiratory RETROICOR evaluated at tzero (.regs.nuisance.1D, -glm_ortvec physio)
+# -- the instant every voxel stands for after the slice-timed final resample.
+# Nothing is regressed out here: on raw slices the terms fit breathing-locked
+# apparent motion that moco and slice timing remove anyway, and doing so lowered
+# held-out R2 on ImaginationStimulation; as a nuisance after the resample it rose.
+# Cardiac is in .regs.slibase.1D (per slice, afni_proc -ricor_regs layout) but not
+# in the GLM: aliased at the volume rate. Also .regs.qc.png (spectrogram + tracked
+# rates), .regs.rates.tsv, .regs.json. Validated against belt + pulse RETROICOR on
+# TASKFORCE (wiki: Physiological noise from the data).
 echo '== stage00: physio =='
 for k in "${{RUN_KEYS[@]}}"; do
   outf="{_physio_out()}"

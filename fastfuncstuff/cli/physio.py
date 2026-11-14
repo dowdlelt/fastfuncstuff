@@ -82,11 +82,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Trace to read respiration from. auto = phase when given, else magnitude.",
     )
     parser.add_argument(
+        "-tzero",
+        type=float,
+        default=None,
+        help="Also write PREFIX.nuisance.1D: RVT + respiratory terms evaluated at "
+        "f*TR + TZERO, the instant every voxel stands for after a slice-timing-corrected "
+        "resample. Give the -tzero the final resample used. Use it as a per-run GLM "
+        "nuisance (like motion) on the RESAMPLED data -- the placement that raised "
+        "held-out R2 on ImaginationStimulation. Cardiac is left out (aliased at the "
+        "volume rate; slice timing cannot shift it correctly).",
+    )
+    parser.add_argument(
         "-clean",
         default=None,
         help="Also write the magnitude with each voxel's physiological fit removed "
         "(its own slice's regressors, fitted jointly with drift; mean and drift kept), "
-        "as afni_proc's ricor block does -- the series to hand to motion correction. "
+        "as afni_proc's ricor block does. CAUTION: on ImaginationStimulation this, done "
+        "before motion correction and slice timing, LOWERED held-out task R2 -- the "
+        "terms fit breathing-locked apparent motion that those steps remove anyway. "
+        "Prefer -tzero and a GLM nuisance after the resample. "
         "Writes OUT and OUT's _physio_removed map (fraction of each voxel's variance "
         "taken). Costs 13 degrees of freedom per voxel that a later GLM does not see.",
     )
@@ -255,6 +269,18 @@ def main(argv: list[str] | None = None) -> int:
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
+    if args.tzero is not None:
+        Xv, vlabels = physio.volume_regressors(diag, np.arange(nt) * tr + args.tzero)
+        with open(base + ".nuisance.1D", "w") as fh:
+            fh.write(f"# ffs_physio volume regressors at f*TR + {args.tzero:g} s\n")
+            fh.write('# ColumnLabels = "' + " ; ".join(vlabels) + '"\n')
+            np.savetxt(fh, Xv, fmt="%.6f")
+        summary["nuisance"] = {
+            "file": base + ".nuisance.1D",
+            "tzero": args.tzero,
+            "columns": vlabels,
+        }
+        Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if args.clean is not None:
         import torch
 

@@ -478,11 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="Data-derived physiological noise regression (ffs_physio -clean) on the "
-        "raw slices, before slice timing and moco: cardiac from magnitude, respiration "
-        "from phase (when the runs have it), sampled once per multiband excitation. "
-        "Single-echo 2-D runs only. Costs 13 dof per voxel that the GLM does not "
-        "charge, as afni_proc's ricor block does.",
+        help="Data-derived physiological regressors (ffs_physio) from the raw slices, "
+        "sampled once per multiband excitation: respiration from phase (when the runs "
+        "have it), cardiac from magnitude. RVT + respiratory terms at -tzero enter the "
+        "GLM as a per-run nuisance (-glm_ortvec physio; in the default set). Nothing is "
+        "regressed out of the series itself. Single-echo 2-D runs only.",
     )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
     g.add_argument(
@@ -1583,6 +1583,11 @@ def _physio_errors(opt, subject, warnings: list[str]) -> list[str]:
         )
     if any(r.is_multiecho for r in runs):
         errors.append("-physio: multi-echo runs are not supported yet (single-echo only).")
+    if getattr(opt, "run_glm", True) and "physio" not in opt.glm_ortvec:
+        warnings.append(
+            "-physio: the GLM nuisance list (-glm_ortvec) has no 'physio', so the regressors "
+            "are written but not used; add it, or leave -glm_ortvec at its default."
+        )
     no_phase = [f"{r.session or '-'}/{r.task}/{r.run or '-'}" for r in runs if r.phase_path is None]
     if no_phase:
         warnings.append(

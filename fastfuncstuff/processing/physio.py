@@ -426,8 +426,49 @@ def slice_regressors(
         "cardiac_prominence": cprom,
         "respiration_prominence": rprom,
         "rv": rvx,
+        # the continuous models, for regressors at other times (volume_regressors)
+        "series": {"t_card": t_c, "phi_card": phi_c, "t_resp": t_r, "phi_resp": phi_r, "rv": rv},
     }
     return np.stack(cols, 1), labels, diag
+
+
+def volume_regressors(
+    diag: dict,
+    times: np.ndarray,
+    rvt_shifts: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0),
+    order: int = 2,
+    cardiac: bool = False,
+) -> tuple[np.ndarray, list[str]]:
+    """Regressors for data that every voxel samples at the same ``times``.
+
+    After a slice-timing-corrected resample every voxel stands for the instant
+    ``f*TR + tzero``, so the physiological model is evaluated there, once, and used as
+    a GLM nuisance like the motion parameters. Measured on ImaginationStimulation:
+    respiration + RVT as nuisance after the resample raised held-out R2 (top 0.5 %:
+    33.5 -> 35.7, 87 % of voxels better), while the same terms regressed out of the
+    raw slices before motion correction LOWERED it (to 31.0) -- on raw slices they
+    mostly fit breathing-locked apparent motion, which motion correction and slice
+    timing then remove themselves, so the subtraction became structured noise.
+
+    Cardiac is off by default: at the volume rate it is aliased, and slice timing
+    cannot shift an aliased component correctly (it acts at the alias frequency).
+    Measured +0.1 there -- harmless, useless.
+    """
+    s = diag["series"]
+    cols, labels = [], []
+    for i, sh in enumerate(rvt_shifts):
+        cols.append(np.interp(times - sh, s["t_resp"], s["rv"]))
+        labels.append(f"rvt{i:02d}")
+    phr = np.interp(times, s["t_resp"], s["phi_resp"])
+    for m in range(1, order + 1):
+        cols += [np.cos(m * phr), np.sin(m * phr)]
+        labels += [f"resp.c{m}", f"resp.s{m}"]
+    if cardiac:
+        phc = np.interp(times, s["t_card"], s["phi_card"])
+        for m in range(1, order + 1):
+            cols += [np.cos(m * phc), np.sin(m * phc)]
+            labels += [f"card.c{m}", f"card.s{m}"]
+    return np.stack(cols, 1), labels
 
 
 def choose_source(

@@ -201,3 +201,26 @@ def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
     assert before > 0.5 and after < 0.1, (before, after)
     assert abs(np.polyfit(np.arange(v.size), v, 1)[0] - drift[1]) < 0.2 * drift[1]  # drift kept
     assert 0.3 < float(np.median(removed)) < 1.0
+
+
+def test_volume_regressors_at_tzero_equal_a_slice_acquired_at_tzero():
+    """The GLM nuisance (one set at f*TR + tzero) and the per-slice terms are one model:
+    at a slice acquired exactly at tzero they must coincide (RVT and respiration)."""
+    mag, ph, st, _ = _synthetic_run(nt=150)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    X, _, diag = physio.slice_regressors(tr_, "magnitude", "phase")
+    k0 = int(np.flatnonzero(st == 0.0)[0])
+    V, labels = physio.volume_regressors(diag, np.arange(150) * TR + 0.0)
+    assert labels == [
+        "rvt00",
+        "rvt01",
+        "rvt02",
+        "rvt03",
+        "rvt04",
+        "resp.c1",
+        "resp.s1",
+        "resp.c2",
+        "resp.s2",
+    ]
+    slice_cols = X[:, k0 * 13 : (k0 + 1) * 13][:, [0, 1, 2, 3, 4, 9, 10, 11, 12]]
+    np.testing.assert_allclose(V, slice_cols, atol=1e-6)

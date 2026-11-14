@@ -44,9 +44,8 @@ class Options:
 
     recipe: str | None = None  # named preset (for the header/provenance only)
     want_nordic: bool = False
-    # Data-derived cardiac/respiratory regression on the raw slices (ffs_physio
-    # -clean), after NORDIC and before everything that reads the run: slice timing,
-    # moco, the final resample. Single-echo 2-D only.
+    # Data-derived physio (ffs_physio) from the raw slices: regressors at tzero, used
+    # as a GLM nuisance (-glm_ortvec physio) on the resampled data. Single-echo 2-D.
     physio: bool = False
     # Carry the phase timeseries through the pipeline: unwrap it up front
     # (after NORDIC when NORDIC runs), then ride it along the magnitude's warp

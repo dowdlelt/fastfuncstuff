@@ -257,11 +257,19 @@ GLM_ORTVEC: dict[str, dict[str, str]] = {
         "(Patriat 2017); models the SIGNAL motion caused rather than the "
         "parameters, so it replaces motion/motion_deriv rather than joining them",
     },
+    "physio": {
+        "pattern": "stage00.physio.*task-{task}*.regs.nuisance.1D",
+        "transform": "none",
+        "requires": "physio",
+        "note": "RVT (5 lags) + respiratory RETROICOR from the data (ffs_physio), "
+        "evaluated at tzero -- the instant every voxel stands for after the "
+        "slice-timed final resample",
+    },
 }
 # What a bare `-glm_ortvec` (or a recipe asking for nuisance) selects. Entries
 # whose `requires` is unmet are dropped silently here — this is the default set,
 # not an explicit request.
-DEFAULT_GLM_ORTVEC = ("motion", "motion_deriv", "locomoco")
+DEFAULT_GLM_ORTVEC = ("motion", "motion_deriv", "locomoco", "physio")
 
 
 def apply_motsim_default(names: list[str]) -> list[str]:

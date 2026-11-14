@@ -4342,28 +4342,39 @@ def _section(script: str, start: str, end: str = "\n# =====") -> str:
 
 
 @pytest.mark.parametrize("nordic", [False, True])
-def test_physio_stage_cleans_the_series_everything_downstream_reads(tmp_path, nordic):
-    """-physio must sit between the source and every consumer of it: the stage reads
-    the NORDIC output (noise already trimmed) or the BIDS magnitude with -drop_last
-    NOISE, and moco and the final resample read its cleaned output -- or the
-    regression happened for nothing."""
+def test_physio_writes_glm_regressors_and_leaves_the_series_alone(tmp_path, nordic):
+    """-physio must NOT regress anything out of the series moco and the final resample
+    read: on raw slices the terms fit breathing-locked apparent motion that those
+    steps remove anyway, and held-out R2 fell. It writes regressors at tzero for the
+    GLM instead. The stage reads the NORDIC output (noise trimmed) or the BIDS
+    magnitude with -drop_last NOISE."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    s = write_script(
-        build_plan(subj, Options(physio=True, want_nordic=nordic)), "wd", bids_root=str(tmp_path)
-    )
+    opt = Options(physio=True, want_nordic=nordic, tzero=0.5)
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
     stage = _section(s, "stage00: physio ====")
-    assert "ffs_physio" in stage and '-clean "$outf"' in stage
-    assert 'outf="stage00.physio.${FRAG[$k]}.nii$FMT"' in stage
+    assert "ffs_physio" in stage and "-tzero 0.5" in stage and "-clean" not in stage
+    assert 'outf="stage00.physio.${FRAG[$k]}.regs.nuisance.1D"' in stage
     if nordic:
         assert 'mag="stage00.nordic.${FRAG[$k]}${E1[$k]:-}.nii$FMT"; drop=0' in stage
+        assert s.index("stage00: physio ====") > s.index("stage00: NORDIC")
     else:
         assert 'mag="${MAG[$k]}"; drop="${NOISE[$k]}"' in stage
-    assert s.index("stage00: physio ====") > s.index("stage00: NORDIC") if nordic else True
-    cleaned = 'raw="stage00.physio.${FRAG[$k]}.nii$FMT"'
-    assert cleaned in _section(s, "stage02: moco")
-    assert cleaned in s.split("stage10", 1)[1]
+    assert "stage00.physio" not in _section(s, "stage02: moco")
     assert "skip_physio=1" in s
     assert "ffs_physio" in s.split("for t in", 1)[1].split("\n", 1)[0]  # preflight checks it
+
+
+def test_physio_nuisance_enters_the_glm_only_with_physio_on():
+    from fastfuncstuff.autoproc import config
+    from fastfuncstuff.autoproc.glm import nuisance_specs
+
+    names = list(config.DEFAULT_GLM_ORTVEC)
+    assert "physio" in names
+    on, _ = nuisance_specs("foo", Options(physio=True, glm_ortvec=names))
+    spec = next(n for n in on if n.label == "physio")
+    assert spec.scope == "glob" and spec.pattern == "stage00.physio.*task-foo*.regs.nuisance.1D"
+    off, skipped = nuisance_specs("foo", Options(physio=False, glm_ortvec=names))
+    assert "physio" not in [n.label for n in off] and "physio" in skipped
 
 
 def test_without_physio_nothing_reads_a_physio_output(tmp_path):
@@ -4378,6 +4389,10 @@ def test_physio_refuses_3d_and_warns_without_phase(tmp_path):
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
     warnings: list[str] = []
     assert _physio_errors(Options(physio=True), subj, warnings) == []
-    assert warnings and "no phase" in warnings[0]
+    assert any("no phase" in w for w in warnings)
+    assert any("no 'physio'" in w for w in warnings)  # Options() has an empty nuisance list
+    quiet: list[str] = []
+    _physio_errors(Options(physio=True, glm_ortvec=["motion", "physio"]), subj, quiet)
+    assert not any("no 'physio'" in w for w in quiet)
     assert _physio_errors(Options(physio=True, acq_3d=True), subj, [])
     assert _physio_errors(Options(), subj, []) == []
