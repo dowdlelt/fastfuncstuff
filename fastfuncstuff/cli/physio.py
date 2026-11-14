@@ -81,6 +81,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="Trace to read respiration from. auto = phase when given, else magnitude.",
     )
+    parser.add_argument(
+        "-clean",
+        default=None,
+        help="Also write the magnitude with each voxel's physiological fit removed "
+        "(its own slice's regressors, fitted jointly with drift; mean and drift kept), "
+        "as afni_proc's ricor block does -- the series to hand to motion correction. "
+        "Writes OUT and OUT's _physio_removed map (fraction of each voxel's variance "
+        "taken). Costs 13 degrees of freedom per voxel that a later GLM does not see.",
+    )
     parser.add_argument("-no_qc", action="store_true", help="Skip the QC spectrogram PNG.")
     add_device_arg(parser)
     add_verbose_arg(parser)
@@ -175,8 +184,18 @@ def main(argv: list[str] | None = None) -> int:
     ph = None
     if args.phase is not None:
         ph = np.asarray(load_nifti(args.phase).dataobj, dtype=np.float32)
-        if ph.shape != mag.shape:
-            raise SystemExit(f"ffs_physio: -phase shape {ph.shape} != -input {mag.shape}")
+        if ph.shape[:3] != mag.shape[:3] or ph.shape[3] < mag.shape[3]:
+            raise SystemExit(
+                f"ffs_physio: -phase shape {ph.shape} does not cover -input {mag.shape}"
+            )
+        if ph.shape[3] > mag.shape[3]:
+            # A NORDIC magnitude has its noise volumes trimmed; the raw phase still
+            # carries them at the end.
+            if verb >= 1:
+                print(
+                    f"  phase has {ph.shape[3] - mag.shape[3]} more volumes than -input: trimmed from its end"
+                )
+            ph = ph[..., : mag.shape[3]]
     ndrop = (
         args.drop_last
         if args.drop_last is not None
@@ -193,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     traces = physio.excitation_traces(mag, st, tr, phase=ph, device=device)
-    del mag, ph
+    del ph
     card_auto, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
     resp_auto, resp_scores = physio.choose_source(traces, physio.RESP_BAND, 40.0)
     sources = {
@@ -236,6 +255,27 @@ def main(argv: list[str] | None = None) -> int:
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
+    if args.clean is not None:
+        import torch
+
+        from fastfuncstuff.processing.io import save_image
+
+        cleaned, removed = physio.regress_out(mag, X, tr, device=device)
+        img = load_nifti(args.input)  # header only; the data stays unread
+        hdr = {"affine": img.affine.copy(), "header": img.header.copy()}
+        save_image(torch.from_numpy(cleaned.transpose(3, 2, 1, 0)), args.clean, header_info=hdr)
+        stem = str(args.clean)
+        for ext in (".nii.gz", ".nii.zst", ".nii"):
+            if stem.endswith(ext):
+                rm_path = stem[: -len(ext)] + "_physio_removed" + ext
+                break
+        else:
+            rm_path = stem + "_physio_removed.nii.gz"
+        save_image(torch.from_numpy(removed.transpose(2, 1, 0)), rm_path, header_info=hdr)
+        summary["clean"] = {"output": stem, "removed_map": rm_path}
+        Path(base + ".json").write_text(json.dumps(summary, indent=2))
+        if verb >= 1:
+            print(f"  cleaned magnitude -> {stem} (variance-removed map {rm_path})")
     if verb >= 1:
         print(
             f"  heart rate {summary['heart_rate_per_min_median']:.1f}/min from {sources['cardiac']}, "

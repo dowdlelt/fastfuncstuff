@@ -176,3 +176,28 @@ def test_cli_writes_a_slibase_that_ffs_reml_reads_slice_major(tmp_path):
     torch.testing.assert_close(blocks[k0], blocks[k1])  # same excitation, same regressors
     other = int(np.flatnonzero(group != group[0])[0])
     assert not torch.allclose(blocks[k0][:, 5:9], blocks[other][:, 5:9])  # different times
+
+
+def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
+    """Cleaning must take the physiology and nothing a later step relies on: each
+    voxel's mean and slow drift survive, the heartbeat at its slice's times goes."""
+    mag, ph, st, t = _synthetic_run(nt=200, noise=0.002)
+    drift = np.linspace(0.0, 5.0, mag.shape[-1], dtype=np.float32)
+    mag = mag + drift
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    X, _, _ = physio.slice_regressors(tr_, "magnitude", "phase")
+    clean, removed = physio.regress_out(mag, X, TR, device=CPU)
+    np.testing.assert_allclose(clean.mean(-1), mag.mean(-1), rtol=1e-4)
+    k = 7
+    v = clean[3, 4, k]
+    heart = np.cos(2 * np.pi * F_CARD * t[k])
+    n = np.arange(v.size)
+
+    def detrended(y):
+        return y - np.polyval(np.polyfit(n, y, 1), n)
+
+    before = abs(np.corrcoef(detrended(mag[3, 4, k]), heart)[0, 1])
+    after = abs(np.corrcoef(detrended(v), heart)[0, 1])
+    assert before > 0.5 and after < 0.1, (before, after)
+    assert abs(np.polyfit(np.arange(v.size), v, 1)[0] - drift[1]) < 0.2 * drift[1]  # drift kept
+    assert 0.3 < float(np.median(removed)) < 1.0

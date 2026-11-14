@@ -450,3 +450,57 @@ def choose_source(
     if traces.phase is None:
         return "magnitude", scores
     return ("phase" if band == RESP_BAND else "magnitude"), scores
+
+
+def regress_out(
+    data: np.ndarray,
+    X: np.ndarray,
+    tr: float,
+    device: torch.device | None = None,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove each voxel's physiological fit, slice by slice (AFNI's ``ricor`` block).
+
+    ``data`` is (nx, ny, nz, nt) raw slices; ``X`` the slice-major slibase matrix
+    (nt, nz * m). Each voxel is fitted with its own slice's ``m`` regressors together
+    with Legendre drift, and only the regressors' part is subtracted -- the mean and
+    the drift stay, since motion correction and the GLM model those themselves.
+    The regressors are first made orthogonal to the drift basis, so a slow one (RVT)
+    cannot take drift it does not own and the subtraction leaves mean and drift exact. Returns the cleaned series and the fraction of each voxel's drift-removed
+    variance the regressors took (a QC map; 0 outside ``mask``).
+
+    The regression spends ``m`` degrees of freedom per voxel that a later GLM does
+    not see, as with afni_proc's ``ricor`` block.
+    """
+    device = device or torch.device("cpu")
+    nx, ny, nz, nt = data.shape
+    m = X.shape[1] // nz
+    if X.shape != (nt, nz * m):
+        raise ValueError(f"regressors {X.shape} do not match {nt} volumes x {nz} slices")
+    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=device, dtype=torch.float64)
+    out = np.array(data, dtype=np.float32, copy=True)
+    removed = np.zeros((nx, ny, nz), dtype=np.float32)
+    if mask is None:
+        mask = np.ones((nx, ny, nz), dtype=bool)
+    for k in range(nz):
+        sel = mask[:, :, k].reshape(-1)
+        if not sel.any():
+            continue
+        Y = torch.from_numpy(out[:, :, k, :].reshape(-1, nt)[sel].T.astype(np.float64)).to(device)
+        Xk = torch.from_numpy(X[:, k * m : (k + 1) * m].astype(np.float64)).to(device)
+        # Regressors made orthogonal to the drift basis (afni_proc 3dDetrends them):
+        # subtracting their fit then cannot move a voxel's mean or drift.
+        Xk = Xk - L @ plinalg.lstsq(L, Xk).solution
+        A = torch.cat([L, Xk], 1)
+        beta = plinalg.lstsq(A, Y).solution
+        fit = Xk @ beta[L.shape[1] :]
+        base = Y - L @ beta[: L.shape[1]]  # drift-removed signal, before the physio fit
+        frac = (fit * (2 * base - fit)).sum(0) / (base**2).sum(0).clamp_min(1e-12)
+        cleaned = (Y - fit).T.float().cpu().numpy()
+        plane = out[:, :, k, :].reshape(-1, nt)
+        plane[sel] = cleaned
+        out[:, :, k, :] = plane.reshape(nx, ny, nt)
+        rm = np.zeros(nx * ny, dtype=np.float32)
+        rm[sel] = frac.float().cpu().numpy()
+        removed[:, :, k] = rm.reshape(nx, ny)
+    return out, removed
