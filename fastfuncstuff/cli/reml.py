@@ -2715,8 +2715,14 @@ def main():
     import os
 
     _, cpu_threads_override, _ = parse_device_arg(args.device)
+    # No TF32: a float32 product at TF32's ~3 significant digits wrecked the held-out
+    # R2 of a design with small, near-collinear nuisance columns (RVT lags) on CUDA --
+    # median -127 on a synthetic replica, fine on the CPU. Statistics are not where
+    # TF32's speed is worth that; ffs_group made the same call against 3dttest++.
     device = setup_device(
-        args.device, float64_only="ffs_reml -use_double" if args.use_double else None
+        args.device,
+        float64_only="ffs_reml -use_double" if args.use_double else None,
+        tf32=False,
     )
 
     if device.type == "cpu":

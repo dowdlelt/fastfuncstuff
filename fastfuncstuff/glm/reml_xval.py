@@ -33,6 +33,7 @@ from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.glm.xval import _compute_projection_matrix
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.utils import to_linalg_f64
 
 
 def _run_local_segments(
@@ -124,6 +125,50 @@ def censor_xval_inputs(
     return data[:, keep.to(data.device)], design, run_starts_kept, tau
 
 
+def _task_betas(
+    design_white: torch.Tensor,
+    data_white: torch.Tensor,
+    stim_indices: list[int],
+    train_present: torch.Tensor,
+) -> torch.Tensor:
+    """GLS task betas from the whitened training pair, the nuisance projected out first.
+
+    By Frisch-Waugh-Lovell these equal the task rows of the joint fit, but the
+    nuisance block is never inverted: it is removed through its own singular
+    vectors (rank-revealing, float64), and only the small task system is solved.
+    The joint float32 ``inv(D'D + 1e-6 I)`` this replaces broke on badly scaled,
+    near-collinear nuisance -- five lagged RVT columns (sd ~0.003, near-constant
+    within a run) took a subject's median held-out R2 to -8 while its t-statistics,
+    from the main fit's own solver, did not move. Returns (n_stim, n_voxels) in the
+    data's dtype; absent conditions get zero.
+    """
+    stim_set = set(stim_indices)
+    nuis_cols = [c for c in range(design_white.shape[1]) if c not in stim_set]
+    kept_stim = [c for c, ok in zip(stim_indices, train_present.tolist(), strict=True) if ok]
+    X = to_linalg_f64(design_white[:, kept_stim])
+    y = to_linalg_f64(data_white)
+    if nuis_cols:
+        N = to_linalg_f64(design_white[:, nuis_cols])
+        norms = N.norm(dim=0)
+        N = N[:, norms > 1e-12 * norms.max().clamp_min(1e-300)]  # other runs' columns are zero here
+        if N.shape[1]:
+            U, sv, _ = plinalg.svd(N, full_matrices=False)
+            U = U[:, sv > 1e-10 * sv[0]]
+            X = X - U @ (U.T @ X)
+            y = y - U @ (U.T @ y)
+    gram = X.T @ X
+    ridge = 1e-12 * gram.diagonal().mean().clamp_min(1e-300)
+    betas = plinalg.solve(
+        gram + ridge * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device), X.T @ y
+    )
+    out = torch.zeros(
+        len(stim_indices), data_white.shape[1], dtype=data_white.dtype, device=data_white.device
+    )
+    present_rows = [i for i, ok in enumerate(train_present.tolist()) if ok]
+    out[present_rows] = betas.to(data_white.device).to(data_white.dtype)
+    return out
+
+
 def _score_voxel_chunk(
     data: torch.Tensor,
     inverse: torch.Tensor,
@@ -173,22 +218,9 @@ def _score_voxel_chunk(
             tau=train_tau,
         )
 
-        # GLS betas = OLS on the whitened pair. The full design is fitted so
-        # the nuisance columns absorb what they should; only the task betas
-        # go on to predict.
-        keep = torch.ones(design_white.shape[1], dtype=torch.bool, device=device)
-        for column, present in zip(stim_indices, train_present.tolist(), strict=True):
-            keep[column] = present
-        fit_design = design_white[:, keep]
-        gram = fit_design.T @ fit_design
-        gram_inv = plinalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
-        betas_kept = (gram_inv @ fit_design.T) @ data_white  # (n_kept, n_group_voxels)
-
-        betas_full = torch.zeros(
-            design_white.shape[1], betas_kept.shape[1], device=device, dtype=betas_kept.dtype
-        )
-        betas_full[keep] = betas_kept
-        task_betas = betas_full[stim_indices]  # (n_stim, n_group_voxels)
+        # GLS betas = OLS on the whitened pair, nuisance absorbed (see _task_betas);
+        # only the task betas go on to predict.
+        task_betas = _task_betas(design_white, data_white, stim_indices, train_present)
 
         predicted = (test_stim @ task_betas).T  # (n_group_voxels, n_test_tps)
         actual = test_data_all[voxel_mask.to(test_data_all.device)]

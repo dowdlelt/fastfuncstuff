@@ -377,3 +377,69 @@ def test_event_prefix_fits_tasks_jointly_and_contrasts_them(tmp_path):
     c = vol[..., labels.index("g_vs_f#0_Coef")]
     np.testing.assert_allclose(c, g - f, atol=1e-4)
     assert np.median(g / f) == pytest.approx(3.0, rel=0.15)
+
+
+def _rvt_like_case(step: float, device: torch.device):
+    """Five runs, a task, and per-run nuisance shaped like lagged RVT: a near-constant
+    column (mean 0.03) wandering by ``step`` per sample, five 1-sample lags of it --
+    tiny, near-collinear with each other and with the run constant. The data carry a
+    component along that nuisance, as real BOLD does along respiration."""
+    design, run_starts, n_timepoints, n_conditions = _design(n_runs=5, run_length=200)
+    rng = np.random.default_rng(3)
+    extra = np.zeros((n_timepoints, 25), dtype=np.float32)
+    for run in range(5):
+        slow = np.cumsum(rng.standard_normal(208)) * step
+        rows = slice(run * 200, (run + 1) * 200)
+        for lag in range(5):
+            extra[rows, run * 5 + lag] = 0.03 + slow[8 - lag : 208 - lag]
+    full = np.concatenate([design, extra], 1)
+    generator = torch.Generator().manual_seed(5)
+    task = torch.randn(200, n_conditions, generator=generator) * 3.0
+    nuis = torch.from_numpy(extra)
+    nuis = (nuis - nuis.mean(0)) / nuis.std(0).clamp_min(1e-12)
+    data = (
+        100.0
+        + task @ torch.from_numpy(design[:, :n_conditions]).T
+        + torch.randn(200, 25, generator=generator) @ nuis.T
+        + torch.randn(200, n_timepoints, generator=generator) * 2.0
+    )
+    common = dict(
+        data=data,
+        run_starts=run_starts,
+        stim_indices=list(range(n_conditions)),
+        cv_splits=_splits(5),
+        device=device,
+        verbose=False,
+        arma_params=torch.full((200, 2), 0.2),
+    )
+    plain = compute_xval_r2_arma(
+        **common, design_matrix=design, nuisance_indices=list(range(n_conditions, design.shape[1]))
+    )["r2"]
+    with_extra = compute_xval_r2_arma(
+        **common, design_matrix=full, nuisance_indices=list(range(n_conditions, full.shape[1]))
+    )["r2"]
+    return float(plain.median()), float(with_extra.median())
+
+
+def test_badly_scaled_collinear_nuisance_does_not_wreck_the_held_out_fit():
+    """Nuisance that carries no task information may cost the held-out R2 a few
+    degrees of freedom and nothing more. The old joint float32 inv(D'D + 1e-6 I)
+    lost a fifth of it here on the CPU (0.221 -> 0.156), and on CUDA with TF32 took
+    a real subject's median to -8 while the main fit's t-statistics barely moved."""
+    plain, with_extra = _rvt_like_case(1e-5, torch.device("cpu"))
+    assert plain > 0.1
+    assert abs(with_extra - plain) < 0.03, (plain, with_extra)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rvt_like_nuisance_survives_tf32_on_cuda():
+    """Under TF32 the old solver failed at a milder scale than on the CPU: 0.221 ->
+    0.106 here (and -127 on a real subject's design)."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        plain, with_extra = _rvt_like_case(3e-5, torch.device("cuda"))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+    assert abs(with_extra - plain) < 0.05, (plain, with_extra)
