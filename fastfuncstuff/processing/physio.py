@@ -545,3 +545,238 @@ def regress_out(
         rm[sel] = frac.float().cpu().numpy()
         removed[:, :, k] = rm.reshape(nx, ny)
     return out, removed
+
+
+# ---------------------------------------------------------------------------
+# Standard regressor sets (TAPAS / physio_calc style), from published definitions.
+# TAPAS is GPL-3 and this repository GPL-2-or-later, so nothing here is ported from
+# it; TAPAS is used only as a black-box reference in validation.
+# ---------------------------------------------------------------------------
+
+
+def cardiac_response(t: np.ndarray) -> np.ndarray:
+    """Cardiac response function (Chang, Cunningham & Glover 2009, NeuroImage 44:857)."""
+    t = np.asarray(t, dtype=float)
+    return 0.6 * t**2.7 * np.exp(-t / 1.6) - 16.0 / np.sqrt(2 * np.pi * 9) * np.exp(
+        -0.5 * (t - 12) ** 2 / 9
+    )
+
+
+def respiration_response(t: np.ndarray) -> np.ndarray:
+    """Respiration response function (Birn, Smith, Jones & Bandettini 2008, NeuroImage 40:644)."""
+    t = np.asarray(t, dtype=float)
+    return 0.6 * t**2.1 * np.exp(-t / 1.6) - 0.0023 * t**3.54 * np.exp(-t / 4.25)
+
+
+def find_beats(
+    t: np.ndarray, x: np.ndarray, band: tuple[float, float], f0: float | None = None
+) -> np.ndarray:
+    """Times of cycle peaks in a trace band-passed around its own rate.
+
+    Used for the beat-to-beat cardiac phase and heart rate. ``f0`` (Hz) is the
+    run's rate; estimated from the whole-run spectrum when not given.
+    """
+    fs = 1.0 / float(np.median(np.diff(t)))
+    if f0 is None:
+        xb = _bandpass(x, band[0], band[1], fs)
+        f, P = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
+        inb = (f >= band[0]) & (f <= band[1])
+        f0 = float(f[inb][np.argmax(P[inb])])
+    xc = _bandpass(x, max(band[0] * 0.8, 0.6 * f0), min(band[1] * 1.2, 1.8 * f0), fs)
+    pk, _ = signal.find_peaks(xc, distance=max(1, int(0.6 * fs / f0)), prominence=0.3 * xc.std())
+    return t[pk]
+
+
+def beat_phase(peaks: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """RETROICOR cycle phase: 2*pi*k at the k-th peak, linear in time between peaks
+    (Glover, Li & Ress 2000). Unwrapped; extrapolated at the ends by the end intervals."""
+    k = np.arange(peaks.size, dtype=float)
+    ph = np.interp(times, peaks, k)
+    lo, hi = times < peaks[0], times > peaks[-1]
+    ph[lo] = (times[lo] - peaks[0]) / (peaks[1] - peaks[0])
+    ph[hi] = k[-1] + (times[hi] - peaks[-1]) / (peaks[-1] - peaks[-2])
+    return 2 * np.pi * ph
+
+
+def beat_rate(peaks: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """Instantaneous rate (per minute) from peak intervals, at ``times``."""
+    mid = 0.5 * (peaks[1:] + peaks[:-1])
+    rate = 60.0 / np.diff(peaks)
+    rate = signal.medfilt(rate, 3) if rate.size >= 3 else rate
+    return np.interp(times, mid, rate)
+
+
+def _convolve_at(
+    t_src: np.ndarray, x_src: np.ndarray, times: np.ndarray, kernel, dt: float = 0.1
+) -> np.ndarray:
+    """Convolve a slow series with a response function on a fine grid, sample at ``times``.
+
+    The series is held at its first value before it starts, so the response does
+    not open with a step from zero."""
+    t0, t1 = min(t_src[0], times[0]) - 40.0, max(t_src[-1], times[-1])
+    grid = np.arange(t0, t1 + dt, dt)
+    x = np.interp(grid, t_src, x_src)
+    x = x - x.mean()
+    h = kernel(np.arange(0, 40.0, dt))
+    y = np.convolve(x, h)[: grid.size] * dt
+    return np.interp(times, grid, y)
+
+
+@dataclass
+class PhysioModel:
+    """Everything the regressors are built from, wherever the traces came from."""
+
+    card_peaks: np.ndarray  # beat times (s, from volume 0)
+    resp_t: np.ndarray
+    resp_phase: np.ndarray  # unwrapped respiratory phase at resp_t
+    rvt: np.ndarray  # breath-by-breath RVT (Birn 2006) at resp_t
+    source: str = ""
+
+
+def respiration_phase_histogram(t: np.ndarray, x: np.ndarray, bins: int = 100) -> np.ndarray:
+    """Respiratory phase by amplitude histogram equalisation (Glover, Li & Ress 2000).
+
+    For a belt recording: each sample's phase is pi times the fraction of the run's
+    samples below its amplitude, signed by whether the chest is filling or emptying,
+    so a shallow breath reaches a smaller phase than a deep one. The sign is read
+    from the trace low-passed at 1 Hz -- the raw derivative flips on every ripple.
+    Measured against TAPAS PhysIO's own phase on a TASKFORCE run: circular agreement
+    0.98 (0.99 on its own filtered trace). For a data-derived trace the Hilbert phase
+    explained more variance (:func:`cycle_phase`).
+    """
+    fs = 1.0 / float(np.median(np.diff(t)))
+    sos = signal.butter(2, [0.05, min(1.0, 0.45 * fs)], btype="band", fs=fs, output="sos")
+    r = signal.sosfiltfilt(sos, x - x.mean())
+    r = r - r.min()
+    hist, edges = np.histogram(r, bins=bins)
+    frac = np.interp(r, edges, np.concatenate([[0.0], np.cumsum(hist) / hist.sum()]))
+    lp = signal.sosfiltfilt(signal.butter(2, min(1.0, 0.45 * fs), fs=fs, output="sos"), r)
+    sign = np.sign(np.gradient(lp))
+    sign[sign == 0] = 1.0
+    return np.pi * frac * sign
+
+
+def breath_rvt(t: np.ndarray, x: np.ndarray, rate_hz: float) -> tuple[np.ndarray, np.ndarray]:
+    """Respiration volume per time, breath by breath (Birn et al. 2006, NeuroImage 31:1536).
+
+    Depth of each breath (its peak minus the trough level there) over its period, at
+    the peak times. Matches AFNI physio_calc.py's RVT on a TASKFORCE belt recording at
+    r = 0.89. TAPAS PhysIO's "Hilbert" RVT is a different quantity: it and
+    physio_calc agree only at r = 0.62 on the same recording, so there is no single
+    reference to match; this is the classic definition. Returns (peak times, RVT).
+    """
+    fs = 1.0 / float(np.median(np.diff(t)))
+    sos = signal.butter(2, [0.05, min(1.0, 0.45 * fs)], btype="band", fs=fs, output="sos")
+    xb = signal.sosfiltfilt(sos, x - x.mean())
+    dist = max(1, int(0.6 * fs / rate_hz))
+    pk, _ = signal.find_peaks(xb, distance=dist, prominence=0.3 * xb.std())
+    tr, _ = signal.find_peaks(-xb, distance=dist, prominence=0.3 * xb.std())
+    if pk.size < 3 or tr.size < 2:
+        return np.array([t[0], t[-1]]), np.zeros(2)
+    tp = t[pk]
+    depth = xb[pk] - np.interp(tp, t[tr], xb[tr])
+    return tp, depth / np.gradient(tp)
+
+
+def model_from_series(
+    t_c,
+    x_c,
+    t_r,
+    x_r,
+    card_f0: float | None = None,
+    resp_phase: str = "histogram",
+    source: str = "",
+) -> PhysioModel:
+    """Build the model from a cardiac and a respiratory trace (recorded or data-derived).
+
+    ``resp_phase``: "histogram" (Glover; the standard for a belt) or "hilbert"
+    (better for the data-derived trace)."""
+    peaks = find_beats(t_c, x_c, CARDIAC_BAND, card_f0)
+    rt, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+    phase = (
+        respiration_phase_histogram(t_r, x_r)
+        if resp_phase == "histogram"
+        else cycle_phase(t_r, x_r, rf)
+    )
+    bt, rvt = breath_rvt(t_r, x_r, float(np.median(rf)))
+    return PhysioModel(peaks, t_r, np.unwrap(phase), np.interp(t_r, bt, rvt), source)
+
+
+def model_from_traces(
+    traces: ExcitationTraces, card_from: str = "magnitude", resp_from: str = "phase"
+) -> PhysioModel:
+    """The model from the data's excitation-rate traces (cardiac notched at k/TR)."""
+    t_c, x_c = traces.series(card_from)
+    t_r, x_r = traces.series(resp_from)
+    tr = float(np.median(np.diff(traces.times[:, 0])))
+    harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
+    if card_from == "magnitude":
+        x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
+    _, cf, _ = track_rate(t_c, x_c, CARDIAC_BAND, 20.0, avoid=harmonics)
+    return model_from_series(
+        t_c, x_c, t_r, x_r, card_f0=float(np.median(cf)), source=f"data ({card_from}/{resp_from})"
+    )
+
+
+def standard_regressors(
+    model: PhysioModel,
+    times: np.ndarray,
+    card_order: int = 3,
+    resp_order: int = 4,
+    inter_order: int = 1,
+    hrv: bool = True,
+    rvt: bool = True,
+) -> tuple[np.ndarray, list[str]]:
+    """RETROICOR (cardiac, respiratory, interaction) + HRV*CRF + RVT*RRF at ``times``.
+
+    The set TAPAS PhysIO builds with orders c/r/cr and its HRV and RVT models; the
+    defaults are its common c3 r4 cr1. Interaction terms are cos/sin of
+    m*phi_c +- n*phi_r (Harvey et al. 2008, JMRI 28:1337).
+    """
+    phc = beat_phase(model.card_peaks, times)
+    phr = np.interp(times, model.resp_t, model.resp_phase)
+    cols, labels = [], []
+    for m in range(1, card_order + 1):
+        cols += [np.cos(m * phc), np.sin(m * phc)]
+        labels += [f"card.c{m}", f"card.s{m}"]
+    for m in range(1, resp_order + 1):
+        cols += [np.cos(m * phr), np.sin(m * phr)]
+        labels += [f"resp.c{m}", f"resp.s{m}"]
+    for m in range(1, inter_order + 1):
+        for sgn, name in ((1, "p"), (-1, "m")):
+            ph = m * phc + sgn * m * phr
+            cols += [np.cos(ph), np.sin(ph)]
+            labels += [f"cxr.c{m}{name}", f"cxr.s{m}{name}"]
+    if hrv:
+        fine = np.arange(model.card_peaks[0], model.card_peaks[-1], 0.1)
+        cols.append(_convolve_at(fine, beat_rate(model.card_peaks, fine), times, cardiac_response))
+        labels.append("hrv.crf")
+    if rvt:
+        cols.append(_convolve_at(model.resp_t, model.rvt, times, respiration_response))
+        labels.append("rvt.rrf")
+    return np.stack(cols, 1), labels
+
+
+def read_cmrr_log(path) -> tuple[np.ndarray, np.ndarray]:
+    """(times in s, values) from a CMRR physio log (RESP / PULS / ECG channel 1),
+    placed by each sample's own 2.5 ms tick -- gaps cost nothing."""
+    t, v = [], []
+    for line in open(path):
+        p = line.split()
+        if len(p) >= 3 and p[0].isdigit() and p[1] in ("RESP", "PULS", "ECG1", "ECG"):
+            t.append(int(p[0]))
+            v.append(float(p[2]))
+    return np.asarray(t, dtype=float) * 0.0025, np.asarray(v, dtype=float)
+
+
+def cmrr_volume_zero(info_path) -> float:
+    """Start of the first acquisition (s, same clock as the logs) from a CMRR Info log."""
+    first = None
+    for line in open(info_path):
+        p = line.split()
+        if len(p) == 5 and all(x.isdigit() for x in p):
+            t = int(p[2]) * 0.0025
+            first = t if first is None else min(first, t)
+    if first is None:
+        raise ValueError(f"no acquisition rows in {info_path}")
+    return first

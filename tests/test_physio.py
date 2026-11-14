@@ -224,3 +224,52 @@ def test_volume_regressors_at_tzero_equal_a_slice_acquired_at_tzero():
     ]
     slice_cols = X[:, k0 * 13 : (k0 + 1) * 13][:, [0, 1, 2, 3, 4, 9, 10, 11, 12]]
     np.testing.assert_allclose(V, slice_cols, atol=1e-6)
+
+
+def test_response_functions_have_their_published_shapes():
+    """Birn 2008 RRF peaks near 3 s and undershoots near 14 s; Chang 2009 CRF peaks
+    near 4 s and undershoots near 12 s -- a typo in a constant moves these."""
+    t = np.arange(0, 40, 0.01)
+    rrf, crf = physio.respiration_response(t), physio.cardiac_response(t)
+    assert 2.5 < t[np.argmax(rrf)] < 4.0 and 10 < t[np.argmin(rrf)] < 18 and rrf.min() < 0
+    assert 3.0 < t[np.argmax(crf)] < 5.5 and 10 < t[np.argmin(crf)] < 14 and crf.min() < 0
+
+
+def test_beat_phase_is_linear_between_beats_and_counts_cycles():
+    peaks = np.array([0.0, 1.0, 1.8, 3.0])
+    ph = physio.beat_phase(peaks, np.array([0.0, 0.5, 1.0, 1.4, 1.8, 2.4]))
+    np.testing.assert_allclose(ph / (2 * np.pi), [0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+
+
+def test_breath_rvt_follows_depth_and_rate():
+    """A breath twice as deep, or twice as fast, doubles RVT."""
+    fs = 50.0
+    t = np.arange(0, 240, 1 / fs)
+    depth = np.where(t < 120, 1.0, 2.0)
+    x = depth * np.sin(2 * np.pi * 0.25 * t)
+    bt, rvt = physio.breath_rvt(t, x, 0.25)
+    early, late = np.median(rvt[(bt > 20) & (bt < 100)]), np.median(rvt[(bt > 140) & (bt < 220)])
+    assert 1.8 < late / early < 2.2
+
+
+def test_histogram_phase_spans_minus_pi_to_pi_and_tracks_the_cycle():
+    fs = 50.0
+    t = np.arange(0, 120, 1 / fs)
+    x = np.sin(2 * np.pi * 0.25 * t)
+    ph = physio.respiration_phase_histogram(t, x)
+    assert ph.min() < -2.8 and ph.max() > 2.8
+    # the cos of the phase follows the breath (peak inhale <-> phase near +-pi... sign-free check)
+    assert abs(np.corrcoef(np.cos(ph[500:-500]), x[500:-500])[0, 1]) > 0.8
+
+
+def test_standard_regressors_tapas_layout():
+    """c3 r4 cr1 + HRV + RVT: TAPAS PhysIO's common 20-column set, in its group order."""
+    fs = 100.0
+    t = np.arange(0, 200, 1 / fs)
+    card = np.sin(2 * np.pi * 1.1 * t) ** 21  # pulse-like
+    resp = np.sin(2 * np.pi * 0.25 * t)
+    model = physio.model_from_series(t, card, t, resp, source="test")
+    X, labels = physio.standard_regressors(model, np.arange(10, 190, 1.0))
+    assert X.shape == (180, 20) and np.isfinite(X).all()
+    assert labels[:6] == ["card.c1", "card.s1", "card.c2", "card.s2", "card.c3", "card.s3"]
+    assert labels[14:] == ["cxr.c1p", "cxr.s1p", "cxr.c1m", "cxr.s1m", "hrv.crf", "rvt.rrf"]
