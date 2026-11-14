@@ -36,7 +36,9 @@ Two samplers live here:
   frozen form (and a two-step tshift-then-motion) smear the wrong tissue -- e.g. a
   brain edge sweeping in and out of a voxel. Following the tissue costs the uniform
   time grid, so the taps are slid back onto one before the kernel is applied (see
-  the class docstring); measured ~20-25% slower than the frozen path.
+  the class docstring); measured ~20-25% slower than the frozen path. By default
+  each sample is also located with the pose at its own slice's acquisition time
+  (``pose_time``), because the head moves while a volume is acquired.
 
 ``sz`` (the source-voxel k index each output voxel samples) is exactly the scanner
 slice ``k'`` because we sample the *raw* source there. Temporal kernels are
