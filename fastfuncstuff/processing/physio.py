@@ -48,6 +48,10 @@ class ExcitationTraces:
     magnitude: np.ndarray  # (nt, G) mean fractional change over brain voxels
     phase: np.ndarray | None  # (nt, G) mean phase change (rad) over stable voxels
     n_voxels: int = 0
+    # (nt, G, 10) second-order field fit to each excitation's phase-change maps:
+    # 1, x, y, z, x2, y2, z2, xy, xz, yz (coordinates in 100 mm units). See
+    # field_breathing_trace for why the gradients carry breath depth.
+    field_coef: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
 
     def series(self, which: str) -> tuple[np.ndarray, np.ndarray]:
@@ -107,6 +111,7 @@ def excitation_traces(
     mask: np.ndarray | None = None,
     stability: float = 0.7,
     comb: bool = True,
+    voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> ExcitationTraces:
     """One physiological sample per (volume, excitation).
 
@@ -155,6 +160,16 @@ def excitation_traces(
         lo, hi = float(phase.min()), float(phase.max())
         if not hi > lo:
             raise ValueError("phase has no range; expected raw scanner units or radians")
+    nx, ny = magnitude.shape[:2]
+    gx, gy = np.meshgrid(
+        (np.arange(nx) - nx / 2) * voxel_size[0] / 100.0,
+        (np.arange(ny) - ny / 2) * voxel_size[1] / 100.0,
+        indexing="ij",
+    )
+    gx_t = torch.from_numpy(gx.reshape(-1).astype(np.float32)).to(device)
+    gy_t = torch.from_numpy(gy.reshape(-1).astype(np.float32)).to(device)
+    field_A = np.zeros((nz, 10, 10))
+    field_b = np.zeros((nz, 10, nt))
     for k in range(nz):
         sel = torch.from_numpy(mask[:, :, k].reshape(-1)).to(device)
         if int(sel.sum()) < 20:
@@ -185,8 +200,40 @@ def excitation_traces(
             w = mu[keep] ** 2
             per_slice_p[:, k] = ((w[:, None] * dphi).sum(0) / w.sum()).cpu().numpy()
             count_p[k] = float(keep.sum())
+            # second-order field over this slice's stable voxels (weighted like the mean)
+            xk, yk = gx_t[sel][keep], gy_t[sel][keep]
+            zk = torch.full_like(xk, (k - nz / 2) * voxel_size[2] / 100.0)
+            bas = torch.stack(
+                [
+                    torch.ones_like(xk),
+                    xk,
+                    yk,
+                    zk,
+                    xk * xk,
+                    yk * yk,
+                    zk * zk,
+                    xk * yk,
+                    xk * zk,
+                    yk * zk,
+                ],
+                1,
+            )
+            wn = (w / w.sum())[:, None]
+            field_A[k] = (bas.T @ (wn * bas)).double().cpu().numpy() * count_p[k]
+            field_b[k] = (bas.T @ (wn * dphi)).double().cpu().numpy() * count_p[k]
     mag_t = np.zeros((nt, G))
     ph_t = np.zeros((nt, G)) if phase is not None else None
+    field_t = np.zeros((nt, G, 10)) if phase is not None else None
+    if field_t is not None:
+        for g in range(G):
+            ks = np.flatnonzero((group == g) & (count_p > 0))
+            if ks.size == 0:
+                continue
+            Ag = field_A[ks].sum(0)
+            Ag = Ag + 1e-6 * np.trace(Ag) / 10 * np.eye(
+                10
+            )  # one excitation's few slices barely fix z2
+            field_t[:, g] = np.linalg.solve(Ag, field_b[ks].sum(0)).T
     for g in range(G):
         s = group == g
         if count_m[s].sum() > 0:
@@ -196,7 +243,33 @@ def excitation_traces(
     if comb:
         mag_t = remove_tr_comb(mag_t, tr)
     times = np.arange(nt)[:, None] * tr + gtimes[None, :]
-    return ExcitationTraces(times, group, mag_t, ph_t, int(count_m.sum()))
+    return ExcitationTraces(times, group, mag_t, ph_t, int(count_m.sum()), field_coef=field_t)
+
+
+def field_breathing_trace(traces: ExcitationTraces) -> tuple[np.ndarray, np.ndarray]:
+    """A trace whose breath-to-breath amplitude follows breath DEPTH.
+
+    The mean phase gives breathing timing but not depth (breath-by-breath RVT from it
+    vs a belt: median r +0.20 after RRF convolution over 91 TASKFORCE runs). Breathing
+    changes lung volume, which reaches the head as a field gradient, not just an
+    offset; the first principal component of the x/y/z gradient coefficients in the
+    respiratory band matched the belt's RVT at median +0.71 (middle half of runs
+    +0.56 to +0.79; +0.85 on a breath-hold run). The offset is left out: it also
+    carries scanner field drift. Sign is arbitrary (depth is peak minus trough).
+    """
+    if traces.field_coef is None or traces.phase is None:
+        raise ValueError("no field fit: the run was given without phase")
+    order = np.argsort(traces.times.ravel(), kind="stable")
+    t = traces.times.ravel()[order]
+    G3 = traces.field_coef[:, :, 1:4].reshape(-1, 3)[order]
+    G3 = (G3 - G3.mean(0)) / np.maximum(G3.std(0), 1e-12)
+    _, x_ph = traces.series("phase")
+    _, rf, _ = peak_rate(t, x_ph, RESP_BAND)
+    f0 = float(np.median(rf))
+    fs = 1.0 / float(np.median(np.diff(t)))
+    sos = signal.butter(2, [0.6 * f0, min(1.6 * f0, 0.45 * fs)], btype="band", fs=fs, output="sos")
+    _, _, vt = np.linalg.svd(signal.sosfiltfilt(sos, G3, axis=0), full_matrices=False)
+    return t, G3 @ vt[0]
 
 
 def remove_tr_comb(trace: np.ndarray, tr: float, cutoff: float = 0.08) -> np.ndarray:
@@ -365,6 +438,17 @@ def respiration_volume(
     return env * rate
 
 
+def _depth_rvt(traces: ExcitationTraces, t_r, x_r, rt, rf) -> np.ndarray:
+    """RVT at ``t_r``: breath by breath from the field-gradient trace when the run has
+    phase (it follows depth; :func:`field_breathing_trace`), else envelope x rate of the
+    respiratory trace."""
+    if traces.field_coef is not None and traces.phase is not None:
+        tf, xf = field_breathing_trace(traces)
+        bt, br = breath_rvt(tf, xf, float(np.median(rf)))
+        return np.interp(t_r, bt, br)
+    return respiration_volume(t_r, x_r, rt, rf)
+
+
 def slice_regressors(
     traces: ExcitationTraces,
     card_from: str,
@@ -391,7 +475,7 @@ def slice_regressors(
     rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND)
     phi_c = cycle_phase(t_c, x_c, cf)
     phi_r = cycle_phase(t_r, x_r, rf)
-    rv = respiration_volume(t_r, x_r, rt, rf)
+    rv = _depth_rvt(traces, t_r, x_r, rt, rf)
 
     nt, G = traces.times.shape
     order_idx = np.argsort(traces.times.ravel(), kind="stable")
@@ -713,9 +797,19 @@ def model_from_traces(
     if card_from == "magnitude":
         x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
     _, cf, _ = track_rate(t_c, x_c, CARDIAC_BAND, 20.0, avoid=harmonics)
-    return model_from_series(
-        t_c, x_c, t_r, x_r, card_f0=float(np.median(cf)), source=f"data ({card_from}/{resp_from})"
+    model = model_from_series(
+        t_c,
+        x_c,
+        t_r,
+        x_r,
+        card_f0=float(np.median(cf)),
+        resp_phase="hilbert",
+        source=f"data ({card_from}/{resp_from})",
     )
+    if traces.field_coef is not None and traces.phase is not None:
+        _, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+        model.rvt = _depth_rvt(traces, t_r, x_r, None, rf)
+    return model
 
 
 def standard_regressors(

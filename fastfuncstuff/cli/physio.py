@@ -190,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.processing import physio
 
     st, tr = _slice_times_and_tr(args)
-    mag = np.asarray(load_nifti(args.input).dataobj, dtype=np.float32)
+    mag_img = load_nifti(args.input)
+    mag = np.asarray(mag_img.dataobj, dtype=np.float32)
+    zooms = tuple(float(z) for z in mag_img.header.get_zooms()[:3])
     if mag.ndim != 4:
         raise SystemExit("ffs_physio: -input must be 4-D")
     if mag.shape[2] != st.size:
@@ -225,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{gt.size} excitations per TR = {gt.size / tr:.1f} Hz, phase {'yes' if ph is not None else 'no'}"
         )
 
-    traces = physio.excitation_traces(mag, st, tr, phase=ph, device=device)
+    traces = physio.excitation_traces(mag, st, tr, phase=ph, device=device, voxel_size=zooms)
     del ph
     card_auto, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
     resp_auto, resp_scores = physio.choose_source(traces, physio.RESP_BAND, 40.0)

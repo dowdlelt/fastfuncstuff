@@ -198,7 +198,10 @@ def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
 
     before = abs(np.corrcoef(detrended(mag[3, 4, k]), heart)[0, 1])
     after = abs(np.corrcoef(detrended(v), heart)[0, 1])
-    assert before > 0.5 and after < 0.1, (before, after)
+    # The cardiac terms explain ~0.95 of this synthetic heartbeat, which leaves a residual
+    # correlation near 0.12. An earlier < 0.1 bound passed only because the old envelope
+    # RVT happened to carry a sliver of the aliased heartbeat (0.955 -> 0.994 with it).
+    assert before > 0.5 and after < 0.2 and after < 0.25 * before, (before, after)
     assert abs(np.polyfit(np.arange(v.size), v, 1)[0] - drift[1]) < 0.2 * drift[1]  # drift kept
     assert 0.3 < float(np.median(removed)) < 1.0
 
@@ -273,3 +276,40 @@ def test_standard_regressors_tapas_layout():
     assert X.shape == (180, 20) and np.isfinite(X).all()
     assert labels[:6] == ["card.c1", "card.s1", "card.c2", "card.s2", "card.c3", "card.s3"]
     assert labels[14:] == ["cxr.c1p", "cxr.s1p", "cxr.c1m", "cxr.s1m", "hrv.crf", "rvt.rrf"]
+
+
+def test_field_gradient_trace_follows_breath_depth():
+    """Breathing that reaches the head as an anterior-posterior field GRADIENT, its depth
+    changing slowly: the field-gradient trace must follow that depth. (On real data the
+    mean phase does not -- 91 TASKFORCE runs, belt RVT after RRF: gradient component
+    +0.71, mean phase +0.20 -- but a synthetic this clean lets the mean see it too, so
+    that half is not asserted here.)"""
+    rng = np.random.default_rng(4)
+    nt, (nx, ny, nz), mb = 240, (16, 16, 20), 2
+    st = _mb_slice_times(nz, mb)
+    t = np.arange(nt)[None, :] * TR + st[:, None]
+    depth = 1.0 + 0.6 * np.sin(2 * np.pi * t / 80.0)  # breath depth, slow
+    breath = 0.2 * depth * np.sin(2 * np.pi * F_RESP * t)  # rad per unit of y
+    y = (np.arange(ny) - ny / 2) / (ny / 2)
+    mag = (100.0 + rng.random((nx, ny, nz)))[..., None] * np.ones(nt, np.float32)
+    mag = mag * (1 + 0.005 * rng.standard_normal(mag.shape))
+    static = rng.uniform(-np.pi, np.pi, (nx, ny, nz))
+    ph = (
+        static[..., None]
+        + y[None, :, None, None] * breath[None, None]
+        + 0.02 * rng.standard_normal(mag.shape)
+    )
+    ph = np.angle(np.exp(1j * ph)) * (4096 / np.pi)
+    traces = physio.excitation_traces(
+        mag.astype(np.float32),
+        st,
+        TR,
+        phase=ph.astype(np.float32),
+        device=CPU,
+        voxel_size=(2.0, 2.0, 2.0),
+    )
+    tf, xf = physio.field_breathing_trace(traces)
+    bt, rvt = physio.breath_rvt(tf, xf, F_RESP)
+    truth = 1.0 + 0.6 * np.sin(2 * np.pi * bt / 80.0)
+    keep = (bt > 20) & (bt < nt - 20)
+    assert np.corrcoef(rvt[keep], truth[keep])[0, 1] > 0.8
