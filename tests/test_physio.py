@@ -140,3 +140,39 @@ def test_source_choice_follows_the_measured_mapping(with_phase):
     resp, _ = physio.choose_source(tr_, physio.RESP_BAND, 40.0)
     assert card == "magnitude"
     assert resp == ("phase" if with_phase else "magnitude")
+
+
+def test_cli_writes_a_slibase_that_ffs_reml_reads_slice_major(tmp_path):
+    """End to end: the file's 13-per-slice blocks land on the right slices when read
+    the way ffs_reml -slibase_sm (and afni_proc -ricor_regs) reads them."""
+    import json
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli.physio import main
+    from fastfuncstuff.design.slibase import deinterleave_slibase, load_1d_matrix
+
+    mag, ph, st, _ = _synthetic_run(nt=150)
+    mag = np.concatenate([mag, np.full(mag.shape[:3] + (2,), 1.0, np.float32)], -1)  # noise scans
+    ph = np.concatenate([ph, np.zeros(ph.shape[:3] + (2,), np.float32)], -1)
+    aff = np.eye(4)
+    nib.save(nib.Nifti1Image(mag, aff), tmp_path / "run_mag.nii.gz")
+    nib.save(nib.Nifti1Image(ph, aff), tmp_path / "run_ph.nii.gz")
+    (tmp_path / "run_mag.json").write_text(
+        json.dumps({"SliceTiming": st.tolist(), "RepetitionTime": TR})
+    )
+    prefix = tmp_path / "out" / "run"
+    rc = main(["-input", str(tmp_path / "run_mag.nii.gz"), "-phase", str(tmp_path / "run_ph.nii.gz"),
+               "-prefix", str(prefix), "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
+    assert rc == 0
+    summary = json.loads((tmp_path / "out" / "run.json").read_text())
+    assert summary["dropped_last"] == 2 and summary["n_volumes"] == 150
+    assert abs(summary["heart_rate_per_min_median"] - F_CARD * 60) < 1.5
+    mat = load_1d_matrix(tmp_path / "out" / "run.slibase.1D")
+    assert mat.shape == (150, st.size * 13)
+    blocks = deinterleave_slibase(mat, st.size, slice_major=True)  # (n_slices, nt, 13)
+    group, _ = physio.excitation_groups(st)
+    k0, k1 = np.flatnonzero(group == group[0])[:2]
+    torch.testing.assert_close(blocks[k0], blocks[k1])  # same excitation, same regressors
+    other = int(np.flatnonzero(group != group[0])[0])
+    assert not torch.allclose(blocks[k0][:, 5:9], blocks[other][:, 5:9])  # different times

@@ -300,6 +300,34 @@ def track_rate(
     return np.array(cen), np.array(est), prominence
 
 
+def peak_rate(
+    t: np.ndarray, x: np.ndarray, band: tuple[float, float]
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Cycle-by-cycle rate from peak intervals, for a slow and irregular rhythm.
+
+    A periodogram long enough to resolve breathing (tens of seconds) blurs a rate
+    that changes breath to breath and lets slow drift compete at the band's low edge;
+    on a TASKFORCE rest run it wandered 5-10 per minute against reviewed belt peaks
+    near 10.7. Counting peaks of the trace band-passed around the run's own rate is
+    what physio_calc.py does on the belt. Returns (interval mid-times, rates in Hz,
+    whole-run peak prominence).
+    """
+    fs = 1.0 / float(np.median(np.diff(t)))
+    xb = _bandpass(x, band[0] * 0.8, band[1] * 1.2, fs)
+    f_all, P_all = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
+    inb = (f_all >= band[0]) & (f_all <= band[1])
+    f0 = float(f_all[inb][np.argmax(P_all[inb])])
+    prominence = float(P_all[inb].max() / np.median(P_all[inb]))
+    xc = _bandpass(x, 0.6 * f0, 1.6 * f0, fs)
+    pk, _ = signal.find_peaks(xc, distance=max(1, int(0.6 * fs / f0)), prominence=0.3 * xc.std())
+    if pk.size < 3:
+        return np.array([t[len(t) // 2]]), np.array([f0]), prominence
+    tp = t[pk]
+    rate = 1.0 / np.diff(tp)
+    rate = signal.medfilt(rate, 3) if rate.size >= 3 else rate  # one missed/extra peak
+    return 0.5 * (tp[1:] + tp[:-1]), np.clip(rate, band[0], band[1]), prominence
+
+
 def cycle_phase(t: np.ndarray, x: np.ndarray, rate_f: np.ndarray) -> np.ndarray:
     """Instantaneous cycle phase (rad, unwrapped) of a physiological trace.
 
@@ -342,7 +370,6 @@ def slice_regressors(
     rvt_shifts: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0),
     order: int = 2,
     card_window: float = 20.0,
-    resp_window: float = 40.0,
 ) -> tuple[np.ndarray, list[str], dict]:
     """Per-slice RETROICOR + RVT regressors, AFNI ``slibase`` layout (slice-major).
 
@@ -359,7 +386,7 @@ def slice_regressors(
     if card_from == "magnitude":
         x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
     ct, cf, cprom = track_rate(t_c, x_c, CARDIAC_BAND, card_window, avoid=harmonics)
-    rt, rf, rprom = track_rate(t_r, x_r, RESP_BAND, resp_window)
+    rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND)
     phi_c = cycle_phase(t_c, x_c, cf)
     phi_r = cycle_phase(t_r, x_r, rf)
     rv = respiration_volume(t_r, x_r, rt, rf)
