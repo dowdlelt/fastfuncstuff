@@ -54,13 +54,21 @@ class ExcitationTraces:
     field_coef: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
 
-    def series(self, which: str) -> tuple[np.ndarray, np.ndarray]:
-        """(times, values) of one trace as a single series in acquisition order."""
+    def series(self, which: str, uniform: bool = False) -> tuple[np.ndarray, np.ndarray]:
+        """(times, values) of one trace as a single series in acquisition order.
+
+        ``uniform=True`` resamples it onto an even grid at the run's mean excitation
+        rate, which every spectral step needs: excitations are not evenly spaced
+        (TASKFORCE: 0.0575 / 0.06 s apart, then a gap before the next volume), and
+        treating them as uniform at 1/median spacing (16.7 Hz, true 17.0) put every
+        frequency 2 % low -- heart rates 1.3-1.7/min under the reviewed beats.
+        """
         vals = self.magnitude if which == "magnitude" else self.phase
         if vals is None:
             raise ValueError("no phase trace: the run was given without phase")
         order = np.argsort(self.times.ravel(), kind="stable")
-        return self.times.ravel()[order], vals.ravel()[order]
+        t, x = self.times.ravel()[order], vals.ravel()[order]
+        return _uniform(t, x) if uniform else (t, x)
 
 
 def excitation_groups(slice_times: np.ndarray, tol: float = 1e-3) -> tuple[np.ndarray, np.ndarray]:
@@ -79,6 +87,20 @@ def excitation_groups(slice_times: np.ndarray, tol: float = 1e-3) -> tuple[np.nd
             times.append(float(st[k]))
         group[k] = len(times) - 1
     return group, np.array(times)
+
+
+def _fs(t: np.ndarray) -> float:
+    """Mean sampling rate of a series (correct for an uneven one, unlike 1/median)."""
+    return (len(t) - 1) / float(t[-1] - t[0])
+
+
+def _uniform(t: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``x`` resampled linearly onto an even grid at the series' mean rate, same span.
+    Columns of a 2-D ``x`` are resampled together."""
+    tu = np.linspace(t[0], t[-1], len(t))
+    if x.ndim == 1:
+        return tu, np.interp(tu, t, x)
+    return tu, np.stack([np.interp(tu, t, c) for c in x.T], 1)
 
 
 def trailing_noise_volumes(mean_per_volume: np.ndarray, frac: float = 0.2) -> int:
@@ -260,13 +282,14 @@ def field_breathing_trace(traces: ExcitationTraces) -> tuple[np.ndarray, np.ndar
     if traces.field_coef is None or traces.phase is None:
         raise ValueError("no field fit: the run was given without phase")
     order = np.argsort(traces.times.ravel(), kind="stable")
-    t = traces.times.ravel()[order]
-    G3 = traces.field_coef[:, :, 1:4].reshape(-1, 3)[order]
+    t, G3 = _uniform(
+        traces.times.ravel()[order], traces.field_coef[:, :, 1:4].reshape(-1, 3)[order]
+    )
     G3 = (G3 - G3.mean(0)) / np.maximum(G3.std(0), 1e-12)
-    _, x_ph = traces.series("phase")
+    _, x_ph = traces.series("phase", uniform=True)
     _, rf, _ = peak_rate(t, x_ph, RESP_BAND)
     f0 = float(np.median(rf))
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     sos = signal.butter(2, [0.6 * f0, min(1.6 * f0, 0.45 * fs)], btype="band", fs=fs, output="sos")
     _, _, vt = np.linalg.svd(signal.sosfiltfilt(sos, G3, axis=0), full_matrices=False)
     return t, G3 @ vt[0]
@@ -307,7 +330,7 @@ def notch_tr_harmonics(
     tracker locks onto (a TASKFORCE rest run: 47 bpm off). A narrow notch costs a
     heart rate sitting exactly on a TR harmonic a little power and nothing else.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     out = np.asarray(x, dtype=float)
     k = 1
     while k / tr <= band[1] * 1.2:
@@ -341,7 +364,7 @@ def track_rate(
     the peak prominence (in-band peak power over in-band median, on the whole-run
     spectrum) used to choose between magnitude and phase.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     xb = _bandpass(x, band[0] * 0.8, band[1] * 1.2, fs)
     n = int(window * fs)
     s = max(1, int(step * fs))
@@ -411,7 +434,7 @@ def peak_rate(
     edge (task blocks, 1/f drift) win, and on two TASKFORCE task runs whose phase trace
     was coherent with the belt (1.00) it reported 6/min against 15-17 true.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     xb = _bandpass(x, band[0] * 0.8, band[1] * 1.2, fs)
     f_all, P_all = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
     inb = (f_all >= band[0]) & (f_all <= band[1])
@@ -437,7 +460,7 @@ def cycle_phase(t: np.ndarray, x: np.ndarray, rate_f: np.ndarray) -> np.ndarray:
     variance on 4 of 5 TASKFORCE runs, and reading the phase earlier (the phase trace
     lags the belt by 1.2-1.7 s) lost variance at every lead tried.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     f0 = float(np.median(rate_f))
     xb = _bandpass(x, 0.6 * f0, 1.6 * f0, fs)
     return np.unwrap(np.angle(signal.hilbert(xb)))
@@ -451,7 +474,7 @@ def respiration_volume(
     Depth is the envelope of the band-passed respiratory trace (Hilbert magnitude),
     rate the tracked fundamental -- the same quantity as Birn's (max - min)/period.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     f0 = float(np.median(rate_f))
     xb = _bandpass(x, 0.6 * f0, 1.6 * f0, fs)
     env = np.abs(signal.hilbert(xb))
@@ -484,13 +507,14 @@ def slice_regressors(
     """Per-slice RETROICOR + RVT regressors, AFNI ``slibase`` layout (slice-major).
 
     For slice ``k`` of volume ``f`` the regressors are evaluated at that slice's own
-    acquisition time, which is exactly one of the excitation samples -- so no
-    interpolation in time is involved. Columns per slice, matching ``physio_calc.py``:
+    acquisition time. Rates and cycle phases are estimated on the traces resampled to
+    an even grid, then read back at each excitation's true time. Columns per slice,
+    matching ``physio_calc.py``:
     ``rvt00..rvtNN, card.c1, card.s1, card.c2, card.s2, resp.c1, resp.s1, resp.c2,
     resp.s2``. Returns ``(matrix (nt, nslices*m), column labels, diagnostics)``.
     """
-    t_c, x_c = traces.series(card_from)
-    t_r, x_r = traces.series(resp_from)
+    t_c, x_c = traces.series(card_from, uniform=True)
+    t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
     harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
     if card_from == "magnitude":
@@ -502,15 +526,15 @@ def slice_regressors(
     rv = _depth_rvt(traces, t_r, x_r, rt, rf)
 
     nt, G = traces.times.shape
-    order_idx = np.argsort(traces.times.ravel(), kind="stable")
-    rank = np.empty_like(order_idx)
-    rank[order_idx] = np.arange(order_idx.size)
+    t_true = traces.times  # (nt, G): each excitation's own acquisition time
 
-    def per_excitation(v: np.ndarray) -> np.ndarray:  # series in time order -> (nt, G)
-        return v[rank].reshape(nt, G)
+    def per_excitation(tu: np.ndarray, v: np.ndarray, shift: float = 0.0) -> np.ndarray:
+        """A series on the even grid ``tu``, read at every excitation's true time."""
+        return np.interp(t_true.ravel() - shift, tu, v).reshape(nt, G)
 
-    pc, pr, rvx = per_excitation(phi_c), per_excitation(phi_r), per_excitation(rv)
-    rv_shifted = [per_excitation(np.interp(t_r - s, t_r, rv)) for s in rvt_shifts]
+    pc, pr = per_excitation(t_c, phi_c), per_excitation(t_r, phi_r)
+    rvx = per_excitation(t_r, rv)
+    rv_shifted = [per_excitation(t_r, rv, s) for s in rvt_shifts]
     labels_one = [f"rvt{i:02d}" for i in range(len(rvt_shifts))]
     labels_one += [f"card.{cs}{m}" for m in range(1, order + 1) for cs in ("c", "s")]
     labels_one += [f"resp.{cs}{m}" for m in range(1, order + 1) for cs in ("c", "s")]
@@ -595,7 +619,7 @@ def choose_source(
     for which in ("magnitude", "phase"):
         if which == "phase" and traces.phase is None:
             continue
-        t, x = traces.series(which)
+        t, x = traces.series(which, uniform=True)
         scores[which] = track_rate(t, x, band, window)[2]
     if traces.phase is None:
         return "magnitude", scores
@@ -740,7 +764,7 @@ def find_beats(
     Used for the beat-to-beat cardiac phase and heart rate. ``f0`` (Hz) is the
     run's rate; estimated from the whole-run spectrum when not given.
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     if f0 is None:
         xb = _bandpass(x, band[0], band[1], fs)
         f, P = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
@@ -808,7 +832,7 @@ def respiration_phase_histogram(t: np.ndarray, x: np.ndarray, bins: int = 100) -
     0.98 (0.99 on its own filtered trace). For a data-derived trace the Hilbert phase
     explained more variance (:func:`cycle_phase`).
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     sos = signal.butter(2, [0.05, min(1.0, 0.45 * fs)], btype="band", fs=fs, output="sos")
     r = signal.sosfiltfilt(sos, x - x.mean())
     r = r - r.min()
@@ -829,7 +853,7 @@ def breath_rvt(t: np.ndarray, x: np.ndarray, rate_hz: float) -> tuple[np.ndarray
     physio_calc agree only at r = 0.62 on the same recording, so there is no single
     reference to match; this is the classic definition. Returns (peak times, RVT).
     """
-    fs = 1.0 / float(np.median(np.diff(t)))
+    fs = _fs(t)
     sos = signal.butter(2, [0.05, min(1.0, 0.45 * fs)], btype="band", fs=fs, output="sos")
     xb = signal.sosfiltfilt(sos, x - x.mean())
     dist = max(1, int(0.6 * fs / rate_hz))
@@ -870,8 +894,8 @@ def model_from_traces(
     traces: ExcitationTraces, card_from: str = "magnitude", resp_from: str = "phase"
 ) -> PhysioModel:
     """The model from the data's excitation-rate traces (cardiac notched at k/TR)."""
-    t_c, x_c = traces.series(card_from)
-    t_r, x_r = traces.series(resp_from)
+    t_c, x_c = traces.series(card_from, uniform=True)
+    t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
     harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
     if card_from == "magnitude":

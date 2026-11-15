@@ -1725,7 +1725,7 @@ def physio_rates_figure(
     from scipy import signal
 
     def bandpass(t, x, lo, hi):
-        fs = 1.0 / float(np.median(np.diff(t)))
+        fs = (len(t) - 1) / float(t[-1] - t[0])
         sos = signal.butter(2, [lo, min(hi, 0.45 * fs)], btype="band", fs=fs, output="sos")
         return signal.sosfiltfilt(sos, x - x.mean())
 
@@ -1738,7 +1738,7 @@ def physio_rates_figure(
         axes = fig.subplots(3, 1)
         for ax, (name, band, _col) in zip(axes[:2], spec, strict=True):
             t, x = series[name]
-            fs = 1.0 / float(np.median(np.diff(t)))
+            fs = (len(t) - 1) / float(t[-1] - t[0])
             win = 20.0 if name == "cardiac" else 40.0  # 40 s resolves breathing to 1.5/min
             f, tt, S = signal.spectrogram(
                 x - x.mean(), fs=fs, nperseg=int(win * fs), noverlap=int((win - 2) * fs)

@@ -165,7 +165,7 @@ def _qc_figure(path: Path, traces, sources: dict, diag: dict) -> None:
     """The standalone PREFIX.qc.png: the same rates figure -qc puts in its folder."""
     from fastfuncstuff.qc import checks, render
 
-    series = {k: traces.series(sources[k]) for k in ("cardiac", "respiration")}
+    series = {k: traces.series(sources[k], uniform=True) for k in ("cardiac", "respiration")}
     rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
     render.save_png(checks.physio_rates_figure(series, rates, sources), path)
 
@@ -190,8 +190,8 @@ def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -
     mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
     maps = physio.explained_maps(mag, X, tr, groups, device=device, mask=mask)
     series = {
-        "cardiac": traces.series(sources["cardiac"]),
-        "respiration": traces.series(sources["respiration"]),
+        "cardiac": traces.series(sources["cardiac"], uniform=True),
+        "respiration": traces.series(sources["respiration"], uniform=True),
     }
     rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
     rec.info["input"] = str(args.input)

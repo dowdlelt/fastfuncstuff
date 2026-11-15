@@ -19,21 +19,25 @@ F_CARD = 1.15  # Hz: aliased to 0.15 Hz at the 1 Hz volume rate
 F_RESP = 0.25
 
 
-def _mb_slice_times(nz: int, mb: int) -> np.ndarray:
-    """Interleaved multiband timing: slice k and k + nz/mb share an excitation."""
+def _mb_slice_times(nz: int, mb: int, fill: float = 1.0) -> np.ndarray:
+    """Interleaved multiband timing: slice k and k + nz/mb share an excitation. The
+    excitations span ``fill`` of the TR, leaving a gap before the next volume, as real
+    sequences do (TASKFORCE: 17 excitations 0.0575-0.06 s apart, then 0.08 s)."""
     n_exc = nz // mb
     order = list(range(0, n_exc, 2)) + list(range(1, n_exc, 2))
     st = np.zeros(nz)
     for pos, g in enumerate(order):
         for m in range(mb):
-            st[g + m * n_exc] = pos * TR / n_exc
+            st[g + m * n_exc] = pos * fill * TR / n_exc
     return st
 
 
-def _synthetic_run(nt=240, shape=(12, 12, 20), mb=2, card=0.01, resp=0.15, noise=0.01, seed=0):
+def _synthetic_run(
+    nt=240, shape=(12, 12, 20), mb=2, card=0.01, resp=0.15, noise=0.01, seed=0, fill=1.0
+):
     rng = np.random.default_rng(seed)
     nx, ny, nz = shape
-    st = _mb_slice_times(nz, mb)
+    st = _mb_slice_times(nz, mb, fill)
     t = np.arange(nt)[None, :] * TR + st[:, None]  # (nz, nt) acquisition times
     base = 100.0 + 20.0 * rng.random(shape)
     heart = card * np.cos(2 * np.pi * F_CARD * t)  # fractional
@@ -71,6 +75,24 @@ def test_heart_rate_comes_from_the_excitation_rate_not_the_aliased_volume_rate()
     _, f_resp, _ = physio.track_rate(t, x, physio.RESP_BAND, 40.0)
     assert abs(np.median(f_card) - F_CARD) < 0.02
     assert abs(np.median(f_resp) - F_RESP) < 0.02
+
+
+def test_rates_are_right_when_excitations_leave_a_gap_in_the_tr():
+    """Excitations packed into 90 % of the TR: read as evenly spaced at 1/median spacing
+    the series runs 10 % slow, and every frequency comes out 10 % low (2 % on TASKFORCE,
+    1.3-1.7/min under the reviewed beats). Rates must come out at the true frequencies,
+    and the cardiac regressor must still fit each slice's own heartbeat."""
+    mag, ph, st, t = _synthetic_run(nt=240, fill=0.9)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    X, _, diag = physio.slice_regressors(tr_, "magnitude", "phase")
+    assert abs(np.median(diag["cardiac_rate_hz"][1]) - F_CARD) < 0.01
+    assert abs(np.median(diag["respiration_rate_hz"][1]) - F_RESP) < 0.01
+    k = int(np.argmax(st))  # the last excitation, next to the gap
+    heart = np.cos(2 * np.pi * F_CARD * t[k])
+    card = X[:, k * 13 + 5 : k * 13 + 7]
+    A = np.column_stack([np.ones(len(heart)), card])
+    fit = A @ np.linalg.lstsq(A, heart, rcond=None)[0]
+    assert np.corrcoef(fit, heart)[0, 1] > 0.9
 
 
 def test_regressors_explain_the_signal_each_slice_actually_carried():
