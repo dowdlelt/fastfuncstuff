@@ -22,14 +22,14 @@ regenerates all of it from the public dataset.
 
 ## At a glance
 
-On the 37,707 vertices both tools fit with R² > 20%:
+On the 37,710 vertices both tools fit with R² > 20%:
 
 | claim | result |
 |---|---|
-| Same receptive fields as analyzePRF | polar angle: circular r = 0.996, median difference 0.33°. Position: median difference 0.68 px of a 100 px aperture; x / y / eccentricity r = 0.997 / 0.996 / 0.990 on the aperture. rfsize: r(log) = 0.93, median ratio 1.00 |
-| Same optimum (scored by one independent float64 evaluator) | median R² difference 0.000. Within half an R² point on 90% of vertices; `ffs_pyrf` better by more than that on 7.5%, worse on 2.7% |
+| Same receptive fields as analyzePRF | polar angle: circular r = 0.996, median difference 0.34°. Position: median difference 0.70 px of a 100 px aperture; x / y / eccentricity r = 0.997 / 0.996 / 0.990 on the aperture. rfsize: r(log) = 0.93, median ratio 1.00 |
+| Same optimum (scored by one independent float64 evaluator) | median R² difference 0.000. Within half an R² point on 90% of vertices; `ffs_pyrf` better by more than that on 7.9%, worse on 2.6% |
 | Agrees with a third toolbox (vistasoft) as well as analyzePRF does | angle circular r 0.987 vs 0.990; eccentricity r 0.983 vs 0.987 (V1–V3) |
-| Speed, same 52,932 vertices | analyzePRF 4.1 h on 6 CPU workers; `ffs_pyrf` 356 s on one GPU, **42× faster** |
+| Speed, same 52,932 vertices | analyzePRF 4.1 h on 6 CPU workers; `ffs_pyrf` 254 s on one GPU, **58× faster** |
 | HRF library (the `ffs_pyrf` default) | held-out R² +6.5 points (median), better on 84% of responsive vertices; 75% of the noise ceiling, against 56% with the canonical HRF |
 | Library + denoising | held-out R² +8.5 points, better on 92%; 79% of the noise ceiling. Receptive-field sizes 0.91× vistasoft's, against about 0.65× with the canonical HRF |
 
@@ -142,12 +142,12 @@ an inference: the dataset does not document it.
 On the same vertices, `ffs_pyrf` and analyzePRF put receptive fields in the same
 places:
 
-- polar angle: circular r = 0.996, median difference 0.33°;
-- position: median difference 0.68 pixels of a 100-pixel aperture;
-- eccentricity: median difference 0.50 px.
+- polar angle: circular r = 0.996, median difference 0.34°;
+- position: median difference 0.70 pixels of a 100-pixel aperture;
+- eccentricity: median difference 0.51 px.
 
-Agreement tightens as fits get better. At R² > 50% (9,800 vertices), the median angle
-difference is 0.16° and the median position difference 0.47 px. rfsize agrees too
+Agreement tightens as fits get better. At R² > 50% (9,803 vertices), the median angle
+difference is 0.17° and the median position difference 0.47 px. rfsize agrees too
 (r(log) = 0.93, median ratio 1.00). The exponent agrees least (r(log) = 0.78), which
 is expected, not a defect:
 [*Size and exponent*](#size-and-exponent-what-the-data-can-and-cannot-pin-down) shows
@@ -155,13 +155,17 @@ how flat the objective is along `n`.
 
 On the common yardstick the two tools reach the same optimum: the median R²
 difference is 0.000, and 90% of vertices are within half an R² point.
-`ffs_pyrf` finds the better fit by more than half a point on 7.5% of vertices;
-analyzePRF does on 2.7%. Large gaps are rare either way. By each tool's own R²,
-`ffs_pyrf` is better by more than 3 points on 351 vertices and worse on 32 (0.1%).
+`ffs_pyrf` finds the better fit by more than half a point on 7.9% of vertices;
+analyzePRF does on 2.6%. Large gaps are rare either way. By each tool's own R²,
+`ffs_pyrf` is better by more than 3 points on 360 vertices and worse on 19 (0.05%).
+Fifteen of those 19 are receptive fields smaller than a pixel (sigma 0.03–0.27 px) that
+landed one pixel-scale step from analyzePRF's. Below a pixel the model samples the
+stimulus at a single point, and its position landscape is jagged enough to stop any
+local optimiser.
 
 ![Parity scatter](prf_validation/fig3_parity.png)
 
-*Figure 3. `ffs_pyrf` (y) against analyzePRF (x) on the 37,707 vertices both fit with
+*Figure 3. `ffs_pyrf` (y) against analyzePRF (x) on the 37,710 vertices both fit with
 R² > 20%. Panels: x, y, polar angle (circular), eccentricity, rfsize and exponent (log),
 R². Linear-panel r is computed on the plotted range (see below). The last panel is the
 per-vertex R² difference on the independent evaluator, with the end bins collecting
@@ -173,10 +177,10 @@ exponent (0.125 or 0.5).*
 
 *Figure 4. Data (mean of runs) and both tools' predictions at vertices at the 97th,
 75th and 50th percentiles of analyzePRF's R², and (bottom) the vertex where the tools
-disagree most of all 37,707. The insets show both receptive fields (±1 rfsize) on the
-aperture. In the top three the predictions are indistinguishable. The bottom vertex is
-the worst case for `ffs_pyrf`: it settled on a large receptive field covering most of
-the screen (R² 31%) where analyzePRF found a smaller one at the upper-left edge (52%).*
+disagree most of all 37,710. The insets show both receptive fields (±1 rfsize) on the
+aperture. In the top three the predictions are indistinguishable. In the bottom one
+`ffs_pyrf` fits better (32% against 25%) with a receptive field at the right edge of
+the aperture. analyzePRF's centre is off the screen, outside the inset.*
 
 ![Maps](prf_validation/fig5_maps.png)
 
@@ -213,7 +217,7 @@ width beyond each edge. Further out, only the far tail of the Gaussian touches t
 display, and the data stop constraining where its centre is.
 
 Pearson r is dominated by those few far-out centres: x / y / eccentricity r is 0.75 /
-0.74 / 0.66 with them included. So the figures above use the 25,542 vertices whose
+0.74 / 0.66 with them included. So the figures above use the 25,541 vertices whose
 centres are on the aperture in both tools (r = 0.997 / 0.996 / 0.990). Rank
 correlations over all vertices tell the same story (Spearman 0.996 / 0.990 / 0.975).
 
@@ -261,20 +265,21 @@ shape how to read it.
 **1. The exponent is barely constrained.** For the vertices where the two tools'
 rfsize disagrees most (among those with R² > 40%), `ffs_pyrf` refit each one at fixed
 exponents across the whole range. At each step it re-optimises position and size
-(figure 7). In four of these six vertices, R² stays within 0.1 points over a 14- to
-2,000-fold range of `n`, and both tools' answers sit on that plateau. The other two
-have a clear peak, which `ffs_pyrf` found and analyzePRF missed. Across all vertices,
-rfsize agreement is only modestly better where `ffs_pyrf`'s own split-half sizes are
-stable (73% within 1.5× of analyzePRF) than where they are not (63%), and in both
-groups the median R² gap between the tools is under 0.1 points.
+(figure 7). In five of these six vertices, R² stays within 0.1 points over a 38- to
+1,400-fold range of `n`, and the tools' rfsize answers differ by up to 1,500× while
+their R² differs by about a point or less. Across all vertices, rfsize agreement is
+only modestly better where `ffs_pyrf`'s own split-half sizes are stable (73% within
+1.5× of analyzePRF) than where they are not (62%), and in both groups the median R²
+gap between the tools is under 0.1 points.
 
 ![Identifiability](prf_validation/fig8_identifiability.png)
 
 *Figure 7. R² at fixed exponent (each point re-optimises position and size) for the
 six vertices with the largest rfsize disagreement and two that agree (bottom right
 pair). The grey band is within 0.1 points of the best; markers are each tool's own
-answer. Several curves are flat across decades of `n`. Jagged profiles are local
-optima in the refit itself and do not change the reading.*
+answer. Most curves are flat across decades of `n`. Jagged profiles (vertex 14031) are
+local optima in the refit itself and do not change the reading. Several of these
+disagreements are sub-pixel sizes (0.001–0.7 px) in one tool or both.*
 
 **2. Most well-fit vertices sit at very small exponents.** 49% of the vertices in the
 parity comparison have `n` < 0.01 in one tool or both (figure 8). This is not frozen
@@ -355,8 +360,20 @@ optimiser move further into the small-`n` regime, where float32 is fitting the
 wrong function. The two fixes only pay off together. Damping changes and computing
 only the SSE in float64 recovered almost nothing (−0.038 and −0.040). The probe was
 deliberately hard: 83% of its vertices had `n` < 0.01, against 49% of the full set.
-On the full set, vertices with `n` ≥ 0.01 in both tools (19,336) have a median R²
+On the full set, vertices with `n` ≥ 0.01 in both tools (19,087) have a median R²
 difference of −0.0004, and the small-`n` vertices +0.05 in `ffs_pyrf`'s favour.
+
+**A NaN in the exponent derivative.** The full comparison then exposed a third bug. A
+receptive field whose overlap with a frame is a float64 denormal (about 1e-323)
+underflows to a drive of exactly 0 once normalised, and the exponent derivative formed
+`0 · log 0 = NaN`. One NaN frame made the vertex's whole Gauss-Newton step NaN, so
+every trial was rejected and the float64 polish kept the float32 answer. float32 had
+chosen a sigma 1.5–2× too large, because its earlier underflow edge makes a wide
+Gaussian behave like a narrower one. Those were the worst parity fits: exponent at the
+floor, rfsize roughly double analyzePRF's, up to 21 R² points behind. Masking the
+derivative on the drive rather than the field fixed them (vertices more than 3 points
+behind: 34 → 19), and a regression test covers it. The numbers on this page are from
+the fixed code.
 
 **An exact alternative, tested and not adopted.** The float range dependence can be
 removed entirely by computing the drive in log space (a log-sum-exp over stimulated
@@ -383,7 +400,7 @@ which loads all 384,042 vertices, screens them and fits the 52,932 that pass.*
 | run | vertices | wall time |
 |---|---|---|
 | analyzePRF, 6 CPU workers | 52,932 | 14,798 s (4.1 h; 0.28 s per vertex) |
-| `ffs_pyrf`, same vertices, canonical HRF, no cross-validation | 52,932 | 356 s |
+| `ffs_pyrf`, same vertices, canonical HRF, no cross-validation | 52,932 | 254 s |
 | `ffs_pyrf`, whole cortex from raw surfaces, including the screen | 384,042 loaded, 52,932 fit | 305 s |
 
 The `ffs_pyrf` times are whole-tool times, including I/O. The options cost time but
@@ -391,10 +408,10 @@ stay in minutes. With `-xval halves` on the screened set, which fits the data th
 times (full data and both halves), the times are: canonical HRF 741 s, HRF library
 1,256 s, canonical + denoise 973 s, library + denoise 1,355 s.
 
-All timings were taken with the CPU shared with other work, so analyzePRF would be
-somewhat faster on an idle machine. The parity fit and the whole-cortex fit do the
-same refinement work on the same vertices; their 51 s difference is most likely that
-noise.
+Timings were taken with the CPU shared with other work at times, so analyzePRF would
+be somewhat faster on an idle machine. The whole-cortex time (305 s) was measured
+during heavier load than the parity fit (254 s), which does the same refinement on the
+same vertices.
 
 ## What the extra options change
 
@@ -534,7 +551,8 @@ scripts/prf_validation/run.sh            # downloads, fits, figures
 ```
 
 Needs the AWS CLI (anonymous S3 access), MATLAB with the Parallel Computing Toolbox,
-and analyzePRF. analyzePRF dominates the runtime (about 4 hours on 6 workers). Each
+and analyzePRF. Data go under `$FFS_BENCHMARK_DATA_DIR` (default: the repository's
+`test_data/`). analyzePRF dominates the runtime (about 4 hours on 6 workers). Each
 `ffs_pyrf` fit takes minutes on a GPU. Steps whose output already exists are skipped.
 
 ## Limits
@@ -545,8 +563,11 @@ and analyzePRF. analyzePRF dominates the runtime (about 4 hours on 6 workers). E
   drops are compared only against vistasoft.
 - Timings were taken with the CPU shared with other work.
 - The noise ceiling relies on all runs showing an identical stimulus.
-- A small set of vertices land in a worse local optimum than analyzePRF's (0.1% by
-  more than 3 R² points; figure 4, bottom).
+- The four option variants and the whole-cortex timing were fit before the NaN fix
+  above. It affects few vertices outside the canonical-HRF small-`n` regime, but those
+  runs have not been redone.
+- 19 vertices (0.05%) land in a worse local optimum than analyzePRF's by more than 3
+  R² points, almost all of them sub-pixel receptive fields.
 - On Metal (MPS), small-exponent fits are float32 and do not match analyzePRF there
   (see above).
 

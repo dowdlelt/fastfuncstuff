@@ -31,7 +31,7 @@ fetch $SUB/$SES/func/${SUB}_${SES}_task-prf_acq-PA_run-01_bold.json
 for h in lh rh; do
   fetch derivatives/ROIs/$SUB/$h.ROIs_V1-4.mgz
   for m in angle eccen sigma vexpl x y; do fetch derivatives/prfanalyze-vista/$SUB/$SES/$h.$m.mgz; done
-  for s in inflated sulc curv; do fetch derivatives/freesurfer/$SUB/surf/$h.$s; done
+  for s in white pial sphere sulc; do fetch derivatives/freesurfer/$SUB/surf/$h.$s; done
 done
 
 # 2. Same numbers for both tools: GIfTI series + the .mat aperture as .npy.
