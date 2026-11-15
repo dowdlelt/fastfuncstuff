@@ -331,6 +331,23 @@ def test_fortran_ordered_integer_series_give_the_same_traces_maps_and_cleaning()
     assert np.corrcoef(cb[2, 9, 5], mag_i[2, 9, 5])[0, 1] > 0.5
 
 
+def test_a_global_phase_step_does_not_drop_the_brain_from_the_phase_trace():
+    """One TASKFORCE run's whole-head phase stepped by 2.4 rad at 70 % of the run (a
+    head movement or frequency adjustment). Against each voxel's whole-run mean
+    phasor every voxel then failed the stability cut, the trace came from 0.3 % of the
+    brain, and its breath depth was noise. Against a running mean the step costs a
+    transient, and breathing is still read everywhere."""
+    mag, ph, st, t = _synthetic_run(nt=300, resp=0.3)
+    step = np.where(np.arange(300) >= 210, 2.4, 0.0) * (4096 / np.pi)
+    ph = np.angle(np.exp(1j * (ph + step) * (np.pi / 4096))) * (4096 / np.pi)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph.astype(np.float32), device=CPU)
+    assert tr_.phase is not None
+    tt, x = tr_.series("phase")
+    breath = np.sin(2 * np.pi * F_RESP * tt)
+    away = np.abs(tt - 210 * TR) > 40  # outside the running mean's transient
+    assert np.corrcoef(x[away], breath[away])[0, 1] > 0.9
+
+
 def test_unique_r2_from_projections_matches_nested_least_squares():
     """explained_maps uses projections onto a drift-orthogonal basis instead of a
     least-squares solve per model; it must still be the nested-model unique R^2,

@@ -127,6 +127,16 @@ def _put_slice_rows(out: np.ndarray, k: int, rows: torch.Tensor) -> None:
     out[:, :, k, :] = host.reshape(nt, ny, nx).transpose(2, 1, 0)
 
 
+def _running_mean(z: torch.Tensor, n: int) -> torch.Tensor:
+    """Centred running mean of length ``n`` (odd) along the last axis, the window
+    shortened at the ends."""
+    h = n // 2
+    c = torch.cat([torch.zeros_like(z[:, :1]), z.cumsum(1)], 1)
+    idx = torch.arange(z.shape[1], device=z.device)
+    hi, lo = (idx + h + 1).clamp_max(z.shape[1]), (idx - h).clamp_min(0)
+    return (c[:, hi] - c[:, lo]) / (hi - lo).to(z.real.dtype)
+
+
 def trailing_noise_volumes(mean_per_volume: np.ndarray, frac: float = 0.2) -> int:
     """Count volumes at the end of a run whose mean signal collapses.
 
@@ -158,6 +168,7 @@ def excitation_traces(
     stability: float = 0.7,
     comb: bool = True,
     voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    reference_s: float = 60.0,
 ) -> ExcitationTraces:
     """One physiological sample per (volume, excitation).
 
@@ -174,14 +185,18 @@ def excitation_traces(
         Voxels to average. Default: brighter than a quarter of the 98th percentile
         of the mean image.
     stability : float
-        Phase voxels must have a mean phasor magnitude above this (their phase is
-        steady enough over the run for a change to be read).
+        Phase voxels must have a running-mean phasor (``reference_s`` window) whose
+        magnitude averages above this: steady enough for a change to be read. Slow
+        drift and one-off steps do not count against a voxel.
+    reference_s : float
+        Window (s) of the running-mean phasor each voxel's phase change is read
+        against.
 
     Notes
     -----
     Magnitude: each voxel's mean and Legendre drift are removed and the residual
     divided by its mean, then averaged over the excitation's voxels. Phase: each
-    voxel's change against its own temporal complex mean, ``angle(z_t * conj(zbar))``,
+    voxel's change against its own running-mean phasor, ``angle(z_t * conj(zref_t))``,
     drift removed, averaged with weight ``mean magnitude**2`` (phase noise scales as
     1/magnitude).
     """
@@ -194,6 +209,7 @@ def excitation_traces(
         thr = 0.25 * np.percentile(mean_img[mean_img > 0], 98)
         mask = mean_img > thr
     deg = _drift_degree(nt, tr)
+    ref_len = min(nt, max(3, int(round(reference_s / tr)) | 1))
     L = construct_polynomial_matrix(nt, deg, device=device)
     proj = L @ plinalg.pinv(L)  # (nt, nt) projector onto the drift space
     per_slice_m = np.zeros((nt, nz))
@@ -233,11 +249,16 @@ def excitation_traces(
             p = _slice_rows(phase, k, device)[sel]
             p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
             z = torch.polar(torch.ones_like(p), p)
-            zbar = z.mean(1)
-            keep = zbar.abs() > stability
+            # Each voxel against its own running-mean phasor, not its whole-run mean:
+            # a global phase step (a head movement, a frequency adjustment) left every
+            # voxel's run mean below the stability cut and dropped 99.7 % of the brain
+            # on one TASKFORCE run. Breathing is far faster than the window and passes.
+            zref = _running_mean(z, ref_len)
+            keep = zref.abs().mean(1) > stability
             if int(keep.sum()) < 20:
                 continue
-            dphi = torch.angle(z[keep] * torch.conj(zbar[keep] / zbar[keep].abs())[:, None])
+            zr = zref[keep]
+            dphi = torch.angle(z[keep] * torch.conj(zr / zr.abs().clamp_min(1e-6)))
             dphi = dphi - dphi @ proj.T
             w = mu[keep] ** 2
             per_slice_p[:, k] = ((w[:, None] * dphi).sum(0) / w.sum()).cpu().numpy()
