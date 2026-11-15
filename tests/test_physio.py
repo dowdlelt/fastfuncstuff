@@ -246,6 +246,19 @@ def test_cardiac_at_tzero_survives_slice_timing():
         assert 1 - (r1 @ r1) / (r0 @ r0) > 0.5, k
 
 
+def test_breathing_rate_is_not_captured_by_slow_power_at_the_band_edge():
+    """Task blocks put slow power near 0.1 Hz -- the respiratory band's floor. With twice
+    the breathing amplitude there, a plain periodogram argmax picked the floor (6/min) on
+    TASKFORCE task runs; the rate must still come out at the breathing frequency."""
+    fs = 17.0
+    t = np.arange(0, 400, 1 / fs)
+    rng = np.random.default_rng(0)
+    x = np.sin(2 * np.pi * 0.25 * t) + 2.0 * np.sin(2 * np.pi * 0.105 * t + 0.3)
+    x += 0.2 * rng.standard_normal(t.size)
+    _, rate, _ = physio.peak_rate(t, x, physio.RESP_BAND)
+    assert abs(np.median(rate) - 0.25) < 0.02, np.median(rate) * 60
+
+
 def test_response_functions_have_their_published_shapes():
     """Birn 2008 RRF peaks near 3 s and undershoots near 14 s; Chang 2009 CRF peaks
     near 4 s and undershoots near 12 s -- a typo in a constant moves these."""

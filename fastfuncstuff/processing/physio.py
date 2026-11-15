@@ -386,12 +386,17 @@ def peak_rate(
     near 10.7. Counting peaks of the trace band-passed around the run's own rate is
     what physio_calc.py does on the belt. Returns (interval mid-times, rates in Hz,
     whole-run peak prominence).
+
+    The run's rate, which sets the band the peaks are counted in, is the peak of the
+    derivative's spectrum (power x f^2): a plain argmax let slow power at the band's low
+    edge (task blocks, 1/f drift) win, and on two TASKFORCE task runs whose phase trace
+    was coherent with the belt (1.00) it reported 6/min against 15-17 true.
     """
     fs = 1.0 / float(np.median(np.diff(t)))
     xb = _bandpass(x, band[0] * 0.8, band[1] * 1.2, fs)
     f_all, P_all = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
     inb = (f_all >= band[0]) & (f_all <= band[1])
-    f0 = float(f_all[inb][np.argmax(P_all[inb])])
+    f0 = float(f_all[inb][np.argmax((P_all * f_all**2)[inb])])
     prominence = float(P_all[inb].max() / np.median(P_all[inb]))
     xc = _bandpass(x, 0.6 * f0, 1.6 * f0, fs)
     pk, _ = signal.find_peaks(xc, distance=max(1, int(0.6 * fs / f0)), prominence=0.3 * xc.std())
