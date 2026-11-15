@@ -347,6 +347,28 @@ def main() -> None:
             float(np.nanquantile(lib_hrf[good], 0.75)),
         ],
     }
+    # Size and exponent per variant, on vertices well fit by all four: whether the HRF
+    # (not precision) drives the sub-pixel sizes, and how reproducible rfsize is per vertex.
+    all_good = fit_mask & np.logical_and.reduce(
+        [np.isfinite(fits[n]["r2"]) & (fits[n]["r2"] > 0.2) for n, _, _ in VARIANTS]
+    )
+    numbers["size_exponent"] = {}
+    for name, label, _ in VARIANTS:
+        f = fits[name]
+        rel = load_bucket(work / f"{name}_reliability")
+        stats = {}
+        for area, m in (("all", all_good), ("V1-V3", all_good & (roi >= 1) & (roi <= 3))):
+            change = rel["abs_delta_rfsize"][m] / f["rfsize"][m]
+            stats[area] = {
+                "n": int(m.sum()),
+                "exponent_below_0.01": float(np.mean(f["exponent"][m] < 0.01)),
+                "exponent_median": float(np.median(f["exponent"][m])),
+                "rfsize_below_1px": float(np.mean(f["rfsize"][m] < 1)),
+                "rfsize_median_px": float(np.median(f["rfsize"][m])),
+                "split_half_rfsize_change_median": float(np.nanmedian(change)),
+                "split_half_rfsize_stable_frac": float(np.nanmean(change < 0.25)),
+            }
+        numbers["size_exponent"][label] = stats
     fig, axes = plt.subplots(1, 4, figsize=(13, 3.3))
     for ax, key, lim, log in (
         (axes[0], "eccentricity", (0, 50), False),

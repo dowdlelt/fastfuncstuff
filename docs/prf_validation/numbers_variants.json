@@ -1,0 +1,252 @@
+{
+  "n_fit": 52913,
+  "ffs_canon_dn": {
+    "components": 2,
+    "pool": 234240,
+    "pool_in_v1v4_frac": 0.001250853825136612,
+    "v1v4_in_pool_frac": 0.013902728351126927
+  },
+  "ffs_lib_dn": {
+    "components": 2,
+    "pool": 234240,
+    "pool_in_v1v4_frac": 0.001250853825136612,
+    "v1v4_in_pool_frac": 0.013902728351126927
+  },
+  "xval": {
+    "canonical HRF": {
+      "median_xval_r2_responsive": 24.799582362174988,
+      "median_xval_r2_all": 20.3197181224823,
+      "median_frac_of_ceiling_responsive": 0.5574366968921647
+    },
+    "HRF library": {
+      "median_xval_r2_responsive": 35.42339503765106,
+      "median_xval_r2_all": 30.9975266456604,
+      "median_delta_responsive": 6.492871046066284,
+      "frac_improved_responsive": 0.839464293581215,
+      "median_delta_v1v3": 6.299805641174316,
+      "median_frac_of_ceiling_responsive": 0.7534580686613461
+    },
+    "canonical + denoise": {
+      "median_xval_r2_responsive": 26.776626706123352,
+      "median_xval_r2_all": 22.350382804870605,
+      "median_delta_responsive": 0.7731795310974121,
+      "frac_improved_responsive": 0.6445438125027534,
+      "median_delta_v1v3": 1.4998078346252441,
+      "median_frac_of_ceiling_responsive": 0.5888900008023819
+    },
+    "library + denoise": {
+      "median_xval_r2_responsive": 37.908926606178284,
+      "median_xval_r2_all": 33.496564626693726,
+      "median_delta_responsive": 8.467134833335876,
+      "frac_improved_responsive": 0.920128640028195,
+      "median_delta_v1v3": 9.07202661037445,
+      "median_frac_of_ceiling_responsive": 0.794135110608024
+    }
+  },
+  "n_responsive": 45398,
+  "reliability": {
+    "canonical HRF": {
+      "x": 0.987944,
+      "y": 0.953751,
+      "eccentricity": 0.9632,
+      "angle": 0.780565,
+      "rfsize": 0.959341,
+      "threshold": 0.2,
+      "n": 37919
+    },
+    "HRF library": {
+      "x": 0.988826,
+      "y": 0.957177,
+      "eccentricity": 0.971369,
+      "angle": 0.919893,
+      "rfsize": 0.96191,
+      "threshold": 0.2,
+      "n": 42596
+    },
+    "canonical + denoise": {
+      "x": 0.987564,
+      "y": 0.957206,
+      "eccentricity": 0.955402,
+      "angle": 0.860646,
+      "rfsize": 0.955262,
+      "threshold": 0.2,
+      "n": 38827
+    },
+    "library + denoise": {
+      "x": 0.98884,
+      "y": 0.961654,
+      "eccentricity": 0.965627,
+      "angle": 0.947887,
+      "rfsize": 0.952823,
+      "threshold": 0.2,
+      "n": 43741
+    }
+  },
+  "param_change": {
+    "n": 37867,
+    "angle_median_abs_deg": 2.7021942138671875,
+    "ecc_r": 0.646218651490152,
+    "rfsize_median_ratio": 0.9616296761437378,
+    "rfsize_r_log": 0.7796867130623226
+  },
+  "outside_aperture_frac": {
+    "canonical HRF": 0.3137560408799218,
+    "HRF library": 0.147225816674149,
+    "canonical + denoise": 0.3282277444740803,
+    "library + denoise": 0.14661842765468613
+  },
+  "outside_aperture_by_area": {
+    "canonical HRF": {
+      "V1": 0.011235955056179775,
+      "V2": 0.02262269938650307,
+      "V3": 0.023504831548707233,
+      "hV4": 0.3722176422093982,
+      "beyond V1-hV4": 0.5032415672272855
+    },
+    "HRF library": {
+      "V1": 0.006335010247810695,
+      "V2": 0.005534034311012728,
+      "V3": 0.0032737345756736337,
+      "hV4": 0.062099358974358976,
+      "beyond V1-hV4": 0.26628783394499034
+    },
+    "canonical + denoise": {
+      "V1": 0.010927914110429447,
+      "V2": 0.025280364949629347,
+      "V3": 0.023483870967741936,
+      "hV4": 0.4006568144499179,
+      "beyond V1-hV4": 0.5245247062026408
+    },
+    "library + denoise": {
+      "V1": 0.0063173541434411,
+      "V2": 0.0071612192434814545,
+      "V3": 0.0032410870107205184,
+      "hV4": 0.057120190400634666,
+      "beyond V1-hV4": 0.26947424282627647
+    }
+  },
+  "param_change_by_variant": {
+    "HRF library": {
+      "n": 37827,
+      "inside_n": 25611,
+      "position_shift_median_px": 1.8556650626841453,
+      "position_shift_p90_px": 8.50536315670639,
+      "ecc_signed_median_px": -1.131697177886963,
+      "ecc_r_inside": 0.9430258719186864,
+      "angle_median_abs_deg": 2.345733642578125,
+      "rfsize_median_ratio": 1.0796632995571256,
+      "flips_across_aperture_edge": 0.1847093346022682
+    },
+    "canonical + denoise": {
+      "n": 37631,
+      "inside_n": 24936,
+      "position_shift_median_px": 0.6388792410380291,
+      "position_shift_p90_px": 2.591976106689077,
+      "ecc_signed_median_px": 0.16280603408813477,
+      "ecc_r_inside": 0.9866593874556191,
+      "angle_median_abs_deg": 0.946533203125,
+      "rfsize_median_ratio": 1.0479833052732437,
+      "flips_across_aperture_edge": 0.03558236560282746
+    },
+    "library + denoise": {
+      "n": 37867,
+      "inside_n": 25579,
+      "position_shift_median_px": 2.095724507560756,
+      "position_shift_p90_px": 8.80779463870923,
+      "ecc_signed_median_px": -1.1375188827514648,
+      "ecc_r_inside": 0.935905860108138,
+      "angle_median_abs_deg": 2.558837890625,
+      "rfsize_median_ratio": 1.1652362616770988,
+      "flips_across_aperture_edge": 0.18863390287057333
+    }
+  },
+  "hrf_index": {
+    "median": 9.0,
+    "iqr": [
+      7.0,
+      12.0
+    ]
+  },
+  "size_exponent": {
+    "canonical HRF": {
+      "all": {
+        "n": 37593,
+        "exponent_below_0.01": 0.46117628281860984,
+        "exponent_median": 0.02125166542828083,
+        "rfsize_below_1px": 0.19695156013087542,
+        "rfsize_median_px": 13.512734413146973,
+        "split_half_rfsize_change_median": 0.3305345215888493,
+        "split_half_rfsize_stable_frac": 0.39959566940653846
+      },
+      "V1-V3": {
+        "n": 14134,
+        "exponent_below_0.01": 0.5699731144757323,
+        "exponent_median": 0.004780441522598267,
+        "rfsize_below_1px": 0.3567992075845479,
+        "rfsize_median_px": 3.0094882249832153,
+        "split_half_rfsize_change_median": 0.4915795246179543,
+        "split_half_rfsize_stable_frac": 0.2730295740766945
+      }
+    },
+    "HRF library": {
+      "all": {
+        "n": 37593,
+        "exponent_below_0.01": 0.6066554943739526,
+        "exponent_median": 0.004578492604196072,
+        "rfsize_below_1px": 0.03418189556566382,
+        "rfsize_median_px": 11.004644393920898,
+        "split_half_rfsize_change_median": 0.21664515966804815,
+        "split_half_rfsize_stable_frac": 0.5583220280371346
+      },
+      "V1-V3": {
+        "n": 14134,
+        "exponent_below_0.01": 0.76170935333239,
+        "exponent_median": 0.002129464060999453,
+        "rfsize_below_1px": 0.061978208575067216,
+        "rfsize_median_px": 5.604921817779541,
+        "split_half_rfsize_change_median": 0.21679652831796803,
+        "split_half_rfsize_stable_frac": 0.5726616669025046
+      }
+    },
+    "canonical + denoise": {
+      "all": {
+        "n": 37593,
+        "exponent_below_0.01": 0.4415183677812359,
+        "exponent_median": 0.03471899405121803,
+        "rfsize_below_1px": 0.17069667225281301,
+        "rfsize_median_px": 14.380454063415527,
+        "split_half_rfsize_change_median": 0.3502884784148735,
+        "split_half_rfsize_stable_frac": 0.38344904636501476
+      },
+      "V1-V3": {
+        "n": 14134,
+        "exponent_below_0.01": 0.5571671147587378,
+        "exponent_median": 0.0051214739214628935,
+        "rfsize_below_1px": 0.32241403707372296,
+        "rfsize_median_px": 3.8724076747894287,
+        "split_half_rfsize_change_median": 0.4778940015443819,
+        "split_half_rfsize_stable_frac": 0.2774869109947644
+      }
+    },
+    "library + denoise": {
+      "all": {
+        "n": 37593,
+        "exponent_below_0.01": 0.5809060197377172,
+        "exponent_median": 0.005149288568645716,
+        "rfsize_below_1px": 0.01585401537520283,
+        "rfsize_median_px": 11.371968269348145,
+        "split_half_rfsize_change_median": 0.2215669748666927,
+        "split_half_rfsize_stable_frac": 0.546697523475115
+      },
+      "V1-V3": {
+        "n": 14134,
+        "exponent_below_0.01": 0.7508843922456487,
+        "exponent_median": 0.0022737201070412993,
+        "rfsize_below_1px": 0.030635347389274092,
+        "rfsize_median_px": 5.925719261169434,
+        "split_half_rfsize_change_median": 0.20929139686137072,
+        "split_half_rfsize_stable_frac": 0.584052639026461
+      }
+    }
+  }
+}
