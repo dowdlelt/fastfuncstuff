@@ -303,6 +303,61 @@ def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
     assert 0.3 < float(np.median(removed)) < 1.0
 
 
+def test_fortran_ordered_integer_series_give_the_same_traces_maps_and_cleaning():
+    """A NIfTI series arrives Fortran-ordered and as stored integers (the CLI no longer
+    converts the whole run to float32); slices are copied in memory order and reordered
+    on the device, so every voxel must still land where it came from."""
+    mag, ph, st, _ = _synthetic_run(nt=160, shape=(10, 14, 20))
+    mag_i = np.round(mag * 50).astype(np.uint16)
+    ph_i = np.round(ph + 4096).astype(np.uint16)  # positive-slope copy of the raw phase
+    mag_f, ph_f = np.asfortranarray(mag_i), np.asfortranarray(ph_i)
+    assert mag_f.flags.f_contiguous and not mag_i.flags.f_contiguous
+    a = physio.excitation_traces(mag_i, st, TR, phase=ph_i, device=CPU)
+    b = physio.excitation_traces(mag_f, st, TR, phase=ph_f, device=CPU)
+    np.testing.assert_allclose(b.magnitude, a.magnitude, atol=1e-9)
+    np.testing.assert_allclose(b.phase, a.phase, atol=1e-7)
+    np.testing.assert_allclose(b.field_coef, a.field_coef, atol=1e-6)
+    X, labels, _ = physio.slice_regressors(a, "magnitude", "phase")
+    ca, ra = physio.regress_out(mag_i, X, TR, device=CPU)
+    cb, rb = physio.regress_out(mag_f, X, TR, device=CPU)
+    np.testing.assert_allclose(cb, ca, rtol=1e-6, atol=1e-3)
+    np.testing.assert_allclose(rb, ra, atol=1e-6)
+    groups = {"cardiac": [5, 6, 7, 8]}
+    ma = physio.explained_maps(mag_i, X, TR, groups, device=CPU)
+    mb = physio.explained_maps(mag_f, X, TR, groups, device=CPU)
+    np.testing.assert_allclose(mb["cardiac"], ma["cardiac"], atol=1e-6)
+    # and the reordering is not a no-op that hides a transpose: a voxel's own series
+    # survives cleaning at its own (x, y)
+    assert np.corrcoef(cb[2, 9, 5], mag_i[2, 9, 5])[0, 1] > 0.5
+
+
+def test_unique_r2_from_projections_matches_nested_least_squares():
+    """explained_maps uses projections onto a drift-orthogonal basis instead of a
+    least-squares solve per model; it must still be the nested-model unique R^2,
+    including when a regressor is constant (rank lost)."""
+    rng = np.random.default_rng(3)
+    nt, nz = 120, 2
+    data = rng.standard_normal((3, 4, nz, nt)).astype(np.float32) + 50
+    X = rng.standard_normal((nt, nz * 4))
+    X[:, 3] = 1.0  # constant column in slice 0: in the drift space already
+    groups = {"a": [0, 1], "b": [2, 3]}
+    maps = physio.explained_maps(data, X, TR, groups, device=CPU)
+    L = np.polynomial.legendre.legvander(np.linspace(-1, 1, nt), physio._drift_degree(nt, TR))
+
+    def sse(A, y):
+        return float(((y - A @ np.linalg.lstsq(A, y, rcond=None)[0]) ** 2).sum())
+
+    for k in range(nz):
+        Xk = X[:, 4 * k : 4 * k + 4]
+        y = data[1, 2, k].astype(np.float64)
+        s0, sf = sse(L, y), sse(np.c_[L, Xk], y)
+        assert maps["all"][1, 2, k] == pytest.approx((s0 - sf) / s0, abs=1e-6)
+        for g, cols in groups.items():
+            rest = [c for c in range(4) if c not in cols]
+            want = (sse(np.c_[L, Xk[:, rest]], y) - sf) / s0
+            assert maps[g][1, 2, k] == pytest.approx(max(want, 0.0), abs=1e-6)
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_traces_on_cuda_with_tf32_match_the_cpu():

@@ -32,6 +32,7 @@ import torch
 from scipy import signal
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.stats.task_coupling import _orthonormal_basis
 
 from ..glm.core import construct_polynomial_matrix
 
@@ -101,6 +102,29 @@ def _uniform(t: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if x.ndim == 1:
         return tu, np.interp(tu, t, x)
     return tu, np.stack([np.interp(tu, t, c) for c in x.T], 1)
+
+
+def _slice_rows(a: np.ndarray, k: int, device: torch.device, np_dtype=np.float32) -> torch.Tensor:
+    """Slice ``k`` of an (nx, ny, nz, nt) array as a (nx*ny, nt) tensor on ``device``,
+    voxels x-fastest (index them with ``mask[:, :, k].reshape(-1, order="F")``).
+
+    Copied from the host in the array's own memory order and reordered on the device:
+    a NIfTI series is Fortran-ordered, and gathering a slice into C order on the host
+    took 1.7 s per run against 0.24 s this way."""
+    nt = a.shape[-1]
+    s = a[:, :, k, :]
+    if a.flags.f_contiguous:
+        host = np.ascontiguousarray(s.reshape(-1, nt, order="F").T, dtype=np_dtype)
+        return torch.from_numpy(host).to(device).T
+    host = np.ascontiguousarray(s, dtype=np_dtype)
+    return torch.from_numpy(host).to(device).permute(1, 0, 2).reshape(-1, nt)
+
+
+def _put_slice_rows(out: np.ndarray, k: int, rows: torch.Tensor) -> None:
+    """Inverse of `_slice_rows`: write (nx*ny, nt) x-fastest rows into ``out[:, :, k, :]``."""
+    nx, ny, _, nt = out.shape
+    host = rows.T.contiguous().cpu().numpy()
+    out[:, :, k, :] = host.reshape(nt, ny, nx).transpose(2, 1, 0)
 
 
 def trailing_noise_volumes(mean_per_volume: np.ndarray, frac: float = 0.2) -> int:
@@ -188,19 +212,15 @@ def excitation_traces(
         (np.arange(ny) - ny / 2) * voxel_size[1] / 100.0,
         indexing="ij",
     )
-    gx_t = torch.from_numpy(gx.reshape(-1).astype(np.float32)).to(device)
-    gy_t = torch.from_numpy(gy.reshape(-1).astype(np.float32)).to(device)
+    gx_t = torch.from_numpy(gx.reshape(-1, order="F").astype(np.float32)).to(device)
+    gy_t = torch.from_numpy(gy.reshape(-1, order="F").astype(np.float32)).to(device)
     field_A = np.zeros((nz, 10, 10))
     field_b = np.zeros((nz, 10, nt))
     for k in range(nz):
-        sel = torch.from_numpy(mask[:, :, k].reshape(-1)).to(device)
+        sel = torch.from_numpy(mask[:, :, k].reshape(-1, order="F")).to(device)
         if int(sel.sum()) < 20:
             continue
-        m = (
-            torch.from_numpy(np.ascontiguousarray(magnitude[:, :, k, :]))
-            .to(device)
-            .reshape(-1, nt)[sel]
-        )
+        m = _slice_rows(magnitude, k, device)[sel]
         mu = m.mean(1)
         # Centred before the projection: the constant is in the drift space, so the
         # result is the same, but TF32 matmuls (on by default on CUDA) keep ~3 digits,
@@ -210,11 +230,7 @@ def excitation_traces(
         per_slice_m[:, k] = frac.mean(0).cpu().numpy()
         count_m[k] = float(m.shape[0])
         if phase is not None:
-            p = (
-                torch.from_numpy(np.ascontiguousarray(phase[:, :, k, :]))
-                .to(device)
-                .reshape(-1, nt)[sel]
-            )
+            p = _slice_rows(phase, k, device)[sel]
             p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
             z = torch.polar(torch.ones_like(p), p)
             zbar = z.mean(1)
@@ -630,6 +646,28 @@ def choose_source(
     return ("phase" if band == RESP_BAND else "magnitude"), scores
 
 
+def _drift_basis(nt: int, tr: float) -> torch.Tensor:
+    """Orthonormal drift basis, on the CPU: it and the per-slice bases built from it
+    are tiny dense factorizations, which lose to launch latency on a GPU."""
+    cpu = torch.device("cpu")
+    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=cpu, dtype=torch.float64)
+    return _orthonormal_basis(L)
+
+
+def _beyond_drift(UL: torch.Tensor, Xk: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Orthonormal basis of the regressors' part orthogonal to the drift basis ``UL``.
+
+    With the two orthogonal, a fit of [drift, regressors] is the sum of two
+    projections, so per-slice fits are a few small products on the slice's voxels
+    instead of a least-squares solve with thousands of right-hand sides (136 ms vs
+    3 ms per call on CPU). The SVD drops a regressor the drift spans, as lstsq did."""
+    X = torch.from_numpy(np.asarray(Xk, dtype=np.float64))
+    if X.shape[1] == 0:
+        return X.to(device)
+    Xo = X - UL @ (UL.T @ X)
+    return _orthonormal_basis(Xo, scale=float(plinalg.svdvals(X)[0])).to(device)
+
+
 def regress_out(
     data: np.ndarray,
     X: np.ndarray,
@@ -655,32 +693,31 @@ def regress_out(
     m = X.shape[1] // nz
     if X.shape != (nt, nz * m):
         raise ValueError(f"regressors {X.shape} do not match {nt} volumes x {nz} slices")
-    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=device, dtype=torch.float64)
+    UL_cpu = _drift_basis(nt, tr)
+    UL = UL_cpu.to(device)
     out = np.array(data, dtype=np.float32, copy=True)
     removed = np.zeros((nx, ny, nz), dtype=np.float32)
     if mask is None:
         mask = np.ones((nx, ny, nz), dtype=bool)
     for k in range(nz):
-        sel = mask[:, :, k].reshape(-1)
-        if not sel.any():
+        sel_np = mask[:, :, k].reshape(-1, order="F")
+        if not sel_np.any():
             continue
-        Y = torch.from_numpy(out[:, :, k, :].reshape(-1, nt)[sel].T.astype(np.float64)).to(device)
-        Xk = torch.from_numpy(X[:, k * m : (k + 1) * m].astype(np.float64)).to(device)
+        sel = torch.from_numpy(sel_np).to(device)
+        rows = _slice_rows(out, k, device)
+        Y = rows[sel].T.to(torch.float64)
         # Regressors made orthogonal to the drift basis (afni_proc 3dDetrends them):
         # subtracting their fit then cannot move a voxel's mean or drift.
-        Xk = Xk - L @ plinalg.lstsq(L, Xk).solution
-        A = torch.cat([L, Xk], 1)
-        beta = plinalg.lstsq(A, Y).solution
-        fit = Xk @ beta[L.shape[1] :]
-        base = Y - L @ beta[: L.shape[1]]  # drift-removed signal, before the physio fit
+        UX = _beyond_drift(UL_cpu, X[:, k * m : (k + 1) * m], device)
+        base = Y - UL @ (UL.T @ Y)  # drift-removed signal, before the physio fit
+        fit = UX @ (UX.T @ base)
         frac = (fit * (2 * base - fit)).sum(0) / (base**2).sum(0).clamp_min(1e-12)
-        cleaned = (Y - fit).T.float().cpu().numpy()
-        plane = out[:, :, k, :].reshape(-1, nt)
-        plane[sel] = cleaned
-        out[:, :, k, :] = plane.reshape(nx, ny, nt)
+        rows = rows.clone()
+        rows[sel] = (Y - fit).T.float()
+        _put_slice_rows(out, k, rows)
         rm = np.zeros(nx * ny, dtype=np.float32)
-        rm[sel] = frac.float().cpu().numpy()
-        removed[:, :, k] = rm.reshape(nx, ny)
+        rm[sel_np] = frac.float().cpu().numpy()
+        removed[:, :, k] = rm.reshape(nx, ny, order="F")
     return out, removed
 
 
@@ -709,33 +746,32 @@ def explained_maps(
     m = X.shape[1] // nz
     if X.shape != (nt, nz * m):
         raise ValueError(f"regressors {X.shape} do not match {nt} volumes x {nz} slices")
-    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=device, dtype=torch.float64)
+    UL_cpu = _drift_basis(nt, tr)
+    UL = UL_cpu.to(device)
     if mask is None:
         mask = np.ones((nx, ny, nz), dtype=bool)
     out = {g: np.zeros((nx, ny, nz), dtype=np.float32) for g in ("all", *groups)}
 
-    def sse(A, Y):
-        return ((Y - A @ plinalg.lstsq(A, Y).solution) ** 2).sum(0)
+    def explained(U, R):
+        return ((U.T @ R) ** 2).sum(0)
 
     for k in range(nz):
-        sel = mask[:, :, k].reshape(-1)
+        sel = mask[:, :, k].reshape(-1, order="F")
         if sel.sum() < 2:
             continue
-        Y = torch.from_numpy(
-            np.ascontiguousarray(data[:, :, k, :]).reshape(-1, nt)[sel].T.astype(np.float64)
-        ).to(device)
-        Xk = torch.from_numpy(X[:, k * m : (k + 1) * m].astype(np.float64)).to(device)
-        Xk = (Xk - Xk.mean(0)) / Xk.std(0).clamp_min(1e-12)
-        s0 = sse(L, Y).clamp_min(1e-12)
-        sf = sse(torch.cat([L, Xk], 1), Y)
-        vals = {"all": (s0 - sf) / s0}
+        Y = _slice_rows(data, k, device)[torch.from_numpy(sel).to(device)].T.to(torch.float64)
+        Xk = X[:, k * m : (k + 1) * m]
+        R = Y - UL @ (UL.T @ Y)
+        s0 = (R**2).sum(0).clamp_min(1e-12)
+        full = explained(_beyond_drift(UL_cpu, Xk, device), R)
+        vals = {"all": full / s0}
         for g, cols in groups.items():
             rest = [c for c in range(m) if c not in cols]
-            vals[g] = (sse(torch.cat([L, Xk[:, rest]], 1), Y) - sf) / s0
+            vals[g] = (full - explained(_beyond_drift(UL_cpu, Xk[:, rest], device), R)) / s0
         for g, v in vals.items():
-            plane = out[g][:, :, k].reshape(-1)
+            plane = np.zeros(nx * ny, dtype=np.float32)
             plane[sel] = v.clamp_min(0).float().cpu().numpy()
-            out[g][:, :, k] = plane.reshape(nx, ny)
+            out[g][:, :, k] = plane.reshape(nx, ny, order="F")
     return out
 
 

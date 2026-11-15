@@ -150,6 +150,26 @@ def _slice_times_and_tr(args) -> tuple[np.ndarray, float]:
     return st, float(tr)
 
 
+def _read_series(img, affine_invariant: bool = False) -> np.ndarray:
+    """The 4-D data at its stored dtype where that is exact, else float32.
+
+    Converting a whole run to float32 went through float64 inside nibabel and peaked
+    at ~5 copies of the series; the library converts one slice at a time instead.
+    ``affine_invariant``: the consumer only uses the data through a positive-slope
+    linear map of its own range (the phase, mapped onto [-pi, pi] by its min and max),
+    so the stored integers can stand in for the scaled values."""
+    proxy = img.dataobj
+    slope = float(getattr(proxy, "slope", 1.0))
+    inter = float(getattr(proxy, "inter", 0.0))
+    unscaled = slope == 1.0 and inter == 0.0
+    if hasattr(proxy, "get_unscaled") and (unscaled or (affine_invariant and slope > 0)):
+        a = np.asarray(proxy.get_unscaled())
+        if a.dtype.kind in "iub" or a.dtype == np.float32:
+            return a
+        return a.astype(np.float32)
+    return np.asarray(proxy, dtype=np.float32)
+
+
 def _write_slibase(path: Path, X: np.ndarray, labels: list[str]) -> None:
     """AFNI-style 1D with its column labels in a comment, as physio_calc.py writes."""
     with open(path, "w") as fh:
@@ -211,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
 
     st, tr = _slice_times_and_tr(args)
     mag_img = load_nifti(args.input)
-    mag = np.asarray(mag_img.dataobj, dtype=np.float32)
+    mag = _read_series(mag_img)
     zooms = tuple(float(z) for z in mag_img.header.get_zooms()[:3])
     if mag.ndim != 4:
         raise SystemExit("ffs_physio: -input must be 4-D")
@@ -219,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"ffs_physio: {st.size} slice times but {mag.shape[2]} slices")
     ph = None
     if args.phase is not None:
-        ph = np.asarray(load_nifti(args.phase).dataobj, dtype=np.float32)
+        ph = _read_series(load_nifti(args.phase), affine_invariant=True)
         if ph.shape[:3] != mag.shape[:3] or ph.shape[3] < mag.shape[3]:
             raise SystemExit(
                 f"ffs_physio: -phase shape {ph.shape} does not cover -input {mag.shape}"
@@ -235,7 +255,9 @@ def main(argv: list[str] | None = None) -> int:
     ndrop = (
         args.drop_last
         if args.drop_last is not None
-        else physio.trailing_noise_volumes(mag.reshape(-1, mag.shape[-1]).mean(0))
+        # A mean over axes, not over a reshape: reshaping the Fortran-ordered series
+        # copies all of it (5 s on a 2 GB run).
+        else physio.trailing_noise_volumes(mag.mean(axis=(0, 1, 2)))
     )
     nt = mag.shape[-1] - ndrop
     mag = mag[..., :nt]
