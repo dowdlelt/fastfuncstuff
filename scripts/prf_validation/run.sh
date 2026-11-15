@@ -74,3 +74,4 @@ pyrf "$WORK/ffs_lib_dn"   cuda -hrf library   -screen "$SCREEN" -xval halves -de
 
 # 7. Figures and numbers.
 "$PY" "$HERE/compare.py" "$DATA" "$WORK" "$REPO/docs/prf_validation"
+"$PY" "$HERE/variants.py" "$DATA" "$WORK" "$REPO/docs/prf_validation"

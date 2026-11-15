@@ -191,7 +191,7 @@ def main() -> None:
         ax.legend(frameon=False, fontsize=7)
         ax.set_title("fraction of the explainable variance", fontsize=9, loc="left")
     fig.tight_layout()
-    save(fig, out, "fig8_xval.png")
+    save(fig, out, "fig10_xval.png")
 
     # ---------------------------------------------------------------- reliability
     params = ["x", "y", "eccentricity", "angle", "rfsize"]
@@ -218,7 +218,7 @@ def main() -> None:
     axes[0].set_ylabel("split-half reliability\n(Spearman-Brown)")
     axes[0].legend(frameon=False, fontsize=7)
     fig.tight_layout()
-    save(fig, out, "fig9_reliability.png")
+    save(fig, out, "fig11_reliability.png")
 
     # ---------------------------------------------------------------- maps
     fig, axes = plt.subplots(2, 5, figsize=(14, 5.4))
@@ -246,25 +246,28 @@ def main() -> None:
             sulcs[hemi],
             rois[hemi],
             "RdBu_r",
-            TwoSlopeNorm(0, -10, 10),
+            TwoSlopeNorm(0, -20, 20),
             split(resp)[hemi],
-            f"Δ library+denoise − canonical · {hemi}",
+            f"Δ both − canonical · {hemi}",
         )
     fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap="magma"),
         ax=axes[:, :4],
-        fraction=0.015,
-        pad=0.01,
+        orientation="horizontal",
+        fraction=0.04,
+        pad=0.03,
+        aspect=50,
         label="held-out R² %",
     )
     fig.colorbar(
-        plt.cm.ScalarMappable(norm=TwoSlopeNorm(0, -10, 10), cmap="RdBu_r"),
+        plt.cm.ScalarMappable(norm=TwoSlopeNorm(0, -20, 20), cmap="RdBu_r"),
         ax=axes[:, 4],
-        fraction=0.05,
-        pad=0.02,
-        label="Δ points",
+        orientation="horizontal",
+        fraction=0.04,
+        pad=0.03,
+        label="Δ held-out R² (points)",
     )
-    save(fig, out, "fig10_xval_maps.png")
+    save(fig, out, "fig12_xval_maps.png")
 
     # ---------------------------------------------------------------- parameter changes
     both = fits["ffs_lib_dn"]
@@ -279,6 +282,63 @@ def main() -> None:
         "rfsize_median_ratio": float(np.median(both["rfsize"][good] / base["rfsize"][good])),
         "rfsize_r_log": pearson(np.log(base["rfsize"][good]), np.log(both["rfsize"][good])),
     }
+    # A pRF centred outside the aperture (radius 50 px) is driven only by the
+    # aperture edge, and its position flips with small model changes; it dominates
+    # any Pearson r. Report it, and the shifts robustly, for each variant.
+    numbers["outside_aperture_frac"] = {
+        label: float(np.mean(fits[name]["eccentricity"][good] > 50)) for name, label, _ in VARIANTS
+    }
+    areas = (
+        ("V1", roi == 1),
+        ("V2", roi == 2),
+        ("V3", roi == 3),
+        ("hV4", roi == 4),
+        ("beyond V1-hV4", roi == 0),
+    )
+    numbers["outside_aperture_by_area"] = {
+        label: {
+            area: float(
+                np.mean(
+                    fits[name]["eccentricity"][
+                        m & np.isfinite(fits[name]["r2"]) & (fits[name]["r2"] > 0.2)
+                    ]
+                    > 50
+                )
+            )
+            for area, m in areas
+        }
+        for name, label, _ in VARIANTS
+    }
+    numbers["param_change_by_variant"] = {}
+    for name, label, _ in VARIANTS[1:]:
+        b = fits[name]
+        ok = good & np.isfinite(b["r2"]) & (b["r2"] > 0.2)
+        inside = ok & (base["eccentricity"] < 50) & (b["eccentricity"] < 50)
+        shift = np.hypot(b["x"] - base["x"], b["y"] - base["y"])
+        numbers["param_change_by_variant"][label] = {
+            "n": int(ok.sum()),
+            "inside_n": int(inside.sum()),
+            "position_shift_median_px": float(np.median(shift[inside])),
+            "position_shift_p90_px": float(np.quantile(shift[inside], 0.9)),
+            "ecc_signed_median_px": float(
+                np.median((b["eccentricity"] - base["eccentricity"])[inside])
+            ),
+            "ecc_r_inside": pearson(base["eccentricity"][inside], b["eccentricity"][inside]),
+            "angle_median_abs_deg": float(
+                np.median(
+                    np.abs(
+                        ang_diff(
+                            b["angle"][inside & (base["eccentricity"] > 2)],
+                            base["angle"][inside & (base["eccentricity"] > 2)],
+                        )
+                    )
+                )
+            ),
+            "rfsize_median_ratio": float(np.median((b["rfsize"] / base["rfsize"])[inside])),
+            "flips_across_aperture_edge": float(
+                np.mean((base["eccentricity"][ok] > 50) != (b["eccentricity"][ok] > 50))
+            ),
+        }
     lib_hrf = fits["ffs_lib"]["hrf_index"]
     numbers["hrf_index"] = {
         "median": float(np.nanmedian(lib_hrf[good])),
@@ -289,7 +349,7 @@ def main() -> None:
     }
     fig, axes = plt.subplots(1, 4, figsize=(13, 3.3))
     for ax, key, lim, log in (
-        (axes[0], "eccentricity", (0, 70), False),
+        (axes[0], "eccentricity", (0, 50), False),
         (axes[1], "rfsize", (0.3, 100), True),
     ):
         a, b = base[key][good], both[key][good]
@@ -325,7 +385,7 @@ def main() -> None:
     ax.set_xlabel("selected HRF (library index, early → late)")
     ax.set_ylabel("vertices")
     fig.tight_layout()
-    save(fig, out, "fig11_params.png")
+    save(fig, out, "fig13_params.png")
 
     # ---------------------------------------------------------------- timecourses
     from fastfuncstuff.design.hrf import load_canonical_hrf_basic, load_canonical_hrf_library
@@ -342,7 +402,7 @@ def main() -> None:
     runs = load_runs(work, np.array(pick))
     raw = np.concatenate(runs, 1)
     raw = np.concatenate([100 * r / r.mean(1, keepdims=True) for r in np.split(raw, R, axis=1)], 1)
-    fig, axes = plt.subplots(len(pick), 1, figsize=(11, 2.6 * len(pick)))
+    fig, axes = plt.subplots(len(pick), 1, figsize=(14, 2.6 * len(pick)))
     t = np.arange(1, T + 1)
     for row, v in enumerate(pick):
         ax = axes[row]
@@ -376,13 +436,13 @@ def main() -> None:
             )
         ax.set_xlim(1, T)
         ax.set_ylabel("% signal")
-        ax.legend(frameon=False, fontsize=7, ncol=3, loc="upper right")
+        ax.legend(frameon=False, fontsize=7, loc="upper left", bbox_to_anchor=(1.01, 1.0))
         ax.set_title(
             f"vertex {v} ({'lh' if v < n_lh else 'rh'}, V{int(roi[v])})", fontsize=9, loc="left"
         )
     axes[-1].set_xlabel("TR (mean of runs)")
     fig.tight_layout()
-    save(fig, out, "fig12_variant_timecourses.png")
+    save(fig, out, "fig14_variant_timecourses.png")
 
     (out / "numbers_variants.json").write_text(json.dumps(numbers, indent=2))
     print(json.dumps(numbers, indent=2))

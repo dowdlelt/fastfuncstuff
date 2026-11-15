@@ -10,6 +10,7 @@ numbers.json (every number the page quotes) to OUTDIR.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -550,7 +551,7 @@ def main() -> None:
         ("analyzePRF", full["apr_ang"], full["apr_ecc"], full["apr_r2"]),
         ("vistasoft (dataset)", v_ang, v_ecc, vista["vexpl"] * 100),
     ]
-    cyc = "twilight_shifted"
+    cyc = "hsv"  # polar angle: the field-standard wheel; a cyclic map is required and hue separates up/horizontal/down
     fig, axes = plt.subplots(3, 6, figsize=(15, 8.2))
     for r, (name, ang, ecc, r2) in enumerate(rows):
         for h, hemi in enumerate(HEMIS):
@@ -688,6 +689,192 @@ def main() -> None:
             loc="left",
         )
     save(fig, out, "fig7_speed.png")
+
+    # ---------------------------------------------------------------- fig 9: three toolboxes
+    # Toolboxes differ (model, HRF, seeding, what they fit), so the claim is not
+    # "identical to vistasoft" but "as close to it as analyzePRF is". vistasoft is
+    # the dataset's own linear-Gaussian fit; its sigma is compared with rfsize.
+    if deg_per_px is not None:
+        dpp = deg_per_px
+        vx, vy = vista["x"][idx], -vista["y"][idx]  # vistasoft y points down
+        vang = np.rad2deg(np.arctan2(vy, vx)) % 360
+        vecc, vsig, vr2 = vista["eccen"][idx], vista["sigma"][idx], 100 * vista["vexpl"][idx]
+        tools = {
+            "ffs_pyrf": (ffs["angle"], ffs["eccentricity"] * dpp, ffs["rfsize"] * dpp, ffs["r2"]),
+            "analyzePRF": (apr_ang, apr_ecc * dpp, apr_rf * dpp, apr.r2),
+            "vistasoft": (vang, vecc, vsig, vr2),
+        }
+        area = roi[idx]
+        common = (area >= 1) & (area <= 3)
+        for _, (_, e, s_, q) in tools.items():
+            common &= (
+                np.isfinite(e) & np.isfinite(s_) & (q > R2_MIN) & (e > 0.5) & (e < 11) & (s_ > 0)
+            )
+        pairs = [("ffs_pyrf", "analyzePRF"), ("ffs_pyrf", "vistasoft"), ("analyzePRF", "vistasoft")]
+        tw = {"n": int(common.sum()), "deg_per_px": dpp, "pairs": {}}
+        for a_, b_ in pairs:
+            A, B = tools[a_], tools[b_]
+            tw["pairs"][f"{a_} vs {b_}"] = {
+                "angle_circ_r": circ_corr(A[0][common], B[0][common]),
+                "angle_median_abs_deg": float(
+                    np.median(np.abs(ang_diff(A[0][common], B[0][common])))
+                ),
+                "ecc_r": pearson(A[1][common], B[1][common]),
+                "ecc_median_abs_deg": float(np.median(np.abs(A[1][common] - B[1][common]))),
+                "size_r_log": pearson(np.log(A[2][common]), np.log(B[2][common])),
+                "size_median_ratio": float(np.median(A[2][common] / B[2][common])),
+            }
+        # size vs eccentricity per area: slope of a robust line in 1-deg bins
+        ebins = np.arange(0.5, 11.5, 1.0)
+        tw["size_ecc"] = {}
+        fig, axes = plt.subplots(
+            1, 4, figsize=(14, 3.6), gridspec_kw={"width_ratios": [1.3, 1, 1, 1]}
+        )
+        for ax_ in axes[2:]:
+            ax_.sharey(axes[1])
+        ax = axes[0]
+        metrics = [
+            ("angle_circ_r", "angle (circ r)"),
+            ("ecc_r", "eccentricity r"),
+            ("size_r_log", "size r (log)"),
+        ]
+        width = 0.26
+        cols = ["#3a3a38", "#8a8985", "#c9c8c3"]  # pairs, not tools: no tool colour
+        for k, (a_, b_) in enumerate(pairs):
+            vals = [tw["pairs"][f"{a_} vs {b_}"][m] for m, _ in metrics]
+            xs = np.arange(len(metrics)) + (k - 1) * width
+            ax.bar(xs, vals, width=width * 0.92, color=cols[k], label=f"{a_} – {b_}")
+            for x_, v_ in zip(xs, vals, strict=True):
+                ax.text(x_, v_ + 0.01, f"{v_:.2f}", ha="center", fontsize=6.5, color=INK)
+        ax.set_xticks(np.arange(len(metrics)), [m[1] for m in metrics], fontsize=8)
+        ax.set_ylim(0, 1.08)
+        ax.legend(frameon=False, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.12))
+        ax.set_title(
+            f"pairwise agreement, V1–V3 ({common.sum():,} vertices)", fontsize=9, loc="left"
+        )
+        tcol = {"ffs_pyrf": FFS, "analyzePRF": APR, "vistasoft": VISTA}
+        for ax, (lab, a_id) in zip(axes[1:], (("V1", 1), ("V2", 2), ("V3", 3)), strict=True):
+            sel = common & (area == a_id)
+            tw["size_ecc"][lab] = {}
+            for name, (_, e, s_, _) in tools.items():
+                med = [
+                    np.median(s_[sel & (e >= lo) & (e < lo + 1)])
+                    if (sel & (e >= lo) & (e < lo + 1)).sum() > 20
+                    else np.nan
+                    for lo in ebins[:-1]
+                ]
+                ax.plot(
+                    ebins[:-1] + 0.5, med, color=tcol[name], lw=1.8, marker="o", ms=3, label=name
+                )
+                slope = np.polyfit(e[sel], s_[sel], 1) if sel.sum() > 30 else [np.nan, np.nan]
+                tw["size_ecc"][lab][name] = {
+                    "slope": float(slope[0]),
+                    "intercept": float(slope[1]),
+                    "n": int(sel.sum()),
+                }
+            ax.set_title(f"{lab}: pRF size vs eccentricity", fontsize=9, loc="left")
+            ax.set_xlabel("eccentricity (deg, est.)")
+            ax.grid(color=GRID, lw=0.6)
+        axes[1].set_ylabel("size (deg): rfsize, or vistasoft sigma\n(median per 1° bin)")
+        axes[1].legend(frameon=False, fontsize=7)
+        fig.tight_layout()
+        save(fig, out, "fig9_toolboxes.png")
+        numbers["toolboxes"] = tw
+
+    # ---------------------------------------------------------------- fig 8: identifiability
+    # Where the tools disagree on exponent / rfsize, is it a different optimum or
+    # a flat objective? Split by whether ffs's own split halves agree on rfsize,
+    # then profile R2 over a fixed exponent for the worst disagreements.
+    rel_path = work / "ffs_canon_reliability"
+    if (work / "ffs_canon_reliability.lh.func.gii").exists():
+        rel = load_bucket(rel_path)
+        canon = load_bucket(work / "ffs_canon")
+        rel_rf = rel["abs_delta_rfsize"][idx] / np.maximum(canon["rfsize"][idx], 1e-6)
+        stable = good & np.isfinite(rel_rf) & (rel_rf < 0.25)
+        unstable = good & np.isfinite(rel_rf) & (rel_rf >= 0.25)
+        sub = {}
+        for name, m in (("stable", stable), ("unstable", unstable)):
+            sub[name] = {
+                "n": int(m.sum()),
+                "rfsize_r_log": pearson(np.log(apr_rf[m]), np.log(ffs["rfsize"][m])),
+                "rfsize_within_1p5x": float(
+                    np.mean(np.abs(np.log(ffs["rfsize"][m] / apr_rf[m])) < np.log(1.5))
+                ),
+                "exponent_r_log": pearson(np.log(pa[m, 4]), np.log(ffs["exponent"][m])),
+                "ev_median_abs_diff": float(np.median(np.abs(d_ev[m]))),
+            }
+        numbers["identifiability"] = {"split_half_rfsize_rel_change_cut": 0.25, **sub}
+
+    if os.environ.get("PRF_SKIP_PROFILE"):  # the profiles are minutes of CPU; skip while iterating
+        (out / "numbers.json").write_text(json.dumps(numbers, indent=2))
+        print(json.dumps(numbers, indent=2))
+        return
+    log_ratio = np.abs(np.log(ffs["rfsize"] / apr_rf))
+    strong = np.flatnonzero(good & (apr.r2 > 40))
+    pick = list(strong[np.argsort(-log_ratio[strong])][:6]) + list(
+        strong[np.argsort(log_ratio[strong])][:2]
+    )
+    ngrid = np.logspace(-3, np.log10(2), 24)
+    from scipy.optimize import least_squares
+
+    def r2_at(p4, v):
+        pred = project_runs(css_predict(p4[None], aperture, apr.hrf, R), T, 2)
+        return r2_percent(proj[v : v + 1], pred)[0][0]
+
+    profiles = []
+    print("profiling R2 over the exponent ...")
+    for v in pick:
+        prof = []
+        for n in ngrid:
+            best = -np.inf
+            for start in (p_ffs[v], p_apr[v]):
+                s0 = start[:3].copy()
+                s0[2] = max(start[2] * np.sqrt(n / start[3]), 0.05)  # start at the same rfsize
+
+                def resid(q, n=n, v=v):
+                    pred = project_runs(css_predict(np.r_[q, n][None], aperture, apr.hrf, R), T, 2)[
+                        0
+                    ]
+                    return proj[v] - (pred @ proj[v] / max(pred @ pred, 1e-30)) * pred
+
+                sol = least_squares(resid, s0, x_scale=[1, 1, max(s0[2], 0.1)], max_nfev=150)
+                best = max(best, r2_at(np.r_[sol.x, n], v))
+            prof.append(best)
+        profiles.append(prof)
+    profiles = np.array(profiles)
+    flat = [
+        float(ngrid[p > p.max() - 0.1].max() / ngrid[p > p.max() - 0.1].min()) for p in profiles
+    ]
+    numbers["profiles"] = {"n_vertices": len(pick), "exponent_range_within_0p1pt_ratio": flat}
+    fig, axes = plt.subplots(2, 4, figsize=(12, 5.2), sharex=True)
+    for ax, v, prof in zip(axes.ravel(), pick, profiles, strict=True):
+        ax.plot(ngrid, prof, color=INK, lw=1.4)
+        ax.axhspan(prof.max() - 0.1, prof.max(), color=GRID)
+        ax.plot(
+            p_apr[v, 3], ev_apr[v], "o", color=APR, ms=7, label=f"analyzePRF rf {apr_rf[v]:.2f}"
+        )
+        ax.plot(
+            p_ffs[v, 3], ev_ffs[v], "s", color=FFS, ms=5, label=f"ffs rf {ffs['rfsize'][v]:.2f}"
+        )
+        ax.set_xscale("log")
+        ax.set_xlim(8e-4, 2.5)
+        lo = min(prof.min(), ev_apr[v], ev_ffs[v])
+        ax.set_ylim(lo - 0.3, prof.max() + 0.3)
+        ax.legend(frameon=False, fontsize=7, loc="lower center")
+        ax.set_title(f"vertex {v}", fontsize=8, loc="left", color=MUTED)
+    for ax in axes[1]:
+        ax.set_xlabel("exponent n (held fixed)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("best R² % at that n")
+    fig.suptitle(
+        "R² profile over the exponent: six largest rfsize disagreements, two agreements "
+        "(grey band: within 0.1 pt of the best)",
+        fontsize=9,
+        x=0.01,
+        ha="left",
+    )
+    fig.tight_layout()
+    save(fig, out, "fig8_identifiability.png")
 
     (out / "numbers.json").write_text(json.dumps(numbers, indent=2))
     print(json.dumps(numbers, indent=2))
