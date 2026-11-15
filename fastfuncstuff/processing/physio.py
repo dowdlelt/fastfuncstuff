@@ -361,18 +361,37 @@ def track_rate(
     for i in range(0, max(1, len(xb) - n), s):
         seg = xb[i : i + n]
         f, P = signal.periodogram(seg * np.hanning(len(seg)), fs=fs, nfft=16 * len(seg))
-        near = allowed(f) & (np.abs(f - prev) <= 0.25 * prev)
+        inb_w = (f >= band[0]) & (f <= band[1])
+        near = inb_w & (np.abs(f - prev) <= 0.25 * prev)
         if not near.any():
-            near = allowed(f)
+            near = inb_w
         j = int(np.flatnonzero(near)[np.argmax(P[near])])
-        if 0 < j < len(P) - 1:  # parabolic refinement on log power
-            a_, b_, c_ = np.log(P[j - 1 : j + 2] + 1e-30)
-            j = j + 0.5 * (a_ - c_) / (a_ - 2 * b_ + c_ + 1e-30)
-        fj = float(np.interp(j, np.arange(len(f)), f))
+        if allowed(f[j : j + 1])[0]:
+            fj = float(np.interp(_refine_peak(P, j), np.arange(len(f)), f))
+        else:
+            # The strongest nearby power sits on a TR harmonic: a comb line, or a heart
+            # rate passing through k/TR (60/min at TR 1 s is ordinary). Hold the last
+            # estimate. Taking the best allowed bin instead picked the shoulder of the
+            # real peak, whose parabola is not around a maximum, and one TASKFORCE track
+            # flew from 63 to ~110/min and stayed there.
+            fj = prev
         est.append(fj)
         cen.append(float(t[min(i + n // 2, len(t) - 1)]))
         prev = fj
     return np.array(cen), np.array(est), prominence
+
+
+def _refine_peak(P: np.ndarray, j: int) -> float:
+    """Sub-bin position of a spectral peak: a parabola through log power at j-1, j, j+1,
+    only where j is a local maximum and at most half a bin. Off a maximum the vertex is
+    meaningless; at zero curvature the old unguarded form moved 1e15 bins."""
+    if not 0 < j < len(P) - 1:
+        return float(j)
+    a, b, c = np.log(P[j - 1 : j + 2] + 1e-30)
+    den = a - 2 * b + c
+    if b < a or b < c or den >= 0:
+        return float(j)
+    return j + float(np.clip(0.5 * (a - c) / den, -0.5, 0.5))
 
 
 def peak_rate(

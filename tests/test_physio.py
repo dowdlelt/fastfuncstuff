@@ -132,6 +132,33 @@ def test_heart_rate_tracker_does_not_lock_onto_a_tr_harmonic():
     assert abs(np.median(f) - 1.1) < 0.02
 
 
+def test_peak_refinement_only_moves_at_a_maximum_and_at_most_half_a_bin():
+    """Off a maximum (a peak's shoulder) or at zero curvature the parabola's vertex is
+    meaningless; the unguarded form moved 0.7 and 4e15 bins there."""
+    assert physio._refine_peak(np.array([1.0, 0.9, 0.5]), 1) == 1.0  # shoulder
+    assert physio._refine_peak(np.array([1.0, 0.8, 0.64]), 1) == 1.0  # zero curvature
+    j = physio._refine_peak(np.array([0.5, 1.0, 0.9]), 1)  # true max, skewed right
+    assert 1.0 < j <= 1.5
+    assert physio._refine_peak(np.array([1.0, 2.0]), 1) == 1.0  # at the edge
+
+
+def test_heart_rate_crossing_the_tr_line_does_not_send_the_track_away():
+    """A heart rate that drifts through 1/TR (60/min at TR 1 s) puts the heartbeat inside
+    the band the tracker may not choose. Taking the shoulder of that peak, then refining
+    a parabola that is not around a maximum, sent a TASKFORCE track from 63 to ~110/min for
+    the rest of the run. It must hold near the true rate and come back."""
+    fs = 17.0
+    t = np.arange(0, 360, 1 / fs)
+    f_inst = np.interp(t, [0, 100, 140, 180, 360], [1.08, 1.06, 0.99, 1.06, 1.07])
+    rng = np.random.default_rng(4)
+    x = np.cos(2 * np.pi * np.cumsum(f_inst) / fs) + 0.8 * rng.standard_normal(t.size)
+    cen, f, _ = physio.track_rate(t, x, physio.CARDIAC_BAND, 20.0, avoid=(1.0, 2.0))
+    truth = np.interp(cen, t, f_inst)
+    assert np.max(np.abs(f - truth)) < 0.08, np.max(np.abs(f - truth)) * 60
+    late = cen > 220
+    assert np.median(np.abs(f[late] - truth[late])) < 0.02
+
+
 @pytest.mark.parametrize("with_phase", [True, False])
 def test_source_choice_follows_the_measured_mapping(with_phase):
     mag, ph, st, _ = _synthetic_run(nt=120)
