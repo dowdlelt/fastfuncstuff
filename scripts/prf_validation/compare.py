@@ -40,6 +40,7 @@ from common import (  # noqa: E402
 )
 from matplotlib.colors import Normalize  # noqa: E402
 from matplotlib.tri import Triangulation  # noqa: E402
+from scipy.stats import spearmanr  # noqa: E402
 
 FFS = "#2a78d6"
 APR = "#eb6834"
@@ -124,8 +125,11 @@ def hexbin_compare(ax, a, b, label, unit="", log=False, lim=None):
         r = pearson(np.log(a), np.log(b))
         txt = f"r(log) = {r:.3f}\nmedian ratio {np.median(b / a):.3f}"
     else:
-        r = pearson(a, b)
-        txt = f"r = {r:.3f}\nmedian |Δ| {np.median(np.abs(b - a)):.3g}{unit}"
+        # Pearson on the plotted range: a few fits thousands of pixels off-screen would
+        # otherwise set r on their own.
+        shown = (a >= lim[0]) & (a <= lim[1]) & (b >= lim[0]) & (b <= lim[1])
+        r = pearson(a[shown], b[shown])
+        txt = f"r = {r:.3f} (in view)\nmedian |Δ| {np.median(np.abs(b - a)):.3g}{unit}"
     ax.text(0.04, 0.96, txt, transform=ax.transAxes, va="top", fontsize=8, color=INK)
     ax.set_title(label, fontsize=10, color=INK, loc="left")
     return r
@@ -275,8 +279,16 @@ def main() -> None:
     numbers["parity"] = {"r2_min_percent": R2_MIN, "n": int(good.sum())}
     ecc_ok = good & (apr_ecc > 2) & (ffs["eccentricity"] > 2)  # angle is undefined at the centre
     pq = numbers["parity"]
-    pq["x_r"] = pearson(apr_x[good], ffs["x"][good])
-    pq["y_r"] = pearson(apr_y[good], ffs["y"][good])
+    # Pearson only where both centres are on the aperture: off it, analyzePRF's centres
+    # run to thousands of pixels (ffs_pyrf's are bounded), and a handful set r alone.
+    inside = good & (apr_ecc < 50) & (ffs["eccentricity"] < 50)
+    pq["inside_n"] = int(inside.sum())
+    pq["frac_outside_aperture_either"] = float(1 - inside.sum() / good.sum())
+    pq["x_r"] = pearson(apr_x[inside], ffs["x"][inside])
+    pq["y_r"] = pearson(apr_y[inside], ffs["y"][inside])
+    pq["x_spearman_all"] = float(spearmanr(apr_x[good], ffs["x"][good])[0])
+    pq["y_spearman_all"] = float(spearmanr(apr_y[good], ffs["y"][good])[0])
+    pq["ecc_spearman_all"] = float(spearmanr(apr_ecc[good], ffs["eccentricity"][good])[0])
     pq["angle_circ_r"] = circ_corr(apr_ang[ecc_ok], ffs["angle"][ecc_ok])
     pq["angle_median_abs_deg"] = float(
         np.median(np.abs(ang_diff(ffs["angle"][ecc_ok], apr_ang[ecc_ok])))
@@ -284,7 +296,7 @@ def main() -> None:
     pq["angle_p90_abs_deg"] = float(
         np.quantile(np.abs(ang_diff(ffs["angle"][ecc_ok], apr_ang[ecc_ok])), 0.9)
     )
-    pq["ecc_r"] = pearson(apr_ecc[good], ffs["eccentricity"][good])
+    pq["ecc_r"] = pearson(apr_ecc[inside], ffs["eccentricity"][inside])
     pq["ecc_median_abs_px"] = float(np.median(np.abs(apr_ecc[good] - ffs["eccentricity"][good])))
     pq["position_median_px"] = float(
         np.median(np.hypot(apr_x[good] - ffs["x"][good], apr_y[good] - ffs["y"][good]))
@@ -460,6 +472,7 @@ def main() -> None:
     hexbin_compare(axes[1, 2], apr.r2[g], ffs["r2"][g], "R²", " %", lim=(R2_MIN, 95))
     ax = axes[1, 3]
     ax.hist(np.clip(d_ev, -3, 3), bins=np.linspace(-3, 3, 61), color=FFS)
+    ax.set_xticks([-3, -2, -1, 0, 1, 2, 3], ["≤−3", "−2", "−1", "0", "1", "2", "≥3"])
     ax.axvline(0, color=MUTED, lw=0.8, ls="--")
     ax.set_xlabel("ΔR² ffs − analyzePRF (points)")
     ax.set_ylabel("vertices")
@@ -753,6 +766,21 @@ def main() -> None:
             f"pairwise agreement, V1–V3 ({common.sum():,} vertices)", fontsize=9, loc="left"
         )
         tcol = {"ffs_pyrf": FFS, "analyzePRF": APR, "vistasoft": VISTA}
+        # ffs_pyrf's default model (HRF library) with denoising, on the same vertices:
+        # the canonical HRF is what shrinks V1 sizes, so show what the better HRF gives.
+        lib_path = work / "ffs_lib_dn"
+        lib = None
+        if any(lib_path.parent.glob(lib_path.name + ".*h.func.gii")):
+            lb = load_bucket(lib_path)
+            lib_rf = lb["rfsize"][idx] * dpp
+            lib_e = lb["eccentricity"][idx] * dpp
+            lib_ok = common & np.isfinite(lib_rf) & (100 * lb["r2"][idx] > R2_MIN) & (lib_rf > 0)
+            lib = (lib_e, lib_rf, lib_ok)
+            tw["library_denoise_vs_vistasoft"] = {
+                "n": int(lib_ok.sum()),
+                "size_median_ratio": float(np.median(lib_rf[lib_ok] / vsig[lib_ok])),
+                "size_r_log": pearson(np.log(lib_rf[lib_ok]), np.log(vsig[lib_ok])),
+            }
         for ax, (lab, a_id) in zip(axes[1:], (("V1", 1), ("V2", 2), ("V3", 3)), strict=True):
             sel = common & (area == a_id)
             tw["size_ecc"][lab] = {}
@@ -772,6 +800,31 @@ def main() -> None:
                     "intercept": float(slope[1]),
                     "n": int(sel.sum()),
                 }
+            if lib is not None:
+                lsel = lib[2] & (area == a_id)
+                med = [
+                    np.median(lib[1][lsel & (lib[0] >= lo) & (lib[0] < lo + 1)])
+                    if (lsel & (lib[0] >= lo) & (lib[0] < lo + 1)).sum() > 20
+                    else np.nan
+                    for lo in ebins[:-1]
+                ]
+                ax.plot(
+                    ebins[:-1] + 0.5,
+                    med,
+                    color=FOURTH,
+                    lw=1.8,
+                    ls="--",
+                    marker="o",
+                    ms=3,
+                    label="ffs_pyrf, library + denoise",
+                )
+                if lsel.sum() > 30:
+                    slope = np.polyfit(lib[0][lsel], lib[1][lsel], 1)
+                    tw["size_ecc"][lab]["ffs_pyrf library+denoise"] = {
+                        "slope": float(slope[0]),
+                        "intercept": float(slope[1]),
+                        "n": int(lsel.sum()),
+                    }
             ax.set_title(f"{lab}: pRF size vs eccentricity", fontsize=9, loc="left")
             ax.set_xlabel("eccentricity (deg, est.)")
             ax.grid(color=GRID, lw=0.6)
@@ -851,10 +904,10 @@ def main() -> None:
         ax.plot(ngrid, prof, color=INK, lw=1.4)
         ax.axhspan(prof.max() - 0.1, prof.max(), color=GRID)
         ax.plot(
-            p_apr[v, 3], ev_apr[v], "o", color=APR, ms=7, label=f"analyzePRF rf {apr_rf[v]:.2f}"
+            p_apr[v, 3], ev_apr[v], "o", color=APR, ms=7, label=f"analyzePRF rf {apr_rf[v]:.2g} px"
         )
         ax.plot(
-            p_ffs[v, 3], ev_ffs[v], "s", color=FFS, ms=5, label=f"ffs rf {ffs['rfsize'][v]:.2f}"
+            p_ffs[v, 3], ev_ffs[v], "s", color=FFS, ms=5, label=f"ffs rf {ffs['rfsize'][v]:.2g} px"
         )
         ax.set_xscale("log")
         ax.set_xlim(8e-4, 2.5)

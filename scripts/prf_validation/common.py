@@ -188,7 +188,13 @@ def _conv_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
 def r2_percent(data_proj: np.ndarray, pred_proj: np.ndarray, gain: np.ndarray | None = None):
     """calccod: 100*(1 - SSE/SS), with the given gain or the least-squares one."""
     if gain is None:
-        gain = np.sum(pred_proj * data_proj, 1) / np.maximum(np.sum(pred_proj**2, 1), 1e-30)
+        # Normalise first: a far-off-screen receptive field with a tiny sigma predicts
+        # values around 1e-20, whose squares fall below any fixed floor; analyzePRF
+        # fits those with a huge gain, and an unnormalised floor scored them near zero.
+        scale = np.abs(pred_proj).max(1)
+        unit = pred_proj / np.where(scale > 0, scale, 1.0)[:, None]
+        unit_gain = np.sum(unit * data_proj, 1) / np.maximum(np.sum(unit**2, 1), 1e-300)
+        gain = np.where(scale > 0, unit_gain / np.where(scale > 0, scale, 1.0), 0.0)
     resid = data_proj - gain[:, None] * pred_proj
     centred = data_proj - data_proj.mean(1, keepdims=True)
     return 100 * (1 - np.sum(resid**2, 1) / np.sum(centred**2, 1)), gain
