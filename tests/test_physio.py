@@ -178,6 +178,54 @@ def test_cli_writes_a_slibase_that_ffs_reml_reads_slice_major(tmp_path):
     assert not torch.allclose(blocks[k0][:, 5:9], blocks[other][:, 5:9])  # different times
 
 
+def _write_cli_inputs(tmp_path, nt=150):
+    import json
+
+    import nibabel as nib
+
+    mag, ph, st, _ = _synthetic_run(nt=nt)
+    nib.save(nib.Nifti1Image(mag, np.eye(4)), tmp_path / "run_mag.nii.gz")
+    nib.save(nib.Nifti1Image(ph, np.eye(4)), tmp_path / "run_ph.nii.gz")
+    (tmp_path / "run_mag.json").write_text(
+        json.dumps({"SliceTiming": st.tolist(), "RepetitionTime": TR})
+    )
+    return ["-input", str(tmp_path / "run_mag.nii.gz"), "-phase", str(tmp_path / "run_ph.nii.gz")]
+
+
+def test_cli_qc_writes_rates_and_maps_with_a_record(tmp_path):
+    import json
+
+    from fastfuncstuff.cli.physio import main
+
+    args = _write_cli_inputs(tmp_path)
+    rc = main([*args, "-prefix", str(tmp_path / "o" / "run"), "-qc", str(tmp_path / "qc"),
+               "-qc_label", "run-01", "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
+    assert rc == 0
+    rec = json.loads((tmp_path / "qc" / "records" / "12.physio.run-01.json").read_text())
+    assert [f["check"] for f in rec["figures"]] == ["rates", "maps"]
+    for f in rec["figures"]:
+        assert (tmp_path / "qc" / f["file"]).stat().st_size > 10_000
+    m = rec["metrics"]
+    assert abs(m["heart_rate"]["value"] - F_CARD * 60) < 2
+    assert abs(m["breathing_rate"]["value"] - F_RESP * 60) < 2
+    assert m["cardiac_r2_p95"]["value"] > 0.2  # the synthetic heartbeat is in every voxel
+
+
+def test_cli_tapas_nuisance_set_writes_physio_default_columns(tmp_path):
+    from fastfuncstuff.cli.physio import main
+    from fastfuncstuff.design.slibase import load_1d_matrix
+
+    args = _write_cli_inputs(tmp_path)
+    prefix = tmp_path / "o" / "run"
+    rc = main([*args, "-prefix", str(prefix), "-tzero", "0.5", "-nuisance_set", "tapas",
+               "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
+    assert rc == 0
+    X = load_1d_matrix(str(prefix) + ".nuisance.1D")
+    assert X.shape == (150, 20)  # card 6 + resp 8 + interaction 4 + HRV + RVT
+    header = str(prefix) + ".nuisance.1D"
+    assert "hrv.crf" in open(header).read() and "cxr.c1p" in open(header).read()
+
+
 def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
     """Cleaning must take the physiology and nothing a later step relies on: each
     voxel's mean and slow drift survive, the heartbeat at its slice's times goes."""
@@ -257,6 +305,29 @@ def test_breathing_rate_is_not_captured_by_slow_power_at_the_band_edge():
     x += 0.2 * rng.standard_normal(t.size)
     _, rate, _ = physio.peak_rate(t, x, physio.RESP_BAND)
     assert abs(np.median(rate) - 0.25) < 0.02, np.median(rate) * 60
+
+
+def test_explained_maps_put_each_group_where_its_signal_is():
+    """A heartbeat only in one half of the volume and breathing (in magnitude) only in
+    the other: the cardiac map must light the first half, respiration the second."""
+    mag, ph, st, t = _synthetic_run(nt=200, card=0.0)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    X, labels, _ = physio.slice_regressors(tr_, "magnitude", "phase")
+    m = X.shape[1] // st.size
+    one = labels[:m]
+    card = [i for i, lab in enumerate(one) if ".card." in lab]
+    resp = [i for i, lab in enumerate(one) if ".resp." in lab]
+    rng = np.random.default_rng(1)
+    data = 100 + rng.standard_normal(mag.shape).astype(np.float32)
+    for k in range(st.size):
+        Xk = X[:, k * m : (k + 1) * m]
+        data[:6, :, k] += 3 * Xk[:, card[0]]  # left half: cardiac
+        data[6:, :, k] += 3 * Xk[:, resp[0]]  # right half: respiration
+    maps = physio.explained_maps(data, X, TR, {"cardiac": card, "respiration": resp}, device=CPU)
+    c, r = maps["cardiac"], maps["respiration"]
+    assert np.median(c[:6]) > 0.5 and np.median(c[6:]) < 0.1
+    assert np.median(r[6:]) > 0.5 and np.median(r[:6]) < 0.1
+    assert (maps["all"] >= c - 1e-6).all()
 
 
 def test_response_functions_have_their_published_shapes():

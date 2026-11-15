@@ -4364,6 +4364,14 @@ def test_physio_writes_glm_regressors_and_leaves_the_series_alone(tmp_path, nord
     assert "ffs_physio" in s.split("for t in", 1)[1].split("\n", 1)[0]  # preflight checks it
 
 
+def test_physio_stage_writes_qc_when_qc_is_on(tmp_path):
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(
+        build_plan(subj, Options(physio=True, tzero=0.5)), "wd", bids_root=str(tmp_path)
+    )
+    assert '-qc qc -qc_label "stage00.physio.${FRAG[$k]}"' in _section(s, "stage00: physio ====")
+
+
 @pytest.mark.parametrize("nordic", [False, True])
 def test_physio_clean_mode_feeds_the_cleaned_series_to_everything_downstream(tmp_path, nordic):
     """-physio_mode clean is afni_proc's ricor order: ffs_physio -clean on the raw

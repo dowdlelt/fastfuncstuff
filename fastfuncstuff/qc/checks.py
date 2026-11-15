@@ -1700,3 +1700,182 @@ def denoise_check(
     path = rec.figure_path(step + 1, "removed")
     render.save_png(img, path)
     rec.add_figure(step + 1, "removed", "Removed signal carpet", path)
+
+
+# ---------------------------------------------------------------------------
+# Physiological noise from the data (ffs_physio)
+# ---------------------------------------------------------------------------
+
+# The respiratory tracker's band floor is 6/min (physio.RESP_BAND); a run whose
+# median rate sits near it has locked onto slow power, not breathing (seen on
+# TASKFORCE task runs and ImaginationStimulation before the f^2 rate fix).
+PHYSIO_RESP_FLOOR_WARN = 7.0
+# Inside 3/min of the cardiac band's edges (36-120/min) the tracker is pinned.
+PHYSIO_CARD_EDGE = (39.0, 117.0)
+
+
+def physio_rates_figure(
+    series: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    rates: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    sources: Mapping[str, str],
+):
+    """Spectrogram of each trace with its tracked rate, and a 30 s excerpt of both,
+    band-passed to their own bands so beats and breaths are visible. A PIL image."""
+    from matplotlib.figure import Figure
+    from scipy import signal
+
+    def bandpass(t, x, lo, hi):
+        fs = 1.0 / float(np.median(np.diff(t)))
+        sos = signal.butter(2, [lo, min(hi, 0.45 * fs)], btype="band", fs=fs, output="sos")
+        return signal.sosfiltfilt(sos, x - x.mean())
+
+    spec = (
+        ("cardiac", (0.5, 2.2), style.ORANGE),
+        ("respiration", (0.05, 0.8), style.BLUE),
+    )
+    with style.mpl_style():
+        fig = Figure(figsize=(style.WIDTH / plots.DPI, 7.2), dpi=plots.DPI)
+        axes = fig.subplots(3, 1)
+        for ax, (name, band, _col) in zip(axes[:2], spec, strict=True):
+            t, x = series[name]
+            fs = 1.0 / float(np.median(np.diff(t)))
+            win = 20.0 if name == "cardiac" else 40.0  # 40 s resolves breathing to 1.5/min
+            f, tt, S = signal.spectrogram(
+                x - x.mean(), fs=fs, nperseg=int(win * fs), noverlap=int((win - 2) * fs)
+            )
+            keep = (f >= band[0]) & (f <= band[1])
+            Sk = S[keep] / S[keep].max(0, keepdims=True).clip(1e-30)  # each window its own max
+            ax.pcolormesh(tt + t[0], f[keep] * 60, Sk, shading="auto", cmap="magma", vmin=0, vmax=1)
+            rt, rf = rates[name]
+            ax.plot(rt, rf * 60, color=style.AQUA, lw=2.0)
+            ax.set_ylabel(f"{name}\nper minute")
+            ax.set_xlim(t[0], t[-1])
+        t_r = series["respiration"][0]
+        t_mid = float(t_r[len(t_r) // 2])
+        for name, _band, col in spec:
+            t, x = series[name]
+            f0 = float(np.median(rates[name][1]))
+            lo, hi = (0.6 * f0, 2.2 * f0) if name == "cardiac" else (0.05, 1.0)
+            xb = bandpass(t, x, lo, hi)
+            w = (t >= t_mid - 15) & (t < t_mid + 15)
+            off = 2.5 if name == "respiration" else -2.5
+            axes[2].plot(t[w], xb[w] / (xb[w].std() + 1e-12) + off, color=col, lw=1.1,
+                         label=f"{name} ({sources[name]}, band-passed)")  # fmt: skip
+        axes[2].set_yticks([])
+        axes[2].set_xlabel("time (s)")
+        axes[2].legend(loc="upper right", ncol=2, frameon=False)
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.98, bottom=0.08, hspace=0.32)
+        return render.figure_image(fig)
+
+
+def physio_check(
+    rec: QCRecord,
+    step: int,
+    series: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    rates: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    sources: Mapping[str, str],
+    maps: Mapping[str, np.ndarray],
+    mean_img: np.ndarray,
+    affine,
+    mask: np.ndarray,
+) -> None:
+    """Tracked rates, the traces themselves, and where each regressor group explains
+    variance.
+
+    ``series``: {"cardiac" | "respiration": (times s, trace)} at the excitation rate;
+    ``rates``: the same keys -> (times s, Hz); ``maps``: unique R^2 per group on the
+    raw slices, (x, y, z) like ``mean_img``. Each map row has its own scale and no
+    colourbar: the shape is the check, and amplitudes differ by run and group.
+    """
+    hr_t, hr = rates["cardiac"]
+    rr_t, rr = rates["respiration"]
+    hr_med, rr_med = float(np.median(hr) * 60), float(np.median(rr) * 60)
+    rec.metric(
+        "heart_rate", hr_med, "/min", f"median heart rate, tracked from {sources['cardiac']}"
+    )
+    rec.metric("heart_rate_iqr", float(np.subtract(*np.percentile(hr * 60, [75, 25]))), "/min",
+               "spread of the tracked heart rate; a wandering track is a weak trace")  # fmt: skip
+    rec.metric(
+        "breathing_rate",
+        rr_med,
+        "/min",
+        f"median breathing rate, from {sources['respiration']}; near the 6/min band floor "
+        "means the tracker followed slow power instead of breaths",
+        warn_lt=PHYSIO_RESP_FLOOR_WARN,
+    )
+    rec.metric(
+        "heart_rate_at_band_edge",
+        int(hr_med < PHYSIO_CARD_EDGE[0] or hr_med > PHYSIO_CARD_EDGE[1]),
+        "",
+        "1 when the heart rate sits at the tracker's band edge (36-120/min)",
+        warn_gt=0.5,
+    )
+    for g, v in maps.items():
+        if g == "all":
+            continue
+        vals = v[mask]
+        rec.metric(f"{g}_r2_p95", float(np.percentile(vals, 95)) if vals.size else float("nan"),
+                   "", f"95th percentile of {g}'s unique R^2 on raw slices")  # fmt: skip
+
+    body = physio_rates_figure(series, rates, sources)
+    status = "warn" if rr_med < PHYSIO_RESP_FLOOR_WARN else None
+    img = render.compose(
+        body,
+        f"Physiology from the data · {rec.label}",
+        f"{rec.tool}  ·  traces at the excitation rate, tracked rate drawn on each spectrogram",
+        [(f"heart {hr_med:.0f}/min", None), (f"breathing {rr_med:.1f}/min", status)],
+        "Look for: one bright band per spectrogram (each window scaled to its own peak) with "
+        "the tracked line on it. A line that "
+        "jumps between bands, sits on a straight harmonic of the TR, or hugs the bottom edge "
+        "is tracking the wrong thing. The excerpt should look like breaths and beats, not "
+        "steps or flat stretches.",
+    )
+    path = rec.figure_path(step, "rates")
+    render.save_png(img, path)
+    rec.add_figure(step, "rates", "Tracked heart and breathing rate", path)
+
+    # ---- figure 2: where each group explains variance, over the raw mean
+    ras_mean, zooms = render.ras_volume(np.transpose(mean_img, (2, 1, 0)), affine)
+    ras_mask, _ = render.ras_volume(np.transpose(mask.astype(np.float32), (2, 1, 0)), affine)
+    head = ras_mask > 0.5
+    grid = render.Grid(ras_mean, zooms, head, n_cut=7)
+    win = render.window(ras_mean, head)
+    table = render.lut("inferno")
+    rows, letters = [], []
+    for g in [k for k in maps if k != "all"]:
+        ras_g, _ = render.ras_volume(np.transpose(maps[g], (2, 1, 0)), affine)
+        inside = ras_g[head]
+        hi = float(np.percentile(inside, 99)) if inside.size else 1.0
+        hi = hi if hi > 0 else 1.0
+        show = (ras_g >= 0.2 * hi) & head  # per-row scale: shape, not amplitude
+        for plane in ("axial", "coronal"):
+            asp = grid.aspect(plane)
+            panels = [
+                render.panel(
+                    render.overlay(render.colorize(u, *win), s_, sh > 0.5, 0.2 * hi, hi, table),
+                    asp,
+                    200,
+                )
+                for u, s_, sh in zip(
+                    grid.slices(ras_mean, plane),
+                    grid.slices(ras_g, plane),
+                    grid.slices(show.astype(np.float32), plane),
+                    strict=True,
+                )
+            ]
+            rows.append((f"{g}\n{plane}", panels))
+            letters.append(grid.side_letter(plane))
+    body = render.montage(rows, side_letters=letters)
+    img = render.compose(
+        body,
+        f"Where physiology explains variance · {rec.label}",
+        f"{rec.tool}  ·  unique R² per group on the raw slices, over the raw mean; each row its own scale",
+        [],
+        "Look for: cardiac on large vessels, the ventricles and the brain's edge; respiration "
+        "broad, strongest at the edges and near the sinuses; RVT broad and grey-matter heavy. "
+        "A flat, speckled or slice-striped map means the trace is wrong. Raw voxels are "
+        "scanner locations, so a moving head also lights the brain's edge.",
+    )
+    path = rec.figure_path(step + 1, "maps")
+    render.save_png(img, path)
+    rec.add_figure(step + 1, "maps", "Where cardiac, respiration and RVT explain variance", path)

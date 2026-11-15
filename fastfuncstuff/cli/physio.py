@@ -117,6 +117,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "taken). Costs 13 degrees of freedom per voxel that a later GLM does not see.",
     )
     parser.add_argument("-no_qc", action="store_true", help="Skip the QC spectrogram PNG.")
+    from fastfuncstuff.qc.record import add_qc_args
+
+    add_qc_args(parser)
     add_device_arg(parser)
     add_verbose_arg(parser)
     return parser.parse_args(argv)
@@ -159,37 +162,42 @@ def _write_slibase(path: Path, X: np.ndarray, labels: list[str]) -> None:
 
 
 def _qc_figure(path: Path, traces, sources: dict, diag: dict) -> None:
-    import matplotlib
+    """The standalone PREFIX.qc.png: the same rates figure -qc puts in its folder."""
+    from fastfuncstuff.qc import checks, render
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from scipy import signal
+    series = {k: traces.series(sources[k]) for k in ("cardiac", "respiration")}
+    rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
+    render.save_png(checks.physio_rates_figure(series, rates, sources), path)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
-    for ax, (name, band, key) in zip(
-        axes,
-        (
-            ("cardiac", (0.5, 2.2), "cardiac_rate_hz"),
-            ("respiration", (0.05, 0.8), "respiration_rate_hz"),
-        ),
-        strict=True,
-    ):
-        t, x = traces.series(sources[name])
-        fs = 1.0 / float(np.median(np.diff(t)))
-        f, tt, S = signal.spectrogram(
-            x - x.mean(), fs=fs, nperseg=int(20 * fs), noverlap=int(18 * fs)
-        )
-        keep = (f >= band[0]) & (f <= band[1])
-        ax.pcolormesh(
-            tt + t[0], f[keep] * 60, np.log10(S[keep] + 1e-20), shading="auto", cmap="magma"
-        )
-        rt, rf = diag[key]
-        ax.plot(rt, rf * 60, color="cyan", lw=1.2)
-        ax.set_ylabel("per minute")
-        ax.set_title(f"{name} from {sources[name]} (cyan: tracked rate)", fontsize=10)
-    axes[-1].set_xlabel("time (s)")
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
+
+def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -> None:
+    """-qc: tracked rates and traces, and where each group explains variance on the
+    raw slices (the maps cost one batched fit per slice; only made under -qc)."""
+    from fastfuncstuff.processing import physio
+    from fastfuncstuff.qc import checks
+    from fastfuncstuff.qc.record import QCRecord
+
+    rec = QCRecord.for_args(args, "physio", args.input)
+    if rec is None:
+        return
+    m = X.shape[1] // mag.shape[2]
+    one = [lab.split(".", 1)[1] for lab in labels[:m]]
+    groups = {
+        name: [i for i, lab in enumerate(one) if lab.startswith(prefix)]
+        for name, prefix in (("cardiac", "card."), ("respiration", "resp."), ("RVT", "rvt"))
+    }
+    mean_img = mag.mean(-1)
+    mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
+    maps = physio.explained_maps(mag, X, tr, groups, device=device, mask=mask)
+    series = {
+        "cardiac": traces.series(sources["cardiac"]),
+        "respiration": traces.series(sources["respiration"]),
+    }
+    rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
+    rec.info["input"] = str(args.input)
+    rec.info["sources"] = f"cardiac {sources['cardiac']}, respiration {sources['respiration']}"
+    checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask)
+    rec.write(args.verb)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -283,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
+    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device)
     if args.tzero is not None:
         times = np.arange(nt) * tr + args.tzero
         if args.nuisance_set == "tapas":

@@ -637,6 +637,61 @@ def regress_out(
     return out, removed
 
 
+def explained_maps(
+    data: np.ndarray,
+    X: np.ndarray,
+    tr: float,
+    groups: dict[str, list[int]],
+    device: torch.device | None = None,
+    mask: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Per voxel, the share of drift-removed variance each regressor group explains
+    beyond all the others (unique R^2), on raw slices.
+
+    ``X`` is the slice-major slibase matrix (nt, nz * m); ``groups`` names column
+    indices within one slice's ``m`` (e.g. ``{"cardiac": [5, 6, 7, 8]}``). Each voxel
+    is fitted with its own slice's regressors, so the maps are in the acquisition
+    grid and overlay the raw mean image directly. The map's shape is the check
+    PhysIO uses (Kasper 2017): cardiac on vessels, ventricles and the brain edge,
+    respiration broad; a wrong trace leaves a flat or speckled map. Edges also catch
+    motion-locked fits, since raw voxels are scanner locations. Returns maps
+    (nx, ny, nz), 0 outside ``mask``, plus ``"all"``.
+    """
+    device = device or torch.device("cpu")
+    nx, ny, nz, nt = data.shape
+    m = X.shape[1] // nz
+    if X.shape != (nt, nz * m):
+        raise ValueError(f"regressors {X.shape} do not match {nt} volumes x {nz} slices")
+    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=device, dtype=torch.float64)
+    if mask is None:
+        mask = np.ones((nx, ny, nz), dtype=bool)
+    out = {g: np.zeros((nx, ny, nz), dtype=np.float32) for g in ("all", *groups)}
+
+    def sse(A, Y):
+        return ((Y - A @ plinalg.lstsq(A, Y).solution) ** 2).sum(0)
+
+    for k in range(nz):
+        sel = mask[:, :, k].reshape(-1)
+        if sel.sum() < 2:
+            continue
+        Y = torch.from_numpy(
+            np.ascontiguousarray(data[:, :, k, :]).reshape(-1, nt)[sel].T.astype(np.float64)
+        ).to(device)
+        Xk = torch.from_numpy(X[:, k * m : (k + 1) * m].astype(np.float64)).to(device)
+        Xk = (Xk - Xk.mean(0)) / Xk.std(0).clamp_min(1e-12)
+        s0 = sse(L, Y).clamp_min(1e-12)
+        sf = sse(torch.cat([L, Xk], 1), Y)
+        vals = {"all": (s0 - sf) / s0}
+        for g, cols in groups.items():
+            rest = [c for c in range(m) if c not in cols]
+            vals[g] = (sse(torch.cat([L, Xk[:, rest]], 1), Y) - sf) / s0
+        for g, v in vals.items():
+            plane = out[g][:, :, k].reshape(-1)
+            plane[sel] = v.clamp_min(0).float().cpu().numpy()
+            out[g][:, :, k] = plane.reshape(nx, ny)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Standard regressor sets (TAPAS / physio_calc style), from published definitions.
 # TAPAS is GPL-3 and this repository GPL-2-or-later, so nothing here is ported from

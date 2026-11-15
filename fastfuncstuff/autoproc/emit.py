@@ -1848,6 +1848,7 @@ def _stage_physio(plan: Plan) -> str:
             '-drop_last "$drop"',
             '-prefix "stage00.physio.${FRAG[$k]}.regs"',
             '-clean "$outf"' if clean else f"-tzero {opt.tzero:g}",
+            *([f'-qc {QC_DIR} -qc_label "stage00.physio.${{FRAG[$k]}}"'] if _qc_on(plan) else []),
             '-device "$DEVICE"',
         ],
     )

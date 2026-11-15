@@ -31,6 +31,7 @@ from typing import Any
 # a new tool slots in without renumbering.
 QC_ORDER: dict[str, int] = {
     "nordic": 10,
+    "physio": 12,
     "tshift": 15,
     "moco": 20,
     "locomoco": 25,
