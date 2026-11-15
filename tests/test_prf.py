@@ -302,6 +302,87 @@ def test_derivatives_hold_for_small_exponents_and_faint_drives():
     torch.testing.assert_close(single.double() / scale, exact / scale, rtol=0, atol=1e-4)
 
 
+def test_float64_polish_never_loses_to_float32_and_keeps_dtype():
+    """The -refine_precision polish runs on a float32 fit and only ever helps.
+
+    Small-exponent, small-sigma voxels are where float32 and float64 disagree
+    about the model itself (how far the Gaussian's tail counts), so the polish is
+    scored on the float64 objective it optimises. It starts from the float32
+    answer and accepts only improvements, so no voxel may come out worse.
+    """
+    stimulus_shape = (16, 16)
+    frames = []
+    for column in range(0, 16, 2):
+        frame = torch.zeros(16, 16, dtype=torch.float64)
+        frame[:, column : column + 2] = 1.0
+        frames.append(frame)
+    for row in range(0, 16, 2):
+        frame = torch.zeros(16, 16, dtype=torch.float64)
+        frame[row : row + 2, :] = 1.0
+        frames.append(frame)
+    frames += [torch.zeros(16, 16, dtype=torch.float64)] * 4
+    run = torch.stack(frames).reshape(len(frames), -1)
+    stimulus_runs = [run, run]
+    truth = torch.tensor(
+        [[5.0, 11.0, 0.4, 0.02], [9.0, 6.0, 0.6, 0.05], [12.0, 12.0, 1.5, 0.3]],
+        dtype=torch.float64,
+    )
+    hrf = torch.tensor([0.0, 0.4, 1.0, 0.7, 0.3, 0.1], dtype=torch.float64)
+    clean = _css_prediction(stimulus_runs, truth, hrf, stimulus_shape)
+    noise = torch.randn(
+        clean.shape, generator=torch.Generator().manual_seed(5), dtype=torch.float64
+    )
+    data64 = (clean + 0.02 * noise).T.contiguous()
+    run_starts = [0, run.shape[0]]
+    nuisance = [torch.ones(run.shape[0], 1, dtype=torch.float64)] * 2
+
+    def sse64(parameters):
+        from fastfuncstuff.design.prf import _project_per_run, _variable_projection_sse
+
+        prediction = _css_prediction(stimulus_runs, parameters.double(), hrf, stimulus_shape)
+        return _variable_projection_sse(
+            _project_per_run(data64.T, nuisance, run_starts),
+            _project_per_run(prediction, nuisance, run_starts),
+        )
+
+    data32 = data64.float()
+    runs32 = [r.float() for r in stimulus_runs]
+    grid = make_analyzeprf_grid(stimulus_shape, n_angles=16)
+    seeds = fit_prf_supergrid(
+        data32,
+        runs32,
+        stimulus_shape,
+        grid,
+        hrf.float().unsqueeze(0),
+        run_starts,
+        nuisance_per_run=[n.float() for n in nuisance],
+        device=torch.device("cpu"),
+    )
+    fits = {
+        name: refine_prf_supergrid(
+            data32,
+            runs32,
+            stimulus_shape,
+            seeds,
+            hrf.float().unsqueeze(0),
+            run_starts,
+            nuisance_per_run=[n.float() for n in nuisance],
+            device=torch.device("cpu"),
+            config=PRFRefinementConfig(stagewise_exponent=True, polish_dtype=polish),
+        )
+        for name, polish in (("float32", None), ("polish", torch.float64))
+    }
+    assert fits["polish"].parameters.dtype == torch.float32
+    assert fits["polish"].r2.dtype == torch.float32
+    plain, polished = sse64(fits["float32"].parameters), sse64(fits["polish"].parameters)
+    assert bool((polished <= plain * (1 + 1e-5)).all()), (plain, polished)
+    # ...and it must actually run: the n = 0.02, sigma = 0.4 voxel is in the regime
+    # float32 cannot represent (measured 1.2% lower SSE after the polish).
+    assert float(polished[0]) < 0.995 * float(plain[0]), (plain, polished)
+    # The polish iterates on top of the float32 refinement, never instead of it.
+    assert bool((fits["polish"].n_iters >= fits["float32"].n_iters).all())
+
+
 @pytest.mark.parametrize("stimulus_shape", [(9, 7), (4, 3)])
 def test_separable_prediction_matches_dense_fields_with_repeated_frames(stimulus_shape):
     """Deduplicated frames and the separable Gaussian must reproduce the dense model.

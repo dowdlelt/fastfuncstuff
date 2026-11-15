@@ -107,6 +107,15 @@ class PRFRefinementConfig:
     min_sigma: float = 1e-3
     min_exponent: float = 1e-3
     max_line_search: int = 4
+    # After refining in the data's dtype, refine again from that answer in this
+    # one (None: don't). The CSS model itself is precision-dependent at small
+    # exponents: drive^n ~ 1 for any drive that has not underflowed, so where the
+    # Gaussian's tail stops counting is set by the float range (~13 sigma in
+    # float32, ~38 in float64), and analyzePRF -- float64 -- fits that function.
+    # On ds003787 46% of screened vertices settle at n < 0.01, and float32 alone
+    # was >0.5 R2 points worse than float64 on 17% of them; the polish brings it
+    # to 1.3% for ~5x the float32 refinement (float64 throughout is ~7x).
+    polish_dtype: torch.dtype | None = torch.float64
     fix_exponent: bool = False
     stagewise_exponent: bool = False
     # Which of (row, column, sigma, exponent) Gauss-Newton may move, by index.
@@ -1356,6 +1365,100 @@ def _padded_rows(mask: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor,
 
 
 def _refine_css_batch(
+    data: torch.Tensor,
+    stimulus_runs: Sequence[torch.Tensor],
+    parameters: torch.Tensor,
+    hrf: torch.Tensor | _HRFApplier,
+    stimulus_shape: tuple[int, int],
+    run_starts: Sequence[int],
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
+    config: PRFRefinementConfig,
+    hrf_group: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Refine one voxel chunk, then polish it in ``config.polish_dtype``.
+
+    The polish is skipped when the exponent is held (the fixed-exponent stage and
+    the linear Gaussian cannot reach the small-exponent regime it exists for),
+    when the data already are that dtype, and on a device that lacks it (Metal).
+    It runs in half-size sub-chunks, because float64 doubles every working
+    tensor and the chunk was sized for the data's dtype.
+    """
+    first = _refine_css_batch_once(
+        data,
+        stimulus_runs,
+        parameters,
+        hrf,
+        stimulus_shape,
+        run_starts,
+        nuisance_per_run,
+        config,
+        hrf_group,
+    )
+    polish = config.polish_dtype
+    if (
+        polish is None
+        or config.fix_exponent
+        or data.dtype == polish
+        or widest_float_dtype(data.device) != polish
+    ):
+        return first
+
+    runs = [run.to(dtype=polish) for run in _compress_aperture_runs(stimulus_runs, stimulus_shape)]
+    applier = _as_applier(hrf)
+    polish_hrf = _HRFApplier(applier.hrfs.to(polish))
+    if isinstance(nuisance_per_run, _NuisanceBases):
+        # A float32 Q is orthonormal only to ~1e-7; refactor its span in float64.
+        polish_nuisance: _NuisanceBases | Sequence[torch.Tensor] | None = _NuisanceBases(
+            tuple(
+                None if q is None else plinalg.qr(q.to(polish))[0] for q in nuisance_per_run.bases
+            )
+        )
+    elif nuisance_per_run is not None:
+        polish_nuisance = [n.to(polish) for n in nuisance_per_run]
+    else:
+        polish_nuisance = None
+    polish_config = replace(config, polish_dtype=None)
+    n_voxels = data.shape[0]
+    step = max(1, (n_voxels + 1) // 2)
+    parts = []
+    for start in range(0, n_voxels, step):
+        rows = slice(start, start + step)
+        group = None if hrf_group is None else hrf_group[rows]
+        parts.append(
+            _refine_css_batch_once(
+                data[rows].to(polish),
+                runs,
+                first[0][rows].to(polish),
+                polish_hrf,
+                stimulus_shape,
+                run_starts,
+                polish_nuisance,
+                polish_config,
+                group,
+            )
+        )
+    merged = [torch.cat([part[i] for part in parts]) for i in range(7)]
+    dtype = data.dtype
+    return (
+        merged[0].to(dtype),
+        merged[1].to(dtype),
+        merged[2].to(dtype),
+        merged[3].to(dtype),
+        merged[4].to(dtype),
+        first[5] + merged[5],
+        merged[6],
+    )
+
+
+def _refine_css_batch_once(
     data: torch.Tensor,
     stimulus_runs: Sequence[torch.Tensor],
     parameters: torch.Tensor,

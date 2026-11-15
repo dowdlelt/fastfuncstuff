@@ -107,7 +107,7 @@ from fastfuncstuff.stats.reliability import (
     spearman_correlation,
     split_half_noise_ceiling,
 )
-from fastfuncstuff.utils import invalid_voxel_mask
+from fastfuncstuff.utils import invalid_voxel_mask, widest_float_dtype
 
 _EPILOG = """
 OUTPUT
@@ -824,6 +824,24 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-4,
         help="CSS parameter convergence tolerance",
+    )
+    model.add_argument(
+        "-refine-precision",
+        "-refine_precision",
+        choices=["polish", "float32"],
+        default="polish",
+        help=(
+            "'polish' refines in float32, then refines again from that answer in "
+            "float64. The CSS model is precision-dependent at small exponents: "
+            "drive^n is ~1 for any drive that has not underflowed, so how far the "
+            "Gaussian's tail counts is set by the float range (~13 sigma in float32, "
+            "~38 in float64), and analyzePRF fits the float64 version. On real "
+            "retinotopy data almost half of responsive voxels settle there, and "
+            "float32 alone was >0.5 R2 points worse on 17%% of voxels; the polish "
+            "matches analyzePRF or better at ~5x the float32 refinement cost. "
+            "'float32' skips it. Metal has no float64, so on MPS the polish is "
+            "skipped with a note"
+        ),
     )
     model.add_argument(
         "-xval",
@@ -2644,7 +2662,18 @@ def main(argv: list[str] | None = None) -> int:
         min_exponent=args.expt_lower_bound,
         fix_exponent=args.model_mode == 3,
         stagewise_exponent=args.model_mode == 1,
+        polish_dtype=torch.float64 if args.refine_precision == "polish" else None,
     )
+    if (
+        refinement_config.polish_dtype is not None
+        and widest_float_dtype(device) != torch.float64
+        and args.verb
+        and not args.quick
+    ):
+        print(
+            f"  Note: {device.type} has no float64, so the -refine_precision polish is "
+            "skipped; small-exponent fits are float32 (use -device cpu for the polish)"
+        )
     hrf_r2_map = None
     canonical_results = None
     if args.quick:
