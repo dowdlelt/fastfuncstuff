@@ -79,6 +79,7 @@ docs/REFERENCE_CODE.md
 
 # real test data
 test_data/ds005165-download/
+test_data/ds003787-download/
 test_data/nordic_test_data/
 test_data/small_validation_afni_data/
 
