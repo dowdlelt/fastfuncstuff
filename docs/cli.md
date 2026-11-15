@@ -383,6 +383,25 @@ Key flags:
 - `-resample TR_NEW` — resample to a new TR grid after correction; useful for TR-locking onsets for GLMsingle-style analysis.
 - Interpolation: `-Fourier` (default), `-linear`, `-cubic`, `-quintic`, `-heptic`, `-wsinc5`, `-wsinc9`.
 
+### `ffs_physio` — cardiac and respiratory regressors from the data
+
+RETROICOR + RVT for 2-D (multiband) EPI with no recordings: each excitation is one
+physiological sample, cardiac comes from magnitude, respiration and breath depth from phase.
+Method, placement and validation against belt + pulse oximeter: [docs/physio.md](physio.md).
+
+```
+ffs_physio \
+    -input run_mag.nii.gz -phase run_phase.nii.gz \
+    -prefix physio/run01 -tzero 0.47 -qc qc/
+```
+
+Key flags:
+
+- `-tzero T` — write `PREFIX.nuisance.1D` for a GLM on data slice-timed to `T` (the default use).
+- `-nuisance_set afni|tapas` — 13 slibase columns (default) or PhysIO's c3 r4 cr1 + HRV + RVT.
+- `-clean OUT` — regress the fit out of the raw slices (afni_proc's `ricor` order).
+- `-qc DIR` — tracked-rate spectrograms and variance-explained maps.
+
 ### `ffs_allineate` — affine alignment
 
 GPU port of `3dAllineate`. Rigid, affine, or EPI-constrained alignment between two 3D volumes.
