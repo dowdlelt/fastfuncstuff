@@ -1062,30 +1062,42 @@ def _css_prediction_and_derivatives(
 
     predictions: list[torch.Tensor] = []
     derivatives: list[torch.Tensor] = []
-    eps = torch.finfo(dtype).eps
     for run in runs:
         field, row_moment, column_moment, row_square, column_square = _separable_drives(
             run, column_profiles, row_weights
         )
         drive = field * norm_t
         # The value must match `_css_prediction` exactly (the line search compares
-        # the two objectives), so only the chain rule and the log use the eps floor.
+        # the two objectives).
         neural = drive.clamp_min(0).pow(exponent.T)
-        positive_drive = drive.clamp_min(eps)
-        # d(drive^n)/d(drive), shared by all three spatial derivatives.
-        drive_chain = exponent.T * positive_drive.pow(exponent.T - 1)
-        spatial_scale = drive_chain * norm_t * inverse_variance
+        # The chain rule is written as n * drive^n * (moment / field) rather than
+        # n * drive^(n-1) * moment. The two are equal, but the first form never
+        # forms drive^(n-1), which is huge for a small exponent and a drive that
+        # barely touches the bar. The old code floored that drive at float eps
+        # (1.2e-7 in float32), while a drive of 1e-10 still contributes 0.056 to
+        # the prediction at n = 0.125: the Jacobian was wrong exactly where the
+        # exponent is small, steps were rejected until the damping capped out, and
+        # about a quarter of real-data voxels kept their super-grid exponent
+        # (float64 hid it behind its smaller eps). moment / field is a weighted
+        # mean of pixel offsets, so it stays bounded however small the field is.
+        # Divide the moments by the field FIRST: neural / field alone overflows
+        # float32 for a denormal field.
+        live = field > 0
+        safe_field = torch.where(live, field, torch.ones_like(field))
+        scaled = torch.where(live, exponent.T * neural, torch.zeros_like(field))
 
         neural_derivatives = torch.empty(
             (run.n_frames, n_voxels, n_derivatives), device=device, dtype=dtype
         )
-        neural_derivatives[:, :, 0] = spatial_scale * row_moment
-        neural_derivatives[:, :, 1] = spatial_scale * column_moment
-        neural_derivatives[:, :, 2] = drive_chain * (
-            norm_t * (row_square + column_square) / sigma.pow(3).T - 2.0 * drive / sigma.T
+        neural_derivatives[:, :, 0] = scaled * inverse_variance * (row_moment / safe_field)
+        neural_derivatives[:, :, 1] = scaled * inverse_variance * (column_moment / safe_field)
+        neural_derivatives[:, :, 2] = scaled * (
+            (row_square + column_square) / safe_field / sigma.pow(3).T - 2.0 / sigma.T
         )
         if n_derivatives == 4:
-            neural_derivatives[:, :, 3] = neural * positive_drive.log()
+            neural_derivatives[:, :, 3] = torch.where(
+                live, neural * torch.where(live, drive, torch.ones_like(drive)).log(), 0.0
+            )
 
         predictions.append(applier.apply(neural, run=run))
         derivatives.append(

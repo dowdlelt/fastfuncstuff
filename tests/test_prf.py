@@ -261,6 +261,47 @@ def test_analytic_derivatives_match_finite_differences():
         torch.testing.assert_close(derivatives[:, :, index], numeric, atol=1e-6, rtol=1e-5)
 
 
+def test_derivatives_hold_for_small_exponents_and_faint_drives():
+    """The CSS chain rule where the drive is tiny and the exponent small.
+
+    Bug of record: the chain rule floored the drive at float eps (1.2e-7 in
+    float32), but at n = 0.05 a drive of 1e-20 still contributes 0.1 to the
+    prediction, so the float32 Jacobian was wrong for receptive fields that only
+    graze the bar. On real retinotopy data that froze about a quarter of voxels at
+    their super-grid exponent and lost to analyzePRF on the same data.
+    """
+    stimulus_shape = (20, 20)
+    frames = torch.zeros((6, 20, 20), dtype=torch.float64)
+    for frame, column in enumerate(range(0, 12, 2)):
+        frames[frame, :, column : column + 2] = 1.0  # a bar sweeping toward the RF
+    stimulus_runs = [frames.reshape(6, -1)]
+    # Centred 9-15 px from the bar at sigma 1.5: drives from ~1e-4 down to ~1e-20.
+    parameters = torch.tensor(
+        [[6.0, 16.0, 1.5, 0.05], [13.0, 14.0, 1.2, 0.02], [4.0, 13.0, 2.0, 0.1]],
+        dtype=torch.float64,
+    )
+    hrf = torch.tensor([1.0, 0.5, 0.2, 0.05], dtype=torch.float64)
+    _, exact = _css_prediction_and_derivatives(stimulus_runs, parameters, hrf, stimulus_shape)
+
+    for index in range(4):
+        delta = 1e-7 * max(1.0, float(parameters[:, index].abs().max()))
+        forward = parameters.clone()
+        forward[:, index] += delta
+        backward = parameters.clone()
+        backward[:, index] -= delta
+        numeric = (
+            _css_prediction(stimulus_runs, forward, hrf, stimulus_shape)
+            - _css_prediction(stimulus_runs, backward, hrf, stimulus_shape)
+        ) / (2 * delta)
+        torch.testing.assert_close(exact[:, :, index], numeric, rtol=1e-4, atol=1e-8)
+
+    _, single = _css_prediction_and_derivatives(
+        [run.float() for run in stimulus_runs], parameters.float(), hrf.float(), stimulus_shape
+    )
+    scale = exact.abs().amax(dim=(0, 1), keepdim=True)
+    torch.testing.assert_close(single.double() / scale, exact / scale, rtol=0, atol=1e-4)
+
+
 @pytest.mark.parametrize("stimulus_shape", [(9, 7), (4, 3)])
 def test_separable_prediction_matches_dense_fields_with_repeated_frames(stimulus_shape):
     """Deduplicated frames and the separable Gaussian must reproduce the dense model.
