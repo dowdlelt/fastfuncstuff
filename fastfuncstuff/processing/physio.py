@@ -202,7 +202,11 @@ def excitation_traces(
             .reshape(-1, nt)[sel]
         )
         mu = m.mean(1)
-        frac = (m - m @ proj.T) / mu.clamp_min(1e-6)[:, None]
+        # Centred before the projection: the constant is in the drift space, so the
+        # result is the same, but TF32 matmuls (on by default on CUDA) keep ~3 digits,
+        # which on raw intensities is the size of the cardiac pulsation itself.
+        mc = m - mu[:, None]
+        frac = (mc - mc @ proj.T) / mu.clamp_min(1e-6)[:, None]
         per_slice_m[:, k] = frac.mean(0).cpu().numpy()
         count_m[k] = float(m.shape[0])
         if phase is not None:

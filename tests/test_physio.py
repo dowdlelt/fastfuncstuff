@@ -303,6 +303,25 @@ def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
     assert 0.3 < float(np.median(removed)) < 1.0
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_traces_on_cuda_with_tf32_match_the_cpu():
+    """TF32 matmuls (setup_device turns them on) keep ~3 digits; projecting drift out
+    of raw intensities with them left the cardiac trace 1 % off the CPU's on real data
+    and moved cardiac regressors by up to 1.5 near weak beats."""
+    mag, ph, st, _ = _synthetic_run(nt=200, card=0.002, noise=0.001)
+    mag = mag * 30  # raw-scanner-sized intensities
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        g = physio.excitation_traces(mag, st, TR, phase=ph, device=torch.device("cuda"))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+    c = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    err = np.sqrt(((g.magnitude - c.magnitude) ** 2).mean()) / c.magnitude.std()
+    assert err < 1e-3, err
+
+
 def test_volume_regressors_at_tzero_equal_a_slice_acquired_at_tzero():
     """The GLM nuisance (one set at f*TR + tzero) and the per-slice terms are one model:
     at a slice acquired exactly at tzero all 13 columns must coincide, cardiac included."""
