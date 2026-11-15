@@ -208,25 +208,42 @@ def test_regress_out_removes_the_heartbeat_and_keeps_mean_and_drift():
 
 def test_volume_regressors_at_tzero_equal_a_slice_acquired_at_tzero():
     """The GLM nuisance (one set at f*TR + tzero) and the per-slice terms are one model:
-    at a slice acquired exactly at tzero they must coincide (RVT and respiration)."""
+    at a slice acquired exactly at tzero all 13 columns must coincide, cardiac included."""
     mag, ph, st, _ = _synthetic_run(nt=150)
     tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
-    X, _, diag = physio.slice_regressors(tr_, "magnitude", "phase")
+    X, slabels, diag = physio.slice_regressors(tr_, "magnitude", "phase")
     k0 = int(np.flatnonzero(st == 0.0)[0])
     V, labels = physio.volume_regressors(diag, np.arange(150) * TR + 0.0)
-    assert labels == [
-        "rvt00",
-        "rvt01",
-        "rvt02",
-        "rvt03",
-        "rvt04",
-        "resp.c1",
-        "resp.s1",
-        "resp.c2",
-        "resp.s2",
-    ]
-    slice_cols = X[:, k0 * 13 : (k0 + 1) * 13][:, [0, 1, 2, 3, 4, 9, 10, 11, 12]]
-    np.testing.assert_allclose(V, slice_cols, atol=1e-6)
+    assert [f"s{k0:03d}.{lab}" for lab in labels] == slabels[k0 * 13 : (k0 + 1) * 13]
+    np.testing.assert_allclose(V, X[:, k0 * 13 : (k0 + 1) * 13], atol=1e-6)
+    V9, labels9 = physio.volume_regressors(diag, np.arange(150) * TR, cardiac=False)
+    assert V9.shape[1] == 9 and not any(lab.startswith("card") for lab in labels9)
+
+
+def test_cardiac_at_tzero_survives_slice_timing():
+    """Slice timing shifts an aliased heartbeat by the wrong phase, but by a constant one
+    per slice; the cardiac pair evaluated at tzero still fits the corrected data. Guards the
+    reason cardiac is in the tzero nuisance (it was once left out as 'aliased')."""
+    from fastfuncstuff.processing.slicetime import slicetime_correct
+
+    nt = 240
+    mag, ph, st, t = _synthetic_run(nt=nt, card=0.02, noise=0.004)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    _, _, diag = physio.slice_regressors(tr_, "magnitude", "phase")
+    tzero = float(st.mean())
+    vol = torch.from_numpy(np.ascontiguousarray(mag.transpose(3, 2, 1, 0)))
+    corr = slicetime_correct(vol, list(st), TR, tzero=tzero, method="heptic", device=CPU)
+    corr = corr.numpy().transpose(3, 2, 1, 0)
+    V, labels = physio.volume_regressors(diag, np.arange(nt) * TR + tzero)
+    card = V[:, [i for i, lab in enumerate(labels) if lab.startswith("card")]]
+    n = np.arange(nt, dtype=float)
+    base = np.column_stack([np.ones(nt), n, n**2])
+    for k in (0, st.size // 3, st.size - 1):  # slices far from tzero included
+        y = corr[3, 4, k]
+        r0 = y - base @ np.linalg.lstsq(base, y, rcond=None)[0]
+        A = np.column_stack([base, card])
+        r1 = y - A @ np.linalg.lstsq(A, y, rcond=None)[0]
+        assert 1 - (r1 @ r1) / (r0 @ r0) > 0.5, k
 
 
 def test_response_functions_have_their_published_shapes():

@@ -521,37 +521,38 @@ def volume_regressors(
     times: np.ndarray,
     rvt_shifts: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0),
     order: int = 2,
-    cardiac: bool = False,
+    cardiac: bool = True,
 ) -> tuple[np.ndarray, list[str]]:
     """Regressors for data that every voxel samples at the same ``times``.
 
     After a slice-timing-corrected resample every voxel stands for the instant
     ``f*TR + tzero``, so the physiological model is evaluated there, once, and used as
-    a GLM nuisance like the motion parameters. Measured on ImaginationStimulation:
-    respiration + RVT as nuisance after the resample raised held-out R2 (top 0.5 %:
-    33.5 -> 35.7, 87 % of voxels better), while the same terms regressed out of the
-    raw slices before motion correction LOWERED it (to 31.0) -- on raw slices they
-    mostly fit breathing-locked apparent motion, which motion correction and slice
-    timing then remove themselves, so the subtraction became structured noise.
+    a GLM nuisance like the motion parameters (PhysIO's placement: Kasper 2017 samples
+    every regressor at the slice-timing reference slice). Columns are the slibase
+    columns in the same order, so at a slice acquired at ``tzero`` they coincide.
 
-    Cardiac is off by default: at the volume rate it is aliased, and slice timing
-    cannot shift an aliased component correctly (it acts at the alias frequency).
-    Measured +0.1 there -- harmless, useless.
+    Cardiac survives slice timing although it is aliased at the volume rate. Slice
+    timing shifts the aliased component by the wrong phase, but that error is a
+    constant per slice and harmonic as long as the harmonic does not alias across a
+    multiple of the volume rate during the run, and a voxel's free cos/sin amplitudes
+    absorb a constant phase. Jones 2008 found one regressor set per volume within
+    0.2 % of slice-specific ones in subject data. Measured on 19 TASKFORCE runs (wiki
+    note, 2026-11-15; belt + pulse): cardiac at tzero after slice timing is significant
+    (p < 0.001) in 15 % of voxels, against 17 % for each slice's own-time terms on raw
+    slices and 16 % for those terms pushed through the same slice-timing operator.
     """
     s = diag["series"]
     cols, labels = [], []
     for i, sh in enumerate(rvt_shifts):
         cols.append(np.interp(times - sh, s["t_resp"], s["rv"]))
         labels.append(f"rvt{i:02d}")
-    phr = np.interp(times, s["t_resp"], s["phi_resp"])
-    for m in range(1, order + 1):
-        cols += [np.cos(m * phr), np.sin(m * phr)]
-        labels += [f"resp.c{m}", f"resp.s{m}"]
+    phases = [("resp", np.interp(times, s["t_resp"], s["phi_resp"]))]
     if cardiac:
-        phc = np.interp(times, s["t_card"], s["phi_card"])
+        phases.insert(0, ("card", np.interp(times, s["t_card"], s["phi_card"])))
+    for name, ph in phases:
         for m in range(1, order + 1):
-            cols += [np.cos(m * phc), np.sin(m * phc)]
-            labels += [f"card.c{m}", f"card.s{m}"]
+            cols += [np.cos(m * ph), np.sin(m * ph)]
+            labels += [f"{name}.c{m}", f"{name}.s{m}"]
     return np.stack(cols, 1), labels
 
 

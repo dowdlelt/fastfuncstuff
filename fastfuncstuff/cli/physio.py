@@ -85,12 +85,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-tzero",
         type=float,
         default=None,
-        help="Also write PREFIX.nuisance.1D: RVT + respiratory terms evaluated at "
-        "f*TR + TZERO, the instant every voxel stands for after a slice-timing-corrected "
-        "resample. Give the -tzero the final resample used. Use it as a per-run GLM "
-        "nuisance (like motion) on the RESAMPLED data -- the placement that raised "
-        "held-out R2 on ImaginationStimulation. Cardiac is left out (aliased at the "
-        "volume rate; slice timing cannot shift it correctly).",
+        help="Also write PREFIX.nuisance.1D: the -nuisance_set evaluated at f*TR + TZERO, "
+        "the instant every voxel stands for after a slice-timing-corrected resample. Give "
+        "the -tzero the final resample used. Use it as a per-run GLM nuisance (like "
+        "motion) on the RESAMPLED data, fitted jointly with the task -- PhysIO's "
+        "placement. Cardiac is included: slice timing shifts the aliased heartbeat by a "
+        "constant phase per slice, which each voxel's cos/sin pair absorbs.",
+    )
+    parser.add_argument(
+        "-nuisance_set",
+        choices=["afni", "tapas"],
+        default="afni",
+        help="Columns of PREFIX.nuisance.1D. afni (13): RVT at 0-4 s lags, cardiac and "
+        "respiratory RETROICOR to 2nd order -- the slibase columns, as physio_calc.py "
+        "writes them. tapas (20): PhysIO's default -- cardiac 3rd, respiratory 4th, "
+        "cardiac x respiratory 1st order (Harvey 2008), HRV*CRF (Chang 2009), RVT*RRF "
+        "(Birn 2008). On TASKFORCE the interaction and HRV terms were significant in "
+        "1-2 %% of voxels (p < 0.001), against ~15 %% for cardiac.",
     )
     parser.add_argument(
         "-clean",
@@ -98,9 +109,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Also write the magnitude with each voxel's physiological fit removed "
         "(its own slice's regressors, fitted jointly with drift; mean and drift kept), "
         "as afni_proc's ricor block does. CAUTION: on ImaginationStimulation this, done "
-        "before motion correction and slice timing, LOWERED held-out task R2 -- the "
-        "terms fit breathing-locked apparent motion that those steps remove anyway. "
-        "Prefer -tzero and a GLM nuisance after the resample. "
+        "before motion correction and slice timing, LOWERED held-out task R2 in all four "
+        "subjects (cause not established; breathing there is task-locked, and cleaning "
+        "first gives shared variance to the noise). -tzero and a GLM nuisance after the "
+        "resample did not. "
         "Writes OUT and OUT's _physio_removed map (fraction of each voxel's variance "
         "taken). Costs 13 degrees of freedom per voxel that a later GLM does not see.",
     )
@@ -272,7 +284,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
     if args.tzero is not None:
-        Xv, vlabels = physio.volume_regressors(diag, np.arange(nt) * tr + args.tzero)
+        times = np.arange(nt) * tr + args.tzero
+        if args.nuisance_set == "tapas":
+            model = physio.model_from_traces(traces, sources["cardiac"], sources["respiration"])
+            Xv, vlabels = physio.standard_regressors(model, times)
+        else:
+            Xv, vlabels = physio.volume_regressors(diag, times)
         with open(base + ".nuisance.1D", "w") as fh:
             fh.write(f"# ffs_physio volume regressors at f*TR + {args.tzero:g} s\n")
             fh.write('# ColumnLabels = "' + " ; ".join(vlabels) + '"\n')
@@ -280,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["nuisance"] = {
             "file": base + ".nuisance.1D",
             "tzero": args.tzero,
+            "set": args.nuisance_set,
             "columns": vlabels,
         }
         Path(base + ".json").write_text(json.dumps(summary, indent=2))
