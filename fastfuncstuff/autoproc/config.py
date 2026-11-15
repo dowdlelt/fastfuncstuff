@@ -260,8 +260,9 @@ GLM_ORTVEC: dict[str, dict[str, str]] = {
     "physio": {
         "pattern": "stage00.physio.*task-{task}*.regs.nuisance.1D",
         "transform": "none",
-        "requires": "physio",
-        "note": "RVT (5 lags) + respiratory RETROICOR from the data (ffs_physio), "
+        "requires": "physio_nuisance",
+        "requires_hint": "-physio with -physio_mode nuisance",
+        "note": "RVT (5 lags) + cardiac and respiratory RETROICOR from the data (ffs_physio), "
         "evaluated at tzero -- the instant every voxel stands for after the "
         "slice-timed final resample",
     },

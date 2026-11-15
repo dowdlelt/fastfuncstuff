@@ -4343,11 +4343,11 @@ def _section(script: str, start: str, end: str = "\n# =====") -> str:
 
 @pytest.mark.parametrize("nordic", [False, True])
 def test_physio_writes_glm_regressors_and_leaves_the_series_alone(tmp_path, nordic):
-    """-physio must NOT regress anything out of the series moco and the final resample
-    read: on raw slices the terms fit breathing-locked apparent motion that those
-    steps remove anyway, and held-out R2 fell. It writes regressors at tzero for the
-    GLM instead. The stage reads the NORDIC output (noise trimmed) or the BIDS
-    magnitude with -drop_last NOISE."""
+    """By default (-physio_mode nuisance) -physio must NOT regress anything out of the
+    series moco and the final resample read -- doing so before them lowered held-out
+    R2 on ImaginationStimulation. It writes regressors at tzero for the GLM instead.
+    The stage reads the NORDIC output (noise trimmed) or the BIDS magnitude with
+    -drop_last NOISE."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
     opt = Options(physio=True, want_nordic=nordic, tzero=0.5)
     s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
@@ -4362,6 +4362,29 @@ def test_physio_writes_glm_regressors_and_leaves_the_series_alone(tmp_path, nord
     assert "stage00.physio" not in _section(s, "stage02: moco")
     assert "skip_physio=1" in s
     assert "ffs_physio" in s.split("for t in", 1)[1].split("\n", 1)[0]  # preflight checks it
+
+
+@pytest.mark.parametrize("nordic", [False, True])
+def test_physio_clean_mode_feeds_the_cleaned_series_to_everything_downstream(tmp_path, nordic):
+    """-physio_mode clean is afni_proc's ricor order: ffs_physio -clean on the raw
+    slices, and slice timing, moco and the final resample all read its output (which has
+    the noise volumes gone already), with no GLM nuisance written or used."""
+    from fastfuncstuff.autoproc import config
+    from fastfuncstuff.autoproc.glm import nuisance_specs
+
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    opt = Options(physio=True, physio_mode="clean", want_nordic=nordic, tzero=0.5)
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
+    stage = _section(s, "stage00: physio ====")
+    assert '-clean "$outf"' in stage and "-tzero" not in stage
+    assert 'outf="stage00.physio.${FRAG[$k]}.nii$FMT"' in stage
+    sources = {ln.strip() for ln in s.splitlines() if ln.strip().startswith('raw="')}
+    assert sources == {'raw="stage00.physio.${FRAG[$k]}.nii$FMT"'}
+    names = list(config.DEFAULT_GLM_ORTVEC)
+    specs, skipped = nuisance_specs(
+        "foo", Options(physio=True, physio_mode="clean", glm_ortvec=names)
+    )
+    assert "physio" in skipped and "physio" not in [n.label for n in specs]
 
 
 def test_physio_nuisance_enters_the_glm_only_with_physio_on():

@@ -480,9 +480,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Data-derived physiological regressors (ffs_physio) from the raw slices, "
         "sampled once per multiband excitation: respiration from phase (when the runs "
-        "have it), cardiac from magnitude. RVT + respiratory terms at -tzero enter the "
+        "have it), cardiac from magnitude. Cardiac + respiratory RETROICOR and RVT at -tzero enter the "
         "GLM as a per-run nuisance (-glm_ortvec physio; in the default set). Nothing is "
-        "regressed out of the series itself. Single-echo 2-D runs only.",
+        "regressed out of the series itself (see -physio_mode). Single-echo 2-D runs only.",
+    )
+    g.add_argument(
+        "-physio_mode",
+        choices=["nuisance", "clean"],
+        default=None,
+        help="Where -physio acts. nuisance (default): regressors at -tzero join the GLM, "
+        "fitted jointly with the task -- PhysIO's placement; task-correlated breathing "
+        "is shared with the task rather than given to the noise, and the GLM counts the "
+        "dof. clean: each voxel's own-slice regressors (RVT x5, cardiac and respiratory "
+        "RETROICOR x4 each) are regressed out of the raw slices before slice timing, "
+        "moco and the final resample -- afni_proc's ricor order. On ImaginationStimulation "
+        "clean lowered held-out task R2 in all four subjects where nuisance raised it in "
+        "one and left three unchanged; it spends 13 dof per voxel the GLM does not charge.",
     )
     g.add_argument("-noise_vols", "-noise-vols", type=int, default=0, help="trailing noise volumes")
     g.add_argument(
@@ -1583,7 +1596,7 @@ def _physio_errors(opt, subject, warnings: list[str]) -> list[str]:
         )
     if any(r.is_multiecho for r in runs):
         errors.append("-physio: multi-echo runs are not supported yet (single-echo only).")
-    if getattr(opt, "run_glm", True) and "physio" not in opt.glm_ortvec:
+    if opt.physio_nuisance and getattr(opt, "run_glm", True) and "physio" not in opt.glm_ortvec:
         warnings.append(
             "-physio: the GLM nuisance list (-glm_ortvec) has no 'physio', so the regressors "
             "are written but not used; add it, or leave -glm_ortvec at its default."
@@ -2073,10 +2086,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     # mismatch worth saying out loud; the same entry coming from the default set
     # is dropped silently (config.GLM_ORTVEC[...]["requires"]).
     for name in args.glm_ortvec or []:
-        req = config.GLM_ORTVEC.get(name, {}).get("requires")
+        entry = config.GLM_ORTVEC.get(name, {})
+        req = entry.get("requires")
         if req and not getattr(opt, req, False):
+            hint = entry.get("requires_hint", f"-{req}")
             warnings.append(
-                f"-glm_ortvec {name} needs -{req}, which is off — that nuisance block is "
+                f"-glm_ortvec {name} needs {hint}, which is off — that nuisance block is "
                 "dropped from the design."
             )
     # A blur of 0 or less is not a no-op request, it is a typo: -do_blur would
@@ -3095,6 +3110,7 @@ def main(argv: list[str] | None = None) -> int:
         recipe=args.recipe,
         want_nordic=eff(args.want_nordic, "want_nordic"),
         physio=eff(args.physio, "physio"),
+        physio_mode=eff(args.physio_mode, "physio_mode", "nuisance"),
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
         medic=args.medic,

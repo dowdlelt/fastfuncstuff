@@ -44,9 +44,12 @@ class Options:
 
     recipe: str | None = None  # named preset (for the header/provenance only)
     want_nordic: bool = False
-    # Data-derived physio (ffs_physio) from the raw slices: regressors at tzero, used
-    # as a GLM nuisance (-glm_ortvec physio) on the resampled data. Single-echo 2-D.
+    # Data-derived physio (ffs_physio) from the raw slices. Single-echo 2-D.
     physio: bool = False
+    # "nuisance": regressors at tzero as a GLM nuisance (-glm_ortvec physio) on the
+    # resampled data. "clean": regressed out of the raw slices before slice timing,
+    # moco and the final resample (afni_proc's ricor order).
+    physio_mode: str = "nuisance"
     # Carry the phase timeseries through the pipeline: unwrap it up front
     # (after NORDIC when NORDIC runs), then ride it along the magnitude's warp
     # chain at the final resample. Nothing between those two points touches it.
@@ -386,6 +389,16 @@ class Options:
     # (cuda | mps | cpu | auto, plus the "cuda,0" / "cpu,8" forms every ffs CLI
     # parses). Emitted as the DEVICE variable so it stays editable in the script.
     device: str = config.DEFAULT_DEVICE
+
+    @property
+    def physio_nuisance(self) -> bool:
+        """-physio writes a GLM nuisance (the -glm_ortvec physio source)."""
+        return self.physio and self.physio_mode == "nuisance"
+
+    @property
+    def physio_clean(self) -> bool:
+        """-physio regresses the raw slices before anything else reads them."""
+        return self.physio and self.physio_mode == "clean"
 
     @property
     def has_grand_ref(self) -> bool:

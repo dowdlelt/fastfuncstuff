@@ -1641,10 +1641,23 @@ def _physio_out() -> str:
     return "stage00.physio.${FRAG[$k]}.regs.nuisance.1D"
 
 
+def _physio_clean_out() -> str:
+    """-physio_mode clean: the cleaned magnitude everything downstream reads."""
+    return "stage00.physio.${FRAG[$k]}.nii$FMT"
+
+
 def _pre_stc_source(plan: Plan, indent: str = "  ") -> str:
     """Bash setting ``raw`` to the series BEFORE any up-front slice timing — the
-    NORDIC output, or the original BIDS magnitude read in place with an inline
-    noise-vol sub-brick selector (no whole-dataset copy)."""
+    physio-cleaned magnitude (-physio_mode clean), the NORDIC output, or the
+    original BIDS magnitude read in place with an inline noise-vol sub-brick
+    selector (no whole-dataset copy)."""
+    if plan.options.physio_clean:
+        return f'{indent}raw="{_physio_clean_out()}"'
+    return _pre_physio_source(plan, indent)
+
+
+def _pre_physio_source(plan: Plan, indent: str = "  ") -> str:
+    """Bash setting ``raw`` to the NORDIC output or the noise-trimmed BIDS magnitude."""
     if plan.options.want_nordic:
         return f'{indent}raw="{_nordic_mag(plan)}"'
     return (
@@ -1808,18 +1821,19 @@ def _task_dofloss(task: str) -> str:
 
 
 def _stage_physio(plan: Plan) -> str:
-    """stage00 physio: cardiac/respiratory models from the raw slices (ffs_physio), and
-    from them RVT + respiratory regressors at tzero for the GLM (-glm_ortvec physio).
+    """stage00 physio: cardiac/respiratory models from the raw slices (ffs_physio).
 
-    Nothing is regressed out of the series: done before motion correction and slice
-    timing (afni_proc's ricor order) the terms fit breathing-locked apparent motion
-    that those steps remove anyway, and held-out R2 FELL; as a nuisance on the
-    resampled data it rose. Reads the NORDIC magnitude when NORDIC ran (noise volumes
-    trimmed), else the BIDS magnitude with -drop_last NOISE; the raw phase, when the
-    run has one, gives the respiratory trace."""
+    -physio_mode nuisance (default): regressors at tzero for the GLM (-glm_ortvec
+    physio); nothing is regressed out of the series. -physio_mode clean: each voxel's
+    own-slice regressors are regressed out here and slice timing, moco and the final
+    resample read the cleaned series (afni_proc's ricor order). On ImaginationStimulation
+    clean lowered held-out R2 where nuisance did not. Reads the NORDIC magnitude when
+    NORDIC ran (noise volumes trimmed), else the BIDS magnitude with -drop_last NOISE;
+    the raw phase, when the run has one, gives the respiratory trace."""
     opt = plan.options
     if not opt.physio:
         return ""
+    clean = opt.physio_clean
     if opt.want_nordic:
         src = f'  mag="{_nordic_mag(plan)}"; drop=0'
     else:
@@ -1833,27 +1847,34 @@ def _stage_physio(plan: Plan) -> str:
             '-TR "${TR[$k]}"',
             '-drop_last "$drop"',
             '-prefix "stage00.physio.${FRAG[$k]}.regs"',
-            f"-tzero {opt.tzero:g}",
+            '-clean "$outf"' if clean else f"-tzero {opt.tzero:g}",
             '-device "$DEVICE"',
         ],
     )
+    if clean:
+        what = """# -physio_mode clean: each voxel's own-slice regressors (RVT x5, cardiac and
+# respiratory RETROICOR x4 each, at that slice's acquisition times) are regressed
+# out of the raw slices with drift (mean and drift kept), as afni_proc's ricor block
+# does; slice timing, moco and the final resample read stage00.physio.<frag>. The 13
+# dof per voxel go uncharged in the GLM. _physio_removed = variance taken per voxel.
+# On ImaginationStimulation this order lowered held-out R2; nuisance did not."""
+    else:
+        what = """# The GLM gets cardiac + respiratory RETROICOR and RVT (5 lags) evaluated at
+# tzero (.regs.nuisance.1D, -glm_ortvec physio) -- the instant every voxel stands
+# for after the slice-timed final resample. Nothing is regressed out here: the
+# GLM fits them jointly with the task (PhysIO's placement)."""
     return f"""
 # ============================ stage00: physio ===============================
 # Cardiac (from magnitude) and respiratory (from phase) models estimated from the
 # data itself: every multiband excitation is one sample, so the run read in
-# acquisition order is a trace at excitations/TR. The GLM gets RVT (5 lags) +
-# respiratory RETROICOR evaluated at tzero (.regs.nuisance.1D, -glm_ortvec physio)
-# -- the instant every voxel stands for after the slice-timed final resample.
-# Nothing is regressed out here: on raw slices the terms fit breathing-locked
-# apparent motion that moco and slice timing remove anyway, and doing so lowered
-# held-out R2 on ImaginationStimulation; as a nuisance after the resample it rose.
-# Cardiac is in .regs.slibase.1D (per slice, afni_proc -ricor_regs layout) but not
-# in the GLM: aliased at the volume rate. Also .regs.qc.png (spectrogram + tracked
-# rates), .regs.rates.tsv, .regs.json. Validated against belt + pulse RETROICOR on
-# TASKFORCE (wiki: Physiological noise from the data).
+# acquisition order is a trace at excitations/TR.
+{what}
+# Per-slice regressors in .regs.slibase.1D (afni_proc -ricor_regs layout); also
+# .regs.qc.png (spectrogram + tracked rates), .regs.rates.tsv, .regs.json.
+# Validated against belt + pulse RETROICOR on TASKFORCE (docs/physio.md).
 echo '== stage00: physio =='
 for k in "${{RUN_KEYS[@]}}"; do
-  outf="{_physio_out()}"
+  outf="{_physio_clean_out() if clean else _physio_out()}"
   [ "$skip_physio" -eq 1 ] && [ -f "$outf" ] && continue
 {src}
   if [ -n "${{PHASE[$k]:-}}" ]; then phase_arg=(-phase "${{PHASE[$k]}}"); else phase_arg=(); fi
