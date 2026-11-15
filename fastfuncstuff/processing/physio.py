@@ -282,8 +282,8 @@ def excitation_traces(
                 1,
             )
             wn = (w / w.sum())[:, None]
-            field_A[k] = (bas.T @ (wn * bas)).double().cpu().numpy() * count_p[k]
-            field_b[k] = (bas.T @ (wn * dphi)).double().cpu().numpy() * count_p[k]
+            field_A[k] = (bas.T @ (wn * bas)).cpu().double().numpy() * count_p[k]
+            field_b[k] = (bas.T @ (wn * dphi)).cpu().double().numpy() * count_p[k]
     mag_t = np.zeros((nt, G))
     ph_t = np.zeros((nt, G)) if phase is not None else None
     field_t = np.zeros((nt, G, 10)) if phase is not None else None
