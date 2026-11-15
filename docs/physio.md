@@ -13,7 +13,8 @@ enough for the heartbeat that the 1 Hz volume rate aliases (figure 1C).
 
 1. **Excitation-rate traces.** For each excitation, the mean over brain voxels of the
    fractional magnitude change (each voxel's mean and drift removed) and of the phase
-   change (each voxel against its own temporal mean; no spatial unwrap). The magnitude
+   change (each voxel against its own 60 s running-mean phasor, so slow drift and sudden
+   global phase steps do not drop voxels; no spatial unwrap). The magnitude
    trace carries cardiac pulsation, the phase trace carries respiration (breathing
    changes the magnetic field in the head).
 2. **Rates and cycle phases.** Heart rate is tracked in sliding 20 s windows, never
@@ -110,9 +111,9 @@ the 85 runs whose belt recorded.*
 
 *Figure 3. (A, B) RVT × RRF from the field gradients against the belt's, in a rest run near
 the median and through deliberate breath-holds. (C) Correlation with the belt's RVT over 85
-runs: the mean phase gives timing but little depth (median r 0.26). The phase-encode (y)
+runs: the mean phase gives timing but little depth (median r 0.27). The phase-encode (y)
 gradient alone does better (0.55). The first principal component of all three gradients is
-best (0.72; above 0.5 in 88 % of runs). (D) Breathing loads on the up–down and front–back
+best (0.73; above 0.5 in 89 % of runs). (D) Breathing loads on the up–down and front–back
 gradients and little on left–right: the field from the chest falls off toward the head
 along every axis, not only the phase-encode one.*
 
@@ -138,9 +139,12 @@ slices, with voxel maps correlated at 0.94–0.98.
 - **The respiratory trace lags the belt by ~1.5 s.** The clocks agree to the tick, so this
   is the belt (abdominal) against the field (lung volume), not a sync error. RETROICOR
   absorbs a constant lag; RVT carries 0–4 s lags.
-- **Data-derived RVT is not the belt's RVT** (median r 0.72 after RRF convolution). It
-  tracks breath depth, but the measure is different. Agreement is weakest at rest, where
-  depth varies least (median 0.56 over 9 rest runs, two of them negative).
+- **Data-derived RVT is not the belt's RVT** (median r 0.73 after RRF convolution). It
+  tracks breath depth, but the measure is different. The belt is also an imperfect
+  reference: set too tight, it clips at both ends of its range and stops measuring depth.
+  Agreement falls as clipping rises (median r 0.74 over 59 runs with under 5 % of breaths
+  clipped, 0.54 over 8 runs with over half clipped); the two negative runs clip on 59 % and
+  71 % of breaths, and so do most rest runs here.
 - **Raw-space QC maps** treat voxels as scanner locations, so a moving head also lights the
   brain's edge.
 
