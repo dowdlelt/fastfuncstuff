@@ -1104,8 +1104,15 @@ def _css_prediction_and_derivatives(
             (row_square + column_square) / safe_field / sigma.pow(3).T - 2.0 / sigma.T
         )
         if n_derivatives == 4:
+            # Masked on the drive, not the field: a denormal field (3e-323 seen on
+            # ds003787) times the normalisation underflows to a drive of exactly 0,
+            # and 0 * log(0) is NaN. One NaN frame made the whole voxel's step NaN,
+            # every trial failed, and the voxel froze where it started -- the float64
+            # polish then kept a float32 answer up to 21 R2 points short. The value
+            # there is exactly 0, so its derivative is too.
+            positive = drive > 0
             neural_derivatives[:, :, 3] = torch.where(
-                live, neural * torch.where(live, drive, torch.ones_like(drive)).log(), 0.0
+                positive, neural * torch.where(positive, drive, torch.ones_like(drive)).log(), 0.0
             )
 
         predictions.append(applier.apply(neural, run=run))

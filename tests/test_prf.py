@@ -20,6 +20,7 @@ from fastfuncstuff.design.prf import (
     PRFRefinementConfig,
     _css_prediction,
     _css_prediction_and_derivatives,
+    _separable_gaussian,
     choose_aperture_bin_factor,
     downsample_aperture,
     fit_prf_loro,
@@ -300,6 +301,49 @@ def test_derivatives_hold_for_small_exponents_and_faint_drives():
     )
     scale = exact.abs().amax(dim=(0, 1), keepdim=True)
     torch.testing.assert_close(single.double() / scale, exact / scale, rtol=0, atol=1e-4)
+
+
+def test_exponent_derivative_is_finite_where_the_drive_underflows():
+    """A denormal field whose drive underflows to exactly zero.
+
+    Bug of record: the exponent derivative was masked on ``field > 0``, but a
+    field of ~1e-323 times the Gaussian's normalisation underflows to a drive of
+    0, and 0 * log(0) is NaN. One NaN frame made the voxel's whole Gauss-Newton
+    step NaN, every trial failed, and the float64 polish left the voxel where the
+    float32 stage put it -- up to 21 R2 points behind analyzePRF on ds003787.
+    """
+    stimulus_shape = (40, 40)
+    frames = torch.zeros((3, 40, 40), dtype=torch.float64)
+    frames[0, :, 0] = 1.0  # one column at the far edge
+    frames[1, :, 0:20] = 1.0
+    frames[2, :, 30:] = 1.0
+    stimulus_runs = [frames.reshape(3, -1)]
+    hrf = torch.tensor([1.0, 0.5], dtype=torch.float64)
+    # sigma 1, exponent at analyzePRF's floor: find the column at which frame 0's
+    # field is denormal but its drive (field / 2 pi sigma^2) is exactly zero.
+    found = None
+    for hundredth in range(3000, 4200):
+        column = hundredth / 100
+        parameters = torch.tensor([[20.0, column, 1.0, 1e-3]], dtype=torch.float64)
+        _, _, row_profile, column_profile, _, normalization = _separable_gaussian(
+            parameters, stimulus_shape
+        )
+        field = float(column_profile[0, 0]) * float(row_profile[0].sum())
+        if field > 0 and field * float(normalization[0, 0]) == 0:
+            found = parameters
+            break
+    assert found is not None, "no column puts the field in the denormal gap"
+    _, derivatives = _css_prediction_and_derivatives(stimulus_runs, found, hrf, stimulus_shape)
+    assert torch.isfinite(derivatives).all()
+    delta = 1e-7
+    forward, backward = found.clone(), found.clone()
+    forward[0, 3] += delta
+    backward[0, 3] -= delta
+    numeric = (
+        _css_prediction(stimulus_runs, forward, hrf, stimulus_shape)
+        - _css_prediction(stimulus_runs, backward, hrf, stimulus_shape)
+    ) / (2 * delta)
+    torch.testing.assert_close(derivatives[:, :, 3], numeric, rtol=1e-4, atol=1e-8)
 
 
 def test_float64_polish_never_loses_to_float32_and_keeps_dtype():
