@@ -48,7 +48,8 @@ blobs by the reconstruction, which is what the blob score is built for. A
 linear-ratio residual was tried: it lifts spikes and noise tails alike and
 separated the known true/false hits worse (1.9x vs 2.4x).
 
-Repair (``clean``, method ``kclip``): for a hit frame, take its complex
+Repair (``clean``). Default ``kinterp`` (described below; chosen 2026-11-16 as
+the most surgical: it removes the herringbone and nothing else). ``kclip``: for a hit frame, take its complex
 spectrum's deviation from the same slice's neighbours (linear in time between
 the nearest non-hit volumes) and clip that deviation, k-point by k-point, to
 ``clip`` times the k-point's normal deviation (the median over the run of
@@ -89,7 +90,7 @@ DEFAULT_KINTERP_Z = 3.0
 DEFAULT_WINDOW = 9
 DEFAULT_EXCLUDE_RADIUS = 0.25
 DEFAULT_CLIP = 1.5
-REPAIR_METHODS = ("kclip", "kinterp", "slice")
+REPAIR_METHODS = ("kinterp", "kclip", "slice")
 
 
 @dataclass
@@ -317,7 +318,7 @@ def hunt_spikes(
     exclude_radius: float = DEFAULT_EXCLUDE_RADIUS,
     clean: bool = False,
     out: Tensor | None = None,
-    method: str = "kclip",
+    method: str = "kinterp",
     clip: float = DEFAULT_CLIP,
     point_frac: float = DEFAULT_POINT_FRAC,
     kinterp_z: float = DEFAULT_KINTERP_Z,

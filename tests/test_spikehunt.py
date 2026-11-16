@@ -64,7 +64,9 @@ def test_clean_repairs_only_hit_frames_and_leaves_input_alone():
     data = _phantom_series(spikes=[(1, 20, 10, 7, AMP)])
     before = data.clone()
     out = data.clone()
-    scan = S.hunt_spikes(data, clean=True, out=out, compute_device=CPU, progress=False)
+    scan = S.hunt_spikes(
+        data, clean=True, out=out, method="kclip", compute_device=CPU, progress=False
+    )
     # on CPU float32, .to() aliases: the input must still be untouched
     assert torch.equal(data, before)
     assert scan.repair == {(1, 20): "kclip"}

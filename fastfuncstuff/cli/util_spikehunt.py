@@ -102,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-repair",
         choices=S.REPAIR_METHODS,
-        default="kclip",
+        default="kinterp",
         help="With -clean. kclip: clip each k-point's deviation from the temporal "
         "neighbours to -clip times that k-point's normal deviation (phase kept); "
         "normal k-points pass unchanged; removes ~100%% of the spike power. kinterp: "

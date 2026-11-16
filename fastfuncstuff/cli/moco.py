@@ -892,7 +892,8 @@ def parse_args(
         default="none",
         help="detect: report hit slices with volume and acquisition time (slice "
         "timing from -tpattern or the JSON sidecar) and write PREFIX_spikes.tsv. "
-        "clean: also repair them (k-space clip) before motion estimation, so the "
+        "clean: also repair them (temporal interpolation of the spike's outlier "
+        "k-points; ffs_util_spikehunt -repair) before motion estimation, so the "
         "estimate and every output see the repaired series. Costs one FFT pass "
         "over the series (~3 s on CPU for 48 x 74 x 60 x 219, ~1 s on a GPU).",
     )
