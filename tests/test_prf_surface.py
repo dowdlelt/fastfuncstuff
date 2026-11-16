@@ -91,6 +91,10 @@ def test_gifti_runs_fit_and_write_a_bucket_on_the_same_mesh(surface_runs, tmp_pa
     labels = out_meta["brick_labels"].split("\t")
     assert {"x", "y", "sigma", "r2"} <= set(labels)
     assert np.isfinite(np.asarray(image.dataobj)[:, 0, 0, labels.index("r2")]).all()
+    # Units and the screen's edge in them, for readers such as ffs_util_prfplot:
+    # -screen_extent 10 makes them degrees, and the screen ends 5 out.
+    assert out_meta["prf_units"] == "deg"
+    assert float(out_meta["prf_stimulus_radius"]) == 5.0
 
 
 def test_surface_blur_needs_a_mesh_mask(surface_runs, tmp_path):
