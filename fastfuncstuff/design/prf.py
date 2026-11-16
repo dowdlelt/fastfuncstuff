@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
@@ -779,6 +779,10 @@ class _ApertureRun:
     n_timepoints: int
     rows: int
     key: tuple[int, ...]
+    # Occupied-line plans for the float64 contraction (_occupied_line_groups),
+    # keyed by frame block, device and dtype. Shared by the copies .to() makes:
+    # they hold the same frames.
+    line_plans: dict = field(default_factory=dict, compare=False, repr=False)
 
     def to(self, device: torch.device | None = None, dtype: torch.dtype | None = None):
         """Move the frame table, so a compressed run passes anywhere a dense one does.
@@ -968,6 +972,81 @@ def _frame_blocks(run: _ApertureRun, columns: int) -> list[slice]:
     return [slice(start, min(start + step, run.n_frames)) for start in range(0, run.n_frames, step)]
 
 
+#: Column tile for grouping a frame's occupied lines (see _occupied_line_groups).
+_LINE_TILE = 10
+
+
+def _occupied_line_groups(
+    run: _ApertureRun, frames: slice
+) -> tuple[list[tuple[int, int, torch.Tensor, torch.Tensor]], torch.Tensor]:
+    """A frame block's non-empty (frame, row) lines, grouped by the columns they span.
+
+    Returns ``(groups, empty)``: each group is ``(start, stop, lines, panel)``,
+    the lines whose occupied pixels all fall in columns ``start:stop`` (whole
+    tiles of ``_LINE_TILE``) and those lines' pixels there; ``empty`` holds the
+    lines with no pixel set. Built once per block, device and dtype.
+    """
+    key = (frames.start, frames.stop, run.frames.device, run.frames.dtype)
+    plan = run.line_plans.get(key)
+    if plan is not None:
+        return plan
+    block = run.frames[frames.start * run.rows : frames.stop * run.rows]
+    occupied_pixels = block != 0
+    occupied = occupied_pixels.any(dim=1)
+    lines = torch.nonzero(occupied).squeeze(1)
+    columns = torch.arange(block.shape[1], device=block.device)
+    width = block.shape[1]
+    first = torch.where(occupied_pixels, columns, width).amin(dim=1)[lines] // _LINE_TILE
+    last = torch.where(occupied_pixels, columns, -1).amax(dim=1)[lines] // _LINE_TILE
+    members: dict[tuple[int, int], list[int]] = {}
+    for position, span in enumerate(zip(first.tolist(), last.tolist(), strict=True)):
+        members.setdefault(span, []).append(position)
+    groups = []
+    for (first_tile, last_tile), positions in sorted(members.items()):
+        index = lines[torch.tensor(positions, device=block.device)]
+        start, stop = first_tile * _LINE_TILE, min((last_tile + 1) * _LINE_TILE, width)
+        groups.append((start, stop, index, block[index, start:stop].contiguous()))
+    plan = (groups, torch.nonzero(~occupied).squeeze(1))
+    run.line_plans[key] = plan
+    return plan
+
+
+def _contract_occupied_lines(
+    run: _ApertureRun, frames: slice, flat_profiles: torch.Tensor
+) -> torch.Tensor:
+    """``(lines, profiles)``: the block's lines against every column profile, skipping zeros.
+
+    Equal to ``block @ flat_profiles.T`` -- the skipped terms are exact zeros, and
+    on ds003787 the result is bit-identical -- but a bar inside a circle leaves
+    44% of lines empty and 90% of pixels unset, so the grouped GEMMs do 15% of
+    the work: 2.5x faster in float64, where the polish spends most of its time
+    (26 of 33 s of the ds003787 parity fit). Each line is written once, so it is
+    deterministic, unlike cuSPARSE's SpMM (faster still, but atomics change its
+    last bits run to run). float32 stays dense: its GEMM is cheap enough that the
+    small grouped ones lose, 3x slower.
+    """
+    groups, empty = _occupied_line_groups(run, frames)
+    n_lines = (frames.stop - frames.start) * run.rows
+    contracted = flat_profiles.new_empty((n_lines, flat_profiles.shape[0]))
+    contracted.index_fill_(0, empty, 0.0)
+    for start, stop, lines, panel in groups:
+        contracted.index_copy_(0, lines, panel @ flat_profiles[:, start:stop].T)
+    return contracted
+
+
+def _reduce_rows(panels: torch.Tensor, row_weight: torch.Tensor, step: int = 8) -> torch.Tensor:
+    """``(frames, voxels)`` = sum over rows of ``panels[f, r, v] * row_weight[v, r]``.
+
+    A few frames at a time: done in one go, the product is a second copy of the
+    contraction, which the chunk planner does not budget for.
+    """
+    out = panels.new_empty((panels.shape[0], panels.shape[2]))
+    weights = row_weight.T.unsqueeze(0)
+    for start in range(0, panels.shape[0], step):
+        out[start : start + step] = (panels[start : start + step] * weights).sum(dim=1)
+    return out
+
+
 def _separable_drives(
     run: _ApertureRun,
     column_profiles: torch.Tensor,
@@ -989,6 +1068,14 @@ def _separable_drives(
     flat_profiles = column_profiles.reshape(n_profiles * n_voxels, n_columns)
     outputs = [column_profiles.new_empty((run.n_frames, n_voxels)) for _ in row_weights]
     for frames in _frame_blocks(run, n_columns):
+        if flat_profiles.dtype == torch.float64:
+            panels = _contract_occupied_lines(run, frames, flat_profiles).view(
+                frames.stop - frames.start, run.rows, n_profiles, n_voxels
+            )
+            for output, (row_weight, profile_index) in zip(outputs, row_weights, strict=True):
+                output[frames] = _reduce_rows(panels[:, :, profile_index, :], row_weight)
+            del panels
+            continue
         block = run.frames[frames.start * run.rows : frames.stop * run.rows]
         # Voxel-major, so the row reduction is a batched matvec over contiguous
         # (frame, row) panels. The frame-major einsum it replaces reduced over a
