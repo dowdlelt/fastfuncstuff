@@ -1315,9 +1315,14 @@ def variable_projection_sse_by_type(
 
 def _variable_projection_sse(data: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     """Return the profiled residual sum of squares at the optimal non-negative gain."""
-    eps = torch.finfo(data.dtype).eps
+    # The floor only guards an all-zero prediction. It must not be eps: a pRF
+    # off the screen predicts only its Gaussian tail, ~1e-8 per sample, so
+    # p.p ~ 1e-14 sits below float32's eps and a floor there divided by the
+    # wrong number -- gains came out far too small and those positions were
+    # misjudged (they were most of the fits >3 R2 points short of analyzePRF).
+    tiny = torch.finfo(data.dtype).tiny
     gain = (
-        (prediction * data).sum(dim=0) / prediction.square().sum(dim=0).clamp_min(eps)
+        (prediction * data).sum(dim=0) / prediction.square().sum(dim=0).clamp_min(tiny)
     ).clamp_min(0)
     return (data - prediction * gain).square().sum(dim=0)
 
@@ -1333,8 +1338,8 @@ def _variable_projection_terms(
     per-voxel OLS gain is included, so GN follows the profiled CSS objective
     instead of treating gain as an additional slow nonlinear parameter.
     """
-    eps = torch.finfo(data.dtype).eps
-    denominator = prediction.square().sum(dim=0).clamp_min(eps)
+    # tiny, not eps: see _variable_projection_sse.
+    denominator = prediction.square().sum(dim=0).clamp_min(torch.finfo(data.dtype).tiny)
     numerator = (prediction * data).sum(dim=0)
     unconstrained_gain = numerator / denominator
     gain = unconstrained_gain.clamp_min(0)
@@ -1342,10 +1347,11 @@ def _variable_projection_terms(
 
     derivative_data = (derivatives * data.unsqueeze(-1)).sum(dim=0)
     derivative_prediction = (derivatives * prediction.unsqueeze(-1)).sum(dim=0)
+    # d(N/D) = (dN - 2 (N/D) dP) / D, never forming D^2, which underflows for
+    # the tail-only predictions the floor above exists for.
     gain_derivative = (
-        derivative_data * denominator.unsqueeze(1)
-        - numerator.unsqueeze(1) * 2.0 * derivative_prediction
-    ) / denominator.square().unsqueeze(1)
+        derivative_data - 2.0 * unconstrained_gain.unsqueeze(1) * derivative_prediction
+    ) / denominator.unsqueeze(1)
     jacobian = -(derivatives * gain.view(1, -1, 1) + prediction.unsqueeze(-1) * gain_derivative)
     # At the non-negative gain boundary, the profiled model is the zero predictor
     # locally; permitting a GN spatial update there creates artificial motion.
@@ -1722,9 +1728,10 @@ class _RepeatCollapse:
         """``(voxels, time)`` data averaged within each pseudo-run."""
         return torch.cat(
             [
-                torch.stack([data[:, self.run_starts[r] : self.run_ends[r]] for r in group]).mean(
-                    dim=0
-                )
+                torch.stack([data[:, self.run_starts[r] : self.run_ends[r]] for r in group])
+                .to(widest_float_dtype(data.device))
+                .mean(dim=0)
+                .to(data.dtype)
                 for group in self.groups
             ],
             dim=1,
@@ -1793,6 +1800,15 @@ def _plan_repeat_collapse(
     )
 
 
+def _widen_bases(nuisance: _NuisanceBases | None, dtype: torch.dtype) -> _NuisanceBases | None:
+    """Refactor float32 bases in ``dtype``: a float32 Q is orthonormal only to ~1e-7."""
+    if nuisance is None:
+        return None
+    return _NuisanceBases(
+        tuple(None if q is None else plinalg.qr(q.to(dtype))[0] for q in nuisance.bases)
+    )
+
+
 def _full_data_statistics(
     data: torch.Tensor,
     collapsed_data: torch.Tensor,
@@ -1811,8 +1827,12 @@ def _full_data_statistics(
     because the scatter is a difference of two large sums.
     """
     wide = widest_float_dtype(data.device)
-    full = _project_per_run(data.T, nuisance, plan.run_starts).to(wide)
-    mean = _project_per_run(collapsed_data.T, collapsed_nuisance, plan.collapsed_starts).to(wide)
+    # Projected in the wide dtype too: unscaled scanner data (~1e4) projected in
+    # float32 moved the restated R2 by ~0.1 points against the float64 polish's.
+    full = _project_per_run(data.T.to(wide), _widen_bases(nuisance, wide), plan.run_starts)
+    mean = _project_per_run(
+        collapsed_data.T.to(wide), _widen_bases(collapsed_nuisance, wide), plan.collapsed_starts
+    )
     full_ss = full.square().sum(dim=0)
     mean_ss = mean.square().sum(dim=0)
     g = float(plan.size)

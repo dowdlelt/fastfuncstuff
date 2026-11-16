@@ -3799,3 +3799,25 @@ def test_runs_with_their_own_nuisance_are_not_collapsed():
 
     noisy = [torch.cat([n, torch.randn(n.shape[0], 1, dtype=n.dtype)], dim=1) for n in nuisance]
     assert _plan_repeat_collapse(stimuli, noisy, run_starts, data.shape[1]) is None
+
+
+def test_variable_projection_fits_a_tail_only_prediction_in_float32():
+    """An off-screen pRF predicts ~1e-8 per sample; p.p ~ 1e-14 is below float32 eps.
+
+    Flooring p.p at eps made the gain ~1e7x too small, so such fits were misjudged.
+    """
+    from fastfuncstuff.design.prf import _variable_projection_sse, _variable_projection_terms
+
+    generator = torch.Generator().manual_seed(3)
+    prediction = 1e-8 * torch.rand(192, 1, generator=generator)
+    data = 4e9 * prediction + 0.01 * torch.randn(192, 1, generator=generator)
+    sse = _variable_projection_sse(data, prediction)
+    exact = _variable_projection_sse(data.double(), prediction.double())
+    assert data.square().sum() > 100 * sse  # the fit explains the signal
+    torch.testing.assert_close(sse.double(), exact, rtol=1e-3, atol=0)
+    derivatives = torch.rand(192, 1, 2, generator=generator) * 1e-8
+    gain, _, jacobian, terms_sse = _variable_projection_terms(data, prediction, derivatives)
+    assert torch.isfinite(jacobian).all()
+    torch.testing.assert_close(
+        gain.double(), torch.tensor([4e9], dtype=torch.float64), rtol=1e-3, atol=0
+    )
