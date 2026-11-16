@@ -877,6 +877,40 @@ def parse_args(
         "FILE.1D:spikes.",
     )
 
+    # --- RF spikes ---
+    from fastfuncstuff.processing import spikehunt as spike_lib
+
+    spk_group = parser.add_argument_group(
+        "RF spikes",
+        "k-space (radio-frequency) spikes found in the 2D spectrum of each slice "
+        "of the raw magnitude series, before estimation; see ffs_util_spikehunt. "
+        "Single-echo only for now.",
+    )
+    spk_group.add_argument(
+        "-spikehunt",
+        choices=("none", "detect", "clean"),
+        default="none",
+        help="detect: report hit slices with volume and acquisition time (slice "
+        "timing from -tpattern or the JSON sidecar) and write PREFIX_spikes.tsv. "
+        "clean: also repair them (k-space clip) before motion estimation, so the "
+        "estimate and every output see the repaired series. Costs one FFT pass "
+        "over the series (~3 s on CPU for 48 x 74 x 60 x 219, ~1 s on a GPU).",
+    )
+    spk_group.add_argument(
+        "-spikeplot",
+        choices=("no", "yes"),
+        default="no",
+        help="With -spikehunt: write PREFIX_spikehunt.png (score heatmap, timing "
+        "within the TR, worst hits before/after).",
+    )
+    spk_group.add_argument(
+        "-spike_thresh",
+        type=float,
+        default=spike_lib.DEFAULT_THRESHOLD,
+        help="With -spikehunt: hit threshold on the slice-normalised score "
+        "(ffs_util_spikehunt -thresh).",
+    )
+
     # --- Hardware ---
     from fastfuncstuff.qc.record import add_qc_args
 
@@ -2182,6 +2216,11 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     motsim_out = _motsim_path(args)
     if motsim_out is not None:
         outs.append(motsim_out)
+    if getattr(args, "spikehunt", "none") != "none" and args.prefix is not None:
+        stem = parse_prefix(args.prefix).stem
+        outs.append(f"{stem}_spikes.tsv")
+        if args.spikeplot == "yes":
+            outs.append(f"{stem}_spikehunt.png")
 
     # -me_3depi: the QC tables, plus the per-echo total-transform files.
     if args.me_3depi:
@@ -2286,6 +2325,8 @@ def _run_stack(args: argparse.Namespace) -> None:
     from fastfuncstuff.processing.grid import resample_to_grid
 
     base_path, sources = args.stack[0], args.stack[1:]
+    if args.spikehunt != "none":
+        sys.exit("Error: -spikehunt needs a time series; -stack registers a few images.")
     if not sources:
         sys.exit("Error: -stack needs a base and at least one source image.")
     if not args.stack_matrices or len(args.stack_matrices) != len(sources):
@@ -2346,6 +2387,67 @@ def _run_stack(args: argparse.Namespace) -> None:
             print(f"  Matrix: {out}")
 
 
+def _spikehunt(args, data: torch.Tensor, input_file: str, device: torch.device, verb: int) -> None:
+    """-spikehunt: score the raw series for RF spikes; with clean, repair ``data`` in place.
+
+    Runs before estimation so a spiked slice cannot pull the motion fit, and
+    on the trimmed series, so reported volumes are offset by -skip_first to
+    count from the scan's first volume.
+    """
+    if args.spikehunt == "none":
+        return
+    import re
+
+    from fastfuncstuff.processing import spikehunt as spike_lib
+
+    clean = args.spikehunt == "clean"
+    plot = args.spikeplot == "yes"
+    if verb >= 1:
+        print_cli_section("RF spikes")
+    tr, slice_times, tsrc = spike_lib.resolve_timing(input_file, args.tpattern, args.TR)
+    if slice_times is not None and len(slice_times) != data.shape[1]:
+        print(f"  ** {tsrc}: {len(slice_times)} slice times for {data.shape[1]} slices, ignored")
+        slice_times = None
+    acq = spike_lib.acquisition_window(tr, slice_times, first_volume=args.skip_first)
+    before = data.clone() if (clean and plot) else data
+    scan = spike_lib.hunt_spikes(
+        before,
+        threshold=args.spike_thresh,
+        clean=clean,
+        out=data if clean else None,
+        compute_device=device,
+        progress=verb >= 1,
+    )
+    events = spike_lib.group_events(scan, acq)
+    if verb >= 1:
+        print(f"  timing: {tsrc}")
+        spike_lib.print_report(scan, events, acq, data.shape[0])
+        if clean and scan.repair:
+            left = 0 if scan.residual is None else len(scan.residual)
+            print(
+                f"  repaired {len(scan.repair)} slice-volumes before estimation; "
+                f"{left} still > {args.spike_thresh:g} after repair"
+            )
+    if args.prefix is not None:
+        stem = parse_prefix(args.prefix).stem
+    else:
+        stem = re.sub(r"\.nii(\.gz|\.zst)?$", "", Path(input_file).name)
+    spike_lib.write_hits_tsv(f"{stem}_spikes.tsv", scan, acq)
+    if verb >= 1:
+        print(f"  Saved {stem}_spikes.tsv")
+    if plot:
+        spike_lib.plot_spikehunt(
+            f"{stem}_spikehunt.png",
+            scan,
+            acq,
+            before,
+            data if clean else None,
+            title=Path(input_file).name,
+        )
+        if verb >= 1:
+            print(f"  Saved {stem}_spikehunt.png")
+
+
 def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> None:
     """Classic single-input motion correction: estimate and resample one series."""
     t0 = time.time()
@@ -2355,6 +2457,8 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
     if verb >= 1:
         print(f"  File: {input_file}")
         print(f"  Data: {tuple(data.shape)} ({data.shape[0]} volumes, {time.time() - t0:.2f}s)")
+
+    _spikehunt(args, data, input_file, device, verb)
 
     base_vol, base_index = _parse_base(args, verb)
 
@@ -2446,6 +2550,11 @@ def _run_multi_echo(
             "Error: -tpattern (slice-timing-aware moco) is single-echo only for now.",
             file=sys.stderr,
         )
+        sys.exit(1)
+    if args.spikehunt != "none":
+        # a spike in one echo's readout hits that echo only: it needs per-echo
+        # detection, and a repair that leaves the other echoes alone
+        print("Error: -spikehunt is single-echo only for now.", file=sys.stderr)
         sys.exit(1)
 
     n_echoes = len(input_files)

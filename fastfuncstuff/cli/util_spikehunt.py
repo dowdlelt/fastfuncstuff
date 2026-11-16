@@ -20,16 +20,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import sys
 import time
 from pathlib import Path
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
-
-_NIFTI_RE = re.compile(r"\.nii(\.gz|\.zst)?$")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -126,63 +122,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def sidecar_for(path: str) -> Path | None:
-    p = Path(path)
-    cand = p.parent / (_NIFTI_RE.sub("", p.name) + ".json")
-    return cand if cand.is_file() else None
-
-
-def resolve_timing(input_path: str, tpattern: str | None, tr_flag: float | None):
-    """(TR, slice_times or None, source label)."""
-    from fastfuncstuff.io.afni import get_tr_from_file
-    from fastfuncstuff.processing.slicetime import load_slice_timing
-
-    src = tpattern or sidecar_for(input_path)
-    slice_times, json_tr, label = None, None, "none"
-    if src is not None:
-        src = str(src)
-        if src.endswith(".json"):
-            meta = json.loads(Path(src).read_text())
-            json_tr = meta.get("RepetitionTime")
-            if "SliceTiming" in meta:
-                slice_times = [float(v) for v in meta["SliceTiming"]]
-        else:
-            slice_times = load_slice_timing(src)
-        label = Path(src).name
-    tr = tr_flag or (float(json_tr) if json_tr else None) or get_tr_from_file(input_path)
-    return float(tr), slice_times, label
-
-
-def report(scan, events, acq, nt: int, out=sys.stdout) -> None:
-    """Terminal summary: counts, readout window, then one line per event."""
-    n_hits = len(scan.hits)
-    print(
-        f"  TR {acq.tr:.3f} s, readout window TA {acq.ta:.3f} s"
-        + (
-            f" ({acq.gap:.3f} s silent gap per TR: spikes there are invisible)"
-            if acq.gap > 1e-6
-            else ""
-        ),
-        file=out,
-    )
-    if n_hits == 0:
-        print(f"  no spikes above {scan.threshold:g}", file=out)
-        return
-    vols = sorted({e.volume for e in events})
-    read_min = nt * acq.ta / 60.0
-    print(
-        f"  {len(events)} spike events ({n_hits} slice hits) in {len(vols)} of {nt} volumes; "
-        f"{len(events) / read_min:.1f} events per minute of readout",
-        file=out,
-    )
-    if acq.slice_times is None:
-        print("  (no slice timing: times are volume onsets)", file=out)
-    print(f"  {'vol':>5} {'time_s':>9} {'in_TR_s':>8} {'score':>6}  slices", file=out)
-    for e in events:
-        sl = ",".join(str(s) for s in e.slices)
-        print(f"  {e.volume:5d} {e.time:9.3f} {e.within_tr:8.3f} {e.score:6.1f}  {sl}", file=out)
-
-
 def main(argv: list[str] | None = None) -> None:
     import numpy as np
 
@@ -199,7 +138,7 @@ def main(argv: list[str] | None = None) -> None:
     if data.ndim != 4:
         raise SystemExit(f"ffs_util_spikehunt: {args.input} is not 4D (shape {tuple(data.shape)})")
     nt, nz = data.shape[0], data.shape[1]
-    tr, slice_times, tsrc = resolve_timing(args.input, args.tpattern, args.TR)
+    tr, slice_times, tsrc = S.resolve_timing(args.input, args.tpattern, args.TR)
     if slice_times is not None and len(slice_times) != nz:
         print(
             f"  ** {tsrc} has {len(slice_times)} slice times for {nz} slices: ignoring it",
@@ -227,7 +166,7 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"ffs_util_spikehunt: {Path(args.input).name}  ({nz} slices x {nt} volumes, timing: {tsrc})"
         )
-        report(scan, events, acq, nt)
+        S.print_report(scan, events, acq, nt)
 
     S.write_hits_tsv(f"{args.prefix}.spikes.tsv", scan, acq)
     S.write_score_tsv(f"{args.prefix}.score.tsv", scan)

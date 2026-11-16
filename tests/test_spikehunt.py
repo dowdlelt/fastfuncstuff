@@ -119,3 +119,67 @@ def test_acquisition_window_and_mb_events():
 def test_no_slice_timing_reports_volume_onsets():
     acq = S.acquisition_window(1.5, None)
     assert acq.ta == 1.5 and acq.gap == 0.0
+
+
+def test_moco_hook_reports_scan_volumes_and_repairs_in_place(tmp_path, monkeypatch):
+    """-spikehunt clean: hits in scan numbering (after -skip_first), data repaired
+    before estimation, timing from the JSON sidecar."""
+    import json
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli import moco
+
+    monkeypatch.chdir(tmp_path)
+    data = _phantom_series(spikes=[(2, 17, 13, -9, AMP)])
+    img = nib.Nifti1Image(data.numpy().transpose(3, 2, 1, 0), np.diag([3.0, 3.0, 3.0, 1.0]))
+    img.header.set_xyzt_units("mm", "sec")
+    img.header["pixdim"][4] = 2.0
+    nib.save(img, tmp_path / "epi.nii.gz")
+    (tmp_path / "epi.json").write_text(
+        json.dumps({"RepetitionTime": 2.0, "SliceTiming": [0.0, 0.4, 0.8, 1.2]})
+    )
+    args = moco.parse_args(
+        [
+            "-input",
+            "epi.nii.gz",
+            "-1Dfile",
+            "m.1D",
+            "-prefix",
+            "mc",
+            "-spikehunt",
+            "clean",
+            "-skip_first",
+            "2",
+        ]  # fmt: skip
+    )
+    trimmed = data[2:].clone()
+    moco._spikehunt(args, trimmed, "epi.nii.gz", CPU, verb=0)
+    rows = (tmp_path / "mc_spikes.tsv").read_text().splitlines()
+    assert len(rows) == 2
+    vol, sl, time_s = rows[1].split("\t")[:3]
+    assert (int(vol), int(sl)) == (17, 2)
+    assert float(time_s) == pytest.approx(17 * 2.0 + 0.8)
+    assert not torch.equal(trimmed[15, 2], data[17, 2])
+    assert torch.equal(trimmed[14], data[16])
+    assert "mc_spikes.tsv" in moco._expected_outputs(args)
+
+
+def test_moco_spikehunt_refuses_multi_echo():
+    from fastfuncstuff.cli import moco
+
+    args = moco.parse_args(
+        [
+            "-input",
+            "e1.nii.gz",
+            "e2.nii.gz",
+            "-reg_echo",
+            "1",
+            "-1Dfile",
+            "m.1D",
+            "-spikehunt",
+            "detect",
+        ]  # fmt: skip
+    )
+    with pytest.raises(SystemExit):
+        moco._run_multi_echo(args, args.input_file, CPU, 0, False, 0)

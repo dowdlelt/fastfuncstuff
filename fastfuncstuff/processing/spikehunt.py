@@ -342,6 +342,9 @@ class AcquisitionWindow:
     tr: float
     slice_times: np.ndarray | None  # (n_slices,) seconds, None when unknown
     ta: float  # readout window per TR (== tr when no slice timing / no gap)
+    # volumes dropped before the scanned series (moco -skip_first): reported
+    # volume numbers and times count from the scan's first volume
+    first_volume: int = 0
 
     @property
     def gap(self) -> float:
@@ -349,7 +352,7 @@ class AcquisitionWindow:
 
 
 def acquisition_window(
-    tr: float, slice_times: list[float] | np.ndarray | None
+    tr: float, slice_times: list[float] | np.ndarray | None, first_volume: int = 0
 ) -> AcquisitionWindow:
     """TR, slice times and the readout window TA.
 
@@ -359,12 +362,12 @@ def acquisition_window(
     TA < TR, and a spike in the gap lands in no slice and cannot be seen.
     """
     if slice_times is None or len(slice_times) == 0:
-        return AcquisitionWindow(tr=tr, slice_times=None, ta=tr)
+        return AcquisitionWindow(tr=tr, slice_times=None, ta=tr, first_volume=first_volume)
     st = np.asarray(slice_times, dtype=np.float64)
     uniq = np.unique(np.round(st, 6))
     step = float(np.diff(uniq).min()) if uniq.size > 1 else tr
     ta = min(tr, float(uniq.max()) + step)
-    return AcquisitionWindow(tr=tr, slice_times=st, ta=ta)
+    return AcquisitionWindow(tr=tr, slice_times=st, ta=ta, first_volume=first_volume)
 
 
 def group_events(scan: SpikeScan, window: AcquisitionWindow) -> list[SpikeEvent]:
@@ -379,10 +382,11 @@ def group_events(scan: SpikeScan, window: AcquisitionWindow) -> list[SpikeEvent]
     events = []
     for (t, _), slices in groups.items():
         within = float(st[slices[0]]) if st is not None and slices[0] < len(st) else 0.0
+        vol = t + window.first_volume
         events.append(
             SpikeEvent(
-                volume=t,
-                time=t * window.tr + within,
+                volume=vol,
+                time=vol * window.tr + within,
                 within_tr=within,
                 slices=sorted(slices),
                 score=float(max(scan.score[s, t] for s in slices)),
@@ -392,17 +396,86 @@ def group_events(scan: SpikeScan, window: AcquisitionWindow) -> list[SpikeEvent]
     return events
 
 
+def sidecar_for(path: str):
+    """The BIDS JSON beside a NIfTI under the same name, or None."""
+    import re
+    from pathlib import Path
+
+    p = Path(path)
+    cand = p.parent / (re.sub(r"\.nii(\.gz|\.zst)?$", "", p.name) + ".json")
+    return cand if cand.is_file() else None
+
+
+def resolve_timing(
+    input_path: str, tpattern: str | None, tr_flag: float | None
+) -> tuple[float, list[float] | None, str]:
+    """(TR, slice times or None, source label) for reporting spike times.
+
+    Slice times come from ``tpattern`` (BIDS JSON or one offset per line), else
+    the JSON sidecar beside the input. TR: flag, else the JSON's
+    ``RepetitionTime``, else the NIfTI header.
+    """
+    import json
+    from pathlib import Path
+
+    from fastfuncstuff.io.afni import get_tr_from_file
+    from fastfuncstuff.processing.slicetime import load_slice_timing
+
+    src = tpattern or sidecar_for(input_path)
+    slice_times, json_tr, label = None, None, "none"
+    if src is not None:
+        src = str(src)
+        if src.endswith(".json"):
+            meta = json.loads(Path(src).read_text())
+            json_tr = meta.get("RepetitionTime")
+            if "SliceTiming" in meta:
+                slice_times = [float(v) for v in meta["SliceTiming"]]
+        else:
+            slice_times = load_slice_timing(src)
+        label = Path(src).name
+    tr = tr_flag or (float(json_tr) if json_tr else None) or get_tr_from_file(input_path)
+    return float(tr), slice_times, label
+
+
+def print_report(
+    scan: SpikeScan, events: list[SpikeEvent], acq: AcquisitionWindow, nt: int, indent: str = "  "
+) -> None:
+    """Terminal summary: readout window, counts, then one line per event."""
+    gap = (
+        f" ({acq.gap:.3f} s silent gap per TR: spikes there are invisible)"
+        if acq.gap > 1e-6
+        else ""
+    )
+    print(f"{indent}TR {acq.tr:.3f} s, readout window TA {acq.ta:.3f} s{gap}")
+    if len(scan.hits) == 0:
+        print(f"{indent}no spikes above {scan.threshold:g}")
+        return
+    n_vols = len({e.volume for e in events})
+    read_min = nt * acq.ta / 60.0
+    print(
+        f"{indent}{len(events)} spike events ({len(scan.hits)} slice hits) in {n_vols} of {nt} "
+        f"volumes; {len(events) / read_min:.1f} events per minute of readout"
+    )
+    if acq.slice_times is None:
+        print(f"{indent}(no slice timing: times are volume onsets)")
+    print(f"{indent}{'vol':>5} {'time_s':>9} {'in_TR_s':>8} {'score':>6}  slices")
+    for e in events:
+        sl = ",".join(str(x) for x in e.slices)
+        print(f"{indent}{e.volume:5d} {e.time:9.3f} {e.within_tr:8.3f} {e.score:6.1f}  {sl}")
+
+
 def write_hits_tsv(path: str, scan: SpikeScan, window: AcquisitionWindow) -> None:
     """One row per hit (slice, volume), time-sorted."""
     st = window.slice_times
     rows = []
     for s, t in scan.hits.tolist():
         within = float(st[s]) if st is not None and s < len(st) else float("nan")
-        time = t * window.tr + (within if np.isfinite(within) else 0.0)
+        vol = t + window.first_volume
+        time = vol * window.tr + (within if np.isfinite(within) else 0.0)
         rows.append(
             (
                 time,
-                f"{t}\t{s}\t{time:.4f}\t{within:.4f}\t{scan.score[s, t]:.2f}\t{scan.raw[s, t]:.2f}"
+                f"{vol}\t{s}\t{time:.4f}\t{within:.4f}\t{scan.score[s, t]:.2f}\t{scan.raw[s, t]:.2f}"
                 f"\t{scan.k_y[s, t]}\t{scan.k_x[s, t]}\t{scan.repair.get((s, t), 'none')}"
                 f"\t{scan.clipped_frac.get((s, t), float('nan')):.4f}",
             )
@@ -463,6 +536,8 @@ def plot_spikehunt(
     fig = plt.figure(figsize=(max(12, 1.5 * n_g), 7.0 + 1.6 * rows_g))
     gs = fig.add_gridspec(3 + rows_g, max(n_g, 4), height_ratios=[2.2, 1.0, 1.2] + [1.2] * rows_g)
 
+    v0 = window_acq.first_volume
+    nz = scan.score.shape[0]
     ax = fig.add_subplot(gs[0, :])
     im = ax.imshow(
         np.clip(scan.score, 0, max(3 * scan.threshold, 1)),
@@ -470,21 +545,27 @@ def plot_spikehunt(
         cmap="magma",
         interpolation="nearest",
         origin="lower",
+        extent=(v0 - 0.5, v0 + nt - 0.5, -0.5, nz - 0.5),
     )
     if len(scan.hits):
         ax.scatter(
-            scan.hits[:, 1], scan.hits[:, 0], s=14, facecolors="none", edgecolors="cyan", lw=0.7
+            scan.hits[:, 1] + v0,
+            scan.hits[:, 0],
+            s=14,
+            facecolors="none",
+            edgecolors="cyan",
+            lw=0.7,
         )
     ax.set_ylabel("slice")
     ax.set_title(f"{title}  k-space spike score (circles: > {scan.threshold:g})", fontsize=10)
     fig.colorbar(im, ax=ax, pad=0.01)
 
     ax2 = fig.add_subplot(gs[1, :], sharex=ax)
-    ax2.plot(np.arange(nt), scan.score.max(axis=0), lw=0.8, color="0.2")
+    ax2.plot(np.arange(nt) + v0, scan.score.max(axis=0), lw=0.8, color="0.2")
     ax2.axhline(scan.threshold, color="tab:red", lw=0.8, ls="--")
     ax2.set_ylabel("max over\nslices")
     ax2.set_xlabel("volume")
-    ax2.set_xlim(-0.5, nt - 0.5)
+    ax2.set_xlim(v0 - 0.5, v0 + nt - 0.5)
 
     ax3 = fig.add_subplot(gs[2, :])
     st = window_acq.slice_times
@@ -504,7 +585,7 @@ def plot_spikehunt(
         v = float(np.percentile(np.abs(res), 99.5)) or 1.0
         a = fig.add_subplot(gs[3, j])
         a.imshow(res, origin="lower", cmap="gray", vmin=-v, vmax=v)
-        a.set_title(f"s{s} v{t}  {scan.score[s, t]:.0f}", fontsize=7)
+        a.set_title(f"s{s} v{t + v0}  {scan.score[s, t]:.0f}", fontsize=7)
         b = fig.add_subplot(gs[4, j])
         b.imshow(np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(res)))), origin="lower", cmap="magma")
         if cleaned is not None:
