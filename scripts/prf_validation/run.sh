@@ -43,10 +43,20 @@ STIMS=$(for r in $RUNS; do printf '%s ' "$APER"; done)
 pyrf() {  # pyrf PREFIX DEVICE EXTRA... ; wall time to PREFIX.time
   local prefix=$1 device=$2; shift 2
   [ -s "$prefix.time" ] && return
-  local t0=$(date +%s.%N)
+  local t0=$(date +%s.%N) started=$(date -Iseconds) commit=$(git -C "$REPO" rev-parse HEAD)
+  local dirty=$(git -C "$REPO" status --porcelain --untracked-files=no -- fastfuncstuff | wc -l)
   "$BIN/ffs_pyrf" -input $INPUTS -stimulus $STIMS -prefix "$prefix" -device "$device" "$@" \
     2>&1 | tee "$prefix.log"
   echo "$(date +%s.%N) - $t0" | bc > "$prefix.time"
+  # Which code produced this fit: a rerun skips it while the .time file exists.
+  {
+    echo "started: $started"
+    echo "commit: $commit"
+    echo "dirty: $dirty tracked files changed under fastfuncstuff/"
+    echo "device: $device"
+    echo "host: $(hostname)"
+    echo "args: $*"
+  } > "$prefix.provenance"
 }
 
 # 3. Whole cortex, both hemispheres, screened: the configuration a user runs,
