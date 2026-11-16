@@ -96,6 +96,7 @@ from fastfuncstuff.design.prf import (
     summarize_hrf_selection,
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
+from fastfuncstuff.io.gifti import set_surface_meta, surface_meta
 from fastfuncstuff.memory import (
     estimate_chunk_size,
     prf_per_type_voxel_chunk,
@@ -1828,11 +1829,25 @@ def _save_results(
         data = full.reshape((*loaded.volume_shape, len(labels)))
     else:
         data = values.reshape((*loaded.volume_shape, len(labels)))
+    header = loaded.nifti_header
+    surface = surface_meta(header) if header is not None else None
+    if surface is not None:
+        # What a reader cannot get back from the numbers: their units, and where
+        # the screen ends in them (ffs_util_prfplot scales eccentricity to it).
+        header = header.copy()
+        set_surface_meta(
+            header,
+            {
+                **surface,
+                "prf_units": "deg" if screen_extent is not None else "px",
+                "prf_stimulus_radius": f"{scale * max(stimulus_shape) / 2:g}",
+            },
+        )
     save_nifti(
         data,
         output_path=output_path,
         affine=loaded.affine,
-        header=loaded.nifti_header,
+        header=header,
         brick_labels=labels,
     )
 
