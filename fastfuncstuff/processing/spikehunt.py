@@ -558,7 +558,9 @@ def plot_spikehunt(
         )
     ax.set_ylabel("slice")
     ax.set_title(f"{title}  k-space spike score (circles: > {scan.threshold:g})", fontsize=10)
-    fig.colorbar(im, ax=ax, pad=0.01)
+    # colorbar in an inset outside the axes: fig.colorbar(ax=...) would shrink the
+    # heatmap and break its column alignment with the per-volume trace below
+    fig.colorbar(im, cax=ax.inset_axes((1.005, 0.0, 0.012, 1.0)))
 
     ax2 = fig.add_subplot(gs[1, :], sharex=ax)
     ax2.plot(np.arange(nt) + v0, scan.score.max(axis=0), lw=0.8, color="0.2")
