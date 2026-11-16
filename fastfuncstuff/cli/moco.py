@@ -2422,6 +2422,7 @@ def _spikehunt(args, data: torch.Tensor, input_file: str, device: torch.device, 
     scan = spike_lib.hunt_spikes(
         before,
         threshold=args.spike_thresh,
+        slice_times=slice_times,
         clean=clean,
         out=data if clean else None,
         compute_device=device,

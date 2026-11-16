@@ -222,3 +222,15 @@ def test_trailing_noise_volumes_are_counted_and_left_out():
     assert S.trailing_noise_volumes(data[:-3]) == 0
     scan = S.hunt_spikes(data[:-3], compute_device=CPU, progress=False)
     assert (2, 17) in set(map(tuple, scan.hits.tolist()))
+
+
+def test_multiband_partner_with_a_weak_copy_of_the_spike_joins_the_hit():
+    """MB2: slices 0/2 share an excitation. The spike lands in both at the same
+    k-point, too weak in slice 2 to be a candidate; the partner check finds it
+    there, and leaves slice 1 (another excitation) alone."""
+    data = _phantom_series(spikes=[(0, 17, 13, -9, AMP), (2, 17, 13, -9, 0.3 * AMP)])
+    alone = S.hunt_spikes(data, compute_device=CPU, progress=False)
+    assert set(map(tuple, alone.hits.tolist())) == {(0, 17)}
+    scan = S.hunt_spikes(data, slice_times=[0.0, 0.5, 0.0, 0.5], compute_device=CPU, progress=False)
+    assert set(map(tuple, scan.hits.tolist())) == {(0, 17), (2, 17)}
+    assert scan.partner_of[(2, 17)][0] == 0

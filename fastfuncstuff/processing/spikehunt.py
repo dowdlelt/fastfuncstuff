@@ -88,6 +88,12 @@ MIN_POINT_RADIUS = 0.5
 # about one spike blob (3x3) plus its Hermitian mirror
 POINT_TOP_N = 18
 DEFAULT_KINTERP_Z = 3.0
+# a multiband partner of a hit is a hit too when its deviation at the hit's own
+# top k-points stands this far above its other volumes (robust z). Slice-GRAPPA
+# shares the spiked readout sample among the partners at the same k-point (the
+# CAIPI shift is a phase ramp, invisible to |K|); measured on 2 mm MB6 data the
+# nearest partners sit at z 5-100 and the far ones near 0
+DEFAULT_PARTNER_Z = 4.0
 # trailing volumes darker than this fraction of the median volume mean are
 # noise scans (flip angle 0, kept for NORDIC): pure noise, no spikes to find,
 # and they would set the per-slice normalisation
@@ -112,6 +118,8 @@ class SpikeScan:
         None  # (slice, vol) k radius of the top-N points; NaN off-candidate
     )
     rejected: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=int))
+    # (partner slice, vol) -> (hit slice that implicated it, partner z)
+    partner_of: dict[tuple[int, int], tuple[int, float]] = field(default_factory=dict)
     hits: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=int))  # (slice, vol)
     repair: dict[tuple[int, int], str] = field(default_factory=dict)  # (slice, vol) -> method
     clipped_frac: dict[tuple[int, int], float] = field(default_factory=dict)  # k-points shrunk
@@ -325,6 +333,64 @@ def trailing_noise_volumes(data: Tensor, frac: float = NOISE_VOLUME_FRAC) -> int
     return n
 
 
+def _slice_spectrum(data: Tensor, s: int, dev: torch.device) -> Tensor:
+    return torch.fft.fftshift(torch.fft.fft2(data[:, s].to(dev, torch.float32)), dim=(-2, -1))
+
+
+def _adjacent_deviation(spec: Tensor) -> Tensor:
+    """(T, ny, nx) deviation of every volume from its two neighbours' mean (one at the ends)."""
+    d = torch.empty_like(spec)
+    d[1:-1] = spec[1:-1] - 0.5 * (spec[:-2] + spec[2:])
+    d[0] = spec[0] - spec[1]
+    d[-1] = spec[-1] - spec[-2]
+    return d
+
+
+def _partner_hits(
+    data: Tensor,
+    hits: list[tuple[int, int]],
+    slice_times: np.ndarray,
+    dev: torch.device,
+    protect: Tensor,
+    partner_z: float,
+) -> dict[tuple[int, int], tuple[int, float]]:
+    """Multiband partners carrying a hit's spike, at the hit's own top k-points.
+
+    Partners are the slices sharing the hit's ``SliceTiming`` value. For each,
+    the normalised deviation power averaged over the hit's ``POINT_TOP_N``
+    strongest k-points is compared with the same number at the partner's other
+    volumes; above ``partner_z`` (robust z) it is a hit.
+    """
+    hit_set = set(hits)
+    cache: dict[int, tuple[Tensor, Tensor]] = {}
+
+    def power(s: int) -> tuple[Tensor, Tensor]:
+        if s not in cache:
+            spec = _slice_spectrum(data, s, dev)
+            normal = _normal_deviation(spec).clamp_min(1e-12)
+            cache[s] = ((_adjacent_deviation(spec).abs() / normal) ** 2, normal)
+        return cache[s]
+
+    found: dict[tuple[int, int], tuple[int, float]] = {}
+    for s, t in hits:
+        if s >= len(slice_times):
+            continue
+        a_hit, _ = power(s)
+        ex = (a_hit[t] - 1.0).clamp_min(0.0).masked_fill(protect, 0.0)
+        idx = torch.topk(ex.flatten(), min(POINT_TOP_N, ex.numel())).indices
+        for p in np.flatnonzero(np.abs(slice_times - slice_times[s]) < 1e-4).tolist():
+            if p == s or (p, t) in hit_set or p >= data.shape[1]:
+                continue
+            series = power(p)[0].flatten(1)[:, idx].mean(dim=1)
+            others = torch.cat([series[:t], series[t + 1 :]])
+            med = others.median()
+            mad = (others - med).abs().median() * 1.4826
+            z = float((series[t] - med) / mad.clamp_min(1e-6))
+            if z > partner_z and z > found.get((p, t), (0, -np.inf))[1]:
+                found[(p, t)] = (s, z)
+    return found
+
+
 def hunt_spikes(
     data: Tensor,
     *,
@@ -337,6 +403,8 @@ def hunt_spikes(
     clip: float = DEFAULT_CLIP,
     point_frac: float = DEFAULT_POINT_FRAC,
     kinterp_z: float = DEFAULT_KINTERP_Z,
+    slice_times: list[float] | np.ndarray | None = None,
+    partner_z: float = DEFAULT_PARTNER_Z,
     compute_device: torch.device | None = None,
     progress: bool = True,
 ) -> SpikeScan:
@@ -345,6 +413,10 @@ def hunt_spikes(
     Slices are taken along Z (the NIfTI third axis, the one ``SliceTiming``
     indexes); the FFT runs over the in-plane (Y, X) axes. ``data`` may live on
     the CPU while ``compute_device`` is a GPU: slabs of slices are streamed.
+
+    With ``slice_times`` (one per slice), the multiband partners of each hit
+    (same acquisition time) are checked at the hit's k-points and join the
+    hits when they carry the spike (:func:`_partner_hits`).
 
     With ``clean=True`` the hits are repaired into ``out`` (default: a copy of
     ``data``; pass ``data`` itself to repair in place) with ``method`` (see
@@ -389,9 +461,7 @@ def hunt_spikes(
         starts, desc="spikehunt", unit="slab", leave=True, disable=not progress or len(starts) < 2
     ):
         s1 = min(nz, s0 + chunk)
-        # copy=True: on the same device and dtype .to() aliases, and cleaning
-        # repairs the slab in place
-        slab = data[:, s0:s1].to(dev, torch.float32, copy=clean)
+        slab = data[:, s0:s1].to(dev, torch.float32)
         spec, zb = _kspace_z(slab, window, exclude_radius)
         best, arg = _peak(zb, center)  # (T, S)
         raw_c = best.T.contiguous()  # (S, T)
@@ -403,40 +473,50 @@ def hunt_spikes(
         cand: dict[int, list[int]] = {}
         for s, t in (sc > threshold).nonzero().tolist():
             cand.setdefault(s, []).append(t)
-        hit_by_slice: dict[int, list[int]] = {}
-        normals: dict[int, Tensor] = {}
         for s, vols in cand.items():
-            normals[s] = _normal_deviation(spec[:, s])
-            for t, (fr, rd) in _point_features(
-                spec[:, s], vols, radius, normals[s], protect
-            ).items():
+            normal = _normal_deviation(spec[:, s])
+            for t, (fr, rd) in _point_features(spec[:, s], vols, radius, normal, protect).items():
                 pfrac[s0 + s, t], krad[s0 + s, t] = fr, rd
                 ok = fr > point_frac and rd > MIN_POINT_RADIUS
                 (accepted if ok else rejected).append((s0 + s, t))
-                if ok:
-                    hit_by_slice.setdefault(s, []).append(t)
-        if clean and hit_by_slice:
-            assert out is not None
-            for s, vols in hit_by_slice.items():
-                fracs = _repair_slice(
-                    spec[:, s], vols, slab[:, s], method, clip, protect, normals[s], kinterp_z
-                )
-                for t, f in fracs.items():
-                    repair[(s0 + s, t)] = method
-                    clipped_frac[(s0 + s, t)] = f
-                out[:, s0 + s] = slab[:, s].to(out.device, out.dtype)
-            # rescore only the repaired slices: the others are unchanged
-            rows = sorted(hit_by_slice)
-            del spec, zb
-            spec, zb = _kspace_z(slab[:, rows], window, exclude_radius)
+        del slab, spec, zb
+
+    partner_of: dict[tuple[int, int], tuple[int, float]] = {}
+    if slice_times is not None and accepted:
+        partner_of = _partner_hits(
+            data, accepted, np.asarray(slice_times, dtype=np.float64), dev, protect, partner_z
+        )
+    hits = sorted(set(accepted) | set(partner_of))
+
+    if clean and hits:
+        assert out is not None
+        by_slice: dict[int, list[int]] = {}
+        for s, t in hits:
+            by_slice.setdefault(s, []).append(t)
+        for s, vols in by_slice.items():
+            spec = _slice_spectrum(data, s, dev)
+            fixed = data[:, s].to(dev, torch.float32, copy=True)
+            fracs = _repair_slice(
+                spec, vols, fixed, method, clip, protect, _normal_deviation(spec), kinterp_z
+            )
+            for t, f in fracs.items():
+                repair[(s, t)] = method
+                clipped_frac[(s, t)] = f
+            out[:, s] = fixed.to(out.device, out.dtype)
+            del spec, fixed
+        # rescore the repaired slices (only they changed), a slab at a time
+        rows = sorted(by_slice)
+        for i0 in range(0, len(rows), chunk):
+            block = rows[i0 : i0 + chunk]
+            _, zb = _kspace_z(out[:, block].to(dev, torch.float32), window, exclude_radius)
             sc2 = _robust_z_over_t(_peak(zb, center)[0].T.contiguous())
-            for i, s in enumerate(rows):
-                for t in hit_by_slice[s]:
+            for i, s in enumerate(block):
+                for t in by_slice[s]:
                     v = float(sc2[i, t])
                     residual_max = max(residual_max, v)
                     if v > threshold:
-                        residual.append((s0 + s, t))
-        del slab, spec, zb
+                        residual.append((s, t))
+            del zb
 
     return SpikeScan(
         score=scores.numpy(),
@@ -447,7 +527,8 @@ def hunt_spikes(
         point_frac=pfrac,
         k_radius=krad,
         rejected=np.asarray(sorted(rejected), dtype=int).reshape(-1, 2),
-        hits=np.asarray(sorted(accepted), dtype=int).reshape(-1, 2),
+        hits=np.asarray(hits, dtype=int).reshape(-1, 2),
+        partner_of=partner_of,
         repair=repair,
         clipped_frac=clipped_frac,
         residual=np.asarray(residual, dtype=int).reshape(-1, 2) if clean else None,
@@ -592,14 +673,28 @@ def print_report(
     )
     if acq.slice_times is None:
         print(f"{indent}(no slice timing: times are volume onsets)")
+    if scan.partner_of:
+        print(
+            f"{indent}{len(scan.partner_of)} of the slice hits are multiband partners carrying "
+            "a hit's spike at its k-points (marked *)"
+        )
     print(f"{indent}{'vol':>5} {'time_s':>9} {'in_TR_s':>8} {'score':>6}  slices")
+    v0 = acq.first_volume
     for e in events:
-        sl = ",".join(str(x) for x in e.slices)
+        t = e.volume - v0
+        sl = ",".join(f"{x}*" if (x, t) in scan.partner_of else str(x) for x in e.slices)
         print(f"{indent}{e.volume:5d} {e.time:9.3f} {e.within_tr:8.3f} {e.score:6.1f}  {sl}")
 
 
 def _get(arr: np.ndarray | None, s: int, t: int) -> float:
     return float("nan") if arr is None else float(arr[s, t])
+
+
+def _source(scan: SpikeScan, s: int, t: int) -> str:
+    if (s, t) in scan.partner_of:
+        hit, z = scan.partner_of[(s, t)]
+        return f"partner_of_s{hit}(z={z:.1f})"
+    return "score"
 
 
 def write_hits_tsv(path: str, scan: SpikeScan, window: AcquisitionWindow) -> None:
@@ -616,13 +711,14 @@ def write_hits_tsv(path: str, scan: SpikeScan, window: AcquisitionWindow) -> Non
                 f"{vol}\t{s}\t{time:.4f}\t{within:.4f}\t{scan.score[s, t]:.2f}\t{scan.raw[s, t]:.2f}"
                 f"\t{scan.k_y[s, t]}\t{scan.k_x[s, t]}\t{scan.repair.get((s, t), 'none')}"
                 f"\t{scan.clipped_frac.get((s, t), float('nan')):.4f}"
-                f"\t{_get(scan.point_frac, s, t):.4f}\t{_get(scan.k_radius, s, t):.3f}",
+                f"\t{_get(scan.point_frac, s, t):.4f}\t{_get(scan.k_radius, s, t):.3f}"
+                f"\t{_source(scan, s, t)}",
             )
         )
     rows.sort(key=lambda r: r[0])
     hdr = (
         "volume\tslice\ttime_s\twithin_tr_s\tscore\traw_blob_z\tk_y\tk_x\trepair"
-        "\tchanged_frac\tpoint_frac\tk_radius"
+        "\tchanged_frac\tpoint_frac\tk_radius\tfound_by"
     )
     with open(path, "w") as f:
         f.write(hdr + "\n")

@@ -192,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
         clip=args.clip,
         point_frac=args.point_frac,
         kinterp_z=args.kinterp_z,
+        slice_times=slice_times,
         compute_device=device,
         progress=verb >= 1,
     )
