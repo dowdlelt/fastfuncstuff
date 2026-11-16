@@ -334,7 +334,12 @@ def trailing_noise_volumes(data: Tensor, frac: float = NOISE_VOLUME_FRAC) -> int
 
 
 def _slice_spectrum(data: Tensor, s: int, dev: torch.device) -> Tensor:
-    return torch.fft.fftshift(torch.fft.fft2(data[:, s].to(dev, torch.float32)), dim=(-2, -1))
+    return torch.fft.fftshift(torch.fft.fft2(data[:, s].to(dev, _work_dtype(data))), dim=(-2, -1))
+
+
+def _work_dtype(data: Tensor) -> torch.dtype:
+    """complex64 for a complex series (mag * exp(i phase)), else float32."""
+    return torch.complex64 if data.is_complex() else torch.float32
 
 
 def _adjacent_deviation(spec: Tensor) -> Tensor:
@@ -432,6 +437,10 @@ def hunt_spikes(
     dev = compute_device or data.device
     if method not in REPAIR_METHODS:
         raise ValueError(f"method must be one of {REPAIR_METHODS}, got {method!r}")
+    if clean and data.is_complex():
+        # kinterp/kclip mirror their changes so a magnitude image stays real;
+        # complex k-space has no mirror, and the output would need splitting back
+        raise NotImplementedError("repair of a complex series is not implemented yet")
     if clean and out is None:
         out = data.clone()
 
@@ -461,7 +470,7 @@ def hunt_spikes(
         starts, desc="spikehunt", unit="slab", leave=True, disable=not progress or len(starts) < 2
     ):
         s1 = min(nz, s0 + chunk)
-        slab = data[:, s0:s1].to(dev, torch.float32)
+        slab = data[:, s0:s1].to(dev, _work_dtype(data))
         spec, zb = _kspace_z(slab, window, exclude_radius)
         best, arg = _peak(zb, center)  # (T, S)
         raw_c = best.T.contiguous()  # (S, T)
