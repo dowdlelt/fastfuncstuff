@@ -845,6 +845,19 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     model.add_argument(
+        "-no-collapse-repeats",
+        "-no_collapse_repeats",
+        action="store_true",
+        help=(
+            "Refine every run separately. By default runs that show the same "
+            "aperture movie and carry the same nuisance design are averaged in "
+            "groups before refinement, which gives the same fit (the per-run "
+            "scatter does not depend on the model) for a fraction of the work; "
+            "statistics are still reported on every run. Runs with their own "
+            "regressors (-denoise) are never averaged. For checking only"
+        ),
+    )
+    model.add_argument(
         "-xval",
         choices=["auto", "none", "loro", "halves"],
         default="auto",
@@ -2664,6 +2677,7 @@ def main(argv: list[str] | None = None) -> int:
         fix_exponent=args.model_mode == 3,
         stagewise_exponent=args.model_mode == 1,
         polish_dtype=torch.float64 if args.refine_precision == "polish" else None,
+        collapse_repeats=not args.no_collapse_repeats,
     )
     if (
         refinement_config.polish_dtype is not None
