@@ -30,16 +30,18 @@ Detection, per slice:
        candidate, the complex deviation from its two temporal neighbours,
        normalised per k-point by its usual deviation, gives the fraction of the
        frame's excess energy in its ``POINT_TOP_N`` strongest k-points and the
-       k radius of those points. A candidate is a hit if its score clears
-       ``SURE_THRESHOLD`` or its top fraction clears ``point_frac``, and its
-       top points sit beyond ``MIN_POINT_RADIUS`` (labelled spikes: >= 0.73;
-       a point-like inflow candidate: 0.05).
+       k radius of those points. A candidate is a hit if its top fraction
+       clears ``point_frac`` and its top points sit beyond
+       ``MIN_POINT_RADIUS`` (labelled spikes: >= 0.73; a point-like inflow
+       candidate: 0.05). No score is high enough to skip this: on a clean
+       2 mm MB6 run, motion and noise frames reached 14 with point fractions
+       of 0.02-0.03 (labelled spikes: median 0.16).
 
 Tuned against hand labels on three runs (253 spikes, 22 inflow/motion
 candidates; wiki: RF spike detection from magnitude k-space): score > 10 alone
-found 60% of the spikes and no false hits; candidate 6 + point check finds 91%
-with 1 false hit in-sample, 89-98% with 5 of 22 false when each run is judged
-with thresholds tuned on the other two. Every non-spike scored under 9.5.
+found 60% of the spikes and no false hits; candidate 6 + point check finds 89%
+with 1 false hit, and none on a clean run (ImaginationStimulation sub-IS6982
+run 1: 110 candidates, highest point fraction 0.066).
 
 Sensitivity floor: the log compresses a spike to log(amplitude / noise), so a
 sharp, weak spike (under ~10x the per-k noise of the magnitude image) does
@@ -81,12 +83,15 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 DEFAULT_THRESHOLD = 6.0
-SURE_THRESHOLD = 9.5
 DEFAULT_POINT_FRAC = 0.08
 MIN_POINT_RADIUS = 0.5
 # about one spike blob (3x3) plus its Hermitian mirror
 POINT_TOP_N = 18
 DEFAULT_KINTERP_Z = 3.0
+# trailing volumes darker than this fraction of the median volume mean are
+# noise scans (flip angle 0, kept for NORDIC): pure noise, no spikes to find,
+# and they would set the per-slice normalisation
+NOISE_VOLUME_FRAC = 0.2
 DEFAULT_WINDOW = 9
 DEFAULT_EXCLUDE_RADIUS = 0.25
 DEFAULT_CLIP = 1.5
@@ -310,6 +315,16 @@ def _repair_slice(
     return fracs
 
 
+def trailing_noise_volumes(data: Tensor, frac: float = NOISE_VOLUME_FRAC) -> int:
+    """Number of noise scans at the end of a (T, ...) series (0 if none)."""
+    means = data.reshape(data.shape[0], -1).float().mean(dim=1)
+    level = float(means.median())
+    n = 0
+    while n < means.numel() - 1 and float(means[-1 - n]) < frac * level:
+        n += 1
+    return n
+
+
 def hunt_spikes(
     data: Tensor,
     *,
@@ -396,7 +411,7 @@ def hunt_spikes(
                 spec[:, s], vols, radius, normals[s], protect
             ).items():
                 pfrac[s0 + s, t], krad[s0 + s, t] = fr, rd
-                ok = (float(sc[s, t]) > SURE_THRESHOLD or fr > point_frac) and rd > MIN_POINT_RADIUS
+                ok = fr > point_frac and rd > MIN_POINT_RADIUS
                 (accepted if ok else rejected).append((s0 + s, t))
                 if ok:
                     hit_by_slice.setdefault(s, []).append(t)
@@ -698,7 +713,6 @@ def plot_spikehunt(
     ax2 = fig.add_subplot(gs[1, :], sharex=ax)
     ax2.plot(np.arange(nt) + v0, scan.score.max(axis=0), lw=0.8, color="0.2")
     ax2.axhline(scan.threshold, color="tab:red", lw=0.8, ls="--")
-    ax2.axhline(SURE_THRESHOLD, color="tab:red", lw=0.6, ls=":")
     ax2.set_ylabel("max over\nslices")
     ax2.set_xlabel("volume")
     ax2.set_xlim(v0 - 0.5, v0 + nt - 0.5)

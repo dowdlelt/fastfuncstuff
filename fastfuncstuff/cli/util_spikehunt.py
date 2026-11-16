@@ -66,8 +66,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=S.DEFAULT_THRESHOLD,
         help="Candidate threshold on the slice-normalised blob score (a robust z "
         "against the same slice's other volumes). Candidates then pass a point check "
-        "(-point_frac); scores above 9.5 skip it. On hand-labelled runs nearly every "
-        "candidate above 6 was a spike, and every inflow/motion candidate scored < 9.5.",
+        "(-point_frac), whatever their score. On hand-labelled runs nearly every "
+        "candidate above 6 was a spike; on a clean run, motion frames reached 14.",
     )
     parser.add_argument(
         "-point_frac",
@@ -126,6 +126,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "by more than this many times their normal deviation are replaced by it.",
     )
     parser.add_argument(
+        "-noise_vols",
+        default="auto",
+        help="Trailing noise scans (flip angle 0, e.g. for NORDIC) to leave out: a "
+        "count, or auto = trailing volumes darker than 20%% of the median volume.",
+    )
+    parser.add_argument(
         "-plots",
         action="store_true",
         help="Write PREFIX.spikehunt.png: score heatmap, per-volume trace, within-TR "
@@ -136,6 +142,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.window < 3 or args.window % 2 == 0:
         parser.error("-window must be an odd integer >= 3")
+    if args.noise_vols != "auto" and not args.noise_vols.isdigit():
+        parser.error("-noise_vols takes a non-negative integer or 'auto'")
     if args.clip <= 0.0:
         parser.error("-clip must be > 0")
     return args
@@ -156,7 +164,13 @@ def main(argv: list[str] | None = None) -> None:
         data, hdr = load_image(args.input)
     if data.ndim != 4:
         raise SystemExit(f"ffs_util_spikehunt: {args.input} is not 4D (shape {tuple(data.shape)})")
-    nt, nz = data.shape[0], data.shape[1]
+    n_noise = S.trailing_noise_volumes(data) if args.noise_vols == "auto" else int(args.noise_vols)
+    nt_all, nz = data.shape[0], data.shape[1]
+    nt = nt_all - n_noise
+    if nt < 5:
+        raise SystemExit(
+            f"ffs_util_spikehunt: only {nt} volumes left after {n_noise} noise volumes"
+        )
     tr, slice_times, tsrc = S.resolve_timing(args.input, args.tpattern, args.TR)
     if slice_times is not None and len(slice_times) != nz:
         print(
@@ -168,12 +182,12 @@ def main(argv: list[str] | None = None) -> None:
 
     cleaned = data.clone() if args.clean else None
     scan = S.hunt_spikes(
-        data,
+        data[:nt],
         threshold=args.thresh,
         window=args.window,
         exclude_radius=args.exclude_radius,
         clean=args.clean,
-        out=cleaned,
+        out=None if cleaned is None else cleaned[:nt],
         method=args.repair,
         clip=args.clip,
         point_frac=args.point_frac,
@@ -187,6 +201,8 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"ffs_util_spikehunt: {Path(args.input).name}  ({nz} slices x {nt} volumes, timing: {tsrc})"
         )
+        if n_noise:
+            print(f"  {n_noise} trailing noise volumes left out (kept unchanged in outputs)")
         S.print_report(scan, events, acq, nt)
 
     S.write_hits_tsv(f"{args.prefix}.spikes.tsv", scan, acq)
@@ -210,8 +226,8 @@ def main(argv: list[str] | None = None) -> None:
             f"{args.prefix}.spikehunt.png",
             scan,
             acq,
-            data,
-            cleaned,
+            data[:nt],
+            None if cleaned is None else cleaned[:nt],
             title=Path(args.input).name,
             window=args.window,
         )

@@ -213,3 +213,12 @@ def test_kinterp_replaces_few_kpoints_and_only_in_the_hit_frame():
     assert scan.clipped_frac[(1, 20)] < 0.5
     ref = 0.5 * (data[19, 1] + data[21, 1])
     assert (out[20, 1] - ref).std() < (data[20, 1] - ref).std()
+
+
+def test_trailing_noise_volumes_are_counted_and_left_out():
+    data = _phantom_series(spikes=[(2, 17, 13, -9, AMP)])
+    data[-3:] = torch.rand_like(data[-3:]) * 4.0  # flip-angle-0 noise scans
+    assert S.trailing_noise_volumes(data) == 3
+    assert S.trailing_noise_volumes(data[:-3]) == 0
+    scan = S.hunt_spikes(data[:-3], compute_device=CPU, progress=False)
+    assert (2, 17) in set(map(tuple, scan.hits.tolist()))

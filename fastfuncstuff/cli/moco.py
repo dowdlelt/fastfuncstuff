@@ -2411,6 +2411,13 @@ def _spikehunt(args, data: torch.Tensor, input_file: str, device: torch.device, 
         print(f"  ** {tsrc}: {len(slice_times)} slice times for {data.shape[1]} slices, ignored")
         slice_times = None
     acq = spike_lib.acquisition_window(tr, slice_times, first_volume=args.skip_first)
+    # noise scans at the end (NORDIC) are pure noise: hunt on a view without them,
+    # so a clean repair still lands in ``data``
+    n_noise = spike_lib.trailing_noise_volumes(data)
+    if n_noise:
+        data = data[: data.shape[0] - n_noise]
+        if verb >= 1:
+            print(f"  {n_noise} trailing noise volumes left out of the hunt")
     before = data.clone() if (clean and plot) else data
     scan = spike_lib.hunt_spikes(
         before,
