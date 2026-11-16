@@ -273,3 +273,40 @@ def test_a_painted_roi_is_the_mask_and_follows_the_brush(pca_session):
     assert 0 < small < 8 * 8 * 6
     stroke(9.0)
     assert int(s.mode._result.mask.sum()) > small
+
+
+def test_the_run_stays_drawn_under_the_component_map(pca_session):
+    """The run is the anatomy a component map is judged on; it is not switched off."""
+    s = pca_session
+    bold = next(ly for ly in s.state.layers if ly.n_volumes > 1)
+    s.do(SetMode("instapca"))
+    assert s.state.layers.find(bold.key).visible
+
+
+def test_amplitude_is_coloured_and_cut_on_the_correlation(pca_session):
+    s = pca_session
+    s.do(SetMode("instapca"))
+    mode = s.mode
+    s.set_mode_param("map", "amplitude")
+    out = mode.compute()
+    k = mode._index
+    np.testing.assert_array_equal(out.values, mode._result.volume(k, "amplitude"))
+    np.testing.assert_array_equal(out.threshold_values, mode._result.volume(k, "correlation"))
+    assert out.threshold_stat is not None and out.threshold_stat[0] == "fico"
+    s.set_mode_param("cut", "map")
+    out = mode.compute()
+    assert out.threshold_values is None and out.threshold_stat is None
+
+
+def test_the_scree_marks_the_component_and_reads_share_of_explained(pca_session):
+    s = pca_session
+    s.do(SetMode("instapca"))
+    mode = s.mode
+    mode.action("next")
+    scree = mode.panels()["scree"][0]
+    assert scree.marker == 1
+    explained = mode._result.explained
+    # The right axis is the same line as a share of what the kept components explain.
+    np.testing.assert_allclose(
+        scree.values[1] * scree.right_scale, explained[1] / explained.sum() * 100, rtol=1e-5
+    )

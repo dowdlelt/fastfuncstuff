@@ -352,6 +352,13 @@ class Trace:
     key: str = ""
     #: Short name for a legend; falls back to the label.
     short: str = ""
+    #: Index of the one point that is "where you are" -- the component a
+    #: scree is showing -- drawn as a bar across the plot and a dot on the line.
+    marker: int | None = None
+    #: A second reading of the same line on a right-hand axis: right = left *
+    #: ``right_scale``. One line, two units (% of the total variance on the
+    #: left, % of the explained variance on the right), not a second line.
+    right_scale: float | None = None
 
     @property
     def ident(self) -> str:
@@ -396,6 +403,11 @@ class Mode(ABC):
     #: Whether this mode owns an overlay layer at all. Plain mode does not --
     #: its overlay is whatever the user picked.
     produces_overlay: ClassVar[bool] = True
+    #: Whether the run the mode read is switched off when its output first
+    #: appears. Right for a 4-D run under its own correlation map; wrong for a
+    #: decomposition reviewer, where the run is the anatomy you judge each
+    #: component's map against.
+    hides_input: ClassVar[bool] = True
     #: What this mode can read, as a declaration rather than a search, in the
     #: same words :attr:`~fastfuncstuff.viewer.tools.base.Tool.input_kind`
     #: uses: ``"4d"`` for a time series, ``"any"`` for any loaded layer,

@@ -41,6 +41,8 @@ from fastfuncstuff.viewer.modes.base import (
 )
 
 LABELS = ("signal", "noise")
+#: How each map's units read in a volume label.
+_MAP_UNITS = {"amplitude": "amplitude (% signal, sd)", "z": "z"}
 #: Upper bound on the component spinner, whatever the run could support. Past
 #: this a review is not a review.
 MAX_COMPONENTS = 200
@@ -71,6 +73,8 @@ class InstaPCAMode(Mode):
     component_word = "PC"
     ortvec_suffix = "pca_noise"
     map_choices: tuple[str, ...] = ("correlation", "amplitude")
+    #: The run is the anatomy each component's map is judged against.
+    hides_input = False
 
     def __init__(self) -> None:
         self._result: engine.Decomposition | None = None
@@ -85,7 +89,8 @@ class InstaPCAMode(Mode):
         self._source_name = ""
         self._source_path = ""
         self._message = ""
-        self._shown_map: str | None = None
+        #: ``(map, cut)`` last drawn: a change of either is a new question.
+        self._shown_map: tuple[str, str] | None = None
         #: component index -> "signal" | "noise". Absent means unlabelled.
         self.labels: dict[int, str] = {}
         self._saved_to: Path | None = None
@@ -152,7 +157,19 @@ class InstaPCAMode(Mode):
                 span=HALF,
                 help="correlation: each voxel's detrended series against the component, "
                 "amplitude-free -- where it lives. amplitude: the standard deviation of its "
-                "share of the voxel, in percent of the voxel's mean -- what removing it costs.",
+                "share of the voxel, in percent signal change -- what removing it costs.",
+            ),
+            ChoiceControl(
+                name="cut",
+                label="thr on",
+                choices=("correlation", "map"),
+                default="correlation",
+                style="radio",
+                span=HALF,
+                help="What the threshold cuts. correlation: colour by the map, keep only "
+                "the voxels where the component is really there (the p spinner reads the "
+                "correlation's p) -- amplitude coloured and r cut answers 'where, and how "
+                "big'. map: cut the map shown on its own values.",
             ),
             PathControl(
                 name="ortvec",
@@ -329,30 +346,45 @@ class InstaPCAMode(Mode):
             return None
         k = self._index
         kind = str(self.params.get("map") or "correlation")
+        cut = (
+            "correlation" if str(self.params.get("cut") or "correlation") == "correlation" else kind
+        )
         values = self._result.volume(k, kind)
-        finite = values[np.isfinite(values)]
-        top = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
-        if kind == "correlation":
-            top = min(top, 1.0)
-        rescale = self._shown_map is not None and self._shown_map != kind
-        self._shown_map = kind
+        top = self._robust_top(values, kind)
+        cut_values = None if cut == kind else self._result.volume(k, cut)
+        cut_top = top if cut_values is None else self._robust_top(cut_values, cut)
+        # The threshold slider is named after the map it cuts, not the one drawn.
+        self.overlay_kind = (  # ty: ignore[invalid-attribute-access]  (as InstaGLM)
+            OverlayKind.CORRELATION if cut == "correlation" else OverlayKind.VALUE
+        )
+        rescale = self._shown_map is not None and self._shown_map != (kind, cut)
+        self._shown_map = (kind, cut)
         pct = self._result.explained[k] * 100
+        word = f"{self.component_word} {k}"
+        shown = f"{word} {_MAP_UNITS.get(kind, kind)} ({pct:.1f}%)"
         return ComputedOverlay(
             values=values,
             affine=self._result.affine,
-            name=self.output_name(f"{self.component_word} {k} {self._label_text(k)}".strip()),
-            kind=OverlayKind.CORRELATION if kind == "correlation" else OverlayKind.VALUE,
+            name=self.output_name(f"{word} {self._label_text(k)}".strip()),
+            kind=self.overlay_kind,
             colormap="redblue",
             display_range=(-top, top) if top > 0 else None,
-            threshold=top * 0.4 if top > 0 else 0.0,
-            volume_labels=(f"{self.component_word} {k} {kind} ({pct:.1f}%)",),
+            threshold=cut_top * 0.4 if cut_top > 0 else 0.0,
+            threshold_values=cut_values,
+            volume_labels=(shown,) if cut_values is None else (shown, f"{word} {cut}"),
             rescale=rescale,
             threshold_stat=(
                 correlation_stat(self._result.timecourses.shape[0], self._result.polort)
-                if kind == "correlation"
+                if cut == "correlation"
                 else None
             ),
         )
+
+    @staticmethod
+    def _robust_top(values: np.ndarray, kind: str) -> float:
+        finite = values[np.isfinite(values)]
+        top = float(np.percentile(np.abs(finite), 99.0)) if finite.size else 1.0
+        return min(top, 1.0) if kind == "correlation" else top
 
     # -- actions -------------------------------------------------------
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
@@ -440,15 +472,28 @@ class InstaPCAMode(Mode):
         )
 
     def _scree(self) -> Trace | None:
+        """Variance per component, the one being reviewed marked.
+
+        Two readings of one line: percent of the run's total variance (left),
+        and percent of what the kept components explain (right) -- the second
+        is the one that says how much of *this decomposition* a component is.
+        """
         if self._result is None:
             return None
+        explained = np.asarray(self._result.explained, dtype=np.float64)
+        kept = float(explained.sum())
+        k = self._index
+        share = explained[k] / kept * 100 if kept > 0 else float("nan")
         return Trace(
-            label="variance explained (%)",
-            values=np.asarray(self._result.explained * 100, dtype=np.float32),
+            label=f"{self.component_word} {k}: {explained[k] * 100:.2f}% of total, "
+            f"{share:.1f}% of the {kept * 100:.0f}% explained  (left: total, right: explained)",
+            values=np.asarray(explained * 100, dtype=np.float32),
             x=np.arange(self._result.n_components, dtype=np.float32),
             x_label="component",
             key="scree",
             short="% variance",
+            marker=k,
+            right_scale=1.0 / kept if kept > 0 else None,
         )
 
     def panels(self) -> dict[str, list[Trace]]:

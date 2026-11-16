@@ -1888,7 +1888,11 @@ class ViewerSession:
             if changes:
                 self.state.layers.update(key, **changes)
         else:
-            consumed = self.mode.input_layer_key() if self.mode.layer_source == source else None
+            consumed = (
+                self.mode.input_layer_key()
+                if self.mode.layer_source == source and self.mode.hides_input
+                else None
+            )
             self._add_on_top(
                 hide=[consumed] if consumed else [],
                 layer=Layer(
@@ -1944,7 +1948,11 @@ class ViewerSession:
         if existing is not None:
             self.state.layers.update(key, **fields)
             return key
-        consumed = self.mode.input_layer_key() if self.mode.layer_source == source else None
+        consumed = (
+            self.mode.input_layer_key()
+            if self.mode.layer_source == source and self.mode.hides_input
+            else None
+        )
         self._add_on_top(
             hide=[consumed] if consumed else [],
             layer=Layer(

@@ -33,6 +33,8 @@ from fastfuncstuff.viewer.viewports import Viewport
 MARGIN_LEFT = 64
 MARGIN_BOTTOM = 20
 MARGIN_TOP = 20
+#: Room for a right-hand axis's numbers, when a line has one.
+MARGIN_RIGHT_AXIS = 48
 #: Legend geometry: the coloured stub, and the height of one entry.
 SWATCH = 14
 LEGEND_ROW = 13
@@ -100,10 +102,12 @@ class PlotView(QtWidgets.QWidget):
         key_width = (
             self._legend_width(p, traces) + 6 if self._legend_outside and len(traces) > 1 else 0.0
         )
+        right_scale = next((t.right_scale for t in traces if t.right_scale), None)
+        right_room = MARGIN_RIGHT_AXIS if right_scale else 8
         plot = QtCore.QRectF(
             MARGIN_LEFT,
             MARGIN_TOP,
-            max(self.width() - MARGIN_LEFT - 8 - key_width, 1),
+            max(self.width() - MARGIN_LEFT - right_room - key_width, 1),
             max(self.height() - MARGIN_TOP - MARGIN_BOTTOM, 1),
         )
 
@@ -150,6 +154,8 @@ class PlotView(QtWidgets.QWidget):
             p.drawPolyline(poly)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
+        self._draw_markers(p, c, plot, traces, series, axes, to_px)
+
         longest = max(v.size for v in series)
         if self._cursor is not None and 0 <= self._cursor < longest:
             p.setPen(QtGui.QPen(QtGui.QColor(c.warn)))
@@ -160,6 +166,14 @@ class PlotView(QtWidgets.QWidget):
         right = QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
         p.drawText(QtCore.QRectF(0, plot.top() - 7, MARGIN_LEFT - 4, 14), right, f"{hi:.3g}")
         p.drawText(QtCore.QRectF(0, plot.bottom() - 7, MARGIN_LEFT - 4, 14), right, f"{lo:.3g}")
+        if right_scale:
+            left_align = QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+            for yv, ypx in ((hi, plot.top()), (lo, plot.bottom())):
+                p.drawText(
+                    QtCore.QRectF(plot.right() + 4, ypx - 7, MARGIN_RIGHT_AXIS - 4, 14),
+                    left_align,
+                    f"{yv * right_scale:.3g}",
+                )
         below = plot.bottom() + 3
         p.drawText(QtCore.QPointF(plot.left(), below + 11), f"{x0:.3g}")
         tail = f"{x1:.3g} {traces[0].x_label}".strip()
@@ -174,6 +188,23 @@ class PlotView(QtWidgets.QWidget):
         else:
             self._draw_legend(p, c, plot, traces)
         p.end()
+
+    def _draw_markers(self, p, c, plot, traces, series, axes, to_px) -> None:
+        """A bar across the plot and a dot on the line at each trace's marker."""
+        for i, (t, values, x) in enumerate(zip(traces, series, axes, strict=True)):
+            k = t.marker
+            if k is None or not 0 <= k < values.size or not np.isfinite(values[k]):
+                continue
+            at = to_px(float(x[k]), float(values[k]))
+            bar = QtGui.QColor(c.warn)
+            bar.setAlphaF(0.35)
+            p.fillRect(QtCore.QRectF(at.x() - 2, plot.top(), 4, plot.height()), bar)
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QtGui.QPen(QtGui.QColor(c.warn), 1.5))
+            p.setBrush(self._colour(c, i, len(traces)))
+            p.drawEllipse(at, 4.0, 4.0)
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
     @staticmethod
     def _colour(c, index: int, total: int) -> QtGui.QColor:
