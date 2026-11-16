@@ -171,7 +171,10 @@ def _geometry(
                 "start": at,
                 "stop": at + size,
                 "mesh_fingerprint": load_gifti_surface(path)[2]["mesh_fingerprint"],
-                "geometry": os.path.relpath(path, out),
+                # Absolute: outputs carrying these bounds are written outside
+                # ``out`` ({prefix} beside {prefix}_hemi), and split_merged_surface
+                # makes the pointer relative to wherever each half lands.
+                "geometry": os.path.abspath(path),
             }
         )
         at += size
@@ -505,7 +508,10 @@ def _hemi_geometry(per_hemi: list[str], hemis: list[str], out: Path, space: str)
                 "start": at,
                 "stop": at + len(block),
                 "mesh_fingerprint": load_gifti_surface(path)[2]["mesh_fingerprint"],
-                "geometry": os.path.relpath(path, out),
+                # Absolute: outputs carrying these bounds are written outside
+                # ``out`` ({prefix} beside {prefix}_hemi), and split_merged_surface
+                # makes the pointer relative to wherever each half lands.
+                "geometry": os.path.abspath(path),
             }
         )
         at += len(block)

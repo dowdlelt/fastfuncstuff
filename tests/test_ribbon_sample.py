@@ -301,6 +301,21 @@ def test_the_merged_result_splits_back_to_the_hemispheres_it_came_from(tmp_path)
         )
 
 
+def test_split_outputs_point_at_real_geometry_from_where_they_are_written(tmp_path):
+    """ffs_pyrf writes {prefix}.func.gii beside {prefix}_hemi/, not in it. Each half's
+    geometry pointer was relative to the merge folder and so pointed nowhere."""
+    files = _hemi_runs(tmp_path, n_runs=1, n_vertices=3, n_times=5)
+    grouped, hemis = group_hemisphere_files(files["lh"])
+    out = tmp_path / "results"
+    out.mkdir()
+    sample = merge_hemisphere_runs(grouped, hemis, out_dir=out / "fit_hemi", verb=0)
+    data, meta = load_gifti_data(sample.runs[0])
+    save_gifti_data(out / "fit.func.gii", data, meta, time_series=False)
+    for part, hemi in zip(split_merged_surface(out / "fit.func.gii"), hemis, strict=True):
+        pointer = Path(part).parent / load_gifti_data(part)[1]["geometry"]
+        assert pointer.resolve() == (tmp_path / f"geom.{hemi}.midthickness.surf.gii").resolve()
+
+
 def test_merge_without_findable_geometry_still_merges(tmp_path):
     """A mesh is only needed by the operations that are geometric. Losing the
     geometry pointer must not cost the fit, which is per-vertex."""
