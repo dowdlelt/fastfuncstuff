@@ -3429,7 +3429,9 @@ def add_hemi_pairing_args(group, tool: str = "the fit") -> None:
         "-hemi-dir",
         metavar="DIR",
         default=None,
-        help="Where the merged runs go. Default: {prefix}_hemi.",
+        help="Where the merged runs go, kept for reuse by the next fit of the same runs."
+        " Default: {prefix}_hemi, removed once the outputs are written (the merged"
+        " runs are as large as the inputs).",
     )
 
 
@@ -3481,6 +3483,25 @@ def pair_hemisphere_inputs(args, parser, input_files: list[str], stem: str, mask
         )
     except (FileNotFoundError, ValueError) as error:
         parser.error(f"-hemi_pair: {error}")
+
+
+def remove_hemi_merge(sample, verbose: bool = True) -> None:
+    """Delete the merged dataset :func:`pair_hemisphere_inputs` wrote by default.
+
+    The merged runs are a copy of the inputs: a whole-cortex fit left 2.3 GB per
+    prefix, and a validation sweep filled a disk with them. Only the files the
+    merge wrote are removed, and the folder only if that empties it.
+    """
+    files = [Path(run) for run in sample.runs]
+    files += [path.with_suffix(".dat") for path in files]
+    files += [Path(p) for p in (sample.mask, sample.geometry) if p]
+    for path in files:
+        path.unlink(missing_ok=True)
+    folder = Path(sample.runs[0]).parent if sample.runs else None
+    if folder is not None and folder.is_dir() and not any(folder.iterdir()):
+        folder.rmdir()
+    if verbose and folder is not None:
+        print(f"  removed the merged runs in {folder.name}/ (-hemi_dir keeps them)")
 
 
 def split_ribbon_outputs(stem: str, verbose: bool = True) -> list[str]:

@@ -54,6 +54,7 @@ from fastfuncstuff.cli_utils import (
     pair_hemisphere_inputs,
     parse_input_files,
     parse_prefix,
+    remove_hemi_merge,
     resolve_polort,
     sample_input_to_ribbon,
     setup_device,
@@ -2383,8 +2384,11 @@ def main(argv: list[str] | None = None) -> int:
     # ribbon, -hemi_pair merges runs already sampled there. Both return the same
     # sample, so everything after this point is the same fit either way.
     ribbon = sample_input_to_ribbon(args, parser, input_files, prefix_info.stem, device=device)
+    temporary_merge = None
     if ribbon is None:
         ribbon = pair_hemisphere_inputs(args, parser, input_files, prefix_info.stem, mask=args.mask)
+        if ribbon is not None and not args.hemi_dir:
+            temporary_merge = ribbon
         if ribbon is not None and ribbon.mask:
             args.mask = ribbon.mask  # the merged twin of the mask the user gave
     if ribbon is not None:
@@ -3130,6 +3134,8 @@ def main(argv: list[str] | None = None) -> int:
         print("-save_hrf_r2 ignored: needs -hrf_select refine with more than one HRF")
     if ribbon is not None:
         split_ribbon_outputs(prefix_info.stem, verbose=args.verb > 0)
+    if temporary_merge is not None:
+        remove_hemi_merge(temporary_merge, verbose=args.verb > 0)
     return 0
 
 
