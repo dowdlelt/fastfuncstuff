@@ -183,3 +183,31 @@ def test_moco_spikehunt_refuses_multi_echo():
     )
     with pytest.raises(SystemExit):
         moco._run_multi_echo(args, args.input_file, CPU, 0, False, 0)
+
+
+def test_localized_inflow_blob_is_not_a_spike():
+    """A bright localized change in the image (inflow, a vessel) is broad, low-k
+    energy in k-space: whatever its score, the point check must reject it."""
+    data = _phantom_series(spikes=[(2, 17, 13, -9, AMP)])
+    ny, nx = data.shape[-2:]
+    yy, xx = np.mgrid[:ny, :nx]
+    blob = 60.0 * np.exp(-(((yy - 10) / 2.0) ** 2 + ((xx - 9) / 2.0) ** 2))
+    data[25, 1] += torch.from_numpy(blob.astype(np.float32))
+    scan = S.hunt_spikes(data, compute_device=CPU, progress=False)
+    assert (1, 25) not in set(map(tuple, scan.hits.tolist()))
+    assert (2, 17) in set(map(tuple, scan.hits.tolist()))
+
+
+def test_kinterp_replaces_few_kpoints_and_only_in_the_hit_frame():
+    data = _phantom_series(spikes=[(1, 20, 10, 7, AMP)])
+    out = data.clone()
+    scan = S.hunt_spikes(
+        data, clean=True, out=out, method="kinterp", compute_device=CPU, progress=False
+    )
+    assert scan.repair == {(1, 20): "kinterp"}
+    assert (out != data).flatten(-2).any(-1).nonzero().tolist() == [[20, 1]]
+    # ~8% on the real runs; the phantom's rectified background spreads more
+    # excess (measured 0.375), so this only guards against a whole-frame swap
+    assert scan.clipped_frac[(1, 20)] < 0.5
+    ref = 0.5 * (data[19, 1] + data[21, 1])
+    assert (out[20, 1] - ref).std() < (data[20, 1] - ref).std()

@@ -23,7 +23,23 @@ Detection, per slice:
     6. Max over k outside a central ellipse (``exclude_radius`` of k-max,
        where motion and global signal change live, ~5% of k-space at 0.25),
        then a robust z of that max against the same slice's other volumes.
-       A (slice, volume) above the threshold is a hit.
+       A (slice, volume) above ``threshold`` (6) is a candidate.
+    7. Point check (:func:`_point_features`): a spike is a point in k-space,
+       so its excess energy is concentrated in a few k-points away from the
+       centre; inflow and motion spread theirs, or pile it at low k. For each
+       candidate, the complex deviation from its two temporal neighbours,
+       normalised per k-point by its usual deviation, gives the fraction of the
+       frame's excess energy in its ``POINT_TOP_N`` strongest k-points and the
+       k radius of those points. A candidate is a hit if its score clears
+       ``SURE_THRESHOLD`` or its top fraction clears ``point_frac``, and its
+       top points sit beyond ``MIN_POINT_RADIUS`` (labelled spikes: >= 0.73;
+       a point-like inflow candidate: 0.05).
+
+Tuned against hand labels on three runs (253 spikes, 22 inflow/motion
+candidates; wiki: RF spike detection from magnitude k-space): score > 10 alone
+found 60% of the spikes and no false hits; candidate 6 + point check finds 91%
+with 1 false hit in-sample, 89-98% with 5 of 22 false when each run is judged
+with thresholds tuned on the other two. Every non-spike scored under 9.5.
 
 Sensitivity floor: the log compresses a spike to log(amplitude / noise), so a
 sharp, weak spike (under ~10x the per-k noise of the magnitude image) does
@@ -43,9 +59,14 @@ multiplies the herringbone by the head, which smears each spike into a band
 around the blob and a streak through the centre that sit below any blob
 threshold (a blob patch removed ~55% of the excess power on the test runs,
 clipping at 1.5 ~100%, leaving hit frames at the noise of a normal frame).
-DC and its eight neighbours are never touched. ``slice`` replaces the whole
-slice by the same temporal interpolation: complete, but it also flattens the
-frame's real fluctuation.
+DC and its eight neighbours are never touched. ``kinterp`` replaces only the
+k-points deviating by more than ``kinterp_z`` (3) times normal, dilated and
+mirrored, with the temporal interpolation: ~8% of k-space, and what it removes
+is a pure herringbone with no anatomy, but it leaves 20-30% of the excess
+power (at 2x it replaces half of k-space and over-smooths the frame).
+``slice`` replaces the whole slice by the same temporal interpolation:
+complete, but it also replaces the frame's own state (its noise, its motion)
+with its neighbours' average.
 """
 
 from __future__ import annotations
@@ -58,11 +79,17 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm.auto import tqdm
 
-DEFAULT_THRESHOLD = 10.0
+DEFAULT_THRESHOLD = 6.0
+SURE_THRESHOLD = 9.5
+DEFAULT_POINT_FRAC = 0.08
+MIN_POINT_RADIUS = 0.5
+# about one spike blob (3x3) plus its Hermitian mirror
+POINT_TOP_N = 18
+DEFAULT_KINTERP_Z = 3.0
 DEFAULT_WINDOW = 9
 DEFAULT_EXCLUDE_RADIUS = 0.25
 DEFAULT_CLIP = 1.5
-REPAIR_METHODS = ("kclip", "slice")
+REPAIR_METHODS = ("kclip", "kinterp", "slice")
 
 
 @dataclass
@@ -74,6 +101,11 @@ class SpikeScan:
     k_y: np.ndarray  # peak k offset from centre, rows (ny axis)
     k_x: np.ndarray  # peak k offset from centre, columns (nx axis)
     threshold: float
+    point_frac: np.ndarray | None = None  # (slice, vol) top-N energy fraction; NaN off-candidate
+    k_radius: np.ndarray | None = (
+        None  # (slice, vol) k radius of the top-N points; NaN off-candidate
+    )
+    rejected: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=int))
     hits: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=int))  # (slice, vol)
     repair: dict[tuple[int, int], str] = field(default_factory=dict)  # (slice, vol) -> method
     clipped_frac: dict[tuple[int, int], float] = field(default_factory=dict)  # k-points shrunk
@@ -154,6 +186,60 @@ def _robust_z_over_t(raw: Tensor) -> Tensor:
     return (raw - med) / mad.clamp_min(1e-6)
 
 
+def _mirror_index(n: int, device: torch.device) -> Tensor:
+    """Index of -k for each fftshift-ed index along an axis of length ``n``."""
+    i = torch.arange(n, device=device)
+    return (2 * (n // 2) - i) % n
+
+
+def _radius(ny: int, nx: int, device: torch.device) -> Tensor:
+    yy = (torch.arange(ny, device=device) - ny // 2) / (ny / 2)
+    xx = (torch.arange(nx, device=device) - nx // 2) / (nx / 2)
+    return torch.sqrt(yy[:, None] ** 2 + xx[None, :] ** 2)
+
+
+def _normal_deviation(spec: Tensor) -> Tensor:
+    """Per k-point usual |deviation from the two temporal neighbours' mean|, (ny, nx).
+
+    Median over the run of the second-difference residual: what a clean frame's
+    deviation looks like, robust to the few spiked frames in it.
+    """
+    return (spec[1:-1] - 0.5 * (spec[:-2] + spec[2:])).abs().median(dim=0).values
+
+
+def _point_features(
+    spec: Tensor, vols: list[int], radius: Tensor, normal: Tensor, protect: Tensor
+) -> dict[int, tuple[float, float]]:
+    """(top-N energy fraction, k radius of those top-N points) for candidate volumes of one slice.
+
+    ``spec`` is the slice's (T, ny, nx) fftshift-ed spectrum. The deviation is
+    against the two adjacent volumes (one at a run end), excess energy is
+    ``max(|dev / normal|^2 - 1, 0)`` so normal k-points contribute nothing.
+    """
+    nt = spec.shape[0]
+    out: dict[int, tuple[float, float]] = {}
+    for t in vols:
+        lo = t - 1 if t > 0 else t + 1
+        hi = t + 1 if t < nt - 1 else t - 1
+        dev = spec[t] - 0.5 * (spec[lo] + spec[hi])
+        ex = ((dev.abs() / normal.clamp_min(1e-12)) ** 2 - 1.0).clamp_min(0.0)
+        # DC and its neighbours are the frame's global level: a rectified
+        # background offset lands there and would outweigh the spike itself
+        ex = ex.masked_fill(protect, 0.0)
+        tot = float(ex.sum())
+        if tot <= 0.0:
+            out[t] = (0.0, 0.0)
+            continue
+        top = torch.topk(ex.flatten(), min(POINT_TOP_N, ex.numel()))
+        top_e = float(top.values.sum())
+        # radius of where the point is, not of all the excess: |.| rectifies part
+        # of a spike into low-k energy wherever the background keeps its noise
+        # floor, and that would drag a whole-frame mean toward the centre
+        rad_top = float((top.values * radius.flatten()[top.indices]).sum()) / max(top_e, 1e-30)
+        out[t] = (top_e / tot, rad_top)
+    return out
+
+
 def _neighbours(hit_vols: list[int], nt: int) -> dict[int, tuple[int, int, float]]:
     """For each hit volume: nearest non-hit volume below and above, and the weight on the upper.
 
@@ -181,6 +267,8 @@ def _repair_slice(
     method: str,
     clip: float,
     protect: Tensor,
+    normal: Tensor,
+    kinterp_z: float = DEFAULT_KINTERP_Z,
 ) -> dict[int, float]:
     """Repair the hit volumes of one slice in ``out_slice`` (T, ny, nx) in place.
 
@@ -194,19 +282,27 @@ def _repair_slice(
         for t, (lo, hi, w) in nbrs.items():
             out_slice[t] = (1.0 - w) * src[lo] + w * src[hi]
         return {t: 1.0 for t in nbrs}
-    # normal deviation magnitude per k-point: median over the run of the
-    # second-difference residual, which is what a clean frame's deviation from
-    # its two neighbours' mean looks like
-    normal = (spec[1:-1] - 0.5 * (spec[:-2] + spec[2:])).abs().median(dim=0).values
-    limit = clip * normal
+    ny, nx = spec.shape[-2:]
+    my, mx = _mirror_index(ny, spec.device), _mirror_index(nx, spec.device)
     fracs: dict[int, float] = {}
     for t, (lo, hi, w) in nbrs.items():
         ref = (1.0 - w) * spec[lo] + w * spec[hi]
         dev = spec[t] - ref
         mag = dev.abs()
-        shrink = torch.where(protect, 1.0, (limit / mag.clamp_min(1e-12)).clamp(max=1.0))
-        fracs[t] = float((shrink < 1.0).float().mean())
-        k = ref + dev * shrink
+        if method == "kinterp":
+            # temporal interpolation at the outlier k-points only (dilated by
+            # one, mirrored so the image stays real); everything else untouched
+            m = (mag > kinterp_z * normal) & ~protect
+            m = F.max_pool2d(m[None, None].float(), 3, stride=1, padding=1)[0, 0] > 0
+            m = (m | m[my][:, mx]) & ~protect
+            fracs[t] = float(m.float().mean())
+            k = torch.where(m, ref, spec[t])
+        else:
+            shrink = torch.where(
+                protect, 1.0, (clip * normal / mag.clamp_min(1e-12)).clamp(max=1.0)
+            )
+            fracs[t] = float((shrink < 1.0).float().mean())
+            k = ref + dev * shrink
         out_slice[t] = torch.fft.ifft2(torch.fft.ifftshift(k, dim=(-2, -1))).real.to(
             out_slice.dtype
         )
@@ -223,6 +319,8 @@ def hunt_spikes(
     out: Tensor | None = None,
     method: str = "kclip",
     clip: float = DEFAULT_CLIP,
+    point_frac: float = DEFAULT_POINT_FRAC,
+    kinterp_z: float = DEFAULT_KINTERP_Z,
     compute_device: torch.device | None = None,
     progress: bool = True,
 ) -> SpikeScan:
@@ -253,6 +351,10 @@ def hunt_spikes(
     k_y = torch.zeros(nz, nt, dtype=torch.int64)
     k_x = torch.zeros(nz, nt, dtype=torch.int64)
     scores = torch.zeros(nz, nt, dtype=torch.float32)
+    pfrac = np.full((nz, nt), np.nan, dtype=np.float32)
+    krad = np.full((nz, nt), np.nan, dtype=np.float32)
+    accepted: list[tuple[int, int]] = []
+    rejected: list[tuple[int, int]] = []
     repair: dict[tuple[int, int], str] = {}
     clipped_frac: dict[tuple[int, int], float] = {}
     residual: list[tuple[int, int]] = []
@@ -263,6 +365,7 @@ def hunt_spikes(
     iy = (torch.arange(ny, device=dev) - ny // 2).abs()
     ix = (torch.arange(nx, device=dev) - nx // 2).abs()
     protect = (iy[:, None] <= 1) & (ix[None, :] <= 1)
+    radius = _radius(ny, nx, dev)
 
     chunk = _slice_chunk(nt, nz, ny, nx, window, dev)
     starts = range(0, nz, chunk)
@@ -281,39 +384,54 @@ def hunt_spikes(
         scores[s0:s1] = sc.cpu()
         k_y[s0:s1] = (arg // nx - ny // 2).T.cpu()
         k_x[s0:s1] = (arg % nx - nx // 2).T.cpu()
-        if clean:
+        cand: dict[int, list[int]] = {}
+        for s, t in (sc > threshold).nonzero().tolist():
+            cand.setdefault(s, []).append(t)
+        hit_by_slice: dict[int, list[int]] = {}
+        normals: dict[int, Tensor] = {}
+        for s, vols in cand.items():
+            normals[s] = _normal_deviation(spec[:, s])
+            for t, (fr, rd) in _point_features(
+                spec[:, s], vols, radius, normals[s], protect
+            ).items():
+                pfrac[s0 + s, t], krad[s0 + s, t] = fr, rd
+                ok = (float(sc[s, t]) > SURE_THRESHOLD or fr > point_frac) and rd > MIN_POINT_RADIUS
+                (accepted if ok else rejected).append((s0 + s, t))
+                if ok:
+                    hit_by_slice.setdefault(s, []).append(t)
+        if clean and hit_by_slice:
             assert out is not None
-            flagged = sc > threshold
-            by_slice: dict[int, list[int]] = {}
-            for s, t in flagged.nonzero().tolist():
-                by_slice.setdefault(s, []).append(t)
-            for s, vols in by_slice.items():
-                fracs = _repair_slice(spec[:, s], vols, slab[:, s], method, clip, protect)
+            for s, vols in hit_by_slice.items():
+                fracs = _repair_slice(
+                    spec[:, s], vols, slab[:, s], method, clip, protect, normals[s], kinterp_z
+                )
                 for t, f in fracs.items():
                     repair[(s0 + s, t)] = method
                     clipped_frac[(s0 + s, t)] = f
                 out[:, s0 + s] = slab[:, s].to(out.device, out.dtype)
-            if by_slice:
-                # rescore only the repaired slices: the others are unchanged
-                rows = sorted(by_slice)
-                del spec, zb
-                spec, zb = _kspace_z(slab[:, rows], window, exclude_radius)
-                sc2 = _robust_z_over_t(_peak(zb, center)[0].T.contiguous())
-                fl2 = flagged[rows]
-                for i, t in (fl2 & (sc2 > threshold)).nonzero().tolist():
-                    residual.append((s0 + rows[i], t))
-                residual_max = max(residual_max, float(sc2[fl2].max()))
+            # rescore only the repaired slices: the others are unchanged
+            rows = sorted(hit_by_slice)
+            del spec, zb
+            spec, zb = _kspace_z(slab[:, rows], window, exclude_radius)
+            sc2 = _robust_z_over_t(_peak(zb, center)[0].T.contiguous())
+            for i, s in enumerate(rows):
+                for t in hit_by_slice[s]:
+                    v = float(sc2[i, t])
+                    residual_max = max(residual_max, v)
+                    if v > threshold:
+                        residual.append((s0 + s, t))
         del slab, spec, zb
 
-    score_np = scores.numpy()
-    hits = np.argwhere(score_np > threshold)
     return SpikeScan(
-        score=score_np,
+        score=scores.numpy(),
         raw=raw.numpy(),
         k_y=k_y.numpy(),
         k_x=k_x.numpy(),
         threshold=threshold,
-        hits=hits,
+        point_frac=pfrac,
+        k_radius=krad,
+        rejected=np.asarray(sorted(rejected), dtype=int).reshape(-1, 2),
+        hits=np.asarray(sorted(accepted), dtype=int).reshape(-1, 2),
         repair=repair,
         clipped_frac=clipped_frac,
         residual=np.asarray(residual, dtype=int).reshape(-1, 2) if clean else None,
@@ -464,6 +582,10 @@ def print_report(
         print(f"{indent}{e.volume:5d} {e.time:9.3f} {e.within_tr:8.3f} {e.score:6.1f}  {sl}")
 
 
+def _get(arr: np.ndarray | None, s: int, t: int) -> float:
+    return float("nan") if arr is None else float(arr[s, t])
+
+
 def write_hits_tsv(path: str, scan: SpikeScan, window: AcquisitionWindow) -> None:
     """One row per hit (slice, volume), time-sorted."""
     st = window.slice_times
@@ -477,11 +599,15 @@ def write_hits_tsv(path: str, scan: SpikeScan, window: AcquisitionWindow) -> Non
                 time,
                 f"{vol}\t{s}\t{time:.4f}\t{within:.4f}\t{scan.score[s, t]:.2f}\t{scan.raw[s, t]:.2f}"
                 f"\t{scan.k_y[s, t]}\t{scan.k_x[s, t]}\t{scan.repair.get((s, t), 'none')}"
-                f"\t{scan.clipped_frac.get((s, t), float('nan')):.4f}",
+                f"\t{scan.clipped_frac.get((s, t), float('nan')):.4f}"
+                f"\t{_get(scan.point_frac, s, t):.4f}\t{_get(scan.k_radius, s, t):.3f}",
             )
         )
     rows.sort(key=lambda r: r[0])
-    hdr = "volume\tslice\ttime_s\twithin_tr_s\tscore\traw_blob_z\tk_y\tk_x\trepair\tclipped_frac"
+    hdr = (
+        "volume\tslice\ttime_s\twithin_tr_s\tscore\traw_blob_z\tk_y\tk_x\trepair"
+        "\tchanged_frac\tpoint_frac\tk_radius"
+    )
     with open(path, "w") as f:
         f.write(hdr + "\n")
         for _, line in rows:
@@ -528,9 +654,8 @@ def plot_spikehunt(
     import matplotlib.pyplot as plt
 
     nt = scan.score.shape[1]
-    order = np.argsort(scan.score.ravel())[::-1]
-    top = [np.unravel_index(i, scan.score.shape) for i in order[:n_gallery]]
-    top = [(int(s), int(t)) for s, t in top if scan.score[s, t] > scan.threshold]
+    hits = sorted(map(tuple, scan.hits.tolist()), key=lambda st: -scan.score[st[0], st[1]])
+    top = [(int(s), int(t)) for s, t in hits[:n_gallery]]
     rows_g = 3 if cleaned is not None else 2
     n_g = max(1, len(top))
     fig = plt.figure(figsize=(max(12, 1.5 * n_g), 7.0 + 1.6 * rows_g))
@@ -556,8 +681,15 @@ def plot_spikehunt(
             edgecolors="cyan",
             lw=0.7,
         )
+    if len(scan.rejected):
+        ax.scatter(
+            scan.rejected[:, 1] + v0, scan.rejected[:, 0], s=12, marker="x", c="tab:red", lw=0.7
+        )
     ax.set_ylabel("slice")
-    ax.set_title(f"{title}  k-space spike score (circles: > {scan.threshold:g})", fontsize=10)
+    ax.set_title(
+        f"{title}  k-space spike score (circles: spikes; x: candidates rejected as not point-like)",
+        fontsize=10,
+    )
     # colorbar in an inset outside the axes: fig.colorbar(ax=...) would shrink the
     # heatmap and break its column alignment with the per-volume trace below
     fig.colorbar(im, cax=ax.inset_axes((1.005, 0.0, 0.012, 1.0)))
@@ -565,6 +697,7 @@ def plot_spikehunt(
     ax2 = fig.add_subplot(gs[1, :], sharex=ax)
     ax2.plot(np.arange(nt) + v0, scan.score.max(axis=0), lw=0.8, color="0.2")
     ax2.axhline(scan.threshold, color="tab:red", lw=0.8, ls="--")
+    ax2.axhline(SURE_THRESHOLD, color="tab:red", lw=0.6, ls=":")
     ax2.set_ylabel("max over\nslices")
     ax2.set_xlabel("volume")
     ax2.set_xlim(v0 - 0.5, v0 + nt - 0.5)

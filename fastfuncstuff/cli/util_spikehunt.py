@@ -64,9 +64,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-thresh",
         type=float,
         default=S.DEFAULT_THRESHOLD,
-        help="Hit threshold on the slice-normalised blob score (a robust z against the "
-        "same slice's other volumes). Spikes on the test data score 10-50; "
-        "motion and noise-floor slices stay under ~8.",
+        help="Candidate threshold on the slice-normalised blob score (a robust z "
+        "against the same slice's other volumes). Candidates then pass a point check "
+        "(-point_frac); scores above 9.5 skip it. On hand-labelled runs nearly every "
+        "candidate above 6 was a spike, and every inflow/motion candidate scored < 9.5.",
+    )
+    parser.add_argument(
+        "-point_frac",
+        type=float,
+        default=S.DEFAULT_POINT_FRAC,
+        help="Point check: a candidate is a spike when at least this fraction of its "
+        "frame's excess k-space energy sits in its 18 strongest k-points (one blob and "
+        "its mirror), with that energy away from the k centre. Inflow and motion "
+        "spread theirs (median 0.05 against 0.16 for spikes).",
     )
     parser.add_argument(
         "-window",
@@ -95,8 +105,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="kclip",
         help="With -clean. kclip: clip each k-point's deviation from the temporal "
         "neighbours to -clip times that k-point's normal deviation (phase kept); "
-        "normal k-points pass unchanged. slice: replace the whole slice by temporal "
-        "interpolation, which also flattens the frame's real fluctuation.",
+        "normal k-points pass unchanged; removes ~100%% of the spike power. kinterp: "
+        "replace only the outlier k-points (> -kinterp_z) by the temporal "
+        "interpolation; ~8%% of k-space, removes ~75%%. slice: replace the whole slice "
+        "by temporal interpolation, which also replaces the frame's own state.",
     )
     parser.add_argument(
         "-clip",
@@ -105,6 +117,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="With -repair kclip: the limit, in multiples of the median normal "
         "deviation. 1.5 brought hit frames to a normal frame's noise level on the "
         "test runs; 2 left ~25%% of the spike power.",
+    )
+    parser.add_argument(
+        "-kinterp_z",
+        type=float,
+        default=S.DEFAULT_KINTERP_Z,
+        help="With -repair kinterp: k-points deviating from the temporal interpolation "
+        "by more than this many times their normal deviation are replaced by it.",
     )
     parser.add_argument(
         "-plots",
@@ -157,6 +176,8 @@ def main(argv: list[str] | None = None) -> None:
         out=cleaned,
         method=args.repair,
         clip=args.clip,
+        point_frac=args.point_frac,
+        kinterp_z=args.kinterp_z,
         compute_device=device,
         progress=verb >= 1,
     )
@@ -176,8 +197,8 @@ def main(argv: list[str] | None = None) -> None:
         if verb >= 1:
             fr = list(scan.clipped_frac.values())
             how = (
-                f", median {100 * float(np.median(fr)):.1f}% of k-points clipped"
-                if args.repair == "kclip" and fr
+                f", median {100 * float(np.median(fr)):.1f}% of k-points changed"
+                if args.repair != "slice" and fr
                 else ""
             )
             print(

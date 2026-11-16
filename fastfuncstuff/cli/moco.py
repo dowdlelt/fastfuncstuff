@@ -907,8 +907,9 @@ def parse_args(
         "-spike_thresh",
         type=float,
         default=spike_lib.DEFAULT_THRESHOLD,
-        help="With -spikehunt: hit threshold on the slice-normalised score "
-        "(ffs_util_spikehunt -thresh).",
+        help="With -spikehunt: candidate threshold on the slice-normalised score; "
+        "candidates must also pass the k-space point check (ffs_util_spikehunt "
+        "-thresh / -point_frac).",
     )
 
     # --- Hardware ---
