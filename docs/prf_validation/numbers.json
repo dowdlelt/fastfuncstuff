@@ -156,8 +156,8 @@
           "n": 4707
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.07575562675490866,
-          "intercept": 0.9212385292076489,
+          "slope": 0.07723476916059983,
+          "intercept": 0.9139159958096231,
           "n": 4706
         }
       },
@@ -178,9 +178,9 @@
           "n": 4726
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.24159756109482625,
-          "intercept": 0.6659863150566347,
-          "n": 4722
+          "slope": 0.24213307280080032,
+          "intercept": 0.6616031268239685,
+          "n": 4721
         }
       },
       "V3": {
@@ -200,33 +200,33 @@
           "n": 3021
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.30535944196437326,
-          "intercept": 0.7214860580733203,
+          "slope": 0.30452756116136714,
+          "intercept": 0.7249250657747313,
           "n": 3017
         }
       }
     },
     "library_denoise_vs_vistasoft": {
-      "n": 12445,
-      "size_median_ratio": 0.9099281617174567,
-      "size_r_log": 0.6081765022633696
+      "n": 12444,
+      "size_median_ratio": 0.9087697663252179,
+      "size_r_log": 0.6096548853779032
     }
   },
   "identifiability": {
     "split_half_rfsize_rel_change_cut": 0.25,
     "stable": {
-      "n": 14924,
-      "rfsize_r_log": 0.9231475180378776,
-      "rfsize_within_1p5x": 0.7340525328330206,
-      "exponent_r_log": 0.8908926874442451,
-      "ev_median_abs_diff": 0.07117145536090419
+      "n": 14919,
+      "rfsize_r_log": 0.9174240991770051,
+      "rfsize_within_1p5x": 0.7336952878879281,
+      "exponent_r_log": 0.8921828505261489,
+      "ev_median_abs_diff": 0.07099661531418633
     },
     "unstable": {
-      "n": 22786,
-      "rfsize_r_log": 0.9167905517820099,
-      "rfsize_within_1p5x": 0.6230141314842447,
-      "exponent_r_log": 0.7133218047446845,
-      "ev_median_abs_diff": 0.08343844210441631
+      "n": 22791,
+      "rfsize_r_log": 0.9178339121873196,
+      "rfsize_within_1p5x": 0.6232723443464525,
+      "exponent_r_log": 0.7127702557146305,
+      "ev_median_abs_diff": 0.08323428578535186
     }
   },
   "profiles": {

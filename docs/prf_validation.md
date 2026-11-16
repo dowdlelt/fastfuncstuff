@@ -30,8 +30,8 @@ On the 37,710 vertices both tools fit with R² > 20%:
 | Same optimum (scored by one independent float64 evaluator) | median R² difference 0.000. Within half an R² point on 90% of vertices; `ffs_pyrf` better by more than that on 7.9%, worse on 2.6% |
 | Agrees with a third toolbox (vistasoft) as well as analyzePRF does | angle circular r 0.987 vs 0.990; eccentricity r 0.983 vs 0.987 (V1–V3) |
 | Speed, same 52,932 vertices | analyzePRF 4.1 h on 6 CPU workers; `ffs_pyrf` 254 s on one GPU, **58× faster** |
-| HRF library (the `ffs_pyrf` default) | held-out R² +6.5 points (median), better on 84% of responsive vertices; 75% of the noise ceiling, against 56% with the canonical HRF |
-| Library + denoising | held-out R² +8.5 points, better on 92%; 79% of the noise ceiling. Receptive-field sizes 0.91× vistasoft's, against about 0.65× with the canonical HRF |
+| HRF library (the `ffs_pyrf` default) | held-out R² +4.7 points (median), better on 83% of responsive vertices; 79% of the noise ceiling, against 65% with the canonical HRF |
+| Library + denoising | held-out R² +6.4 points, better on 92%; 83% of the noise ceiling. Receptive-field sizes 0.91× vistasoft's, against about 0.65× with the canonical HRF |
 
 ## The model, briefly
 
@@ -299,12 +299,12 @@ Vertices well fit (R² > 20%) by all four variants:
 
 | | V1–V3: rfsize < 1 px | median rfsize | split-half rfsize within 25% | `n` < 0.01 | all vertices: split-half within 25% |
 |---|---|---|---|---|---|
-| canonical HRF | 36% | 3.0 px | 27% | 57% | 40% |
-| HRF library | 6% | 5.6 px | 57% | 76% | 56% |
-| canonical + denoise | 32% | 3.9 px | 28% | 56% | 38% |
-| library + denoise | 3% | 5.9 px | 58% | 75% | 55% |
+| canonical HRF | 36% | 3.1 px | 28% | 59% | 40% |
+| HRF library | 6% | 5.6 px | 57% | 79% | 56% |
+| canonical + denoise | 32% | 3.9 px | 28% | 57% | 38% |
+| library + denoise | 3% | 5.9 px | 58% | 78% | 55% |
 
-*14,134 V1–V3 vertices, 37,593 in all (`size_exponent` in numbers_variants.json).*
+*14,146 V1–V3 vertices, 37,607 in all (`size_exponent` in numbers_variants.json).*
 
 **4. The parity comparison runs where rfsize is least determined.** To match
 analyzePRF, it must use the canonical HRF. That the two tools still agree on rfsize at
@@ -385,9 +385,16 @@ predictive accuracy. The exact model remains an option for a float64-free path o
 Apple GPUs.
 
 `-refine_precision float32` skips the polish. Refinement is then about 5× faster
-(whole-cortex fit 138 s against 305 s), with different results at small `n`. Apple's
+(whole-cortex fit 138 s against 294 s), with different results at small `n`. Apple's
 Metal has no float64, so on MPS the polish is skipped with a note. Use `-device cpu`
 there for analyzePRF-equivalent fits.
+
+The polished parameters must also be *evaluated* in float64: held-out predictions and
+response amplitudes use the polish precision. Before this was fixed, float64 fits were
+scored with the float32 model, which understated the canonical HRF's median held-out
+R² by 5 points (24.8% against 29.9%), because canonical fits sit at small `n` most
+often. The library's held-out gain over the canonical HRF shrank accordingly, from
++6.5 to +4.7 points.
 
 ## Speed
 
@@ -401,17 +408,17 @@ which loads all 384,042 vertices, screens them and fits the 52,932 that pass.*
 |---|---|---|
 | analyzePRF, 6 CPU workers | 52,932 | 14,798 s (4.1 h; 0.28 s per vertex) |
 | `ffs_pyrf`, same vertices, canonical HRF, no cross-validation | 52,932 | 254 s |
-| `ffs_pyrf`, whole cortex from raw surfaces, including the screen | 384,042 loaded, 52,932 fit | 305 s |
+| `ffs_pyrf`, whole cortex from raw surfaces, including the screen | 384,042 loaded, 52,932 fit | 294 s |
 
 The `ffs_pyrf` times are whole-tool times, including I/O. The options cost time but
 stay in minutes. With `-xval halves` on the screened set, which fits the data three
-times (full data and both halves), the times are: canonical HRF 741 s, HRF library
-1,256 s, canonical + denoise 973 s, library + denoise 1,355 s.
+times (full data and both halves), the times are: canonical HRF 668 s, HRF library
+964 s, canonical + denoise 674 s, library + denoise 1,037 s.
 
 Timings were taken with the CPU shared with other work at times, so analyzePRF would
-be somewhat faster on an idle machine. The whole-cortex time (305 s) was measured
-during heavier load than the parity fit (254 s), which does the same refinement on the
-same vertices.
+be somewhat faster on an idle machine. The whole-cortex fit (294 s) adds loading and
+screening all 384,042 vertices to the parity fit's refinement (254 s) of the same
+52,932.
 
 ## What the extra options change
 
@@ -425,17 +432,17 @@ the other half. Four variants were fit to the same screened vertices with
 - **canonical + denoise**;
 - **library + denoise**.
 
-Unless stated, statistics use the 45,398 *responsive* vertices, those with held-out
+Unless stated, statistics use the 50,862 *responsive* vertices, those with held-out
 R² > 5% under the canonical HRF.
 
 ### Held-out R²
 
 | variant | median held-out R² | Δ vs canonical (all / V1–V3) | vertices improved | fraction of noise ceiling |
 |---|---|---|---|---|
-| canonical HRF | 24.8% | — | — | 0.56 |
-| HRF library | 35.4% | +6.5 / +6.3 | 84% | 0.75 |
-| canonical + denoise | 26.8% | +0.8 / +1.5 | 64% | 0.59 |
-| library + denoise | 37.9% | +8.5 / +9.1 | 92% | 0.79 |
+| canonical HRF | 29.9% | — | — | 0.65 |
+| HRF library | 35.8% | +4.7 / +2.8 | 83% | 0.79 |
+| canonical + denoise | 30.8% | +0.7 / +1.5 | 69% | 0.67 |
+| library + denoise | 37.6% | +6.4 / +5.5 | 92% | 0.83 |
 
 ![Held-out R²](prf_validation/fig10_xval.png)
 
@@ -446,9 +453,9 @@ The ceiling is the split-half reliability of the data themselves, which works he
 because all runs show the same stimulus.*
 
 - **The HRF library is the big win.** It helps nearly everywhere, most for
-  moderately responsive vertices (+9 points at 30–40% held-out R²). Even the
-  best-fit vertices gain. Where the canonical HRF reaches 56% of the explainable
-  variance (median), the library reaches 75%.
+  moderately responsive vertices (+8 points at 40–50% held-out R²). Even the
+  best-fit vertices gain. Where the canonical HRF reaches 65% of the explainable
+  variance (median), the library reaches 79%.
 - **Denoising adds a little by itself and more on top of the library.** The
   cross-validated choice kept 2 noise components from a pool of 234,240 vertices with
   no stimulus response (screen R² < 0; 0.1% of the pool lies inside V1–hV4). Its gain
@@ -463,10 +470,10 @@ and extends well beyond them.*
 
 ![Variant timecourses](prf_validation/fig14_variant_timecourses.png)
 
-*Figure 12. Why the library wins. A V1 vertex (top) and a V3 vertex (bottom), averaged
+*Figure 12. Why the library wins. Two V1 vertices, averaged
 over runs. The canonical predictions (blue, green) peak late and decay slowly. The
-library's HRF follows the data's sharper, earlier responses. V1 vertex: held-out R²
-38% canonical, 63% library, 66% library + denoise. The canonical HRF is analyzePRF's
+library's HRF follows the data's sharper, earlier responses. Top vertex: held-out R²
+53% canonical, 64% library, 68% library + denoise. The canonical HRF is analyzePRF's
 default too, so this applies to analyzePRF fits of these data.*
 
 ### Reliability
@@ -481,7 +488,7 @@ At an R² threshold of 0.2:
 
 | variant | x | y | eccentricity | angle | rfsize |
 |---|---|---|---|---|---|
-| canonical HRF | 0.988 | 0.954 | 0.963 | 0.781 | 0.959 |
+| canonical HRF | 0.988 | 0.954 | 0.963 | 0.783 | 0.958 |
 | HRF library | 0.989 | 0.957 | 0.971 | 0.920 | 0.962 |
 | canonical + denoise | 0.988 | 0.957 | 0.955 | 0.861 | 0.955 |
 | library + denoise | 0.989 | 0.962 | 0.966 | 0.948 | 0.953 |
@@ -508,9 +515,9 @@ On vertices whose receptive fields lie inside the aperture under both fits:
 
 | vs canonical HRF | position shift, median (90th pct) | eccentricity change (median) | angle change (median) | rfsize ratio (median) |
 |---|---|---|---|---|
-| HRF library | 1.9 px (8.5) | −1.1 px | 2.3° | 1.08 |
+| HRF library | 1.8 px (8.6) | −1.1 px | 2.3° | 1.08 |
 | canonical + denoise | 0.6 px (2.6) | +0.2 px | 0.9° | 1.05 |
-| library + denoise | 2.1 px (8.8) | −1.1 px | 2.6° | 1.17 |
+| library + denoise | 2.1 px (8.9) | −1.1 px | 2.6° | 1.16 |
 
 - **Denoising barely moves the receptive fields.** It sharpens them: less than a pixel
   of position and a degree of angle.
@@ -532,7 +539,7 @@ stimulus edge (eccentricity > 50 px with R² > 20%):
 In V1–V3 these are mostly real. vistasoft, fit to the same subject, places the same
 vertices at 12.6–16.6°, beyond the 12.4° stimulus. In hV4 and beyond, the canonical
 HRF pushes over a third of fits off the screen, and the library brings most of them
-back. About 18% of vertices cross the aperture edge between the canonical and library
+back. About 19% of vertices cross the aperture edge between the canonical and library
 fits, against 4% for denoising.
 
 ## Which mode to use
@@ -563,9 +570,6 @@ and analyzePRF. Data go under `$FFS_BENCHMARK_DATA_DIR` (default: the repository
   drops are compared only against vistasoft.
 - Timings were taken with the CPU shared with other work.
 - The noise ceiling relies on all runs showing an identical stimulus.
-- The four option variants and the whole-cortex timing were fit before the NaN fix
-  above. It affects few vertices outside the canonical-HRF small-`n` regime, but those
-  runs have not been redone.
 - 19 vertices (0.05%) land in a worse local optimum than analyzePRF's by more than 3
   R² points, almost all of them sub-pixel receptive fields.
 - On Metal (MPS), small-exponent fits are float32 and do not match analyzePRF there
