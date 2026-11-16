@@ -1313,16 +1313,24 @@ def variable_projection_sse_by_type(
     return gains, (data.square().sum(dim=0) - explained).clamp_min(0)
 
 
+# Floor on p.p, the variable-projection gain's denominator. Not eps: a pRF off
+# the screen predicts only its Gaussian tail, ~1e-8 per sample, so p.p ~ 1e-14
+# sits below float32's eps and a floor there divided by the wrong number -- gains
+# came out far too small and those positions were misjudged (they were most of
+# the fits >3 R2 points short of analyzePRF on ds003787). Nor each dtype's own
+# tiny: the float64 polish then followed the near-flat tail valley out to
+# p.p ~ 1e-200, where the gain (~|y|/sqrt(p.p)) overflows the float32 output to
+# inf. One floor for both dtypes keeps refine and polish on the same objective,
+# and below it the fit fades (N^2/floor -> 0), so the search stops there with a
+# gain of at most ~1e19 |y|.
+_PREDICTION_ENERGY_FLOOR = torch.finfo(torch.float32).tiny
+
+
 def _variable_projection_sse(data: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     """Return the profiled residual sum of squares at the optimal non-negative gain."""
-    # The floor only guards an all-zero prediction. It must not be eps: a pRF
-    # off the screen predicts only its Gaussian tail, ~1e-8 per sample, so
-    # p.p ~ 1e-14 sits below float32's eps and a floor there divided by the
-    # wrong number -- gains came out far too small and those positions were
-    # misjudged (they were most of the fits >3 R2 points short of analyzePRF).
-    tiny = torch.finfo(data.dtype).tiny
     gain = (
-        (prediction * data).sum(dim=0) / prediction.square().sum(dim=0).clamp_min(tiny)
+        (prediction * data).sum(dim=0)
+        / prediction.square().sum(dim=0).clamp_min(_PREDICTION_ENERGY_FLOOR)
     ).clamp_min(0)
     return (data - prediction * gain).square().sum(dim=0)
 
@@ -1338,8 +1346,7 @@ def _variable_projection_terms(
     per-voxel OLS gain is included, so GN follows the profiled CSS objective
     instead of treating gain as an additional slow nonlinear parameter.
     """
-    # tiny, not eps: see _variable_projection_sse.
-    denominator = prediction.square().sum(dim=0).clamp_min(torch.finfo(data.dtype).tiny)
+    denominator = prediction.square().sum(dim=0).clamp_min(_PREDICTION_ENERGY_FLOOR)
     numerator = (prediction * data).sum(dim=0)
     unconstrained_gain = numerator / denominator
     gain = unconstrained_gain.clamp_min(0)

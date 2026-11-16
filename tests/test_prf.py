@@ -3821,3 +3821,22 @@ def test_variable_projection_fits_a_tail_only_prediction_in_float32():
     torch.testing.assert_close(
         gain.double(), torch.tensor([4e9], dtype=torch.float64), rtol=1e-3, atol=0
     )
+
+
+def test_a_vanishing_float64_prediction_keeps_a_storable_gain():
+    """The float64 polish shares float32's floor on p.p.
+
+    With float64's own tiny it followed the off-screen tail valley to p.p ~ 1e-200
+    and saved gains of inf: ~950 vertices of the ds003787 cortex fit.
+    """
+    from fastfuncstuff.design.prf import _variable_projection_sse, _variable_projection_terms
+
+    generator = torch.Generator().manual_seed(4)
+    data = torch.randn(192, 1, generator=generator, dtype=torch.float64)
+    prediction = 1e-102 * torch.rand(192, 1, generator=generator, dtype=torch.float64)
+    sse = _variable_projection_sse(data, prediction)
+    torch.testing.assert_close(sse, data.square().sum(dim=0))  # no fit down there
+    derivatives = 1e-102 * torch.rand(192, 1, 2, generator=generator, dtype=torch.float64)
+    gain, _, jacobian, _ = _variable_projection_terms(data, prediction, derivatives)
+    assert torch.isfinite(gain.float()).all()
+    assert torch.isfinite(jacobian).all()
