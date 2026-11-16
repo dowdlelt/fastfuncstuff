@@ -29,7 +29,7 @@ On the 37,714 vertices both tools fit with R² > 20%:
 | Same receptive fields as analyzePRF | polar angle: circular r = 0.996, median difference 0.34°. Position: median difference 0.70 px of a 100 px aperture; x / y / eccentricity r = 0.998 / 0.997 / 0.994 on the aperture. rfsize: r(log) = 0.93, median ratio 1.00 |
 | Same optimum (scored by one independent float64 evaluator) | median R² difference 0.000. Within half an R² point on 90% of vertices; `ffs_pyrf` better by more than that on 8.1%, worse on 2.3% |
 | Agrees with a third toolbox (vistasoft) as well as analyzePRF does | angle circular r 0.987 vs 0.990; eccentricity r 0.984 vs 0.987 (V1–V3) |
-| Speed, same 52,932 vertices | analyzePRF 4.1 h on 6 CPU workers; `ffs_pyrf` 156 s on one GPU, **95× faster** |
+| Speed, same 52,932 vertices | analyzePRF 4.1 h on 6 CPU workers; `ffs_pyrf` 40 s on one GPU, **368× faster** |
 | HRF library (the `ffs_pyrf` default) | held-out R² +4.7 points (median), better on 83% of responsive vertices; 79% of the noise ceiling, against 65% with the canonical HRF |
 | Library + denoising | held-out R² +6.4 points, better on 92%; 83% of the noise ceiling. Receptive-field sizes 0.91× vistasoft's, against about 0.65× with the canonical HRF |
 
@@ -164,8 +164,8 @@ On the common yardstick the two tools reach the same optimum: the median R²
 difference is 0.000, and 90% of vertices are within half an R² point.
 `ffs_pyrf` finds the better fit by more than half a point on 8.1% of vertices;
 analyzePRF does on 2.3%. Large gaps are rare either way. By each tool's own R²,
-`ffs_pyrf` is better by more than 3 points on 363 vertices and worse on 15 (0.04%).
-Fourteen of those 15 are receptive fields smaller than a pixel (13 of them 0.03–0.23 px) that
+`ffs_pyrf` is better by more than 3 points on 361 vertices and worse on 16 (0.04%).
+Fifteen of those 16 are receptive fields smaller than a pixel (14 of them 0.04–0.26 px) that
 landed one pixel-scale step from analyzePRF's. Below a pixel the model samples the
 stimulus at a single point, and its position landscape is jagged enough to stop any
 local optimiser.
@@ -224,7 +224,7 @@ width beyond each edge. Further out, only the far tail of the Gaussian touches t
 display, and the data stop constraining where its centre is.
 
 Pearson r is dominated by those few far-out centres: x / y / eccentricity r is 0.74 /
-0.73 / 0.65 with them included. So the figures above use the 25,443 vertices whose
+0.73 / 0.65 with them included. So the figures above use the 25,435 vertices whose
 centres are on the aperture in both tools (r = 0.998 / 0.997 / 0.994). Rank
 correlations over all vertices tell the same story (Spearman 0.995 / 0.989 / 0.969).
 
@@ -309,10 +309,10 @@ Vertices well fit (R² > 20%) by all four variants:
 |---|---|---|---|---|---|
 | canonical HRF | 36% | 3.0 px | 27% | 59% | 39% |
 | HRF library | 6% | 5.6 px | 57% | 79% | 56% |
-| canonical + denoise | 32% | 3.8 px | 27% | 57% | 37% |
+| canonical + denoise | 33% | 3.9 px | 27% | 57% | 37% |
 | library + denoise | 3% | 5.9 px | 58% | 78% | 55% |
 
-*14,142 V1–V3 vertices, 37,620 in all (`size_exponent` in numbers_variants.json).*
+*14,143 V1–V3 vertices, 37,611 in all (`size_exponent` in numbers_variants.json).*
 
 **4. The parity comparison runs where rfsize is least determined.** To match
 analyzePRF, it must use the canonical HRF. That the two tools still agree on rfsize at
@@ -368,7 +368,7 @@ optimiser move further into the small-`n` regime, where float32 is fitting the
 wrong function. The two fixes only pay off together. Damping changes and computing
 only the SSE in float64 recovered almost nothing (−0.038 and −0.040). The probe was
 deliberately hard: 83% of its vertices had `n` < 0.01, against 49% of the full set.
-On the full set, vertices with `n` ≥ 0.01 in both tools (19,155) have a median R²
+On the full set, vertices with `n` ≥ 0.01 in both tools (19,089) have a median R²
 difference of −0.0004, and the small-`n` vertices +0.05 in `ffs_pyrf`'s favour.
 
 **A NaN in the exponent derivative.** The full comparison then exposed a third bug. A
@@ -403,10 +403,8 @@ difference 0.000). Their split-half rfsize was no more reproducible either: 15% 
 predictive accuracy. The exact model remains an option for a float64-free path on
 Apple GPUs.
 
-`-refine_precision float32` skips the polish. Refinement then takes about 2 s
-instead of about 30 s on the screened set, with different results at small `n`. The
-whole-cortex fit drops only from 163 s to 129 s, because loading, screening and
-writing outputs take most of either. Apple's
+`-refine_precision float32` skips the polish: the whole-cortex fit takes 29 s instead
+of 42 s, with different results at small `n`. Apple's
 Metal has no float64, so on MPS the polish is skipped with a note. Use `-device cpu`
 there for analyzePRF-equivalent fits.
 
@@ -428,23 +426,30 @@ which loads all 384,042 vertices, screens them and fits the 52,932 that pass.*
 | run | vertices | wall time |
 |---|---|---|
 | analyzePRF, 6 CPU workers | 52,932 | 14,798 s (4.1 h; 0.28 s per vertex) |
-| `ffs_pyrf`, same vertices, canonical HRF, no cross-validation | 52,932 | 156 s |
-| `ffs_pyrf`, whole cortex from raw surfaces, including the screen | 384,042 loaded, 52,932 fit | 163 s |
+| `ffs_pyrf`, same vertices, canonical HRF, no cross-validation | 52,932 | 40 s |
+| `ffs_pyrf`, whole cortex from raw surfaces, including the screen | 384,042 loaded, 52,932 fit | 42 s |
 
-The `ffs_pyrf` times are whole-tool times, including I/O. All six runs show the same
-stimulus, so `ffs_pyrf` refines their mean once rather than every run (see
-[*The model, briefly*](#the-model-briefly)). Without that the parity fit took
-254 s. The options cost time but stay in minutes. With `-xval halves` on the
-screened set, which fits the data three times (full data and both halves), the times
-are: canonical HRF 282 s, HRF library 340 s, canonical + denoise 670 s, library +
-denoise 982 s. Denoising adds per-run noise components, so its runs differ and are
-refined one by one.
+The `ffs_pyrf` times are whole-tool times, including I/O. Three changes took the
+parity fit from 254 s to 40 s. None changes what is fitted; the first moves vertices in
+near-flat valleys by rounding, as any change of batch does (see *Limits*):
+
+- All six runs show the same stimulus, so `ffs_pyrf` refines their mean once rather
+  than every run (see [*The model, briefly*](#the-model-briefly)).
+- Each surface run is read once. GIfTI has no lazy header, and the tool used to parse
+  every 190 MB run about four times over.
+- The float64 polish multiplies only the aperture lines the bar occupies. The frames
+  are 90% blank, so this skips exact zeros: 15% of the work, the same numbers.
+
+The options cost time but stay in minutes. With `-xval halves` on the screened set,
+which fits the data three times (full data and both halves), the times are: canonical
+HRF 104 s, HRF library 139 s, canonical + denoise 281 s, library + denoise 490 s.
+Denoising adds per-run noise components, so its runs differ and are refined one by
+one.
 
 Timings were taken with the CPU shared with other work at times, so analyzePRF would
-be somewhat faster on an idle machine. The whole-cortex fit (163 s), which also
-screens all 384,042 vertices, takes barely longer than the parity fit (156 s) of the
-same 52,932. Both read the full surfaces, and reading the six runs and writing outputs
-is most of either: refinement itself is about 30 s.
+be somewhat faster on an idle machine. The whole-cortex fit (42 s), which also
+screens all 384,042 vertices, takes barely longer than the parity fit (40 s) of the
+same 52,932.
 
 ## What the extra options change
 
@@ -499,7 +504,8 @@ and extends well beyond them.*
 *Figure 12. Why the library wins. Two V1 vertices, averaged
 over runs. The canonical predictions (blue, green) peak late and decay slowly. The
 library's HRF follows the data's sharper, earlier responses. Top vertex: held-out R²
-55% canonical, 68% library, 70% library + denoise. The canonical HRF is analyzePRF's
+25% canonical, 38% library, 41% library + denoise. At the bottom vertex the canonical
+HRF already fits (57% against the library's 56%) and denoising is what helps (63%). The canonical HRF is analyzePRF's
 default too, so this applies to analyzePRF fits of these data.*
 
 ### Reliability
@@ -514,7 +520,7 @@ At an R² threshold of 0.2:
 
 | variant | x | y | eccentricity | angle | rfsize |
 |---|---|---|---|---|---|
-| canonical HRF | 0.987 | 0.953 | 0.959 | 0.785 | 0.957 |
+| canonical HRF | 0.987 | 0.953 | 0.959 | 0.784 | 0.957 |
 | HRF library | 0.989 | 0.957 | 0.971 | 0.920 | 0.962 |
 | canonical + denoise | 0.987 | 0.956 | 0.951 | 0.862 | 0.953 |
 | library + denoise | 0.989 | 0.962 | 0.966 | 0.948 | 0.953 |
@@ -543,7 +549,7 @@ On vertices whose receptive fields lie inside the aperture under both fits:
 |---|---|---|---|---|
 | HRF library | 1.8 px (8.3) | −1.1 px | 2.3° | 1.08 |
 | canonical + denoise | 0.6 px (2.5) | +0.2 px | 0.9° | 1.05 |
-| library + denoise | 2.1 px (8.7) | −1.1 px | 2.6° | 1.16 |
+| library + denoise | 2.1 px (8.6) | −1.1 px | 2.6° | 1.16 |
 
 - **Denoising barely moves the receptive fields.** It sharpens them: less than a pixel
   of position and a degree of angle.
@@ -596,7 +602,7 @@ and analyzePRF. Data go under `$FFS_BENCHMARK_DATA_DIR` (default: the repository
   drops are compared only against vistasoft.
 - Timings were taken with the CPU shared with other work.
 - The noise ceiling relies on all runs showing an identical stimulus.
-- 15 vertices (0.04%) land in a worse local optimum than analyzePRF's by more than 3
+- 16 vertices (0.04%) land in a worse local optimum than analyzePRF's by more than 3
   R² points, almost all of them sub-pixel receptive fields.
 - GPU fits are not bit-repeatable at a few percent of vertices, those in near-flat
   valleys (mostly off-screen tails and sub-pixel sizes): parallel float rounding moves
