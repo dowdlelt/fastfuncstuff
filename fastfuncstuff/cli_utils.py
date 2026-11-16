@@ -702,7 +702,7 @@ def load_and_preprocess_runs(
 
     # A one-dimensional surface can share a vertex count with an unrelated mesh.
     # Never treat it as an ordinary grid without checking every input's identity.
-    from fastfuncstuff.io.gifti import is_gifti, surface_meta
+    from fastfuncstuff.io.gifti import gifti_header, is_gifti, surface_meta
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
     if any(is_gifti(str(path).split("[")[0]) != surface_input for path in input_files):
@@ -713,19 +713,22 @@ def load_and_preprocess_runs(
         fingerprint = (surface_meta(first_img.header) or {}).get("mesh_fingerprint")
         if not fingerprint:
             raise ValueError("Surface input needs mesh_fingerprint metadata")
+
+        # Headers, not load_nifti: a .gii has no lazy header, so loading one decodes
+        # all of it -- six whole runs re-read here only to compare two fields.
+        def same_mesh(path) -> bool:
+            header = gifti_header(str(path).split("[")[0])
+            return (header.n_vertices, 1, 1) == volume_shape and header.meta.get(
+                "mesh_fingerprint"
+            ) == fingerprint
+
         for path in input_files[1:]:
-            img = load_nifti(path)
-            other = (surface_meta(img.header) or {}).get("mesh_fingerprint")
-            if img.shape[:3] != volume_shape or other != fingerprint:
+            if not same_mesh(path):
                 raise ValueError(f"Surface run {path} does not match the first run's mesh")
         if mask_file:
             if not is_gifti(str(mask_file).split("[")[0]):
                 raise ValueError("A surface input needs a GIfTI mask on the same mesh")
-            mask_img = load_nifti(mask_file)
-            if (
-                mask_img.shape[:3] != volume_shape
-                or (surface_meta(mask_img.header) or {}).get("mesh_fingerprint") != fingerprint
-            ):
+            if not same_mesh(mask_file):
                 raise ValueError("Surface mask does not match the input mesh")
         if mask_array is not None:
             raise ValueError("Surface mask arrays have no mesh identity; pass a GIfTI mask file")
