@@ -81,6 +81,7 @@ from fastfuncstuff.design.prf import (
     grid_seeds_as_fit,
     loro_folds,
     make_analyzeprf_grid,
+    prediction_dtype,
     prf_parameter_maps,
     prf_percent_signal_change,
     prf_response_peak,
@@ -2853,6 +2854,9 @@ def main(argv: list[str] | None = None) -> int:
         nuisance_per_run=nuisance_per_run,
         run_starts=list(loaded.run_starts),
         device=device,
+        model_dtype=prediction_dtype(
+            refinement_config.polish_dtype, device, results.parameters.dtype
+        ),
     )
     canonical_peak = (
         None
@@ -2868,6 +2872,9 @@ def main(argv: list[str] | None = None) -> int:
             nuisance_per_run=nuisance_per_run,
             run_starts=list(loaded.run_starts),
             device=device,
+            model_dtype=prediction_dtype(
+                refinement_config.polish_dtype, device, canonical_results.parameters.dtype
+            ),
         )
     )
     type_fit = None

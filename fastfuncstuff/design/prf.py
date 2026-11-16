@@ -2140,6 +2140,24 @@ def grid_seeds_as_fit(grid_fit: PRFGridFit) -> PRFRefinedFit:
     )
 
 
+def prediction_dtype(
+    polish_dtype: torch.dtype | None, device: torch.device, dtype: torch.dtype
+) -> torch.dtype:
+    """The dtype a fitted CSS model must be evaluated in to be the model that was fit.
+
+    At small exponents the CSS model's value depends on float range (see
+    ``PRFRefinementConfig.polish_dtype``), so parameters and gains polished in
+    float64 describe the float64 function. Evaluating them in float32 -- for
+    held-out R2 or a response amplitude -- scores a different function: on a
+    ds003787 sample that moved held-out R2 by more than half a point on most
+    small-exponent vertices and peak amplitude by more than 25% on a fifth.
+    Falls back to ``dtype`` wherever the polish would not have run either.
+    """
+    if polish_dtype is None or widest_float_dtype(device) != polish_dtype:
+        return dtype
+    return polish_dtype
+
+
 def _predict_selected_prfs(
     stimulus_runs: Sequence[torch.Tensor],
     parameters: torch.Tensor,
@@ -2148,19 +2166,30 @@ def _predict_selected_prfs(
     hrf_library: torch.Tensor,
     stimulus_shape: tuple[int, int],
     voxel_chunk_size: int,
+    model_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Predict one selected-HRF CSS response for each voxel."""
+    """Predict one selected-HRF CSS response for each voxel.
+
+    ``model_dtype`` evaluates the CSS model in a wider dtype (see
+    :func:`prediction_dtype`); the result comes back in ``parameters.dtype``.
+    """
     n_timepoints = aperture_timepoints(stimulus_runs)
+    dtype = parameters.dtype
+    model_dtype = model_dtype or dtype
     prediction = torch.empty(
-        (n_timepoints, parameters.shape[0]), device=parameters.device, dtype=parameters.dtype
+        (n_timepoints, parameters.shape[0]), device=parameters.device, dtype=dtype
     )
+    runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    if model_dtype != dtype:
+        runs = [run.to(dtype=model_dtype) for run in runs]
     for selected_hrf in hrf_index.unique(sorted=True).tolist():
         indices = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
+        hrf = hrf_library[selected_hrf].to(model_dtype)
         for start in range(0, indices.numel(), voxel_chunk_size):
             chunk = indices[start : start + voxel_chunk_size]
             prediction[:, chunk] = (
-                _css_prediction(
-                    stimulus_runs, parameters[chunk], hrf_library[selected_hrf], stimulus_shape
+                _css_prediction(runs, parameters[chunk].to(model_dtype), hrf, stimulus_shape).to(
+                    dtype
                 )
                 * gain[chunk]
             )
@@ -2178,6 +2207,7 @@ def prf_response_peak(
     nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None = None,
     run_starts: Sequence[int] | None = None,
     device: torch.device | None = None,
+    model_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Peak of each voxel's fitted response above its own baseline, in data units.
 
@@ -2201,6 +2231,9 @@ def prf_response_peak(
     ``device`` is where the prediction is computed; the returned map always
     lands where ``parameters`` live. They differ whenever the fit itself
     streamed a CPU-resident dataset through the GPU.
+
+    ``model_dtype`` evaluates the CSS model in a wider dtype, as
+    :func:`_predict_selected_prfs` does.
     """
     if (nuisance_per_run is None) != (run_starts is None):
         raise ValueError("nuisance_per_run and run_starts go together")
@@ -2209,13 +2242,14 @@ def prf_response_peak(
     # while the library and the apertures were built on the compute device.
     out_device, dtype = parameters.device, parameters.dtype
     device = device or out_device
+    model_dtype = model_dtype or dtype
     # Compressed and moved once: the frame table is the same for every chunk,
     # and deduplicating a run costs a unique() over the whole aperture.
     runs = [
-        run.to(device=device, dtype=dtype)
+        run.to(device=device, dtype=model_dtype)
         for run in _compress_aperture_runs(stimulus_runs, stimulus_shape)
     ]
-    hrf_library = hrf_library.to(device=device, dtype=dtype)
+    hrf_library = hrf_library.to(device=device, dtype=model_dtype)
     peak = torch.zeros(parameters.shape[0], device=out_device, dtype=dtype)
     for selected_hrf in hrf_index.unique(sorted=True).tolist():
         indices = torch.nonzero(hrf_index == selected_hrf, as_tuple=False).squeeze(1)
@@ -2225,8 +2259,11 @@ def prf_response_peak(
         for start in range(0, indices.numel(), voxel_chunk_size):
             chunk = indices[start : start + voxel_chunk_size]
             prediction = _css_prediction(
-                runs, parameters[chunk].to(device), applier, stimulus_shape
-            )
+                runs,
+                parameters[chunk].to(device=device, dtype=model_dtype),
+                applier,
+                stimulus_shape,
+            ).to(dtype)
             if run_starts is not None:
                 prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
             peak[chunk] = (prediction.amax(dim=0) * gain[chunk].to(device)).to(out_device)
@@ -2494,6 +2531,7 @@ def refine_prf_per_type(
                         hrf_library,
                         stimulus_shape,
                         stop - start,
+                        model_dtype=prediction_dtype(config.polish_dtype, device, dtype),
                     )
                 seed = PRFGridFit(
                     candidate_index=torch.zeros(stop - start, dtype=torch.long, device=device),
@@ -2862,6 +2900,7 @@ def fit_prf_folds(
             hrf_library.to(device=device, dtype=data.dtype),
             stimulus_shape,
             refine_chunk_size or voxel_chunk_size,
+            model_dtype=prediction_dtype(refinement_config.polish_dtype, device, data.dtype),
         )
         held_prediction = _project_per_run(held_prediction, held_nuisance, held_starts)
         residual_ss += (held_data - held_prediction).square().sum(dim=0).to(output_device)

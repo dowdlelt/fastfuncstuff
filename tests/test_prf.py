@@ -20,6 +20,7 @@ from fastfuncstuff.design.prf import (
     PRFRefinementConfig,
     _css_prediction,
     _css_prediction_and_derivatives,
+    _predict_selected_prfs,
     _separable_gaussian,
     choose_aperture_bin_factor,
     downsample_aperture,
@@ -27,6 +28,7 @@ from fastfuncstuff.design.prf import (
     fit_prf_supergrid,
     gaussian_receptive_fields,
     make_analyzeprf_grid,
+    prediction_dtype,
     prf_parameter_maps,
     refine_prf_supergrid,
 )
@@ -344,6 +346,57 @@ def test_exponent_derivative_is_finite_where_the_drive_underflows():
         - _css_prediction(stimulus_runs, backward, hrf, stimulus_shape)
     ) / (2 * delta)
     torch.testing.assert_close(derivatives[:, :, 3], numeric, rtol=1e-4, atol=1e-8)
+
+
+def test_selected_predictions_evaluate_the_model_in_the_polish_dtype():
+    """Held-out R2 and amplitudes must score the function the polish fit.
+
+    Bug of record: the float64-polished parameters and gains were re-evaluated in
+    float32 for held-out prediction and response peaks. At small exponents those
+    are different functions (where the Gaussian's tail underflows), so held-out
+    R2 on ds003787 moved by more than half a point on most small-exponent
+    vertices once evaluated consistently.
+    """
+    stimulus_shape = (40, 40)
+    frames = torch.zeros((8, 40, 40), dtype=torch.float64)
+    for frame in range(8):
+        frames[frame, :, 4 * frame : 4 * frame + 4] = 1.0
+    runs64 = [frames.reshape(8, -1)]
+    # sigma 0.6 at the exponent floor: the bar is 13-38 sigma away for most
+    # frames, beyond float32's tail but inside float64's.
+    parameters64 = torch.tensor([[20.0, 38.0, 0.6, 1e-3]], dtype=torch.float64)
+    hrf64 = torch.tensor([[1.0, 0.6, 0.2]], dtype=torch.float64)
+    gain = torch.ones(1, dtype=torch.float32)
+    index = torch.zeros(1, dtype=torch.long)
+    exact = _predict_selected_prfs(
+        runs64, parameters64, index, gain.double(), hrf64, stimulus_shape, 10
+    )
+    single = _predict_selected_prfs(
+        [r.float() for r in runs64],
+        parameters64.float(),
+        index,
+        gain,
+        hrf64.float(),
+        stimulus_shape,
+        10,
+    )
+    widened = _predict_selected_prfs(
+        [r.float() for r in runs64],
+        parameters64.float(),
+        index,
+        gain,
+        hrf64.float(),
+        stimulus_shape,
+        10,
+        model_dtype=torch.float64,
+    )
+    assert widened.dtype == torch.float32
+    centred = lambda x: x - x.mean()  # noqa: E731 -- the polynomials remove the mean
+    torch.testing.assert_close(centred(widened).double(), centred(exact), rtol=1e-5, atol=1e-6)
+    gap = (centred(single).double() - centred(exact)).abs().max()
+    assert gap > 100 * (centred(widened).double() - centred(exact)).abs().max()
+    assert prediction_dtype(torch.float64, torch.device("cpu"), torch.float32) == torch.float64
+    assert prediction_dtype(None, torch.device("cpu"), torch.float32) == torch.float32
 
 
 def test_float64_polish_never_loses_to_float32_and_keeps_dtype():
