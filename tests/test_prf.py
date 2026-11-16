@@ -3710,3 +3710,133 @@ class TestApertureLengthRule:
             == 0
         )
         assert output.exists()
+
+
+def _repeated_run_problem(n_voxels=24):
+    """Six runs, two stimuli (4 + 2 repeats), shared drift design, noisy voxels."""
+    generator = torch.Generator().manual_seed(7)
+    dtype = torch.float64
+    first = torch.randint(0, 2, (14, 25), generator=generator).to(dtype)
+    second = torch.randint(0, 2, (10, 25), generator=generator).to(dtype)
+    stimulus_runs = [first, second, first, first, second, first]
+    lengths = [run.shape[0] for run in stimulus_runs]
+    run_starts = [sum(lengths[:index]) for index in range(len(lengths))]
+
+    def drift(n):
+        t = torch.linspace(-1, 1, n, dtype=dtype)
+        return torch.stack([torch.ones(n, dtype=dtype), t], dim=1)
+
+    nuisance = [drift(n) for n in lengths]
+    truth = torch.stack(
+        [
+            torch.empty(n_voxels, dtype=dtype).uniform_(1.5, 3.5, generator=generator),
+            torch.empty(n_voxels, dtype=dtype).uniform_(1.5, 3.5, generator=generator),
+            torch.empty(n_voxels, dtype=dtype).uniform_(0.6, 1.6, generator=generator),
+            torch.empty(n_voxels, dtype=dtype).uniform_(0.2, 0.9, generator=generator),
+        ],
+        dim=1,
+    )
+    hrf = torch.tensor([1.0, 0.4, 0.1], dtype=dtype)
+    prediction, _ = _css_prediction_and_derivatives(stimulus_runs, truth, hrf, (5, 5))
+    noise = 0.3 * torch.randn(prediction.shape, generator=generator, dtype=dtype)
+    data = (prediction * 2.0 + noise + 5.0).T.contiguous()
+    seeds = truth + 0.2 * torch.randn(truth.shape, generator=generator, dtype=dtype)
+    seeds[:, 2:].clamp_(min=0.1)
+    grid_fit = PRFGridFit(
+        candidate_index=torch.zeros(n_voxels, dtype=torch.long),
+        hrf_index=torch.zeros(n_voxels, dtype=torch.long),
+        parameters=seeds,
+        gain=torch.ones(n_voxels, dtype=dtype),
+        correlation=torch.zeros(n_voxels, dtype=dtype),
+        r2=torch.zeros(n_voxels, dtype=dtype),
+    )
+    return data, stimulus_runs, run_starts, nuisance, hrf, grid_fit
+
+
+def test_collapsing_repeated_runs_gives_the_same_fit():
+    """Refining pseudo-run means must equal refining every run, statistics included.
+
+    4 + 2 repeats collapse to three pseudo-runs of two, so this also covers
+    classes of unequal size.
+    """
+    data, stimulus_runs, run_starts, nuisance, hrf, grid_fit = _repeated_run_problem()
+    fits = {
+        collapse: refine_prf_supergrid(
+            data,
+            stimulus_runs,
+            (5, 5),
+            grid_fit,
+            hrf.unsqueeze(0),
+            run_starts,
+            nuisance_per_run=nuisance,
+            device=torch.device("cpu"),
+            config=PRFRefinementConfig(max_iter=30, polish_dtype=None, collapse_repeats=collapse),
+        )
+        for collapse in (False, True)
+    }
+    full, collapsed = fits[False], fits[True]
+    assert full.r2.median() > 0.4  # a real fit, not a degenerate one
+    for name in ("parameters", "gain", "correlation", "r2", "residual_ss"):
+        torch.testing.assert_close(
+            # Measured: parameters 2e-9 apart (summation order), statistics 3e-14.
+            getattr(collapsed, name),
+            getattr(full, name),
+            rtol=1e-6,
+            atol=1e-8,
+            msg=name,
+        )
+
+
+def test_runs_with_their_own_nuisance_are_not_collapsed():
+    """Per-run regressors (denoising's noise components) rule the collapse out."""
+    from fastfuncstuff.design.prf import _compress_aperture_runs, _plan_repeat_collapse
+
+    data, stimulus_runs, run_starts, nuisance, _, _ = _repeated_run_problem()
+    stimuli = _compress_aperture_runs(stimulus_runs, (5, 5))
+    plan = _plan_repeat_collapse(stimuli, nuisance, run_starts, data.shape[1])
+    assert plan is not None and plan.size == 2
+    assert plan.groups == ((0, 2), (3, 5), (1, 4))
+
+    noisy = [torch.cat([n, torch.randn(n.shape[0], 1, dtype=n.dtype)], dim=1) for n in nuisance]
+    assert _plan_repeat_collapse(stimuli, noisy, run_starts, data.shape[1]) is None
+
+
+def test_variable_projection_fits_a_tail_only_prediction_in_float32():
+    """An off-screen pRF predicts ~1e-8 per sample; p.p ~ 1e-14 is below float32 eps.
+
+    Flooring p.p at eps made the gain ~1e7x too small, so such fits were misjudged.
+    """
+    from fastfuncstuff.design.prf import _variable_projection_sse, _variable_projection_terms
+
+    generator = torch.Generator().manual_seed(3)
+    prediction = 1e-8 * torch.rand(192, 1, generator=generator)
+    data = 4e9 * prediction + 0.01 * torch.randn(192, 1, generator=generator)
+    sse = _variable_projection_sse(data, prediction)
+    exact = _variable_projection_sse(data.double(), prediction.double())
+    assert data.square().sum() > 100 * sse  # the fit explains the signal
+    torch.testing.assert_close(sse.double(), exact, rtol=1e-3, atol=0)
+    derivatives = torch.rand(192, 1, 2, generator=generator) * 1e-8
+    gain, _, jacobian, terms_sse = _variable_projection_terms(data, prediction, derivatives)
+    assert torch.isfinite(jacobian).all()
+    torch.testing.assert_close(
+        gain.double(), torch.tensor([4e9], dtype=torch.float64), rtol=1e-3, atol=0
+    )
+
+
+def test_a_vanishing_float64_prediction_keeps_a_storable_gain():
+    """The float64 polish shares float32's floor on p.p.
+
+    With float64's own tiny it followed the off-screen tail valley to p.p ~ 1e-200
+    and saved gains of inf: ~950 vertices of the ds003787 cortex fit.
+    """
+    from fastfuncstuff.design.prf import _variable_projection_sse, _variable_projection_terms
+
+    generator = torch.Generator().manual_seed(4)
+    data = torch.randn(192, 1, generator=generator, dtype=torch.float64)
+    prediction = 1e-102 * torch.rand(192, 1, generator=generator, dtype=torch.float64)
+    sse = _variable_projection_sse(data, prediction)
+    torch.testing.assert_close(sse, data.square().sum(dim=0))  # no fit down there
+    derivatives = 1e-102 * torch.rand(192, 1, 2, generator=generator, dtype=torch.float64)
+    gain, _, jacobian, _ = _variable_projection_terms(data, prediction, derivatives)
+    assert torch.isfinite(gain.float()).all()
+    assert torch.isfinite(jacobian).all()

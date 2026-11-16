@@ -116,6 +116,10 @@ class PRFRefinementConfig:
     # was >0.5 R2 points worse than float64 on 17% of them; the polish brings it
     # to 1.3% for ~5x the float32 refinement (float64 throughout is ~7x).
     polish_dtype: torch.dtype | None = torch.float64
+    # Refine the mean of runs that share a stimulus and a nuisance design instead
+    # of every run (see _plan_repeat_collapse). Exact, not an approximation; off
+    # only to A/B it.
+    collapse_repeats: bool = True
     fix_exponent: bool = False
     stagewise_exponent: bool = False
     # Which of (row, column, sigma, exponent) Gauss-Newton may move, by index.
@@ -1309,11 +1313,24 @@ def variable_projection_sse_by_type(
     return gains, (data.square().sum(dim=0) - explained).clamp_min(0)
 
 
+# Floor on p.p, the variable-projection gain's denominator. Not eps: a pRF off
+# the screen predicts only its Gaussian tail, ~1e-8 per sample, so p.p ~ 1e-14
+# sits below float32's eps and a floor there divided by the wrong number -- gains
+# came out far too small and those positions were misjudged (they were most of
+# the fits >3 R2 points short of analyzePRF on ds003787). Nor each dtype's own
+# tiny: the float64 polish then followed the near-flat tail valley out to
+# p.p ~ 1e-200, where the gain (~|y|/sqrt(p.p)) overflows the float32 output to
+# inf. One floor for both dtypes keeps refine and polish on the same objective,
+# and below it the fit fades (N^2/floor -> 0), so the search stops there with a
+# gain of at most ~1e19 |y|.
+_PREDICTION_ENERGY_FLOOR = torch.finfo(torch.float32).tiny
+
+
 def _variable_projection_sse(data: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     """Return the profiled residual sum of squares at the optimal non-negative gain."""
-    eps = torch.finfo(data.dtype).eps
     gain = (
-        (prediction * data).sum(dim=0) / prediction.square().sum(dim=0).clamp_min(eps)
+        (prediction * data).sum(dim=0)
+        / prediction.square().sum(dim=0).clamp_min(_PREDICTION_ENERGY_FLOOR)
     ).clamp_min(0)
     return (data - prediction * gain).square().sum(dim=0)
 
@@ -1329,8 +1346,7 @@ def _variable_projection_terms(
     per-voxel OLS gain is included, so GN follows the profiled CSS objective
     instead of treating gain as an additional slow nonlinear parameter.
     """
-    eps = torch.finfo(data.dtype).eps
-    denominator = prediction.square().sum(dim=0).clamp_min(eps)
+    denominator = prediction.square().sum(dim=0).clamp_min(_PREDICTION_ENERGY_FLOOR)
     numerator = (prediction * data).sum(dim=0)
     unconstrained_gain = numerator / denominator
     gain = unconstrained_gain.clamp_min(0)
@@ -1338,10 +1354,11 @@ def _variable_projection_terms(
 
     derivative_data = (derivatives * data.unsqueeze(-1)).sum(dim=0)
     derivative_prediction = (derivatives * prediction.unsqueeze(-1)).sum(dim=0)
+    # d(N/D) = (dN - 2 (N/D) dP) / D, never forming D^2, which underflows for
+    # the tail-only predictions the floor above exists for.
     gain_derivative = (
-        derivative_data * denominator.unsqueeze(1)
-        - numerator.unsqueeze(1) * 2.0 * derivative_prediction
-    ) / denominator.square().unsqueeze(1)
+        derivative_data - 2.0 * unconstrained_gain.unsqueeze(1) * derivative_prediction
+    ) / denominator.unsqueeze(1)
     jacobian = -(derivatives * gain.view(1, -1, 1) + prediction.unsqueeze(-1) * gain_derivative)
     # At the non-negative gain boundary, the profiled model is the zero predictor
     # locally; permitting a GN spatial update there creates artificial motion.
@@ -1683,6 +1700,158 @@ def _refine_css_batch_once(
     return current, gain, correlation, r2, residual_ss, n_iters, converged
 
 
+@dataclass(frozen=True)
+class _RepeatCollapse:
+    """Runs grouped into equal-size pseudo-runs, each the mean of identical runs.
+
+    Runs that show the same aperture movie and carry the same nuisance design
+    have the same projected prediction ``p`` for any parameters, so for ``g`` of
+    them ``sum_r ||P y_r - b p||^2 = sum_r ||P y_r - P ybar||^2 + g ||P ybar - b p||^2``.
+    The first term does not depend on the model, and a uniform factor ``g``
+    scales J^T J and J^T r alike, which the relative damping cancels. Refining
+    the means therefore takes the same Gauss-Newton steps, accepts the same
+    trials and lands on the same parameters and gains, at 1/g of the prediction
+    work. Classes of different sizes split into pseudo-runs of their gcd, so
+    every pseudo-run carries the same weight and the objective stays unweighted.
+    """
+
+    groups: tuple[tuple[int, ...], ...]
+    size: int
+    run_starts: tuple[int, ...]  # the original runs'
+    run_ends: tuple[int, ...]
+    collapsed_starts: tuple[int, ...]
+
+    def stimuli(self, stimuli: Sequence[_ApertureRun]) -> list[_ApertureRun]:
+        return [stimuli[group[0]] for group in self.groups]
+
+    def nuisance(self, nuisance: Sequence[torch.Tensor] | _NuisanceBases | None):
+        if nuisance is None:
+            return None
+        if isinstance(nuisance, _NuisanceBases):
+            return _NuisanceBases(tuple(nuisance.bases[group[0]] for group in self.groups))
+        return [nuisance[group[0]] for group in self.groups]
+
+    def data(self, data: torch.Tensor) -> torch.Tensor:
+        """``(voxels, time)`` data averaged within each pseudo-run."""
+        return torch.cat(
+            [
+                torch.stack([data[:, self.run_starts[r] : self.run_ends[r]] for r in group])
+                .to(widest_float_dtype(data.device))
+                .mean(dim=0)
+                .to(data.dtype)
+                for group in self.groups
+            ],
+            dim=1,
+        )
+
+
+def _same_nuisance(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return a.shape == b.shape and bool(torch.equal(a, b))
+
+
+def _plan_repeat_collapse(
+    stimuli: Sequence[_ApertureRun],
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
+    run_starts: Sequence[int],
+    n_timepoints: int,
+) -> _RepeatCollapse | None:
+    """Group identical runs; None when no two runs can be merged.
+
+    Identity is exact: the same frame table in the same order and a bit-equal
+    nuisance matrix. Anything per-run in the nuisance -- denoising's noise
+    components above all -- makes every run its own class, and the fit falls
+    back to the runs as given.
+    """
+    if len(stimuli) < 2:
+        return None
+    if nuisance_per_run is None:
+        nuisance: list[torch.Tensor | None] = [None] * len(stimuli)
+    elif isinstance(nuisance_per_run, _NuisanceBases):
+        nuisance = list(nuisance_per_run.bases)
+    else:
+        nuisance = [None if n.shape[1] == 0 else n for n in nuisance_per_run]
+    classes: list[list[int]] = []
+    for index, run in enumerate(stimuli):
+        for members in classes:
+            first = stimuli[members[0]]
+            if (
+                run.key == first.key
+                and run.frames.shape == first.frames.shape
+                and bool(torch.equal(run.frames, first.frames))
+                and _same_nuisance(nuisance[index], nuisance[members[0]])
+            ):
+                members.append(index)
+                break
+        else:
+            classes.append([index])
+    size = math.gcd(*(len(members) for members in classes))
+    if size == 1:
+        return None
+    groups = tuple(
+        tuple(members[start : start + size])
+        for members in classes
+        for start in range(0, len(members), size)
+    )
+    ends = (*run_starts[1:], n_timepoints)
+    collapsed_starts = [0]
+    for group in groups[:-1]:
+        collapsed_starts.append(collapsed_starts[-1] + stimuli[group[0]].n_timepoints)
+    return _RepeatCollapse(
+        groups=groups,
+        size=size,
+        run_starts=tuple(run_starts),
+        run_ends=tuple(ends),
+        collapsed_starts=tuple(collapsed_starts),
+    )
+
+
+def _widen_bases(nuisance: _NuisanceBases | None, dtype: torch.dtype) -> _NuisanceBases | None:
+    """Refactor float32 bases in ``dtype``: a float32 Q is orthonormal only to ~1e-7."""
+    if nuisance is None:
+        return None
+    return _NuisanceBases(
+        tuple(None if q is None else plinalg.qr(q.to(dtype))[0] for q in nuisance.bases)
+    )
+
+
+def _full_data_statistics(
+    data: torch.Tensor,
+    collapsed_data: torch.Tensor,
+    plan: _RepeatCollapse,
+    nuisance: _NuisanceBases | None,
+    collapsed_nuisance: _NuisanceBases | None,
+    correlation: torch.Tensor,
+    residual_ss: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Correlation, R2 and residual SS of a collapsed fit, restated on every run.
+
+    With ``A = P Y`` the projected runs and ``Abar`` their pseudo-run means,
+    the full residual is the collapsed one times ``g`` plus the within-group
+    scatter ``||A||^2 - g ||Abar||^2``, and the full correlation is the
+    collapsed one times ``sqrt(g) ||Abar|| / ||A||``. Summed in the widest float,
+    because the scatter is a difference of two large sums.
+    """
+    wide = widest_float_dtype(data.device)
+    # Projected in the wide dtype too: unscaled scanner data (~1e4) projected in
+    # float32 moved the restated R2 by ~0.1 points against the float64 polish's.
+    full = _project_per_run(data.T.to(wide), _widen_bases(nuisance, wide), plan.run_starts)
+    mean = _project_per_run(
+        collapsed_data.T.to(wide), _widen_bases(collapsed_nuisance, wide), plan.collapsed_starts
+    )
+    full_ss = full.square().sum(dim=0)
+    mean_ss = mean.square().sum(dim=0)
+    g = float(plan.size)
+    full_residual = g * residual_ss.to(wide) + (full_ss - g * mean_ss).clamp_min(0)
+    total = (full - full.mean(dim=0, keepdim=True)).square().sum(dim=0)
+    eps = torch.finfo(data.dtype).eps
+    r2 = 1.0 - full_residual / total.clamp_min(eps)
+    full_correlation = correlation.to(wide) * (g * mean_ss / full_ss.clamp_min(eps)).sqrt()
+    dtype = data.dtype
+    return full_correlation.to(dtype), r2.to(dtype), full_residual.to(dtype)
+
+
 def refine_prf_supergrid(
     data: torch.Tensor,
     stimulus_runs: Sequence[torch.Tensor],
@@ -1729,6 +1898,22 @@ def refine_prf_supergrid(
     )
     nuisance_per_run = _nuisance_bases(nuisance_per_run, device, data.dtype)
     hrf_library = hrf_library.to(device=device, dtype=data.dtype)
+    plan = (
+        _plan_repeat_collapse(stimuli, nuisance_per_run, run_starts, data.shape[1])
+        if config.collapse_repeats
+        else None
+    )
+    if plan is None:
+        fit_stimuli, fit_nuisance, fit_starts = stimuli, nuisance_per_run, run_starts
+    else:
+        fit_stimuli = plan.stimuli(stimuli)
+        fit_nuisance = plan.nuisance(nuisance_per_run)
+        fit_starts = plan.collapsed_starts
+        if verbose:
+            print(
+                f"  pRF refinement: {len(stimuli)} runs refined as {len(plan.groups)} "
+                f"(identical stimulus and nuisance, averaged in groups of {plan.size})"
+            )
 
     progress = None
     if verbose:
@@ -1750,6 +1935,8 @@ def refine_prf_supergrid(
     for start in range(0, n_voxels, voxel_chunk_size):
         chunk_indices = hrf_order[start : start + voxel_chunk_size]
         chunk_group = dense_group[start : start + voxel_chunk_size].to(device)
+        chunk_data = data[chunk_indices].to(device=device, dtype=data.dtype)
+        fit_data = chunk_data if plan is None else plan.data(chunk_data)
         if config.stagewise_exponent and not config.fix_exponent:
             stage_config = replace(
                 config,
@@ -1758,13 +1945,13 @@ def refine_prf_supergrid(
                 stagewise_exponent=False,
             )
             stage_parameters, _, _, _, _, stage_iters, _ = _refine_css_batch(
-                data[chunk_indices].to(device=device, dtype=data.dtype),
-                stimuli,
+                fit_data,
+                fit_stimuli,
                 grid_fit.parameters[chunk_indices].to(device=device, dtype=data.dtype),
                 applier,
                 stimulus_shape,
-                run_starts,
-                nuisance_per_run,
+                fit_starts,
+                fit_nuisance,
                 stage_config,
                 hrf_group=chunk_group,
             )
@@ -1783,16 +1970,27 @@ def refine_prf_supergrid(
             chunk_iters,
             chunk_converged,
         ) = _refine_css_batch(
-            data[chunk_indices].to(device=device, dtype=data.dtype),
-            stimuli,
+            fit_data,
+            fit_stimuli,
             refine_parameters,
             applier,
             stimulus_shape,
-            run_starts,
-            nuisance_per_run,
+            fit_starts,
+            fit_nuisance,
             replace(config, stagewise_exponent=False),
             hrf_group=chunk_group,
         )
+        if plan is not None:
+            chunk_corr, chunk_r2, chunk_ss = _full_data_statistics(
+                chunk_data,
+                fit_data,
+                plan,
+                nuisance_per_run,
+                fit_nuisance,
+                chunk_corr,
+                chunk_ss,
+            )
+        del chunk_data, fit_data
         parameters[chunk_indices] = chunk_parameters.to(output_device)
         gain[chunk_indices] = chunk_gain.to(output_device)
         correlation[chunk_indices] = chunk_corr.to(output_device)
