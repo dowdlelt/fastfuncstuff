@@ -36,6 +36,7 @@ from fastfuncstuff.io.gifti import (
     load_gifti_surface,
     mesh_fingerprint,
     save_gifti_data,
+    save_gifti_series_external,
     save_gifti_surface,
 )
 
@@ -139,7 +140,20 @@ def _merge_data(
         at += size
         del block
     assert merged is not None
-    save_gifti_data(out_path, merged if merged.shape[1] > 1 else merged[:, 0], meta, time_series)
+    if time_series and merged.shape[1] > 1:
+        # Raw binary beside the .gii: the fit reads this straight back, and base64
+        # would cost an encode here and a GIL-bound decode there, ~1 s each a run.
+        save_gifti_series_external(out_path, merged, meta)
+    else:
+        save_gifti_data(
+            out_path, merged if merged.shape[1] > 1 else merged[:, 0], meta, time_series
+        )
+
+
+def _merged_series_present(merged: str) -> bool:
+    """The merged run and its raw data file both exist (older merges were base64
+    and have no .dat; they are redone once)."""
+    return Path(merged).is_file() and Path(merged).with_suffix(".dat").is_file()
 
 
 def _geometry(
@@ -166,7 +180,7 @@ def _geometry(
 
 def _reusable(merged: str, sidecar: Path, source: str, settings: dict) -> bool:
     """Was this run already sampled the same way, from a source no newer than it?"""
-    if not Path(merged).is_file() or not sidecar.is_file():
+    if not _merged_series_present(merged) or not sidecar.is_file():
         return False
     try:
         recorded = json.loads(sidecar.read_text())
@@ -550,7 +564,7 @@ def merge_hemisphere_runs(
     runs = []
     for index, per_hemi in enumerate(grouped, start=1):
         merged = str(out / f"run-{index:02d}.{space}.func.gii")
-        if reuse and Path(merged).is_file() and _no_older_than(merged, per_hemi):
+        if reuse and _merged_series_present(merged) and _no_older_than(merged, per_hemi):
             runs.append(merged)
             if verb >= 1:
                 print(f"    reusing {Path(merged).name}")

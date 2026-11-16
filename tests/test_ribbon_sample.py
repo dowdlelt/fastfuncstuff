@@ -168,6 +168,9 @@ def test_reuse_requires_the_same_settings_and_a_source_no_newer(tmp_path):
     settings = {"subject": "s", "mesh": "native", "hemis": ["lh"], "depths": [0.5], "sampling": "f"}
     sidecar.write_text(json.dumps({**settings, "source": str(source)}))
 
+    # The series lives in a raw .dat beside the .gii; without it nothing can be read.
+    assert not _reusable(str(merged), sidecar, str(source), settings)
+    (tmp_path / "run-01.native.func.dat").write_bytes(b"")
     assert _reusable(str(merged), sidecar, str(source), settings)
     assert not _reusable(str(merged), sidecar, str(source), {**settings, "depths": [0.1, 0.9]})
 
