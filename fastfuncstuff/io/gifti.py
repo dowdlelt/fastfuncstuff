@@ -233,7 +233,9 @@ def _read_gifti(path: str | os.PathLike) -> _Gifti | None:
                 # Exactly <Data>: the coordinate system's <DataSpace> also starts
                 # "<Data".
                 open_data = mm.find(b"<Data>", tag_end, end)
-                close_data = mm.find(b"</Data>", open_data, end)
+                # Backwards from the next array: a forward search would scan the
+                # whole base64 block a second time.
+                close_data = mm.rfind(b"</Data>", open_data, end)
                 if open_data < 0 or close_data < 0:
                     return None
                 raw = base64.b64decode(mm[open_data + len(b"<Data>") : close_data])
@@ -242,10 +244,14 @@ def _read_gifti(path: str | os.PathLike) -> _Gifti | None:
                 data = np.frombuffer(bytearray(raw), dtype=dtype).reshape(shape, order=order)
             else:
                 return None
-            meta_start = mm.find(b"<MetaData", tag_end, end)
+            # An array's MetaData precedes its <Data>; bounding the search there
+            # keeps it out of the data.
+            data_at = mm.find(b"<Data", tag_end, end)
+            meta_end = data_at if data_at >= 0 else end
+            meta_start = mm.find(b"<MetaData", tag_end, meta_end)
             meta: dict[str, str] = {}
             if meta_start >= 0:
-                meta_stop = mm.find(b"</MetaData>", meta_start, end)
+                meta_stop = mm.find(b"</MetaData>", meta_start, meta_end)
                 if meta_stop >= 0:
                     meta = _md_dict(bytes(mm[meta_start : meta_stop + len(b"</MetaData>")]))
             intent = nib.nifti1.intent_codes.code[attrs.get("Intent", "NIFTI_INTENT_NONE")]
