@@ -721,6 +721,19 @@ def bytes_per_voxel_spectral(n_timepoints: int) -> int:
     return int(n_timepoints * (4 + 8 + 8 + 4) * 1.5)
 
 
+def bytes_per_slice_spikehunt(n_timepoints: int, ny: int, nx: int, window: int) -> int:
+    """Per-slice peak of the spikehunt k-space scoring pass.
+
+    Per k-sample: the float32 slab, its complex64 spectrum, about eight float32
+    working arrays (log magnitude, running median, residual, |residual|, z, the
+    padded and pooled blob), and the running-median sort, which holds the
+    window's values plus int64 indices (12 bytes per window tap). 1.25x for
+    cuFFT workspace and allocator slack.
+    """
+    per_sample = 4 + 8 + 8 * 4 + 12 * window
+    return int(n_timepoints * ny * nx * per_sample * 1.25)
+
+
 def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device) -> int:
     """Voxels per chunk for :func:`bytes_per_voxel_spectral` passes."""
     avail = get_available_memory(device, empty_cache=False)
