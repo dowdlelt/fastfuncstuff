@@ -3840,3 +3840,51 @@ def test_a_vanishing_float64_prediction_keeps_a_storable_gain():
     gain, _, jacobian, _ = _variable_projection_terms(data, prediction, derivatives)
     assert torch.isfinite(gain.float()).all()
     assert torch.isfinite(jacobian).all()
+
+
+@pytest.mark.parametrize("kind", ["bars", "dense"])
+def test_float64_drives_skip_empty_lines_without_changing_them(kind):
+    """The float64 contraction only multiplies occupied lines; it must equal the dense one."""
+    from fastfuncstuff.design.prf import (
+        _compress_aperture_runs,
+        _separable_drives,
+        _separable_gaussian,
+    )
+
+    rows = columns = 12
+    generator = torch.Generator().manual_seed(5)
+    frames = []
+    for t in range(40):  # > columns distinct frames, so several frame blocks
+        frame = torch.zeros(rows, columns, dtype=torch.float64)
+        if kind == "dense":
+            frame = torch.rand(rows, columns, generator=generator, dtype=torch.float64)
+        elif t % 5:  # every fifth frame blank
+            if t % 2:
+                frame[:, t % columns] = 1.0  # vertical bar
+            else:
+                frame[t % rows, 2:9] = 1.0  # horizontal bar, part width
+        frames.append(frame.reshape(-1))
+    run = _compress_aperture_runs([torch.stack(frames)], (rows, columns))[0]
+    parameters = torch.stack(
+        [
+            torch.rand(30, generator=generator, dtype=torch.float64) * 16 - 2,
+            torch.rand(30, generator=generator, dtype=torch.float64) * 16 - 2,
+            torch.rand(30, generator=generator, dtype=torch.float64) * 3 + 0.2,
+            torch.rand(30, generator=generator, dtype=torch.float64),
+        ],
+        dim=1,
+    )
+    row_delta, column_delta, row_profile, column_profile, _, _ = _separable_gaussian(
+        parameters, (rows, columns)
+    )
+    column_profiles = torch.stack([column_profile, column_profile * column_delta])
+    row_weights = [(row_profile, 0), (row_profile * row_delta, 0), (row_profile, 1)]
+    got = _separable_drives(run, column_profiles, row_weights)
+
+    pixels = run.frames.view(run.n_frames, rows, columns)
+    for drive, (row_weight, j) in zip(got, row_weights, strict=True):
+        expected = torch.einsum("frc,vr,vc->fv", pixels, row_weight, column_profiles[j])
+        # Summation order differs from the einsum's, and the signed derivative
+        # weights cancel, so the yardstick is each output's own scale: ~1e-15 seen.
+        scale = expected.abs().max().item()
+        torch.testing.assert_close(drive, expected, rtol=0, atol=1e-13 * scale)
