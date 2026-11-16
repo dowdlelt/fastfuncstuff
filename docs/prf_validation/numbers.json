@@ -104,7 +104,7 @@
     "analyzeprf_workers": 6,
     "analyzeprf_vertices": 52932,
     "ffs_parity_s": 254.338083394,
-    "ffs_cortex_s": 305.141916424,
+    "ffs_cortex_s": 293.663424065,
     "ffs_cortex_vertices_loaded": 384042,
     "ffs_cortex_vertices_fit": 52932,
     "speedup_same_vertices": 58.184194594544564
@@ -156,8 +156,8 @@
           "n": 4707
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.07743242080871496,
-          "intercept": 0.9161320866973468,
+          "slope": 0.07575562675490866,
+          "intercept": 0.9212385292076489,
           "n": 4706
         }
       },
@@ -178,8 +178,8 @@
           "n": 4726
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.2387979867511437,
-          "intercept": 0.6733516613114461,
+          "slope": 0.24159756109482625,
+          "intercept": 0.6659863150566347,
           "n": 4722
         }
       },
@@ -200,33 +200,33 @@
           "n": 3021
         },
         "ffs_pyrf library+denoise": {
-          "slope": 0.3027969934139591,
-          "intercept": 0.7320538186964517,
-          "n": 3018
+          "slope": 0.30535944196437326,
+          "intercept": 0.7214860580733203,
+          "n": 3017
         }
       }
     },
     "library_denoise_vs_vistasoft": {
-      "n": 12446,
-      "size_median_ratio": 0.9088360002714407,
-      "size_r_log": 0.6049817643170572
+      "n": 12445,
+      "size_median_ratio": 0.9099281617174567,
+      "size_r_log": 0.6081765022633696
     }
   },
   "identifiability": {
     "split_half_rfsize_rel_change_cut": 0.25,
     "stable": {
-      "n": 15096,
-      "rfsize_r_log": 0.9208372862443441,
-      "rfsize_within_1p5x": 0.7316507684154743,
-      "exponent_r_log": 0.8886228333637709,
-      "ev_median_abs_diff": 0.07112635002141943
+      "n": 14924,
+      "rfsize_r_log": 0.9231475180378776,
+      "rfsize_within_1p5x": 0.7340525328330206,
+      "exponent_r_log": 0.8908926874442451,
+      "ev_median_abs_diff": 0.07117145536090419
     },
     "unstable": {
-      "n": 22614,
-      "rfsize_r_log": 0.9166237977173128,
-      "rfsize_within_1p5x": 0.6237728840541258,
-      "exponent_r_log": 0.714922161976063,
-      "ev_median_abs_diff": 0.08288773871356092
+      "n": 22786,
+      "rfsize_r_log": 0.9167905517820099,
+      "rfsize_within_1p5x": 0.6230141314842447,
+      "exponent_r_log": 0.7133218047446845,
+      "ev_median_abs_diff": 0.08343844210441631
     }
   },
   "profiles": {

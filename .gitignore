@@ -67,6 +67,7 @@ docs/REFERENCE_CODE.md
 *.pdf
 *.svg
 !docs/benchmarks/**/*.png
+!docs/prf_validation/*.png
 
 # AFNI files
 *.BRIK
