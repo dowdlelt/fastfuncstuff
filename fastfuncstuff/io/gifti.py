@@ -11,16 +11,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import dataclass
 
 import numpy as np
 
 __all__ = [
     "HISTORY_KEY",
+    "GiftiHeader",
+    "gifti_header",
     "with_history",
     "load_gifti_data",
     "load_gifti_surface",
     "mesh_fingerprint",
     "save_gifti_data",
+    "save_gifti_series_external",
     "save_gifti_surface",
 ]
 
@@ -87,15 +91,246 @@ def save_gifti_data(
     nib.save(img, os.fspath(path))
 
 
-def load_gifti_data(path: str | os.PathLike) -> tuple[np.ndarray, dict[str, str]]:
-    """``(V, T)`` (or ``(V,)`` for one array) and the file-level metadata."""
+@dataclass(frozen=True)
+class GiftiHeader:
+    """What a ``.gii`` holds, read without decoding its data."""
+
+    n_arrays: int
+    n_vertices: int  # Dim0 of the first array
+    meta: dict[str, str]
+
+
+def gifti_header(path: str | os.PathLike) -> GiftiHeader:
+    """Array count, vertex count and file-level metadata of a ``.gii``, cheaply.
+
+    nibabel parses and base64-decodes the whole file to answer any of these: about
+    1.5 s for a 390 MB series, and one ffs_pyrf fit used to ask some 26 times. The
+    file-level MetaData precedes the first DataArray, so it is parsed on its own;
+    the arrays are counted by their opening tags.
+    """
+    import mmap
+    import re
+    import xml.etree.ElementTree as ET
+
+    with (
+        open(os.fspath(path), "rb") as fh,
+        mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm,
+    ):
+        first = mm.find(b"<DataArray")
+        if first < 0:
+            raise ValueError(f"{path} has no DataArray")
+        head = bytes(mm[:first])
+        tag = bytes(mm[first : mm.find(b">", first) + 1])
+        n_arrays, at = 0, first
+        while at >= 0:
+            n_arrays += 1
+            at = mm.find(b"<DataArray", at + len(b"<DataArray"))
+    dim0 = re.search(rb'Dim0\s*=\s*"(\d+)"', tag)
+    if dim0 is None:
+        raise ValueError(f"{path}: first DataArray has no Dim0")
+    meta: dict[str, str] = {}
+    start = head.find(b"<MetaData")
+    if start >= 0:
+        stop = head.find(b"</MetaData>", start)
+        block = head[start : stop + len(b"</MetaData>")] if stop >= 0 else b"<MetaData/>"
+        for md in ET.fromstring(block).iter("MD"):
+            name, value = md.find("Name"), md.find("Value")
+            if name is not None and name.text is not None:
+                meta[name.text] = "" if value is None or value.text is None else value.text
+    return GiftiHeader(n_arrays=n_arrays, n_vertices=int(dim0.group(1)), meta=meta)
+
+
+@dataclass(frozen=True)
+class _Array:
+    data: np.ndarray
+    intent: int
+    meta: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _Gifti:
+    darrays: list[_Array]
+    meta: dict[str, str]
+
+
+def _md_dict(block: bytes) -> dict[str, str]:
+    import xml.etree.ElementTree as ET
+
+    out: dict[str, str] = {}
+    for md in ET.fromstring(block).iter("MD"):
+        name, value = md.find("Name"), md.find("Value")
+        if name is not None and name.text is not None:
+            out[name.text] = "" if value is None or value.text is None else value.text
+    return out
+
+
+def _read_gifti(path: str | os.PathLike) -> _Gifti | None:
+    """The data arrays of a base64 ``.gii``, decoded straight from the file.
+
+    nibabel streams the base64 text through expat's Python callbacks before it
+    decodes it; on a 190 MB series that is about 60% of a 1.2 s load. Slicing each
+    ``<Data>`` element out of a memory map and decoding it in one call gives the
+    same arrays, bit for bit. Returns None for anything else it does not handle
+    (ASCII or external-file encodings, unknown types), and the caller falls back to
+    nibabel, so the result never depends on which reader ran.
+    """
+    import base64
+    import mmap
+    import re
+    import zlib
+
     import nibabel as nib
 
+    codes = nib.nifti1.data_type_codes
+    attr = re.compile(rb'(\w+)\s*=\s*"([^"]*)"')
+    with (
+        open(os.fspath(path), "rb") as fh,
+        mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm,
+    ):
+        first = mm.find(b"<DataArray")
+        if first < 0:
+            return None
+        head = bytes(mm[:first])
+        start = head.find(b"<MetaData")
+        file_meta: dict[str, str] = {}
+        if start >= 0:
+            stop = head.find(b"</MetaData>", start)
+            if stop >= 0:
+                file_meta = _md_dict(head[start : stop + len(b"</MetaData>")])
+        arrays: list[_Array] = []
+        external: dict[str, np.memmap] = {}
+        at = first
+        while at >= 0:
+            tag_end = mm.find(b">", at)
+            attrs = {k.decode(): v.decode() for k, v in attr.findall(bytes(mm[at : tag_end + 1]))}
+            next_array = mm.find(b"<DataArray", tag_end)
+            end = next_array if next_array >= 0 else len(mm)
+            try:
+                dtype = np.dtype(codes.dtype[attrs["DataType"]])
+            except KeyError:
+                return None
+            dtype = dtype.newbyteorder(
+                "<" if attrs.get("Endian", "LittleEndian") == "LittleEndian" else ">"
+            )
+            ndim = int(attrs.get("Dimensionality", "1"))
+            shape = tuple(int(attrs[f"Dim{k}"]) for k in range(ndim))
+            order = "F" if attrs.get("ArrayIndexingOrder") == "ColumnMajorOrder" else "C"
+            encoding = attrs.get("Encoding")
+            if encoding == "ExternalFileBinary":
+                name = attrs.get("ExternalFileName", "")
+                ext = os.path.join(os.path.dirname(os.fspath(path)), name)
+                if not name or not os.path.isfile(ext):
+                    return None
+                if ext not in external:
+                    external[ext] = np.memmap(ext, dtype=np.uint8, mode="r")
+                offset = int(attrs.get("ExternalFileOffset", "0"))
+                count = int(np.prod(shape)) * dtype.itemsize
+                block = external[ext][offset : offset + count]
+                if block.size != count:
+                    return None
+                data = np.array(block).view(dtype).reshape(shape, order=order)
+            elif encoding in ("Base64Binary", "GZipBase64Binary"):
+                # Exactly <Data>: the coordinate system's <DataSpace> also starts
+                # "<Data".
+                open_data = mm.find(b"<Data>", tag_end, end)
+                # Backwards from the next array: a forward search would scan the
+                # whole base64 block a second time.
+                close_data = mm.rfind(b"</Data>", open_data, end)
+                if open_data < 0 or close_data < 0:
+                    return None
+                raw = base64.b64decode(mm[open_data + len(b"<Data>") : close_data])
+                if encoding == "GZipBase64Binary":
+                    raw = zlib.decompress(raw)
+                data = np.frombuffer(bytearray(raw), dtype=dtype).reshape(shape, order=order)
+            else:
+                return None
+            # An array's MetaData precedes its <Data>; bounding the search there
+            # keeps it out of the data.
+            data_at = mm.find(b"<Data", tag_end, end)
+            meta_end = data_at if data_at >= 0 else end
+            meta_start = mm.find(b"<MetaData", tag_end, meta_end)
+            meta: dict[str, str] = {}
+            if meta_start >= 0:
+                meta_stop = mm.find(b"</MetaData>", meta_start, meta_end)
+                if meta_stop >= 0:
+                    meta = _md_dict(bytes(mm[meta_start : meta_stop + len(b"</MetaData>")]))
+            intent = nib.nifti1.intent_codes.code[attrs.get("Intent", "NIFTI_INTENT_NONE")]
+            arrays.append(_Array(data=data, intent=int(intent), meta=meta))
+            at = next_array
+    return _Gifti(darrays=arrays, meta=file_meta)
+
+
+def _load_gifti(path: str | os.PathLike):
+    import nibabel as nib
+
+    fast = _read_gifti(path)
+    if fast is not None:
+        return fast
     img = nib.load(os.fspath(path))
     assert isinstance(img, nib.gifti.GiftiImage)
+    return img
+
+
+def load_gifti_data(path: str | os.PathLike) -> tuple[np.ndarray, dict[str, str]]:
+    """``(V, T)`` (or ``(V,)`` for one array) and the file-level metadata."""
+    img = _load_gifti(path)
     cols = [np.asarray(a.data, np.float32) for a in img.darrays]
     data = cols[0] if len(cols) == 1 else np.stack(cols, axis=1)
     return data, dict(img.meta)
+
+
+def save_gifti_series_external(
+    path: str | os.PathLike, data: np.ndarray, meta: dict[str, str] | None = None
+) -> str:
+    """A ``(V, T)`` float32 series as a GIfTI whose arrays live in a raw ``.dat`` file.
+
+    For intermediates ffs writes and reads back itself (the merged hemispheres):
+    base64 costs a full encode on write and a GIL-bound decode on every read, about
+    1 s each for a 390 MB run, where raw binary is a plain copy. ExternalFileBinary
+    is part of the GIfTI standard and nibabel and Workbench read it; nibabel cannot
+    write it, hence this writer. Frames are stored one after another, so each array
+    is one contiguous block. Returns the ``.dat`` path, which must travel with the
+    ``.gii``.
+    """
+    import xml.etree.ElementTree as ET
+
+    d = np.asarray(data, np.float32)
+    if d.ndim != 2:
+        raise ValueError(f"expected (vertices, frames), got {d.shape}")
+    n_vertices, n_frames = d.shape
+    out = os.fspath(path)
+    dat = (out[: -len(".gii")] if out.endswith(".gii") else out) + ".dat"
+    with open(dat, "wb") as fh:
+        np.ascontiguousarray(d.T, dtype="<f4").tofile(fh)
+    root = ET.Element("GIFTI", Version="1.0", NumberOfDataArrays=str(n_frames))
+    md = ET.SubElement(root, "MetaData")
+    for key, value in with_history(meta).items():
+        entry = ET.SubElement(md, "MD")
+        ET.SubElement(entry, "Name").text = key
+        ET.SubElement(entry, "Value").text = value
+    ET.SubElement(root, "LabelTable")
+    for t in range(n_frames):
+        array = ET.SubElement(
+            root,
+            "DataArray",
+            Intent="NIFTI_INTENT_TIME_SERIES",
+            DataType="NIFTI_TYPE_FLOAT32",
+            ArrayIndexingOrder="RowMajorOrder",
+            Dimensionality="1",
+            Dim0=str(n_vertices),
+            Encoding="ExternalFileBinary",
+            Endian="LittleEndian",
+            ExternalFileName=os.path.basename(dat),
+            ExternalFileOffset=str(t * n_vertices * 4),
+        )
+        ET.SubElement(array, "MetaData")
+        ET.SubElement(array, "Data")
+    body = ET.tostring(root, encoding="unicode")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        fh.write('<!DOCTYPE GIFTI SYSTEM "http://www.nitrc.org/frs/download.php/115/gifti.dtd">\n')
+        fh.write(body)
+    return dat
 
 
 def save_gifti_surface(
@@ -222,8 +457,7 @@ def gifti_as_nifti(path: str | os.PathLike):
     """A ``.gii`` data file as a ``(V, 1, 1, T)`` (or ``(V, 1, 1)``) NIfTI-2 image."""
     import nibabel as nib
 
-    img = nib.load(os.fspath(path))
-    assert isinstance(img, nib.gifti.GiftiImage)
+    img = _load_gifti(path)
     if any(a.intent in (1008, 1009) for a in img.darrays):  # POINTSET / TRIANGLE
         raise ValueError(f"{path} is a surface geometry file, not per-vertex data")
     cols = [np.asarray(a.data, np.float32).reshape(-1) for a in img.darrays]

@@ -1217,6 +1217,14 @@ def _peek_run_length(run_file: str | Path) -> int | None:
                 return None
             hdr = nib.Nifti1Header.from_fileobj(io.BytesIO(head), check=False)
             shape = hdr.get_data_shape()
+        elif str(path).lower().endswith(".gii"):
+            # nib.load(...).shape would parse the whole file and then fail: a
+            # GiftiImage has no shape. A series is one array per time point
+            # (gifti_as_nifti), so the array count is the length.
+            from fastfuncstuff.io.gifti import gifti_header
+
+            n_arrays = gifti_header(path).n_arrays
+            return n_arrays if n_arrays > 1 else 1
         else:
             shape = nib.load(str(path)).shape  # ty: ignore[unresolved-attribute]  # stub gap: FileBasedImage
         return int(shape[3]) if len(shape) > 3 else 1

@@ -168,6 +168,9 @@ def test_reuse_requires_the_same_settings_and_a_source_no_newer(tmp_path):
     settings = {"subject": "s", "mesh": "native", "hemis": ["lh"], "depths": [0.5], "sampling": "f"}
     sidecar.write_text(json.dumps({**settings, "source": str(source)}))
 
+    # The series lives in a raw .dat beside the .gii; without it nothing can be read.
+    assert not _reusable(str(merged), sidecar, str(source), settings)
+    (tmp_path / "run-01.native.func.dat").write_bytes(b"")
     assert _reusable(str(merged), sidecar, str(source), settings)
     assert not _reusable(str(merged), sidecar, str(source), {**settings, "depths": [0.1, 0.9]})
 
@@ -296,6 +299,21 @@ def test_the_merged_result_splits_back_to_the_hemispheres_it_came_from(tmp_path)
             .resolve()
             .name.startswith(f"geom.{hemi}")
         )
+
+
+def test_split_outputs_point_at_real_geometry_from_where_they_are_written(tmp_path):
+    """ffs_pyrf writes {prefix}.func.gii beside {prefix}_hemi/, not in it. Each half's
+    geometry pointer was relative to the merge folder and so pointed nowhere."""
+    files = _hemi_runs(tmp_path, n_runs=1, n_vertices=3, n_times=5)
+    grouped, hemis = group_hemisphere_files(files["lh"])
+    out = tmp_path / "results"
+    out.mkdir()
+    sample = merge_hemisphere_runs(grouped, hemis, out_dir=out / "fit_hemi", verb=0)
+    data, meta = load_gifti_data(sample.runs[0])
+    save_gifti_data(out / "fit.func.gii", data, meta, time_series=False)
+    for part, hemi in zip(split_merged_surface(out / "fit.func.gii"), hemis, strict=True):
+        pointer = Path(part).parent / load_gifti_data(part)[1]["geometry"]
+        assert pointer.resolve() == (tmp_path / f"geom.{hemi}.midthickness.surf.gii").resolve()
 
 
 def test_merge_without_findable_geometry_still_merges(tmp_path):

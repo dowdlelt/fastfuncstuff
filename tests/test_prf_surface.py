@@ -473,3 +473,43 @@ def test_noise_pool_mask_is_refused_paired_and_says_what_to_use(tmp_path):
             "-denoise", "-noise_pool_mask", "all",
             "-prefix", str(tmp_path / "x"), "-device", "cpu", "-verb", "0",
         ])  # fmt: skip
+
+
+def test_a_paired_fit_cleans_up_its_merge_and_points_outputs_at_real_meshes(
+    surface_runs, tmp_path
+):
+    """Both hemispheres in, one file per hemisphere out. The merged runs are a copy
+    of the inputs, so the default merge folder goes once the outputs are written;
+    -hemi_dir keeps them for the next fit."""
+    from pathlib import Path
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.gifti import load_gifti_data
+
+    runs, aperture, meta = surface_runs
+    paired = []
+    for index, run in enumerate(runs):
+        data, _ = load_gifti_data(run)
+        for hemi in ("lh", "rh"):
+            path = tmp_path / f"run{index}.{hemi}.func.gii"
+            save_gifti_data(path, data, meta=meta, time_series=True)
+            paired.append(str(path))
+    lh_runs = paired[::2]
+    out = tmp_path / "out"
+    out.mkdir()
+
+    assert main(_argv(lh_runs, aperture, str(out / "prf.func.gii"))) == 0
+    assert not (out / "prf_hemi").exists()
+    for hemi in ("lh", "rh"):
+        part = out / f"prf.{hemi}.func.gii"
+        pointer = part.parent / load_gifti_data(part)[1]["geometry"]
+        assert pointer.resolve() == (tmp_path / "mesh.surf.gii").resolve()
+
+    keep = tmp_path / "merged"
+    assert main(_argv(lh_runs, aperture, str(out / "kept.func.gii"), "-hemi_dir", str(keep))) == 0
+    assert sorted(Path(p).name for p in keep.glob("run-*")) == [
+        "run-01.merged.func.dat",
+        "run-01.merged.func.gii",
+        "run-02.merged.func.dat",
+        "run-02.merged.func.gii",
+    ]

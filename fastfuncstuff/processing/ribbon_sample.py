@@ -31,10 +31,12 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.io.gifti import (
+    gifti_header,
     load_gifti_data,
     load_gifti_surface,
     mesh_fingerprint,
     save_gifti_data,
+    save_gifti_series_external,
     save_gifti_surface,
 )
 
@@ -138,7 +140,20 @@ def _merge_data(
         at += size
         del block
     assert merged is not None
-    save_gifti_data(out_path, merged if merged.shape[1] > 1 else merged[:, 0], meta, time_series)
+    if time_series and merged.shape[1] > 1:
+        # Raw binary beside the .gii: the fit reads this straight back, and base64
+        # would cost an encode here and a GIL-bound decode there, ~1 s each a run.
+        save_gifti_series_external(out_path, merged, meta)
+    else:
+        save_gifti_data(
+            out_path, merged if merged.shape[1] > 1 else merged[:, 0], meta, time_series
+        )
+
+
+def _merged_series_present(merged: str) -> bool:
+    """The merged run and its raw data file both exist (older merges were base64
+    and have no .dat; they are redone once)."""
+    return Path(merged).is_file() and Path(merged).with_suffix(".dat").is_file()
 
 
 def _geometry(
@@ -156,7 +171,10 @@ def _geometry(
                 "start": at,
                 "stop": at + size,
                 "mesh_fingerprint": load_gifti_surface(path)[2]["mesh_fingerprint"],
-                "geometry": os.path.relpath(path, out),
+                # Absolute: outputs carrying these bounds are written outside
+                # ``out`` ({prefix} beside {prefix}_hemi), and split_merged_surface
+                # makes the pointer relative to wherever each half lands.
+                "geometry": os.path.abspath(path),
             }
         )
         at += size
@@ -165,7 +183,7 @@ def _geometry(
 
 def _reusable(merged: str, sidecar: Path, source: str, settings: dict) -> bool:
     """Was this run already sampled the same way, from a source no newer than it?"""
-    if not Path(merged).is_file() or not sidecar.is_file():
+    if not _merged_series_present(merged) or not sidecar.is_file():
         return False
     try:
         recorded = json.loads(sidecar.read_text())
@@ -269,7 +287,7 @@ def sample_runs_to_ribbon(
             continue
 
         per_hemi = [f"{prefix}.{space}.{hemi}.func.gii" for hemi in hemis]
-        source_meta = load_gifti_data(per_hemi[0])[1]
+        source_meta = gifti_header(per_hemi[0]).meta
         meta = {
             key: source_meta[key]
             for key in ("subject", "mesh", "depths", "equivolume", "sampling", "TR_seconds")
@@ -472,7 +490,7 @@ def _hemi_geometry(per_hemi: list[str], hemis: list[str], out: Path, space: str)
     """
     paths = []
     for path in per_hemi:
-        meta = load_gifti_data(path)[1]
+        meta = gifti_header(path).meta
         pointer = meta.get("geometry")
         if not pointer:
             return None, None
@@ -490,7 +508,10 @@ def _hemi_geometry(per_hemi: list[str], hemis: list[str], out: Path, space: str)
                 "start": at,
                 "stop": at + len(block),
                 "mesh_fingerprint": load_gifti_surface(path)[2]["mesh_fingerprint"],
-                "geometry": os.path.relpath(path, out),
+                # Absolute: outputs carrying these bounds are written outside
+                # ``out`` ({prefix} beside {prefix}_hemi), and split_merged_surface
+                # makes the pointer relative to wherever each half lands.
+                "geometry": os.path.abspath(path),
             }
         )
         at += len(block)
@@ -519,13 +540,15 @@ def merge_hemisphere_runs(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     geometry, merged_geometry = _hemi_geometry(grouped[0], hemis, out, space)
-    sizes = [load_gifti_data(path)[0].shape[0] for path in grouped[0]]
+    # Headers only: fully parsing each file for its size and metadata cost about as
+    # much as the merge itself.
+    sizes = [gifti_header(path).n_vertices for path in grouped[0]]
     if geometry is None:
         # No mesh to point at: the ranges still come from the data, and each
         # hemisphere's own fingerprint keeps a result from being paired wrongly.
         bounds, at = [], 0
         for hemi, size, path in zip(hemis, sizes, grouped[0], strict=True):
-            meta = load_gifti_data(path)[1]
+            meta = gifti_header(path).meta
             bounds.append(
                 {
                     "hemi": hemi,
@@ -547,12 +570,12 @@ def merge_hemisphere_runs(
     runs = []
     for index, per_hemi in enumerate(grouped, start=1):
         merged = str(out / f"run-{index:02d}.{space}.func.gii")
-        if reuse and Path(merged).is_file() and _no_older_than(merged, per_hemi):
+        if reuse and _merged_series_present(merged) and _no_older_than(merged, per_hemi):
             runs.append(merged)
             if verb >= 1:
                 print(f"    reusing {Path(merged).name}")
             continue
-        source_meta = load_gifti_data(per_hemi[0])[1]
+        source_meta = gifti_header(per_hemi[0]).meta
         meta = {
             key: source_meta[key]
             for key in ("subject", "mesh", "depths", "equivolume", "sampling", "TR_seconds")

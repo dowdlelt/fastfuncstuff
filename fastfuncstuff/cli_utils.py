@@ -702,7 +702,7 @@ def load_and_preprocess_runs(
 
     # A one-dimensional surface can share a vertex count with an unrelated mesh.
     # Never treat it as an ordinary grid without checking every input's identity.
-    from fastfuncstuff.io.gifti import is_gifti, surface_meta
+    from fastfuncstuff.io.gifti import gifti_header, is_gifti, surface_meta
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
     if any(is_gifti(str(path).split("[")[0]) != surface_input for path in input_files):
@@ -713,19 +713,22 @@ def load_and_preprocess_runs(
         fingerprint = (surface_meta(first_img.header) or {}).get("mesh_fingerprint")
         if not fingerprint:
             raise ValueError("Surface input needs mesh_fingerprint metadata")
+
+        # Headers, not load_nifti: a .gii has no lazy header, so loading one decodes
+        # all of it -- six whole runs re-read here only to compare two fields.
+        def same_mesh(path) -> bool:
+            header = gifti_header(str(path).split("[")[0])
+            return (header.n_vertices, 1, 1) == volume_shape and header.meta.get(
+                "mesh_fingerprint"
+            ) == fingerprint
+
         for path in input_files[1:]:
-            img = load_nifti(path)
-            other = (surface_meta(img.header) or {}).get("mesh_fingerprint")
-            if img.shape[:3] != volume_shape or other != fingerprint:
+            if not same_mesh(path):
                 raise ValueError(f"Surface run {path} does not match the first run's mesh")
         if mask_file:
             if not is_gifti(str(mask_file).split("[")[0]):
                 raise ValueError("A surface input needs a GIfTI mask on the same mesh")
-            mask_img = load_nifti(mask_file)
-            if (
-                mask_img.shape[:3] != volume_shape
-                or (surface_meta(mask_img.header) or {}).get("mesh_fingerprint") != fingerprint
-            ):
+            if not same_mesh(mask_file):
                 raise ValueError("Surface mask does not match the input mesh")
         if mask_array is not None:
             raise ValueError("Surface mask arrays have no mesh identity; pass a GIfTI mask file")
@@ -3426,7 +3429,9 @@ def add_hemi_pairing_args(group, tool: str = "the fit") -> None:
         "-hemi-dir",
         metavar="DIR",
         default=None,
-        help="Where the merged runs go. Default: {prefix}_hemi.",
+        help="Where the merged runs go, kept for reuse by the next fit of the same runs."
+        " Default: {prefix}_hemi, removed once the outputs are written (the merged"
+        " runs are as large as the inputs).",
     )
 
 
@@ -3478,6 +3483,25 @@ def pair_hemisphere_inputs(args, parser, input_files: list[str], stem: str, mask
         )
     except (FileNotFoundError, ValueError) as error:
         parser.error(f"-hemi_pair: {error}")
+
+
+def remove_hemi_merge(sample, verbose: bool = True) -> None:
+    """Delete the merged dataset :func:`pair_hemisphere_inputs` wrote by default.
+
+    The merged runs are a copy of the inputs: a whole-cortex fit left 2.3 GB per
+    prefix, and a validation sweep filled a disk with them. Only the files the
+    merge wrote are removed, and the folder only if that empties it.
+    """
+    files = [Path(run) for run in sample.runs]
+    files += [path.with_suffix(".dat") for path in files]
+    files += [Path(p) for p in (sample.mask, sample.geometry) if p]
+    for path in files:
+        path.unlink(missing_ok=True)
+    folder = Path(sample.runs[0]).parent if sample.runs else None
+    if folder is not None and folder.is_dir() and not any(folder.iterdir()):
+        folder.rmdir()
+    if verbose and folder is not None:
+        print(f"  removed the merged runs in {folder.name}/ (-hemi_dir keeps them)")
 
 
 def split_ribbon_outputs(stem: str, verbose: bool = True) -> list[str]:
