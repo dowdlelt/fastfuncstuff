@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.io.gifti import (
+    gifti_header,
     load_gifti_data,
     load_gifti_surface,
     mesh_fingerprint,
@@ -269,7 +270,7 @@ def sample_runs_to_ribbon(
             continue
 
         per_hemi = [f"{prefix}.{space}.{hemi}.func.gii" for hemi in hemis]
-        source_meta = load_gifti_data(per_hemi[0])[1]
+        source_meta = gifti_header(per_hemi[0]).meta
         meta = {
             key: source_meta[key]
             for key in ("subject", "mesh", "depths", "equivolume", "sampling", "TR_seconds")
@@ -472,7 +473,7 @@ def _hemi_geometry(per_hemi: list[str], hemis: list[str], out: Path, space: str)
     """
     paths = []
     for path in per_hemi:
-        meta = load_gifti_data(path)[1]
+        meta = gifti_header(path).meta
         pointer = meta.get("geometry")
         if not pointer:
             return None, None
@@ -519,13 +520,15 @@ def merge_hemisphere_runs(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     geometry, merged_geometry = _hemi_geometry(grouped[0], hemis, out, space)
-    sizes = [load_gifti_data(path)[0].shape[0] for path in grouped[0]]
+    # Headers only: fully parsing each file for its size and metadata cost about as
+    # much as the merge itself.
+    sizes = [gifti_header(path).n_vertices for path in grouped[0]]
     if geometry is None:
         # No mesh to point at: the ranges still come from the data, and each
         # hemisphere's own fingerprint keeps a result from being paired wrongly.
         bounds, at = [], 0
         for hemi, size, path in zip(hemis, sizes, grouped[0], strict=True):
-            meta = load_gifti_data(path)[1]
+            meta = gifti_header(path).meta
             bounds.append(
                 {
                     "hemi": hemi,
@@ -552,7 +555,7 @@ def merge_hemisphere_runs(
             if verb >= 1:
                 print(f"    reusing {Path(merged).name}")
             continue
-        source_meta = load_gifti_data(per_hemi[0])[1]
+        source_meta = gifti_header(per_hemi[0]).meta
         meta = {
             key: source_meta[key]
             for key in ("subject", "mesh", "depths", "equivolume", "sampling", "TR_seconds")

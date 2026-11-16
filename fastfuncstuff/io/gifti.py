@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import dataclass
 
 import numpy as np
 
 __all__ = [
     "HISTORY_KEY",
+    "GiftiHeader",
+    "gifti_header",
     "with_history",
     "load_gifti_data",
     "load_gifti_surface",
@@ -85,6 +88,55 @@ def save_gifti_data(
     ]
     img = nib.gifti.GiftiImage(darrays=arrays, meta=nib.gifti.GiftiMetaData(with_history(meta)))
     nib.save(img, os.fspath(path))
+
+
+@dataclass(frozen=True)
+class GiftiHeader:
+    """What a ``.gii`` holds, read without decoding its data."""
+
+    n_arrays: int
+    n_vertices: int  # Dim0 of the first array
+    meta: dict[str, str]
+
+
+def gifti_header(path: str | os.PathLike) -> GiftiHeader:
+    """Array count, vertex count and file-level metadata of a ``.gii``, cheaply.
+
+    nibabel parses and base64-decodes the whole file to answer any of these: about
+    1.5 s for a 390 MB series, and one ffs_pyrf fit used to ask some 26 times. The
+    file-level MetaData precedes the first DataArray, so it is parsed on its own;
+    the arrays are counted by their opening tags.
+    """
+    import mmap
+    import re
+    import xml.etree.ElementTree as ET
+
+    with (
+        open(os.fspath(path), "rb") as fh,
+        mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm,
+    ):
+        first = mm.find(b"<DataArray")
+        if first < 0:
+            raise ValueError(f"{path} has no DataArray")
+        head = bytes(mm[:first])
+        tag = bytes(mm[first : mm.find(b">", first) + 1])
+        n_arrays, at = 0, first
+        while at >= 0:
+            n_arrays += 1
+            at = mm.find(b"<DataArray", at + len(b"<DataArray"))
+    dim0 = re.search(rb'Dim0\s*=\s*"(\d+)"', tag)
+    if dim0 is None:
+        raise ValueError(f"{path}: first DataArray has no Dim0")
+    meta: dict[str, str] = {}
+    start = head.find(b"<MetaData")
+    if start >= 0:
+        stop = head.find(b"</MetaData>", start)
+        block = head[start : stop + len(b"</MetaData>")] if stop >= 0 else b"<MetaData/>"
+        for md in ET.fromstring(block).iter("MD"):
+            name, value = md.find("Name"), md.find("Value")
+            if name is not None and name.text is not None:
+                meta[name.text] = "" if value is None or value.text is None else value.text
+    return GiftiHeader(n_arrays=n_arrays, n_vertices=int(dim0.group(1)), meta=meta)
 
 
 def load_gifti_data(path: str | os.PathLike) -> tuple[np.ndarray, dict[str, str]]:
