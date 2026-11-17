@@ -125,6 +125,13 @@ class Viewport:
     strip: int = 0
     strip_step: int = 0
     strip_zoom: float = 4.0
+    #: Slab projection of the overlays, ``slab_mm`` thick and centred on the
+    #: slice (0 = off): each overlay is reduced across the slab by
+    #: ``slab_mode`` (mip / minip / mean) while the base stays one slice, so a
+    #: vessel or a band map that winds through slices is drawn whole over the
+    #: anatomy it sits in. The 2-D cousin of the vox3d window's MIP.
+    slab_mm: float = 0.0
+    slab_mode: str = "mip"
 
     # -- graph ---------------------------------------------------------
     grid_n: int = 2
@@ -322,6 +329,8 @@ class Viewport:
             return f"depth · {self.depth_source}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
+        if self.is_image and self.slab_mm > 0:
+            extra += f" · {self.slab_mode} {self.slab_mm:g} mm"
         if self.tiles:
             extra += " · tiles"
         if self.is_graph:

@@ -209,6 +209,23 @@ class SetViewSolo(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewSlab(Command):
+    """Project this window's overlays across a slab ``mm`` thick (0 = off).
+
+    ``mode`` is how a slab reduces: ``mip`` keeps, per pixel, the slice whose
+    threshold statistic is largest (and its value, so colour and cut agree),
+    ``minip`` the smallest, ``mean`` the average. The base layer stays one slice.
+    """
+
+    name = "SET_VIEW_SLAB"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    mm: float
+    mode: str = "mip"
+
+
+@command
+@dataclass(frozen=True)
 class SetViewTiles(Command):
     """One tile per visible image in this window, sharing its slice, zoom and pan."""
 
@@ -2552,6 +2569,16 @@ def install(
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewSolo)
         return _set_view(st, cmd.view, SetViewSolo.aspects, solo=bool(cmd.on))
+
+    @bus.handle(SetViewSlab.name)
+    def _set_view_slab(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewSlab)
+        from fastfuncstuff.viewer.compose import SLAB_MODES
+
+        if cmd.mode not in SLAB_MODES:
+            raise ValueError(f"slab mode is one of {', '.join(SLAB_MODES)}, not {cmd.mode!r}")
+        mm = max(0.0, float(cmd.mm))
+        return _set_view(st, cmd.view, SetViewSlab.aspects, slab_mm=mm, slab_mode=cmd.mode)
 
     @bus.handle(SetViewTiles.name)
     def _set_view_tiles(cmd: Command, st: ViewerState) -> Aspect:
