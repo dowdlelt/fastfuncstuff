@@ -253,13 +253,14 @@ def test_cli_qc_writes_rates_and_maps_with_a_record(tmp_path):
                "-qc_label", "run-01", "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
     assert rc == 0
     rec = json.loads((tmp_path / "qc" / "records" / "12.physio.run-01.json").read_text())
-    assert [f["check"] for f in rec["figures"]] == ["rates", "maps"]
+    assert [f["check"] for f in rec["figures"]] == ["rates", "maps", "cardiac_mip"]
     for f in rec["figures"]:
         assert (tmp_path / "qc" / f["file"]).stat().st_size > 10_000
     m = rec["metrics"]
     assert abs(m["heart_rate"]["value"] - F_CARD * 60) < 2
     assert abs(m["breathing_rate"]["value"] - F_RESP * 60) < 2
     assert m["cardiac_r2_p95"]["value"] > 0.2  # the synthetic heartbeat is in every voxel
+    assert m["cardiac_found"]["value"] == 1
 
 
 def test_cli_tapas_nuisance_set_writes_physio_default_columns(tmp_path):

@@ -230,7 +230,9 @@ def _qc_figure(path: Path, traces, sources: dict, diag: dict) -> None:
     render.save_png(checks.physio_rates_figure(series, rates, sources), path)
 
 
-def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -> None:
+def _write_qc(
+    args, mag, X, labels, traces, sources, diag, affine, tr, device, refined=None
+) -> None:
     """-qc: tracked rates and traces, and where each group explains variance on the
     raw slices (the maps cost one batched fit per slice; only made under -qc)."""
     from fastfuncstuff.processing import physio
@@ -256,7 +258,12 @@ def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -
     rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
     rec.info["input"] = str(args.input)
     rec.info["sources"] = f"cardiac {sources['cardiac']}, respiration {sources['respiration']}"
-    checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask)
+    cardiac = (
+        None
+        if refined is None
+        else {"weight": refined.weight, "found": refined.found, "split_half": refined.split_half}
+    )
+    checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask, cardiac)
     rec.write(args.verb)
 
 
@@ -388,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
-    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device)
+    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device, refined)
     if args.tzero is not None:
         times = np.arange(nt) * tr + args.tzero
         if args.nuisance_set == "tapas":
