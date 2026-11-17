@@ -21,12 +21,24 @@ enough for the heartbeat that the 1 Hz volume rate aliases (figure 1C).
    locking onto a harmonic of the TR. Breathing rate comes from breath-to-breath peaks.
    Cycle phases come from the analytic signal. All spectral steps run on the trace
    resampled to an even grid, since excitations are not evenly spaced in time.
-3. **Breath depth (RVT) from the field's spatial gradients.** A smooth field is fitted
+3. **Cardiac from the vessels.** The brain-mean magnitude trace dilutes the heartbeat:
+   pulsation lives in a small fraction of voxels, each with its own sign and delay. Starting
+   from the mean trace's cardiac phase, every voxel is fitted with cos/sin of that phase at
+   its own excitation's times (the pair absorbs its delay and sign), and the trace is rebuilt
+   excitation by excitation from the best-fitting 1 % of voxels, weighted by fit. Weights
+   are fitted on alternate 20 s blocks and applied to the others, so no voxel's noise feeds
+   its own weight; eight passes. Against a pulse oximeter on five TASKFORCE runs, phase
+   locking to the pulse rose from 0.88–0.91 to 0.95–0.99. Two halves of the brain are
+   then refitted separately from the same start. They share a heartbeat but no voxels, so
+   if they disagree (median 30 s phase locking below 0.8) the heartbeat was **not found**.
+   That is reported, and the cardiac columns are left out of the nuisance
+   (`-card_unfound keep` keeps them). `PREFIX.cardiac_weight` maps where it was found.
+4. **Breath depth (RVT) from the field's spatial gradients.** A smooth field is fitted
    to each excitation's phase-change map. Breathing moves along a direction in the
    left–right, front–back and up–down gradients (figure 3D), and the first principal
    component of those gradients gives breath depth. The mean phase gives breath *timing*
    but not depth.
-4. **Regressors.** RETROICOR (cardiac and respiratory, 2nd order) and RVT at 0–4 s lags,
+5. **Regressors.** RETROICOR (cardiac and respiratory, 2nd order) and RVT at 0–4 s lags,
    evaluated at every slice's own acquisition time (`PREFIX.slibase.1D`, AFNI's
    slice-major layout, as `physio_calc.py` writes), and once at `-tzero` for a GLM on
    slice-timed data (`PREFIX.nuisance.1D`).
@@ -134,8 +146,14 @@ slices, with voxel maps correlated at 0.94–0.98.
 - **3-D EPI**: not supported (no excitation-rate samples). Respiration might still be read
   from phase at the volume rate; not built.
 - **Multi-echo**: refused for now; it should work (more samples per excitation) once tested.
-- **Weak cardiac in magnitude**: no fallback yet (a PESTICA-style decomposition per
-  excitation is the candidate).
+- **Cardiac needs a start.** The vessel refinement improves a heartbeat the mean trace
+  roughly has; it cannot find one from nothing. A voxel fitted with a free delay cannot tell
+  f from f ± k/TR, and a start 9/min off was never pulled back. On HiHiFaces (TR 0.67,
+  MB5, 1.6 mm, flip 31°, L–R phase encoding), every run tried was **not found**: the
+  cardiac band there is dominated by lines at 1/TR ± the breathing rate (72, 81, 98/min,
+  breathing 8.6/min) that survive per-voxel respiratory RETROICOR. A heart rate within
+  ~3/min of k/TR is undetectable from magnitude (it aliases to near zero in every voxel).
+  Finding a start without a recording is open (wiki: *Physiological noise from the data*).
 - **The respiratory trace lags the belt by ~1.5 s.** The clocks agree to the tick, so this
   is the belt (abdominal) against the field (lung volume), not a sync error. RETROICOR
   absorbs a constant lag; RVT carries 0–4 s lags.

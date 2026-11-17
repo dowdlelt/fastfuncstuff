@@ -264,7 +264,7 @@ GLM_ORTVEC: dict[str, dict[str, str]] = {
         "requires_hint": "-physio with -physio_mode nuisance",
         "note": "RVT (5 lags) + cardiac and respiratory RETROICOR from the data (ffs_physio), "
         "evaluated at tzero -- the instant every voxel stands for after the "
-        "slice-timed final resample",
+        "slice-timed final resample; cardiac only when a heartbeat was found",
     },
 }
 # What a bare `-glm_ortvec` (or a recipe asking for nuisance) selects. Entries

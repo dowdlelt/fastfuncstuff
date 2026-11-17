@@ -734,6 +734,13 @@ def bytes_per_slice_spikehunt(n_timepoints: int, ny: int, nx: int, window: int) 
     return int(n_timepoints * ny * nx * per_sample * 1.25)
 
 
+def bytes_per_voxel_cardiac_refine(n_timepoints: int) -> int:
+    """Per-voxel peak of one streamed pass of ``physio.refine_cardiac``: the float32
+    host row on the device, its accumulator-dtype copy (8 bytes) and, for the
+    sum-of-squares pass, its square; 1.5x for allocator slack."""
+    return int(n_timepoints * (4 + 8 + 8) * 1.5)
+
+
 def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device) -> int:
     """Voxels per chunk for :func:`bytes_per_voxel_spectral` passes."""
     avail = get_available_memory(device, empty_cache=False)

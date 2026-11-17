@@ -33,6 +33,7 @@ from scipy import signal
 
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+from fastfuncstuff.utils import accum_dtype
 
 from ..glm.core import construct_polynomial_matrix
 
@@ -53,6 +54,8 @@ class ExcitationTraces:
     # 1, x, y, z, x2, y2, z2, xy, xz, yz (coordinates in 100 mm units). See
     # field_breathing_trace for why the gradients carry breath depth.
     field_coef: np.ndarray | None = None
+    # (nt, G) cardiac trace from the vascular voxels (refine_cardiac), when made
+    cardiac: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
 
     def series(self, which: str, uniform: bool = False) -> tuple[np.ndarray, np.ndarray]:
@@ -64,9 +67,9 @@ class ExcitationTraces:
         treating them as uniform at 1/median spacing (16.7 Hz, true 17.0) put every
         frequency 2 % low -- heart rates 1.3-1.7/min under the reviewed beats.
         """
-        vals = self.magnitude if which == "magnitude" else self.phase
+        vals = {"magnitude": self.magnitude, "phase": self.phase, "weighted": self.cardiac}[which]
         if vals is None:
-            raise ValueError("no phase trace: the run was given without phase")
+            raise ValueError(f"no {which} trace on this run")
         order = np.argsort(self.times.ravel(), kind="stable")
         t, x = self.times.ravel()[order], vals.ravel()[order]
         return _uniform(t, x) if uniform else (t, x)
@@ -394,14 +397,14 @@ def track_rate(
     band: tuple[float, float],
     window: float,
     step: float = 2.0,
-    avoid: tuple[float, ...] = (),
+    avoid: tuple[float | tuple[float, float], ...] = (),
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Fundamental frequency over time within ``band``.
 
     Sliding Hann-windowed periodograms (zero-padded 16x, parabolic peak refinement),
     each window's peak searched near the previous one so a harmonic or a noise
     burst cannot capture the track. Frequencies within 0.03 Hz of any in ``avoid``
-    (the TR harmonics) are never chosen. Returns window centres, frequencies (Hz) and
+    (the TR harmonics) are never chosen; an entry ``(f, half_width)`` sets its own. Returns window centres, frequencies (Hz) and
     the peak prominence (in-band peak power over in-band median, on the whole-run
     spectrum) used to choose between magnitude and phase.
     """
@@ -414,7 +417,8 @@ def track_rate(
     def allowed(f: np.ndarray) -> np.ndarray:
         ok = (f >= band[0]) & (f <= band[1])
         for fa in avoid:
-            ok &= np.abs(f - fa) > 0.03
+            f0, w = fa if isinstance(fa, tuple) else (fa, 0.03)
+            ok &= np.abs(f - f0) > w
         return ok
 
     inb = allowed(f_all)
@@ -537,6 +541,23 @@ def _depth_rvt(traces: ExcitationTraces, t_r, x_r, rt, rf) -> np.ndarray:
     return respiration_volume(t_r, x_r, rt, rf)
 
 
+def _cardiac_input(traces, card_from, t_c, x_c, tr, f_resp):
+    """The cardiac trace as the tracker should see it, and the lines it must avoid.
+
+    The weighted trace (:func:`refine_cardiac`) gets the full avoid set it was built
+    with, breathing sidebands of k/TR included; the mean traces keep the k/TR-only
+    set they were validated with -- on TASKFORCE (TR 1 s, breathing 0.2-0.3 Hz) the
+    sidebands sit at 71-77/min, where real heart rates were."""
+    if card_from == "weighted":
+        avoid = cardiac_avoid(tr, f_resp)
+        t_c, x_c = _cardiac_series(traces.times, traces.cardiac, avoid)
+        return t_c, x_c, avoid
+    harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
+    if card_from == "magnitude":
+        x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
+    return t_c, x_c, harmonics
+
+
 def slice_regressors(
     traces: ExcitationTraces,
     card_from: str,
@@ -557,11 +578,9 @@ def slice_regressors(
     t_c, x_c = traces.series(card_from, uniform=True)
     t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
-    harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
-    if card_from == "magnitude":
-        x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
-    ct, cf, cprom = track_rate(t_c, x_c, CARDIAC_BAND, card_window, avoid=harmonics)
     rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND)
+    t_c, x_c, harmonics = _cardiac_input(traces, card_from, t_c, x_c, tr, float(np.median(rf)))
+    ct, cf, cprom = track_rate(t_c, x_c, CARDIAC_BAND, card_window, avoid=harmonics)
     phi_c = cycle_phase(t_c, x_c, cf)
     phi_r = cycle_phase(t_r, x_r, rf)
     rv = _depth_rvt(traces, t_r, x_r, rt, rf)
@@ -603,6 +622,311 @@ def slice_regressors(
         "series": {"t_card": t_c, "phi_card": phi_c, "t_resp": t_r, "phi_resp": phi_r, "rv": rv},
     }
     return np.stack(cols, 1), labels, diag
+
+
+# ---------------------------------------------------------------------------
+# Cardiac from the vascular voxels
+# ---------------------------------------------------------------------------
+
+# Measured on 5 TASKFORCE runs against a pulse oximeter (wiki: *Physiological noise
+# from the data*, 2026-11-17). Fraction of each excitation's voxels that vote: the
+# vascular ones. 1 % locked to the pulse at 0.96-1.00; 5 % lost two runs and 10 %
+# three, because every extra voxel brings a noisy weight.
+REFINE_TOP = 0.01
+REFINE_BLOCK_S = 20.0  # weights fitted on alternate blocks of this length
+REFINE_ITER = 8
+REFINE_HIGHPASS_HZ = 0.05
+# Two halves of the brain, fitted separately from the same start, agreed at 1.00
+# (median phase locking over 30 s windows) on every TASKFORCE run where the heart
+# was found and at 0.39 on a HiHiFaces run where it was not.
+FOUND_SPLIT_HALF = 0.8
+
+
+@dataclass
+class CardiacRefinement:
+    """Result of :func:`refine_cardiac`."""
+
+    trace: np.ndarray  # (nt, G) cardiac signal at each excitation
+    found: bool
+    split_half: float  # median 30 s phase locking between two independent halves
+    heart_rate_per_min: float
+    weight: np.ndarray  # (nx, ny, nz) cardiac signal-to-residual per voxel
+    n_voxels: int
+    start_rate_per_min: float
+
+
+def cardiac_avoid(
+    tr: float, f_resp: float | None = None, band: tuple[float, float] = CARDIAC_BAND
+) -> tuple[tuple[float, float], ...]:
+    """Frequencies the cardiac tracker must not choose, as (Hz, half-width) pairs.
+
+    ``k/TR``, widened to 0.05 Hz: the voxels are high-passed at
+    ``REFINE_HIGHPASS_HZ`` and a heartbeat that close to k/TR aliases below it in
+    every voxel, where it cannot be told from slow drift. Left open, the shoulder
+    of the comb captured the track on HiHiFaces (87/min, 1/TR 89.6).
+    ``k/TR +- f_resp`` and ``+- 2 f_resp``: breathing modulates the TR pattern. On
+    HiHiFaces those lines (72, 81, 98/min) out-scored everything else in the band,
+    in magnitude and phase alike, and per-voxel respiratory RETROICOR did not remove
+    them.
+    """
+    out: list[tuple[float, float]] = []
+    reach = band[1] * 1.2 + (2 * f_resp if f_resp else 0.0)
+    k = 1
+    while k / tr <= reach:
+        out.append((k / tr, 0.05))
+        if f_resp:
+            for m in (1, 2):
+                out += [(k / tr - m * f_resp, 0.03), (k / tr + m * f_resp, 0.03)]
+        k += 1
+    return tuple(a for a in out if band[0] * 0.8 - 0.05 < a[0] < band[1] * 1.2 + 0.05)
+
+
+def _cardiac_series(
+    times: np.ndarray, x: np.ndarray, avoid, band: tuple[float, float] = CARDIAC_BAND
+) -> tuple[np.ndarray, np.ndarray]:
+    """An (nt, G) trace on an even grid, band-passed and notched at ``avoid``."""
+    order = np.argsort(times.ravel(), kind="stable")
+    tu, xu = _uniform(times.ravel()[order], x.ravel()[order])
+    fs = _fs(tu)
+    xb = _bandpass(xu, band[0], band[1], fs)
+    for f0, _ in avoid:
+        if band[0] * 0.8 < f0 < min(band[1] * 1.2, 0.45 * fs):
+            b, a = signal.iirnotch(f0, Q=30, fs=fs)
+            xb = signal.filtfilt(b, a, xb)
+    return tu, xb
+
+
+def _trace_phase(times: np.ndarray, x: np.ndarray, avoid, window: float = 20.0):
+    """Cardiac cycle phase of an (nt, G) trace at every excitation, and its rate track."""
+    tu, xb = _cardiac_series(times, x, avoid)
+    ct, cf, prom = track_rate(tu, xb, CARDIAC_BAND, window, avoid=avoid)
+    phi = cycle_phase(tu, xb, cf)
+    return np.interp(times.ravel(), tu, phi).reshape(times.shape), ct, cf, prom
+
+
+def _cardiac_voxels(
+    magnitude: np.ndarray,
+    slice_times: np.ndarray,
+    tr: float,
+    mask: np.ndarray,
+    resp_phase: np.ndarray | None,
+    highpass: float,
+) -> tuple[list[torch.Tensor], list[np.ndarray]]:
+    """Each excitation's voxels as host (nv, nt) float32: fractional change with drift,
+    slow fluctuations below ``highpass`` Hz and breathing (RETROICOR to 2nd order at
+    the excitation's own times) projected out, and the (x, y, z) of every row.
+
+    Built on the CPU in float64: per slice it is a small product, and on CUDA the
+    default TF32 matmul keeps ~3 digits, the size of a pulsation on a raw intensity.
+    """
+    nx, _, nz, nt = magnitude.shape
+    group, gtimes = excitation_groups(slice_times)
+    cpu = torch.device("cpu")
+    L = construct_polynomial_matrix(nt, _drift_degree(nt, tr), device=cpu, dtype=torch.float64)
+    n = torch.arange(nt, dtype=torch.float64)
+    ks = [k for k in range(1, nt) if k / (2 * nt * tr) < highpass]
+    C = (
+        torch.stack([torch.cos(torch.pi * k * (n + 0.5) / nt) for k in ks], 1)
+        if ks
+        else n.new_zeros((nt, 0))
+    )
+    bases = []
+    for g in range(len(gtimes)):
+        cols = [L, C]
+        if resp_phase is not None:
+            p = torch.from_numpy(np.asarray(resp_phase[:, g], dtype=np.float64))
+            cols.append(torch.stack([p.cos(), p.sin(), (2 * p).cos(), (2 * p).sin()], 1))
+        bases.append(_orthonormal_basis(torch.cat(cols, 1)))
+    ys: list[list[torch.Tensor]] = [[] for _ in gtimes]
+    where: list[list[np.ndarray]] = [[] for _ in gtimes]
+    for k in range(nz):
+        sel = mask[:, :, k].reshape(-1, order="F")
+        if int(sel.sum()) < 20:
+            continue
+        m = _slice_rows(magnitude, k, cpu, np.float64)[torch.from_numpy(sel)]
+        mu = m.mean(1, keepdim=True)
+        y = (m - mu) / mu.clamp_min(1e-6)
+        Q = bases[group[k]]
+        y = y - (y @ Q) @ Q.T
+        ys[group[k]].append(y.float())
+        flat = np.flatnonzero(sel)
+        where[group[k]].append(np.column_stack([flat % nx, flat // nx, np.full(flat.size, k)]))
+    Ys = [torch.cat(y) if y else torch.zeros((0, nt)) for y in ys]
+    idx = [np.concatenate(w) if w else np.zeros((0, 3), int) for w in where]
+    return Ys, idx
+
+
+def _refine_pass(
+    Ys: list[torch.Tensor],
+    times: np.ndarray,
+    phase: np.ndarray,
+    avoid,
+    tr: float,
+    device: torch.device,
+    top: float = REFINE_TOP,
+    block_s: float = REFINE_BLOCK_S,
+    n_iter: int = REFINE_ITER,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[torch.Tensor]]:
+    """Iterate: fit every voxel to the current cardiac phase, rebuild the trace from
+    the best-fitting voxels, re-read its phase.
+
+    Each voxel is fitted with cos/sin of the phase at its excitation's times, so the
+    pair absorbs the voxel's own delay and sign. The new trace at a sample is the
+    weighted least-squares estimate of (cos, sin) from the excitation's top ``top``
+    voxels by fit, weights 1/residual variance. Weights are fitted on alternate
+    ``block_s`` blocks and applied to the others, so no voxel's noise feeds its own
+    weight. Returns (trace, phase, rate track (t, Hz), per-excitation signal-to-
+    residual of every voxel at the last iteration).
+    """
+    nt, G = times.shape
+    nb = max(2, int(round(nt * tr / block_s)))
+    blk = (np.arange(nt) * nb // nt) % 2
+    train = torch.from_numpy(np.stack([blk != 0, blk != 1], 1).astype(np.float64))
+    n_train = train.sum(0)
+    dt = accum_dtype(device)
+    # per-voxel sum of squares over each fold's training samples: fixed, read once
+    ss = [_stream_rows(Y, train, device, dt, square=True) for Y in Ys]
+    rates = (np.zeros(1), np.zeros(1))
+    snr_last: list[torch.Tensor] = []
+    trace = np.zeros((nt, G))
+    for _ in range(n_iter):
+        trace = np.zeros((nt, G))
+        snr_last = []
+        for g, Y in enumerate(Ys):
+            nv = Y.shape[0]
+            if nv == 0:
+                snr_last.append(torch.zeros(0))
+                continue
+            X = torch.from_numpy(np.stack([np.cos(phase[:, g]), np.sin(phase[:, g])], 1))
+            Xf = [X * train[:, f : f + 1] for f in (0, 1)]
+            P = _stream_rows(Y, torch.cat(Xf, 1), device, dt)  # (nv, 4) float64 host
+            snr_g = torch.zeros(nv, dtype=torch.float64)
+            for f in (0, 1):
+                XtX = Xf[f].T @ Xf[f]
+                Xty = P[:, 2 * f : 2 * f + 2]
+                A = XtX + (1e-3 * torch.trace(XtX) + 1e-12) * torch.eye(2, dtype=torch.float64)
+                B = Xty @ plinalg.inv(A)
+                expl = ((B @ XtX) * B).sum(1)
+                rss = (ss[g][:, f] - 2 * (B * Xty).sum(1) + expl).clamp_min(1e-30)
+                snr = expl / rss
+                snr_g += 0.5 * snr
+                k = min(nv, max(10, int(np.ceil(top * nv))))
+                keep = snr.topk(k).indices
+                Bk = B[keep]
+                W = Bk / (rss[keep] / n_train[f])[:, None]
+                M = Bk.T @ W
+                test = torch.from_numpy(blk == f)
+                Yk = Y[keep][:, test].to(torch.float64)
+                th = plinalg.solve(
+                    M + (1e-9 * torch.trace(M) + 1e-30) * torch.eye(2, dtype=torch.float64),
+                    W.T @ Yk,
+                )
+                trace[blk == f, g] = th[0].numpy()
+            snr_last.append(snr_g)
+        phase, ct, cf, _ = _trace_phase(times, trace, avoid)
+        rates = (ct, cf)
+    return trace, phase, np.stack(rates), snr_last
+
+
+def _stream_rows(
+    Y: torch.Tensor, X: torch.Tensor, device: torch.device, dt: torch.dtype, square: bool = False
+) -> torch.Tensor:
+    """``Y @ X`` (or ``Y**2 @ X``) for a host (nv, nt) ``Y``, in voxel chunks on
+    ``device``; returned on the host in float64."""
+    from fastfuncstuff.memory import bytes_per_voxel_cardiac_refine, get_available_memory
+
+    nv, nt = Y.shape
+    if nv == 0:
+        return torch.zeros((0, X.shape[1]), dtype=torch.float64)
+    per = bytes_per_voxel_cardiac_refine(nt)
+    chunk = int(max(1024, min(nv, get_available_memory(device, empty_cache=False) // per)))
+    Xd = X.to(device=device).to(dt)
+    out = torch.empty((nv, X.shape[1]), dtype=torch.float64)
+    for i in range(0, nv, chunk):
+        y = Y[i : i + chunk].to(device=device).to(dt)
+        if square:
+            y = y * y
+        out[i : i + chunk] = (y @ Xd).cpu().to(torch.float64)
+    return out
+
+
+def refine_cardiac(
+    magnitude: np.ndarray,
+    traces: ExcitationTraces,
+    slice_times: np.ndarray,
+    tr: float,
+    resp_from: str = "phase",
+    mask: np.ndarray | None = None,
+    split_axis: int = 1,
+    device: torch.device | None = None,
+    top: float = REFINE_TOP,
+    n_iter: int = REFINE_ITER,
+) -> CardiacRefinement:
+    """A cardiac trace from the voxels that carry the heartbeat, not from all of them.
+
+    The magnitude trace averages every brain voxel, but pulsation lives in a small
+    fraction of them (the vessels), each with its own sign and delay, so the mean
+    dilutes it and partly cancels it. Starting from the magnitude trace's cardiac
+    phase, :func:`_refine_pass` finds the voxels that follow it and rebuilds the
+    trace from them, organised by excitation (all slices acquired at one instant
+    are fitted at that instant). Against a pulse oximeter on 5 TASKFORCE runs, phase
+    locking rose from 0.80-0.91 (the mean) to 0.96-1.00.
+
+    It needs a start in the right place: a voxel fitted with a free delay cannot tell
+    f from f +- k/TR, so only the stitching across excitations pins the frequency,
+    and a start 9/min off was never pulled back. Whether it found the heart is judged
+    by fitting two halves of the brain (split along ``split_axis``; use the in-plane
+    axis that is NOT phase-encoded, as the N/2 ghost copies vessels half a FOV along
+    it) from the same start: they share a heartbeat but no voxels or noise.
+    """
+    device = device or torch.device("cpu")
+    nt, G = traces.times.shape
+    times = traces.times
+    mean_img = magnitude[..., :nt].mean(-1)
+    if mask is None:
+        mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
+    resp_phase, f_resp = None, None
+    if resp_from == "phase" and traces.phase is None:
+        resp_from = "magnitude"
+    t_r, x_r = traces.series(resp_from, uniform=True)
+    _, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+    f_resp = float(np.median(rf))
+    phi_r = cycle_phase(t_r, x_r, rf)
+    resp_phase = np.interp(times.ravel(), t_r, phi_r).reshape(times.shape)
+    avoid = cardiac_avoid(tr, f_resp)
+    start, _, cf0, _ = _trace_phase(times, traces.magnitude, avoid)
+    Ys, idx = _cardiac_voxels(
+        magnitude[..., :nt], slice_times, tr, mask, resp_phase, REFINE_HIGHPASS_HZ
+    )
+    trace, phase, rates, snr = _refine_pass(Ys, times, start, avoid, tr, device, top, n_iter=n_iter)
+    half_phase = []
+    n_ax = magnitude.shape[split_axis]
+    for side in (0, 1):
+        sub = [
+            Y[torch.from_numpy((i[:, split_axis] < n_ax // 2) == (side == 0))]
+            for Y, i in zip(Ys, idx, strict=True)
+        ]
+        half_phase.append(_refine_pass(sub, times, start, avoid, tr, device, top, n_iter=n_iter)[1])
+    d = (half_phase[0] - half_phase[1]).ravel()[np.argsort(times.ravel(), kind="stable")]
+    w = max(2, int(30.0 * G / tr))
+    plv = [
+        float(np.abs(np.exp(1j * d[i : i + w]).mean()))
+        for i in range(0, max(1, d.size - w), w // 2)
+    ]
+    split = float(np.median(plv))
+    weight = np.zeros(magnitude.shape[:3], np.float32)
+    for g, i in enumerate(idx):
+        if i.size:
+            weight[i[:, 0], i[:, 1], i[:, 2]] = snr[g].numpy()
+    return CardiacRefinement(
+        trace=trace,
+        found=split >= FOUND_SPLIT_HALF,
+        split_half=split,
+        heart_rate_per_min=float(np.median(rates[1]) * 60),
+        weight=weight,
+        n_voxels=int(sum(Y.shape[0] for Y in Ys)),
+        start_rate_per_min=float(np.median(cf0) * 60),
+    )
 
 
 def volume_regressors(
@@ -958,9 +1282,8 @@ def model_from_traces(
     t_c, x_c = traces.series(card_from, uniform=True)
     t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
-    harmonics = tuple(k / tr for k in range(1, int(CARDIAC_BAND[1] * tr * 1.2) + 2))
-    if card_from == "magnitude":
-        x_c = notch_tr_harmonics(t_c, x_c, tr, CARDIAC_BAND)
+    f_resp = float(np.median(peak_rate(t_r, x_r, RESP_BAND)[1]))
+    t_c, x_c, harmonics = _cardiac_input(traces, card_from, t_c, x_c, tr, f_resp)
     _, cf, _ = track_rate(t_c, x_c, CARDIAC_BAND, 20.0, avoid=harmonics)
     model = model_from_series(
         t_c,
