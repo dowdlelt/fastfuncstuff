@@ -373,3 +373,63 @@ def test_the_spectrum_window_writes_the_frequency_at_the_marker(spec_session):
     bare.set_traces([replace(t, marker_label="") for t in traces])
     bare.grab()
     assert (np.abs(strip(bare) - want).max(axis=-1) <= 10).sum() == 0
+
+
+def test_the_graph_gets_the_voxels_signal_in_the_band(spec_session):
+    """A tickable line in every graph: drift plus band, riding on the raw trace."""
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    r = s.mode._result
+    k = r.frame_of(F_HEART)
+    s.do(SetVolume(_map_layer(s).key, k))
+    ijk = (2, 2, 1)  # in the heartbeat corner
+    (line,) = s.mode_series(ijk)
+    assert line.key == "band" and line.x_label == "TR" and "Hz" in line.label
+    raw = s.timeseries(s.mode._source_key, ijk).astype(np.float64)
+    assert line.values.shape == raw.shape
+    # Drift removed, what is left is (nearly) the planted 0.8 Hz sinusoid.
+    band = detrend_trace(line.values.astype(np.float64), r.polort)
+    t = np.arange(N_TIME) * TR
+    planted = 3.0 * np.sin(2 * np.pi * F_HEART * t)
+    assert np.corrcoef(band, planted)[0, 1] > 0.95
+    # Riding on the raw trace: the same drift.
+    assert np.allclose(raw - detrend_trace(raw, r.polort), line.values - band, atol=1e-2)
+    # Off the heartbeat, the band holds little of the signal.
+    s.do(SetVolume(_map_layer(s).key, r.frame_of(0.3)))
+    (off,) = s.mode_series(ijk)
+    assert np.std(detrend_trace(off.values.astype(np.float64), r.polort)) < 0.3 * np.std(band)
+
+
+def test_the_band_line_keeps_the_raw_series_where_volumes_were_dropped(spec_session):
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    s.set_mode_param("live", "1")
+    s.set_mode_param("drop_first", "5")
+    (line,) = s.mode_series((2, 2, 1))
+    raw = s.timeseries(s.mode._source_key, (2, 2, 1))
+    assert line.values.size == raw.size
+    np.testing.assert_allclose(line.values[:5], raw[:5])
+
+
+def test_a_graph_window_offers_the_band_line_ticked(spec_session):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    s.do(OpenView("G1", "graph", "axial"))
+    win = GraphWindow("G1", s, s.do)
+    vp = s.state.viewports.get("G1")
+    win.apply(vp)
+    entries = {e.ident: e for e in win.entries(vp)}
+    assert "mode:band" in entries and entries["mode:band"].is_time
+    assert "mode:band" in win._drawn(vp)
+    win.close()

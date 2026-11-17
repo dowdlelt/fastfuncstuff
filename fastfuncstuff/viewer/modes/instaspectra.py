@@ -388,6 +388,48 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         return float(spectral.alias(bpm / 60.0, self._result.tr))
 
     # -- graph ---------------------------------------------------------
+    def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
+        """The voxel's signal in the band shown, for the graph: a highlight of it.
+
+        Its drift plus the band and nothing else, so the line rides on the raw
+        trace and shows which part of its wiggle the map is counting; with the
+        graph's own detrend on, that is the band component over the detrended
+        signal. A brick-wall FFT filter over the band's edges in Hz -- what the
+        map summed, whatever estimator made the map. Volumes cut by drop first /
+        last are left as the raw series: no band was measured there.
+        """
+        line = self._band_line(ijk)
+        return [] if line is None else [line]
+
+    def _band_line(self, ijk: tuple[int, int, int]) -> Trace | None:
+        from fastfuncstuff.viewer.derive import detrend_trace
+
+        r = self._result
+        if self.session is None or r is None or self._source_key is None:
+            return None
+        raw = self.session.timeseries(self._source_key, ijk)
+        if raw.size == 0:
+            return None
+        window = self.time_window(raw.size)
+        x = np.asarray(raw[window], dtype=np.float64)
+        if x.size != r.n_time:
+            return None
+        resid = np.asarray(detrend_trace(x, r.polort), dtype=np.float64)
+        k = self._frame
+        lo, hi = r.band_edges(k, self._view()[2])
+        freqs = np.fft.rfftfreq(x.size, d=r.tr)
+        keep = (freqs >= lo) & (freqs < hi) & (freqs > 0)
+        band = np.fft.irfft(np.fft.rfft(resid) * keep, n=x.size)
+        out = np.asarray(raw, dtype=np.float64).copy()
+        out[window] = (x - resid) + band
+        return Trace(
+            label=f"band-filtered {self._where(k)}",
+            values=out.astype(np.float32),
+            x_label="TR",
+            key="band",
+            short=f"band {r.freqs[k]:.3g} {r.unit}",
+        )
+
     def _voxel_psd(self) -> np.ndarray | None:
         """The crosshair voxel's PSD, prepared exactly as the maps' voxels were."""
         if self.session is None or self._result is None or self._source_key is None:
