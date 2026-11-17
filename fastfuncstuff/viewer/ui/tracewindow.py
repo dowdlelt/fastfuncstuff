@@ -50,11 +50,16 @@ class PlotView(QtWidgets.QWidget):
     why translation and rotation are two panels and not one.
     """
 
+    #: A click or drag on a line marked ``scrub``: the nearest sample's index.
+    scrubbed = QtCore.Signal(int)
+
     def __init__(
         self, parent: QtWidgets.QWidget | None = None, *, legend_outside: bool = False
     ) -> None:
         super().__init__(parent)
         self._traces: list[Trace] = []
+        #: ``(plot rect, x0, x1)`` of the last paint, to turn a click into an x.
+        self._geom: tuple[QtCore.QRectF, float, float] | None = None
         #: Key to the right of the plot rather than over it. For a plot whose
         #: every line is the subject -- the band splitter's column and its
         #: bands -- a key laid over the lines hides exactly what it labels.
@@ -129,6 +134,7 @@ class PlotView(QtWidgets.QWidget):
                 plot.bottom() - (yv - lo) / (hi - lo) * plot.height(),
             )
 
+        self._geom = (plot, x0, x1)
         p.setPen(QtGui.QPen(QtGui.QColor(c.edge)))
         p.drawRect(plot)
         if lo < 0 < hi:
@@ -189,6 +195,28 @@ class PlotView(QtWidgets.QWidget):
             self._draw_legend(p, c, plot, traces)
         p.end()
 
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if not self._scrub(event.position().x()):
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if not (
+            event.buttons() & QtCore.Qt.MouseButton.LeftButton and self._scrub(event.position().x())
+        ):
+            super().mouseMoveEvent(event)
+
+    def _scrub(self, px: float) -> bool:
+        """Emit the sample of the first scrubbable line nearest a pixel column."""
+        line = next((t for t in self._traces if t.scrub), None)
+        if line is None or self._geom is None:
+            return False
+        plot, x0, x1 = self._geom
+        xv = x0 + (px - plot.left()) / max(plot.width(), 1.0) * (x1 - x0)
+        values = np.asarray(line.values)
+        axis = np.arange(values.size) if line.x is None else np.asarray(line.x, dtype=float)
+        self.scrubbed.emit(int(np.argmin(np.abs(axis - xv))))
+        return True
+
     def _draw_markers(self, p, c, plot, traces, series, axes, to_px) -> None:
         """A bar across the plot and a dot on the line at each trace's marker."""
         for i, (t, values, x) in enumerate(zip(traces, series, axes, strict=True)):
@@ -246,6 +274,8 @@ class TraceWindow(QtWidgets.QWidget):
     closed = QtCore.Signal(str)
     #: A key asked the mode to do something: the action's name.
     action_requested = QtCore.Signal(str)
+    #: A click on a scrubbable line: the time index to show.
+    scrubbed = QtCore.Signal(int)
 
     def __init__(
         self,
@@ -266,6 +296,7 @@ class TraceWindow(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
         self.view = PlotView()
+        self.view.scrubbed.connect(self.scrubbed)
         v.addWidget(self.view, 1)
 
         def ask(name: str) -> Callable[[], None]:

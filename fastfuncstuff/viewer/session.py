@@ -1851,8 +1851,19 @@ class ViewerSession:
             return self._install_colour(source, overlay)
         existing = self.state.layers.find_by_source(source)
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
-        array, shape_of = _overlay_array(overlay)
-        self.store.adopt(key, array, name=overlay.name)
+        if overlay.frames is not None:
+            # One volume per frame, made on request: a frequency stack is the
+            # size of the run, and nothing needs all of it at once.
+            if overlay.threshold_values is not None:
+                raise ValueError("a frame stack cuts on what it shows; no threshold volume")
+            shape_of = tuple(int(v) for v in np.shape(overlay.values)[:3])
+            n_vol = max(int(overlay.n_frames), 1)
+            self.store.adopt_lazy(key, shape_of, n_vol, overlay.frames, name=overlay.name)
+        else:
+            array, shape_of = _overlay_array(overlay)
+            self.store.adopt(key, array, name=overlay.name)
+            n_vol = int(array.shape[3])
+        time_linked = overlay.frames is not None and n_vol > 1
         self.invalidate(key)
 
         lo, hi = overlay.display_range or derive_range(overlay.values)
@@ -1873,7 +1884,8 @@ class ViewerSession:
             # claiming one volume while the store holds two thresholds on a
             # brick that is no longer there.
             changes.update(
-                n_volumes=int(array.shape[3]),
+                n_volumes=n_vol,
+                time_linked=time_linked,
                 shape=shape_of,
                 labels=overlay.volume_labels,
                 volume_index=0,
@@ -1900,7 +1912,8 @@ class ViewerSession:
                     name=overlay.name,
                     path=f"<{overlay.name}>",
                     shape=shape_of,
-                    n_volumes=int(array.shape[3]),
+                    n_volumes=n_vol,
+                    time_linked=time_linked,
                     labels=overlay.volume_labels,
                     affine=np.asarray(overlay.affine, dtype=float),
                     colormap=overlay.colormap,
@@ -2003,6 +2016,11 @@ class ViewerSession:
             self.store.adopt_lazy(
                 key, live.shape, live.n_volumes, frozen.lightness_volume, name=name
             )
+        elif (provider := self.store.get(live.key).provider) is not None:
+            # A frame stack's provider is never changed after it is handed
+            # over (ComputedOverlay.frames), so the copy shares it rather than
+            # building every frame.
+            self.store.adopt_lazy(key, live.shape, live.n_volumes, provider, name=name)
         else:
             values = np.array(self.store.ensure_ram(live.key), dtype=np.float32, copy=True)
             self.store.adopt(key, values, name=name)

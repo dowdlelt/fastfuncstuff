@@ -23,6 +23,7 @@ from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instaglm import InstaGLMMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instaica import InstaICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instapca import InstaPCAMode  # noqa: E402
+from fastfuncstuff.viewer.modes.instaspectra import InstaSpectraMode  # noqa: E402
 from fastfuncstuff.viewer.modes.paint import PaintMode  # noqa: E402
 
 # Registration is an import side effect, so every built-in mode must be
@@ -46,6 +47,7 @@ __all__ = [
     "InstaGLMMode",
     "InstaICAMode",
     "InstaPCAMode",
+    "InstaSpectraMode",
     "IntControl",
     "Mark",
     "Mode",

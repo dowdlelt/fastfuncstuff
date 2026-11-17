@@ -320,6 +320,14 @@ class ComputedOverlay:
     #: A colour view (viewer.chromalayer.ColourSource) instead of values: the
     #: RGB mode's output. ``values`` is unused when this is set.
     colour: Any = None
+    #: A stack of volumes laid along the time axis instead of one: ``frames(i)``
+    #: makes volume ``i`` of ``n_frames`` on request, and the layer follows the
+    #: global time index. InstaSpectra's one map per frequency bin, so scrubbing
+    #: time scrubs frequency. ``values`` is then just the first frame, for the
+    #: shape and a fallback range. The callable must not change after it is
+    #: handed over -- KEEP shares it -- so a new look is a new callable.
+    frames: Callable[[int], np.ndarray] | None = None
+    n_frames: int = 0
 
 
 @dataclass(frozen=True)
@@ -359,6 +367,10 @@ class Trace:
     #: ``right_scale``. One line, two units (% of the total variance on the
     #: left, % of the explained variance on the right), not a second line.
     right_scale: float | None = None
+    #: Clicking or dragging along the line sets the global time index to the
+    #: nearest sample: for a line whose samples *are* the time axis's frames
+    #: (InstaSpectra's spectrum, one bin per frame).
+    scrub: bool = False
 
     @property
     def ident(self) -> str:

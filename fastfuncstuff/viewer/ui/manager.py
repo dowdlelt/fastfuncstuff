@@ -192,6 +192,7 @@ class WindowManager(QtCore.QObject):
         elif viewport.is_trace:
             win = TraceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
+            win.scrubbed.connect(self._on_scrubbed)
         elif viewport.is_clusters:
             win = ClusterWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
