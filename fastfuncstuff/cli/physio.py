@@ -405,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             "slice_alignment": refined.alignment,
             "slice_alignment_null": refined.alignment_null,
             "testable": bool(refined.testable),
+            "slice_resolvability": refined.resolvability,
             "rule": (
                 f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
                 f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers"

@@ -677,6 +677,7 @@ class CardiacRefinement:
     alignment: float = 0.0  # vessel phases lined up under the true slice times, 0-1
     alignment_null: float = 0.0  # the best of the slice-time shuffles
     testable: bool = True  # False with a single excitation time: nothing to shuffle
+    resolvability: dict = field(default_factory=dict)  # slice_resolvability of the acquisition
 
 
 def cardiac_avoid(
@@ -1047,6 +1048,30 @@ def _shuffled_alignment(Ys, times, phase, offsets, tr, device, n: int, rng) -> n
     return np.asarray(out)
 
 
+def slice_resolvability(
+    slice_times: np.ndarray, tr: float, rates_per_min=(50.0, 75.0, 100.0)
+) -> dict:
+    """How sharply this acquisition's excitation times can test a heartbeat, from the
+    sidecar alone (wiki: Slice-time alignment of the heartbeat).
+
+    A perfect heartbeat lines up at slope kappa = 0; its profile over kappa is
+    |mean_g exp(4 pi i kappa s_g / TR)|. ``alias_leak`` is that profile's height at the
+    other integer kappa (how confusable alias steps are); ``volume_leak`` its height
+    where a signal the same in every slice of a volume would sit (kappa = rate x TR),
+    for the given heart rates. Near 0: sharp. TASKFORCE (17 excitations) 0.00 / 0.17;
+    ds004645 (5 excitations at TR 0.227) 0.40 / 0.81, where the test is blunt."""
+    s = np.unique(np.round(np.asarray(slice_times, float), 6)) / tr
+
+    def psf(k):
+        return float(np.abs(np.exp(4j * np.pi * k * s).mean()))
+
+    return dict(
+        excitations=int(s.size),
+        alias_leak=max(psf(k) for k in (-3, -2, -1, 1, 2, 3)),
+        volume_leak=max(psf(r * tr / 60) for r in rates_per_min),
+    )
+
+
 def _crossed_phase(times: np.ndarray, trace: np.ndarray, avoid) -> np.ndarray:
     """The cardiac phase at the odd excitations read from the even excitations' traces
     only, and vice versa. A phase tracked through all excitations at their true times
@@ -1161,6 +1186,7 @@ def refine_cardiac(
             trace=np.zeros((nt, G)), found=False, split_half=0.0, heart_rate_per_min=float("nan"),
             weight=np.zeros(magnitude.shape[:3], np.float32), n_voxels=0,
             start_rate_per_min=float("nan"), start="none", testable=False,
+            resolvability=slice_resolvability(slice_times, tr),
         )  # fmt: skip
     mean_img = magnitude[..., :nt].mean(-1)
     if mask is None:
@@ -1284,6 +1310,7 @@ def refine_cardiac(
         alignment=float(score),
         alignment_null=float(floor),
         testable=G >= 2,
+        resolvability=slice_resolvability(slice_times, tr),
     )
 
 

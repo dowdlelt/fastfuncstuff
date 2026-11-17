@@ -758,3 +758,12 @@ def test_a_single_excitation_time_is_untestable():
     tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
     ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
     assert not ref.testable and not ref.found
+
+
+def test_slice_resolvability_reads_how_sharp_the_slice_timing_is():
+    """Many excitations spread over the TR resolve alias steps; a few bunched ones do
+    not (5 excitations over 0.17 of a 0.227 s TR, as ds004645)."""
+    spread = physio.slice_resolvability(np.linspace(0, 0.95, 17), 1.0)
+    bunched = physio.slice_resolvability(np.repeat(np.linspace(0, 0.17, 5), 3), 0.227)
+    assert spread["excitations"] == 17 and spread["alias_leak"] < 0.05
+    assert bunched["excitations"] == 5 and bunched["alias_leak"] > 0.3
