@@ -320,7 +320,7 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         rescale = self._shown is not None and self._shown != (kind, scale)
         self._shown = (kind, scale)
         unit = "z" if z else engine.MAP_UNITS[kind]
-        labels = tuple(f"{kind} {unit} @ {f:.4g} {result.unit}" for f in result.freqs)
+        labels = tuple(f"{kind} {unit} @ {self._where(k, width)}" for k in range(result.n_frames))
         return ComputedOverlay(
             values=frame(0),
             affine=result.affine,
@@ -369,6 +369,18 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         self.session.state.layers.update(layer.key, volume_index=target)
         return SetVolume.aspects | Aspect.GRAPH
 
+    def _where(self, k: int, width: float | None = None) -> str:
+        """``0.8125 Hz``, or ``0.8125 Hz (band 0.79-0.83)`` when a band is summed."""
+        r = self._result
+        if r is None:
+            return ""
+        width = self._view()[2] if width is None else width
+        text = f"{r.freqs[k]:.4g} {r.unit}"
+        if r.half_bins(width) > 0:
+            lo, hi = r.band_edges(k, width)
+            text += f" (band {lo:.3g}-{hi:.3g})"
+        return text
+
     def _heart_alias(self) -> float | None:
         bpm = float(self.params.get("heart_bpm") or 0.0)
         if bpm <= 0 or self._result is None or not self._result.tr_known:
@@ -396,13 +408,16 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         k = self._frame
         layer = self._layer()
         scrub_key = layer.key if layer is not None else ""
+        band = result.band_edges(k, self._view()[2])
         lines: list[Trace] = []
         psd = self._voxel_psd()
         x_label = f"{result.unit}"
         if psd is not None:
             lines.append(
                 Trace(
-                    label=f"voxel log10 PSD  ·  {result.freqs[k]:.4g} {result.unit}",
+                    label=f"voxel log10 PSD  ·  {self._where(k)}",
+                    band=band,
+                    marker_label=self._where(k),
                     values=np.log10(np.maximum(psd, 1e-30)).astype(np.float32),
                     x=result.freqs.astype(np.float32),
                     x_label=x_label,
@@ -421,6 +436,8 @@ class InstaSpectraMode(RunMaskMixin, Mode):
                 x_label=x_label,
                 key="mask",
                 short="mask mean",
+                band=band,
+                marker_label="" if psd is not None else self._where(k),
                 marker=None if psd is not None else k,
                 scrub=True,
                 scrub_key=scrub_key,
@@ -445,8 +462,7 @@ class InstaSpectraMode(RunMaskMixin, Mode):
             else ""
         )
         return (
-            f"{self.name}: bin {k}/{r.n_frames - 1} = {r.freqs[k]:.4g} {r.unit}{alias}  ·  "
-            f"{self._message}"
+            f"{self.name}: bin {k}/{r.n_frames - 1} = {self._where(k)}{alias}  ·  {self._message}"
         )
 
 

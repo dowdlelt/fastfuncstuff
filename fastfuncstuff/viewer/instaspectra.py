@@ -87,6 +87,24 @@ class Spectra:
     def unit(self) -> str:
         return "Hz" if self.tr_known else "cycles/vol"
 
+    def half_bins(self, width: float) -> int:
+        """Bins either side of the centre a band ``width`` Hz wide sums."""
+        return max(0, int(round(float(width) / 2.0 / self.df)))
+
+    def band_edges(self, k: int, width: float = 0.0) -> tuple[float, float]:
+        """The frequencies bin ``k``'s band covers, outer bin edges included.
+
+        Clipped at the ends of the spectrum exactly as :meth:`maps` clips the
+        sum, so what is shown is what was summed.
+        """
+        half = self.half_bins(width)
+        lo = max(0, int(k) - half)
+        hi = min(self.n_frames - 1, int(k) + half)
+        return (
+            max(0.0, float(self.freqs[lo]) - self.df / 2.0),
+            float(self.freqs[hi]) + self.df / 2.0,
+        )
+
     def frame_of(self, frequency: float) -> int:
         """The bin nearest a frequency."""
         return int(np.argmin(np.abs(self.freqs - float(frequency))))
@@ -103,7 +121,7 @@ class Spectra:
         if kind not in MAP_KINDS:
             raise ValueError(f"unknown map {kind!r}; have {', '.join(MAP_KINDS)}")
         p = torch.from_numpy(self.psd).double()
-        half = max(0, int(round(float(width) / 2.0 / self.df)))
+        half = self.half_bins(width)
         band_sum, band_n = _band(p, half)
         if kind == "share":
             above = torch.from_numpy(self.freqs >= float(floor))

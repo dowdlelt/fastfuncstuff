@@ -784,6 +784,12 @@ class Vox3DWindow(QtWidgets.QWidget):
         an = None if anatomy is None else self._slot(anatomy, cache, overlay=False)
         # Only what is drawn stays cached: a dropped layer's voxels go with it.
         self._cache = cache
+        # A sub-brick stack (a bucket, InstaSpectra's bins) says which brick is
+        # drawn: the projection of 0.81 Hz and of 0.83 Hz look alike otherwise.
+        self._brick = ""
+        if overlay is not None and overlay.n_volumes > 1 and not overlay.time_linked:
+            i = overlay.volume_index
+            self._brick = f" [{overlay.labels[i] if i < len(overlay.labels) else f'#{i}'}]"
         self._names = (
             "" if overlay is None else overlay.name,
             "" if anatomy is None else anatomy.name,
@@ -795,7 +801,10 @@ class Vox3DWindow(QtWidgets.QWidget):
         parts = [self.canvas.mode]
         if ov:
             o = self.canvas.overlay
-            parts.append(f"{ov}" + (f"  thr {o.threshold:.3g}" if o is not None else ""))
+            parts.append(
+                f"{ov}{getattr(self, '_brick', '')}"
+                + (f"  thr {o.threshold:.3g}" if o is not None else "")
+            )
         if an:
             parts.append(f"over {an}")
         if self.canvas.clip != "off":

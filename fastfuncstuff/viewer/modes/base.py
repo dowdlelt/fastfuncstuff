@@ -375,6 +375,13 @@ class Trace:
     #: InstaSpectra's spectrum, one bin per frame of its map layer.
     scrub: bool = False
     scrub_key: str = ""
+    #: ``(lo, hi)`` in x units, shaded across the plot: the range a marker
+    #: stands for, when that is wider than one sample (a summed band).
+    band: tuple[float, float] | None = None
+    #: Text written at the marker, on the plot: what "where you are" is --
+    #: ``0.81 Hz``. Drawn whatever the number of lines, unlike ``label``,
+    #: which gives way to a legend once a plot has two.
+    marker_label: str = ""
 
     @property
     def ident(self) -> str:

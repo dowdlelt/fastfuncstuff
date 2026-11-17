@@ -219,6 +219,15 @@ class PlotView(QtWidgets.QWidget):
 
     def _draw_markers(self, p, c, plot, traces, series, axes, to_px) -> None:
         """A bar across the plot and a dot on the line at each trace's marker."""
+        band = next((t.band for t in traces if t.band is not None), None)
+        if band is not None:
+            # Under the marker bar: the range it stands for, clipped to the plot.
+            a = max(to_px(float(band[0]), 0.0).x(), plot.left())
+            b = min(to_px(float(band[1]), 0.0).x(), plot.right())
+            if b > a:
+                shade = QtGui.QColor(c.warn)
+                shade.setAlphaF(0.15)
+                p.fillRect(QtCore.QRectF(a, plot.top(), b - a, plot.height()), shade)
         for i, (t, values, x) in enumerate(zip(traces, series, axes, strict=True)):
             k = t.marker
             if k is None or not 0 <= k < values.size or not np.isfinite(values[k]):
@@ -233,6 +242,27 @@ class PlotView(QtWidgets.QWidget):
             p.drawEllipse(at, 4.0, 4.0)
             p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            if t.marker_label:
+                self._draw_marker_label(p, c, plot, at.x(), t.marker_label)
+
+    @staticmethod
+    def _draw_marker_label(p, c, plot: QtCore.QRectF, x: float, text: str) -> None:
+        """The marker's caption over its bar, in the strip above the plot.
+
+        Above rather than in it: a legend sits in the plot's top-right, and a
+        caption that ran under it would hide either one. Above the plot is
+        where a single line's title goes, empty once there are two lines.
+        """
+        metrics = QtGui.QFontMetrics(p.font())
+        w = metrics.horizontalAdvance(text) + 8
+        h = metrics.height() + 2
+        left = min(max(x - w / 2, plot.left()), plot.right() - w)
+        box = QtCore.QRectF(left, max(plot.top() - h - 1, 0.0), w, h)
+        p.fillRect(box, QtGui.QColor(c.panel))
+        p.setPen(QtGui.QPen(QtGui.QColor(c.warn)))
+        p.drawRect(box)
+        p.setPen(QtGui.QColor(c.text))
+        p.drawText(box, QtCore.Qt.AlignmentFlag.AlignCenter, text)
 
     @staticmethod
     def _colour(c, index: int, total: int) -> QtGui.QColor:

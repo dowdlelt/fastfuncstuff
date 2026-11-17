@@ -299,9 +299,7 @@ class InstaPCAMode(RunMaskMixin, Mode):
         cut_values = None if cut == kind else self._result.volume(k, cut)
         cut_top = top if cut_values is None else self._robust_top(cut_values, cut)
         # The threshold slider is named after the map it cuts, not the one drawn.
-        self.overlay_kind = (
-            OverlayKind.CORRELATION if cut == "correlation" else OverlayKind.VALUE
-        )
+        self.overlay_kind = OverlayKind.CORRELATION if cut == "correlation" else OverlayKind.VALUE
         rescale = self._shown_map is not None and self._shown_map != (kind, cut)
         self._shown_map = (kind, cut)
         pct = self._result.explained[k] * 100

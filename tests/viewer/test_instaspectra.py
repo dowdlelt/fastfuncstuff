@@ -292,3 +292,84 @@ def test_the_3d_window_follows_the_bin(spec_session):
     win.refresh(Aspect.TIME)  # stepping time does not move it
     assert np.array_equal(win.canvas.overlay.data, after)
     win.close()
+
+
+def test_the_bin_and_its_band_are_shown_where_you_look(spec_session):
+    """Status line, sub-brick label, the spectrum's shaded band and the 3-D
+    caption all name the frequency -- and the band's edges once it is wide."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.vox3dwindow import Vox3DWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    r = s.mode._result
+    k = r.frame_of(F_HEART)
+    s.do(SetVolume(_map_layer(s).key, k))
+    here = f"{r.freqs[k]:.4g} Hz"
+    assert here in s.mode.status() and "band" not in s.mode.status()
+    lo, hi = s.mode.panels()["spectrum"][0].band
+    assert hi - lo == pytest.approx(r.df)  # one bin: its own width
+
+    s.set_mode_param("width", str(4 * r.df))  # two bins either side
+    lo, hi = r.band_edges(k, 4 * r.df)
+    assert (lo, hi) == pytest.approx((r.freqs[k - 2] - r.df / 2, r.freqs[k + 2] + r.df / 2))
+    band = f"(band {lo:.3g}-{hi:.3g})"
+    assert band in s.mode.status()
+    assert _map_layer(s).labels[k].endswith(band)
+    assert s.mode.panels()["spectrum"][0].band == pytest.approx((lo, hi))
+
+    s.do(OpenView("X1", "vox3d", "axial"))
+    win = Vox3DWindow("X1", s, s.do)
+    win.apply(s.state.viewports.get("X1"))
+    assert band in win.canvas.caption and here in win.canvas.caption
+    win.close()
+
+
+def test_the_spectrum_window_writes_the_frequency_at_the_marker(spec_session):
+    """With two lines the plot shows a legend instead of a title, which hid the
+    frequency; the marker's own caption is drawn above the bar regardless."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtGui, QtWidgets
+
+    from fastfuncstuff.viewer.ui import theme
+    from fastfuncstuff.viewer.ui.tracewindow import PlotView
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    r = s.mode._result
+    k = r.frame_of(F_HEART)
+    s.do(SetVolume(_map_layer(s).key, k))
+    traces = s.mode.panels()["spectrum"]
+    assert len(traces) == 2
+    assert traces[0].marker_label == f"{r.freqs[k]:.4g} Hz"
+
+    def strip(view: PlotView) -> np.ndarray:
+        img = view.grab().toImage().convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+        px = np.array(img.constBits()).reshape(img.height(), img.width(), 4)[..., :3]
+        plot, x0, x1 = view._geom
+        x = int(plot.left() + (r.freqs[k] - x0) / (x1 - x0) * plot.width())
+        return px[: int(plot.top()), max(x - 30, 0) : x + 30].astype(int)
+
+    warn = QtGui.QColor(theme.palette().warn)
+    want = np.array([warn.red(), warn.green(), warn.blue()])
+    with_caption = PlotView()
+    with_caption.resize(500, 220)
+    with_caption.set_traces(traces)
+    with_caption.grab()
+    assert (np.abs(strip(with_caption) - want).max(axis=-1) <= 10).sum() > 20
+    from dataclasses import replace
+
+    bare = PlotView()
+    bare.resize(500, 220)
+    bare.set_traces([replace(t, marker_label="") for t in traces])
+    bare.grab()
+    assert (np.abs(strip(bare) - want).max(axis=-1) <= 10).sum() == 0
