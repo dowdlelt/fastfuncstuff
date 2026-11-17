@@ -655,3 +655,30 @@ def test_cli_drops_unfound_cardiac_from_the_nuisance_and_keeps_the_slibase(tmp_p
         assert summ["cardiac_weighted"]["found"] is False
         assert summ["cardiac_weighted"]["in_nuisance"] is (mode == "keep")
         assert Path(summ["cardiac_weighted"]["weight_map"]).exists()
+
+
+def test_refine_cardiac_frees_its_voxel_store_without_the_garbage_collector(monkeypatch):
+    """A self-calling closure once kept the device-resident voxel store alive until
+    the garbage collector happened to run: 15 GB of CUDA memory over a loop of runs in
+    one process, then out-of-memory. The store must die when the call returns."""
+    import gc
+    import weakref
+
+    mag, ph, st = _vascular_run(nt=160)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    refs = []
+    real = physio._store_voxels
+
+    def spy(Ys, device):
+        out, dt = real(Ys, device)
+        refs.extend(weakref.ref(Y) for Y in out)
+        return out, dt
+
+    monkeypatch.setattr(physio, "_store_voxels", spy)
+    gc.disable()
+    try:
+        physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU, ica=False)
+        alive = sum(r() is not None for r in refs)
+    finally:
+        gc.enable()
+    assert refs and alive == 0, f"{alive} of {len(refs)} stored voxel blocks outlived the call"

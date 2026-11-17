@@ -1054,22 +1054,27 @@ def refine_cardiac(
     Ys, dt = _store_voxels(host, device)
     n_ax = magnitude.shape[split_axis]
     halves = [
-        [torch.from_numpy(np.flatnonzero((i[:, split_axis] < n_ax // 2) == (side == 0))).to(Ys[g].device)
+        [torch.from_numpy(np.flatnonzero((i[:, split_axis] < n_ax // 2) == (side == 0))).to(device)  # indexes P, computed on device
          for g, i in enumerate(idx)]
         for side in (0, 1)
     ]  # fmt: skip
 
-    def judge(label: str, start: np.ndarray, realias: bool = True):
-        mem = _refine_pass(
-            Ys, times, [_Member(None, start), _Member(halves[0], start), _Member(halves[1], start)],
-            avoid, tr, device, dt, top, n_iter=n_iter,
-        )  # fmt: skip
-        cands = _alias_phases(times, mem[0].phase, tr)
-        coh = {hr: mean_trace_coherence(traces.magnitude, ph, tr) for hr, ph in cands.items()}
-        order = sorted(coh, key=lambda h: -coh[h])
-        rate = float(np.median(mem[0].rates[1]) * 60)
-        if realias and order and abs(order[0] - rate) > 3.0:
-            return judge(label, cands[order[0]], realias=False)
+    def judge(label: str, start: np.ndarray):
+        # A loop, not recursion: a closure that calls itself is a reference cycle, and it
+        # kept the GPU-resident voxel store alive until the garbage collector happened
+        # to run -- 15 GB over a loop of runs in one process.
+        for realias in (True, False):
+            mem = _refine_pass(
+                Ys, times, [_Member(None, start), _Member(halves[0], start), _Member(halves[1], start)],
+                avoid, tr, device, dt, top, n_iter=n_iter,
+            )  # fmt: skip
+            cands = _alias_phases(times, mem[0].phase, tr)
+            coh = {hr: mean_trace_coherence(traces.magnitude, ph, tr) for hr, ph in cands.items()}
+            order = sorted(coh, key=lambda h: -coh[h])
+            rate = float(np.median(mem[0].rates[1]) * 60)
+            if not (realias and order and abs(order[0] - rate) > 3.0):
+                break
+            start = cands[order[0]]
         best = coh[order[0]] if order else 0.0
         ratio = best / max(coh[order[1]], 1e-12) if len(order) > 1 else np.inf
         split = _split_locking(mem[1].phase, mem[2].phase, times, tr)
@@ -1091,6 +1096,8 @@ def refine_cardiac(
                 kept = (ok, info, full)
                 break
     ok, info, full = kept
+    n_vox = int(sum(Y.shape[0] for Y in Ys))
+    Ys = halves = []  # drop the device-resident store now, not when the caller lets go
     weight = np.zeros(magnitude.shape[:3], np.float32)
     for g, i in enumerate(idx):
         if i.size:
@@ -1101,7 +1108,7 @@ def refine_cardiac(
         split_half=info[2],
         heart_rate_per_min=info[1],
         weight=weight,
-        n_voxels=int(sum(Y.shape[0] for Y in Ys)),
+        n_voxels=n_vox,
         start_rate_per_min=float(np.median(cf0) * 60),
         alias_coherence=info[3],
         alias_ratio=float(info[4]),
