@@ -640,16 +640,16 @@ REFINE_TOP = 0.01
 REFINE_BLOCK_S = 20.0  # weights fitted on alternate blocks of this length
 REFINE_ITER = 8
 REFINE_HIGHPASS_HZ = 0.05
-# Two halves of the brain, fitted separately from the same start, agreed at 0.99-1.00
-# (median phase locking over 30 s windows) wherever the heart was found against a pulse
-# oximeter, and at 0.3-0.7 where it was not.
-FOUND_SPLIT_HALF = 0.8
-# The halves are blind to aliases (a start on f +- k/TR stays there, halves 0.99), so the
-# alias is chosen by the brain-mean trace's coherence with each candidate; it must win
-# clearly and be present at all. On TASKFORCE and HiHiFaces the true alias won by
-# 2.1-50x at 0.06-0.30; artefacts showed no winner (1.0-1.6x) or sat below 0.04.
-ALIAS_RATIO = 2.0
-ALIAS_COHERENCE = 0.04
+# Found or not: a heartbeat is sampled at each slice's own acquisition time, so the best
+# vessel voxels' cardiac phases line up across excitations only under the TRUE slice
+# times; drift, task, spin history and denoising residue are the same in every slice of
+# a volume and line up no better under shuffled ones. The kept answer must out-align
+# every one of SLICE_PERMUTATIONS shuffles of itself for each of the (up to)
+# PERMUTED_ANSWERS distinct answers tried -- Bonferroni for "the best of several". Tested against
+# recordings on TASKFORCE, two Philips sites (TR 2 s sequential, MB4) and an MB4 slab:
+# no wrong find; misses come out not found (wiki: Slice-time alignment of the heartbeat).
+SLICE_PERMUTATIONS = 30
+PERMUTED_ANSWERS = 4
 # Per-excitation ICA start (used when the mean-trace start is not found).
 ICA_COMPONENTS = 20
 ICA_CANDIDATES = 14  # aliased frequencies tried, in order of how many excitations agree
@@ -669,11 +669,14 @@ class CardiacRefinement:
     weight: np.ndarray  # (nx, ny, nz) cardiac signal-to-residual per voxel
     n_voxels: int
     start_rate_per_min: float
-    alias_coherence: float = 0.0  # brain-mean trace vs the chosen alias
-    alias_ratio: float = 0.0  # ... over the next-best alias
-    start: str = "mean"  # which start was kept: "mean" or "ica@<aliased Hz>"
-    tried: list = field(default_factory=list)  # (start, rate, halves, coherence, ratio)
+    alias_coherence: float = 0.0  # brain-mean trace vs the chosen alias (diagnostic)
+    alias_ratio: float = 0.0  # slice alignment of the chosen alias over the next-best
+    start: str = "mean"  # which start was kept: "mean", "ica@<aliased Hz>"
+    tried: list = field(default_factory=list)  # (start, rate, alignment, its shuffles' max or nan)
     tried_phase: list = field(default_factory=list)  # each start's final (nt, G) phase
+    alignment: float = 0.0  # vessel phases lined up under the true slice times, 0-1
+    alignment_null: float = 0.0  # the best of the slice-time shuffles
+    testable: bool = True  # False with a single excitation time: nothing to shuffle
 
 
 def cardiac_avoid(
@@ -960,6 +963,115 @@ def _stitched_power(cols: np.ndarray, times: np.ndarray, cands) -> float:
     return float((np.abs(x) ** 2).max())
 
 
+def _voxel_fits(Ys: list[torch.Tensor], phase: np.ndarray, device: torch.device) -> list:
+    """Each voxel's complex cardiac coefficient and fit signal-to-residual under
+    ``phase`` (nt, G), excitation by excitation: (z, snr) on ``device``, or None."""
+    out = []
+    for g, Y in enumerate(Ys):
+        if Y.shape[0] == 0:
+            out.append(None)
+            continue
+        X = torch.from_numpy(np.stack([np.cos(phase[:, g]), np.sin(phase[:, g])], 1))
+        X = X.to(device).to(torch.float64)
+        Yd = Y.to(device).to(torch.float64)
+        Yd = Yd - Yd.mean(1, keepdim=True)
+        XtX = X.T @ X
+        B = (Yd @ X) @ torch.linalg.inv(XtX)
+        expl = ((B @ XtX) * B).sum(1)
+        rss = ((Yd * Yd).sum(1) - expl).clamp_min(1e-30)
+        out.append((torch.complex(B[:, 0], -B[:, 1]), expl / rss))
+    return out
+
+
+def slice_alignment(fits: list, top: float = REFINE_TOP) -> float:
+    """How well the best voxels' cardiac phases line up, pooled over excitations: the
+    SNR-weighted mean of exp(2i * phase) (doubled, so a vessel's sign does not matter),
+    0-1. Each voxel's phase holds its own delay, so only a heartbeat sampled at the
+    slice times it was fitted at lines up across excitations; anything the same in
+    every slice of a volume turns with the slice time instead (wiki: Slice-time
+    alignment of the heartbeat)."""
+    num = torch.zeros((), dtype=torch.complex128)
+    den = 0.0
+    for ft in fits:
+        if ft is None:
+            continue
+        z, snr = ft
+        k = min(snr.numel(), max(10, int(np.ceil(top * snr.numel()))))
+        sel = snr.topk(k).indices
+        u = z[sel] / z[sel].abs().clamp_min(1e-30)
+        num = num + (snr[sel] * u * u).sum().cpu()
+        den += float(snr[sel].sum())
+    return float(num.abs() / den) if den > 0 else 0.0
+
+
+def _alias_offsets(times, phase, tr, avoid=()) -> dict[float, tuple[int, int]]:
+    """The (sign, k) of every alias of ``phase`` -- sign * phase + 2 pi k t / TR -- whose
+    rate is in the cardiac band and outside ``avoid``, keyed by that rate per minute.
+    Near k/TR a slow signal, the same in every slice of a volume, re-aliases onto a
+    rate that lines up like a heartbeat (pure noise did, at 58.6/min with TR 1 s)."""
+    span = times[-1].mean() - times[0].mean()
+    f0 = (phase[-1].mean() - phase[0].mean()) / (2 * np.pi * span)
+    out = {}
+    for k in range(-3, 4):
+        for sgn in (1, -1):
+            fr = sgn * f0 + k / tr
+            if CARDIAC_BAND[0] <= fr <= CARDIAC_BAND[1] and all(abs(fr - c) >= w for c, w in avoid):
+                out[round(fr * 60, 1)] = (sgn, k)
+    return out
+
+
+def _best_alias(Ys, times, phase, offsets, tr, device) -> tuple[float, np.ndarray | None, dict]:
+    """The alias in ``offsets`` whose vessel voxels line up best: (score, phase, scores)."""
+    scores, phases = {}, {}
+    for h, (sgn, k) in offsets.items():
+        phases[h] = sgn * phase + 2 * np.pi * k * times / tr
+        scores[h] = slice_alignment(_voxel_fits(Ys, phases[h], device))
+    if not scores:
+        return 0.0, None, {}
+    h = max(scores, key=scores.get)
+    return scores[h], phases[h], scores
+
+
+def _shuffled_alignment(Ys, times, phase, offsets, tr, device, n: int, rng) -> np.ndarray:
+    """The best-alias alignment of ``phase`` with the excitations' sample times shuffled
+    among them, choosing among the same alias offsets as the answer did: the null a
+    heartbeat must beat. Every excitation moves (a derangement): with few excitations,
+    a shuffle that swaps two neighbours is nearly the truth, not a null."""
+    G = phase.shape[1]
+    out = []
+    for _ in range(n):
+        perm = rng.permutation(G)
+        while np.any(perm == np.arange(G)):
+            perm = rng.permutation(G)
+        out.append(_best_alias(Ys, times, phase[:, perm], offsets, tr, device)[0])
+    return np.asarray(out)
+
+
+def _crossed_phase(times: np.ndarray, trace: np.ndarray, avoid) -> np.ndarray:
+    """The cardiac phase at the odd excitations read from the even excitations' traces
+    only, and vice versa. A phase tracked through all excitations at their true times
+    is shaped by each excitation's own voxels, so on pure noise it partly manufactures
+    the cross-excitation agreement :func:`slice_alignment` measures; crossing removes
+    that. Each half still spans the TR, so the phase stays well sampled."""
+    nt, G = times.shape
+    if G < 2:
+        return _trace_phase(times, trace, avoid)[0]
+    out = np.zeros((nt, G))
+    halves = (np.arange(0, G, 2), np.arange(1, G, 2))
+    for src, dst in (halves, halves[::-1]):
+        tu, xb = _cardiac_series(times[:, src], trace[:, src], avoid)
+        _, cf, _ = track_rate(tu, xb, CARDIAC_BAND, 20.0, avoid=avoid)
+        phi = cycle_phase(tu, xb, cf)
+        out[:, dst] = np.interp(times[:, dst].ravel(), tu, phi).reshape(nt, dst.size)
+    return out
+
+
+def _phase_rate(times: np.ndarray, phase: np.ndarray) -> float:
+    """Mean rate (per minute) of an unwrapped (nt, G) phase over the run."""
+    span = times[-1].mean() - times[0].mean()
+    return float(abs(phase[-1].mean() - phase[0].mean()) / (2 * np.pi * span) * 60)
+
+
 def _ica_starts(Ys: list[torch.Tensor], times: np.ndarray, tr: float, avoid, device: torch.device):
     """Cardiac starts from spatial ICA per excitation, best-supported first.
 
@@ -1044,6 +1156,12 @@ def refine_cardiac(
     device = device or torch.device("cpu")
     nt, G = traces.times.shape
     times = traces.times
+    if G < 2:  # one excitation time: no within-volume samples, nothing to shuffle
+        return CardiacRefinement(
+            trace=np.zeros((nt, G)), found=False, split_half=0.0, heart_rate_per_min=float("nan"),
+            weight=np.zeros(magnitude.shape[:3], np.float32), n_voxels=0,
+            start_rate_per_min=float("nan"), start="none", testable=False,
+        )  # fmt: skip
     mean_img = magnitude[..., :nt].mean(-1)
     if mask is None:
         mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
@@ -1065,43 +1183,82 @@ def refine_cardiac(
         for side in (0, 1)
     ]  # fmt: skip
 
-    def judge(label: str, start: np.ndarray):
+    def judge(start: np.ndarray):
         # A loop, not recursion: a closure that calls itself is a reference cycle, and it
         # kept the GPU-resident voxel store alive until the garbage collector happened
         # to run -- 15 GB over a loop of runs in one process.
         for realias in (True, False):
             mem = _refine_pass(
-                Ys, times, [_Member(None, start), _Member(halves[0], start), _Member(halves[1], start)],
-                avoid, tr, device, dt, top, n_iter=n_iter,
-            )  # fmt: skip
-            cands = _alias_phases(times, mem[0].phase, tr)
-            coh = {hr: mean_trace_coherence(traces.magnitude, ph, tr) for hr, ph in cands.items()}
-            order = sorted(coh, key=lambda h: -coh[h])
-            rate = float(np.median(mem[0].rates[1]) * 60)
-            if not (realias and order and abs(order[0] - rate) > 3.0):
+                Ys, times, [_Member(None, start)], avoid, tr, device, dt, top, n_iter=n_iter
+            )
+            offsets = _alias_offsets(times, mem[0].phase, tr, avoid)
+            score, chosen, scores = _best_alias(Ys, times, mem[0].phase, offsets, tr, device)
+            if chosen is None:
+                return None, mem[0], 0.0, 0.0, {}
+            if not (
+                realias and abs(_phase_rate(times, chosen) - _phase_rate(times, mem[0].phase)) > 3.0
+            ):
                 break
-            start = cands[order[0]]
-        best = coh[order[0]] if order else 0.0
-        ratio = best / max(coh[order[1]], 1e-12) if len(order) > 1 else np.inf
-        split = _split_locking(mem[1].phase, mem[2].phase, times, tr)
-        ok = split >= FOUND_SPLIT_HALF and ratio >= ALIAS_RATIO and best >= ALIAS_COHERENCE
-        return ok, (label, rate, split, best, ratio), mem[0]
+            start = chosen  # the refinement cannot tell aliases apart: rerun on the chosen one
+        order = sorted(scores, key=lambda h: -scores[h])
+        ratio = scores[order[0]] / max(scores[order[1]], 1e-12) if len(order) > 1 else np.inf
+        # offsets re-expressed relative to the chosen alias, for its shuffle null
+        return chosen, mem[0], float(ratio), score, _alias_offsets(times, chosen, tr, avoid)
 
     start_mean, _, cf0, _ = _trace_phase(times, traces.magnitude, avoid)
-    tried, tried_phase = [], []
-    ok, info, full = judge("mean", start_mean)
-    tried.append(info)
-    tried_phase.append(full.phase)
-    kept = (ok, info, full)
-    if not ok and ica:
-        for label, start in _ica_starts(Ys, times, tr, avoid, device):
-            ok, info, full = judge(label, start)
-            tried.append(info)
-            tried_phase.append(full.phase)
-            if ok:
-                kept = (ok, info, full)
-                break
-    ok, info, full = kept
+    starts = [("mean", start_mean)] + (
+        list(_ica_starts(Ys, times, tr, avoid, device)) if ica else []
+    )
+    answers = []  # [label, phase, member, alias ratio, alignment, rate, shuffles, alias offsets]
+    for label, start in starts:
+        phase, mem, ratio, _, _ = judge(start)
+        if phase is None:
+            continue  # every alias in a blind zone
+        # scored, and shuffled, on the crossed phase (see _crossed_phase)
+        crossed = _crossed_phase(times, mem.trace, avoid)
+        offs = _alias_offsets(times, crossed, tr, avoid)
+        score, crossed, _ = _best_alias(Ys, times, crossed, offs, tr, device)
+        if crossed is None:
+            continue
+        offs = _alias_offsets(times, crossed, tr, avoid)
+        answers.append([label, crossed, mem, ratio, score, _phase_rate(times, crossed), None, offs])
+    if not answers:  # nothing outside the blind zones: report the mean start, unfound
+        mem = _refine_pass(
+            Ys, times, [_Member(None, start_mean)], avoid, tr, device, dt, top, n_iter=n_iter
+        )[0]
+        answers.append(["mean", mem.phase, mem, 0.0, 0.0, _phase_rate(times, mem.phase), None, {}])
+    # the slice-time shuffle null, for each distinct answer (best first)
+    rng = np.random.default_rng(0)
+    tested: list[float] = []
+    for a in sorted(answers, key=lambda a: -a[4]):
+        if G < 2 or len(tested) >= PERMUTED_ANSWERS:
+            break
+        if any(abs(a[5] - r) < 1.5 for r in tested):
+            continue
+        tested.append(a[5])
+        a[6] = _shuffled_alignment(Ys, times, a[1], a[7], tr, device, SLICE_PERMUTATIONS, rng)
+    nulls = [a for a in answers if a[6] is not None]
+    if nulls:
+        kept = max(nulls, key=lambda a: a[4] - a[6].max())  # most clearly slice-locked
+        # Several answers were tried, so the kept one must beat as many shuffles OF ITS
+        # OWN as were drawn for all of them (Bonferroni). Pooling the others' shuffles
+        # instead let a badly converged answer -- whose shuffles can repair it -- set
+        # the floor for a good one.
+        extra = _shuffled_alignment(Ys, times, kept[1], kept[7], tr, device,
+                                    SLICE_PERMUTATIONS * (len(nulls) - 1), rng)  # fmt: skip
+        floor = (
+            float(np.concatenate([kept[6], extra]).max()) if extra.size else float(kept[6].max())
+        )
+        ok = kept[4] > floor
+    else:
+        kept, floor, ok = max(answers, key=lambda a: a[4]), float("nan"), False
+    label, phase, full, ratio, score, rate, _, _ = kept
+    # diagnostics for the kept answer only: two brain halves fitted from it, and the
+    # brain-mean trace's coherence with it
+    hm = _refine_pass(Ys, times, [_Member(halves[0], phase), _Member(halves[1], phase)],
+                      avoid, tr, device, dt, top, n_iter=n_iter)  # fmt: skip
+    split = _split_locking(hm[0].phase, hm[1].phase, times, tr)
+    coherence = mean_trace_coherence(traces.magnitude, phase, tr)
     n_vox = int(sum(Y.shape[0] for Y in Ys))
     Ys = halves = []  # drop the device-resident store now, not when the caller lets go
     weight = np.zeros(magnitude.shape[:3], np.float32)
@@ -1111,16 +1268,22 @@ def refine_cardiac(
     return CardiacRefinement(
         trace=full.trace,
         found=bool(ok),
-        split_half=info[2],
-        heart_rate_per_min=info[1],
+        split_half=float(split),
+        heart_rate_per_min=rate,
         weight=weight,
         n_voxels=n_vox,
         start_rate_per_min=float(np.median(cf0) * 60),
-        alias_coherence=info[3],
-        alias_ratio=float(info[4]),
-        start=info[0],
-        tried=tried,
-        tried_phase=tried_phase,
+        alias_coherence=float(coherence),
+        alias_ratio=float(ratio),
+        start=label,
+        tried=[
+            (a[0], a[5], a[4], float(a[6].max()) if a[6] is not None else float("nan"))
+            for a in answers
+        ],
+        tried_phase=[a[1] for a in answers],
+        alignment=float(score),
+        alignment_null=float(floor),
+        testable=G >= 2,
     )
 
 

@@ -1899,10 +1899,16 @@ def _physio_cardiac_mip(rec: QCRecord, step: int, cardiac: Mapping, affine) -> N
     found = bool(cardiac["found"])
     split = float(cardiac["split_half"])
     rec.metric("cardiac_found", int(found), "",
-               "1 when two halves of the brain agreed on the heartbeat (vessel-voxel trace)",
+               "1 when the vessel voxels' cardiac phases line up under the true slice times "
+               "better than under every shuffle of them (vessel-voxel trace)",
                warn_lt=0.5)  # fmt: skip
+    if "alignment" in cardiac:
+        rec.metric("cardiac_slice_alignment", float(cardiac["alignment"]), "",
+                   "vessel phases lined up across excitations at their true slice times, 0-1")  # fmt: skip
+        rec.metric("cardiac_slice_alignment_null", float(cardiac["alignment_null"]), "",
+                   "the best of the slice-time shuffles the alignment had to beat")  # fmt: skip
     rec.metric("cardiac_split_half", split, "",
-               "median 30 s phase locking between the two halves' cardiac traces")  # fmt: skip
+               "median 30 s phase locking between two brain halves' cardiac traces (diagnostic)")  # fmt: skip
     w = np.asarray(cardiac["weight"], dtype=np.float32)
     pos = w[w > 0]
     if pos.size == 0:

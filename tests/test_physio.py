@@ -559,7 +559,9 @@ def test_field_gradient_trace_follows_breath_depth():
     assert np.corrcoef(rvt[keep], truth[keep])[0, 1] > 0.8
 
 
-def _vascular_run(nt=240, shape=(16, 16, 20), mb=2, frac=0.05, card=0.03, seed=1, heart=True):
+def _vascular_run(
+    nt=240, shape=(16, 16, 20), mb=2, frac=0.05, card=0.03, seed=1, heart=True, volume_locked=False
+):
     """The heartbeat only in a few 'vessel' voxels, each with its own delay and sign
     (70 % positive, so the brain mean keeps a weak, partly cancelled heartbeat), plus
     breathing in the phase. Everywhere else: noise."""
@@ -570,7 +572,10 @@ def _vascular_run(nt=240, shape=(16, 16, 20), mb=2, frac=0.05, card=0.03, seed=1
     vessel = rng.random(shape) < frac
     delay = rng.uniform(0, 0.3, shape)
     sign = np.where(rng.random(shape) < 0.7, 1.0, -1.0)
-    beat = np.cos(2 * np.pi * F_CARD * (t[None, None] - delay[..., None]))
+    # volume_locked: the pulsation is the same in every slice of a volume, as drift,
+    # task or denoising residue are, instead of sampled at each slice's own time
+    tb = np.arange(nt)[None, :] * TR + 0 * st[:, None] if volume_locked else t
+    beat = np.cos(2 * np.pi * F_CARD * (tb[None, None] - delay[..., None]))
     pulse = card * sign[..., None] * beat * vessel[..., None] if heart else 0.0
     base = 100.0 + 20.0 * rng.random(shape)
     mag = base[..., None] * (1.0 + pulse + 0.01 * rng.standard_normal((nx, ny, nz, nt)))
@@ -610,12 +615,12 @@ def test_weighted_cardiac_beats_the_brain_mean_when_only_vessels_pulse():
 
 
 def test_no_heartbeat_is_reported_as_not_found():
-    """Noise and breathing only: whatever the iteration settles on, two halves of the
-    brain fitted separately must disagree, so the cardiac terms can be flagged."""
+    """Noise and breathing only: whatever the iteration settles on, its vessel phases
+    must line up no better under the true slice times than under shuffled ones."""
     mag, ph, st = _vascular_run(heart=False)
     tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
     ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
-    assert not ref.found and ref.split_half < physio.FOUND_SPLIT_HALF
+    assert ref.testable and not ref.found and ref.alignment <= ref.alignment_null
 
 
 def test_cardiac_avoid_covers_tr_lines_and_their_breathing_sidebands():
@@ -730,3 +735,26 @@ def test_ica_starts_survive_empty_and_sparse_excitations():
     ]
     starts = list(physio._ica_starts(Ys, times, TR, physio.cardiac_avoid(TR, 0.3), CPU))
     assert all(np.isfinite(ph).all() for _, ph in starts)
+
+
+def test_a_pulsation_the_same_in_every_slice_of_a_volume_is_not_a_heartbeat():
+    """The found test is slice timing: a real heartbeat is sampled at each slice's own
+    time, so its vessel phases line up only under the true slice times. The same
+    periodic signal stamped identically on every slice of a volume (what drift, task
+    and NORDIC residue look like) is perfectly periodic in the vessels and passes any
+    spectral or split-half test -- it must still be reported as not found."""
+    for locked in (False, True):
+        mag, ph, st = _vascular_run(volume_locked=locked, card=0.05)
+        tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+        ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+        assert ref.found is (not locked), (locked, ref.alignment, ref.alignment_null)
+
+
+def test_a_single_excitation_time_is_untestable():
+    """All slices at one instant (3D EPI, or no slice timing): nothing to shuffle, so
+    the heartbeat can be neither confirmed nor rejected -- untestable, not found."""
+    mag, ph, _ = _vascular_run()
+    st = np.zeros(mag.shape[2])
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    assert not ref.testable and not ref.found

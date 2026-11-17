@@ -261,7 +261,13 @@ def _write_qc(
     cardiac = (
         None
         if refined is None
-        else {"weight": refined.weight, "found": refined.found, "split_half": refined.split_half}
+        else {
+            "weight": refined.weight,
+            "found": refined.found,
+            "split_half": refined.split_half,
+            "alignment": refined.alignment,
+            "alignment_null": refined.alignment_null,
+        }
     )
     checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask, cardiac)
     rec.write(args.verb)
@@ -335,14 +341,16 @@ def main(argv: list[str] | None = None) -> int:
         )  # fmt: skip
         traces.cardiac = refined.trace
         if verb >= 1:
-            for lab, rate, split, coh, ratio in refined.tried:
-                print(f"    start {lab}: {rate:.1f}/min, halves {split:.2f}, alias coherence "
-                      f"{coh:.3f} (x{ratio:.1f} the next alias)")  # fmt: skip
+            for lab, rate, align, null in refined.tried:
+                shuf = "" if np.isnan(null) else f" (shuffled slice times: best {null:.2f})"
+                print(f"    start {lab}: {rate:.1f}/min, slice alignment {align:.2f}{shuf}")
+            verdict = (
+                "FOUND" if refined.found else ("NOT FOUND" if refined.testable else "UNTESTABLE")
+            )
             print(
-                f"  cardiac from {refined.n_voxels} voxels' best 1 %: "
-                f"{'FOUND' if refined.found else 'NOT FOUND'} via {refined.start}, "
-                f"{refined.heart_rate_per_min:.1f}/min (needs halves >= {physio.FOUND_SPLIT_HALF}, "
-                f"alias x{physio.ALIAS_RATIO:g} and >= {physio.ALIAS_COHERENCE:g})"
+                f"  cardiac from {refined.n_voxels} voxels' best 1 %: {verdict} via {refined.start}, "
+                f"{refined.heart_rate_per_min:.1f}/min (slice alignment {refined.alignment:.2f} must beat "
+                f"every slice-time shuffle, best {refined.alignment_null:.2f}; halves {refined.split_half:.2f})"
             )
         if not refined.found:
             # The slibase keeps its layout, built from the mean trace as before.
@@ -394,21 +402,17 @@ def main(argv: list[str] | None = None) -> int:
             "start": refined.start,
             "alias_coherence": refined.alias_coherence,
             "alias_ratio": refined.alias_ratio,
-            "thresholds": {
-                "split_half": physio.FOUND_SPLIT_HALF,
-                "alias_ratio": physio.ALIAS_RATIO,
-                "alias_coherence": physio.ALIAS_COHERENCE,
-            },
+            "slice_alignment": refined.alignment,
+            "slice_alignment_null": refined.alignment_null,
+            "testable": bool(refined.testable),
+            "rule": (
+                f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
+                f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers"
+            ),
             "tried": [
                 dict(
                     zip(
-                        (
-                            "start",
-                            "heart_rate_per_min",
-                            "split_half",
-                            "alias_coherence",
-                            "alias_ratio",
-                        ),
+                        ("start", "heart_rate_per_min", "slice_alignment", "shuffled_max"),
                         t,
                         strict=True,
                     )
