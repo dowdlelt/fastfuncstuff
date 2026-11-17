@@ -682,3 +682,19 @@ def test_refine_cardiac_frees_its_voxel_store_without_the_garbage_collector(monk
     finally:
         gc.enable()
     assert refs and alive == 0, f"{alive} of {len(refs)} stored voxel blocks outlived the call"
+
+
+def test_refine_pass_streams_from_the_host_past_an_empty_excitation():
+    """A host-stored voxel block with no rows (an excitation whose slices all fall
+    outside the mask, as at the end of a sequential whole-brain stack) crashed the
+    host-streaming path with torch.cat([]). cpu:0 differs from cpu, so the store
+    counts as off-device and the streaming branch runs without a GPU."""
+    rng = np.random.default_rng(0)
+    nt, G = 120, 3
+    times = np.arange(nt)[:, None] * TR + np.arange(G)[None] * TR / G
+    phase = 2 * np.pi * 1.1 * times
+    Ys = [torch.from_numpy(np.cos(phase[:, g])[None] + 0.1 * rng.standard_normal((40, nt))) for g in range(G - 1)]
+    Ys.append(torch.zeros((0, nt), dtype=torch.float64))
+    mem = physio._refine_pass(Ys, times, [physio._Member(None, phase)], physio.cardiac_avoid(TR, 0.3),
+                              TR, torch.device("cpu", 0), torch.float64, n_iter=1)
+    assert np.isfinite(mem[0].phase).all()

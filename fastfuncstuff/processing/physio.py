@@ -845,6 +845,7 @@ def _refine_pass(
     n_train = train.sum(0)
     ss = [_matmul_rows(Y * Y if Y.device == device else Y, train, device, dt) if Y.device == device
           else torch.cat([(Y[i:i + 65536].to(device).to(dt) ** 2) @ train for i in range(0, Y.shape[0], 65536)])
+          if Y.shape[0] else torch.zeros((0, 2), device=device, dtype=dt)
           for Y in Ys]  # fmt: skip
     M = len(members)
     for _ in range(n_iter):
