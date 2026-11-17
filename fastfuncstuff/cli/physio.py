@@ -335,11 +335,14 @@ def main(argv: list[str] | None = None) -> int:
         )  # fmt: skip
         traces.cardiac = refined.trace
         if verb >= 1:
+            for lab, rate, split, coh, ratio in refined.tried:
+                print(f"    start {lab}: {rate:.1f}/min, halves {split:.2f}, alias coherence "
+                      f"{coh:.3f} (x{ratio:.1f} the next alias)")  # fmt: skip
             print(
                 f"  cardiac from {refined.n_voxels} voxels' best 1 %: "
-                f"{'FOUND' if refined.found else 'NOT FOUND'} (halves agree "
-                f"{refined.split_half:.2f}, need {physio.FOUND_SPLIT_HALF}), "
-                f"{refined.heart_rate_per_min:.1f}/min"
+                f"{'FOUND' if refined.found else 'NOT FOUND'} via {refined.start}, "
+                f"{refined.heart_rate_per_min:.1f}/min (needs halves >= {physio.FOUND_SPLIT_HALF}, "
+                f"alias x{physio.ALIAS_RATIO:g} and >= {physio.ALIAS_COHERENCE:g})"
             )
         if not refined.found:
             # The slibase keeps its layout, built from the mean trace as before.
@@ -385,10 +388,33 @@ def main(argv: list[str] | None = None) -> int:
         summary["cardiac_weighted"] = {
             "found": bool(refined.found),
             "split_half_phase_locking": refined.split_half,
-            "found_threshold": physio.FOUND_SPLIT_HALF,
             "heart_rate_per_min_median": refined.heart_rate_per_min,
             "start_heart_rate_per_min": refined.start_rate_per_min,
             "n_voxels": refined.n_voxels,
+            "start": refined.start,
+            "alias_coherence": refined.alias_coherence,
+            "alias_ratio": refined.alias_ratio,
+            "thresholds": {
+                "split_half": physio.FOUND_SPLIT_HALF,
+                "alias_ratio": physio.ALIAS_RATIO,
+                "alias_coherence": physio.ALIAS_COHERENCE,
+            },
+            "tried": [
+                dict(
+                    zip(
+                        (
+                            "start",
+                            "heart_rate_per_min",
+                            "split_half",
+                            "alias_coherence",
+                            "alias_ratio",
+                        ),
+                        t,
+                        strict=True,
+                    )
+                )
+                for t in refined.tried
+            ],
             "weight_map": wpath,
             "in_nuisance": bool(cardiac_in_nuisance),
         }
