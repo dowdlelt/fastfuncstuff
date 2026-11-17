@@ -693,8 +693,40 @@ def test_refine_pass_streams_from_the_host_past_an_empty_excitation():
     nt, G = 120, 3
     times = np.arange(nt)[:, None] * TR + np.arange(G)[None] * TR / G
     phase = 2 * np.pi * 1.1 * times
-    Ys = [torch.from_numpy(np.cos(phase[:, g])[None] + 0.1 * rng.standard_normal((40, nt))) for g in range(G - 1)]
+    Ys = [
+        torch.from_numpy(np.cos(phase[:, g])[None] + 0.1 * rng.standard_normal((40, nt)))
+        for g in range(G - 1)
+    ]
     Ys.append(torch.zeros((0, nt), dtype=torch.float64))
-    mem = physio._refine_pass(Ys, times, [physio._Member(None, phase)], physio.cardiac_avoid(TR, 0.3),
-                              TR, torch.device("cpu", 0), torch.float64, n_iter=1)
+    mem = physio._refine_pass(
+        Ys,
+        times,
+        [physio._Member(None, phase)],
+        physio.cardiac_avoid(TR, 0.3),
+        TR,
+        torch.device("cpu", 0),
+        torch.float64,
+        n_iter=1,
+    )
     assert np.isfinite(mem[0].phase).all()
+
+
+def test_ica_starts_survive_empty_and_sparse_excitations():
+    """Excitations with no voxels, or fewer voxels than components, divided by zero
+    inside FastICA and broke the stack of per-excitation time courses."""
+    rng = np.random.default_rng(0)
+    nt, G = 160, 4
+    times = np.arange(nt)[:, None] * TR + np.arange(G)[None] * TR / G
+    beat = np.cos(2 * np.pi * 1.1 * times)
+    Ys = [
+        torch.from_numpy(
+            rng.standard_normal((60, 1)) * beat[:, g][None] + 0.3 * rng.standard_normal((60, nt))
+        )
+        for g in range(2)
+    ]
+    Ys += [
+        torch.zeros((0, nt), dtype=torch.float64),
+        torch.from_numpy(rng.standard_normal((3, nt))),
+    ]
+    starts = list(physio._ica_starts(Ys, times, TR, physio.cardiac_avoid(TR, 0.3), CPU))
+    assert all(np.isfinite(ph).all() for _, ph in starts)

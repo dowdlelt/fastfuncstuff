@@ -977,19 +977,24 @@ def _ica_starts(Ys: list[torch.Tensor], times: np.ndarray, tr: float, avoid, dev
 
     nt, G = times.shape
     fs = 1.0 / tr
+    # one component count for every excitation, so they stack; an excitation with too
+    # few voxels for it (slices outside the mask) contributes silent columns
+    K = min(ICA_COMPONENTS, nt - 1, max(1, max(Y.shape[0] for Y in Ys) - 1))
     tcs = []
     for Y in Ys:
+        if Y.shape[0] <= K:
+            tcs.append(np.zeros((nt, K)))
+            continue
         y = Y.to(device=device, dtype=torch.float32)
         y = y / (y.std(1, keepdim=True) + 1e-9)
-        k = min(ICA_COMPONENTS, nt - 1, max(1, y.shape[0] - 1))
         ica = FastICA(
-            n_components=k, pca_components=k, random_state=0, device=device, verbose=False
+            n_components=K, pca_components=K, random_state=0, device=device, verbose=False
         )
         T = ica.fit_transform(y.T).cpu().numpy().astype(np.float64)  # spatial ICA: time courses
         tcs.append(T / T.std(0, keepdims=True).clip(1e-12))
     nseg = min(128, nt)
     f, Pw = signal.welch(np.stack(tcs), fs=fs, nperseg=nseg, axis=1)  # (G, F, K)
-    Pn = Pw / Pw.sum(1, keepdims=True)
+    Pn = Pw / Pw.sum(1, keepdims=True).clip(1e-300)
     score = np.where(f > 1.0 / (nt * tr) * 2, Pn.max(2).sum(0), 0.0)
     for i in [j for j in np.argsort(score)[::-1] if score[j] > 0][:ICA_CANDIDATES]:
         band = np.abs(f - f[i]) <= 2 * (f[1] - f[0])
