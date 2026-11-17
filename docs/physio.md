@@ -66,8 +66,10 @@ ffs_physio -input run_mag.nii.gz -phase run_phase.nii.gz -prefix physio/run01 \
   cardiac × respiratory 1st order, HRV × CRF, RVT × RRF).
 - `-clean OUT` regresses each voxel's own-slice regressors out of the raw series
   (afni_proc's `ricor` order). See *Where in the pipeline* before using it.
-- `-qc DIR` writes two figures and a metrics record: the tracked rates on each trace's
-  spectrogram, and maps of where cardiac, respiration and RVT explain variance.
+- `-qc DIR` writes three figures and a metrics record: the tracked rates on each trace's
+  spectrogram, maps of where cardiac, respiration and RVT explain variance, and maximum
+  intensity projections of the cardiac weight map. A found heartbeat draws the arterial
+  tree; speckle, slice stripes or a bright edge mean it was not found.
 
 In `ffs_autoproc`, `-physio` runs it for every run and adds the nuisance to the GLM
 (`-glm_ortvec physio`, in the default set). `-physio_mode clean` switches to the `ricor`
