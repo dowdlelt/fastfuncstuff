@@ -296,7 +296,7 @@ class TraceWindow(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
         self.view = PlotView()
-        self.view.scrubbed.connect(self.scrubbed)
+        self.view.scrubbed.connect(self._scrubbed)
         v.addWidget(self.view, 1)
 
         def ask(name: str) -> Callable[[], None]:
@@ -320,6 +320,17 @@ class TraceWindow(QtWidgets.QWidget):
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
+
+    def _scrubbed(self, index: int) -> None:
+        """A click on a scrubbable line: its layer's sub-brick, or the time index."""
+        from fastfuncstuff.viewer.vocab import SetVolume
+
+        line = next((t for t in self.view._traces if t.scrub), None)
+        key = line.scrub_key if line is not None else ""
+        if key and self.session.state.layers.find(key) is not None:
+            self._dispatch(SetVolume(key, int(index)))
+        else:
+            self.scrubbed.emit(int(index))
 
     def apply(self, viewport: Viewport) -> None:
         self.setWindowTitle(viewport.title)

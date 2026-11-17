@@ -9,7 +9,7 @@ import torch
 from fastfuncstuff.stats import spectra
 from fastfuncstuff.viewer import instaspectra as engine
 from fastfuncstuff.viewer.session import ViewerSession
-from fastfuncstuff.viewer.vocab import SetIndex, SetMode, SetOverlay, SetUnderlay
+from fastfuncstuff.viewer.vocab import SetIndex, SetMode, SetOverlay, SetUnderlay, SetVolume
 
 nib = pytest.importorskip("nibabel")
 CPU = torch.device("cpu")
@@ -124,47 +124,66 @@ def _map_layer(s):
     return layer
 
 
-def test_the_map_has_one_frame_per_bin_and_follows_the_time_index(spec_session):
+def test_the_map_has_one_frame_per_bin_stepped_apart_from_time(spec_session):
+    """Its own sub-brick index: stepping frequency must not move the run."""
     s = spec_session
     s.do(SetMode("instaspectra"))
     s.set_mode_param("mask", str(s.tmp / "mask.nii.gz"))
     s.mode.action("go")
     result = s.mode._result
     layer = _map_layer(s)
-    assert layer.time_linked and layer.n_volumes == result.n_frames
+    assert not layer.time_linked and layer.n_volumes == result.n_frames
+    s.do(SetIndex(7))
     k = result.frame_of(F_HEART)
-    s.do(SetIndex(k))
-    shown = s.volume(layer.key)
+    s.do(SetVolume(layer.key, k))
+    shown = s.volume(layer.key, _map_layer(s).volume_index)
     assert np.nanmin(shown[CORNER][result.mask[CORNER]]) > 3.0
-    s.do(SetIndex(1))
-    assert not np.array_equal(np.nan_to_num(s.volume(layer.key)), np.nan_to_num(shown))
+    for _ in range(3):
+        s.mode.action("next")
+    assert _map_layer(s).volume_index == k + 3
+    assert s.state.time_index == 7
     assert layer.labels[k].endswith("Hz")
+    # A new look at the same spectra keeps the bin.
+    s.set_mode_param("width", "0.05")
+    assert _map_layer(s).volume_index == k + 3
 
 
-def test_the_spectrum_panel_marks_the_current_bin_and_scrubs(spec_session):
+def test_comma_and_period_step_the_selected_map_not_time(spec_session):
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    layer = _map_layer(s)
+    s.state.selected = layer.key
+    s.do(SetIndex(4))
+    s.do(s.frame_step(1))
+    assert _map_layer(s).volume_index == 1 and s.state.time_index == 4
+
+
+def test_the_spectrum_panel_marks_the_current_bin_and_scrubs_the_map(spec_session):
     s = spec_session
     s.do(SetMode("instaspectra"))
     k = s.mode._result.frame_of(F_HEART)
-    s.do(SetIndex(k))
+    s.do(SetVolume(_map_layer(s).key, k))
     traces = s.mode.panels()["spectrum"]
     voxel = traces[0]
-    assert voxel.marker == k and voxel.scrub
+    assert voxel.marker == k and voxel.scrub and voxel.scrub_key == _map_layer(s).key
     assert voxel.x is not None and voxel.x[k] == pytest.approx(s.mode._result.freqs[k])
 
 
-def test_voxel_peak_and_alias_jump_the_time_index(spec_session):
+def test_voxel_peak_and_alias_jump_the_bin(spec_session):
     s = spec_session
     s.do(SetMode("instaspectra"))
     result = s.mode._result
+    s.do(SetIndex(5))
     # Into the corner, then ask for that voxel's peak.
     s.state.crosshair = (2, 2, 1)
     s.mode.action("voxel_peak")
-    assert s.state.time_index == result.frame_of(F_HEART)
+    assert _map_layer(s).volume_index == result.frame_of(F_HEART)
     # A rate of 48 bpm is 0.8 Hz, below Nyquist: the alias is itself.
     s.set_mode_param("heart_bpm", "48")
-    s.do(SetIndex(0))
+    s.do(SetVolume(_map_layer(s).key, 0))
     s.mode.action("alias")
-    assert s.state.time_index == result.frame_of(spectra.alias(0.8, TR))
+    assert _map_layer(s).volume_index == result.frame_of(spectra.alias(0.8, TR))
+    assert s.state.time_index == 5
 
 
 def test_display_changes_do_not_recompute_the_spectra(spec_session):
@@ -184,7 +203,7 @@ def test_keep_freezes_a_lazy_copy(spec_session):
     kept = [ly for ly in s.state.layers if ly.source == "kept:mode:instaspectra"]
     assert len(kept) == 1
     live = _map_layer(s)
-    assert kept[0].n_volumes == live.n_volumes and kept[0].time_linked
+    assert kept[0].n_volumes == live.n_volumes and not kept[0].time_linked
     np.testing.assert_array_equal(
         np.nan_to_num(s.volume(kept[0].key, 3)), np.nan_to_num(s.volume(live.key, 3))
     )
@@ -219,3 +238,57 @@ def test_clicking_the_spectrum_emits_the_nearest_bin():
     )
     view.mousePressEvent(press)
     assert got and abs(freqs[got[0]] - 0.5) < 0.011
+
+
+def test_a_click_in_the_spectrum_window_moves_the_map_and_not_time(spec_session):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
+    from fastfuncstuff.viewer.viewports import ViewKind
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    s.open_mode_panels()
+    vp = next(v for v in s.state.viewports.of_kind(ViewKind.TRACE) if v.panel == "spectrum")
+    win = TraceWindow(vp.id, s, s.do)
+    win.apply(vp)
+    s.do(SetIndex(6))
+    timed: list[int] = []
+    win.scrubbed.connect(timed.append)
+    win._scrubbed(9)
+    assert _map_layer(s).volume_index == 9
+    assert s.state.time_index == 6 and not timed
+    win.close()
+
+
+def test_the_3d_window_follows_the_bin(spec_session):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.ui.vox3dwindow import Vox3DWindow
+    from fastfuncstuff.viewer.vocab import OpenView
+
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    s = spec_session
+    s.do(SetMode("instaspectra"))
+    s.do(OpenView("X1", "vox3d", "axial"))
+    win = Vox3DWindow("X1", s, s.do)
+    win.apply(s.state.viewports.get("X1"))
+    assert win.chosen_layers()[0].key == _map_layer(s).key
+    before = win.canvas.overlay.data.copy()
+    k = s.mode._result.frame_of(F_HEART)
+    win.refresh(s.do(SetVolume(_map_layer(s).key, k)))
+    after = win.canvas.overlay.data
+    assert not np.array_equal(before, after)
+    # (nz, ny, nx): the heartbeat corner is bright at its bin.
+    assert after[1, 2, 2] > 3.0
+    win.refresh(Aspect.TIME)  # stepping time does not move it
+    assert np.array_equal(win.canvas.overlay.data, after)
+    win.close()

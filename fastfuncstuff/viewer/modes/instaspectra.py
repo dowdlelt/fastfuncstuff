@@ -1,11 +1,13 @@
-"""InstaSpectra: every voxel's spectrum, as maps you step through with the time axis.
+"""InstaSpectra: every voxel's spectrum, as one map per frequency bin.
 
-The run goes in, and out comes a layer with one map per frequency bin, laid
-along the time axis: scrubbing or playing time steps through frequency, and the
-graph of any voxel of that layer is its spectrum in the map's units. A spectrum
-window follows the crosshair -- the voxel's density and the brain's, the bin
-being shown marked -- and clicking or dragging along it moves the time axis to
-that bin.
+The run goes in, and out comes a layer with one map per frequency bin, stepped
+by its own sub-brick index -- ``◀ bin`` / ``bin ▶``, left / right in the
+spectrum window, or `,` / `.` with the layer selected -- and never by the time
+index: stepping frequency must not move the run underneath to another volume.
+(It was laid along the time axis at first; that moved every time series in the
+stack with it.) A spectrum window follows the crosshair -- the voxel's density
+and the brain's, the bin being shown marked -- and clicking or dragging along
+it moves the map to that bin.
 
 The use it was built for: find the band a heartbeat (or breathing, or a
 scanner artefact) occupies, then look at where it lives. ``→ voxel peak`` jumps
@@ -44,6 +46,7 @@ from fastfuncstuff.viewer.modes.base import (
     mode,
 )
 from fastfuncstuff.viewer.modes.masking import RunMaskMixin
+from fastfuncstuff.viewer.vocab import SetVolume
 
 #: The cut a robust z map starts at: well out of the brain's own distribution.
 Z_THRESHOLD = 3.0
@@ -271,11 +274,19 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         return True
 
     # -- production ----------------------------------------------------
+    def _layer(self):
+        """The map layer this mode owns, once it exists."""
+        if self.session is None:
+            return None
+        return self.session.state.layers.find_by_source(self.layer_source)
+
     @property
     def _frame(self) -> int:
+        """The bin shown: the map layer's own sub-brick."""
         n = self._result.n_frames if self._result is not None else 1
-        t = self.session.state.time_index if self.session is not None else 0
-        return max(0, min(int(t), n - 1))
+        layer = self._layer()
+        k = layer.volume_index if layer is not None else 0
+        return max(0, min(int(k), n - 1))
 
     def _view(self) -> tuple[str, str, float, float]:
         return (
@@ -322,6 +333,7 @@ class InstaSpectraMode(RunMaskMixin, Mode):
             rescale=rescale,
             frames=frame,
             n_frames=n,
+            frame=self._frame,
         )
 
     # -- actions -------------------------------------------------------
@@ -346,15 +358,16 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         return super().action(name, progress)
 
     def _goto(self, k: int) -> Aspect:
-        """Set the time index to bin ``k`` -- the frame the map shows."""
-        if self.session is None or self._result is None:
+        """Show bin ``k``: the map layer's sub-brick, leaving the time index alone."""
+        layer = self._layer()
+        if layer is None or self._result is None:
             return Aspect.NOTHING
-        st = self.session.state
-        target = max(0, min(int(k), self._result.n_frames - 1, st.max_time_index()))
-        if target == st.time_index:
+        target = max(0, min(int(k), self._result.n_frames - 1))
+        if target == layer.volume_index:
             return Aspect.NOTHING
-        st.time_index = target
-        return Aspect.TIME | Aspect.SLICES | Aspect.GRAPH
+        assert self.session is not None
+        self.session.state.layers.update(layer.key, volume_index=target)
+        return SetVolume.aspects | Aspect.GRAPH
 
     def _heart_alias(self) -> float | None:
         bpm = float(self.params.get("heart_bpm") or 0.0)
@@ -381,6 +394,8 @@ class InstaSpectraMode(RunMaskMixin, Mode):
         if result is None:
             return {}
         k = self._frame
+        layer = self._layer()
+        scrub_key = layer.key if layer is not None else ""
         lines: list[Trace] = []
         psd = self._voxel_psd()
         x_label = f"{result.unit}"
@@ -395,6 +410,7 @@ class InstaSpectraMode(RunMaskMixin, Mode):
                     short="voxel",
                     marker=k,
                     scrub=True,
+                    scrub_key=scrub_key,
                 )
             )
         lines.append(
@@ -407,6 +423,7 @@ class InstaSpectraMode(RunMaskMixin, Mode):
                 short="mask mean",
                 marker=None if psd is not None else k,
                 scrub=True,
+                scrub_key=scrub_key,
             )
         )
         return {"spectrum": lines}

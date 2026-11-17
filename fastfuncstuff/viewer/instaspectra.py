@@ -3,8 +3,8 @@
 One run in, ``(V, F)`` one-sided PSDs out (``stats/spectra.py``), each voxel
 detrended first with the same Legendre drift InstaPCA removes. The maps are then
 views of that one array, cheap enough to remake on every change of a display
-control: one map per frequency bin, which the viewer lays along its time axis so
-stepping through time steps through frequency.
+control: one map per frequency bin, which the viewer steps through as the
+map layer's sub-bricks.
 
 The default map is a voxel's **share** of its own power: the power in a band
 around each bin over the voxel's total above a floor (0.04 Hz). A share means

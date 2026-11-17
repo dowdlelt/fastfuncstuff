@@ -7,8 +7,8 @@ default, or a MinIP, a mean, the first surface over threshold, or a composite.
 Everything is read from the layer stack exactly as the slices read it -- the
 topmost visible layer above the base is the overlay, with its colour map,
 range, sign and threshold; the base is the anatomy -- so a threshold dragged in
-the controller redraws the projection, and stepping time (or InstaSpectra's
-frequency) steps the 3-D view with it.
+the controller redraws the projection, and stepping time -- or the overlay's
+own sub-bricks, InstaSpectra's frequency bins -- steps the 3-D view with it.
 
 Rendering is Qt's RHI (``QRhiWidget``, Metal on a Mac), with the shaders in
 ``viewer/shaders/vox3d.*``; the arithmetic, and the CPU twin that picking uses,

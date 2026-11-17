@@ -1863,7 +1863,6 @@ class ViewerSession:
             array, shape_of = _overlay_array(overlay)
             self.store.adopt(key, array, name=overlay.name)
             n_vol = int(array.shape[3])
-        time_linked = overlay.frames is not None and n_vol > 1
         self.invalidate(key)
 
         lo, hi = overlay.display_range or derive_range(overlay.values)
@@ -1885,10 +1884,16 @@ class ViewerSession:
             # brick that is no longer there.
             changes.update(
                 n_volumes=n_vol,
-                time_linked=time_linked,
+                # A frame stack has its own index (SET_VOLUME), like a bucket:
+                # stepping it must not move every time series in the stack.
+                # Kept across a recompute -- a new band width is the same
+                # frequency, looked at differently.
+                time_linked=False,
                 shape=shape_of,
                 labels=overlay.volume_labels,
-                volume_index=0,
+                volume_index=(
+                    min(existing.volume_index, n_vol - 1) if overlay.frames is not None else 0
+                ),
                 **cut,
             )
             if overlay.rescale:
@@ -1913,7 +1918,7 @@ class ViewerSession:
                     path=f"<{overlay.name}>",
                     shape=shape_of,
                     n_volumes=n_vol,
-                    time_linked=time_linked,
+                    volume_index=max(0, min(int(overlay.frame), n_vol - 1)),
                     labels=overlay.volume_labels,
                     affine=np.asarray(overlay.affine, dtype=float),
                     colormap=overlay.colormap,
