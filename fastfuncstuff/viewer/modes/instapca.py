@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.viewer import instapca as engine
-from fastfuncstuff.viewer.commands import Aspect, Command
+from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
     HALF,
     THIRD,
@@ -39,6 +39,7 @@ from fastfuncstuff.viewer.modes.base import (
     correlation_stat,
     mode,
 )
+from fastfuncstuff.viewer.modes.masking import RunMaskMixin
 
 LABELS = ("signal", "noise")
 #: How each map's units read in a volume label.
@@ -62,7 +63,7 @@ def default_ortvec_path(run_path: str, tail: str = "pca_noise") -> Path:
 
 
 @mode
-class InstaPCAMode(Mode):
+class InstaPCAMode(RunMaskMixin, Mode):
     name = "instapca"
     label = "InstaPCA"
     tag = "IPCA"
@@ -99,22 +100,7 @@ class InstaPCAMode(Mode):
     def controls(self) -> tuple[Control, ...]:
         n = self._result.n_components if self._result is not None else 0
         return (
-            ChoiceControl(
-                name="roi",
-                label="mask ROI",
-                choices=("none", *self._roi_choices()),
-                default="none",
-                help="A painted (or loaded ROI) layer as the mask, followed live as you "
-                "paint it. Overrides the mask below.",
-            ),
-            PathControl(
-                name="mask",
-                label="mask",
-                filter="NIfTI (*.nii *.nii.gz *.nii.zst);;All (*)",
-                help="A mask file on the run's grid, or the key of a loaded layer (a "
-                "painted ROI, an atlas: nonzero is inside; any grid). Empty means AFNI's "
-                "automask of the run.",
-            ),
+            *self.mask_controls(),
             *self.time_cut_controls(),
             IntControl(
                 name="polort",
@@ -203,28 +189,6 @@ class InstaPCAMode(Mode):
     def preparation_params(self) -> frozenset[str]:
         return frozenset({"roi", "mask", "polort", "n_components", "drop_first", "drop_last"})
 
-    def _roi_choices(self) -> list[str]:
-        if self.session is None:
-            return []
-        return [
-            f"{ly.key} {ly.name}"
-            for ly in self.session.state.layers
-            if ly.roi or self.session.painter.owns(ly.key)
-        ]
-
-    def _roi_key(self) -> str | None:
-        """The layer chosen as the mask ROI, if it is still loaded."""
-        text = str(self.params.get("roi") or "none").split(" ", 1)[0]
-        if text == "none" or self.session is None:
-            return None
-        return text if self.session.state.layers.find(text) is not None else None
-
-    def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
-        # A stroke on the ROI that is the mask changes the voxels decomposed.
-        if self.roi_stroke(cmd, self._roi_key()):
-            return self.stale()
-        return Aspect.NOTHING
-
     def panel_names(self) -> tuple[str, ...]:
         return ("timecourse", "spectrum", "scree")
 
@@ -240,20 +204,10 @@ class InstaPCAMode(Mode):
             self._message = "needs a 4-D run"
             self._dirty = False
             return False
-        mask_text = str(self.params.get("mask") or "").strip()
-        roi_key = self._roi_key()
-        if roi_key is not None:
-            mask_text = roi_key
-        mask_layer = (
-            self.session.state.layers.find(mask_text.split(" ", 1)[0]) if mask_text else None
-        )
         polort = int(self.params.get("polort", 2))
         n_comp = int(self.params.get("n_components") or 20)
-        # A layer used as the mask can be painted after the fact: its data
-        # version is part of what the decomposition was made from.
-        mask_version = self.session.store.get(mask_layer.key).generation if mask_layer else 0
         cut = (int(self.params.get("drop_first") or 0), int(self.params.get("drop_last") or 0))
-        identity = (layer.key, f"{mask_text}@{mask_version}", polort, cut, *self._identity_extra())
+        identity = (layer.key, self.mask_identity(), polort, cut, *self._identity_extra())
         # Coming back into the mode re-marks it dirty; the decomposition it
         # left is still the right one unless what it was made from changed.
         if self._result is not None and identity == self._identity and n_comp == self._n_requested:
@@ -268,22 +222,13 @@ class InstaPCAMode(Mode):
                 data = self.session.store.ensure_ram(layer.key)
                 data = data[..., self.time_window(data.shape[-1])]
                 tr = float(self.session.store.get(layer.key).info.tr or 0.0)
-                if mask_layer is not None:
-                    mask = self.session.mask_from_layer(mask_layer.key, layer)
-                else:
-                    mask = engine.read_mask(mask_text, data.shape[:3]) if mask_text else None
+                mask = self.resolve_mask(layer, data.shape[:3])
                 result = engine.decompose(
                     data,
                     affine=np.asarray(layer.affine, dtype=float),
                     tr=tr,
                     mask=mask,
-                    mask_source=(
-                        mask_layer.name
-                        if mask_layer
-                        else Path(mask_text).name
-                        if mask_text
-                        else "automask"
-                    ),
+                    mask_source=self.mask_source(),
                     polort=polort,
                     n_components=n_comp,
                     device=self.session.store.device,
