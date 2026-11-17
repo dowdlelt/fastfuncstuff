@@ -252,3 +252,71 @@ def test_the_rendered_mip_draws_the_blob_in_the_overlay_colour(stack):
     c = QtGui.QColor(bg)
     assert np.abs(px[2, 2] - [c.red(), c.green(), c.blue()]).max() <= 3
     win.close()
+
+
+def _grab_axial(s, mode: str, anat: int):
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.layers import SignMode
+    from fastfuncstuff.viewer.ui.vox3dwindow import Vox3DWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetIndex
+
+    s.do(SetIndex(11))
+    key = s.state.layers.layers[-1].key
+    s.state.layers.update(
+        key, threshold=150.0, sign_mode=SignMode.POS, colormap="hot", range_lo=0.0, range_hi=200.0
+    )
+    if s.state.viewports.find("X1") is None:
+        s.do(OpenView("X1", "vox3d", "axial"))
+    win = Vox3DWindow("X1", s, s.do)
+    win.canvas.resize(300, 300)
+    win.apply(s.state.viewports.get("X1"))
+    win.refresh(Aspect.ALL)
+    win.anat.setValue(anat)
+    win.canvas.mode = mode
+    win.canvas.reset_camera("axial")
+    grabbed = win.canvas.grabFramebuffer()
+    img = grabbed.convertToFormat(grabbed.Format.Format_RGBA8888)
+    if img.isNull():
+        pytest.skip("no QRhi available to render with")
+    px = np.array(img.constBits()).reshape(img.height(), img.width(), 4)[..., :3].astype(int)
+    return win, px, img.width(), img.height()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["mip", "first hit"])
+def test_the_anatomy_backdrop_shows_on_either_theme(stack, mode):
+    """Drawn in the ink that contrasts with the background: mixing toward
+    white made the backdrop vanish on the light palette."""
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        pytest.skip("QRhi needs a real platform plugin")
+    from PySide6 import QtGui
+
+    from fastfuncstuff.viewer.ui import theme
+
+    win, px, w, h = _grab_axial(stack, mode, anat=60)
+    aff = _affine()
+    # Inside the box, away from the bright voxel: only the anatomy is there.
+    mm = aff[:3, :3] @ np.array([15.0, 6.0, 8.0]) + aff[:3, 3]
+    at, _ = win.canvas.camera.to_widget(mm[None], w, h)
+    x, y = (int(v) for v in at[0])
+    c = QtGui.QColor(theme.palette().bg)
+    assert np.abs(px[y, x] - [c.red(), c.green(), c.blue()]).max() > 40
+    win.close()
+
+
+@pytest.mark.gpu
+def test_a_first_hit_surface_takes_the_colour_of_its_peak(stack):
+    """Not the value at the threshold crossing, which is the cut itself."""
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        pytest.skip("QRhi needs a real platform plugin")
+    win, px, w, h = _grab_axial(stack, "first hit", anat=0)
+    aff = _affine()
+    mm = aff[:3, :3] @ np.array([5.0, 12.0, 8.0]) + aff[:3, 3]
+    at, _ = win.canvas.camera.to_widget(mm[None], w, h)
+    x, y = (int(v) for v in at[0])
+    lut = win.canvas.overlay.lut[:, :3].astype(int)
+    # The voxel peaks near 210 on a 0..200 scale: the top of the LUT, give
+    # or take the lighting (seen face-on from above, nearly 1).
+    want = lut[255]
+    assert np.abs(px[y, x] - want).max() <= 40, (px[y, x], want)
+    win.close()

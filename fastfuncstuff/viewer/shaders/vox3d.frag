@@ -151,7 +151,21 @@ void main()
                     nrm = normalize(nrm);
                     lit = 0.35 + 0.65 * abs(dot(nrm, normalize(world)));
                 }
-                hitColour = lut(v) * lit;
+                // Coloured by the peak just inside, not the value at the
+                // crossing: that is the threshold itself, so every object
+                // would come out the colour of the cut.
+                vec3 dims = vec3(textureSize(ovTex, 0));
+                int extra = int(ceil(2.0 * eye.w / max(max(dims.x, dims.y), dims.z)));
+                float peak = v;
+                float peakScore = sc;
+                for (int j = 1; j <= 16; ++j) {
+                    if (j > extra) break;
+                    vec3 q = (ovFromMm * vec4(e + (s + float(j) * ds) * world, 1.0)).xyz;
+                    if (!inside(q)) break;
+                    float w2 = texture(ovTex, q).r;
+                    if (score(w2) > peakScore) { peakScore = score(w2); peak = w2; }
+                }
+                hitColour = lut(peak) * lit;
                 hit = true;
                 break;
             }
@@ -177,8 +191,10 @@ void main()
 
     float anMean = anCount > 0.0 ? anSum / anCount : 0.0;
     // The anatomy behind a projection: its mean along the ray, stretched so a
-    // brain reads as a brain rather than as a faint haze.
-    vec3 backdrop = mix(back, vec3(1.0), hasAn ? clamp(anMean * 2.2, 0.0, 1.0) * anShade.z : 0.0);
+    // brain reads as a brain rather than as a faint haze -- in the ink that
+    // contrasts with the background, or a light theme draws white on white.
+    vec3 ink = dot(back, vec3(0.299, 0.587, 0.114)) > 0.5 ? vec3(0.0) : vec3(1.0);
+    vec3 backdrop = mix(back, ink, hasAn ? clamp(anMean * 2.2, 0.0, 1.0) * anShade.z : 0.0);
     vec3 colour = backdrop;
     if (mode == 0) {
         if (hasOv && best >= thr && best > 0.0) colour = mix(backdrop, lut(bestV), ovShade.w);
