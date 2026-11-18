@@ -3411,7 +3411,8 @@ def _get_shift1d_body(device: torch.device):
     ):
         return _shift1d_lanczos_body
     try:
-        compiled = torch.compile(_shift1d_lanczos_body, dynamic=True)
+        # Lazy build: a CPU node with no g++ fails on the first call, not here.
+        compiled = _interp.compile_with_eager_fallback(_shift1d_lanczos_body, dynamic=True)
     except Exception:
         compiled = _shift1d_lanczos_body  # compile unavailable on this build
     _compiled_shift1d[dt] = compiled

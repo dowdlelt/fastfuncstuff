@@ -106,3 +106,28 @@ def test_a_flat_region_keeps_its_intensity():
     flat = torch.full((4, 16, 16), 2.75)
     got = L._shift1d_windowed_sinc(flat, torch.full((4, 16, 16), 0.37), 1, 3)
     assert torch.allclose(got, flat, atol=1e-5)
+
+
+def test_no_cxx_compiler_falls_back_to_eager(monkeypatch):
+    """Bug of record: a CPU-only Kubernetes pod without g++ raised inductor's
+    InvalidCxxCompiler on the first compiled call and killed ffs_locomoco
+    mid-run (moco/qwarp already wrapped their kernels)."""
+
+    class InductorError(Exception):
+        pass
+
+    InductorError.__module__ = "torch._inductor.exc"
+
+    def _broken_compile(fn, **kwargs):
+        def compiled(*a, **k):
+            raise InductorError("InvalidCxxCompiler: No working C++ compiler found")
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", _broken_compile)
+    torch.manual_seed(0)
+    vol, shift = torch.randn(8, 20, 20), torch.randn(8, 20, 20) * 0.4
+    L._shift1d_eager_seconds["cpu"] = 1e9
+    expected = _eager(vol, shift, 1)
+    assert torch.equal(L._shift1d_windowed_sinc(vol, shift, 1, 3), expected)
+    assert torch.equal(L._shift1d_windowed_sinc(vol, shift, 1, 3), expected)
