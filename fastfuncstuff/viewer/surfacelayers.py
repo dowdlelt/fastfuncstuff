@@ -84,7 +84,17 @@ def sibling_path(path: str | Path) -> Path | None:
         return None
     hit = m[-1]
     other = "rh" if hit.group(1) == "lh" else "lh"
-    return p.with_name(p.name[: hit.start()] + other + p.name[hit.end() :])
+    named = p.with_name(p.name[: hit.start()] + other + p.name[hit.end() :])
+    # A per-hemisphere folder carries the token too: ffs_group -etac writes
+    # grp.lh.etac/grp.lh.ETACmask... and its twin under grp.rh.etac/.
+    d = list(_HEMI_TOKEN.finditer(p.parent.name))
+    if d and d[-1].group(1) == hit.group(1) and not named.exists():
+        dh = d[-1]
+        folder = p.parent.name[: dh.start()] + other + p.parent.name[dh.end() :]
+        moved = p.parent.parent / folder / named.name
+        if moved.exists():
+            return moved
+    return named
 
 
 def open_surface_parts(path: str | Path, place) -> dict[str, SurfaceData]:

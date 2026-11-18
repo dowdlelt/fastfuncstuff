@@ -115,11 +115,11 @@ def test_alpha_rule_sizes_each_hemisphere_from_its_own_group_table(group, sessio
 def test_etac_mask_and_per_test_files_open_as_surface_layers(group, session):
     tmp, _ = group
     m = session.state.layers.get(
-        session.load(str(tmp / "grp.lh.ETACmask.global.2sid.5perc.func.gii"))
+        session.load(str(tmp / "grp.lh.etac" / "grp.lh.ETACmask.global.2sid.5perc.func.gii"))
     )
     assert m.source == "surface:lh,rh"
     allm = session.state.layers.get(
-        session.load(str(tmp / "grp.lh.ETACmaskALL.global.2sid.5perc.func.gii"))
+        session.load(str(tmp / "grp.lh.etac" / "grp.lh.ETACmaskALL.global.2sid.5perc.func.gii"))
     )
     assert allm.labels == ("B0.0_p0.01", "B0.0_p0.002")
 
@@ -155,3 +155,20 @@ def test_a_subjects_own_mesh_is_never_replaced(group, session, tmp_path):
     save_gifti_data(tmp_path / "x.lh.func.gii", np.ones(len(d2), np.float32), meta)
     with pytest.raises(ValueError, match="not on any loaded mesh"):
         session.load(str(tmp_path / "x.lh.func.gii"))
+
+
+def test_sibling_is_found_across_per_hemisphere_folders(tmp_path):
+    """ffs_group -etac moved its masks into PREFIX.etac/, one folder per hemisphere."""
+    from fastfuncstuff.viewer.surfacelayers import sibling_path
+
+    name = "grp.{h}.ETACmask.global.2sid.5perc.func.gii"
+    for h in ("lh", "rh"):
+        (tmp_path / f"grp.{h}.etac").mkdir()
+        (tmp_path / f"grp.{h}.etac" / name.format(h=h)).touch()
+    lh = tmp_path / "grp.lh.etac" / name.format(h="lh")
+    assert sibling_path(lh) == tmp_path / "grp.rh.etac" / name.format(h="rh")
+    # Same folder still wins when both exist; no folder twin falls back to the name swap.
+    (tmp_path / "grp.lh.etac" / name.format(h="rh")).touch()
+    assert sibling_path(lh) == tmp_path / "grp.lh.etac" / name.format(h="rh")
+    flat = tmp_path / "x.lh.func.gii"
+    assert sibling_path(flat) == tmp_path / "x.rh.func.gii"
