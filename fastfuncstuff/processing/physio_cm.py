@@ -234,7 +234,7 @@ def detect(
     kept = max(pulsed, key=lambda a: a["stat"] - a["null"].max())
     # Bonferroni over the starts tried: more derangements of the KEPT start, not the
     # other starts' nulls -- a start that is no heartbeat (drift the same in every
-    # slice) survives derangement, and its high null rejected true finds (39 of 147).
+    # slice) survives derangement, and its high null rejected correct picks (69 of 171 runs).
     extra = _null(Ys, times, kept["start"], tr, device, band, shuffles * (len(answers) - 1), rng)
     floor = float(np.concatenate([kept["null"], extra]).max())
     found = bool(kept["stat"] > floor and kept["a2"] > kept["hnull"])
