@@ -29,6 +29,8 @@ def experiment_hooks(
     full_aliases=False,
     ica_components=None,
     ica_candidates=None,
+    extra_starts=(),
+    extra_only=False,
 ):
     original_avoid = p.cardiac_avoid
     original_voxels = p._cardiac_voxels
@@ -65,7 +67,9 @@ def experiment_hooks(
         return phase
 
     def ica_starts(series, times, tr, avoid, device):
-        yield from original_ica(series, times, tr, avoid, device)
+        yield from extra_starts
+        if not extra_only:
+            yield from original_ica(series, times, tr, avoid, device)
         if not harmonic_seeds:
             return
         # A component may be the pulse's second harmonic. Treating every component
@@ -160,6 +164,11 @@ def main():
     parser.add_argument("--ica-components", type=int)
     parser.add_argument("--ica-candidates", type=int)
     parser.add_argument(
+        "--cm-starts", type=int, default=0, help="Add N constant-modulus subspace starts"
+    )
+    parser.add_argument("--cm-only", action="store_true", help="CM starts replace ICA starts")
+    parser.add_argument("--cm-k", type=int, help="PCs searched (default min(20, nt // 6))")
+    parser.add_argument(
         "--shuffle-times",
         type=int,
         help="Negative control: derange excitation times with this seed",
@@ -204,6 +213,16 @@ def main():
     traces = p.excitation_traces(mag, st, tr, phase=phase, device=CPU)
     del phase
     print(label, "traces ready", flush=True)
+    extra, cm_record = [], []
+    if args.cm_starts:
+        from scripts.physio_phase_review.cm_subspace import cm_traces, excitation_start
+
+        mean_img = mag.mean(-1)
+        cm_mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
+        for i, (ratio, c) in enumerate(cm_traces(mag, cm_mask, k=args.cm_k, n=args.cm_starts)):
+            extra.append((f"cm{i}@{ratio:.3f}", excitation_start(c, traces.times, tr)))
+            cm_record.append(dict(label=extra[-1][0], cm_ratio=ratio))
+        print(label, "cm starts", [e[0] for e in extra], flush=True)
     with experiment_hooks(
         args.drop_resp_zones,
         args.phase_mode,
@@ -211,6 +230,8 @@ def main():
         args.full_aliases,
         args.ica_components,
         args.ica_candidates,
+        extra,
+        args.cm_only,
     ) as diagnostics:
         result = p.refine_cardiac(mag, traces, st, tr, device=CPU, ica=not args.mean_only)
     del mag
@@ -220,6 +241,10 @@ def main():
     else:
         peak_path, start_time, sample_rate = reference_spec
         peaks = np.loadtxt(peak_path) / sample_rate + start_time
+    for entry, (_, start_phase) in zip(cm_record, extra, strict=True):
+        entry["start_metrics"] = metrics(start_phase, traces.times, peaks)
+        print(label, entry["label"], "start lock", round(entry["start_metrics"]["lock"], 3),
+              "rate", round(entry["start_metrics"]["rate"], 1), flush=True)
     candidates = []
     for tried, phase in zip(result.tried, result.tried_phase, strict=True):
         candidates.append(
@@ -243,6 +268,8 @@ def main():
         complete_aliases=args.full_aliases,
         ica_components=args.ica_components,
         ica_candidates=args.ica_candidates,
+        cm_starts=cm_record,
+        cm_only=args.cm_only,
         drop_resp_zones=args.drop_resp_zones,
         ica=not args.mean_only,
         found=result.found,

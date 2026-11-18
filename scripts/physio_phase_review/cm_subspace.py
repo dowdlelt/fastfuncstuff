@@ -189,3 +189,53 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def cm_traces(mag, mask, k=None, n=3, degree=4, restarts=60, seed=0):
+    """Image-only: the ``n`` most constant-modulus complex volume-rate traces.
+
+    Returns [(cm_ratio, c)], best first. ``k`` defaults to min(20, nt // 6): 40 overfit
+    the 120-volume Rockland runs, 12 missed sub-06's heartbeat (it sat beyond PC 12).
+    """
+    nt = mag.shape[-1]
+    k = k or min(20, nt // 6)
+    Y = legendre_detrend(mag[mask].astype(np.float64), degree)
+    Y /= Y.std(1, keepdims=True) + 1e-9
+    _, _, Vt = np.linalg.svd(Y, full_matrices=False)
+    X = Vt[:k] * np.sqrt(nt)
+    subs = cm_subspaces(X, restarts, np.random.default_rng(seed))
+    return [(cost, (W.T @ X)[0] + 1j * (W.T @ X)[1]) for cost, W in subs[:n]]
+
+
+def unwrap_around_rate(theta_steps, tr, window_s=60.0):
+    """Per-volume phase steps lifted around a local circular-mean rate, not around 0.
+
+    The complex trace's aliased rate has no fold, but plain unwrapping slips a cycle
+    whenever a step crosses +-pi -- exactly where a heartbeat near (k + 1/2)/TR sits.
+    Wrapping around the local mean step instead keeps the slow HRV drift continuous
+    as long as it stays within 1/(2 TR) of that mean."""
+    w = max(3, int(round(window_s / tr)) | 1)
+    u = np.exp(1j * theta_steps)
+    ref = np.angle(np.convolve(u, np.ones(w) / w, mode="same"))
+    return ref + np.angle(u * np.exp(-1j * ref))
+
+
+def excitation_start(c, times, tr, band=(0.6, 2.0)):
+    """An in-band (nt, G) start phase at the excitation times from a volume trace.
+
+    The trace is referenced to the mean excitation time; the alias step chosen here is
+    only a start -- refine_cardiac re-chooses the alias by slice alignment."""
+    nt = c.size
+    steps = unwrap_around_rate(np.angle(c[1:] * np.conj(c[:-1])), tr)
+    theta = np.angle(c[0]) + np.concatenate([[0.0], np.cumsum(steps)])
+    tv = times.mean(1)
+    f_a = (theta[-1] - theta[0]) / (2 * np.pi * (tv[-1] - tv[0]))
+    k = int(np.round((np.mean(band) - f_a) * tr))
+    slope = np.gradient(theta, tv)
+    flat = np.interp(times.ravel(), tv, theta).reshape(times.shape)
+    # extrapolate linearly past the first/last volume centre instead of clamping
+    lo, hi = times < tv[0], times > tv[-1]
+    flat[lo] = theta[0] + slope[0] * (times[lo] - tv[0])
+    flat[hi] = theta[-1] + slope[-1] * (times[hi] - tv[-1])
+    assert nt == times.shape[0]
+    return flat + 2 * np.pi * k * times / tr

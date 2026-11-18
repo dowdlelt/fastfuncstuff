@@ -343,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
         )  # fmt: skip
         traces.cardiac = refined.trace
+        traces.cardiac_phase = refined.phase
         if verb >= 1:
             for lab, rate, align, null, harm, hnull in refined.tried:
                 shuf = (

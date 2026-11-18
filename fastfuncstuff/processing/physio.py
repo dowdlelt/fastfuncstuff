@@ -56,6 +56,9 @@ class ExcitationTraces:
     field_coef: np.ndarray | None = None
     # (nt, G) cardiac trace from the vascular voxels (refine_cardiac), when made
     cardiac: np.ndarray | None = None
+    # (nt, G) cardiac phase the detector settled on, when it should be used as is
+    # rather than re-tracked from ``cardiac`` (the constant-modulus path)
+    cardiac_phase: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
 
     def series(self, which: str, uniform: bool = False) -> tuple[np.ndarray, np.ndarray]:
@@ -562,6 +565,11 @@ def _cardiac_input(traces, card_from, t_c, x_c, tr, f_resp):
     return t_c, x_c, harmonics
 
 
+def _sorted_series(times: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(times.ravel(), kind="stable")
+    return times.ravel()[order], values.ravel()[order]
+
+
 def slice_regressors(
     traces: ExcitationTraces,
     card_from: str,
@@ -583,9 +591,15 @@ def slice_regressors(
     t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
     rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND)
-    t_c, x_c, harmonics = _cardiac_input(traces, card_from, t_c, x_c, tr, float(np.median(rf)))
-    ct, cf, cprom = track_rate(t_c, x_c, CARDIAC_BAND, card_window, avoid=harmonics)
-    phi_c = cycle_phase(t_c, x_c, cf)
+    if card_from == "weighted" and traces.cardiac_phase is not None:
+        # The detector's own phase: re-tracking its trace with the band-pass tracker
+        # would bring back the very failure the constant-modulus path avoids.
+        t_c, phi_c = _uniform(*_sorted_series(traces.times, traces.cardiac_phase))
+        ct, cf, cprom = t_c, np.gradient(phi_c, t_c) / (2 * np.pi), float("nan")
+    else:
+        t_c, x_c, harmonics = _cardiac_input(traces, card_from, t_c, x_c, tr, float(np.median(rf)))
+        ct, cf, cprom = track_rate(t_c, x_c, CARDIAC_BAND, card_window, avoid=harmonics)
+        phi_c = cycle_phase(t_c, x_c, cf)
     phi_r = cycle_phase(t_r, x_r, rf)
     rv = _depth_rvt(traces, t_r, x_r, rt, rf)
 
@@ -684,6 +698,10 @@ class CardiacRefinement:
     harmonic_null: float = 0.0  # the best at non-harmonic multiples (HARMONIC_CONTROLS)
     testable: bool = True  # False with a single excitation time: nothing to shuffle
     resolvability: dict = field(default_factory=dict)  # slice_resolvability of the acquisition
+    # "constant_modulus" (physio_cm.detect) or "refine" (the rebuild-and-re-read starts);
+    # for the former, alignment/null/harmonic hold its fundamental+harmonic statistic
+    method: str = "refine"
+    phase: np.ndarray | None = None  # (nt, G) phase to use as is (constant_modulus only)
 
 
 def cardiac_avoid(
@@ -1185,6 +1203,7 @@ def refine_cardiac(
     top: float = REFINE_TOP,
     n_iter: int = REFINE_ITER,
     ica: bool = True,
+    constant_modulus: bool = True,
 ) -> CardiacRefinement:
     """A cardiac trace from the voxels that carry the heartbeat, not from all of them.
 
@@ -1233,6 +1252,37 @@ def refine_cardiac(
          for g, i in enumerate(idx)]
         for side in (0, 1)
     ]  # fmt: skip
+    cm_tried: list = []
+    cm_phases: list = []
+    if constant_modulus:
+        # Frequency-free starts first (physio_cm): they find heartbeats that alias near
+        # 0 or Nyquist, where the spectral starts below fail. Not found -> the old path.
+        from .physio_cm import detect, split_half_locking
+
+        cm = detect(magnitude[..., :nt], mask, Ys, times, tr, device, np.random.default_rng(1),
+                    band=CARDIAC_BAND, shuffles=SLICE_PERMUTATIONS,
+                    controls=HARMONIC_CONTROLS)  # fmt: skip
+        cm_tried, cm_phases = list(cm.tried), list(cm.tried_phase)
+        if cm.found and cm.phase is not None:
+            fits = _voxel_fits(Ys, cm.phase, device)
+            n_vox = int(sum(Y.shape[0] for Y in Ys))
+            Ys = halves = []
+            weight = np.zeros(magnitude.shape[:3], np.float32)
+            for ft, i in zip(fits, idx, strict=True):
+                if ft is not None and i.size:
+                    weight[i[:, 0], i[:, 1], i[:, 2]] = ft[1].float().cpu().numpy()
+            del fits
+            return CardiacRefinement(
+                trace=np.cos(cm.phase), found=True,
+                split_half=split_half_locking(magnitude[..., :nt], mask, split_axis, cm.phase,
+                                              times, tr, device),
+                heart_rate_per_min=cm.rate_per_min, weight=weight, n_voxels=n_vox,
+                start_rate_per_min=cm.rate_per_min, start=cm.label, tried=cm_tried,
+                tried_phase=cm_phases, alignment=cm.statistic, alignment_null=cm.floor,
+                harmonic=cm.harmonic, harmonic_null=cm.harmonic_null, testable=True,
+                resolvability=slice_resolvability(slice_times, tr),
+                method="constant_modulus", phase=cm.phase,
+            )  # fmt: skip
 
     def judge(start: np.ndarray):
         # A loop, not recursion: a closure that calls itself is a reference cycle, and it
@@ -1357,7 +1407,8 @@ def refine_cardiac(
         alias_coherence=float(coherence),
         alias_ratio=float(ratio),
         start=label,
-        tried=[
+        tried=cm_tried
+        + [
             (
                 a[0],
                 a[5],
@@ -1368,7 +1419,7 @@ def refine_cardiac(
             )
             for a in answers
         ],
-        tried_phase=[a[1] for a in answers],
+        tried_phase=cm_phases + [a[1] for a in answers],
         alignment=float(score),
         alignment_null=float(floor),
         harmonic=float(harm),
