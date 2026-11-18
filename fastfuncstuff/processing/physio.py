@@ -983,7 +983,7 @@ def _voxel_fits(Ys: list[torch.Tensor], phase: np.ndarray, device: torch.device)
         Yd = Y.to(device).to(torch.float64)
         Yd = Yd - Yd.mean(1, keepdim=True)
         XtX = X.T @ X
-        B = (Yd @ X) @ torch.linalg.inv(XtX)
+        B = (Yd @ X) @ plinalg.inv(XtX)
         expl = ((B @ XtX) * B).sum(1)
         rss = ((Yd * Yd).sum(1) - expl).clamp_min(1e-30)
         out.append((torch.complex(B[:, 0], -B[:, 1]), expl / rss))
