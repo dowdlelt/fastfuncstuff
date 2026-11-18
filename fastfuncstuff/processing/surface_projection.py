@@ -39,6 +39,7 @@ __all__ = [
     "resolve_mesh",
     "resolve_subject",
     "space_name",
+    "subject_lookup_on_mesh",
     "subject_morph_on_mesh",
     "subject_on_mesh",
     "surface_targets",
@@ -235,19 +236,28 @@ def subject_morph_on_mesh(
     ``target_sphere`` is that mesh's vertices on the registered sphere (a template's
     ``?h.sphere.reg``); each is placed in the subject through ``?h.sphere.reg`` and
     the value interpolated barycentrically -- the projection's own correspondence,
-    so it lines up with a result made on that template. The lookup is disk-cached
-    under the same key the viewer uses for the same search.
+    so it lines up with a result made on that template.
     """
     import nibabel as nib
 
+    surf = resolve_subject(subject_dir) / "surf"
+    values = np.asarray(nib.freesurfer.read_morph_data(surf / f"{hemi}.{name}"))
+    look = subject_lookup_on_mesh(subject_dir, hemi, target_sphere)
+    if len(values) != int(look.faces.max()) + 1:
+        raise ValueError(f"{surf / f'{hemi}.{name}'} is not on {hemi}.sphere.reg's mesh")
+    return look.interpolate(values)
+
+
+def subject_lookup_on_mesh(subject_dir: str | os.PathLike, hemi: str, target_sphere: np.ndarray):
+    """Where each vertex of ``target_sphere`` (a registered-sphere mesh) falls in the
+    subject's mesh, through ``?h.sphere.reg``: a :class:`SphereLookup` whose
+    ``interpolate`` carries a morph and ``nearest`` a label. Disk-cached under the
+    same key the viewer uses for the same search."""
     from fastfuncstuff.surface import diskcache
     from fastfuncstuff.surface.remesh import SphereLookup, sphere_lookup
 
     surf = resolve_subject(subject_dir) / "surf"
     reg = read_surface(surf / f"{hemi}.sphere.reg")
-    values = np.asarray(nib.freesurfer.read_morph_data(surf / f"{hemi}.{name}"))
-    if len(values) != len(reg.vertices):
-        raise ValueError(f"{surf / f'{hemi}.{name}'} is not on {hemi}.sphere.reg's mesh")
     faces = np.asarray(reg.faces, np.int64)
     targets = np.asarray(target_sphere)
     key = diskcache.content_key("lookup-1", reg.vertices, faces, targets)
@@ -257,7 +267,7 @@ def subject_morph_on_mesh(
     else:
         look = sphere_lookup(reg.vertices, faces, targets)
         diskcache.save("sphere_lookups", key, face=look.face, weights=look.weights)
-    return look.interpolate(values)
+    return look
 
 
 def _voxel_face(source_path: str) -> float:

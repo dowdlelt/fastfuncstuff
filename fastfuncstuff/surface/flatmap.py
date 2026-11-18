@@ -128,13 +128,15 @@ def draw_flat_map(
     borders: np.ndarray | None = None,
     period: float | None = None,
     title: str = "",
+    border_names: dict[int, str] | None = None,
 ) -> object | None:
     """Draw ``values`` on the view: a sulcal underlay, the data, label borders, the rim.
 
     ``underlay`` is a FreeSurfer-style morph value (sulc or curv, positive in
     sulci), drawn as two greys. ``mask`` limits which vertices are coloured; a
     face is drawn only when all three of its vertices are. ``borders`` is an
-    integer label per vertex; each nonzero label gets an outline. ``period``
+    integer label per vertex; each nonzero label gets an outline, and its name from
+    ``border_names`` at its in-view vertex furthest from any other label. ``period``
     marks the values as cyclic (polar angle: 360): faces are then coloured flat by
     their circular mean, because smooth shading would sweep through the whole
     colour wheel between 350 and 10. Returns the data's mappable (for a colorbar),
@@ -176,6 +178,20 @@ def draw_flat_map(
                 colors="k",
                 linewidths=0.6,
             )
+            name = (border_names or {}).get(int(label))
+            inside = np.flatnonzero((labels == label) & view.keep)
+            if name and inside.size >= 3:
+                import matplotlib.patheffects as effects
+                from scipy.spatial import KDTree
+
+                # The point deepest inside the area: a ring's centre (V2 around
+                # V1) lies in its neighbour, so the centroid would mislabel.
+                outside = np.flatnonzero((labels != label) & view.keep)
+                pts = xy[inside]
+                depth = KDTree(xy[outside]).query(pts)[0] if outside.size else np.zeros(len(pts))
+                at = pts[np.argmax(depth)]
+                ax.text(*at, name, fontsize=6, ha="center", va="center",
+                        path_effects=[effects.withStroke(linewidth=1.5, foreground="w")])  # fmt: skip
     rim = np.linspace(0, 2 * np.pi, 361)
     ax.plot(view.edge * np.cos(rim), view.edge * np.sin(rim), color="0.4", linewidth=0.6)
     limit = view.edge * 1.02

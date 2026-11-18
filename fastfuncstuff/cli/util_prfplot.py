@@ -42,8 +42,11 @@ used; on a template (onavg-ico64, ...) the template's ?h.sphere.reg, with the
 subject's sulcal depth carried onto it through ?h.sphere.reg for the grey underlay.
 -fs_subj, -sphere and -underlay override what the bucket says.
 
-Visual-area labels are optional: -rois draws their borders (FreeSurfer .mgz,
-.annot, .label, or GIfTI), one file per hemisphere.
+Visual-area labels are optional: -rois draws their borders, named, from FreeSurfer
+.annot / .label, .mgz or GIfTI files -- one per hemisphere, or names found in the
+subject's label/ folder for both (-rois BA_exvivo.thresh.annot -roi_labels V1 V2
+MT). Labels on the subject's own mesh are carried onto a template bucket's mesh
+through ?h.sphere.reg.
 
 Polar angle uses a colour wheel (0 = right horizontal meridian, 90 = up), coloured
 flat per face, because smooth shading would sweep the whole wheel between 350 and
@@ -81,8 +84,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="Sulcal depth or curvature per hemisphere (FreeSurfer morph or "
                       ".shape.gii), drawn grey underneath. 'none' to omit.")  # fmt: skip
     surf.add_argument("-rois", nargs="+", metavar="LABELS", default=None,
-                      help="Area labels per hemisphere (.mgz, .annot, .label, .gii); their "
-                      "borders are drawn.")  # fmt: skip
+                      help="Area labels whose borders are drawn: a file per hemisphere "
+                      "(.annot, .label, .mgz, .gii), or one or more names in the subject's "
+                      "label/ folder, read as ?h.NAME for each hemisphere (BA_exvivo.thresh.annot, "
+                      "V1_exvivo.label V2_exvivo.label).")  # fmt: skip
     maps = p.add_argument_group("maps")
     maps.add_argument("-maps", nargs="+", default=["angle", "eccentricity", "r2"], metavar="MAP",
                       help="Sub-bricks to draw, one row each: angle, eccentricity, r2, rfsize, "
@@ -108,9 +113,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     view.add_argument("-align", choices=["none", "rois"], default="none",
                       help="rois: turn the view so the labelled region's long axis is "
                       "horizontal.")  # fmt: skip
-    view.add_argument("-roi_subset", nargs="+", type=int, default=None, metavar="LABEL",
-                      help="Label values -center rois and -align rois use (e.g. 1 for V1 in a "
-                      "V1-V4 file). Default: every nonzero label.")  # fmt: skip
+    view.add_argument(
+        "-roi_labels",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="Keep only these labels of -rois, by name (V1 matches "
+        "V1_exvivo.thresh) or value; the rest are not drawn.",
+    )
+    view.add_argument("-roi_subset", nargs="+", default=None, metavar="LABEL",
+                      help="Labels -center rois and -align rois use, by name or value (e.g. V1, "
+                      "or 1 in a V1-V4 file). Default: every label drawn.")  # fmt: skip
     view.add_argument("-rotate", type=float, default=0.0, metavar="DEG",
                       help="Turn the view counter-clockwise by this much.")  # fmt: skip
     out = p.add_argument_group("figure")
@@ -154,9 +167,18 @@ def _load_per_vertex(path: str, n_vertices: int) -> np.ndarray:
     else:
         values = nib.freesurfer.read_morph_data(path)
     values = np.asarray(values)
-    if values.shape[0] != n_vertices:
+    if n_vertices >= 0 and values.shape[0] != n_vertices:
         raise ValueError(f"{path} has {values.shape[0]} values, the mesh {n_vertices} vertices")
     return values
+
+
+def _subjects(fs_subj: str | None, meta: dict[str, str]) -> list[Path]:
+    """FreeSurfer folders to look in: -fs_subj, then the subject the bucket records."""
+    out: list[Path] = []
+    for name in (fs_subj, meta.get("subject")):
+        if name and Path(name, "surf").is_dir() and Path(name) not in out:
+            out.append(Path(name))
+    return out
 
 
 def _resolve_surfaces(
@@ -177,10 +199,7 @@ def _resolve_surfaces(
     """
     from fastfuncstuff.processing.surface_projection import resolve_mesh, subject_morph_on_mesh
 
-    subjects = []
-    for name in (fs_subj, meta.get("subject")):
-        if name and Path(name, "surf").is_dir() and Path(name) not in subjects:
-            subjects.append(Path(name))
+    subjects = _subjects(fs_subj, meta)
     if sphere is not None:
         candidates = [Path(sphere)]
     else:
@@ -236,6 +255,134 @@ def _resolve_surfaces(
             values = subject_morph_on_mesh(subject, hemi, vertices)
             return str(path), vertices, faces, values, f"{sulc} via sphere.reg"
     return str(path), vertices, faces, None, "none found"
+
+
+def _read_labels(path: str) -> tuple[np.ndarray, dict[int, str]]:
+    """A label file's integer per vertex (0 = none) and the names it carries."""
+    import nibabel as nib
+
+    name = os.path.basename(path)
+    if name.lower().endswith(".annot"):
+        values, _, names = nib.freesurfer.read_annot(path)
+        names = [n.decode() if isinstance(n, bytes) else n for n in names]
+        named = {i + 1: n for i, n in enumerate(names) if n.lower() not in ("unknown", "???")}
+        values = np.where(values < 0, 0, values + 1)
+        values[~np.isin(values, list(named))] = 0
+        return values.astype(np.int64), _short_names(named)
+    if name.lower().endswith(".label"):
+        ids = np.asarray(nib.freesurfer.read_label(path), np.int64)
+        values = np.zeros(int(ids.max()) + 1, np.int64)
+        values[ids] = 1
+        stem = name.removesuffix(".label")
+        stem = stem.split(".", 1)[1] if stem[:3] in ("lh.", "rh.") else stem
+        return values, {1: stem.replace(".", "_").split("_")[0]}
+    return _load_per_vertex(path, -1).astype(np.int64), {}  # any length: checked by the caller
+
+
+def _short_names(named: dict[int, str]) -> dict[int, str]:
+    """Drop the suffix every name shares (``_exvivo.thresh``, ``.mpm.vpnl``)."""
+    names = list(named.values())
+    if len(names) < 2:
+        return named
+    rev = os.path.commonprefix([n[::-1] for n in names])[::-1]
+    cut = min((rev.find(c) for c in "_." if c in rev), default=-1)
+    if cut < 0:
+        return named
+    suffix = rev[cut:]
+    return {k: v.removesuffix(suffix) or v for k, v in named.items()}
+
+
+def _pick_labels(wanted: list[str], names: dict[int, str], where: str) -> list[int]:
+    """Label values for names (exact, or a name's first ``_`` / ``.`` part) or numbers."""
+    import re
+
+    out = []
+    for want in wanted:
+        if want.isdigit():
+            out.append(int(want))
+            continue
+        hits = [k for k, n in names.items() if n == want or re.split(r"[_.]", n)[0] == want]
+        if not hits:
+            raise SystemExit(f"ffs_util_prfplot: {where} has no label {want!r}; it has "
+                             f"{', '.join(names.values()) or 'no names'}")  # fmt: skip
+        out += hits
+    return out
+
+
+def _load_rois(
+    specs: list[str],
+    hemi: str,
+    n_vertices: int,
+    subjects: list[Path],
+    sphere: str,
+    vertices: np.ndarray,
+    keep: list[str] | None,
+) -> tuple[np.ndarray, dict[int, str]]:
+    """``(label per bucket vertex, names)`` from one or more label files of a hemisphere.
+
+    Several files stack, each after the last one's values. A file on another mesh
+    (the subject's own, for a template bucket) is carried over through sphere.reg,
+    taking the nearest corner so labels are never blended.
+    """
+    from fastfuncstuff.processing.surface_projection import subject_lookup_on_mesh
+
+    labels = np.zeros(n_vertices, np.int64)
+    names: dict[int, str] = {}
+    for spec in specs:
+        values, these = _read_labels(spec)
+        owner = next((s for s in subjects if (s / "surf" / f"{hemi}.sphere.reg").is_file()), None)
+        # A .label lists vertex ids, so its length says nothing about its mesh: one in
+        # the subject's own folder is on the subject's mesh, any other on the bucket's.
+        is_label = spec.lower().endswith(".label")
+        in_subject = owner is not None and Path(spec).resolve().is_relative_to(owner.resolve())
+        on_bucket = (
+            len(values) <= n_vertices and not (in_subject and "sphere.reg" in sphere)
+            if is_label
+            else len(values) == n_vertices
+        )
+        if on_bucket:
+            values = np.pad(values, (0, n_vertices - len(values)))
+        else:
+            if owner is None or "sphere.reg" not in os.path.basename(sphere):
+                raise SystemExit(f"ffs_util_prfplot: {spec} has {len(values)} vertices, the "
+                                 f"bucket {n_vertices}, and no sphere.reg to carry it over")  # fmt: skip
+            look = subject_lookup_on_mesh(owner, hemi, vertices)
+            n_native = int(look.faces.max()) + 1
+            if is_label and len(values) <= n_native:
+                values = np.pad(values, (0, n_native - len(values)))
+            if len(values) != n_native:
+                raise SystemExit(f"ffs_util_prfplot: {spec} is on neither the bucket's mesh "
+                                 f"nor {owner}'s")  # fmt: skip
+            values = look.nearest(values)
+        if not these:
+            these = {int(v): str(int(v)) for v in np.unique(values) if v}
+        offset = max(names, default=0)
+        mask = values > 0
+        labels[mask] = values[mask] + offset
+        names.update({k + offset: n for k, n in these.items()})
+    if keep:
+        chosen = _pick_labels(keep, names, " ".join(specs))
+        labels[~np.isin(labels, chosen)] = 0
+        names = {k: n for k, n in names.items() if k in chosen}
+    return labels, names
+
+
+def _roi_specs(rois: list[str], hemis: list[str], hemi: str, subjects: list[Path]) -> list[str]:
+    """One hemisphere's label files: one given per hemisphere, or names in label/."""
+    if all(os.path.isfile(r) for r in rois):
+        return [str(_per_hemi(rois, "rois", hemis)[hemis.index(hemi)])]
+    if any(os.sep in r for r in rois):
+        missing = [r for r in rois if not os.path.isfile(r)]
+        raise SystemExit(f"ffs_util_prfplot: -rois {' '.join(missing)}: no such file")
+    found = []
+    for name in rois:
+        paths = [s / "label" / f"{hemi}.{name}" for s in subjects]
+        hit = next((p for p in paths if p.is_file()), None)
+        if hit is None:
+            looked = ", ".join(str(p) for p in paths) or "no subject: give -fs_subj"
+            raise SystemExit(f"ffs_util_prfplot: -rois {name}: not found ({looked})")
+        found.append(str(hit))
+    return found
 
 
 def _load_bucket(path: str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
@@ -344,13 +491,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.underlay == ["none"]
         else _per_hemi(args.underlay, "underlay", hemis)
     )
-    rois = _per_hemi(args.rois, "rois", hemis)
     if (args.center == "rois" or args.align == "rois") and args.rois is None:
         raise SystemExit("ffs_util_prfplot: -center rois and -align rois need -rois")
 
     panels = []
     panel_r2: list[np.ndarray] = []
-    for (hemi, path), sphere, underlay, roi in zip(pairs, spheres, underlays, rois, strict=True):
+    for (hemi, path), sphere, underlay in zip(pairs, spheres, underlays, strict=True):
         bucket, bucket_meta = _load_bucket(path)
         n_vertices = len(next(iter(bucket.values())))
         sphere, vertices, faces, underlay_values, underlay_from = _resolve_surfaces(
@@ -365,12 +511,22 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             raise SystemExit(f"ffs_util_prfplot: {path} has no {', '.join(missing)}; it has "
                              f"{', '.join(bucket)}")  # fmt: skip
-        labels = None if roi is None else _load_per_vertex(roi, n_vertices).astype(int)
-        chosen = None
-        if labels is not None:
-            chosen = labels > 0 if args.roi_subset is None else np.isin(labels, args.roi_subset)
+        subjects = _subjects(args.fs_subj, bucket_meta)
+        roi_files = _roi_specs(args.rois, hemis, hemi, subjects) if args.rois else []
+        labels, label_names, chosen = None, {}, None
+        if roi_files:
+            labels, label_names = _load_rois(roi_files, hemi, n_vertices, subjects, sphere,
+                                             vertices, args.roi_labels)  # fmt: skip
+            print(f"{hemi}: rois {', '.join(label_names.values())} from {' '.join(roi_files)}")
+            subset = (
+                None
+                if args.roi_subset is None
+                else _pick_labels(args.roi_subset, label_names, " ".join(roi_files))
+            )
+            chosen = labels > 0 if subset is None else np.isin(labels, subset)
             if (args.center == "rois" or args.align == "rois") and not chosen.any():
-                raise SystemExit(f"ffs_util_prfplot: {roi} has none of labels {args.roi_subset}")
+                raise SystemExit(f"ffs_util_prfplot: {' '.join(roi_files)} has none of "
+                                 f"labels {args.roi_subset}")  # fmt: skip
         r2 = 100.0 * bucket["r2"] if "r2" in bucket else np.full(n_vertices, 100.0)
         shown = np.isfinite(r2) & (r2 >= args.r2_min)
         if args.center_xyz is not None:
@@ -397,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
             rotate_deg=args.rotate,
             align=None if args.align == "none" else chosen,
         )
-        panels.append((hemi, view, bucket, shown, underlay_values, labels))
+        panels.append((hemi, view, bucket, shown, underlay_values, labels, label_names))
         panel_r2.append(r2)
 
     n_rows, n_cols = len(args.maps), len(panels)
@@ -410,14 +566,14 @@ def main(argv: list[str] | None = None) -> int:
     for row, name in enumerate(args.maps):
         values_all = [
             100.0 * bucket[name] if name == "r2" else bucket[name]
-            for _, _, bucket, _, _, _ in panels
+            for _, _, bucket, _, _, _, _ in panels
         ]
         pooled = np.concatenate(values_all)
-        pooled_shown = np.concatenate([shown for _, _, _, shown, _, _ in panels])
+        pooled_shown = np.concatenate([shown for _, _, _, shown, _, _, _ in panels])
         pooled_r2 = np.concatenate([r2 for r2 in panel_r2])
         cmap, norm, period, label = _style(name, pooled, pooled_shown, pooled_r2, args)
         mappable = None
-        for col, (hemi, view, _, shown, underlay_values, labels) in enumerate(panels):
+        for col, (hemi, view, _, shown, underlay_values, labels, names) in enumerate(panels):
             drawn = draw_flat_map(
                 axes[row, col],
                 view,
@@ -427,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
                 mask=shown,
                 underlay=underlay_values,
                 borders=labels,
+                border_names=names,
                 period=period,
                 title=f"{label} · {hemi}",
             )
