@@ -2008,3 +2008,25 @@ def test_search_pivot_is_the_grid_centre_and_round_trips():
             torch.testing.assert_close(p2m_b(p[None])[0], p2m(p))
             torch.testing.assert_close(m2p(p2m(p))[:6], p[:6], atol=1e-4, rtol=0)
         assert _p2m_fns()[0] is params_to_matrix  # restored on exit
+
+
+@pytest.mark.parametrize("cost", ["ls", "pearclp"])
+def test_batched_clipped_cost_clips_each_candidate_by_its_own_range(cost):
+    """Bug of record: the batch took its source clip from candidate 0 alone. The
+    coarse grid's first candidate sits at the shift corner, mostly off the base,
+    so its range collapsed and clamped every candidate flat: all scored 0 and
+    argmax returned the corner (test_allineate_init, torch 2.15)."""
+    g = torch.Generator().manual_seed(0)
+    base = torch.rand(10, 12, 14, generator=g)
+    weight = (torch.rand(10, 12, 14, generator=g) > 0.4).float()
+    batch = torch.rand(5, 10, 12, 14, generator=g)
+    batch[0] = 0.0
+    batch[0, :2] = 1.0  # candidate 0: mostly empty in the weighted region
+    batch[3] = base * 0.7 + 0.1  # a perfect match hidden behind it
+    ctx = CostContext(name=cost)
+    got = _batched_cost(base, batch, weight, ctx)
+    want = torch.stack(
+        [_compute_cost(base, batch[i], weight, ctx, (1.0, 1.0, 1.0)) for i in range(5)]
+    )
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+    assert int(got.argmax()) == 3

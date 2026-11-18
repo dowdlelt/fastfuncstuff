@@ -949,8 +949,21 @@ def _batched_cost(
         bc = base_flat.clamp(base_clip[0], base_clip[1])
 
         warped_flat = warped_batch.reshape(B, -1)
-        src_clip = _auto_clip(warped_flat[0], w_flat)
-        sc = warped_flat.clamp(src_clip[0], src_clip[1])
+        # Each candidate clips by its own range, as _compute_cost does for one.
+        # One shared clip from candidate 0 -- the corner of the shift grid, mostly
+        # off the weighted region -- collapsed to a constant and clamped the
+        # whole batch flat: every coarse ls candidate scored 0 and argmax took
+        # the first (failed test_allineate_init on torch 2.15).
+        d = warped_flat[:, w_flat > 0] if w_flat is not None else warped_flat
+        n = d.shape[1]
+        if n == 0:
+            return torch.zeros(B, device=base.device)
+        if n < 10:
+            lo, hi = d.amin(dim=1), d.amax(dim=1)
+        else:
+            lo = d.kthvalue(max(0, int(0.01 * n)) + 1, dim=1).values
+            hi = d.kthvalue(min(n - 1, int(0.99 * n)) + 1, dim=1).values
+        sc = torch.minimum(torch.maximum(warped_flat, lo[:, None]), hi[:, None])
 
         if w_flat is not None:
             w = w_flat[None, :]
