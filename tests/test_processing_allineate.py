@@ -729,6 +729,40 @@ class TestRefineAdamNormalized:
         # Must run essentially the whole budget, not stop near `patience` (~40).
         assert calls[0] > n_iters - 5
 
+    def test_a_cost_with_no_graph_stops_instead_of_raising(self):
+        """A pose with no overlap makes the cost fn return a plain constant.
+
+        Bug of record: test_allineate_init's no-start control wandered off the
+        base on a CPU-only pod (generic-path MKL) and loss.backward() raised
+        'element 0 of tensors does not require grad'.
+        """
+        base = _sphere_volume((8, 8, 8))
+        bounds = _compute_param_bounds((8, 8, 8))
+        init = _identity_physical()
+        calls = [0]
+
+        def cost_fn(matrix):
+            calls[0] += 1
+            return torch.tensor(0.0)
+
+        params, cost = _refine_adam_normalized(
+            base,
+            base,
+            None,
+            init,
+            AffineAlignConfig(dof="rigid", verb=0),
+            CostContext(name="lpa"),
+            (1.0, 1.0, 1.0),
+            bounds,
+            DEV,
+            verb=0,
+            n_iters=50,
+            cost_fn=cost_fn,
+        )
+        assert calls[0] == 1  # nothing to follow: one look, then stop
+        assert cost == 0.0
+        np.testing.assert_allclose(params, init, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # _refine_powell (small test)

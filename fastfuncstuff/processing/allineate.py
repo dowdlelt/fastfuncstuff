@@ -1762,13 +1762,18 @@ def _refine_adam_normalized(
             )
 
         loss = -cost
-        loss.backward()
+        # A cost with no graph is a constant: the pose left no overlap (or no
+        # variance) and the cost fn returned a plain zero. There is no gradient
+        # to follow, so record it and stop rather than raise in backward().
+        flat = not loss.requires_grad
+        if not flat:
+            loss.backward()
 
-        # Zero gradients for frozen params
-        if params_norm.grad is not None:
-            params_norm.grad.data[~free_mask] = 0.0
+            # Zero gradients for frozen params
+            if params_norm.grad is not None:
+                params_norm.grad.data[~free_mask] = 0.0
 
-        optimizer.step()
+            optimizer.step()
 
         # On-device best tracking — no sync, so the GPU can keep going.
         with torch.no_grad():
@@ -1776,6 +1781,8 @@ def _refine_adam_normalized(
             improved = cur > best_cost_t
             best_norm = torch.where(improved, cand_norm, best_norm)
             best_cost_t = torch.maximum(best_cost_t, cur)
+        if flat:
+            break
 
         if it % sync_every == 0 or it == n_iters - 1:
             bc = best_cost_t.item()  # the only host sync
@@ -2389,12 +2396,14 @@ def _refine_adam_batched(
         """Forward+backward over all T trials, in slices that fit; returns (T,)."""
         if tchunk >= T:
             cost = forward(params_norm)
-            (-cost.sum()).backward()
+            if cost.requires_grad:  # all trials off the base: constant, no graph
+                (-cost.sum()).backward()
             return cost.detach()
         parts = []
         for s0 in range(0, T, tchunk):
             c = forward(params_norm[s0 : s0 + tchunk])
-            (-c.sum()).backward()
+            if c.requires_grad:
+                (-c.sum()).backward()
             parts.append(c.detach())
         return torch.cat(parts)
 
