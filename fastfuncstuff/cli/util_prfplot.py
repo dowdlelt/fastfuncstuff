@@ -26,10 +26,11 @@ map, one column per hemisphere; the .lh / .rh partner of -input is found beside 
 
 The view looks at the sphere from outside, dorsal up, so every subject and both
 hemispheres come out the same way round. Where it looks:
-  -center auto        (default) the R2-weighted centre of the vertices that pass
-                      -r2_min -- the responsive cortex, found without labels
-  -center visual      early visual cortex: the centre of V1+V2 on the registered
-                      sphere (fsaverage's labels), medial and below the pole
+  -center visual      (default) early visual cortex: the centre of V1+V2 on the
+                      registered sphere (fsaverage's labels), medial and below the
+                      pole -- the same place for every subject and every map
+  -center auto        the R2-weighted centre of the vertices that pass -r2_min --
+                      the responsive cortex, found without labels
   -center posterior | anterior | dorsal | ventral | lateral | medial
   -center rois        the centre of the -rois labels
   -center_xyz X Y Z   any direction on the sphere (FreeSurfer: x right, y anterior,
@@ -104,7 +105,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="Label for spatial values. Default: what the bucket records (deg "
                       "or px).")  # fmt: skip
     view = p.add_argument_group("view")
-    view.add_argument("-center", default="auto",
+    view.add_argument("-center", default="visual",
                       choices=["auto", "rois", "visual", "posterior", "anterior", "dorsal",
                                "ventral", "lateral", "medial"],
                       help="Where the view looks (see above).")  # fmt: skip
