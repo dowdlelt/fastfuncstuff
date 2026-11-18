@@ -220,3 +220,26 @@ def test_subject_labels_by_name_are_carried_onto_a_template_bucket(tmp_path):
     with pytest.raises(SystemExit, match="not found"):
         main(["-input", str(tmp_path / "prf.lh.func.gii"), "-rois", "nope.annot",
               "-prefix", str(out)])  # fmt: skip
+
+
+def test_visual_centre_goes_through_sphere_reg_on_a_subjects_own_sphere(tmp_path):
+    """?h.sphere is not registered: the visual centre is found on the sphere.reg
+    beside it and read back on ?h.sphere, vertex for vertex."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.util_prfplot import _registered_center
+    from fastfuncstuff.surface.flatmap import center_direction
+
+    reg, faces = _sphere(4000)
+    turn = np.deg2rad(30)  # the unregistered sphere: the same mesh, turned about z
+    rot = np.array([[np.cos(turn), -np.sin(turn), 0], [np.sin(turn), np.cos(turn), 0], [0, 0, 1]])
+    native = reg @ rot.T
+    nib.freesurfer.write_geometry(tmp_path / "lh.sphere", native, faces)
+    nib.freesurfer.write_geometry(tmp_path / "lh.sphere.reg", reg, faces)
+    want = center_direction("visual", "lh")
+    got = _registered_center(want, "lh", str(tmp_path / "lh.sphere"), native)
+    got /= np.linalg.norm(got)
+    assert np.degrees(np.arccos(np.clip(got @ (rot @ want), -1, 1))) < 2
+    # on sphere.reg itself it is the direction unchanged
+    same = _registered_center(want, "lh", str(tmp_path / "lh.sphere.reg"), reg)
+    assert np.array_equal(same, want)

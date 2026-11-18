@@ -28,6 +28,8 @@ The view looks at the sphere from outside, dorsal up, so every subject and both
 hemispheres come out the same way round. Where it looks:
   -center auto        (default) the R2-weighted centre of the vertices that pass
                       -r2_min -- the responsive cortex, found without labels
+  -center visual      early visual cortex: the centre of V1+V2 on the registered
+                      sphere (fsaverage's labels), medial and below the pole
   -center posterior | anterior | dorsal | ventral | lateral | medial
   -center rois        the centre of the -rois labels
   -center_xyz X Y Z   any direction on the sphere (FreeSurfer: x right, y anterior,
@@ -103,8 +105,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       "or px).")  # fmt: skip
     view = p.add_argument_group("view")
     view.add_argument("-center", default="auto",
-                      choices=["auto", "rois", "posterior", "anterior", "dorsal", "ventral",
-                               "lateral", "medial"],
+                      choices=["auto", "rois", "visual", "posterior", "anterior", "dorsal",
+                               "ventral", "lateral", "medial"],
                       help="Where the view looks (see above).")  # fmt: skip
     view.add_argument("-center_xyz", nargs=3, type=float, metavar=("X", "Y", "Z"), default=None,
                       help="Look along this direction instead (overrides -center).")  # fmt: skip
@@ -170,6 +172,30 @@ def _load_per_vertex(path: str, n_vertices: int) -> np.ndarray:
     if n_vertices >= 0 and values.shape[0] != n_vertices:
         raise ValueError(f"{path} has {values.shape[0]} values, the mesh {n_vertices} vertices")
     return values
+
+
+def _registered_center(
+    direction: np.ndarray, hemi: str, sphere: str, vertices: np.ndarray
+) -> np.ndarray:
+    """A direction on the registered sphere, as seen on the sphere being drawn.
+
+    A template bucket is drawn on sphere.reg itself. A subject's own ?h.sphere is
+    not registered, so the vertices within 10 degrees of ``direction`` on the
+    ?h.sphere.reg beside it (same mesh) are found and their mean taken on ?h.sphere.
+    """
+    if "sphere.reg" in os.path.basename(sphere):
+        return direction
+    reg_path = Path(sphere).with_name(f"{hemi}.sphere.reg")
+    if reg_path.is_file():
+        reg, _ = _load_surface(str(reg_path))
+        if len(reg) == len(vertices):
+            reg_unit = reg / np.linalg.norm(reg, axis=1, keepdims=True)
+            near = reg_unit @ direction >= np.cos(np.deg2rad(10))
+            if near.any():
+                unit = vertices / np.linalg.norm(vertices, axis=1, keepdims=True)
+                return unit[near].mean(axis=0)
+    print(f"{hemi}: no {reg_path.name} beside {sphere}; -center visual is approximate")
+    return direction
 
 
 def _subjects(fs_subj: str | None, meta: dict[str, str]) -> list[Path]:
@@ -543,6 +569,8 @@ def main(argv: list[str] | None = None) -> int:
                 if shown.sum() >= 10
                 else center_direction("posterior")
             )
+        elif args.center == "visual":
+            center = _registered_center(center_direction("visual", hemi), hemi, sphere, vertices)
         else:
             center = center_direction(args.center, hemi)
         view = sphere_view(

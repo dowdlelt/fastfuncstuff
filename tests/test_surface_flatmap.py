@@ -64,6 +64,11 @@ def test_medial_and_lateral_depend_on_the_hemisphere():
     assert center_direction("medial", "lh")[0] == 1.0
     assert center_direction("lateral", "lh")[0] == -1.0
     assert center_direction("medial", "rh")[0] == -1.0
+    # V1 is medial and below the pole on the registered sphere, far from posterior
+    for hemi, medial in (("lh", 1), ("rh", -1)):
+        v = center_direction("visual", hemi)
+        assert np.isclose(np.linalg.norm(v), 1) and v[1] < 0 and v[2] < 0 and v[0] * medial > 0
+        assert np.degrees(np.arccos(v @ center_direction("posterior"))) > 35
     with pytest.raises(ValueError, match="hemisphere"):
         center_direction("medial")
     with pytest.raises(ValueError, match="unknown"):

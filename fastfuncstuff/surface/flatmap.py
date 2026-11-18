@@ -16,11 +16,24 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["CENTER_PRESETS", "FlatView", "center_direction", "draw_flat_map", "sphere_view"]
+__all__ = [
+    "CENTER_PRESETS",
+    "VISUAL_CENTER",
+    "FlatView",
+    "center_direction",
+    "draw_flat_map",
+    "sphere_view",
+]
 
 #: Named view centres, as directions on a FreeSurfer sphere (x right, y anterior,
-#: z superior); ``lateral`` and ``medial`` depend on the hemisphere.
-CENTER_PRESETS = ("posterior", "anterior", "dorsal", "ventral", "lateral", "medial")
+#: z superior); ``lateral``, ``medial`` and ``visual`` depend on the hemisphere.
+CENTER_PRESETS = ("posterior", "anterior", "dorsal", "ventral", "lateral", "medial", "visual")
+
+#: Centre of early visual cortex on the *registered* sphere: the mean direction of
+#: fsaverage's V1_exvivo + V2_exvivo vertices on ?h.sphere.reg. It sits 41 (lh) and
+#: 53 (rh) degrees from ``posterior`` -- medial and well below the equator -- so a
+#: posterior view puts V1 at the rim. Valid on any sphere.reg-aligned mesh.
+VISUAL_CENTER = {"lh": (0.324, -0.753, -0.573), "rh": (-0.576, -0.606, -0.548)}
 
 
 @dataclass(frozen=True)
@@ -33,6 +46,11 @@ class FlatView:
 
 def center_direction(name: str, hemi: str | None = None) -> np.ndarray:
     """Unit direction of a :data:`CENTER_PRESETS` view on a FreeSurfer sphere."""
+    if name == "visual":
+        if hemi not in VISUAL_CENTER:
+            raise ValueError("a visual view needs the hemisphere (lh or rh)")
+        direction = np.array(VISUAL_CENTER[hemi])
+        return direction / np.linalg.norm(direction)
     if name in ("lateral", "medial"):
         if hemi not in ("lh", "rh"):
             raise ValueError(f"a {name} view needs the hemisphere (lh or rh)")
