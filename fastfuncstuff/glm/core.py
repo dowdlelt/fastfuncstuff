@@ -226,10 +226,22 @@ def design_cholesky(design: torch.Tensor) -> torch.Tensor | None:
     the caller can fall back to ``lstsq``, which handles rank deficiency.
     """
     ld = _linalg_device(design.device)
+    X = to_factor_f64(design)
     try:
-        return plinalg.cholesky(design.to(ld).T @ design.to(ld))
+        L = plinalg.cholesky(X.T @ X)
     except torch.linalg.LinAlgError:
         return None
+    # An exactly singular X'X does not reliably raise: rounding can leave a tiny
+    # positive last pivot (9.9e-08 against 11.4 on a duplicated column under a
+    # generic-path MKL, where AVX512 MKL raised). The squared pivot ratio tracks
+    # 1/cond(X'X), which exact collinearity puts at float64 eps. The factor is
+    # float64 because a float32 one leaves an ill-conditioned but full-rank
+    # design at the same pivot ratio as a singular one.
+    d = L.diagonal()
+    tol = max(design.shape) * torch.finfo(torch.float64).eps
+    if not bool(torch.isfinite(d).all()) or float((d.min() / d.max()) ** 2) < tol:
+        return None
+    return L.to(device=ld, dtype=design.dtype)
 
 
 @torch.inference_mode()
