@@ -7,6 +7,8 @@ aliases the heartbeat and only an excitation-rate reading can recover it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -33,14 +35,23 @@ def _mb_slice_times(nz: int, mb: int, fill: float = 1.0) -> np.ndarray:
 
 
 def _synthetic_run(
-    nt=240, shape=(12, 12, 20), mb=2, card=0.01, resp=0.15, noise=0.01, seed=0, fill=1.0
+    nt=240,
+    shape=(12, 12, 20),
+    mb=2,
+    card=0.01,
+    resp=0.15,
+    noise=0.01,
+    seed=0,
+    fill=1.0,
+    harmonic=0.0,
 ):
     rng = np.random.default_rng(seed)
     nx, ny, nz = shape
     st = _mb_slice_times(nz, mb, fill)
     t = np.arange(nt)[None, :] * TR + st[:, None]  # (nz, nt) acquisition times
     base = 100.0 + 20.0 * rng.random(shape)
-    heart = card * np.cos(2 * np.pi * F_CARD * t)  # fractional
+    theta = 2 * np.pi * F_CARD * t
+    heart = card * (np.cos(theta) + harmonic * np.cos(2 * theta - 0.5))  # fractional
     breath = resp * np.sin(2 * np.pi * F_RESP * t)  # radians of field phase
     mag = base[..., None] * (
         1.0 + heart[None, None] + noise * rng.standard_normal((nx, ny, nz, nt))
@@ -232,7 +243,8 @@ def _write_cli_inputs(tmp_path, nt=150):
 
     import nibabel as nib
 
-    mag, ph, st, _ = _synthetic_run(nt=nt)
+    # a pulse with its second harmonic, which the found test needs to line up too
+    mag, ph, st, _ = _synthetic_run(nt=nt, harmonic=0.5)
     nib.save(nib.Nifti1Image(mag, np.eye(4)), tmp_path / "run_mag.nii.gz")
     nib.save(nib.Nifti1Image(ph, np.eye(4)), tmp_path / "run_ph.nii.gz")
     (tmp_path / "run_mag.json").write_text(
@@ -251,13 +263,14 @@ def test_cli_qc_writes_rates_and_maps_with_a_record(tmp_path):
                "-qc_label", "run-01", "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
     assert rc == 0
     rec = json.loads((tmp_path / "qc" / "records" / "12.physio.run-01.json").read_text())
-    assert [f["check"] for f in rec["figures"]] == ["rates", "maps"]
+    assert [f["check"] for f in rec["figures"]] == ["rates", "maps", "cardiac_mip"]
     for f in rec["figures"]:
         assert (tmp_path / "qc" / f["file"]).stat().st_size > 10_000
     m = rec["metrics"]
     assert abs(m["heart_rate"]["value"] - F_CARD * 60) < 2
     assert abs(m["breathing_rate"]["value"] - F_RESP * 60) < 2
     assert m["cardiac_r2_p95"]["value"] > 0.2  # the synthetic heartbeat is in every voxel
+    assert m["cardiac_found"]["value"] == 1
 
 
 def test_cli_tapas_nuisance_set_writes_physio_default_columns(tmp_path):
@@ -554,3 +567,237 @@ def test_field_gradient_trace_follows_breath_depth():
     truth = 1.0 + 0.6 * np.sin(2 * np.pi * bt / 80.0)
     keep = (bt > 20) & (bt < nt - 20)
     assert np.corrcoef(rvt[keep], truth[keep])[0, 1] > 0.8
+
+
+def _vascular_run(
+    nt=240,
+    shape=(16, 16, 20),
+    mb=2,
+    frac=0.05,
+    card=0.03,
+    seed=1,
+    heart=True,
+    volume_locked=False,
+    harmonic=0.5,
+):
+    """The heartbeat only in a few 'vessel' voxels, each with its own delay and sign
+    (70 % positive, so the brain mean keeps a weak, partly cancelled heartbeat), plus
+    breathing in the phase. Everywhere else: noise."""
+    rng = np.random.default_rng(seed)
+    nx, ny, nz = shape
+    st = _mb_slice_times(nz, mb)
+    t = np.arange(nt)[None, :] * TR + st[:, None]
+    vessel = rng.random(shape) < frac
+    # 0.15 s of spread: what held-out heartbeats' second-harmonic alignment (median
+    # 0.36 over their top voxels) implies; 0.3 s scatters the harmonic's angles
+    delay = rng.uniform(0, 0.15, shape)
+    sign = np.where(rng.random(shape) < 0.7, 1.0, -1.0)
+    # volume_locked: the pulsation is the same in every slice of a volume, as drift,
+    # task or denoising residue are, instead of sampled at each slice's own time
+    tb = np.arange(nt)[None, :] * TR + 0 * st[:, None] if volume_locked else t
+    # a pulse, not a sinusoid: the waveform carries a second harmonic, which the found
+    # test requires to line up as well
+    theta = 2 * np.pi * F_CARD * (tb[None, None] - delay[..., None])
+    beat = np.cos(theta) + harmonic * np.cos(2 * theta - 0.5)
+    pulse = card * sign[..., None] * beat * vessel[..., None] if heart else 0.0
+    base = 100.0 + 20.0 * rng.random(shape)
+    mag = base[..., None] * (1.0 + pulse + 0.01 * rng.standard_normal((nx, ny, nz, nt)))
+    breath = 0.15 * np.sin(2 * np.pi * F_RESP * t)
+    static = rng.uniform(-np.pi, np.pi, shape)
+    ph = static[..., None] + breath[None, None] + 0.02 * rng.standard_normal((nx, ny, nz, nt))
+    ph = np.angle(np.exp(1j * ph)) * (4096 / np.pi)
+    return mag.astype(np.float32), ph.astype(np.float32), st
+
+
+def _locking_to_truth(traces, card_from):
+    """Phase locking of the regressors' cardiac phase to the true heartbeat."""
+    _, _, diag = physio.slice_regressors(traces, card_from, "phase")
+    s = diag["series"]
+    return abs(np.exp(1j * (s["phi_card"] - 2 * np.pi * F_CARD * s["t_card"])).mean())
+
+
+def test_weighted_cardiac_beats_the_brain_mean_when_only_vessels_pulse():
+    """The case the brain mean handles badly: pulsation in 5 % of voxels with mixed
+    sign and delay. Rebuilt from the voxels that follow it, the trace must lock to
+    the heartbeat better than the mean does, and the two halves must agree."""
+    mag, ph, st = _vascular_run()
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    tr_.cardiac = ref.trace
+    assert ref.found and ref.split_half > 0.9
+    assert abs(ref.heart_rate_per_min - F_CARD * 60) < 1.5
+    mean_lock, weighted_lock = (
+        _locking_to_truth(tr_, "magnitude"),
+        _locking_to_truth(tr_, "weighted"),
+    )
+    assert weighted_lock > 0.95 and weighted_lock > mean_lock
+    # the weight map is the vessels: their median signal-to-residual far above the rest
+    rng = np.random.default_rng(1)
+    vessel = rng.random(mag.shape[:3]) < 0.05
+    assert np.median(ref.weight[vessel]) > 10 * np.median(ref.weight[~vessel & (ref.weight > 0)])
+
+
+def test_no_heartbeat_is_reported_as_not_found():
+    """Noise and breathing only: whatever the iteration settles on, its vessel phases
+    must line up no better under the true slice times than under shuffled ones."""
+    mag, ph, st = _vascular_run(heart=False)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    assert ref.testable and not ref.found and ref.alignment <= ref.alignment_null
+
+
+def test_cardiac_avoid_covers_tr_lines_and_their_breathing_sidebands():
+    """HiHiFaces (TR 0.67, breathing 8.6/min): the lines that captured the cardiac
+    track were 1/TR - 2 f_r, 1/TR - f_r and 1/TR + f_r = 72, 81, 98 per minute."""
+    avoid = dict(physio.cardiac_avoid(0.67, 8.6 / 60))
+    for per_min in (89.55, 72.35, 80.95, 98.15, 106.75):
+        assert any(abs(f * 60 - per_min) < 0.1 for f in avoid), per_min
+    assert avoid[min(avoid, key=lambda f: abs(f - 1 / 0.67))] == 0.05  # widened at k/TR
+
+
+def test_cli_drops_unfound_cardiac_from_the_nuisance_and_keeps_the_slibase(tmp_path):
+    import json
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli.physio import main
+    from fastfuncstuff.design.slibase import load_1d_matrix
+
+    mag, ph, st = _vascular_run(nt=200, heart=False)
+    nib.save(nib.Nifti1Image(mag, np.eye(4)), tmp_path / "run_mag.nii.gz")
+    nib.save(nib.Nifti1Image(ph, np.eye(4)), tmp_path / "run_ph.nii.gz")
+    (tmp_path / "run_mag.json").write_text(
+        json.dumps(
+            {"SliceTiming": st.tolist(), "RepetitionTime": TR, "PhaseEncodingDirection": "i"}
+        )
+    )
+    args = ["-input", str(tmp_path / "run_mag.nii.gz"), "-phase", str(tmp_path / "run_ph.nii.gz")]
+    for mode, n_cols in (("drop", 9), ("keep", 13)):
+        prefix = tmp_path / mode / "run"
+        rc = main([*args, "-prefix", str(prefix), "-tzero", "0.5", "-card_unfound", mode,
+                   "-device", "cpu", "-verb", "0", "-no_qc"])  # fmt: skip
+        assert rc == 0
+        assert load_1d_matrix(str(prefix) + ".nuisance.1D").shape == (200, n_cols)
+        assert load_1d_matrix(str(prefix) + ".slibase.1D").shape == (200, 13 * st.size)
+        summ = json.loads(Path(str(prefix) + ".json").read_text())
+        assert summ["cardiac_weighted"]["found"] is False
+        assert summ["cardiac_weighted"]["in_nuisance"] is (mode == "keep")
+        assert Path(summ["cardiac_weighted"]["weight_map"]).exists()
+
+
+def test_refine_cardiac_frees_its_voxel_store_without_the_garbage_collector(monkeypatch):
+    """A self-calling closure once kept the device-resident voxel store alive until
+    the garbage collector happened to run: 15 GB of CUDA memory over a loop of runs in
+    one process, then out-of-memory. The store must die when the call returns."""
+    import gc
+    import weakref
+
+    mag, ph, st = _vascular_run(nt=160)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    refs = []
+    real = physio._store_voxels
+
+    def spy(Ys, device):
+        out, dt = real(Ys, device)
+        refs.extend(weakref.ref(Y) for Y in out)
+        return out, dt
+
+    monkeypatch.setattr(physio, "_store_voxels", spy)
+    gc.disable()
+    try:
+        physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU, ica=False)
+        alive = sum(r() is not None for r in refs)
+    finally:
+        gc.enable()
+    assert refs and alive == 0, f"{alive} of {len(refs)} stored voxel blocks outlived the call"
+
+
+def test_refine_pass_streams_from_the_host_past_an_empty_excitation():
+    """A host-stored voxel block with no rows (an excitation whose slices all fall
+    outside the mask, as at the end of a sequential whole-brain stack) crashed the
+    host-streaming path with torch.cat([]). cpu:0 differs from cpu, so the store
+    counts as off-device and the streaming branch runs without a GPU."""
+    rng = np.random.default_rng(0)
+    nt, G = 120, 3
+    times = np.arange(nt)[:, None] * TR + np.arange(G)[None] * TR / G
+    phase = 2 * np.pi * 1.1 * times
+    Ys = [
+        torch.from_numpy(np.cos(phase[:, g])[None] + 0.1 * rng.standard_normal((40, nt)))
+        for g in range(G - 1)
+    ]
+    Ys.append(torch.zeros((0, nt), dtype=torch.float64))
+    mem = physio._refine_pass(
+        Ys,
+        times,
+        [physio._Member(None, phase)],
+        physio.cardiac_avoid(TR, 0.3),
+        TR,
+        torch.device("cpu", 0),
+        torch.float64,
+        n_iter=1,
+    )
+    assert np.isfinite(mem[0].phase).all()
+
+
+def test_ica_starts_survive_empty_and_sparse_excitations():
+    """Excitations with no voxels, or fewer voxels than components, divided by zero
+    inside FastICA and broke the stack of per-excitation time courses."""
+    rng = np.random.default_rng(0)
+    nt, G = 160, 4
+    times = np.arange(nt)[:, None] * TR + np.arange(G)[None] * TR / G
+    beat = np.cos(2 * np.pi * 1.1 * times)
+    Ys = [
+        torch.from_numpy(
+            rng.standard_normal((60, 1)) * beat[:, g][None] + 0.3 * rng.standard_normal((60, nt))
+        )
+        for g in range(2)
+    ]
+    Ys += [
+        torch.zeros((0, nt), dtype=torch.float64),
+        torch.from_numpy(rng.standard_normal((3, nt))),
+    ]
+    starts = list(physio._ica_starts(Ys, times, TR, physio.cardiac_avoid(TR, 0.3), CPU))
+    assert all(np.isfinite(ph).all() for _, ph in starts)
+
+
+def test_a_pulsation_the_same_in_every_slice_of_a_volume_is_not_a_heartbeat():
+    """The found test is slice timing: a real heartbeat is sampled at each slice's own
+    time, so its vessel phases line up only under the true slice times. The same
+    periodic signal stamped identically on every slice of a volume (what drift, task
+    and NORDIC residue look like) is perfectly periodic in the vessels and passes any
+    spectral or split-half test -- it must still be reported as not found."""
+    for locked in (False, True):
+        mag, ph, st = _vascular_run(volume_locked=locked, card=0.05)
+        tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+        ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+        assert ref.found is (not locked), (locked, ref.alignment, ref.alignment_null)
+
+
+def test_a_slice_locked_sinusoid_without_a_harmonic_is_not_a_heartbeat():
+    """Slow physical signals aliased into the cardiac band follow the slice times too,
+    and on held-out data beat their shuffles at the fundamental (8 wrong finds in 66
+    runs); what they lack is a pulse's second harmonic. A pure sinusoid at the heart
+    rate, sampled at each slice's own time, must therefore not be found."""
+    mag, ph, st = _vascular_run(harmonic=0.0, card=0.05)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    assert not ref.found and ref.harmonic <= ref.harmonic_null, (ref.harmonic, ref.harmonic_null)
+
+
+def test_a_single_excitation_time_is_untestable():
+    """All slices at one instant (3D EPI, or no slice timing): nothing to shuffle, so
+    the heartbeat can be neither confirmed nor rejected -- untestable, not found."""
+    mag, ph, _ = _vascular_run()
+    st = np.zeros(mag.shape[2])
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    assert not ref.testable and not ref.found
+
+
+def test_slice_resolvability_reads_how_sharp_the_slice_timing_is():
+    """Many excitations spread over the TR resolve alias steps; a few bunched ones do
+    not (5 excitations over 0.17 of a 0.227 s TR, as ds004645)."""
+    spread = physio.slice_resolvability(np.linspace(0, 0.95, 17), 1.0)
+    bunched = physio.slice_resolvability(np.repeat(np.linspace(0, 0.17, 5), 3), 0.227)
+    assert spread["excitations"] == 17 and spread["alias_leak"] < 0.05
+    assert bunched["excitations"] == 5 and bunched["alias_leak"] > 0.3

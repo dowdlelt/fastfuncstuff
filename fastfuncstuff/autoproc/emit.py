@@ -1863,7 +1863,9 @@ def _stage_physio(plan: Plan) -> str:
         what = """# The GLM gets cardiac + respiratory RETROICOR and RVT (5 lags) evaluated at
 # tzero (.regs.nuisance.1D, -glm_ortvec physio) -- the instant every voxel stands
 # for after the slice-timed final resample. Nothing is regressed out here: the
-# GLM fits them jointly with the task (PhysIO's placement)."""
+# GLM fits them jointly with the task (PhysIO's placement). Cardiac comes from
+# the vessel voxels; when two halves of the brain disagree on it (no heartbeat
+# found -- see .regs.json, cardiac_weighted) its columns are left out."""
     return f"""
 # ============================ stage00: physio ===============================
 # Cardiac (from magnitude) and respiratory (from phase) models estimated from the

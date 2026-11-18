@@ -1778,9 +1778,15 @@ def physio_check(
     mean_img: np.ndarray,
     affine,
     mask: np.ndarray,
+    cardiac: Mapping | None = None,
 ) -> None:
     """Tracked rates, the traces themselves, and where each regressor group explains
     variance.
+
+    ``cardiac``: {"weight": (x, y, z) per-voxel cardiac signal-to-residual, "found":
+    bool, "split_half": float} from the vessel-voxel refinement; adds a maximum-
+    intensity-projection figure of the weight, where a found heartbeat draws the
+    arterial tree.
 
     ``series``: {"cardiac" | "respiration": (times s, trace)} at the excitation rate;
     ``rates``: the same keys -> (times s, Hz); ``maps``: unique R^2 per group on the
@@ -1879,3 +1885,56 @@ def physio_check(
     path = rec.figure_path(step + 1, "maps")
     render.save_png(img, path)
     rec.add_figure(step + 1, "maps", "Where cardiac, respiration and RVT explain variance", path)
+    if cardiac is not None:
+        _physio_cardiac_mip(rec, step + 2, cardiac, affine)
+
+
+def _physio_cardiac_mip(rec: QCRecord, step: int, cardiac: Mapping, affine) -> None:
+    """Maximum intensity projections of the cardiac weight map, one per plane.
+
+    A projection, not cuts: vessels wind through slices, and only the projection
+    draws them as a tree -- on TASKFORCE both MCAs, the ACA and the basilar. A
+    heartbeat that was not found draws speckle, slice stripes or the brain's edge.
+    """
+    found = bool(cardiac["found"])
+    split = float(cardiac["split_half"])
+    rec.metric("cardiac_found", int(found), "",
+               "1 when the vessel voxels' cardiac phases line up under the true slice times "
+               "better than under every shuffle of them (vessel-voxel trace)",
+               warn_lt=0.5)  # fmt: skip
+    if "alignment" in cardiac:
+        rec.metric("cardiac_slice_alignment", float(cardiac["alignment"]), "",
+                   "vessel phases lined up across excitations at their true slice times, 0-1")  # fmt: skip
+        rec.metric("cardiac_slice_alignment_null", float(cardiac["alignment_null"]), "",
+                   "the best of the slice-time shuffles the alignment had to beat")  # fmt: skip
+    rec.metric("cardiac_split_half", split, "",
+               "median 30 s phase locking between two brain halves' cardiac traces (diagnostic)")  # fmt: skip
+    w = np.asarray(cardiac["weight"], dtype=np.float32)
+    pos = w[w > 0]
+    if pos.size == 0:
+        return
+    ras, zooms = render.ras_volume(np.transpose(np.log1p(w / np.median(pos)), (2, 1, 0)), affine)
+    table = render.lut("inferno")
+    panels = []
+    for name in ("sagittal", "coronal", "axial"):
+        _, cut_ax, row_ax, col_ax, fr, fc, _ = render.PLANES[name]
+        mip = render.plane_slice(ras.max(axis=cut_ax, keepdims=True), cut_ax, 0, row_ax, fr, fc)
+        nz = mip[mip > 0]
+        lo, hi = np.percentile(nz, [50, 99.9]) if nz.size else (0.0, 1.0)
+        rgb = render.colorize(mip, float(lo), float(max(hi, lo + 1e-6)), table=table)
+        panels.append(render.panel(rgb, (zooms[row_ax], zooms[col_ax]), 260))
+    body = render.montage([("MIP", panels)])
+    img = render.compose(
+        body,
+        f"Where the heartbeat was found · {rec.label}",
+        f"{rec.tool}  ·  per-voxel cardiac signal-to-residual, maximum intensity projection, "
+        "log scale, its own range",
+        [(f"{'found' if found else 'NOT found'} (halves {split:.2f})", None if found else "warn")],
+        "Look for: the arterial tree -- middle cerebral arteries along the Sylvian fissures, "
+        "the anterior cerebral midline, the basilar in front of the brainstem -- plus the "
+        "basal cisterns. Uniform speckle, stripes along slices, or a bright brain edge "
+        "mean the cardiac trace followed something else.",
+    )
+    path = rec.figure_path(step, "cardiac_mip")
+    render.save_png(img, path)
+    rec.add_figure(step, "cardiac_mip", "Cardiac weight, maximum intensity projections", path)

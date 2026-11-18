@@ -23,7 +23,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=FfsHelpFormatter,
         prog="ffs_physio",
         description=(
-            "Cardiac and respiratory noise regressors estimated from the data itself.\n\n"
+            "EXPERIMENTAL. Cardiac and respiratory noise regressors estimated from the data\n"
+            "itself. Cardiac detection is judged by slice timing and reports 'not found'\n"
+            "rather than guess, but it is not yet trusted on all data: it finds few runs at\n"
+            "TR >= 2 s (see docs/physio.md, Limits). Check the QC before relying on it.\n\n"
             "Each multiband excitation is one physiological sample, so a run read in\n"
             "acquisition order is a trace at n_excitations/TR (17 Hz for MB5, 85 slices,\n"
             "TR 1 s) -- fast enough for the heartbeat that the volume rate aliases.\n"
@@ -71,9 +74,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-card_from",
-        choices=["auto", "magnitude", "phase"],
+        choices=["auto", "weighted", "magnitude", "phase"],
         default="auto",
-        help="Trace to read cardiac from. auto = magnitude (measured best).",
+        help="Trace to read cardiac from. weighted (= auto): rebuilt from the voxels "
+        "that carry the heartbeat (the vessels, ~1 %% of the brain), starting from the "
+        "magnitude trace -- against a pulse oximeter on TASKFORCE, phase locking "
+        "0.95-0.99 vs 0.88-0.91 for magnitude; ~5 s per run. It also tests whether a "
+        "heartbeat was found (two halves of the brain must agree) and writes "
+        "PREFIX.cardiac_weight (where it was found). magnitude: the mean over the brain.",
+    )
+    parser.add_argument(
+        "-card_unfound",
+        choices=["drop", "keep"],
+        default="drop",
+        help="When -card_from weighted finds no heartbeat: drop = leave the cardiac "
+        "columns out of PREFIX.nuisance.1D (they would fit noise and cost the GLM "
+        "their degrees of freedom); keep = write them from the magnitude trace anyway. "
+        "The slibase keeps its 13-per-slice layout either way.",
     )
     parser.add_argument(
         "-resp_from",
@@ -125,6 +142,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _split_axis(args) -> int:
+    """In-plane axis to split the brain along for the found-a-heartbeat test: the one
+    NOT phase-encoded, since the N/2 ghost copies a vessel half a FOV along PE and
+    would hand both halves the same voxel. Read from the sidecar; j (A/P) if unknown."""
+    src = args.tpattern
+    if src is None or not str(src).endswith(".json"):
+        stem = str(args.input)
+        for ext in (".nii.gz", ".nii.zst", ".nii"):
+            if stem.endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        src = stem + ".json"
+    try:
+        pe = str(json.loads(Path(src).read_text()).get("PhaseEncodingDirection", "j"))
+    except (OSError, ValueError):
+        pe = "j"
+    return 1 if pe.startswith("i") else 0
+
+
 def _slice_times_and_tr(args) -> tuple[np.ndarray, float]:
     from fastfuncstuff.io.afni import get_tr_from_file
     from fastfuncstuff.processing.slicetime import load_slice_timing
@@ -170,6 +206,13 @@ def _read_series(img, affine_invariant: bool = False) -> np.ndarray:
     return np.asarray(proxy, dtype=np.float32)
 
 
+def _torch_volume(vol: np.ndarray):
+    """A (nx, ny, nz) array in save_image's (z, y, x) tensor order."""
+    import torch
+
+    return torch.from_numpy(np.ascontiguousarray(vol.transpose(2, 1, 0)))
+
+
 def _write_slibase(path: Path, X: np.ndarray, labels: list[str]) -> None:
     """AFNI-style 1D with its column labels in a comment, as physio_calc.py writes."""
     with open(path, "w") as fh:
@@ -190,7 +233,9 @@ def _qc_figure(path: Path, traces, sources: dict, diag: dict) -> None:
     render.save_png(checks.physio_rates_figure(series, rates, sources), path)
 
 
-def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -> None:
+def _write_qc(
+    args, mag, X, labels, traces, sources, diag, affine, tr, device, refined=None
+) -> None:
     """-qc: tracked rates and traces, and where each group explains variance on the
     raw slices (the maps cost one batched fit per slice; only made under -qc)."""
     from fastfuncstuff.processing import physio
@@ -216,7 +261,18 @@ def _write_qc(args, mag, X, labels, traces, sources, diag, affine, tr, device) -
     rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
     rec.info["input"] = str(args.input)
     rec.info["sources"] = f"cardiac {sources['cardiac']}, respiration {sources['respiration']}"
-    checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask)
+    cardiac = (
+        None
+        if refined is None
+        else {
+            "weight": refined.weight,
+            "found": refined.found,
+            "split_half": refined.split_half,
+            "alignment": refined.alignment,
+            "alignment_null": refined.alignment_null,
+        }
+    )
+    checks.physio_check(rec, 1, series, rates, sources, maps, mean_img, affine, mask, cardiac)
     rec.write(args.verb)
 
 
@@ -271,14 +327,43 @@ def main(argv: list[str] | None = None) -> int:
 
     traces = physio.excitation_traces(mag, st, tr, phase=ph, device=device, voxel_size=zooms)
     del ph
-    card_auto, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
+    _, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
     resp_auto, resp_scores = physio.choose_source(traces, physio.RESP_BAND, 40.0)
     sources = {
-        "cardiac": card_auto if args.card_from == "auto" else args.card_from,
+        "cardiac": "weighted" if args.card_from == "auto" else args.card_from,
         "respiration": resp_auto if args.resp_from == "auto" else args.resp_from,
     }
     if "phase" in sources.values() and traces.phase is None:
         raise SystemExit("ffs_physio: phase was asked for but -phase was not given")
+    refined = None
+    cardiac_in_nuisance = True
+    if sources["cardiac"] == "weighted":
+        refined = physio.refine_cardiac(
+            mag, traces, st, tr, sources["respiration"], split_axis=_split_axis(args),
+            device=device,
+        )  # fmt: skip
+        traces.cardiac = refined.trace
+        if verb >= 1:
+            for lab, rate, align, null, harm, hnull in refined.tried:
+                shuf = (
+                    ""
+                    if np.isnan(null)
+                    else f" (shuffled best {null:.2f}); harmonic {harm:.2f} (non-harmonic best {hnull:.2f})"
+                )
+                print(f"    start {lab}: {rate:.1f}/min, slice alignment {align:.2f}{shuf}")
+            verdict = (
+                "FOUND" if refined.found else ("NOT FOUND" if refined.testable else "UNTESTABLE")
+            )
+            print(
+                f"  cardiac from {refined.n_voxels} voxels' best 1 %: {verdict} via {refined.start}, "
+                f"{refined.heart_rate_per_min:.1f}/min (slice alignment {refined.alignment:.2f} must beat "
+                f"every slice-time shuffle, best {refined.alignment_null:.2f}; harmonic "
+                f"{refined.harmonic:.2f} must beat {refined.harmonic_null:.2f}; halves {refined.split_half:.2f})"
+            )
+        if not refined.found:
+            # The slibase keeps its layout, built from the mean trace as before.
+            sources["cardiac"] = "magnitude"
+            cardiac_in_nuisance = args.card_unfound == "keep"
     X, labels, diag = physio.slice_regressors(traces, sources["cardiac"], sources["respiration"])
 
     prefix = Path(args.prefix)
@@ -310,17 +395,66 @@ def main(argv: list[str] | None = None) -> int:
         "columns_per_slice": 13,
         "layout": "slice-major (ffs_reml -slibase_sm, afni_proc -ricor_regs)",
     }
+    if refined is not None:
+        from fastfuncstuff.processing.io import save_image
+
+        wpath = base + ".cardiac_weight.nii.gz"
+        hdr = {"affine": mag_img.affine.copy(), "header": mag_img.header.copy()}
+        save_image(_torch_volume(refined.weight), wpath, header_info=hdr)
+        summary["cardiac_weighted"] = {
+            "found": bool(refined.found),
+            "split_half_phase_locking": refined.split_half,
+            "heart_rate_per_min_median": refined.heart_rate_per_min,
+            "start_heart_rate_per_min": refined.start_rate_per_min,
+            "n_voxels": refined.n_voxels,
+            "start": refined.start,
+            "alias_coherence": refined.alias_coherence,
+            "alias_ratio": refined.alias_ratio,
+            "slice_alignment": refined.alignment,
+            "slice_alignment_null": refined.alignment_null,
+            "harmonic_alignment": refined.harmonic,
+            "harmonic_alignment_null": refined.harmonic_null,
+            "testable": bool(refined.testable),
+            "slice_resolvability": refined.resolvability,
+            "rule": (
+                f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
+                f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers, and its "
+                f"second harmonic beats its alignment at all {len(physio.HARMONIC_CONTROLS)} non-harmonic multiples"
+            ),
+            "tried": [
+                dict(
+                    zip(
+                        (
+                            "start",
+                            "heart_rate_per_min",
+                            "slice_alignment",
+                            "shuffled_max",
+                            "harmonic_alignment",
+                            "harmonic_control_max",
+                        ),
+                        t,
+                        strict=True,
+                    )
+                )
+                for t in refined.tried
+            ],
+            "weight_map": wpath,
+            "in_nuisance": bool(cardiac_in_nuisance),
+        }
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
-    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device)
+    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device, refined)
     if args.tzero is not None:
         times = np.arange(nt) * tr + args.tzero
         if args.nuisance_set == "tapas":
             model = physio.model_from_traces(traces, sources["cardiac"], sources["respiration"])
-            Xv, vlabels = physio.standard_regressors(model, times)
+            no_card = (
+                {} if cardiac_in_nuisance else {"card_order": 0, "inter_order": 0, "hrv": False}
+            )
+            Xv, vlabels = physio.standard_regressors(model, times, **no_card)
         else:
-            Xv, vlabels = physio.volume_regressors(diag, times)
+            Xv, vlabels = physio.volume_regressors(diag, times, cardiac=cardiac_in_nuisance)
         with open(base + ".nuisance.1D", "w") as fh:
             fh.write(f"# ffs_physio volume regressors at f*TR + {args.tzero:g} s\n")
             fh.write('# ColumnLabels = "' + " ; ".join(vlabels) + '"\n')
