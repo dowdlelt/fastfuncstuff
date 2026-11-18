@@ -1068,6 +1068,18 @@ class TestGrowPipe:
 
         read_end, write_end = os.pipe()
         try:
+            # A container's root lacks CAP_SYS_RESOURCE, and every root pod on a
+            # node shares uid 0's pipe-page quota, so the kernel can refuse the
+            # size outright (seen on a Kubernetes pod: pipes left at 8 KiB).
+            # _grow_pipe swallowing that refusal is the documented contract.
+            probe_r, probe_w = os.pipe()
+            try:
+                fcntl.fcntl(probe_r, fcntl.F_SETPIPE_SZ, 1 << 20)
+            except OSError as exc:
+                pytest.skip(f"kernel refuses a 1 MiB pipe here ({exc.strerror})")
+            finally:
+                os.close(probe_r)
+                os.close(probe_w)
             with os.fdopen(read_end, "rb", buffering=0, closefd=False) as fobj:
                 _grow_pipe(fobj)
             assert fcntl.fcntl(read_end, fcntl.F_GETPIPE_SZ) == 1 << 20

@@ -795,6 +795,9 @@ def test_f_test_glt_matrix_round_trip(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not (TEST_DATA_DIR / "X.xmat.1D").exists(), reason="AFNI reference design matrix not found"
+)
 def test_goodlist_utilities():
     """Test GoodList parsing and censoring utilities"""
     from fastfuncstuff.io.afni import (

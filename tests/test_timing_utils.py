@@ -24,7 +24,8 @@ class TestTimingProfiler:
         assert len(profiler.timings["test_operation"]) == 1
 
         elapsed = profiler.timings["test_operation"][0]
-        assert 0.005 <= elapsed <= 0.02, f"Expected ~0.01s, got {elapsed:.3f}s"
+        # Upper bound only catches a ms/s mixup: a loaded box oversleeps freely.
+        assert 0.005 <= elapsed <= 1.0, f"Expected ~0.01s, got {elapsed:.3f}s"
 
     def test_profiler_multiple_operations(self):
         """Test profiling multiple different operations."""
@@ -45,10 +46,11 @@ class TestTimingProfiler:
         assert len(profiler.timings["op1"]) == 1
         assert len(profiler.timings["op2"]) == 1
 
-        # op2 should be slower (0.02 vs 0.01)
-        op1_total = sum(profiler.timings["op1"])
-        op2_total = sum(profiler.timings["op2"])
-        assert op2_total > op1_total, "op2 (0.02s) should be slower than op1 (0.01s)"
+        # Each records at least its own sleep. Not op2 > op1: sleep() only
+        # promises a minimum, and on a loaded box (32 workers on a CPU quota)
+        # op1 measured 66 ms against op2's 27 ms.
+        assert sum(profiler.timings["op1"]) >= 0.01
+        assert sum(profiler.timings["op2"]) >= 0.02
 
     def test_profiler_nested_operations(self):
         """Test profiling nested operations."""
