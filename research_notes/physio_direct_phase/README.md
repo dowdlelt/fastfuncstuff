@@ -164,3 +164,31 @@ interrupted summary reports 8793 passed, 117 skipped, 4 xfailed, and 5 failures:
 These failures are untriaged; interruption may affect the worker-related results.
 The complete local log is `/tmp/ffs_physio_direct_phase/test-fast.log`. The broad
 suite is not claimed green, and no further tests were started after the stop request.
+
+## Follow-up: recover the missed cases
+
+The first pilot did not establish missed-run recovery. The follow-up therefore
+audits the five rejected TASKFORCE runs in the earlier default-library evaluation
+([miss_audit.json](miss_audit.json)) and reruns actual detection decisions.
+Four already generated a useful cardiac candidate (pulse locking 0.91–0.97) but
+failed the harmonic gate. The fifth, s02 mvpsA/4, had no useful candidate: its
+recorded median 96.77/min falls in the respiratory exclusion 97.07 +/- 1.8/min.
+
+Two actual recoveries so far, using the existing acceptance rule:
+
+| Run | Change | Before | After | Pulse locking after |
+|---|---|---|---|---:|
+| s01 rest/1 | Refine every crossed candidate with the direct phase fit before judging | Not found | Found | 0.9731 |
+| s02 mvpsA/4 | Admit respiratory-sideband frequencies; keep the current phase estimator | Not found | Found | 0.9682 |
+
+The second run estimates 97.15/min against 96.77/min recorded. This is a concrete
+discovery failure caused by a forbidden frequency, not absent cardiac information.
+It does **not** establish that removing respiratory exclusions is a safe default:
+earlier long-TR experiments produced false finds when they were removed. Neither
+the new fitter's false-find rate nor its shuffled null calibration is established.
+
+Reproduction: `scripts/physio_phase_review/rescue_misses.py`. These are real-data
+research experiments, not restarts of the stopped regression suite. Results are in
+the [rescues](rescues/) directory; candidate phases remain in the local cache.
+The next cases are the remaining TASKFORCE misses, genuine long-TR misses, and
+previously observed impostors. Production behaviour is still unchanged.

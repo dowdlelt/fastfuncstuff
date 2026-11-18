@@ -1,0 +1,85 @@
+{
+  "run": "s02_mvpsA_04",
+  "phase_mode": "current",
+  "drop_resp_zones": true,
+  "ica": true,
+  "found": true,
+  "selected": {
+    "start": "ica@0.391",
+    "alignment": 0.40560496554134284,
+    "shuffled": 0.2068789964161251,
+    "harmonic": 0.7292520380300559,
+    "harmonic_null": 0.07052815105885536,
+    "lock": 0.9681530130879673,
+    "harmonic_lock": 0.8800166866093743,
+    "window_lock_median": 0.9806906916221607,
+    "outside_cardiac_band": 0.0011437908496732027,
+    "rate": 97.14989956082934
+  },
+  "recorded_rate_per_min": 96.77419354838639,
+  "final_alignment_floor": 0.2068789964161251,
+  "candidates": [
+    {
+      "start": "mean",
+      "alignment": 0.35055804027502335,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.9648811346666928,
+      "harmonic_lock": 0.8682181582418345,
+      "window_lock_median": 0.9696781788766967,
+      "outside_cardiac_band": 0.023529411764705882,
+      "rate": 97.16601917136096
+    },
+    {
+      "start": "ica@0.391",
+      "alignment": 0.40560496554134284,
+      "shuffled": 0.2068789964161251,
+      "harmonic": 0.7292520380300559,
+      "harmonic_null": 0.07052815105885536,
+      "lock": 0.9681530130879673,
+      "harmonic_lock": 0.8800166866093743,
+      "window_lock_median": 0.9806906916221607,
+      "outside_cardiac_band": 0.0011437908496732027,
+      "rate": 97.14989956082934
+    },
+    {
+      "start": "ica@0.383",
+      "alignment": 0.39387635319030895,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.9715558287314628,
+      "harmonic_lock": 0.8930295917222325,
+      "window_lock_median": 0.9799425656976989,
+      "outside_cardiac_band": 0.0017973856209150326,
+      "rate": 97.15034116891351
+    },
+    {
+      "start": "ica@0.375",
+      "alignment": 0.39387635319030895,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.9715558287314628,
+      "harmonic_lock": 0.8930295917222325,
+      "window_lock_median": 0.9799425656976989,
+      "outside_cardiac_band": 0.0017973856209150326,
+      "rate": 97.15034116891351
+    },
+    {
+      "start": "ica@0.359",
+      "alignment": 0.36815958211998984,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.9699949578303511,
+      "harmonic_lock": 0.8872492906334242,
+      "window_lock_median": 0.9751427197357855,
+      "outside_cardiac_band": 0.011928104575163398,
+      "rate": 97.14944962927176
+    }
+  ],
+  "fit_diagnostics": [],
+  "seconds": 256.39269060688093
+}
