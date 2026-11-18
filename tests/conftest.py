@@ -63,6 +63,27 @@ except Exception:
     pass
 
 
+def pytest_xdist_auto_num_workers(config):
+    """``-n auto`` capped by the container's CPU quota.
+
+    xdist's own count is psutil's physical cores, which inside a Kubernetes pod
+    is the whole node: a 128-core host started 128 workers on a pod granted a
+    fraction of that, and the quota freezes the lot. resolve_cpu_threads already
+    applies affinity and the cgroup quota; the thread env vars it would honour
+    first are the ones pinned to 1 above, so they are hidden from it here.
+    ``PYTEST_XDIST_AUTO_NUM_WORKERS`` still overrides (xdist checks it first).
+    """
+    from fastfuncstuff.utils import resolve_cpu_threads
+
+    hidden = ("FFS_NUM_THREADS", "OMP_NUM_THREADS", "SLURM_CPUS_PER_TASK")
+    saved = {v: os.environ.pop(v) for v in hidden if v in os.environ}
+    try:
+        n, _ = resolve_cpu_threads()
+    finally:
+        os.environ.update(saved)
+    return n
+
+
 def pytest_configure(config):
     """Configure pytest with custom markers."""
     config.addinivalue_line(
