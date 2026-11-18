@@ -49,3 +49,15 @@ def test_free_voxel_coefficients_leave_the_alias_ambiguous():
     true_score = prediction_score(series, phase, tr)
     alias_score = prediction_score(series, phase + 2 * np.pi * times / tr, tr)
     np.testing.assert_allclose(true_score, alias_score, atol=1e-10)
+
+
+def test_smoothing_is_invariant_to_independent_crossed_phase_origins():
+    times = np.arange(120)[:, None] + np.linspace(0, 0.9, 9)[None]
+    initial = 2 * np.pi * 1.13 * times + 0.3 * np.sin(times / 13)
+    series = [np.cos(p)[None] for p in initial.T]
+    shifted = initial.copy()
+    shifted[:, ::2] += 4 * np.pi
+    shifted[60:, 1::2] -= 2 * np.pi
+    phase, _ = fit_phase(series, times, initial, maxiter=0)
+    other, _ = fit_phase(series, times, shifted, maxiter=0)
+    np.testing.assert_allclose(np.exp(1j * phase), np.exp(1j * other), atol=1e-8)

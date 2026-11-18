@@ -39,7 +39,12 @@ def fit_phase(series, times, initial, knot_s=4.0, maxiter=150):
     basis = CubicSpline(knots, np.eye(len(knots)), bc_type="natural")(times)
     carrier = 2 * np.pi * np.polyfit(times.ravel(), initial.ravel() / (2 * np.pi), 1)[0] * times
     flat_basis = basis.reshape(-1, len(knots))
-    start = np.linalg.lstsq(flat_basis, (initial - carrier).ravel(), rcond=None)[0]
+    # Crossed tracks have independent 2*pi origins. Project a common lift of the
+    # demodulated phase, otherwise averaging those origins can invent half-cycles.
+    residual_phase = np.angle(np.exp(1j * (initial - carrier)))
+    centre = np.unwrap(np.angle(np.exp(1j * residual_phase).mean(axis=1)))
+    lifted = centre[:, None] + np.angle(np.exp(1j * (residual_phase - centre[:, None])))
+    start = np.linalg.lstsq(flat_basis, lifted.ravel(), rcond=None)[0]
     if maxiter == 0:
         return carrier + np.einsum("ngk,k->ng", basis, start), dict(
             success=True, iterations=0, loss=None, message="Initial phase smoothed only"
