@@ -35,14 +35,23 @@ def _mb_slice_times(nz: int, mb: int, fill: float = 1.0) -> np.ndarray:
 
 
 def _synthetic_run(
-    nt=240, shape=(12, 12, 20), mb=2, card=0.01, resp=0.15, noise=0.01, seed=0, fill=1.0
+    nt=240,
+    shape=(12, 12, 20),
+    mb=2,
+    card=0.01,
+    resp=0.15,
+    noise=0.01,
+    seed=0,
+    fill=1.0,
+    harmonic=0.0,
 ):
     rng = np.random.default_rng(seed)
     nx, ny, nz = shape
     st = _mb_slice_times(nz, mb, fill)
     t = np.arange(nt)[None, :] * TR + st[:, None]  # (nz, nt) acquisition times
     base = 100.0 + 20.0 * rng.random(shape)
-    heart = card * np.cos(2 * np.pi * F_CARD * t)  # fractional
+    theta = 2 * np.pi * F_CARD * t
+    heart = card * (np.cos(theta) + harmonic * np.cos(2 * theta - 0.5))  # fractional
     breath = resp * np.sin(2 * np.pi * F_RESP * t)  # radians of field phase
     mag = base[..., None] * (
         1.0 + heart[None, None] + noise * rng.standard_normal((nx, ny, nz, nt))
@@ -234,7 +243,8 @@ def _write_cli_inputs(tmp_path, nt=150):
 
     import nibabel as nib
 
-    mag, ph, st, _ = _synthetic_run(nt=nt)
+    # a pulse with its second harmonic, which the found test needs to line up too
+    mag, ph, st, _ = _synthetic_run(nt=nt, harmonic=0.5)
     nib.save(nib.Nifti1Image(mag, np.eye(4)), tmp_path / "run_mag.nii.gz")
     nib.save(nib.Nifti1Image(ph, np.eye(4)), tmp_path / "run_ph.nii.gz")
     (tmp_path / "run_mag.json").write_text(
@@ -560,7 +570,15 @@ def test_field_gradient_trace_follows_breath_depth():
 
 
 def _vascular_run(
-    nt=240, shape=(16, 16, 20), mb=2, frac=0.05, card=0.03, seed=1, heart=True, volume_locked=False
+    nt=240,
+    shape=(16, 16, 20),
+    mb=2,
+    frac=0.05,
+    card=0.03,
+    seed=1,
+    heart=True,
+    volume_locked=False,
+    harmonic=0.5,
 ):
     """The heartbeat only in a few 'vessel' voxels, each with its own delay and sign
     (70 % positive, so the brain mean keeps a weak, partly cancelled heartbeat), plus
@@ -570,12 +588,17 @@ def _vascular_run(
     st = _mb_slice_times(nz, mb)
     t = np.arange(nt)[None, :] * TR + st[:, None]
     vessel = rng.random(shape) < frac
-    delay = rng.uniform(0, 0.3, shape)
+    # 0.15 s of spread: what held-out heartbeats' second-harmonic alignment (median
+    # 0.36 over their top voxels) implies; 0.3 s scatters the harmonic's angles
+    delay = rng.uniform(0, 0.15, shape)
     sign = np.where(rng.random(shape) < 0.7, 1.0, -1.0)
     # volume_locked: the pulsation is the same in every slice of a volume, as drift,
     # task or denoising residue are, instead of sampled at each slice's own time
     tb = np.arange(nt)[None, :] * TR + 0 * st[:, None] if volume_locked else t
-    beat = np.cos(2 * np.pi * F_CARD * (tb[None, None] - delay[..., None]))
+    # a pulse, not a sinusoid: the waveform carries a second harmonic, which the found
+    # test requires to line up as well
+    theta = 2 * np.pi * F_CARD * (tb[None, None] - delay[..., None])
+    beat = np.cos(theta) + harmonic * np.cos(2 * theta - 0.5)
     pulse = card * sign[..., None] * beat * vessel[..., None] if heart else 0.0
     base = 100.0 + 20.0 * rng.random(shape)
     mag = base[..., None] * (1.0 + pulse + 0.01 * rng.standard_normal((nx, ny, nz, nt)))
@@ -748,6 +771,17 @@ def test_a_pulsation_the_same_in_every_slice_of_a_volume_is_not_a_heartbeat():
         tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
         ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
         assert ref.found is (not locked), (locked, ref.alignment, ref.alignment_null)
+
+
+def test_a_slice_locked_sinusoid_without_a_harmonic_is_not_a_heartbeat():
+    """Slow physical signals aliased into the cardiac band follow the slice times too,
+    and on held-out data beat their shuffles at the fundamental (8 wrong finds in 66
+    runs); what they lack is a pulse's second harmonic. A pure sinusoid at the heart
+    rate, sampled at each slice's own time, must therefore not be found."""
+    mag, ph, st = _vascular_run(harmonic=0.0, card=0.05)
+    tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=CPU)
+    ref = physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=CPU)
+    assert not ref.found and ref.harmonic <= ref.harmonic_null, (ref.harmonic, ref.harmonic_null)
 
 
 def test_a_single_excitation_time_is_untestable():

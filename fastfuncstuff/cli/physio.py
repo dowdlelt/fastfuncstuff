@@ -341,8 +341,12 @@ def main(argv: list[str] | None = None) -> int:
         )  # fmt: skip
         traces.cardiac = refined.trace
         if verb >= 1:
-            for lab, rate, align, null in refined.tried:
-                shuf = "" if np.isnan(null) else f" (shuffled slice times: best {null:.2f})"
+            for lab, rate, align, null, harm, hnull in refined.tried:
+                shuf = (
+                    ""
+                    if np.isnan(null)
+                    else f" (shuffled best {null:.2f}); harmonic {harm:.2f} (shuffled best {hnull:.2f})"
+                )
                 print(f"    start {lab}: {rate:.1f}/min, slice alignment {align:.2f}{shuf}")
             verdict = (
                 "FOUND" if refined.found else ("NOT FOUND" if refined.testable else "UNTESTABLE")
@@ -350,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  cardiac from {refined.n_voxels} voxels' best 1 %: {verdict} via {refined.start}, "
                 f"{refined.heart_rate_per_min:.1f}/min (slice alignment {refined.alignment:.2f} must beat "
-                f"every slice-time shuffle, best {refined.alignment_null:.2f}; halves {refined.split_half:.2f})"
+                f"every slice-time shuffle, best {refined.alignment_null:.2f}; harmonic "
+                f"{refined.harmonic:.2f} must beat {refined.harmonic_null:.2f}; halves {refined.split_half:.2f})"
             )
         if not refined.found:
             # The slibase keeps its layout, built from the mean trace as before.
@@ -404,16 +409,26 @@ def main(argv: list[str] | None = None) -> int:
             "alias_ratio": refined.alias_ratio,
             "slice_alignment": refined.alignment,
             "slice_alignment_null": refined.alignment_null,
+            "harmonic_alignment": refined.harmonic,
+            "harmonic_alignment_null": refined.harmonic_null,
             "testable": bool(refined.testable),
             "slice_resolvability": refined.resolvability,
             "rule": (
                 f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
-                f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers"
+                f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers, and its "
+                f"second harmonic beats {physio.SLICE_PERMUTATIONS} shuffles of its own"
             ),
             "tried": [
                 dict(
                     zip(
-                        ("start", "heart_rate_per_min", "slice_alignment", "shuffled_max"),
+                        (
+                            "start",
+                            "heart_rate_per_min",
+                            "slice_alignment",
+                            "shuffled_max",
+                            "harmonic_alignment",
+                            "harmonic_shuffled_max",
+                        ),
                         t,
                         strict=True,
                     )

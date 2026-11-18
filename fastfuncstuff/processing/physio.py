@@ -672,10 +672,14 @@ class CardiacRefinement:
     alias_coherence: float = 0.0  # brain-mean trace vs the chosen alias (diagnostic)
     alias_ratio: float = 0.0  # slice alignment of the chosen alias over the next-best
     start: str = "mean"  # which start was kept: "mean", "ica@<aliased Hz>"
-    tried: list = field(default_factory=list)  # (start, rate, alignment, its shuffles' max or nan)
+    tried: list = field(
+        default_factory=list
+    )  # (start, rate, alignment, its shuffles' max, harmonic, its shuffles' max); nan if untested
     tried_phase: list = field(default_factory=list)  # each start's final (nt, G) phase
     alignment: float = 0.0  # vessel phases lined up under the true slice times, 0-1
     alignment_null: float = 0.0  # the best of the slice-time shuffles
+    harmonic: float = 0.0  # the same alignment at twice the cardiac phase
+    harmonic_null: float = 0.0  # the best of its slice-time shuffles
     testable: bool = True  # False with a single excitation time: nothing to shuffle
     resolvability: dict = field(default_factory=dict)  # slice_resolvability of the acquisition
 
@@ -1048,6 +1052,27 @@ def _shuffled_alignment(Ys, times, phase, offsets, tr, device, n: int, rng) -> n
     return np.asarray(out)
 
 
+def _harmonic_alignment(Ys, phase, device, n: int = 0, rng=None) -> tuple[float, float]:
+    """Slice alignment at the second harmonic (twice ``phase``), and the best of ``n``
+    excitation-time shuffles of it (nan without). A pulse is not a sinusoid: its
+    waveform carries a second harmonic, sampled at the same slice times, that lines up
+    too. Slow physical signals that impersonate a heartbeat through an alias line up at
+    the fundamental only -- on held-out data every such impostor that beat its shuffles
+    had harmonic alignment 0.03-0.11, the heartbeats mostly 0.2-0.7 (wiki: Slice-time
+    alignment of the heartbeat)."""
+    score = slice_alignment(_voxel_fits(Ys, 2 * phase, device))
+    if not n:
+        return score, float("nan")
+    G = phase.shape[1]
+    best = 0.0
+    for _ in range(n):
+        perm = rng.permutation(G)
+        while np.any(perm == np.arange(G)):
+            perm = rng.permutation(G)
+        best = max(best, slice_alignment(_voxel_fits(Ys, 2 * phase[:, perm], device)))
+    return score, best
+
+
 def slice_resolvability(
     slice_times: np.ndarray, tr: float, rates_per_min=(50.0, 75.0, 100.0)
 ) -> dict:
@@ -1170,13 +1195,14 @@ def refine_cardiac(
     that follow it and rebuilds the trace from them, excitation by excitation (all
     slices acquired at one instant are fitted at that instant).
 
-    Each start is judged the same way: (1) the alias the brain-mean trace is most
-    coherent with is kept (the refinement cannot tell f from f +- k/TR); (2) two halves
-    of the brain (split along ``split_axis``, the in-plane axis NOT phase-encoded -- the
-    N/2 ghost copies vessels half a FOV along it), fitted from the same start, must
-    agree; (3) the alias must win clearly. The mean-trace start is tried first; if it
-    fails, per-excitation ICA starts (:func:`_ica_starts`) in order of support. Against
-    a pulse oximeter on TASKFORCE, phase locking 0.90-0.99 where found.
+    Every start (the brain-mean trace, then per-excitation ICA, :func:`_ica_starts`) is
+    refined and judged by slice timing (wiki: Slice-time alignment of the heartbeat):
+    the alias whose vessel phases line up best across excitations is kept, and found
+    means that alignment beats slice-time shuffles of itself (Bonferroni over the
+    answers tested) AND its second harmonic beats its own shuffles -- slow physical
+    signals aliased into the band pass the first and fail the second. One excitation
+    time: untestable. Two brain halves (split along ``split_axis``, the in-plane axis
+    NOT phase-encoded) are refitted from the kept answer as a diagnostic only.
     """
     device = device or torch.device("cpu")
     nt, G = traces.times.shape
@@ -1235,7 +1261,7 @@ def refine_cardiac(
     starts = [("mean", start_mean)] + (
         list(_ica_starts(Ys, times, tr, avoid, device)) if ica else []
     )
-    answers = []  # [label, phase, member, alias ratio, alignment, rate, shuffles, alias offsets]
+    answers = []  # [label, phase, member, alias ratio, alignment, rate, shuffles, alias offsets, harmonic, its null]
     for label, start in starts:
         phase, mem, ratio, _, _ = judge(start)
         if phase is None:
@@ -1247,12 +1273,38 @@ def refine_cardiac(
         if crossed is None:
             continue
         offs = _alias_offsets(times, crossed, tr, avoid)
-        answers.append([label, crossed, mem, ratio, score, _phase_rate(times, crossed), None, offs])
+        answers.append(
+            [
+                label,
+                crossed,
+                mem,
+                ratio,
+                score,
+                _phase_rate(times, crossed),
+                None,
+                offs,
+                np.nan,
+                np.nan,
+            ]
+        )
     if not answers:  # nothing outside the blind zones: report the mean start, unfound
         mem = _refine_pass(
             Ys, times, [_Member(None, start_mean)], avoid, tr, device, dt, top, n_iter=n_iter
         )[0]
-        answers.append(["mean", mem.phase, mem, 0.0, 0.0, _phase_rate(times, mem.phase), None, {}])
+        answers.append(
+            [
+                "mean",
+                mem.phase,
+                mem,
+                0.0,
+                0.0,
+                _phase_rate(times, mem.phase),
+                None,
+                {},
+                np.nan,
+                np.nan,
+            ]
+        )
     # the slice-time shuffle null, for each distinct answer (best first)
     rng = np.random.default_rng(0)
     tested: list[float] = []
@@ -1263,9 +1315,13 @@ def refine_cardiac(
             continue
         tested.append(a[5])
         a[6] = _shuffled_alignment(Ys, times, a[1], a[7], tr, device, SLICE_PERMUTATIONS, rng)
+        a[8], a[9] = _harmonic_alignment(Ys, a[1], device, SLICE_PERMUTATIONS, rng)
     nulls = [a for a in answers if a[6] is not None]
     if nulls:
-        kept = max(nulls, key=lambda a: a[4] - a[6].max())  # most clearly slice-locked
+        # a heartbeat's second harmonic lines up too; among those, the most clearly
+        # slice-locked (with none, the most slice-locked is reported, unfound)
+        pulsed = [a for a in nulls if a[8] > a[9]] or nulls
+        kept = max(pulsed, key=lambda a: a[4] - a[6].max())
         # Several answers were tried, so the kept one must beat as many shuffles OF ITS
         # OWN as were drawn for all of them (Bonferroni). Pooling the others' shuffles
         # instead let a badly converged answer -- whose shuffles can repair it -- set
@@ -1275,10 +1331,10 @@ def refine_cardiac(
         floor = (
             float(np.concatenate([kept[6], extra]).max()) if extra.size else float(kept[6].max())
         )
-        ok = kept[4] > floor
+        ok = kept[4] > floor and kept[8] > kept[9]
     else:
         kept, floor, ok = max(answers, key=lambda a: a[4]), float("nan"), False
-    label, phase, full, ratio, score, rate, _, _ = kept
+    label, phase, full, ratio, score, rate, _, _, harm, harm_null = kept
     # diagnostics for the kept answer only: two brain halves fitted from it, and the
     # brain-mean trace's coherence with it
     hm = _refine_pass(Ys, times, [_Member(halves[0], phase), _Member(halves[1], phase)],
@@ -1303,12 +1359,21 @@ def refine_cardiac(
         alias_ratio=float(ratio),
         start=label,
         tried=[
-            (a[0], a[5], a[4], float(a[6].max()) if a[6] is not None else float("nan"))
+            (
+                a[0],
+                a[5],
+                a[4],
+                float(a[6].max()) if a[6] is not None else float("nan"),
+                float(a[8]),
+                float(a[9]),
+            )
             for a in answers
         ],
         tried_phase=[a[1] for a in answers],
         alignment=float(score),
         alignment_null=float(floor),
+        harmonic=float(harm),
+        harmonic_null=float(harm_null),
         testable=G >= 2,
         resolvability=slice_resolvability(slice_times, tr),
     )
