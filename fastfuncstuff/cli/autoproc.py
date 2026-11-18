@@ -478,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="Data-derived physiological regressors (ffs_physio) from the raw slices, "
+        help="EXPERIMENTAL, off by default. Data-derived physiological regressors (ffs_physio) from the raw slices, "
         "sampled once per multiband excitation: respiration from phase (when the runs "
         "have it), cardiac from magnitude. Cardiac + respiratory RETROICOR and RVT at -tzero enter the "
         "GLM as a per-run nuisance (-glm_ortvec physio; in the default set). Nothing is "

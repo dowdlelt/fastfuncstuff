@@ -23,7 +23,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=FfsHelpFormatter,
         prog="ffs_physio",
         description=(
-            "Cardiac and respiratory noise regressors estimated from the data itself.\n\n"
+            "EXPERIMENTAL. Cardiac and respiratory noise regressors estimated from the data\n"
+            "itself. Cardiac detection is judged by slice timing and reports 'not found'\n"
+            "rather than guess, but it is not yet trusted on all data: it finds few runs at\n"
+            "TR >= 2 s (see docs/physio.md, Limits). Check the QC before relying on it.\n\n"
             "Each multiband excitation is one physiological sample, so a run read in\n"
             "acquisition order is a trace at n_excitations/TR (17 Hz for MB5, 85 slices,\n"
             "TR 1 s) -- fast enough for the heartbeat that the volume rate aliases.\n"

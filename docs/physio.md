@@ -1,5 +1,11 @@
 # `ffs_physio`: physiological noise from the data
 
+> **Experimental.** Off by default (`ffs_autoproc -physio` opts in). Respiration and the
+> cardiac machinery are validated on one dataset; cardiac *detection* never reported a wrong
+> heartbeat on 117 runs checked against recordings, but it finds few runs at TR ≥ 2 s and is
+> not yet trusted on all data. See *Limits*. Work in progress is recorded in the wiki note
+> *Slice-time alignment of the heartbeat* (section *Parked*).
+
 Cardiac and respiratory noise regressors for 2-D (multiband) EPI, estimated from the
 images themselves. No pulse oximeter or respiratory belt is needed. The output plugs
 into the GLM the way recorded-physio regressors do (RETROICOR, RVT, and optionally
@@ -28,11 +34,26 @@ enough for the heartbeat that the 1 Hz volume rate aliases (figure 1C).
    excitation by excitation from the best-fitting 1 % of voxels, weighted by fit. Weights
    are fitted on alternate 20 s blocks and applied to the others, so no voxel's noise feeds
    its own weight; eight passes. Against a pulse oximeter on five TASKFORCE runs, phase
-   locking to the pulse rose from 0.88–0.91 to 0.95–0.99. Two halves of the brain are
-   then refitted separately from the same start. They share a heartbeat but no voxels, so
-   if they disagree (median 30 s phase locking below 0.8) the heartbeat was **not found**.
-   That is reported, and the cardiac columns are left out of the nuisance
-   (`-card_unfound keep` keeps them). `PREFIX.cardiac_weight` maps where it was found.
+   locking to the pulse rose from 0.88–0.91 to 0.95–0.99. Starts come from the mean
+   trace and from spatial ICA in each excitation (the aliased cardiac frequency is where
+   most excitations have a component).
+3b. **Is it the heartbeat? Judged by slice timing.** A heartbeat is physical, so every
+   vessel voxel samples it at its own slice's time: under the true cardiac phase, the best
+   voxels' fitted delays **line up across excitations**. Almost everything that impersonates
+   a heartbeat (drift, task residue, NORDIC's patch structure) is the same in every slice of
+   a volume and turns with the slice time instead. Each answer takes the alias that lines up
+   best (outside blind zones at k/TR and at k/TR ± the breathing rate), and is **found** only
+   if:
+   - its alignment beats 30 slice-time shuffles of itself per answer tested (Bonferroni), and
+   - its **second harmonic** lines up better than the same measure at 21 non-harmonic
+     multiples of its phase (1.2–1.8, 2.2–2.8, 3.2–3.8 ×). Slow physical signals aliased
+     into the band near k/TR also follow slice timing; a pulse's waveform has a harmonic and
+     they do not.
+
+   With one excitation time (3-D EPI) the test is **untestable**. Not found is reported, and
+   the cardiac columns are left out of the nuisance (`-card_unfound keep` keeps them).
+   `PREFIX.cardiac_weight` maps where it was found. No tuned thresholds: the cardiac band
+   (36–120/min) is the only fixed number. Wiki: *Slice-time alignment of the heartbeat*.
 4. **Breath depth (RVT) from the field's spatial gradients.** A smooth field is fitted
    to each excitation's phase-change map. Breathing moves along a direction in the
    left–right, front–back and up–down gradients (figure 3D), and the first principal
@@ -148,14 +169,26 @@ slices, with voxel maps correlated at 0.94–0.98.
 - **3-D EPI**: not supported (no excitation-rate samples). Respiration might still be read
   from phase at the volume rate; not built.
 - **Multi-echo**: refused for now; it should work (more samples per excitation) once tested.
-- **Cardiac needs a start.** The vessel refinement improves a heartbeat the mean trace
-  roughly has; it cannot find one from nothing. A voxel fitted with a free delay cannot tell
-  f from f ± k/TR, and a start 9/min off was never pulled back. On HiHiFaces (TR 0.67,
-  MB5, 1.6 mm, flip 31°, L–R phase encoding), every run tried was **not found**: the
-  cardiac band there is dominated by lines at 1/TR ± the breathing rate (72, 81, 98/min,
-  breathing 8.6/min) that survive per-voxel respiratory RETROICOR. A heart rate within
-  ~3/min of k/TR is undetectable from magnitude (it aliases to near zero in every voxel).
-  Finding a start without a recording is open (wiki: *Physiological noise from the data*).
+- **Cardiac: how often it is found.** Judged against recordings (right = the heart rate
+  the recording gives; wrong = found, but at another rate):
+
+  | Data | TR | Right | Wrong | Not found |
+  |---|---|---|---|---|
+  | TASKFORCE (development) | 1 s | 14 | 0 | 5 |
+  | 66 held-out runs: ds002603 ×4 sequences, Rockland 645/1400/CAP, ds002547 | 0.55–2.5 s | 26 | 0 | 40 |
+  | ds001168 full-brain (fresh) | 3 s | 1 | 0 | 8 |
+  | ds001168 prefrontal 0.8 mm slab (fresh) | 4 s | 0 | 0 | 9 (correct: recording shows almost no pulsation there) |
+
+  It finds most runs at short TR (Rockland 645: 7/8; ds002603 550/700 ms: 5/8 each) and few at
+  TR ≥ 2 s (ds002603 sequential 0/8, Rockland CAP 1/7). At long TR the recorded heartbeat
+  itself passes the test in 17 of 18 runs checked, so the heartbeat is there; the estimate
+  of its phase is too rough to pass (see the wiki note's *Long TR* section). HiHiFaces (no
+  recording): fast (TR 0.67) found 7/9; fine (0.8 mm, TR 1.86) 1/17, its harmonic at the
+  noise level.
+- **A heart rate within ~3/min of k/TR** aliases to near zero in every voxel and cannot be
+  told from drift; those rates are a blind zone, and so are k/TR ± the breathing rate.
+- **Run it on the raw magnitude**, before NORDIC: on HiHiFaces fine, NORDIC strengthened the
+  volume-locked component and one run found on raw data was not found after it.
 - **The respiratory trace lags the belt by ~1.5 s.** The clocks agree to the tick, so this
   is the belt (abdominal) against the field (lung volume), not a sync error. RETROICOR
   absorbs a constant lag; RVT carries 0–4 s lags.
