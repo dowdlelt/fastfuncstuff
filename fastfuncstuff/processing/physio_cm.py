@@ -179,6 +179,16 @@ def _derange(G: int, rng) -> np.ndarray:
     return perm
 
 
+def _null(Ys, times, start, tr, device, band, n, rng) -> np.ndarray:
+    """Best alias statistic after each of ``n`` derangements of the excitation times."""
+    G = times.shape[1]
+    return np.array([
+        max(r[1] + r[2] for r in _alias_rows(Ys, times, start[:, _derange(G, rng)], tr,
+                                             device, band) or [(None, 0.0, 0.0)])
+        for _ in range(n)
+    ] or [0.0])  # fmt: skip
+
+
 def detect(
     magnitude: np.ndarray,
     mask: np.ndarray,
@@ -198,8 +208,8 @@ def detect(
     alone could not tell a heartbeat's aliases apart once voxel delays scatter its
     phases (Rockland CAP: 0.37 for the true alias and two wrong ones); a pulse's
     harmonic lines up only on the true one. Found = that statistic beats every
-    derangement of the excitation times, re-choosing among the same aliases, for
-    every start tried (Bonferroni), and the harmonic beats the non-harmonic
+    derangement of the excitation times, re-choosing among the same aliases (30 per
+    start tried, all drawn for the kept start: Bonferroni), and the harmonic beats the non-harmonic
     multiples ``controls`` at the kept alias. The phase is not re-tracked: the
     rebuild-and-re-read refinement dragged correct starts onto a wrong rate.
     """
@@ -211,22 +221,22 @@ def detect(
         if not rows:
             continue
         phase, a1, a2 = max(rows, key=lambda r: r[1] + r[2])
-        null = np.array([
-            max(r[1] + r[2] for r in _alias_rows(Ys, times, start[:, _derange(G, rng)], tr,
-                                                 device, band) or [(None, 0.0, 0.0)])
-            for _ in range(shuffles)
-        ])  # fmt: skip
+        null = _null(Ys, times, start, tr, device, band, shuffles, rng)
         hnull = max((_alignment(Ys, m * phase, device) for m in controls), default=0.0)
         rate = float(abs(phase[-1].mean() - phase[0].mean())
                      / (2 * np.pi * (times[-1].mean() - times[0].mean())) * 60)  # fmt: skip
-        answers.append(dict(label=f"cm{i}@{ratio:.2f}", phase=phase, a1=a1, a2=a2,
+        answers.append(dict(label=f"cm{i}@{ratio:.2f}", phase=phase, a1=a1, a2=a2, start=start,
                             stat=a1 + a2, null=null, hnull=hnull, rate=rate))  # fmt: skip
     if not answers:
         return ConstantModulusDetection(False, None, "none", float("nan"), 0.0, 0.0, 0.0, 0.0,
                                         float("nan"))  # fmt: skip
     pulsed = [a for a in answers if a["a2"] > a["hnull"]] or answers
     kept = max(pulsed, key=lambda a: a["stat"] - a["null"].max())
-    floor = float(max(a["null"].max() for a in answers))
+    # Bonferroni over the starts tried: more derangements of the KEPT start, not the
+    # other starts' nulls -- a start that is no heartbeat (drift the same in every
+    # slice) survives derangement, and its high null rejected true finds (39 of 147).
+    extra = _null(Ys, times, kept["start"], tr, device, band, shuffles * (len(answers) - 1), rng)
+    floor = float(np.concatenate([kept["null"], extra]).max())
     found = bool(kept["stat"] > floor and kept["a2"] > kept["hnull"])
     return ConstantModulusDetection(
         found=found, phase=kept["phase"], label=kept["label"], rate_per_min=kept["rate"],
