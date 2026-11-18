@@ -192,3 +192,29 @@ research experiments, not restarts of the stopped regression suite. Results are 
 the [rescues](rescues/) directory; candidate phases remain in the local cache.
 The next cases are the remaining TASKFORCE misses, genuine long-TR misses, and
 previously observed impostors. Production behaviour is still unchanged.
+
+The remaining three TASKFORCE confirmation failures also pass after direct phase
+refinement: s01 mvpsA/7 (locking 0.9777), s09 mdtb/11 (0.9127), and s09 mdtb/5
+(0.9423). Thus each of the five previously missed runs has been recovered by one
+of the targeted ablations. This is **not** a single-configuration 19/19 evaluation:
+four runs retain the respiratory exclusions and use direct phase fitting; one
+uses the original phase fitter with those exclusions removed.
+
+The complete fit rerun with deranged slice times rejects s01 rest/1 (alignment
+0.1349 vs its initial shuffled floor 0.2298; harmonic 0.0572 vs controls 0.1210).
+This is one falsification control, not false-positive-rate calibration.
+
+Rockland A00018030 FLU1 CAP, a previously observed false-find case, is also
+rejected with direct fitting plus respiratory exclusions removed. Its selected
+candidate is now cardiac (84.82/min vs 85.23/min recorded, locking 0.8541), but
+alignment 0.3597 falls below the final multiple-answer shuffle floor 0.3704.
+Its harmonic passes (0.2971 vs controls 0.1065). This is improved discovery with
+confirmation still unresolved, not a recovered detection.
+
+Baseline provenance matters: [baseline_long_tr.json](baseline_long_tr.json)
+records the prior **default-library** statuses. ds002547 sub-02 and sub-07 were
+already found (locking 0.8425 and 0.9597); their new results, 0.8894 and 0.9684,
+are positive controls and must not be counted as rescued long-TR misses. Their
+earlier constant-rate grid experiment had failed, which initially led to a wrong
+comparison in the progress report. The actual long-TR miss experiments use sub-08
+and sub-09.
