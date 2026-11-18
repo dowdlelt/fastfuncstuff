@@ -3,6 +3,7 @@
 The initial phase supplies the alias and basin. Variable projection learns each
 voxel's sine/cosine coefficients while a shared cubic spline learns phase at the
 actual acquisition times. This is deliberately outside the production pipeline.
+Wiki rationale and limits: ``Continuous cardiac phase refinement``.
 """
 
 import numpy as np

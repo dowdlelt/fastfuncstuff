@@ -138,7 +138,16 @@ def main():
         # Recordings are loaded only after the image-derived cache has been built.
         peaks = reference(ses, task, run)
         baseline = json.loads(str(data["baseline"]))
-        out = dict(run=label, baseline=baseline, variants={})
+        out = dict(
+            run=label,
+            baseline=baseline,
+            tr=tr,
+            nt=int(times.shape[0]),
+            excitations=int(times.shape[1]),
+            recorded_rate_per_min=float(60 / np.median(np.diff(peaks))),
+            phase_fit_version="circular_lift_v1",
+            variants={},
+        )
         phases = {"current": initial}
         out["variants"]["current"] = metrics(initial, times, peaks)
         out["variants"]["current"]["prediction"] = prediction_score(validation, initial, tr)
