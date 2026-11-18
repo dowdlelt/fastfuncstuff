@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 
 CM_DEGREE = 4  # Legendre drift removed before the search (a k/TR heartbeat is slow)
@@ -36,7 +37,7 @@ def temporal_gram(magnitude: np.ndarray, mask: np.ndarray, device: torch.device)
     never the whole masked volume in float64."""
     nt = magnitude.shape[-1]
     L = construct_polynomial_matrix(nt, CM_DEGREE, device=device, dtype=torch.float64)
-    Q, _ = torch.linalg.qr(L.cpu())
+    Q, _ = plinalg.qr(L.cpu())
     Q = Q.to(device)
     G = torch.zeros((nt, nt), dtype=torch.float64, device=device)
     for k in range(magnitude.shape[2]):
@@ -59,7 +60,7 @@ def constant_modulus_traces(
     rotating phasor. Distinct subspaces only (smallest principal cosine < 0.9)."""
     nt = G.shape[0]
     k = cm_components(nt)
-    _, evecs = torch.linalg.eigh(G.cpu())
+    _, evecs = plinalg.eigh(G.cpu())
     X = (evecs[:, -k:].T.flip(0) * math.sqrt(nt)).to(G.device)  # whitened (k, nt)
     # Starts: every pair of principal axes (the heartbeat is often nearly one, and the
     # landscape on ~100 volumes has many shallow minima random starts can all miss),
@@ -70,14 +71,14 @@ def constant_modulus_traces(
     pairs[torch.arange(ii.numel()), ii, 0] = 1.0
     pairs[torch.arange(ii.numel()), jj, 1] = 1.0
     W = torch.cat([pairs, torch.randn((CM_RESTARTS, k, 2), generator=gen, dtype=torch.float64)])
-    W, _ = torch.linalg.qr(W.to(G.device))
+    W, _ = plinalg.qr(W.to(G.device))
     for _ in range(CM_ITERS):
         Z = W.transpose(1, 2) @ X  # (R, 2, nt)
         r2 = (Z * Z).sum(1, keepdim=True)
         grad = (X.unsqueeze(0) * r2) @ Z.transpose(1, 2) * (4 / nt)  # d E[r^4] / dW
         sym = W.transpose(1, 2) @ grad
         grad = grad - W @ (sym + sym.transpose(1, 2)) / 2
-        W, _ = torch.linalg.qr(W - CM_STEP * grad)
+        W, _ = plinalg.qr(W - CM_STEP * grad)
     Z = W.transpose(1, 2) @ X
     r2 = (Z * Z).sum(1)
     ratio = ((r2 * r2).mean(1) / r2.mean(1) ** 2).cpu().numpy()
@@ -85,7 +86,7 @@ def constant_modulus_traces(
     out: list[tuple[float, np.ndarray]] = []
     kept: list[torch.Tensor] = []
     for i in np.argsort(ratio):
-        if any(torch.linalg.svdvals(W[i].T @ V).min() >= 0.9 for V in kept):
+        if any(plinalg.svdvals(W[i].T @ V).min() >= 0.9 for V in kept):
             continue
         kept.append(W[i])
         out.append((float(ratio[i]), Z[i, 0] + 1j * Z[i, 1]))
