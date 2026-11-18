@@ -1099,11 +1099,21 @@ def _global_correlation(
     sw = wm.sum()
     if sw <= 0:
         return 0.0
-    xbar = (wm * b_flat).sum() / sw
-    ybar = (wm * s_flat).sum() / sw
-    vxx = ((wm * b_flat * b_flat).sum() / sw - xbar * xbar).clamp(min=1e-20)
-    vyy = ((wm * s_flat * s_flat).sum() / sw - ybar * ybar).clamp(min=1e-20)
-    vxy = (wm * b_flat * s_flat).sum() / sw - xbar * ybar
+    # Centred sums with a scale-relative variance floor. The one-pass form
+    # E[x^2] - xbar^2 cancels to rounding noise on a constant image, and the
+    # noisy covariance over a clamped 1e-20 variance read as a cost of +-500:
+    # a zeroed warped source then beat the incumbent or not depending on the
+    # BLAS's summation order (passed on AVX512 MKL, failed on a generic path).
+    db = b_flat - (wm * b_flat).sum() / sw
+    ds = s_flat - (wm * s_flat).sum() / sw
+    vxx = (wm * db * db).sum() / sw
+    vyy = (wm * ds * ds).sum() / sw
+    eps = torch.finfo(b_flat.dtype).eps
+    floor_b = (64 * eps * b_flat.abs().max()) ** 2
+    floor_s = (64 * eps * s_flat.abs().max()) ** 2
+    if vxx <= floor_b or vyy <= floor_s:
+        return 0.0  # a constant image carries no correlation either way
+    vxy = (wm * db * ds).sum() / sw
     return float((-vxy / (vxx * vyy).sqrt()).item())
 
 

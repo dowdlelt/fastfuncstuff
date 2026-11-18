@@ -1755,3 +1755,20 @@ class TestGaussNewtonForLpc:
             return self._lpc(base, warped.cpu())
 
         assert run("gn") >= run("adam") * 0.95
+
+
+def test_global_correlation_of_a_constant_image_is_zero():
+    """One-pass variance cancelled to rounding noise on a constant image and read
+    as a cost of +-500 by summation order, so a zeroed warp could beat the
+    incumbent on one BLAS and lose on another (failed on a generic-path MKL)."""
+    from fastfuncstuff.processing.warp import _auto_clip, _global_correlation
+
+    g = torch.Generator().manual_seed(3)
+    base = torch.rand(12, 12, 12, generator=g) + 0.1
+    weight = (torch.rand(12, 12, 12, generator=g) > 0.3).float()
+    clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
+    assert _global_correlation(base, base, weight, clip, clip) == pytest.approx(-1.0, abs=1e-5)
+    for const in (0.0, 0.5, 7.0):
+        flat = torch.full_like(base, const)
+        assert _global_correlation(base, flat, weight, clip, clip) == 0.0
+        assert _global_correlation(base, flat, weight, None, None) == 0.0
