@@ -97,3 +97,56 @@ def test_the_bucket_must_be_on_the_sphere_and_hold_the_maps(subject):
             *base, "-sphere", str(subject / "lh.sphere.surf.gii"),
             str(subject / "rh.sphere.surf.gii"), "-align", "rois",
         ])  # fmt: skip
+
+
+def test_a_template_bucket_finds_its_sphere_and_the_subjects_sulc(tmp_path, capsys):
+    """What ffs_pyrf records (mesh, subject) is enough: the template has no ?h.sphere
+    and no sulc, so its sphere.reg is used and the subject's sulc carried onto it."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.util_prfplot import _resolve_surfaces, main
+    from fastfuncstuff.io.gifti import set_surface_meta
+
+    fine, fine_faces = _sphere(3000)
+    coarse, coarse_faces = _sphere(800)
+    subject, template = tmp_path / "sub-01", tmp_path / "tmpl-ico"
+    for folder in (subject, template):
+        (folder / "surf").mkdir(parents=True)
+    meta = {"mesh": "tmpl-ico", "subject": str(subject), "prf_units": "deg"}
+    labels = ["angle", "eccentricity", "r2"]
+    header = nib.Nifti2Image(np.zeros((len(coarse), 1, 1, 1), np.float32), np.eye(4)).header
+    set_surface_meta(header, meta)
+    unit = coarse / 100
+    for hemi in ("lh", "rh"):
+        nib.freesurfer.write_geometry(subject / "surf" / f"{hemi}.sphere", fine, fine_faces)
+        nib.freesurfer.write_geometry(subject / "surf" / f"{hemi}.sphere.reg", fine, fine_faces)
+        nib.freesurfer.write_morph_data(subject / "surf" / f"{hemi}.sulc", fine[:, 2] / 100)
+        nib.freesurfer.write_geometry(
+            template / "surf" / f"{hemi}.sphere.reg", coarse, coarse_faces
+        )
+        bucket = np.stack(
+            [unit[:, 0] * 180 + 180, 5 + 5 * unit[:, 2], np.clip(-unit[:, 1], 0, 1)], 1
+        )
+        save_nifti_data_as_gifti(
+            tmp_path / f"prf.{hemi}.func.gii",
+            bucket[:, None, None, :].astype(np.float32),
+            header=header,
+            brick_labels=labels,
+        )
+
+    sphere, vertices, _, sulc, source = _resolve_surfaces(
+        "lh", len(coarse), meta, "prf", None, None, None
+    )
+    assert sphere == str(template / "surf" / "lh.sphere.reg")
+    assert source.endswith("via sphere.reg")
+    # interpolated from the subject's mesh: the template's own z, to within a face
+    assert np.abs(sulc - vertices[:, 2] / 100).max() < 0.05
+
+    out = tmp_path / "auto.png"
+    assert main(["-input", str(tmp_path / "prf.lh.func.gii"), "-prefix", str(out)]) == 0
+    assert out.stat().st_size > 10_000
+
+    # a wrong -fs_subj with no template to fall back on says which meshes were tried
+    meta_alone = {"subject": str(subject)}
+    with pytest.raises(SystemExit, match=r"sphere \(3000\).*not the same mesh"):
+        _resolve_surfaces("lh", len(coarse), meta_alone, "prf", None, None, None)

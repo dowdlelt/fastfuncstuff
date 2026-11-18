@@ -36,6 +36,12 @@ hemispheres come out the same way round. Where it looks:
 -align rois turns the view so the labelled region's long axis is horizontal (with
 V1 alone in -rois, the calcarine runs left-right); -rotate then turns it further.
 
+Surfaces come from the bucket itself: ffs_pyrf records the mesh it was fitted on
+and the FreeSurfer subject. On the subject's own mesh, its ?h.sphere and ?h.sulc are
+used; on a template (onavg-ico64, ...) the template's ?h.sphere.reg, with the
+subject's sulcal depth carried onto it through ?h.sphere.reg for the grey underlay.
+-fs_subj, -sphere and -underlay override what the bucket says.
+
 Visual-area labels are optional: -rois draws their borders (FreeSurfer .mgz,
 .annot, .label, or GIfTI), one file per hemisphere.
 
@@ -65,8 +71,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Figure to write; the extension picks the format (.png, .pdf, .svg).")  # fmt: skip
     surf = p.add_argument_group("surfaces")
     surf.add_argument("-fs_subj", metavar="DIR", default=None,
-                      help="FreeSurfer subject: surf/?h.sphere and surf/?h.sulc are used "
-                      "unless -sphere / -underlay name others.")  # fmt: skip
+                      help="FreeSurfer subject, or a template folder (onavg-ico64): surf/?h.sphere "
+                      "(else ?h.sphere.reg) and surf/?h.sulc are used unless -sphere / "
+                      "-underlay name others. Default: the subject the bucket records.")  # fmt: skip
     surf.add_argument("-sphere", nargs="+", metavar="SPHERE", default=None,
                       help="Sphere per hemisphere, in -input's hemisphere order (FreeSurfer "
                       "or .surf.gii), on the bucket's mesh.")  # fmt: skip
@@ -150,6 +157,85 @@ def _load_per_vertex(path: str, n_vertices: int) -> np.ndarray:
     if values.shape[0] != n_vertices:
         raise ValueError(f"{path} has {values.shape[0]} values, the mesh {n_vertices} vertices")
     return values
+
+
+def _resolve_surfaces(
+    hemi: str,
+    n_vertices: int,
+    meta: dict[str, str],
+    bucket_path: str,
+    fs_subj: str | None,
+    sphere: str | None,
+    underlay: str | None,
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray | None, str]:
+    """``(sphere path, vertices, faces, underlay values, underlay source)`` for a bucket.
+
+    Explicit -sphere / -fs_subj come first, then what ffs_pyrf recorded: the template
+    folder named by ``mesh`` and the ``subject``. A folder's ?h.sphere, else its
+    ?h.sphere.reg, is taken when it has the bucket's vertex count. Without a sulc on
+    that mesh, the subject's is carried onto a registered sphere through sphere.reg.
+    """
+    from fastfuncstuff.processing.surface_projection import resolve_mesh, subject_morph_on_mesh
+
+    subjects = []
+    for name in (fs_subj, meta.get("subject")):
+        if name and Path(name, "surf").is_dir() and Path(name) not in subjects:
+            subjects.append(Path(name))
+    if sphere is not None:
+        candidates = [Path(sphere)]
+    else:
+        folders = list(subjects[:1])
+        mesh = meta.get("mesh", "native")
+        if mesh != "native":
+            for anchor in subjects or [Path(".")]:
+                try:
+                    folder = resolve_mesh(mesh, anchor)
+                except FileNotFoundError:
+                    continue
+                if folder is not None:
+                    folders.append(folder)
+                    break
+        folders += subjects[1:]
+        candidates = [f / "surf" / f"{hemi}.{n}" for f in folders for n in ("sphere", "sphere.reg")]
+    tried = []
+    for path in dict.fromkeys(candidates):
+        if not path.is_file():
+            continue
+        vertices, faces = _load_surface(str(path))
+        if len(vertices) == n_vertices:
+            break
+        tried.append(f"{path} ({len(vertices)})")
+    else:
+        if tried:
+            raise SystemExit(
+                f"ffs_util_prfplot: {bucket_path} has {n_vertices} vertices, "
+                f"{'; '.join(tried)}: not the same mesh"
+            )
+        looked = ", ".join(str(c) for c in candidates) or "nothing: the bucket names no subject"
+        raise SystemExit(f"ffs_util_prfplot: no {hemi} sphere found (looked at {looked}); "
+                         "give -fs_subj or -sphere")  # fmt: skip
+
+    if underlay == "none":
+        return str(path), vertices, faces, None, "none"
+    if underlay is not None:
+        return str(path), vertices, faces, _load_per_vertex(underlay, n_vertices), underlay
+    on_mesh = path.parent / f"{hemi}.sulc"
+    if sphere is None and on_mesh.is_file():
+        values = _load_per_vertex(str(on_mesh), n_vertices)
+        return str(path), vertices, faces, values, str(on_mesh)
+    for subject in subjects:
+        sulc = subject / "surf" / f"{hemi}.sulc"
+        if not sulc.is_file():
+            continue
+        import nibabel as nib
+
+        values = np.asarray(nib.freesurfer.read_morph_data(sulc))
+        if len(values) == n_vertices:
+            return str(path), vertices, faces, values, str(sulc)
+        if "sphere.reg" in path.name and (subject / "surf" / f"{hemi}.sphere.reg").is_file():
+            values = subject_morph_on_mesh(subject, hemi, vertices)
+            return str(path), vertices, faces, values, f"{sulc} via sphere.reg"
+    return str(path), vertices, faces, None, "none found"
 
 
 def _load_bucket(path: str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
@@ -253,7 +339,11 @@ def main(argv: list[str] | None = None) -> int:
     pairs = _pair_inputs(args.input)
     hemis = [hemi for hemi, _ in pairs]
     spheres = _per_hemi(args.sphere, "sphere", hemis)
-    underlays = _per_hemi(None if args.underlay == ["none"] else args.underlay, "underlay", hemis)
+    underlays = (
+        ["none"] * len(hemis)
+        if args.underlay == ["none"]
+        else _per_hemi(args.underlay, "underlay", hemis)
+    )
     rois = _per_hemi(args.rois, "rois", hemis)
     if (args.center == "rois" or args.align == "rois") and args.rois is None:
         raise SystemExit("ffs_util_prfplot: -center rois and -align rois need -rois")
@@ -261,25 +351,16 @@ def main(argv: list[str] | None = None) -> int:
     panels = []
     panel_r2: list[np.ndarray] = []
     for (hemi, path), sphere, underlay, roi in zip(pairs, spheres, underlays, rois, strict=True):
-        fs_surf = Path(args.fs_subj, "surf") if args.fs_subj else None
-        sphere = sphere or (str(fs_surf / f"{hemi}.sphere") if fs_surf else None)
-        if sphere is None:
-            raise SystemExit("ffs_util_prfplot: give -fs_subj or -sphere")
-        if underlay is None and fs_surf is not None and args.underlay != ["none"]:
-            candidate = fs_surf / f"{hemi}.sulc"
-            underlay = str(candidate) if candidate.is_file() else None
-        vertices, faces = _load_surface(sphere)
         bucket, bucket_meta = _load_bucket(path)
+        n_vertices = len(next(iter(bucket.values())))
+        sphere, vertices, faces, underlay_values, underlay_from = _resolve_surfaces(
+            hemi, n_vertices, bucket_meta, path, args.fs_subj, sphere, underlay
+        )
+        print(f"{hemi}: sphere {sphere}; underlay {underlay_from}")
         if not args.units:
             args.units = bucket_meta.get("prf_units", "")
         if args.ecc_max is None and bucket_meta.get("prf_stimulus_radius"):
             args.ecc_max = float(bucket_meta["prf_stimulus_radius"])
-        n_vertices = len(vertices)
-        if len(next(iter(bucket.values()))) != n_vertices:
-            raise SystemExit(
-                f"ffs_util_prfplot: {path} has {len(next(iter(bucket.values())))} vertices, "
-                f"{sphere} {n_vertices}: not the same mesh"
-            )
         missing = [name for name in args.maps if name not in bucket]
         if missing:
             raise SystemExit(f"ffs_util_prfplot: {path} has no {', '.join(missing)}; it has "
@@ -316,7 +397,6 @@ def main(argv: list[str] | None = None) -> int:
             rotate_deg=args.rotate,
             align=None if args.align == "none" else chosen,
         )
-        underlay_values = None if underlay is None else _load_per_vertex(underlay, n_vertices)
         panels.append((hemi, view, bucket, shown, underlay_values, labels))
         panel_r2.append(r2)
 
