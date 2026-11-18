@@ -50,11 +50,16 @@ class PlotView(QtWidgets.QWidget):
     why translation and rotation are two panels and not one.
     """
 
+    #: A click or drag on a line marked ``scrub``: the nearest sample's index.
+    scrubbed = QtCore.Signal(int)
+
     def __init__(
         self, parent: QtWidgets.QWidget | None = None, *, legend_outside: bool = False
     ) -> None:
         super().__init__(parent)
         self._traces: list[Trace] = []
+        #: ``(plot rect, x0, x1)`` of the last paint, to turn a click into an x.
+        self._geom: tuple[QtCore.QRectF, float, float] | None = None
         #: Key to the right of the plot rather than over it. For a plot whose
         #: every line is the subject -- the band splitter's column and its
         #: bands -- a key laid over the lines hides exactly what it labels.
@@ -129,6 +134,7 @@ class PlotView(QtWidgets.QWidget):
                 plot.bottom() - (yv - lo) / (hi - lo) * plot.height(),
             )
 
+        self._geom = (plot, x0, x1)
         p.setPen(QtGui.QPen(QtGui.QColor(c.edge)))
         p.drawRect(plot)
         if lo < 0 < hi:
@@ -189,8 +195,39 @@ class PlotView(QtWidgets.QWidget):
             self._draw_legend(p, c, plot, traces)
         p.end()
 
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if not self._scrub(event.position().x()):
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if not (
+            event.buttons() & QtCore.Qt.MouseButton.LeftButton and self._scrub(event.position().x())
+        ):
+            super().mouseMoveEvent(event)
+
+    def _scrub(self, px: float) -> bool:
+        """Emit the sample of the first scrubbable line nearest a pixel column."""
+        line = next((t for t in self._traces if t.scrub), None)
+        if line is None or self._geom is None:
+            return False
+        plot, x0, x1 = self._geom
+        xv = x0 + (px - plot.left()) / max(plot.width(), 1.0) * (x1 - x0)
+        values = np.asarray(line.values)
+        axis = np.arange(values.size) if line.x is None else np.asarray(line.x, dtype=float)
+        self.scrubbed.emit(int(np.argmin(np.abs(axis - xv))))
+        return True
+
     def _draw_markers(self, p, c, plot, traces, series, axes, to_px) -> None:
         """A bar across the plot and a dot on the line at each trace's marker."""
+        band = next((t.band for t in traces if t.band is not None), None)
+        if band is not None:
+            # Under the marker bar: the range it stands for, clipped to the plot.
+            a = max(to_px(float(band[0]), 0.0).x(), plot.left())
+            b = min(to_px(float(band[1]), 0.0).x(), plot.right())
+            if b > a:
+                shade = QtGui.QColor(c.warn)
+                shade.setAlphaF(0.15)
+                p.fillRect(QtCore.QRectF(a, plot.top(), b - a, plot.height()), shade)
         for i, (t, values, x) in enumerate(zip(traces, series, axes, strict=True)):
             k = t.marker
             if k is None or not 0 <= k < values.size or not np.isfinite(values[k]):
@@ -205,6 +242,27 @@ class PlotView(QtWidgets.QWidget):
             p.drawEllipse(at, 4.0, 4.0)
             p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            if t.marker_label:
+                self._draw_marker_label(p, c, plot, at.x(), t.marker_label)
+
+    @staticmethod
+    def _draw_marker_label(p, c, plot: QtCore.QRectF, x: float, text: str) -> None:
+        """The marker's caption over its bar, in the strip above the plot.
+
+        Above rather than in it: a legend sits in the plot's top-right, and a
+        caption that ran under it would hide either one. Above the plot is
+        where a single line's title goes, empty once there are two lines.
+        """
+        metrics = QtGui.QFontMetrics(p.font())
+        w = metrics.horizontalAdvance(text) + 8
+        h = metrics.height() + 2
+        left = min(max(x - w / 2, plot.left()), plot.right() - w)
+        box = QtCore.QRectF(left, max(plot.top() - h - 1, 0.0), w, h)
+        p.fillRect(box, QtGui.QColor(c.panel))
+        p.setPen(QtGui.QPen(QtGui.QColor(c.warn)))
+        p.drawRect(box)
+        p.setPen(QtGui.QColor(c.text))
+        p.drawText(box, QtCore.Qt.AlignmentFlag.AlignCenter, text)
 
     @staticmethod
     def _colour(c, index: int, total: int) -> QtGui.QColor:
@@ -246,6 +304,8 @@ class TraceWindow(QtWidgets.QWidget):
     closed = QtCore.Signal(str)
     #: A key asked the mode to do something: the action's name.
     action_requested = QtCore.Signal(str)
+    #: A click on a scrubbable line: the time index to show.
+    scrubbed = QtCore.Signal(int)
 
     def __init__(
         self,
@@ -266,6 +326,7 @@ class TraceWindow(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
         self.view = PlotView()
+        self.view.scrubbed.connect(self._scrubbed)
         v.addWidget(self.view, 1)
 
         def ask(name: str) -> Callable[[], None]:
@@ -289,6 +350,17 @@ class TraceWindow(QtWidgets.QWidget):
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
+
+    def _scrubbed(self, index: int) -> None:
+        """A click on a scrubbable line: its layer's sub-brick, or the time index."""
+        from fastfuncstuff.viewer.vocab import SetVolume
+
+        line = next((t for t in self.view._traces if t.scrub), None)
+        key = line.scrub_key if line is not None else ""
+        if key and self.session.state.layers.find(key) is not None:
+            self._dispatch(SetVolume(key, int(index)))
+        else:
+            self.scrubbed.emit(int(index))
 
     def apply(self, viewport: Viewport) -> None:
         self.setWindowTitle(viewport.title)

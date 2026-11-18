@@ -29,7 +29,7 @@ from fastfuncstuff.viewer.colormap import (
     threshold_alpha,
     to_rgba8,
 )
-from fastfuncstuff.viewer.layers import Layer
+from fastfuncstuff.viewer.layers import Layer, SignMode
 from fastfuncstuff.viewer.slicing import (
     PlaneView,
     extract_plane,
@@ -137,6 +137,49 @@ def edge_colors(values: Tensor, inside: Tensor, sigma: float) -> tuple[Tensor, T
 _GRID_SAMPLE = {"nearest": "nearest", "linear": "bilinear", "cubic": "cubic"}
 
 
+#: How a slab projection reduces its slices; see :func:`slab_reduce`.
+SLAB_MODES = ("mip", "minip", "mean")
+
+
+def slab_positions(grid: DisplayGrid, plane: Plane, pos: int, slab_mm: float) -> list[int]:
+    """The display slices a slab ``slab_mm`` thick centred on ``pos`` covers."""
+    axis = plane_layout(grid.frame, plane).fixed
+    step = float(np.linalg.norm(np.asarray(grid.affine, float)[:3, axis])) or 1.0
+    # Floor, so the slab never reaches past the thickness asked for (round()
+    # rounds 2.5 to 2 and 3.5 to 4).
+    half = int(np.floor(0.5 * float(slab_mm) / step + 1e-9))
+    lo, hi = max(0, pos - half), min(grid.shape[axis] - 1, pos + half)
+    return list(range(lo, hi + 1))
+
+
+def slab_reduce(
+    values: Tensor, stat: Tensor, mode: str, sign_mode: SignMode
+) -> tuple[Tensor, Tensor]:
+    """``(S, H, W)`` slices of a layer and its threshold statistic, reduced to one.
+
+    ``mip`` and ``minip`` choose one slice per pixel by the statistic -- read
+    through the layer's sign, so a positive-only map projects its peaks -- and
+    take the value *and* the statistic from that slice, so the colour drawn is
+    the voxel that passed the cut. ``mean`` averages both, ignoring NaN.
+    """
+    if mode == "mean":
+        return values.nanmean(dim=0), stat.nanmean(dim=0)
+    if sign_mode == SignMode.POS:
+        score = stat.clone()
+    elif sign_mode == SignMode.NEG:
+        score = -stat
+    else:
+        score = stat.abs()
+    if mode == "minip":
+        # Zero and NaN are "no data", not the smallest value.
+        score = torch.where((stat == 0) | stat.isnan(), torch.full_like(score, float("inf")), score)
+        pick = score.argmin(dim=0, keepdim=True)
+    else:
+        score = torch.nan_to_num(score, nan=float("-inf"))
+        pick = score.argmax(dim=0, keepdim=True)
+    return values.gather(0, pick)[0], stat.gather(0, pick)[0]
+
+
 def render_plane(
     session,
     plane: Plane,
@@ -145,6 +188,7 @@ def render_plane(
     solo_key: str | None = None,
     view: PlaneView | None = None,
     grid: DisplayGrid | None = None,
+    slab: tuple[float, str] | None = None,
 ) -> PaneImage | None:
     """Composite every visible layer for one display plane.
 
@@ -173,6 +217,9 @@ def render_plane(
 
     stacked: list[tuple[Tensor, Tensor]] = []
     box_overlays: list[Tensor] = []
+    slab_mm, slab_mode = slab if slab is not None else (0.0, "mip")
+    slab_at = slab_positions(grid, plane, pos, slab_mm) if slab_mm > 0 else [pos]
+    base_key = state.layers.layers[0].key if len(state.layers) else None
 
     for layer in visible:
         if layer.colour:
@@ -241,6 +288,14 @@ def render_plane(
                 )
             )
 
+        keep = session.display_mask(layer.key)
+        projected = len(slab_at) > 1 and layer.key != base_key and not layer.roi and not layer.edges
+        if projected:
+            values, stat = _project_slab(
+                session, layer, volume, grid, plane, slab_at, view, how, keep, slab_mode
+            )
+            keep = None  # applied slice by slice, before the reduction
+
         # A label layer is coloured by identity rather than by magnitude, and
         # nothing about a range, a threshold or an alpha ramp applies to it --
         # "half of region 12" is not a thing. Boxed, though, means something
@@ -265,7 +320,6 @@ def render_plane(
         )
         # Zero the stat as well as the alpha: boxed edges are traced on the
         # stat, and a cluster cut by the mask should be outlined where it is cut.
-        keep = session.display_mask(layer.key)
         if keep is not None:
             inside = extract_plane(keep, grid, layer.affine, plane, pos, view=view, mode="nearest")
             inside = inside > 0.5
@@ -288,6 +342,34 @@ def render_plane(
         rgb = torch.where(edges.unsqueeze(-1), box, rgb)
 
     return PaneImage(rgba=to_rgba8(rgb), plane=plane, position=pos)
+
+
+def _project_slab(
+    session, layer, volume, grid, plane, positions, view, how, keep, mode
+) -> tuple[Tensor, Tensor]:
+    """A layer's value and threshold planes across a slab, reduced by ``mode``."""
+    repair = session.display_has_nan(layer.key)
+    stat_vol = (
+        None
+        if layer.threshold_index is None
+        else session.display_volume(layer.key, index=layer.threshold_index)
+    )
+    vals, stats = [], []
+    for p in positions:
+        v = extract_plane(
+            volume, grid, layer.affine, plane, p, view=view, mode=how, repair_nan=repair
+        )
+        s = (
+            v
+            if stat_vol is None
+            else extract_plane(stat_vol, grid, layer.affine, plane, p, view=view, mode=how)
+        )
+        if keep is not None:
+            inside = extract_plane(keep, grid, layer.affine, plane, p, view=view, mode="nearest")
+            s = torch.where(inside > 0.5, s, torch.zeros_like(s))
+        vals.append(v)
+        stats.append(s)
+    return slab_reduce(torch.stack(vals), torch.stack(stats), mode, layer.sign_mode)
 
 
 def tilt_matrix(viewport) -> np.ndarray:
@@ -393,6 +475,7 @@ def render_viewport(session, viewport, solo_key: str | None = None) -> PaneImage
         solo_key=solo,
         view=plane_view(session.state, viewport),
         grid=view_grid(session.state, viewport),
+        slab=(float(viewport.slab_mm), str(viewport.slab_mode)) if viewport.slab_mm > 0 else None,
     )
 
 

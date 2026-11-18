@@ -32,6 +32,7 @@ from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
 from fastfuncstuff.viewer.ui.profilewindow import ProfileWindow
 from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
 from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
+from fastfuncstuff.viewer.ui.vox3dwindow import Vox3DWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
 from fastfuncstuff.viewer.vocab import CloseView, SetViewGeometry
 
@@ -67,6 +68,7 @@ Companion = (
     | ChediWindow
     | ProfileWindow
     | DepthWindow
+    | Vox3DWindow
 )
 
 
@@ -189,9 +191,13 @@ class WindowManager(QtCore.QObject):
             win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
             win.rebuild_requested.connect(self.rebuild_requested)
+        elif viewport.is_vox3d:
+            win = Vox3DWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.located.connect(self._on_located)
         elif viewport.is_trace:
             win = TraceWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
+            win.scrubbed.connect(self._on_scrubbed)
         elif viewport.is_clusters:
             win = ClusterWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
@@ -294,7 +300,9 @@ class WindowManager(QtCore.QObject):
             if isinstance(win, ImageWindow):
                 if images and not (stroke is not None and win.misses(*stroke)):
                     self._timed(win, win.follow if moving else win.redraw)
-            elif isinstance(win, SurfaceWindow):
+            elif isinstance(win, SurfaceWindow | Vox3DWindow):
+                # vox3d reads what a surface window does: the stack's volumes
+                # (layers, an edit, time, colour, threshold) and the crosshair.
                 if surfaces:
                     self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, ChediWindow):
@@ -377,7 +385,9 @@ class WindowManager(QtCore.QObject):
         held, self._held = self._held, {}
         for vid, dirty in held.items():
             win = self.windows.get(vid)
-            if isinstance(win, SurfaceWindow | ChediWindow | DepthWindow | ProfileWindow):
+            if isinstance(
+                win, SurfaceWindow | ChediWindow | DepthWindow | ProfileWindow | Vox3DWindow
+            ):
                 self._timed(win, lambda w=win, d=dirty: w.refresh(d))
         if held:
             self._last_move = time.monotonic()  # a scroll resumed mid-draw is still one

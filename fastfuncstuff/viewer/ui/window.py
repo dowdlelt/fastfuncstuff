@@ -575,6 +575,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 self._new_surface,
             ),
             (
+                "VOX",
+                "3-D voxel window: MIP / first hit / composite of the overlay over the "
+                "anatomy, turnable (shift+X)",
+                self._new_vox3d,
+            ),
+            (
                 "DEPTH",
                 "Depth profiles of the overlay around the crosshair (shift+L)",
                 self._new_depth,
@@ -1241,6 +1247,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             )
             return
         self.manager.open(ViewKind.SURFACE, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+
+    def _new_vox3d(self) -> None:
+        if not len(self.session.state.layers):
+            self.statusBar().showMessage("vox3d: load a dataset first", 5000)
+            return
+        self.manager.open(ViewKind.VOX3D, Plane.AXIAL)
         self.refresh(Aspect.VIEWPORTS)
 
     def _new_chedi(self) -> None:
@@ -2117,6 +2130,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("alt+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
+                Binding(
+                    "shift+x",
+                    "open a 3-D voxel window (MIP / first hit / composite)",
+                    self._new_vox3d,
+                    group="windows",
+                ),
                 Binding(
                     "ctrl+m",
                     "mesh list (compare / use / back up)",

@@ -320,6 +320,17 @@ class ComputedOverlay:
     #: A colour view (viewer.chromalayer.ColourSource) instead of values: the
     #: RGB mode's output. ``values`` is unused when this is set.
     colour: Any = None
+    #: A stack of volumes instead of one: ``frames(i)`` makes volume ``i`` of
+    #: ``n_frames`` on request. The layer steps through them by its own
+    #: sub-brick index (SET_VOLUME, `,` / `.` when selected), not the global
+    #: time index -- InstaSpectra's one map per frequency bin, where stepping
+    #: frequency must not move the run underneath. ``values`` is just a frame,
+    #: for the shape and a fallback range; ``frame`` is the one shown when the
+    #: layer is first made. The callable must not change after it is handed
+    #: over -- KEEP shares it -- so a new look is a new callable.
+    frames: Callable[[int], np.ndarray] | None = None
+    n_frames: int = 0
+    frame: int = 0
 
 
 @dataclass(frozen=True)
@@ -359,6 +370,18 @@ class Trace:
     #: ``right_scale``. One line, two units (% of the total variance on the
     #: left, % of the explained variance on the right), not a second line.
     right_scale: float | None = None
+    #: Clicking or dragging along the line picks the nearest sample: it sets
+    #: the global time index, or, with ``scrub_key``, that layer's sub-brick --
+    #: InstaSpectra's spectrum, one bin per frame of its map layer.
+    scrub: bool = False
+    scrub_key: str = ""
+    #: ``(lo, hi)`` in x units, shaded across the plot: the range a marker
+    #: stands for, when that is wider than one sample (a summed band).
+    band: tuple[float, float] | None = None
+    #: Text written at the marker, on the plot: what "where you are" is --
+    #: ``0.81 Hz``. Drawn whatever the number of lines, unlike ``label``,
+    #: which gives way to a legend once a plot has two.
+    marker_label: str = ""
 
     @property
     def ident(self) -> str:

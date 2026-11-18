@@ -56,6 +56,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewLocked,
     SetViewPlane,
     SetViewPosition,
+    SetViewSlab,
     SetViewSolo,
     SetViewStrip,
     SetViewTiles,
@@ -465,6 +466,18 @@ class ImageWindow(QtWidgets.QWidget):
                     group="view",
                 ),
                 Binding("x", "crosshair: lines / off / ring", self._cycle_cross, group="view"),
+                Binding(
+                    "alt+m",
+                    "slab projection of the overlays: off / 5 / 10 / 20 / 40 mm",
+                    self._cycle_slab,
+                    group="view",
+                ),
+                Binding(
+                    "alt+shift+m",
+                    "slab projection: mip / minip / mean",
+                    self._cycle_slab_mode,
+                    group="view",
+                ),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding(
                     ".",
@@ -2051,6 +2064,30 @@ class ImageWindow(QtWidgets.QWidget):
     def _toggle_value_box(self) -> None:
         self.value_box = not self.value_box
         self.redraw_crosshair()
+
+    #: Slab thicknesses ``alt+m`` steps through, in mm; 0 is a plain slice.
+    SLAB_STEPS = (0.0, 5.0, 10.0, 20.0, 40.0)
+
+    def _cycle_slab(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        steps = self.SLAB_STEPS
+        later = [t for t in steps if t > vp.slab_mm]
+        mm = later[0] if later else 0.0
+        self._dispatch(SetViewSlab(self.vid, mm, vp.slab_mode))
+        self._toast(f"slab: {vp.slab_mode} {mm:g} mm" if mm > 0 else "slab: off")
+
+    def _cycle_slab_mode(self) -> None:
+        from fastfuncstuff.viewer.compose import SLAB_MODES
+
+        vp = self._viewport()
+        if vp is None:
+            return
+        mode = SLAB_MODES[(SLAB_MODES.index(vp.slab_mode) + 1) % len(SLAB_MODES)]
+        mm = vp.slab_mm if vp.slab_mm > 0 else self.SLAB_STEPS[2]
+        self._dispatch(SetViewSlab(self.vid, mm, mode))
+        self._toast(f"slab: {mode} {mm:g} mm")
 
     def _cycle_cross(self) -> None:
         styles = ImagePane.CROSS_STYLES

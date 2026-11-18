@@ -66,6 +66,7 @@ class ViewKind(StrEnum):
     PROFILE = "profile"
     DEPTH = "depth"
     CHEDI = "chedi"
+    VOX3D = "vox3d"
 
 
 #: Most slices a neighbour strip shows. Past this each cell is too narrow to
@@ -124,6 +125,13 @@ class Viewport:
     strip: int = 0
     strip_step: int = 0
     strip_zoom: float = 4.0
+    #: Slab projection of the overlays, ``slab_mm`` thick and centred on the
+    #: slice (0 = off): each overlay is reduced across the slab by
+    #: ``slab_mode`` (mip / minip / mean) while the base stays one slice, so a
+    #: vessel or a band map that winds through slices is drawn whole over the
+    #: anatomy it sits in. The 2-D cousin of the vox3d window's MIP.
+    slab_mm: float = 0.0
+    slab_mode: str = "mip"
 
     # -- graph ---------------------------------------------------------
     grid_n: int = 2
@@ -286,6 +294,10 @@ class Viewport:
         return self.kind is ViewKind.SURFACE
 
     @property
+    def is_vox3d(self) -> bool:
+        return self.kind is ViewKind.VOX3D
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -311,10 +323,14 @@ class Viewport:
             return f"profiles · {self.profile_score}  [{self.id}]"
         if self.is_chedi:
             return f"chedi · {self.sampling}  [{self.id}]"
+        if self.is_vox3d:
+            return f"vox3d  [{self.id}]"
         if self.is_depth:
             return f"depth · {self.depth_source}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
+        if self.is_image and self.slab_mm > 0:
+            extra += f" · {self.slab_mode} {self.slab_mm:g} mm"
         if self.tiles:
             extra += " · tiles"
         if self.is_graph:
@@ -340,7 +356,7 @@ class ViewportSet:
         return [v.id for v in self.viewports]
 
     def mint_id(self, kind: ViewKind) -> str:
-        """A fresh id: ``V1`` image, ``G1`` graph, ``C1`` carpet, ``M1`` matrix, ``K1`` clusters, ``S1`` surface."""
+        """A fresh id: ``V1`` image, ``G1`` graph, ``C1`` carpet, ``M1`` matrix, ``K1`` clusters, ``S1`` surface, ``X1`` vox3d."""
         stem = {
             ViewKind.IMAGE: "V",
             ViewKind.GRAPH: "G",
@@ -352,6 +368,7 @@ class ViewportSet:
             ViewKind.PROFILE: "P",
             ViewKind.DEPTH: "D",
             ViewKind.CHEDI: "E",
+            ViewKind.VOX3D: "X",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:
