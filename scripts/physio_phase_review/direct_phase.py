@@ -11,24 +11,27 @@ from scipy.interpolate import CubicSpline
 from scipy.optimize import minimize
 
 
-def select_voxels(series, phase, fraction=0.01):
+def select_voxels(series, phase, fraction=0.01, harmonics=1):
     """Select/scale training voxels using only their fit to the initial phase."""
     selected, conditioning = [], []
     for y, p in zip(series, phase.T, strict=True):
         y = np.asarray(y, dtype=np.float64)
-        x = np.column_stack((np.ones(len(p)), np.cos(p), np.sin(p)))
+        columns = [np.ones(len(p))]
+        for order in range(1, harmonics + 1):
+            columns.extend((np.cos(order * p), np.sin(order * p)))
+        x = np.column_stack(columns)
         beta = np.linalg.lstsq(x, y.T, rcond=None)[0].T
         residual = np.mean((y - beta @ x.T) ** 2, axis=1)
         power = np.sum(beta[:, 1:] ** 2, axis=1)
         k = min(len(y), max(10, int(np.ceil(fraction * len(y)))))
         keep = np.argsort(power / np.maximum(residual, 1e-20))[-k:]
         selected.append(y[keep] / np.sqrt(np.maximum(residual[keep, None], 1e-20)))
-        b = beta[keep, 1:] / np.sqrt(np.maximum(residual[keep, None], 1e-20))
+        b = beta[keep, 1:3] / np.sqrt(np.maximum(residual[keep, None], 1e-20))
         conditioning.append(float(np.linalg.cond(b.T @ b)))
     return selected, conditioning
 
 
-def fit_phase(series, times, initial, knot_s=4.0, maxiter=150):
+def fit_phase(series, times, initial, knot_s=4.0, maxiter=150, harmonics=1):
     """Fit one smooth phase across groups, allowing free voxel amplitudes/delays.
 
     No cardiac acceptance decision is made here. Knot spacing controls flexibility
@@ -58,11 +61,18 @@ def fit_phase(series, times, initial, knot_s=4.0, maxiter=150):
         loss, gradient = 0.0, np.zeros_like(c)
         for g, y in enumerate(ys):
             p = phase[:, g]
-            co, si = np.cos(p), np.sin(p)
-            x = np.column_stack((np.ones(len(p)), co, si))
+            columns = [np.ones(len(p))]
+            for order in range(1, harmonics + 1):
+                columns.extend((np.cos(order * p), np.sin(order * p)))
+            x = np.column_stack(columns)
             beta = np.linalg.lstsq(x, y.T, rcond=None)[0].T
             residual = beta @ x.T - y
-            derivative = -beta[:, 1, None] * si + beta[:, 2, None] * co
+            derivative = np.zeros_like(y)
+            for order in range(1, harmonics + 1):
+                co, si = columns[2 * order - 1], columns[2 * order]
+                derivative += order * (
+                    -beta[:, 2 * order - 1, None] * si + beta[:, 2 * order, None] * co
+                )
             loss += np.sum(residual**2)
             gradient += basis[:, g].T @ (2 * np.sum(residual * derivative, axis=0))
         return loss / normalizer, gradient / normalizer

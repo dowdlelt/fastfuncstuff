@@ -1,0 +1,318 @@
+{
+  "run": "on.ds002547.sub-04",
+  "tr": 2.0,
+  "input": "/mnt/belegost/Data/nii_data/openneuro_physio/ds002547/sub-04/ses-1/func/sub-04_ses-1_task-other_bold.nii.gz",
+  "shuffled_time_seed": null,
+  "phase_mode": "joint",
+  "harmonic_seeds": true,
+  "drop_resp_zones": true,
+  "ica": true,
+  "found": false,
+  "selected": {
+    "start": "ica@0.051",
+    "alignment": 0.16766227849305446,
+    "shuffled": 0.4310083990968403,
+    "harmonic": 0.02957106988315203,
+    "harmonic_null": 0.10188130019245298,
+    "lock": 0.030286384260061142,
+    "harmonic_lock": 0.00982241549911514,
+    "window_lock_median": 0.14083781947918492,
+    "outside_cardiac_band": 0.3506278745284481,
+    "rate": 40.08254772043243
+  },
+  "recorded_rate_per_min": 56.2570888468811,
+  "final_alignment_floor": 0.4310083990968403,
+  "candidates": [
+    {
+      "start": "ica@0.051",
+      "alignment": 0.16766227849305446,
+      "shuffled": 0.4310083990968403,
+      "harmonic": 0.02957106988315203,
+      "harmonic_null": 0.10188130019245298,
+      "lock": 0.030286384260061142,
+      "harmonic_lock": 0.00982241549911514,
+      "window_lock_median": 0.14083781947918492,
+      "outside_cardiac_band": 0.3506278745284481,
+      "rate": 40.08254772043243
+    },
+    {
+      "start": "ica@0.242",
+      "alignment": 0.05500000199244689,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.020289157963686417,
+      "harmonic_lock": 0.005576202523551339,
+      "window_lock_median": 0.09639881251191781,
+      "outside_cardiac_band": 0.0,
+      "rate": 73.96265664989662
+    },
+    {
+      "start": "ica@0.238",
+      "alignment": 0.05789357344884619,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.00778917085258467,
+      "harmonic_lock": 0.014978536782222648,
+      "window_lock_median": 0.11126721626365063,
+      "outside_cardiac_band": 0.17983566740736912,
+      "rate": 43.56060206157661
+    },
+    {
+      "start": "ica@0.121",
+      "alignment": 0.08512706539427013,
+      "shuffled": 0.38919110885597336,
+      "harmonic": 0.013692786574703944,
+      "harmonic_null": 0.09375082246201896,
+      "lock": 0.08923846888410812,
+      "harmonic_lock": 0.027515826569867903,
+      "window_lock_median": 0.2101269595703936,
+      "outside_cardiac_band": 0.0623223606015193,
+      "rate": 49.886316384885255
+    },
+    {
+      "start": "ica@0.230",
+      "alignment": 0.08259476267708489,
+      "shuffled": 0.43293940530208275,
+      "harmonic": 0.03205067129411493,
+      "harmonic_null": 0.15336430150207764,
+      "lock": 0.027809689379851375,
+      "harmonic_lock": 0.02520512725900534,
+      "window_lock_median": 0.10751878864640721,
+      "outside_cardiac_band": 0.1667614076791897,
+      "rate": 43.16426220581046
+    },
+    {
+      "start": "ica@0.223",
+      "alignment": 0.04993465964715154,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.049826320594516325,
+      "harmonic_lock": 0.009846560525356748,
+      "window_lock_median": 0.12231660723783397,
+      "outside_cardiac_band": 0.13549687354658674,
+      "rate": 44.24861463743546
+    },
+    {
+      "start": "harmonic2:ica@0.051:0",
+      "alignment": 0.05719291392933599,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.03192328100131612,
+      "harmonic_lock": 0.006460113604507334,
+      "window_lock_median": 0.11083563174142025,
+      "outside_cardiac_band": 0.2305823988424371,
+      "rate": 42.766051354737385
+    },
+    {
+      "start": "harmonic2:ica@0.242:1",
+      "alignment": 0.045225720454859425,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.01634391349935178,
+      "harmonic_lock": 0.014088905704222884,
+      "window_lock_median": 0.10653154352134347,
+      "outside_cardiac_band": 0.4956333006046199,
+      "rate": 36.57238005734861
+    },
+    {
+      "start": "harmonic2:ica@0.082:0",
+      "alignment": 0.025374582359351416,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.029753471597582497,
+      "harmonic_lock": 0.020501788744208646,
+      "window_lock_median": 0.18742206933121147,
+      "outside_cardiac_band": 0.0735879282724407,
+      "rate": 50.41702991826092
+    },
+    {
+      "start": "harmonic2:ica@0.082:1",
+      "alignment": 0.0497693334966548,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.033430099299260406,
+      "harmonic_lock": 0.011826606902472689,
+      "window_lock_median": 0.13106800055086054,
+      "outside_cardiac_band": 0.20386543331094,
+      "rate": 42.82050058162222
+    },
+    {
+      "start": "harmonic2:ica@0.059:1",
+      "alignment": 0.03752484261121233,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.05175705365922935,
+      "harmonic_lock": 0.02844243583974907,
+      "window_lock_median": 0.13327290116793583,
+      "outside_cardiac_band": 0.07968580435119632,
+      "rate": 47.03776452380999
+    },
+    {
+      "start": "harmonic2:ica@0.238:1",
+      "alignment": 0.054246888837798435,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.011407478928005367,
+      "harmonic_lock": 0.009383971280135095,
+      "window_lock_median": 0.0751835719023879,
+      "outside_cardiac_band": 0.0,
+      "rate": 75.2033993962619
+    },
+    {
+      "start": "harmonic2:ica@0.230:0",
+      "alignment": 0.06654517181656101,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.03544740126304538,
+      "harmonic_lock": 0.013896897925974051,
+      "window_lock_median": 0.09798792032561937,
+      "outside_cardiac_band": 0.18453826675624,
+      "rate": 43.134582006824814
+    },
+    {
+      "start": "harmonic2:ica@0.230:1",
+      "alignment": 0.11670884833039852,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.01767172429270227,
+      "harmonic_lock": 0.01711505487374212,
+      "window_lock_median": 0.09352772110064456,
+      "outside_cardiac_band": 0.3380187070435636,
+      "rate": 40.145509767762356
+    },
+    {
+      "start": "harmonic2:ica@0.223:0",
+      "alignment": 0.0343195448940813,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.013834647112307226,
+      "harmonic_lock": 0.01141829601919081,
+      "window_lock_median": 0.10258355837130928,
+      "outside_cardiac_band": 0.2550255800733812,
+      "rate": 41.954271735088824
+    },
+    {
+      "start": "harmonic2:ica@0.223:1",
+      "alignment": 0.061296350065909486,
+      "shuffled": 0.3576004923415142,
+      "harmonic": 0.013243736982455396,
+      "harmonic_null": 0.11209505844309078,
+      "lock": 0.16290518181550082,
+      "harmonic_lock": 0.022010604102443636,
+      "window_lock_median": 0.2717179815740337,
+      "outside_cardiac_band": 0.004805953180714175,
+      "rate": 64.1346378260975
+    }
+  ],
+  "fit_diagnostics": [
+    {
+      "success": true,
+      "iterations": 69,
+      "loss": 0.9604453673862744,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 87,
+      "loss": 0.958384990270714,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 114,
+      "loss": 0.9642815061302862,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 55,
+      "loss": 1.052138693485558,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 49,
+      "loss": 0.9064999110992951,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 46,
+      "loss": 0.9591332706746977,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 61,
+      "loss": 0.8530222299276314,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 57,
+      "loss": 0.904770761989181,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 138,
+      "loss": 0.9535061034059241,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 68,
+      "loss": 0.764285215704884,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 63,
+      "loss": 0.785552648553669,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 64,
+      "loss": 0.9036426558868734,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 56,
+      "loss": 0.8264057874115978,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 112,
+      "loss": 0.7245458702813962,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 56,
+      "loss": 0.7893689005024481,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 74,
+      "loss": 0.9659017132547412,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    }
+  ],
+  "seconds": 208.37999876588583
+}

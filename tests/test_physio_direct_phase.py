@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from scripts.physio_phase_review.candidate_aliases import complete_alias_offsets
 from scripts.physio_phase_review.direct_phase import fit_phase, prediction_score
 
 
@@ -61,3 +62,17 @@ def test_smoothing_is_invariant_to_independent_crossed_phase_origins():
     phase, _ = fit_phase(series, times, initial, maxiter=0)
     other, _ = fit_phase(series, times, shifted, maxiter=0)
     np.testing.assert_allclose(np.exp(1j * phase), np.exp(1j * other), atol=1e-8)
+
+
+def test_long_tr_alias_enumeration_includes_the_mirrored_cardiac_clock():
+    times = np.arange(100)[:, None] * 2 + np.linspace(0, 1.9, 17)[None]
+    phase = 2 * np.pi * 0.8 * times
+    offsets = complete_alias_offsets(times, phase, 2.0)
+    assert (-1, 4) in offsets  # -0.8 + 4/2 = 1.2 Hz; fixed +/-3 misses it.
+
+
+def test_same_mean_rate_keeps_both_opposite_rate_fluctuations():
+    times = np.arange(100)[:, None] * 2 + np.linspace(0, 1.9, 17)[None]
+    phase = 2 * np.pi * 0.75 * times + 0.2 * np.sin(np.linspace(0, 2 * np.pi, 100))[:, None]
+    offsets = complete_alias_offsets(times, phase, 2.0)
+    assert (1, 0) in offsets and (-1, 3) in offsets

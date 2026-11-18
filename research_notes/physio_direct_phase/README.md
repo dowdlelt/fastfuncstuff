@@ -218,3 +218,51 @@ are positive controls and must not be counted as rescued long-TR misses. Their
 earlier constant-rate grid experiment had failed, which initially led to a wrong
 comparison in the progress report. The actual long-TR miss experiments use sub-08
 and sub-09.
+
+### Genuine long-TR recoveries and a rejected variant
+
+- ds002547 sub-08: default-library **not found**, direct phase fitting **found**,
+  locking 0.9384 (recorded median 78.52/min, estimate 78.12/min).
+- ds002547 sub-09: default-library **not found**, direct fitting plus respiratory
+  exclusions removed **found**, locking 0.8610 (55.42/min vs estimate 55.22/min).
+- Rockland A00018030 FLU1 CAP: fitting the fundamental and harmonic jointly
+  improves locking 0.8541 -> 0.8964 and passes the existing acceptance rule.
+- **The joint variant is not trustworthy as a detector.** On Rockland A00027167
+  FLU1 CAP it falsely reports 40.29/min against 87.21/min recorded, locking 0.0038.
+  Fundamental-only refinement rejects this case. Complete alias enumeration does
+  not prevent the joint variant's false acceptance. Joint fitting uses the second
+  harmonic during estimation, so its post-fit harmonic confirmation especially
+  needs independent observations and selection-aware calibration.
+- The full shuffled-timing control is rejected with both fundamental-only and
+  joint refinement. One passed falsification control does not establish safety.
+
+### Remaining hard discovery failures
+
+ds002547 sub-04 and sub-06 remain missed after admitting respiratory-sideband
+frequencies, extra harmonic-derived ICA starts, complete aliases, and (sub-04)
+80 ICA components. Extra starts have not solved these cases. Their recordings
+are not fed to any discovery method.
+
+The evaluation-only oracle confirms substantial signal under current preprocessing:
+
+| Run | Recorded-phase alignment / shuffle max | Harmonic / controls | Voxels with recorded-phase R2 > 0.1 |
+|---|---|---|---:|
+| sub-04 | 0.3602 / 0.2291 | 0.3010 / 0.1208 | 7.95% |
+| sub-06 | 0.4043 / 0.2451 | 0.4374 / 0.1062 | 4.33% |
+
+Removing respiratory projection or high-pass filtering does not reveal a missing
+oracle signal: it was already retained. The recorded clock draws useful signal
+from the images; blind discovery has not found that clock. `oracle_audit.py` and
+the corresponding JSON records separate this estimation failure from absent signal.
+
+The fixed `k=-3..3` alias enumeration is mathematically incomplete at long TR:
+at TR 2 s, a candidate at 0.8 Hz has a mirrored 1.2 Hz clock at `-0.8 + 4/2`.
+Frequency-only dictionary keys can also discard opposite rate-fluctuation paths
+with the same mean rate. The research `--full-aliases` option enumerates the
+complete band and preserves transformations separately. Added regression tests
+are written but deferred, as requested. This corrects search coverage; it has
+not yet rescued the remaining hard cases.
+
+The next discovery experiment uses split-time multivoxel spectral evidence in
+short windows, rather than depending on the brain mean or ICA to supply a clean
+initial trace. It remains experimental and has no acceptance decision of its own.

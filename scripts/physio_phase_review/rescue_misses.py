@@ -16,15 +16,26 @@ import torch
 
 from fastfuncstuff.io.afni import load_nifti
 from fastfuncstuff.processing import physio as p
+from scripts.physio_phase_review.candidate_aliases import complete_alias_offsets
 from scripts.physio_phase_review.direct_phase import fit_phase, select_voxels
 from scripts.physio_phase_review.run_taskforce import CPU, ROOT, metrics, reference
 
 
 @contextmanager
-def experiment_hooks(drop_resp_zones, phase_mode):
+def experiment_hooks(
+    drop_resp_zones,
+    phase_mode,
+    harmonic_seeds=False,
+    full_aliases=False,
+    ica_components=None,
+    ica_candidates=None,
+):
     original_avoid = p.cardiac_avoid
     original_voxels = p._cardiac_voxels
     original_crossed = p._crossed_phase
+    original_ica = p._ica_starts
+    original_aliases = p._alias_offsets
+    original_components, original_candidates = p.ICA_COMPONENTS, p.ICA_CANDIDATES
     training = []
     diagnostics = []
 
@@ -40,26 +51,96 @@ def experiment_hooks(drop_resp_zones, phase_mode):
         phase = original_crossed(times, trace, avoid)
         if phase_mode == "current":
             return phase
-        selected, _ = select_voxels(training, phase)
+        harmonics = 2 if phase_mode == "joint" else 1
+        selected, _ = select_voxels(training, phase, harmonics=harmonics)
         phase, diag = fit_phase(
             selected,
             times,
             phase,
             knot_s=2.0,
             maxiter=0 if phase_mode == "smooth" else 150,
+            harmonics=harmonics,
         )
         diagnostics.append(diag)
         return phase
 
+    def ica_starts(series, times, tr, avoid, device):
+        yield from original_ica(series, times, tr, avoid, device)
+        if not harmonic_seeds:
+            return
+        # A component may be the pulse's second harmonic. Treating every component
+        # as a fundamental otherwise never proposes its lower cardiac clock.
+        fs = 1 / np.median(np.diff(np.sort(times.ravel())))
+        wide_band = (1.2, min(4.0, 0.3 * fs))
+        if wide_band[1] <= wide_band[0]:
+            return
+
+        def wide_trace(sample_times, trace, excluded, window=20.0):
+            tu, xb = p._cardiac_series(sample_times, trace, excluded, band=wide_band)
+            ct, cf, prominence = p.track_rate(tu, xb, wide_band, window, avoid=excluded)
+            phase = p.cycle_phase(tu, xb, cf)
+            return (
+                np.interp(sample_times.ravel(), tu, phase).reshape(sample_times.shape),
+                ct,
+                cf,
+                prominence,
+            )
+
+        band, trace_phase = p.CARDIAC_BAND, p._trace_phase
+        try:
+            p.CARDIAC_BAND = wide_band
+            p._trace_phase = wide_trace
+            proposals = list(
+                original_ica(series, times, tr, p.cardiac_avoid(tr, band=wide_band), device)
+            )
+        finally:
+            p.CARDIAC_BAND = band
+            p._trace_phase = trace_phase
+        added = []
+        for label, phase in proposals:
+            for parity in (0, 1):
+                candidate = phase / 2 + parity * np.pi * times / tr
+                offsets = p._alias_offsets(times, candidate, tr, avoid)
+                if not offsets:
+                    continue
+                f0 = (candidate[-1].mean() - candidate[0].mean()) / (
+                    2 * np.pi * (times[-1].mean() - times[0].mean())
+                )
+                closest = min(
+                    offsets,
+                    key=lambda key: abs(
+                        60 * (offsets[key][0] * f0 + offsets[key][1] / tr) - abs(60 * f0)
+                    ),
+                )
+                sign, step = offsets[closest]
+                added.append(
+                    (
+                        f"harmonic2:{label}:{parity}",
+                        sign * candidate + 2 * np.pi * step * times / tr,
+                    )
+                )
+        print("additional harmonic-derived seeds", len(added), flush=True)
+        yield from added
+
     p.cardiac_avoid = avoid
     p._cardiac_voxels = voxels
     p._crossed_phase = crossed
+    p._ica_starts = ica_starts
+    if full_aliases:
+        p._alias_offsets = complete_alias_offsets
+    if ica_components is not None:
+        p.ICA_COMPONENTS = ica_components
+    if ica_candidates is not None:
+        p.ICA_CANDIDATES = ica_candidates
     try:
         yield diagnostics
     finally:
         p.cardiac_avoid = original_avoid
         p._cardiac_voxels = original_voxels
         p._crossed_phase = original_crossed
+        p._ica_starts = original_ica
+        p._alias_offsets = original_aliases
+        p.ICA_COMPONENTS, p.ICA_CANDIDATES = original_components, original_candidates
 
 
 def main():
@@ -70,8 +151,14 @@ def main():
     parser.add_argument("--label", help="Run label to select from --list")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--drop-resp-zones", action="store_true")
-    parser.add_argument("--phase-mode", choices=("current", "smooth", "direct"), default="current")
+    parser.add_argument(
+        "--phase-mode", choices=("current", "smooth", "direct", "joint"), default="current"
+    )
     parser.add_argument("--mean-only", action="store_true")
+    parser.add_argument("--harmonic-seeds", action="store_true")
+    parser.add_argument("--full-aliases", action="store_true")
+    parser.add_argument("--ica-components", type=int)
+    parser.add_argument("--ica-candidates", type=int)
     parser.add_argument(
         "--shuffle-times",
         type=int,
@@ -117,7 +204,14 @@ def main():
     traces = p.excitation_traces(mag, st, tr, phase=phase, device=CPU)
     del phase
     print(label, "traces ready", flush=True)
-    with experiment_hooks(args.drop_resp_zones, args.phase_mode) as diagnostics:
+    with experiment_hooks(
+        args.drop_resp_zones,
+        args.phase_mode,
+        args.harmonic_seeds,
+        args.full_aliases,
+        args.ica_components,
+        args.ica_candidates,
+    ) as diagnostics:
         result = p.refine_cardiac(mag, traces, st, tr, device=CPU, ica=not args.mean_only)
     del mag
     # Oracle data cannot influence candidate generation, fitting, or selection.
@@ -145,6 +239,10 @@ def main():
         input=str(mag_path),
         shuffled_time_seed=args.shuffle_times,
         phase_mode=args.phase_mode,
+        harmonic_seeds=args.harmonic_seeds,
+        complete_aliases=args.full_aliases,
+        ica_components=args.ica_components,
+        ica_candidates=args.ica_candidates,
         drop_resp_zones=args.drop_resp_zones,
         ica=not args.mean_only,
         found=result.found,
