@@ -345,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                 shuf = (
                     ""
                     if np.isnan(null)
-                    else f" (shuffled best {null:.2f}); harmonic {harm:.2f} (shuffled best {hnull:.2f})"
+                    else f" (shuffled best {null:.2f}); harmonic {harm:.2f} (non-harmonic best {hnull:.2f})"
                 )
                 print(f"    start {lab}: {rate:.1f}/min, slice alignment {align:.2f}{shuf}")
             verdict = (
@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             "rule": (
                 f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
                 f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers, and its "
-                f"second harmonic beats {physio.SLICE_PERMUTATIONS} shuffles of its own"
+                f"second harmonic beats its alignment at all {len(physio.HARMONIC_CONTROLS)} non-harmonic multiples"
             ),
             "tried": [
                 dict(
@@ -427,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
                             "slice_alignment",
                             "shuffled_max",
                             "harmonic_alignment",
-                            "harmonic_shuffled_max",
+                            "harmonic_control_max",
                         ),
                         t,
                         strict=True,

@@ -649,6 +649,8 @@ REFINE_HIGHPASS_HZ = 0.05
 # recordings on TASKFORCE, two Philips sites (TR 2 s sequential, MB4) and an MB4 slab:
 # no wrong find; misses come out not found (wiki: Slice-time alignment of the heartbeat).
 SLICE_PERMUTATIONS = 30
+# non-harmonic multiples of the cardiac phase, at least 0.2 from an integer
+HARMONIC_CONTROLS = tuple(k + d / 10 for k in (1, 2, 3) for d in range(2, 9))
 PERMUTED_ANSWERS = 4
 # Per-excitation ICA start (used when the mean-trace start is not found).
 ICA_COMPONENTS = 20
@@ -674,12 +676,12 @@ class CardiacRefinement:
     start: str = "mean"  # which start was kept: "mean", "ica@<aliased Hz>"
     tried: list = field(
         default_factory=list
-    )  # (start, rate, alignment, its shuffles' max, harmonic, its shuffles' max); nan if untested
+    )  # (start, rate, alignment, its shuffles' max, harmonic, control max); nan if untested
     tried_phase: list = field(default_factory=list)  # each start's final (nt, G) phase
     alignment: float = 0.0  # vessel phases lined up under the true slice times, 0-1
     alignment_null: float = 0.0  # the best of the slice-time shuffles
     harmonic: float = 0.0  # the same alignment at twice the cardiac phase
-    harmonic_null: float = 0.0  # the best of its slice-time shuffles
+    harmonic_null: float = 0.0  # the best at non-harmonic multiples (HARMONIC_CONTROLS)
     testable: bool = True  # False with a single excitation time: nothing to shuffle
     resolvability: dict = field(default_factory=dict)  # slice_resolvability of the acquisition
 
@@ -1052,25 +1054,22 @@ def _shuffled_alignment(Ys, times, phase, offsets, tr, device, n: int, rng) -> n
     return np.asarray(out)
 
 
-def _harmonic_alignment(Ys, phase, device, n: int = 0, rng=None) -> tuple[float, float]:
-    """Slice alignment at the second harmonic (twice ``phase``), and the best of ``n``
-    excitation-time shuffles of it (nan without). A pulse is not a sinusoid: its
-    waveform carries a second harmonic, sampled at the same slice times, that lines up
-    too. Slow physical signals that impersonate a heartbeat through an alias line up at
-    the fundamental only -- on held-out data every such impostor that beat its shuffles
-    had harmonic alignment 0.03-0.11, the heartbeats mostly 0.2-0.7 (wiki: Slice-time
-    alignment of the heartbeat)."""
+def _harmonic_alignment(Ys, phase, device) -> tuple[float, float]:
+    """Slice alignment at the second harmonic (twice ``phase``), and the best of the
+    same alignment at the non-harmonic multiples ``HARMONIC_CONTROLS``.
+
+    A pulse is not a sinusoid: its waveform carries a second harmonic, sampled at the
+    same slice times, that lines up too. Slow physical signals that impersonate a
+    heartbeat through an alias line up at the fundamental only. A control multiple has
+    no physical relation to the candidate but the same slice timing and voxels, so the
+    controls are this run's own floor for chance alignment: a signal without a harmonic
+    beats all of them 1 time in len(HARMONIC_CONTROLS) + 1. Shuffling the excitations
+    is no floor here -- it only rearranges the excitations' few angles, and the best
+    of 30 often lines a real harmonic up again (median 0.27 under true heartbeats,
+    against 0.15 under impostors). Wiki: Slice-time alignment of the heartbeat."""
     score = slice_alignment(_voxel_fits(Ys, 2 * phase, device))
-    if not n:
-        return score, float("nan")
-    G = phase.shape[1]
-    best = 0.0
-    for _ in range(n):
-        perm = rng.permutation(G)
-        while np.any(perm == np.arange(G)):
-            perm = rng.permutation(G)
-        best = max(best, slice_alignment(_voxel_fits(Ys, 2 * phase[:, perm], device)))
-    return score, best
+    floor = max(slice_alignment(_voxel_fits(Ys, m * phase, device)) for m in HARMONIC_CONTROLS)
+    return score, floor
 
 
 def slice_resolvability(
@@ -1315,7 +1314,7 @@ def refine_cardiac(
             continue
         tested.append(a[5])
         a[6] = _shuffled_alignment(Ys, times, a[1], a[7], tr, device, SLICE_PERMUTATIONS, rng)
-        a[8], a[9] = _harmonic_alignment(Ys, a[1], device, SLICE_PERMUTATIONS, rng)
+        a[8], a[9] = _harmonic_alignment(Ys, a[1], device)
     nulls = [a for a in answers if a[6] is not None]
     if nulls:
         # a heartbeat's second harmonic lines up too; among those, the most clearly
