@@ -136,3 +136,32 @@ def test_every_census_entry_rebuilds_and_runs(tmp_path):
     for row in rows:
         fn, _ = replay.build_call(row, torch.device("cpu"))
         fn()  # raises if any template does not round-trip
+
+
+def test_env_hook_only_arms_for_ffs_clis(monkeypatch, tmp_path):
+    from fastfuncstuff import _audit_hook
+
+    armed = []
+    monkeypatch.setattr(_audit_hook, "_install", lambda mode, tool: armed.append((mode, tool)))
+    monkeypatch.setenv("FFS_AUDIT_DIR", str(tmp_path))
+
+    monkeypatch.delenv("FFS_AUDIT", raising=False)
+    monkeypatch.setattr("sys.argv", ["/usr/bin/ffs_moco", "-input", "x"])
+    _audit_hook.maybe_install()
+    monkeypatch.setenv("FFS_AUDIT", "idle")
+    monkeypatch.setattr("sys.argv", ["/usr/bin/python", "-c", "x"])  # a notebook, a pool worker
+    _audit_hook.maybe_install()
+    assert armed == []
+
+    monkeypatch.setattr("sys.argv", ["/usr/bin/ffs_moco", "-input", "x"])
+    _audit_hook.maybe_install()
+    assert armed == [("idle", "ffs_moco")]
+
+
+def test_env_hook_never_breaks_the_tool(monkeypatch, capsys):
+    from fastfuncstuff import _audit_hook
+
+    monkeypatch.setenv("FFS_AUDIT", "bogus")
+    monkeypatch.setattr("sys.argv", ["/usr/bin/ffs_moco"])
+    _audit_hook.maybe_install()  # must not raise
+    assert "not recording" in capsys.readouterr().err

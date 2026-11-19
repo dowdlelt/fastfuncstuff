@@ -54,6 +54,14 @@ from fastfuncstuff._mkl_shim import maybe_reexec as _maybe_reexec  # noqa: E402
 
 _maybe_reexec()
 
+# FFS_AUDIT=idle|ops records a speed audit of this ffs_* process (GPU busy
+# fraction and host-sync sites, or an op census) at exit; see _audit_hook.
+# After the shim, so the audited process is the one that does the work. A
+# no-op import unless the variable is set.
+from fastfuncstuff._audit_hook import maybe_install as _maybe_audit  # noqa: E402
+
+_maybe_audit()
+
 # Every public name, mapped to the (module, attribute) it lives in. Importing
 # them eagerly meant that `import fastfuncstuff.<anything>` -- a header read, a
 # CLI --help -- paid ~4 s to bring up torch, scipy, sympy and matplotlib. They

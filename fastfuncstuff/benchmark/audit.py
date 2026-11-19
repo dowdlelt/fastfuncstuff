@@ -382,6 +382,68 @@ def make_census() -> Any:
 # ---------------------------------------------------------------------------
 
 
+class AuditSession:
+    """One audit, started and stopped explicitly (``_audit_hook`` spans a whole process)."""
+
+    def __init__(self, mode: str, *, command: list[str], label: str, stage: str) -> None:
+        if mode not in MODES:
+            raise ValueError(f"audit mode must be one of {MODES}, got {mode!r}")
+        self.mode, self.command, self.label, self.stage = mode, command, label, stage
+        self.requested = _requested_device(command)
+        self.sampler: BusySampler | None = None
+        self.syncs: SyncRecorder | None = None
+        self.census: Any = None
+        self.baseline: int | None = None
+        self.started_at = ""
+        self.t0 = 0.0
+
+    def start(self) -> None:
+        self.started_at = datetime.now().astimezone().isoformat()
+        wants_cuda = self.requested is None or self.requested.startswith("cuda")
+        if self.mode == "idle" and wants_cuda:
+            self.sampler = BusySampler(_nvml_index(self.requested))
+            self.baseline = self.sampler.read()
+            self.sampler.start()
+            self.syncs = SyncRecorder()
+            self.syncs.install()
+        elif self.mode == "ops":
+            self.census = make_census()
+            self.census.__enter__()
+        self.t0 = time.monotonic()
+
+    def stop(self, output_path: Path, error: str | None) -> None:
+        t1 = time.monotonic()
+        tool_seconds = t1 - self.t0
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "mode": self.mode,
+            "stage": self.stage,
+            "label": self.label,
+            "command": self.command,
+            "requested_device": self.requested,
+            "started_at": self.started_at,
+            "tool_seconds": tool_seconds,
+            "error": error,
+        }
+        if self.census is not None:
+            self.census.__exit__(None, None, None)
+            import torch
+
+            # The tool set it during its run; replay compares against this width.
+            payload["torch_threads"] = torch.get_num_threads()
+            payload["ops"] = self.census.table()
+        if self.syncs is not None:
+            self.syncs.uninstall()
+            payload["syncs"] = self.syncs.summary(tool_seconds)
+        if self.sampler is not None:
+            self.sampler.stop()
+            payload["gpu"] = self.sampler.summary(self.t0, t1)
+            # Another process on the card inflates busy% and hides idling.
+            payload["gpu"]["baseline_busy_pct"] = self.baseline
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=1) + "\n")
+
+
 def capture_audit[T](
     function: Callable[[], T],
     output_path: Path,
@@ -392,66 +454,17 @@ def capture_audit[T](
     stage: str,
 ) -> T:
     """Run ``function`` under one audit mode and write its JSON report."""
-    if mode not in MODES:
-        raise ValueError(f"audit mode must be one of {MODES}, got {mode!r}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    requested = _requested_device(command)
-    wants_cuda = requested is None or requested.startswith("cuda")
-    started_at = datetime.now().astimezone().isoformat()
-
-    sampler = syncs = census = None
-    baseline = None
-    if mode == "idle" and wants_cuda:
-        sampler = BusySampler(_nvml_index(requested))
-        baseline = sampler.read()
-        sampler.start()
-        syncs = SyncRecorder()
-        syncs.install()
-    elif mode == "ops":
-        census = make_census()
-
+    session = AuditSession(mode, command=command, label=label, stage=stage)
+    session.start()
     error: str | None = None
-    tool_started = time.monotonic()
     try:
-        if census is not None:
-            with census:
-                result = function()
-        else:
-            result = function()
+        return function()
     except BaseException as exc:
         if not isinstance(exc, SystemExit) or exc.code not in (None, 0):
             error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        tool_ended = time.monotonic()
-        tool_seconds = tool_ended - tool_started
-        payload: dict[str, Any] = {
-            "schema_version": 1,
-            "mode": mode,
-            "stage": stage,
-            "label": label,
-            "command": command,
-            "requested_device": requested,
-            "started_at": started_at,
-            "tool_seconds": tool_seconds,
-            "error": error,
-        }
-        if syncs is not None:
-            syncs.uninstall()
-            payload["syncs"] = syncs.summary(tool_seconds)
-        if sampler is not None:
-            sampler.stop()
-            payload["gpu"] = sampler.summary(tool_started, tool_ended)
-            # Another process on the card inflates busy% and hides idling.
-            payload["gpu"]["baseline_busy_pct"] = baseline
-        if census is not None:
-            import torch
-
-            # The tool set it during its run; replay compares against this width.
-            payload["torch_threads"] = torch.get_num_threads()
-            payload["ops"] = census.table()
-        output_path.write_text(json.dumps(payload, indent=1) + "\n")
-    return result
+        session.stop(output_path, error)
 
 
 # ---------------------------------------------------------------------------
@@ -654,3 +667,30 @@ class BenchmarkAuditor:
         (self.root / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
         (self.root / "summary.txt").write_text(format_report(self.stages, self.mode))
         return manifest
+
+
+def main(argv: list[str] | None = None) -> None:
+    """``python -m fastfuncstuff.benchmark.audit DIR``: summarise an ``FFS_AUDIT`` tree.
+
+    DIR is ``$FFS_AUDIT_DIR/<mode>`` (one folder per tool) or an
+    ``ffs_benchmark -audit`` run (one folder per stage).
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description=main.__doc__)
+    ap.add_argument("root", type=Path)
+    args = ap.parse_args(argv)
+    stages: dict[str, dict[str, Any]] = {}
+    mode = ""
+    for stage_dir in sorted(p for p in args.root.iterdir() if (p / "invocations").is_dir()):
+        summary = aggregate_stage(stage_dir, stage_dir.name)
+        if summary["invocation_count"]:
+            stages[stage_dir.name] = summary
+            mode = mode or ("ops" if "ops" in summary else "idle")
+    if not stages:
+        sys.exit(f"no audit invocations under {args.root}")
+    print(format_report(stages, mode))
+
+
+if __name__ == "__main__":
+    main()
