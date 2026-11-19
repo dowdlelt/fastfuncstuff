@@ -67,5 +67,10 @@ include breathhold1, which is a wrong pick that the harmonic-only rule accepts, 
 production rule rejects it. Derangement has little power at short TR with multiband
 (G ≈ 9–14 close slice times), so the harmonic test carries more weight there.
 
-Still open: a principled K(nt); respiration winning the CM ranking (not seen yet);
-ds001168 fresh cohort not run.
+Final rerun (ec5673eb, unwrap anchored to the run mean, production `detect`, rng 1):
+held-out 61/0/5, local 102/0/3, ds001168 full brain 9/0/0, prefrontal 1/0/9. All 190:
+173 right, 0 wrong, 17 not found. The old path never found a run CM missed. K ladder
+(scripts/physio_phase_review/k_ladder.py): K 16-40 is a plateau (100-103 of 105 runs have
+the heartbeat among the starts); K = 20 kept. Respiration from magnitude alone at long TR:
+CM does not carry over (ds002547 10/10 wrong), parked. Figure: docs/physio/fig6_detection.png
+(scripts/physio_phase_review/fig_detection.py).
