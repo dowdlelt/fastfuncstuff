@@ -109,6 +109,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "traces. These can be very large.",
     )
     parser.add_argument(
+        "-audit",
+        choices=("idle", "ops"),
+        default=None,
+        help="Low-overhead speed audit of FFS commands that execute, written under "
+        "<data-dir>/audits. 'idle': GPU-busy fraction (NVML) and the ffs lines that force "
+        "host syncs. 'ops': a census of (op, shapes, dtype, device) with CPU op times, "
+        "for scripts/replay_op_census.py. Does not imply -force-ffs; timings are not cached.",
+    )
+    parser.add_argument(
         "-plot",
         type=str,
         default=None,
@@ -173,6 +182,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.profile_trace and not args.profile:
         parser.error("-profile-trace requires -profile")
+    if args.audit and args.profile:
+        parser.error("-audit and -profile measure the same commands; pick one")
     return args
 
 
@@ -292,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         show_output=args.verb >= 1,
         profile=args.profile,
         profile_trace=args.profile_trace,
+        audit=args.audit,
         config=config,
     )
 

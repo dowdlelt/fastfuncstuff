@@ -32,6 +32,7 @@ class BenchmarkContext:
     show_output: bool = False  # Stream subprocess stdout/stderr when True
     profile: bool = False  # Profile FFS commands that actually execute
     profile_trace: bool = False  # Also export potentially large Chrome traces
+    audit: str | None = None  # "idle" or "ops": low-overhead speed audit (benchmark/audit.py)
     config: Any = None  # BenchmarkConfig — typed as Any to avoid circular import
 
     # Per-stage scratch: how many items each role (ref/ffs) actually ran vs the
@@ -535,6 +536,11 @@ def run_stages(
 
         benchmark_profiler = BenchmarkProfiler.create(ctx.data_dir, trace=ctx.profile_trace)
         print(f"Profiles: {benchmark_profiler.root}")
+    elif ctx.audit:
+        from .audit import BenchmarkAuditor
+
+        benchmark_profiler = BenchmarkAuditor.create(ctx.data_dir, ctx.audit)
+        print(f"Audit ({ctx.audit}): {benchmark_profiler.root}")
 
     # Up-front dependency advisory: if a requested stage depends on stages not in
     # this run, its upstream outputs may be missing -> it'll come back INCOMPLETE.
@@ -686,7 +692,8 @@ def run_stages(
         if result.ref_time is not None and result.ref_time > 0:
             timing_entry["ref_seconds"] = result.ref_time
         # Profiler overhead must never replace normal speed baselines.
-        if not ctx.profile and result.ffs_time is not None and result.ffs_time > 0:
+        timed_clean = not (ctx.profile or ctx.audit)
+        if timed_clean and result.ffs_time is not None and result.ffs_time > 0:
             timing_entry["ffs_seconds"] = result.ffs_time
         for role, m in result.partial.items():
             timing_entry[f"{role}_partial"] = True
@@ -717,7 +724,9 @@ def run_stages(
         manifest = benchmark_profiler.finish()
         count = manifest["profiled_invocations"]
         if count:
-            print(f"\nWrote {count} profile(s) to {benchmark_profiler.root}")
+            print(f"\nWrote {count} report(s) to {benchmark_profiler.root}")
+            if ctx.audit:
+                print((benchmark_profiler.root / "summary.txt").read_text())
         else:
             print(
                 f"\nNo profiles were produced (FFS outputs were likely cached). "
