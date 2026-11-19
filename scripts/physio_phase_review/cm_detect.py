@@ -31,24 +31,18 @@ def alias_table(Ys, times, start, tr, device, rng=None):
         while np.any(perm == np.arange(G)):
             perm = rng.permutation(G)
         start = start[:, perm]
-    rows = []
-    for sign, step in cm.complete_aliases(times, start, tr, p.CARDIAC_BAND):
-        phase = sign * start + 2 * np.pi * step * times / tr
-        rows.append(
-            dict(
-                sign=sign,
-                step=step,
-                rate=p._phase_rate(times, phase),
-                a1=align(Ys, phase, device),
-                a2=align(Ys, 2 * phase, device),
-                phase=phase,
-            )
-        )
-    return rows
+    alias = cm.complete_aliases(times, start, tr, p.CARDIAC_BAND)
+    phases = [sign * start + 2 * np.pi * step * times / tr for sign, step in alias]
+    a = p.slice_alignments(Ys, phases + [2 * q for q in phases], device)
+    return [
+        dict(sign=sign, step=step, rate=p._phase_rate(times, q), a1=float(a[i]),
+             a2=float(a[len(phases) + i]), phase=q)
+        for i, ((sign, step), q) in enumerate(zip(alias, phases, strict=True))
+    ]  # fmt: skip
 
 
 def controls(Ys, phase, device):
-    return max(align(Ys, m * phase, device) for m in p.HARMONIC_CONTROLS)
+    return float(p.slice_alignments(Ys, [m * phase for m in p.HARMONIC_CONTROLS], device).max())
 
 
 def main():

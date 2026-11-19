@@ -25,6 +25,24 @@ def test_unwrap_around_rate_keeps_a_heartbeat_crossing_nyquist_continuous():
     assert len(np.unique(np.round((true_steps - wrapped) / (2 * np.pi)))) > 1
 
 
+def test_a_stretch_that_creeps_off_does_not_commit_the_clock_to_a_cycle_slip():
+    """A stretch where the trace follows something else, its step creeping a whole
+    cycle away (TR 3 s), in the middle of a steady heartbeat: after it, the clock must
+    come back on the same cycle count as before. Chaining the local reference volume
+    to volume followed the creep and kept the whole-cycle offset for the rest of the
+    run (ds001168 sub-13: 0.97 lock for 7.5 min, then 1/TR fast to the end)."""
+    tr = 3.0
+    n = 300
+    true_steps = 2 * np.pi * (1.38 + 0.02 * np.sin(np.arange(n) / 30)) * tr
+    observed = true_steps.copy()
+    observed[130:190] += np.linspace(0, 2 * np.pi, 60)
+    wrapped = np.angle(np.exp(1j * observed))
+    lifted = physio_cm.unwrap_around_rate(wrapped, tr)
+    offset = np.round((true_steps - lifted) / (2 * np.pi))
+    before, after = offset[:130], offset[200:]
+    assert np.all(before == before[0]) and np.all(after == before[0])
+
+
 def test_constant_modulus_traces_find_a_rotating_pair_in_noise():
     """A phasor with an aliased, wandering phase mixed into 30 noisy series, among
     Gaussian sources of larger variance: the flat-radius search returns it first."""

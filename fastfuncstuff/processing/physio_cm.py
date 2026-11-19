@@ -134,13 +134,18 @@ def unwrap_around_rate(steps: np.ndarray, tr: float, window_s: float = 60.0) -> 
 
     A complex trace's aliased rate has no fold, but plain unwrapping slips a cycle
     whenever a step crosses +-pi -- exactly where a heartbeat near (k + 1/2)/TR sits.
-    Lifting around the local mean keeps heart-rate drift continuous while it stays
-    within 1/(2 TR) of that mean (15/min at TR 2 s)."""
+    Each step is lifted to within pi of the 60 s local mean step, and that local mean
+    to within pi of the run's mean step: heart-rate drift stays continuous while each
+    minute's rate is within 1/(2 TR) of the run's (10/min at TR 3 s) and each volume's
+    within 1/(2 TR) of its minute. Chaining the local mean from one volume to the next
+    instead (np.unwrap) let a noisy stretch, where the mean phasor is weak and its
+    angle wanders, commit a whole-cycle offset for the rest of the run: ds001168
+    sub-13 locked at 0.97 for 7.5 min, then read 1/TR fast to the end."""
     w = max(3, int(round(window_s / tr)) | 1)
     u = np.exp(1j * steps)
-    # unwrapped: a reference sitting near pi would otherwise flip sign between
-    # neighbours and carry the slip it exists to prevent
-    ref = np.unwrap(np.angle(np.convolve(u, np.ones(w) / w, mode="same")))
+    run = np.angle(u.mean())
+    local = np.convolve(u, np.ones(w) / w, mode="same")
+    ref = run + np.angle(local * np.exp(-1j * run))
     return ref + np.angle(u * np.exp(-1j * ref))
 
 
