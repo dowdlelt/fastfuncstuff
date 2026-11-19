@@ -54,6 +54,21 @@ _NEVER_SPLIT = {"unique_rows"}
 # Each lane must get a few matrices, or the split is all overhead.
 _MIN_PER_LANE = 4
 
+# cuSOLVER's batched SVD is a batched Jacobi only while both sides are <= 32;
+# past that torch loops one gesvd per matrix at 0.4-1 ms each, whatever the
+# size, and float64 is 5-10x worse again on a consumer card. Measured on an RTX
+# 5070 Ti against a 6-core CPU through _cpu_batch_split, copies both ways
+# included (scripts/bench_gpu_host.py has the batched rows):
+#   float32 (512,33,33) 330 ms vs 29; (512,100,40) 485 vs 72; (2000,60,30) 1025
+#   vs 114; (4,400,200) a tie at 16M work; (4,1000,300) CUDA 1.6x at 90M
+#   float64 CPU 3-40x ahead at every size up to (4,2000,300)
+# so a batched SVD (and pinv, which is one) leaves CUDA below the f32 tie and
+# always in float64. Unbatched SVD is not routed: it loses only below ~1M work,
+# by about a millisecond.
+_CUDA_JACOBI_MAX = 32
+_CUDA_SVD_CPU_BELOW_F32 = 16e6
+_CUDA_SVD_OPS = {"svd_batched", "pinv"}
+
 _lane_thread_setters: list | None = None
 
 
@@ -291,6 +306,22 @@ def _cpu_batch_split(op: str, fn, args: tuple, kwargs: dict):
         return _gather(parts, bounds, batch, pool, modes)
 
 
+def cuda_svd_belongs_on_cpu(op: str, a, kwargs: dict | None = None) -> bool:
+    """Whether a batched SVD-family call on CUDA is faster on the CPU (see ``_CUDA_JACOBI_MAX``)."""
+    if op not in _CUDA_SVD_OPS or not isinstance(a, torch.Tensor) or a.device.type != "cuda":
+        return False
+    if (kwargs or {}).get("hermitian"):  # pinv(hermitian=True) is an eigh
+        return False
+    if a.ndim < 3 or math.prod(a.shape[:-2]) < 2 or torch.compiler.is_compiling():
+        return False
+    m, n = a.shape[-2:]
+    if max(m, n) <= _CUDA_JACOBI_MAX:
+        return False
+    if a.dtype in (torch.float64, torch.complex128):
+        return True
+    return m * n * min(m, n) < _CUDA_SVD_CPU_BELOW_F32
+
+
 def _routed(op: str, fn, *args, **kwargs):
     """``fn(*args, **kwargs)`` on the device *op* belongs on, returned to the input's."""
     devices = [a.device for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor)]
@@ -298,6 +329,8 @@ def _routed(op: str, fn, *args, **kwargs):
     # solve(b_cpu, L_mps) is a normal thing to arrive here, and Metal is where it goes home to.
     home = next((d for d in devices if d.type == "mps"), devices[0])
     work = cpu_if_mps(home, op)
+    if work == home and args and cuda_svd_belongs_on_cpu(op, args[0], kwargs):
+        work = torch.device("cpu")
     if work == home:
         if home.type == "cpu":
             split = _cpu_batch_split(op, fn, args, kwargs)
@@ -306,7 +339,9 @@ def _routed(op: str, fn, *args, **kwargs):
         return fn(*args, **kwargs)
     moved = [a.to(work) if isinstance(a, torch.Tensor) else a for a in args]
     named = {k: v.to(work) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
-    result = fn(*moved, **named)
+    result = _cpu_batch_split(op, fn, tuple(moved), named) if work.type == "cpu" else None
+    if result is None:
+        result = fn(*moved, **named)
     if isinstance(result, torch.Tensor):
         return result.to(home)
     # torch's return_types are structseqs: they take one sequence, not *args.

@@ -257,3 +257,37 @@ def test_lu_guard_runs_an_unmirrorable_broadcast_in_one_lane(splits):
     got = P.solve(a, b)
     assert splits
     torch.testing.assert_close(got, torch.linalg.solve(a, b.expand(2, -1, -1, -1)))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_batched_svd_routing_rule():
+    from fastfuncstuff.policy_linalg import cuda_svd_belongs_on_cpu as rule
+
+    def t(*shape, dtype=torch.float32):
+        return torch.empty(*shape, device="cuda", dtype=dtype)
+
+    assert not rule("svd_batched", t(512, 32, 32))  # batched Jacobi: stays
+    assert rule("svd_batched", t(512, 33, 33))  # looped gesvd: leaves
+    assert rule("svd_batched", t(64, 300, 50))
+    assert not rule("svd_batched", t(4, 1000, 300))  # big enough that CUDA wins
+    assert rule("svd_batched", t(4, 1000, 300, dtype=torch.float64))  # f64 always leaves
+    assert not rule("svd", t(100, 40))  # unbatched is not routed
+    assert not rule("svd_batched", t(1, 100, 40))  # a batch of one is unbatched
+    assert not rule("pinv", t(64, 100, 40), {"hermitian": True})  # that is an eigh
+    assert rule("pinv", t(64, 100, 40))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_batched_svd_routed_to_cpu_returns_on_cuda_and_matches():
+    from fastfuncstuff import policy_linalg as pl
+
+    a = torch.randn(64, 100, 40, device="cuda", dtype=torch.float64)
+    u, s, vh = pl.svd(a, full_matrices=False)
+    assert u.device.type == s.device.type == vh.device.type == "cuda"
+    torch.testing.assert_close(u @ torch.diag_embed(s) @ vh, a, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(s, torch.linalg.svdvals(a.cpu()).cuda(), rtol=1e-12, atol=1e-12)
+    p = pl.pinv(a)
+    assert p.device.type == "cuda"
+    torch.testing.assert_close(p, torch.linalg.pinv(a.cpu()).cuda(), rtol=1e-8, atol=1e-10)
