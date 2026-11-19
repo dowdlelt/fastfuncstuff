@@ -283,7 +283,16 @@ def _load(path: str, collapse: str | None = None) -> tuple[np.ndarray, np.ndarra
     img = load_nifti(path)
     arr = np.asarray(img.dataobj, dtype=np.float32)
     if collapse is not None and arr.ndim == 4:
-        arr = np.median(arr, axis=3) if collapse == "median" else arr.mean(axis=3)
+        if collapse == "median":
+            import torch
+
+            from fastfuncstuff.processing.censor import afni_median
+
+            # np.median's convention (mean of the middle two), 2.5x faster on a
+            # (76,76,54,268) EPI and bit-identical to it.
+            arr = afni_median(torch.from_numpy(arr), dim=3).numpy()
+        else:
+            arr = arr.mean(axis=3)
     return arr, np.asarray(img.affine), img.header
 
 
@@ -464,8 +473,13 @@ def main(argv: list[str] | None = None) -> int:
     fmap_pe_mm = _voxel_sizes_zyx(affine)[{0: 2, 1: 1, 2: 0}[pe_axis]]
     epi_pe_mm = fmap_pe_mm
     if args.epi:
-        _, epi_affine_probe, _ = _load(args.epi, collapse=args.collapse)
-        epi_pe_mm = _voxel_sizes_zyx(epi_affine_probe)[{0: 2, 1: 1, 2: 0}[pe_axis]]
+        from fastfuncstuff.io.afni import load_nifti
+
+        # Header only: this used to load the whole EPI and take its temporal
+        # median just for the voxel size, then do both again below.
+        epi_pe_mm = _voxel_sizes_zyx(np.asarray(load_nifti(args.epi).affine))[
+            {0: 2, 1: 1, 2: 0}[pe_axis]
+        ]
 
     def forward_distort(f: torch.Tensor) -> torch.Tensor:
         assert mag_arr is not None
