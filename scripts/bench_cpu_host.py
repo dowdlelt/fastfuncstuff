@@ -151,6 +151,34 @@ def _cholsolve_batch(quick: bool) -> Built:
     return call, bsz / 1e6, a.numel() * 8 * 2
 
 
+def _ffs_eigh_batch(quick: bool) -> Built:
+    # The same batch through policy_linalg, which deals it across threads.
+    import torch
+
+    from fastfuncstuff import policy_linalg as plinalg
+
+    b = 5_000 if quick else 20_000
+    a = torch.randn(b, 8, 8)
+    a = a @ a.transpose(-1, -2)
+    return (lambda: plinalg.eigh(a)), b / 1e6, a.numel() * 4 * 2
+
+
+def _ffs_cholsolve_batch(quick: bool) -> Built:
+    import torch
+
+    from fastfuncstuff import policy_linalg as plinalg
+
+    bsz, k = (10_000 if quick else 50_000), 10
+    x = torch.randn(bsz, k, k, dtype=torch.float64)
+    a = x @ x.transpose(-1, -2) + k * torch.eye(k, dtype=torch.float64)
+    rhs = torch.randn(bsz, k, 1, dtype=torch.float64)
+
+    def call():
+        return plinalg.cholesky_solve(rhs, plinalg.cholesky(a))
+
+    return call, bsz / 1e6, a.numel() * 8 * 2
+
+
 def _rfft(quick: bool) -> Built:
     import torch
 
@@ -225,13 +253,25 @@ KERNELS: dict[str, tuple[str, str, str, Callable[[bool], Built]]] = {
     "svd_f32": ("SVD (2000,500) f32", "call/s", "torch", _svd),
     "eigh_batch_f32": ("batched eigh 20k x (8,8)", "Mmat/s", "torch", _eigh_batch),
     "cholsolve_f64": ("batched chol+solve 50k x (10,10) f64", "Mmat/s", "torch", _cholsolve_batch),
+    "ffs_eigh_batch_f32": (
+        "policy_linalg eigh, same batch",
+        "Mmat/s",
+        "torch",
+        _ffs_eigh_batch,
+    ),
+    "ffs_cholsolve_f64": (
+        "policy_linalg chol+solve, same batch",
+        "Mmat/s",
+        "torch",
+        _ffs_cholsolve_batch,
+    ),
     "rfft_f32": ("rfft along time, (50k,512)", "Mseries/s", "torch", _rfft),
     "grid_sample_f32": ("stock F.grid_sample 3-D warp 96x128x128", "Mvox/s", "torch", _grid_sample),
     "ffs_resample_f32": ("ffs _grid_sample_3d, same warp", "Mvox/s", "torch", _ffs_resample),
     "numpy_gemm_f64": ("numpy GEMM 2048 f64", "GFLOP/s", "numpy", _numpy_gemm),
     "scipy_eigh_f64": ("scipy eigh 1000x1000 f64", "call/s", "numpy", _scipy_eigh),
 }
-DEFAULT_JOB_KERNELS = ["gemm_f32", "glm_f32", "stream_f32", "ffs_resample_f32", "cholsolve_f64"]
+DEFAULT_JOB_KERNELS = ["gemm_f32", "glm_f32", "stream_f32", "ffs_resample_f32", "ffs_cholsolve_f64"]
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +356,30 @@ def _cpu_quota() -> float | None:
         return None if raw[0] == "max" else int(raw[0]) / int(raw[1] if len(raw) > 1 else 100000)
 
 
+def batched_lu_hangs() -> bool | None:
+    """Does plain torch hang on a multi-threaded batched LU with k > 128?
+
+    torch 2.14.1 does (MKL: 'Parameter 6 was incorrect on entry to DLASWP'), and
+    policy_linalg guards it; this says whether the installed torch still needs
+    that guard. Run in a subprocess because the failure mode is a hang.
+    """
+    import subprocess
+
+    code = (
+        "import torch; torch.set_num_threads(2); "
+        "x = torch.randn(2, 192, 192, dtype=torch.float64); "
+        "torch.linalg.lu_factor(x @ x.mT + 192 * torch.eye(192, dtype=torch.float64)); print('ok')"
+    )
+    env = dict(os.environ, OMP_NUM_THREADS="2")
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=30, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    return None if "ok" not in out.stdout else False
+
+
 def host_report() -> dict:
     import numpy as np
     import scipy.linalg  # noqa: F401 -- loads scipy's BLAS so threadpoolctl sees it
@@ -364,6 +428,9 @@ def host_report() -> dict:
     info["allocator"] = next(
         (a for a in ("jemalloc", "tcmalloc", "mimalloc") if a in maps), "glibc"
     )
+    info["mkl_avx512_shim"] = "mkl_force_avx512" in maps
+    vendor = re.search(r"vendor_id\s*:\s*(\S+)", cpuinfo)
+    info["cpu_vendor"] = vendor.group(1) if vendor else "?"
     info["env"] = {
         k: v
         for k, v in os.environ.items()
@@ -376,6 +443,7 @@ def host_report() -> dict:
     info["torch"] = torch.__version__
     info["torch_blas"] = (blas.group(1) if blas else "?") + (f" {mkl.group(1)}" if mkl else "")
     info["torch_cpu_capability"] = torch.backends.cpu.get_cpu_capability()
+    info["torch_batched_lu_hangs"] = batched_lu_hangs()
     info["cxx_for_torch_compile"] = shutil.which(os.environ.get("CXX", "g++")) or shutil.which(
         "c++"
     )
@@ -426,13 +494,14 @@ def print_host(info: dict) -> None:
         f"  defrag={info['thp_defrag']}"
     )
     print(
-        f"  allocator={info['allocator']}   cgroup quota={info.get('cgroup_cpu_quota')}"
+        f"  allocator={info['allocator']}  mkl_avx512_shim={info['mkl_avx512_shim']}   cgroup quota={info.get('cgroup_cpu_quota')}"
         f" -> testing up to {info['usable_cores']} cores"
         f"   ffs default threads={info['ffs_default_threads']}"
     )
     print(
         f"  torch {info['torch']}  BLAS={info['torch_blas']}  capability={info['torch_cpu_capability']}"
         f"  C++ for torch.compile={info['cxx_for_torch_compile'] or 'MISSING'}"
+        f"  batched-LU hang={info['torch_batched_lu_hangs']}"
     )
     if isinstance(info["threadpools"], list):
         for p in info["threadpools"]:
@@ -473,17 +542,39 @@ class _Threads:
         return True
 
 
-def time_call(fn: Callable[[], Any], min_time: float, min_reps: int = 3) -> float:
+def throttled_usec() -> int | None:
+    """Microseconds this cgroup has spent frozen by its CPU quota (cgroup v2)."""
+    rel = ""
+    for line in (_read("/proc/self/cgroup") or "").splitlines():
+        if line.startswith("0::"):
+            rel = line[3:].strip("/")
+    for path in (f"/sys/fs/cgroup/{rel}/cpu.stat", "/sys/fs/cgroup/cpu.stat"):
+        m = re.search(r"throttled_usec (\d+)", _read(path) or "")
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def time_call(fn: Callable[[], Any], min_time: float, min_reps: int = 3) -> tuple[float, float]:
+    """Sustained seconds per call, and the fraction of that time spent throttled.
+
+    The mean over a window, not the fastest call: under a CPU quota, more threads
+    than the quota burn a period's budget early and freeze for the rest, so the
+    fastest call is one that dodged the freeze, and the minimum would report an
+    over-quota thread count as a speedup it can never sustain.
+    """
     fn()  # warm-up: allocator, lazy init, thread pool spin-up
-    best, total, reps = float("inf"), 0.0, 0
-    while reps < min_reps or total < min_time:
-        t0 = time.perf_counter()
+    th0, reps = throttled_usec(), 0
+    t0 = time.perf_counter()
+    while True:
         fn()
-        dt = time.perf_counter() - t0
-        best, total, reps = min(best, dt), total + dt, reps + 1
-        if reps >= 50:
+        reps += 1
+        total = time.perf_counter() - t0
+        if (reps >= min_reps and total >= min_time) or reps >= 1000:
             break
-    return best
+    th1 = throttled_usec()
+    frac = (th1 - th0) / 1e6 / total if th0 is not None and th1 is not None else 0.0
+    return total / reps, frac
 
 
 def run_scaling(names, thread_counts, quick, min_time, pin, topo) -> list[dict]:
@@ -496,9 +587,9 @@ def run_scaling(names, thread_counts, quick, min_time, pin, topo) -> list[dict]:
         try:
             fn, work, _ = build(quick)
         except ImportError as exc:
-            print(f"  {name:<16} skipped: {exc}")
+            print(f"  {name:<18} skipped: {exc}")
             continue
-        line = f"  {name:<16} {unit:<10}"
+        line = f"  {name:<18} {unit:<10}"
         print(line, end="", flush=True)
         for t in thread_counts:
             if not threads.set(lib, t):
@@ -507,7 +598,7 @@ def run_scaling(names, thread_counts, quick, min_time, pin, topo) -> list[dict]:
                 print(" (threads not controllable: pip install threadpoolctl)", end="")
             if pin:
                 _set_affinity_all_threads(set(_cpus_for(topo, 0, t)))
-            sec = time_call(fn, min_time)
+            sec, throttled = time_call(fn, min_time)
             rows.append(
                 {
                     "kernel": name,
@@ -515,9 +606,11 @@ def run_scaling(names, thread_counts, quick, min_time, pin, topo) -> list[dict]:
                     "sec_per_call": sec,
                     "rate": work / sec,
                     "unit": unit,
+                    "throttled": throttled,
                 }
             )
-            print(f" {t}:{work / sec:.4g}", end="", flush=True)
+            mark = f"[T{throttled:.0%}]" if throttled > 0.02 else ""
+            print(f" {t}:{work / sec:.4g}{mark}", end="", flush=True)
         if pin:
             _set_affinity_all_threads(all_cpus)
         print()
@@ -538,6 +631,7 @@ def _job_worker(name, quick, n_threads, cpus, barrier, queue, duration):
         fn()
         fn()
         barrier.wait(timeout=900)
+        th0 = throttled_usec()
         t0 = time.perf_counter()
         count = 0
         while True:
@@ -546,9 +640,11 @@ def _job_worker(name, quick, n_threads, cpus, barrier, queue, duration):
             elapsed = time.perf_counter() - t0
             if elapsed >= duration:
                 break
-        queue.put(("ok", count, elapsed, work))
+        th1 = throttled_usec()
+        frac = (th1 - th0) / 1e6 / elapsed if th0 is not None and th1 is not None else 0.0
+        queue.put(("ok", count, elapsed, work, frac))
     except Exception as exc:  # noqa: BLE001 -- report, don't hang the parent
-        queue.put(("error", repr(exc), 0.0, 0.0))
+        queue.put(("error", repr(exc), 0.0, 0.0, 0.0))
         try:
             barrier.abort()
         except Exception:  # noqa: BLE001
@@ -609,14 +705,17 @@ def run_jobs(names, layouts, quick, duration, pin, topo, mem_avail_gib) -> list[
             if errors:
                 print(f"    {n_jobs}x{n_threads:<8} FAILED: {errors[0]}")
                 continue
-            agg = sum(count * work / elapsed for _, count, elapsed, work in results)
-            per_call = sum(elapsed / count for _, count, elapsed, _ in results) / len(results)
+            agg = sum(count * work / elapsed for _, count, elapsed, work, _ in results)
+            per_call = sum(elapsed / count for _, count, elapsed, _, _ in results) / len(results)
+            throttled = max(r[4] for r in results)
             base = base or agg
             tag = ""
             if n_threads == per_l3 and per_l3 != len(topo):
                 tag = "  = 1 L3 group/job"
             elif n_threads == per_node and len(nodes) > 1:
                 tag = "  = 1 NUMA node/job"
+            if throttled > 0.02:
+                tag += f"  THROTTLED {throttled:.0%} of the time"
             print(
                 f"    {n_jobs}x{n_threads:<8} {agg:>11.4g} {agg / base:>8.2f}x {per_call:>15.4g}{tag}"
             )
@@ -628,6 +727,7 @@ def run_jobs(names, layouts, quick, duration, pin, topo, mem_avail_gib) -> list[
                     "aggregate_rate": agg,
                     "per_job_sec_per_call": per_call,
                     "unit": unit,
+                    "throttled": throttled,
                 }
             )
     return rows
@@ -689,6 +789,26 @@ def observations(info: dict, scaling: list[dict], jobs: list[dict]) -> list[str]
                 f"{name}: best layout {best['jobs']}x{best['threads']} = "
                 f"{best['aggregate_rate'] / one['aggregate_rate']:.2f}x the throughput of 1x{one['threads']}"
             )
+    if "mkl" in info.get("torch_blas", "") and info.get("cpu_vendor") != "GenuineIntel":
+        if info.get("mkl_avx512_shim"):
+            notes.append(
+                "MKL AVX-512 dispatch forced by the shim -- compare against a run without it"
+            )
+        elif "avx512f" in info["isa"]:
+            notes.append(
+                "torch's MKL picks AVX2 kernels on non-Intel CPUs; this one has AVX-512. A/B with"
+                " LD_PRELOAD=scripts/mkl_force_avx512.so (see scripts/mkl_force_avx512.c)"
+            )
+    if info.get("torch_batched_lu_hangs"):
+        notes.append(
+            "this torch hangs on multi-threaded batched LU with k > 128 (solve/inv/det/lu_*);"
+            " ffs routes those through policy_linalg's guard -- never call torch.linalg directly"
+        )
+    if any(r.get("throttled", 0) > 0.02 for r in scaling + jobs):
+        notes.append(
+            "[T..%] / THROTTLED: the cgroup CPU quota froze the process that share of the time --"
+            " those thread counts exceed what the quota can feed"
+        )
     if info["allocator"] == "glibc":
         notes.append(
             "allocator is glibc malloc -- try an A/B with LD_PRELOAD of libjemalloc.so.2 or libtcmalloc"
@@ -774,7 +894,10 @@ def main() -> None:
     )
     ap.add_argument("--duration", type=float, help="seconds per job layout (default 5, quick 2)")
     ap.add_argument(
-        "--min-time", type=float, default=0.3, help="min seconds of repeats per scaling point"
+        "--min-time",
+        type=float,
+        help="seconds of sustained calls per scaling point (default 1, quick 0.3; keep it"
+        " >= 10 scheduler periods under a quota)",
     )
     ap.add_argument(
         "--max-cpus",
@@ -826,6 +949,7 @@ def main() -> None:
             "glm_f32",
             "stream_f32",
             "cholsolve_f64",
+            "ffs_cholsolve_f64",
             "grid_sample_f32",
             "ffs_resample_f32",
             "numpy_gemm_f64",
@@ -850,7 +974,12 @@ def main() -> None:
         []
         if args.skip_scaling
         else run_scaling(
-            scale_names, thread_counts, args.quick, args.min_time, args.pin_scaling, topo
+            scale_names,
+            thread_counts,
+            args.quick,
+            args.min_time or (0.3 if args.quick else 1.0),
+            args.pin_scaling,
+            topo,
         )
     )
     jobs = (
