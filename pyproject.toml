@@ -197,6 +197,7 @@ exclude = ["tests*", "examples*"]
 # non-editable install drops them and runtime loads fail (e.g. the canonical
 # HRF library .tsv); editable installs masked the bug by reading the source tree.
 [tool.setuptools.package-data]
+"fastfuncstuff" = ["_native/*.c"]
 "fastfuncstuff.design" = ["*.tsv"]
 "fastfuncstuff.benchmark.configs" = ["*.yaml"]
 "fastfuncstuff.benchmark" = ["assets/*.m"]

@@ -83,7 +83,40 @@ export OMP_NUM_THREADS=8   # numpy and other libraries read this
 Add the same lines to `~/.bashrc` to keep them. To override for a single run, use
 `-device cpu,8`.
 
-## A CPU-only machine downloaded several GB of CUDA packages
+## AMD servers: the MKL speed shim (`FFS_NO_SHIM`)
+
+torch's built-in math library (Intel MKL) runs its slower AVX2 code on any non-Intel CPU,
+even one with AVX-512. On AMD Zen 4 and Zen 5 (EPYC 9004/9005, Ryzen 7000 and later) that
+costs half or more of torch's matrix speed: on an EPYC 9555, float32 matrix multiply ran
+119 GFLOP/s per core without the fix and 271 with it, and a 32-thread GLM fit ran 6.6x
+faster.
+
+The `ffs_*` tools fix this themselves. On Linux with an AVX-512 AMD CPU, a tool compiles a
+small library once into `~/.cache/fastfuncstuff/` (this needs a C compiler; without one,
+nothing changes) and restarts itself with it in `LD_PRELOAD`, before torch loads. Intel
+CPUs, older AMD CPUs, Macs and ARM machines are left alone, because they gain nothing.
+Python code that imports `fastfuncstuff` (notebooks, your own scripts) cannot restart
+itself; start that Python with
+`LD_PRELOAD=$(python -c 'from fastfuncstuff._mkl_shim import built_library as b; print(b())')`
+to get the same speed.
+
+To check it is active, run `python scripts/bench_cpu_host.py --quick --skip-jobs` with the
+same environment and look for `mkl_avx512_shim=True`.
+
+Turn it off with:
+
+```bash
+export FFS_NO_SHIM=1
+```
+
+Do this if a run hangs at 100% CPU, if you see `Intel oneMKL ERROR: Parameter 6 was
+incorrect on entry to DLASWP`, or if results differ from another machine in a way that
+matters to you. (They differ in the last digits, as they would between two CPUs.) The
+hang is a torch bug in batched solves of matrices larger than 128x128 on MKL's AVX-512
+path. ffs routes its own solves around it, but code that calls `torch.linalg.solve` on
+such a batch directly, in the same process, can hit it.
+
+
 
 A plain `pip install` on Linux pulls the CUDA build of torch, which brings the `nvidia-*`
 and `cuda-*` packages with it. They do no harm, but a machine without a GPU can't use them.

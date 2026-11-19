@@ -47,6 +47,13 @@ __version__ = "0.1.0"
 # fell back needs to be able to turn it off.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+# On an AVX-512 AMD CPU, restart an ffs_* CLI once with the MKL dispatch shim
+# preloaded (2-6x on torch's BLAS); a no-op everywhere else, and in notebooks.
+# Same before-torch constraint as above. FFS_NO_SHIM=1 turns it off.
+from fastfuncstuff._mkl_shim import maybe_reexec as _maybe_reexec  # noqa: E402
+
+_maybe_reexec()
+
 # Every public name, mapped to the (module, attribute) it lives in. Importing
 # them eagerly meant that `import fastfuncstuff.<anything>` -- a header read, a
 # CLI --help -- paid ~4 s to bring up torch, scipy, sympy and matplotlib. They

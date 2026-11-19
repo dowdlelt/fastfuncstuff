@@ -3,9 +3,9 @@
  * MKL picks its code path from mkl_serv_cpu_detect(), and on a non-Intel CPU
  * that answers "AVX2" whatever the hardware supports. On a 32-CPU EPYC 9555
  * (Zen 5, full-width AVX-512) that left torch's float64 GEMM at 58 GFLOP/s per
- * core against OpenBLAS's 109 on the same box. The pip torch wheel links MKL
- * into libtorch_cpu.so, so the classic mkl_serv_intel_cpu_true override cannot
- * reach it -- but mkl_serv_cpu_detect is called through the PLT, so an
+ * core against OpenBLAS's 109 on the same box; with this preloaded it ran 135.
+ * The pip torch wheel links MKL into libtorch_cpu.so, so the classic
+ * mkl_serv_intel_cpu_true override cannot reach it -- but mkl_serv_cpu_detect is called through the PLT, so an
  * LD_PRELOAD definition wins.
  *
  * 7 is what MKL's own detection returns on an AVX-512 Intel CPU (measured on a
@@ -16,10 +16,11 @@
  * without AVX-512 changes nothing. FFS_MKL_CPU_CODE=<n> overrides the value for
  * experiments.
  *
- * Build and A/B:
- *   gcc -O2 -shared -fPIC -o scripts/mkl_force_avx512.so scripts/mkl_force_avx512.c -ldl
+ * The ffs_* tools compile and preload this themselves on AVX-512 AMD CPUs
+ * (fastfuncstuff/_mkl_shim.py; FFS_NO_SHIM=1 turns it off). To A/B by hand:
+ *   so=$(python -c 'from fastfuncstuff._mkl_shim import built_library as b; print(b())')
  *   python scripts/bench_cpu_host.py --json base.json
- *   LD_PRELOAD=$PWD/scripts/mkl_force_avx512.so python scripts/bench_cpu_host.py --json shim.json
+ *   LD_PRELOAD=$so python scripts/bench_cpu_host.py --json shim.json
  *   python scripts/bench_cpu_host.py --compare base.json shim.json
  *
  * Results change in the last bits (different kernels, different summation

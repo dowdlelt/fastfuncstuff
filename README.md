@@ -282,7 +282,10 @@ Frank efficiency). See `docs/` for details.
 ### PyTorch, CPU and Mac MPS
 
 The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
-`OMP_NUM_THREADS`. On Apple Silicon you no longer have to choose: **`-device auto`
+`OMP_NUM_THREADS`. On AMD CPUs with AVX-512 (Zen 4/5) the `ffs_*` tools also put
+torch's MKL on its AVX-512 kernels, which it otherwise reserves for Intel (2-6x on matrix
+work); see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#amd-servers-the-mkl-speed-shim-ffs_no_shim)
+to turn it off. On Apple Silicon you no longer have to choose: **`-device auto`
 (the default) picks MPS**, and the toolbox routes the individual operations that
 Metal handles badly back to the CPU for you. Two mechanisms do that:
 

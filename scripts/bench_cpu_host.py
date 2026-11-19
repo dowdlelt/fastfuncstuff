@@ -796,8 +796,10 @@ def observations(info: dict, scaling: list[dict], jobs: list[dict]) -> list[str]
             )
         elif "avx512f" in info["isa"]:
             notes.append(
-                "torch's MKL picks AVX2 kernels on non-Intel CPUs; this one has AVX-512. A/B with"
-                " LD_PRELOAD=scripts/mkl_force_avx512.so (see scripts/mkl_force_avx512.c)"
+                "torch's MKL picks AVX2 kernels on non-Intel CPUs; this one has AVX-512. ffs_* tools"
+                " preload a fix themselves (fastfuncstuff/_mkl_shim.py); this script does not, so"
+                " A/B it with LD_PRELOAD=$(python -c 'from fastfuncstuff._mkl_shim import"
+                " built_library as b; print(b())')"
             )
     if info.get("torch_batched_lu_hangs"):
         notes.append(
