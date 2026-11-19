@@ -306,6 +306,16 @@ def _set_affinity_all_threads(cpus: set[int]) -> None:
             pass
 
 
+def _cpu_quota() -> float | None:
+    try:
+        from fastfuncstuff.utils import cgroup_cpu_quota
+
+        return cgroup_cpu_quota()
+    except ImportError:  # running without ffs installed: top-level cgroup v2 only
+        raw = (_read("/sys/fs/cgroup/cpu.max") or "max").split()
+        return None if raw[0] == "max" else int(raw[0]) / int(raw[1] if len(raw) > 1 else 100000)
+
+
 def host_report() -> dict:
     import numpy as np
     import scipy.linalg  # noqa: F401 -- loads scipy's BLAS so threadpoolctl sees it
@@ -383,10 +393,15 @@ def host_report() -> dict:
     except ImportError:
         info["threadpools"] = "threadpoolctl not installed"
 
+    info["cgroup_cpu_quota"] = _cpu_quota()
+    # A container quota (Kubernetes cpu limit) hides nothing from nproc or the
+    # affinity mask, but threads past it get the whole process frozen each
+    # period -- so the quota, not the core count, is how far to push.
+    q = info["cgroup_cpu_quota"]
+    info["usable_cores"] = min(len(topo), max(1, int(q))) if q else len(topo)
     try:
-        from fastfuncstuff.utils import cgroup_cpu_quota, resolve_cpu_threads
+        from fastfuncstuff.utils import resolve_cpu_threads
 
-        info["cgroup_cpu_quota"] = cgroup_cpu_quota()
         n, src = resolve_cpu_threads()
         info["ffs_default_threads"] = f"{n} ({src})"
     except Exception as exc:  # noqa: BLE001 -- the report must not die on an ffs import
@@ -412,6 +427,7 @@ def print_host(info: dict) -> None:
     )
     print(
         f"  allocator={info['allocator']}   cgroup quota={info.get('cgroup_cpu_quota')}"
+        f" -> testing up to {info['usable_cores']} cores"
         f"   ffs default threads={info['ffs_default_threads']}"
     )
     print(
@@ -639,7 +655,7 @@ def _kernel_gib(name: str, quick: bool) -> float:
 
 def observations(info: dict, scaling: list[dict], jobs: list[dict]) -> list[str]:
     notes = []
-    n_phys = info["physical_cores"]
+    n_phys = info["usable_cores"]
     by = {(r["kernel"], r["threads"]): r for r in scaling}
     for name in dict.fromkeys(r["kernel"] for r in scaling):
         r1 = by.get((name, 1))
@@ -760,6 +776,11 @@ def main() -> None:
     ap.add_argument(
         "--min-time", type=float, default=0.3, help="min seconds of repeats per scaling point"
     )
+    ap.add_argument(
+        "--max-cpus",
+        type=int,
+        help="never use more than this many cores (default: the cgroup CPU quota, else all)",
+    )
     ap.add_argument("--pin-scaling", action="store_true", help="pin T threads to the first T cores")
     ap.add_argument("--no-pin-jobs", action="store_true", help="let the OS place job processes")
     ap.add_argument("--skip-scaling", action="store_true")
@@ -777,7 +798,17 @@ def main() -> None:
     info = host_report()
     print_host(info)
     topo = cpu_topology()
-    n_phys, n_log = len(topo), info["logical_cpus"]
+    n_all = len(topo)
+    n_phys = min(info["usable_cores"], args.max_cpus or n_all)
+    info["usable_cores"] = n_phys
+    # Contiguous in L3/NUMA order, so a capped run fills whole CCDs / nodes
+    # rather than one core from each.
+    topo = topo[:n_phys]
+    # SMT siblings are only worth testing when nothing caps us below the full
+    # core count; under a quota extra threads just oversubscribe it.
+    n_log = info["logical_cpus"] if n_phys == n_all else n_phys
+    if n_phys < n_all:
+        print(f"\n  using {n_phys} of {n_all} cores (cgroup quota / --max-cpus)")
 
     if args.threads:
         thread_counts = [int(t) for t in args.threads.split(",")]
