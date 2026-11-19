@@ -593,12 +593,16 @@ class TissueFollowingSampler:
         # frame's own offset, which is exactly the frozen path's time grid.
         delta = {f: self._delta_of(f) for f in frames}
         delta_ref = delta[frame_idx]
-        weights = {
-            f: temporal_kernel_weights(
-                (frame_idx - f) + (self.tzero - delta_ref) / self.tr, self.tinterp
-            )
-            for f in frames
-        }
+        # One stacked evaluation for every tap: the taps differ only by an integer
+        # frame offset, and the kernel is a ~25-op elementwise chain, so per-tap
+        # calls were 11x the launches for the same arithmetic -- 5.4 s of host
+        # time on a 5-run nwarp (ffs_benchmark -audit idle). Same values per
+        # element: an integer offset is exact in float32 either way.
+        base = (self.tzero - delta_ref) / self.tr
+        offsets = torch.arange(frame_idx - f_lo, frame_idx - f_hi - 1, -1, device=base.device)
+        offsets = offsets.to(base.dtype).reshape(-1, *([1] * base.dim()))
+        stacked = temporal_kernel_weights(offsets + base, self.tinterp)
+        weights = dict(zip(frames, stacked.unbind(0), strict=True))
         # Every tap, with no "is its weight all zero?" check: that check is a host
         # sync per tap (eleven a frame), which stalls the GPU queue, while a zero
         # weight adds exactly 0 and its warp is cached for the neighbouring frames.
