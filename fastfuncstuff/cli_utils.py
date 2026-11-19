@@ -5374,7 +5374,7 @@ def run_batch_jobs(
 
     from tqdm import tqdm
 
-    from fastfuncstuff.io.afni import _history_commandline, history_commandline
+    from fastfuncstuff.io.afni import _history_commandline, deferred_writes, history_commandline
 
     outer_commandline = _history_commandline()
     if verb >= 1:
@@ -5385,6 +5385,12 @@ def run_batch_jobs(
     t0 = time.time()
     desc = f"{tool.removeprefix('ffs_')} batch"
     bar = tqdm(jobs, desc=desc, unit="run", leave=True, disable=len(jobs) == 1)
+    # One run's outputs encode and write on a background thread while the next
+    # run computes: each write used to leave the GPU idle (ffs -audit idle put
+    # ~8 s of a 5-run locomoco batch there). Runs are independent, and a run's
+    # own read of a file still being written waits for it.
+    writes = contextlib.ExitStack()
+    drain = writes.enter_context(deferred_writes()) if len(jobs) > 1 else None
     for label, line in bar:
         try:
             run_args = parse_line(line, _run_defaults(defaults))
@@ -5404,6 +5410,7 @@ def run_batch_jobs(
             with history_commandline(f"{tool} {line}  [batch: {outer_commandline}]"):
                 dispatch(run_args, device)
         except KeyboardInterrupt:
+            writes.close()  # finish what was written; never leave the writer installed
             raise
         except (Exception, SystemExit) as exc:
             # A bad run must not sink the batch. The underlying error has usually
@@ -5417,6 +5424,10 @@ def run_batch_jobs(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+    if drain is not None:
+        for path, exc in drain():
+            failures.append((os.path.basename(path), f"write failed: {exc}"))
+    writes.close()
     if verb >= 1:
         ok = len(jobs) - len(failures) - skipped
         tail = f", {skipped} skipped" if skipped else ""

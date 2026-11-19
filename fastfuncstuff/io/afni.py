@@ -143,6 +143,113 @@ from fastfuncstuff.utils import (
 _BIG_WRITE_BYTES = 256 << 20
 
 
+class _DeferredWrites:
+    """One writer thread that encodes and writes NIfTIs while the caller computes.
+
+    Inside :func:`deferred_writes`, :func:`save_nifti` builds the header (history
+    note included) on the calling thread and hands this the reorder into file
+    order and the encode/write. ``max_bytes`` bounds the arrays held for pending
+    writes; past it a save blocks until the writer catches up.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        import threading
+
+        self.max_bytes = max_bytes
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ffs-write")
+        self.cond = threading.Condition()
+        self.bytes = 0
+        self.pending: dict[str, Future] = {}
+        self.errors: list[tuple[str, BaseException]] = []
+
+    def submit(self, path: str, nbytes: int, fn) -> None:
+        with self.cond:
+            while self.bytes and self.bytes + nbytes > self.max_bytes:
+                self.cond.wait()
+            self.bytes += nbytes
+
+        def run() -> None:
+            try:
+                fn()
+            except BaseException as exc:
+                with self.cond:
+                    self.errors.append((path, exc))
+                raise
+            finally:
+                with self.cond:
+                    self.bytes -= nbytes
+                    self.cond.notify_all()
+
+        fut = self.pool.submit(run)
+        with self.cond:
+            self.pending[path] = fut
+
+    def wait_for(self, path: str) -> None:
+        with self.cond:
+            fut = self.pending.get(path)
+        if fut is not None:
+            with contextlib.suppress(BaseException):
+                fut.result()  # its error is reported by drain()
+
+    def drain(self) -> list[tuple[str, BaseException]]:
+        with self.cond:
+            futs = list(self.pending.values())
+        for fut in futs:
+            with contextlib.suppress(BaseException):
+                fut.result()
+        with self.cond:
+            self.pending.clear()
+            errors, self.errors = self.errors, []
+        return errors
+
+
+_deferred: _DeferredWrites | None = None
+
+
+def _pending_key(path: str | Path) -> str:
+    return os.path.abspath(str(path))
+
+
+@contextlib.contextmanager
+def deferred_writes(max_bytes: int | None = None):
+    """Write NIfTIs in the background while the caller goes on computing.
+
+    For loops of independent jobs (``cli_utils.run_batch_jobs``): one job's
+    outputs encode and hit the disk while the next job's GPU work runs, where
+    each write used to leave the GPU idle. Yields a ``drain()`` that waits for
+    every pending write and returns ``(path, exception)`` for those that failed;
+    leaving the block drains too. :func:`load_nifti` of a path still being
+    written waits for it.
+
+    The contract is ownership: an array handed to :func:`save_nifti` here must
+    not be modified afterwards, since the write may not have read it yet.
+    Nested use joins the outer writer.
+    """
+    global _deferred
+    if _deferred is not None:
+        yield _deferred.drain
+        return
+    if max_bytes is None:
+        import torch
+
+        from fastfuncstuff.memory import get_available_memory
+
+        # Held arrays are full outputs (a 4-D series is a GB); a quarter of free
+        # RAM keeps a run or two in flight without competing with the next one.
+        max_bytes = max(1 << 30, int(get_available_memory(torch.device("cpu")) // 4))
+    writer = _DeferredWrites(max_bytes)
+    _deferred = writer
+    try:
+        yield writer.drain
+    finally:
+        _deferred = None
+        errors = writer.drain()
+        writer.pool.shutdown(wait=True)
+        if errors:
+            path, exc = errors[0]
+            raise OSError(f"{len(errors)} deferred write(s) failed; first {path}: {exc}") from exc
+
+
 @functools.lru_cache(maxsize=1)
 def _require_zstd() -> None:
     """Raise unless a usable ``zstd`` is on PATH.
@@ -427,6 +534,8 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
     """
     # Parse sub-brick selector before resolving the path
     clean_path, indices = parse_subbrick_selector(str(filepath))
+    if _deferred is not None:
+        _deferred.wait_for(_pending_key(clean_path))  # our own background write
     filepath = Path(_afni_head_path(clean_path))
 
     if not filepath.exists():
@@ -4071,6 +4180,26 @@ def save_nifti(
 
     # Create NIfTI image (NIfTI-2 when the header is: see the dims check above)
     cls = nib.Nifti2Image if isinstance(header, nib.Nifti2Header) else nib.Nifti1Image
+    writer = _deferred
+    if writer is not None:
+        # Everything above read process state (the history note, space codes) and
+        # had to happen now; the reorder and the encode can happen while the caller
+        # computes. See deferred_writes for the ownership contract.
+        writer.submit(
+            _pending_key(output_path),
+            int(data.nbytes),
+            lambda: _finish_nifti_write(
+                cls, data, affine, header, scode, qcode, tr, output_path, quiet=True
+            ),
+        )
+        return
+    _finish_nifti_write(cls, data, affine, header, scode, qcode, tr, output_path)
+
+
+def _finish_nifti_write(cls, data, affine, header, scode, qcode, tr, output_path, *, quiet=False):
+    """Build the image from a prepared header and write it: save_nifti's second half."""
+    import nibabel as nib
+
     img = cls(_to_file_order(data), affine, header=header)
 
     # Write BOTH forms from the affine we were handed. nibabel only touches the
@@ -4121,7 +4250,7 @@ def save_nifti(
     # the callers that wrap their own saves. CLI spinner contexts suppress it entirely
     # and provide their own live status + timing.
     _nbytes = int(data.nbytes)
-    if _nbytes >= _BIG_WRITE_BYTES and not io_progress_suppressed():
+    if _nbytes >= _BIG_WRITE_BYTES and not quiet and not io_progress_suppressed():
         with spinner(f"Writing {out.name} ({_nbytes / 1e9:.2f} GB)"):
             _do_write()
     else:
