@@ -5921,6 +5921,13 @@ def build_ljung_box_tau(
     return out.to(device) if device is not None else out
 
 
+def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host tensor to *device* without blocking: a pageable copy to CUDA waits for the stream."""
+    if device.type != "cuda":
+        return t.to(device)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def _ljung_box_batched(
     resid: torch.Tensor,
     max_lag: int | None = None,
@@ -5956,27 +5963,42 @@ def _ljung_box_batched(
     sum0 = torch.where(ok, sum0, torch.ones_like(sum0))
 
     sumk = torch.zeros(n_vox, hh + 1, dtype=torch.float64, device=r.device)
-    nj = torch.zeros(hh + 1, dtype=torch.long, device=r.device)
-
-    if tau is not None:
-        tau = tau.to(device=r.device, dtype=torch.long).flatten()
-
-    for kk in range(1, hh + 1):
-        prod = r[:, : n_time - kk] * r[:, kk:]
-        if tau is None:
-            sumk[:, kk] = prod.sum(dim=1)
+    # The binning depends only on tau, never on the residuals, so it is worked
+    # out on the host: done on the device it cost three syncs per lag (any(),
+    # and two boolean gathers), thousands per GLM.
+    nj = torch.zeros(hh + 1, dtype=torch.long)
+    bins: list[tuple[int, torch.Tensor, torch.Tensor] | tuple[int, None, None]] = []
+    if tau is None:
+        for kk in range(1, hh + 1):
             nj[kk] = n_time - kk
-        else:
+            bins.append((kk, None, None))
+    else:
+        tau_h = tau.detach().to(device="cpu", dtype=torch.long).flatten()
+        picks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+        for kk in range(1, hh + 1):
             # Bin by *time* lag dj, not index lag kk: one index lag can scatter
             # across several bins once censoring stretches the gaps, and pairs
             # further apart than hh (including every cross-run pair) drop out.
-            dj = tau[kk:] - tau[: n_time - kk]
-            keep = (dj > 0) & (dj <= hh)
-            if not bool(keep.any()):
-                continue
-            dj = dj[keep]
-            sumk.index_add_(1, dj, prod[:, keep])
-            nj.index_add_(0, dj, torch.ones_like(dj))
+            dj = tau_h[kk:] - tau_h[: n_time - kk]
+            keep = ((dj > 0) & (dj <= hh)).nonzero().flatten()
+            if keep.numel():
+                picks.append((kk, keep, dj[keep]))
+                nj.index_add_(0, dj[keep], torch.ones_like(keep))
+        if picks:
+            # One host->device copy for every lag's indices, then views.
+            flat = _to_device_async(torch.cat([torch.cat([k, d]) for _, k, d in picks]), r.device)
+            off = 0
+            for kk, k, _ in picks:
+                n = k.numel()
+                bins.append((kk, flat[off : off + n], flat[off + n : off + 2 * n]))
+                off += 2 * n
+
+    for kk, keep_d, dj_d in bins:
+        prod = r[:, : n_time - kk] * r[:, kk:]
+        if keep_d is None:
+            sumk[:, kk] = prod.sum(dim=1)
+        else:
+            sumk.index_add_(1, dj_d, prod.index_select(1, keep_d))
 
     # AFNI requires nj > 1 (not > 0) before a bin contributes.
     good = nj > 1
@@ -5984,8 +6006,10 @@ def _ljung_box_batched(
     if not bool(good.any()):
         return zeros
 
-    ck = sumk[:, good] / sum0.unsqueeze(1)
-    gsum = (ck.pow(2) / nj[good].to(torch.float64)).sum(dim=1) * (n_time * (n_time + 2.0))
+    good_idx = good.nonzero().flatten()
+    ck = sumk[:, _to_device_async(good_idx, r.device)] / sum0.unsqueeze(1)
+    nj_good = _to_device_async(nj[good_idx].to(torch.float64), r.device)
+    gsum = (ck.pow(2) / nj_good).sum(dim=1) * (n_time * (n_time + 2.0))
     return torch.where(ok, gsum.clamp(max=1.0e10), torch.zeros_like(gsum))
 
 

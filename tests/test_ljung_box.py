@@ -262,3 +262,26 @@ class TestRvarOutput:
         res.reml_likelihood = torch.rand(8)
         with pytest.warns(UserWarning, match="LjungBox"):
             save_arma_rvar(res, tmp_path / "rvar.nii.gz", volume_shape=(2, 2, 2))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_batched_ljung_box_is_sync_free_on_cuda_and_matches_cpu():
+    from fastfuncstuff.glm.arma import _ljung_box_batched
+
+    gen = torch.Generator().manual_seed(0)
+    resid = torch.randn(300, 240, generator=gen, dtype=torch.float64)
+    tau = torch.cat([torch.arange(120), 66666 + torch.arange(120)])
+    tau = tau[torch.rand(240, generator=gen) > 0.1]  # censored: uneven gaps
+    resid = resid[:, : tau.numel()]
+    expect = _ljung_box_batched(resid, 20, tau)
+    r_cuda = resid.cuda()
+    torch.cuda.synchronize()
+    # The lag binning used to cost three host syncs per lag; "error" makes any
+    # implicit sync inside the call raise.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = _ljung_box_batched(r_cuda, 20, tau)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.testing.assert_close(got.cpu(), expect, rtol=1e-10, atol=1e-8)
