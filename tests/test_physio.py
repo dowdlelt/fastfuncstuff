@@ -663,7 +663,9 @@ def test_cli_drops_unfound_cardiac_from_the_nuisance_and_keeps_the_slibase(tmp_p
     from fastfuncstuff.cli.physio import main
     from fastfuncstuff.design.slibase import load_1d_matrix
 
-    mag, ph, st = _vascular_run(nt=200, heart=False)
+    # The subject is the drop/keep wiring, so a seed where nothing is found: noise
+    # passes the 90-derangement test about 1 run in 100 (seed 1 here, 1 of 83 seeds).
+    mag, ph, st = _vascular_run(nt=200, heart=False, seed=2)
     nib.save(nib.Nifti1Image(mag, np.eye(4)), tmp_path / "run_mag.nii.gz")
     nib.save(nib.Nifti1Image(ph, np.eye(4)), tmp_path / "run_ph.nii.gz")
     (tmp_path / "run_mag.json").write_text(
