@@ -73,13 +73,13 @@ def split_masks(mask: np.ndarray, split_axis: int) -> list[np.ndarray]:
 
 
 def constant_modulus_traces(
-    G: torch.Tensor, n_keep: int = CM_KEEP, seed: int = 0
+    G: torch.Tensor, n_keep: int = CM_KEEP, seed: int = 0, k: int | None = None
 ) -> list[tuple[float, np.ndarray]]:
     """The ``n_keep`` most constant-modulus complex traces from the Gram ``G``, best
     first, as (E[r^4] / E[r^2]^2, c). The ratio is 2 for a Gaussian pair, 1 for a pure
     rotating phasor. Distinct subspaces only (smallest principal cosine < 0.9)."""
     nt = G.shape[0]
-    k = cm_components(nt)
+    k = cm_components(nt) if k is None else k
     _, evecs = plinalg.eigh(G)
     X = evecs[:, -k:].T.flip(0) * math.sqrt(nt)  # whitened (k, nt)
     # Starts: every pair of principal axes (the heartbeat is often nearly one, and the
@@ -144,15 +144,15 @@ def unwrap_around_rate(steps: np.ndarray, tr: float, window_s: float = 60.0) -> 
     return ref + np.angle(u * np.exp(-1j * ref))
 
 
-def excitation_phase(c: np.ndarray, times: np.ndarray, tr: float) -> np.ndarray:
+def excitation_phase(c: np.ndarray, times: np.ndarray, tr: float, mid: float = 1.3) -> np.ndarray:
     """(nt, G) phase at the excitation times from a volume-rate complex trace, on the
-    alias step nearest mid-band (the alias is chosen afterwards from slice timing).
+    alias step nearest ``mid`` Hz (the alias is chosen afterwards from slice timing).
     The trace belongs to no single slice; it is placed at each volume's mean time."""
     steps = unwrap_around_rate(np.angle(c[1:] * np.conj(c[:-1])), tr)
     theta = np.angle(c[0]) + np.concatenate([[0.0], np.cumsum(steps)])
     tv = times.mean(1)
     f_alias = (theta[-1] - theta[0]) / (2 * np.pi * (tv[-1] - tv[0]))
-    step = int(np.round((1.3 - f_alias) * tr))
+    step = int(np.round((mid - f_alias) * tr))
     slope = np.gradient(theta, tv)
     phase = np.interp(times.ravel(), tv, theta).reshape(times.shape)
     lo, hi = times < tv[0], times > tv[-1]  # extrapolate, don't clamp
