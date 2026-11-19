@@ -26,6 +26,7 @@ from torch import Tensor
 from fastfuncstuff.memory import get_available_memory
 
 from .cost import _separable_smooth_3d
+from .interp import _grid_sample_3d
 from .mask import _quantile
 
 
@@ -81,9 +82,12 @@ def _suppress_non_maxima(mag: Tensor, step: tuple[Tensor, ...]) -> Tensor:
                 ],
                 dim=-1,
             )[None]
-            neighbour = F.grid_sample(
-                src, grid, mode="bilinear", padding_mode="border", align_corners=True
-            )[0, 0]
+            if nd == 3:  # the wrapper threads an N=1 volume; stock runs it on one core
+                neighbour = _grid_sample_3d(src, grid, "bilinear", align_corners=True)[0, 0]
+            else:
+                neighbour = F.grid_sample(
+                    src, grid, mode="bilinear", padding_mode="border", align_corners=True
+                )[0, 0]
             # >= on one side and > on the other: a plateau two voxels wide keeps one.
             keep &= mag[a0:a1] >= neighbour if sign > 0 else mag[a0:a1] > neighbour
         out[a0:a1] = torch.where(keep, mag[a0:a1], out[a0:a1])

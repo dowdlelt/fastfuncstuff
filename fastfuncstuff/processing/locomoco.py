@@ -51,6 +51,7 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
 from tqdm import tqdm
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff.processing.interp import _grid_sample_3d
 from fastfuncstuff.utils import replicate_pad_3d
 
 from ..utils import get_device, linalg_device, to_linalg_f64
@@ -2772,13 +2773,8 @@ def _warp3d_pull(
     # grid_sample wants (N,D,H,W,3) with the last-axis order (x_w, y_h, z_d); our
     # (nx,ny,nz) maps to (W=nx, H=ny, D=nz), so permute to (nz,ny,nx) and stack (gx,gy,gz).
     grid = torch.stack([gx, gy, gz], dim=-1).permute(2, 1, 0, 3).unsqueeze(0)
-    out = F.grid_sample(
-        vol.permute(2, 1, 0)[None, None],
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
-    )
+    # Through the wrapper: stock grid_sample threads an N=1 volume on one core.
+    out = _grid_sample_3d(vol.permute(2, 1, 0)[None, None], grid, "bilinear", align_corners=True)
     return out[0, 0].permute(2, 1, 0).contiguous()
 
 
