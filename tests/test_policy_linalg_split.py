@@ -184,3 +184,59 @@ def test_a_forked_child_builds_its_own_pool(monkeypatch):
     first = P._lane_pool(4)
     monkeypatch.setattr(P.os, "getpid", lambda: -12345)
     assert P._lane_pool(4) is not first
+
+
+def test_lanes_do_not_open_their_own_thread_teams():
+    # Each lane's ATen/MKL call used to open a full OpenMP team: six lanes on six
+    # cores peaked at 36 running threads, which a container CPU quota punishes by
+    # freezing the process. A lane must report one OpenMP thread of its own.
+    import ctypes
+
+    setters = P._thread_local_setters()
+    if not setters:
+        pytest.skip("no OpenMP runtime found in /proc/self/maps")
+    import re
+
+    with open("/proc/self/maps") as fh:
+        path = sorted(set(re.findall(r"(/\S*lib(?:gomp|iomp5|omp)[\w.-]*\.so[\w.]*)", fh.read())))[
+            0
+        ]
+    get_max = ctypes.CDLL(path).omp_get_max_threads
+    assert P._lane_pool(4).submit(get_max).result() == 1
+
+
+@pytest.mark.parametrize("op", ["solve", "inv", "det", "slogdet", "lu_factor"])
+def test_batched_lu_past_the_hang_size_always_takes_the_lanes(op, splits, monkeypatch):
+    # torch 2.14.1's multi-threaded batched getrf hangs once k > 128, even for a
+    # batch of two. The guard must engage below every speed threshold and with
+    # the speed switch off.
+    monkeypatch.setattr(P, "_SPLIT_MIN_WORK_DEFAULT", 1e30)
+    monkeypatch.setenv("FFS_LINALG_SPLIT", "0")
+    a = _spd((2,), P._LU_HANG_K + 8)
+    b = _rhs((2, P._LU_HANG_K + 8, 1))
+    call = {
+        "solve": lambda: P.solve(a, b),
+        "inv": lambda: P.inv(a),
+        "det": lambda: P.det(a),
+        "slogdet": lambda: P.slogdet(a),
+        "lu_factor": lambda: P.lu_factor(a),
+    }[op]
+    got = call()
+    assert splits
+    torch.set_num_threads(1)  # the real thread count; one thread cannot hang
+    want = {
+        "solve": lambda: torch.linalg.solve(a, b),
+        "inv": lambda: torch.linalg.inv(a),
+        "det": lambda: torch.linalg.det(a),
+        "slogdet": lambda: torch.linalg.slogdet(a),
+        "lu_factor": lambda: torch.linalg.lu_factor(a),
+    }[op]()
+    assert _identical(want, got)
+
+
+def test_lu_guard_runs_an_unmirrorable_broadcast_in_one_lane(splits):
+    a = _spd((2, 3), P._LU_HANG_K + 8)
+    b = _rhs((1, 3, P._LU_HANG_K + 8, 1))  # broadcasts over the first batch dim
+    got = P.solve(a, b)
+    assert splits
+    torch.testing.assert_close(got, torch.linalg.solve(a, b.expand(2, -1, -1, -1)))
