@@ -284,8 +284,6 @@ def _load(path: str, collapse: str | None = None) -> tuple[np.ndarray, np.ndarra
     arr = np.asarray(img.dataobj, dtype=np.float32)
     if collapse is not None and arr.ndim == 4:
         if collapse == "median":
-            import torch
-
             from fastfuncstuff.processing.censor import afni_median
 
             # np.median's convention (mean of the middle two), 2.5x faster on a

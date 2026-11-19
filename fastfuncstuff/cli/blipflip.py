@@ -518,8 +518,6 @@ def _load_volume(path: str, collapse: str) -> tuple[torch.Tensor, np.ndarray, ob
     arr = np.asarray(img.dataobj, dtype=np.float32)  # (nx, ny, nz[, t])
     if arr.ndim == 4:
         if collapse == "median":
-            import torch
-
             from fastfuncstuff.processing.censor import afni_median
 
             # np.median's convention (mean of the middle two), 2.5x faster on a
