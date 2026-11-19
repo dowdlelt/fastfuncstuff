@@ -1,0 +1,127 @@
+{
+  "source": "/tmp/claude-1000/-home-logan-Dropbox-Resources-code-fastfuncstuff/97a614c4-0eaa-4d1d-b9a1-97d131f5410a/scratchpad/le_dev3.jsonl",
+  "runs": [
+    {
+      "run": "tf.ses-01.mvpsA7",
+      "prior_evaluation_best_lock": 0.9729940847929938,
+      "chosen": {
+        "start": "ica@0.086",
+        "hr": 66.08658188966228,
+        "alignment": 0.4427970716653987,
+        "shuffled": 0.21890587961297364,
+        "harmonic": 0.17687619491469941,
+        "harmonic_null": 0.33905247130302196,
+        "lock": 0.9671759783475903
+      },
+      "best_candidate": {
+        "start": "mean",
+        "hr": 66.06662985392353,
+        "alignment": 0.4411923407659149,
+        "shuffled": null,
+        "harmonic": null,
+        "harmonic_null": null,
+        "lock": 0.9729940847929938
+      },
+      "diagnosis": "usable candidate rejected by harmonic check"
+    },
+    {
+      "run": "tf.ses-01.rest1",
+      "prior_evaluation_best_lock": 0.9596106779714406,
+      "chosen": {
+        "start": "mean",
+        "hr": 66.31255805768913,
+        "alignment": 0.42577977202349615,
+        "shuffled": 0.20786888473670043,
+        "harmonic": 0.051769002223087245,
+        "harmonic_null": 0.16638312201476338,
+        "lock": 0.9596106779714406
+      },
+      "best_candidate": {
+        "start": "mean",
+        "hr": 66.31255805768913,
+        "alignment": 0.42577977202349615,
+        "shuffled": 0.20786888473670043,
+        "harmonic": 0.051769002223087245,
+        "harmonic_null": 0.16638312201476338,
+        "lock": 0.9596106779714406
+      },
+      "diagnosis": "usable candidate rejected by harmonic check"
+    },
+    {
+      "run": "tf.ses-09.mdtb11",
+      "prior_evaluation_best_lock": 0.9200354398564783,
+      "chosen": {
+        "start": "mean",
+        "hr": 64.91599413094431,
+        "alignment": 0.4690118204954467,
+        "shuffled": 0.23721099990145367,
+        "harmonic": 0.12720963687412515,
+        "harmonic_null": 0.2901774169123893,
+        "lock": 0.9200354398564783
+      },
+      "best_candidate": {
+        "start": "mean",
+        "hr": 64.91599413094431,
+        "alignment": 0.4690118204954467,
+        "shuffled": 0.23721099990145367,
+        "harmonic": 0.12720963687412515,
+        "harmonic_null": 0.2901774169123893,
+        "lock": 0.9200354398564783
+      },
+      "diagnosis": "usable candidate rejected by harmonic check"
+    },
+    {
+      "run": "tf.ses-09.mdtb5",
+      "prior_evaluation_best_lock": 0.9143547979831307,
+      "chosen": {
+        "start": "mean",
+        "hr": 64.91818096324047,
+        "alignment": 0.4638230849524654,
+        "shuffled": 0.24525884222854116,
+        "harmonic": 0.15789422912374496,
+        "harmonic_null": 0.24276383899834592,
+        "lock": 0.9143547979831307
+      },
+      "best_candidate": {
+        "start": "mean",
+        "hr": 64.91818096324047,
+        "alignment": 0.4638230849524654,
+        "shuffled": 0.24525884222854116,
+        "harmonic": 0.15789422912374496,
+        "harmonic_null": 0.24276383899834592,
+        "lock": 0.9143547979831307
+      },
+      "diagnosis": "usable candidate rejected by harmonic check"
+    },
+    {
+      "run": "tf.ses-02.mvpsA4",
+      "prior_evaluation_best_lock": 0.0030958843603916147,
+      "chosen": {
+        "start": "ica@0.359",
+        "hr": 37.40891430351732,
+        "alignment": 0.08937427277553048,
+        "shuffled": 0.18478385479355794,
+        "harmonic": 0.010213923440860416,
+        "harmonic_null": 0.04656899012237536,
+        "lock": 0.0030958843603916147
+      },
+      "best_candidate": {
+        "start": "ica@0.359",
+        "hr": 37.40891430351732,
+        "alignment": 0.08937427277553048,
+        "shuffled": 0.18478385479355794,
+        "harmonic": 0.010213923440860416,
+        "harmonic_null": 0.04656899012237536,
+        "lock": 0.0030958843603916147
+      },
+      "diagnosis": "no useful candidate generated",
+      "recorded_rate_per_min": 96.77419354838639,
+      "exclusions_covering_recorded_median": [
+        {
+          "centre_per_min": 97.06563706563693,
+          "half_width_per_min": 1.7999999999999998
+        }
+      ]
+    }
+  ]
+}

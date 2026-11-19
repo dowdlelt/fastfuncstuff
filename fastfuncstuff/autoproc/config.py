@@ -216,6 +216,29 @@ DEFAULT_GLM_FMT = ".gz"
 # A CUDA box keeps the loud failure when the card goes missing. A Mac has no card to
 # name, and each stage's own auto-detection already picks Metal or the CPU per op.
 DEFAULT_DEVICE = "auto" if sys.platform == "darwin" else "cuda"
+
+
+def nvidia_driver_present() -> bool:
+    """Whether this machine has an NVIDIA driver, checked without importing torch."""
+    import os
+    import shutil
+
+    return os.path.exists("/proc/driver/nvidia/version") or shutil.which("nvidia-smi") is not None
+
+
+def default_device() -> str:
+    """The DEVICE an unflagged script gets: cuda only where a card exists.
+
+    A box with no NVIDIA driver at all (a CPU server, a container without GPU
+    passthrough) would fail every stage on ``cuda`` within seconds, so it gets
+    ``auto`` instead. That is still CUDA if the script is later run on a GPU
+    node, but without the loud failure when a card goes missing.
+    """
+    if DEFAULT_DEVICE == "cuda" and not nvidia_driver_present():
+        return "auto"
+    return DEFAULT_DEVICE
+
+
 DEFAULT_FINAL_INTERP = "wsinc5"
 
 

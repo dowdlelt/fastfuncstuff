@@ -1,0 +1,43 @@
+{
+  "run": "on.ds002547.sub-04",
+  "recorded_rate_per_min": 56.2570888468811,
+  "estimated_respiration_per_min": 36.0,
+  "variants": {
+    "current": {
+      "alignment": 0.3601818038305304,
+      "shuffled_max": 0.22912377566245187,
+      "harmonic": 0.3009705040113013,
+      "harmonic_control_max": 0.12076571222737137,
+      "r2_median": 0.011858597787300917,
+      "r2_p99": 0.3087371376747126,
+      "fraction_r2_above_0p1": 0.0795142021077644
+    },
+    "no_resp_projection": {
+      "alignment": 0.39383932231996727,
+      "shuffled_max": 0.22260590459741028,
+      "harmonic": 0.29936866484519187,
+      "harmonic_control_max": 0.1166739759159868,
+      "r2_median": 0.01256991536070568,
+      "r2_p99": 0.3529578837712956,
+      "fraction_r2_above_0p1": 0.08871091945171723
+    },
+    "drift_only": {
+      "alignment": 0.43880748679175696,
+      "shuffled_max": 0.24540620236359448,
+      "harmonic": 0.3241486236966985,
+      "harmonic_control_max": 0.09773871928773657,
+      "r2_median": 0.012553641468948377,
+      "r2_p99": 0.43690816381282016,
+      "fraction_r2_above_0p1": 0.09634551495016612
+    },
+    "mean_only": {
+      "alignment": 0.45374629447060666,
+      "shuffled_max": 0.22434330628762233,
+      "harmonic": 0.32564407478369006,
+      "harmonic_control_max": 0.08669021702292326,
+      "r2_median": 0.006412258530364495,
+      "r2_p99": 0.3477366367540322,
+      "fraction_r2_above_0p1": 0.05911861125167763
+    }
+  }
+}

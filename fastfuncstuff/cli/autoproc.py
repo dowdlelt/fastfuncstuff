@@ -3247,6 +3247,13 @@ def main(argv: list[str] | None = None) -> int:
         opt.glm_fmt = args.glm_fmt
     if args.device is not None:
         opt.device = args.device
+    else:
+        opt.device = config.default_device()
+        if opt.device != config.DEFAULT_DEVICE:
+            print(
+                f"note: no NVIDIA driver on this machine, so DEVICE={opt.device} "
+                f"(not {config.DEFAULT_DEVICE}); pass -device to override"
+            )
 
     _report_events(args, opt, subject)
 

@@ -1,0 +1,101 @@
+{
+  "run": "on.ds002547.sub-07",
+  "nt": 523,
+  "k": 12,
+  "ref_hr": 67.94520547945262,
+  "subspaces": [
+    {
+      "rank": 0,
+      "cm_ratio": 1.0932889343907994,
+      "lock": 0.9761737559120548,
+      "lock_slice_time": 0.8108108108108109,
+      "lock_sign": -1,
+      "ramp_rate_bpm": 20.400000000000002,
+      "ramp_coherence": 0.10000204568157584
+    },
+    {
+      "rank": 1,
+      "cm_ratio": 1.307702532712228,
+      "lock": 0.4946819808775313,
+      "lock_slice_time": 0.8648648648648649,
+      "lock_sign": -1,
+      "ramp_rate_bpm": 0.8999999999999999,
+      "ramp_coherence": 0.33515925909712974
+    },
+    {
+      "rank": 2,
+      "cm_ratio": 1.316605446395604,
+      "lock": 0.47940920699491524,
+      "lock_slice_time": 0.918918918918919,
+      "lock_sign": 1,
+      "ramp_rate_bpm": 0.6,
+      "ramp_coherence": 0.7334375773284907
+    },
+    {
+      "rank": 3,
+      "cm_ratio": 1.3204028586662793,
+      "lock": 0.5186559499959229,
+      "lock_slice_time": 0.7567567567567568,
+      "lock_sign": -1,
+      "ramp_rate_bpm": 7.199999999999999,
+      "ramp_coherence": 0.6087944995729082
+    },
+    {
+      "rank": 4,
+      "cm_ratio": 1.3484952100567797,
+      "lock": 0.5176636780589766,
+      "lock_slice_time": 0.5945945945945946,
+      "lock_sign": -1,
+      "ramp_rate_bpm": 9.9,
+      "ramp_coherence": 0.6552678694561506
+    },
+    {
+      "rank": 5,
+      "cm_ratio": 1.357391200043347,
+      "lock": 0.5389946886819984,
+      "lock_slice_time": 0.7027027027027027,
+      "lock_sign": 1,
+      "ramp_rate_bpm": 0.3,
+      "ramp_coherence": 0.2662657684016811
+    },
+    {
+      "rank": 6,
+      "cm_ratio": 1.3661936338465903,
+      "lock": 0.5122268747676975,
+      "lock_slice_time": 0.8108108108108109,
+      "lock_sign": 1,
+      "ramp_rate_bpm": 0.0,
+      "ramp_coherence": 0.2230155032539869
+    },
+    {
+      "rank": 7,
+      "cm_ratio": 1.3742466756774638,
+      "lock": 0.5011333293275838,
+      "lock_slice_time": 0.7567567567567568,
+      "lock_sign": -1,
+      "ramp_rate_bpm": 13.5,
+      "ramp_coherence": 0.24876418292842659
+    },
+    {
+      "rank": 8,
+      "cm_ratio": 1.376868914020818,
+      "lock": 0.07638492237263123,
+      "lock_slice_time": 1.2972972972972974,
+      "lock_sign": 1,
+      "ramp_rate_bpm": 0.0,
+      "ramp_coherence": 0.9069378754798254
+    },
+    {
+      "rank": 9,
+      "cm_ratio": 1.390234171820862,
+      "lock": 0.510152534658764,
+      "lock_slice_time": 1.0810810810810811,
+      "lock_sign": 1,
+      "ramp_rate_bpm": 0.6,
+      "ramp_coherence": 0.2564315362232244
+    }
+  ],
+  "pca_pair_lock_max": 0.9216077461835922,
+  "random_lock_p95": 0.5161413934944749,
+  "random_lock_max": 0.7277324950915278
+}

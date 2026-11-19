@@ -1,0 +1,119 @@
+{
+  "run": "on.ds002547.sub-09",
+  "tr": 2.0,
+  "input": "/mnt/belegost/Data/nii_data/openneuro_physio/ds002547/sub-09/ses-1/func/sub-09_ses-1_task-other_bold.nii.gz",
+  "shuffled_time_seed": null,
+  "phase_mode": "direct",
+  "drop_resp_zones": true,
+  "ica": true,
+  "found": true,
+  "selected": {
+    "start": "ica@0.078",
+    "alignment": 0.33710771172511056,
+    "shuffled": 0.23356471951112928,
+    "harmonic": 0.3194468205726514,
+    "harmonic_null": 0.14294391017681218,
+    "lock": 0.8609723404183656,
+    "harmonic_lock": 0.6692464879255005,
+    "window_lock_median": 0.9307202097813917,
+    "outside_cardiac_band": 0.0005684460751382357,
+    "rate": 55.21656213342284
+  },
+  "recorded_rate_per_min": 55.41899441340876,
+  "final_alignment_floor": 0.2482958635188857,
+  "candidates": [
+    {
+      "start": "mean",
+      "alignment": 0.308507203444622,
+      "shuffled": NaN,
+      "harmonic": NaN,
+      "harmonic_null": NaN,
+      "lock": 0.850613690366266,
+      "harmonic_lock": 0.6535975025541083,
+      "window_lock_median": 0.9167569976256036,
+      "outside_cardiac_band": 0.002945584207534494,
+      "rate": 55.21689582556361
+    },
+    {
+      "start": "ica@0.086",
+      "alignment": 0.10271159929709993,
+      "shuffled": 0.26227220929816814,
+      "harmonic": 0.06550513077226004,
+      "harmonic_null": 0.09386940482316265,
+      "lock": 0.15323029847937683,
+      "harmonic_lock": 0.04017721197628521,
+      "window_lock_median": 0.21635549058713033,
+      "outside_cardiac_band": 0.0011368921502764714,
+      "rate": 65.30509334233582
+    },
+    {
+      "start": "ica@0.078",
+      "alignment": 0.33710771172511056,
+      "shuffled": 0.23356471951112928,
+      "harmonic": 0.3194468205726514,
+      "harmonic_null": 0.14294391017681218,
+      "lock": 0.8609723404183656,
+      "harmonic_lock": 0.6692464879255005,
+      "window_lock_median": 0.9307202097813917,
+      "outside_cardiac_band": 0.0005684460751382357,
+      "rate": 55.21656213342284
+    },
+    {
+      "start": "ica@0.195",
+      "alignment": 0.06621950687367144,
+      "shuffled": 0.3705538536517447,
+      "harmonic": 0.008588930836030422,
+      "harmonic_null": 0.09219385370230562,
+      "lock": 0.005005403794341831,
+      "harmonic_lock": 0.005155942295373079,
+      "window_lock_median": 0.061661134483700586,
+      "outside_cardiac_band": 0.0,
+      "rate": 79.48953710295895
+    },
+    {
+      "start": "ica@0.191",
+      "alignment": 0.06497676672795477,
+      "shuffled": 0.43865943753098213,
+      "harmonic": 0.012417451011421847,
+      "harmonic_null": 0.08312661342875363,
+      "lock": 0.04894267194811732,
+      "harmonic_lock": 0.012534785786946548,
+      "window_lock_median": 0.18020856299138244,
+      "outside_cardiac_band": 0.05772311508449176,
+      "rate": 49.678357989100235
+    }
+  ],
+  "fit_diagnostics": [
+    {
+      "success": true,
+      "iterations": 27,
+      "loss": 0.9840602754390211,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 44,
+      "loss": 1.0575159020629097,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 26,
+      "loss": 0.9888674606448721,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 61,
+      "loss": 0.958993480271364,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    },
+    {
+      "success": true,
+      "iterations": 53,
+      "loss": 0.9407215613448012,
+      "message": "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL"
+    }
+  ],
+  "seconds": 107.25037966482341
+}

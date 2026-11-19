@@ -422,3 +422,14 @@ def test_phasereg_without_phase_proc_is_refused(tmp_path, monkeypatch, capsys):
     assert rc != 0
     cap = capsys.readouterr()
     assert "-phasereg needs -phase_proc" in cap.out + cap.err
+
+
+def test_default_device_is_cuda_only_where_a_card_exists(monkeypatch):
+    """A CPU-only Linux server got DEVICE=cuda and every stage died in seconds."""
+    monkeypatch.setattr(config, "DEFAULT_DEVICE", "cuda")
+    monkeypatch.setattr(config, "nvidia_driver_present", lambda: True)
+    assert config.default_device() == "cuda"
+    monkeypatch.setattr(config, "nvidia_driver_present", lambda: False)
+    assert config.default_device() == "auto"
+    monkeypatch.setattr(config, "DEFAULT_DEVICE", "auto")  # the Mac default stands
+    assert config.default_device() == "auto"

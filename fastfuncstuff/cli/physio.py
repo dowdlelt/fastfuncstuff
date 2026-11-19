@@ -343,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
         )  # fmt: skip
         traces.cardiac = refined.trace
+        traces.cardiac_phase = refined.phase
         if verb >= 1:
             for lab, rate, align, null, harm, hnull in refined.tried:
                 shuf = (
@@ -354,9 +355,14 @@ def main(argv: list[str] | None = None) -> int:
             verdict = (
                 "FOUND" if refined.found else ("NOT FOUND" if refined.testable else "UNTESTABLE")
             )
+            stat = (
+                "fundamental + harmonic alignment"
+                if refined.method == "constant_modulus"
+                else "slice alignment"
+            )
             print(
                 f"  cardiac from {refined.n_voxels} voxels' best 1 %: {verdict} via {refined.start}, "
-                f"{refined.heart_rate_per_min:.1f}/min (slice alignment {refined.alignment:.2f} must beat "
+                f"{refined.heart_rate_per_min:.1f}/min ({stat} {refined.alignment:.2f} must beat "
                 f"every slice-time shuffle, best {refined.alignment_null:.2f}; harmonic "
                 f"{refined.harmonic:.2f} must beat {refined.harmonic_null:.2f}; halves {refined.split_half:.2f})"
             )
@@ -416,8 +422,15 @@ def main(argv: list[str] | None = None) -> int:
             "harmonic_alignment_null": refined.harmonic_null,
             "testable": bool(refined.testable),
             "slice_resolvability": refined.resolvability,
+            "method": refined.method,
             "rule": (
-                f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
+                f"constant-modulus starts: found = slice alignment of the phase plus of its second "
+                f"harmonic beats {physio.SLICE_PERMUTATIONS} slice-time derangements per start "
+                f"tried (all drawn for the kept start), re-choosing among the same aliases, and "
+                f"the harmonic beats its alignment at all {len(physio.HARMONIC_CONTROLS)} "
+                f"non-harmonic multiples"
+                if refined.method == "constant_modulus"
+                else f"found = slice alignment beats all {physio.SLICE_PERMUTATIONS} slice-time "
                 f"shuffles of each of up to {physio.PERMUTED_ANSWERS} distinct answers, and its "
                 f"second harmonic beats its alignment at all {len(physio.HARMONIC_CONTROLS)} non-harmonic multiples"
             ),
