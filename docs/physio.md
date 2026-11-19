@@ -1,10 +1,12 @@
 # `ffs_physio`: physiological noise from the data
 
-> **Experimental.** Off by default (`ffs_autoproc -physio` opts in). Respiration and the
-> cardiac machinery are validated on one dataset; cardiac *detection* never reported a wrong
-> heartbeat on 117 runs checked against recordings, but it finds few runs at TR ≥ 2 s and is
-> not yet trusted on all data. See *Limits*. Work in progress is recorded in the wiki note
-> *Slice-time alignment of the heartbeat* (section *Parked*).
+> **Experimental.** Off by default (`ffs_autoproc -physio` opts in). Cardiac detection was
+> checked against pulse recordings on 190 runs from seven datasets, TR 0.23–4 s. It found the
+> heartbeat in 173 and never reported a wrong heart rate. At TR ≥ 2 s outside the prefrontal
+> slab it found 42 of 46 runs; the previous detector found 9 of the 45 it scored
+> (*Cardiac detection, against recordings*). Respiration and breath depth are validated on
+> one dataset, and respiration from magnitude alone at long TR is unreliable (*Limits*).
+> Wiki: *Constant-modulus cardiac start*, *Slice-time alignment of the heartbeat*.
 
 Cardiac and respiratory noise regressors for 2-D (multiband) EPI, estimated from the
 images themselves. No pulse oximeter or respiratory belt is needed. The output plugs
@@ -27,33 +29,43 @@ enough for the heartbeat that the 1 Hz volume rate aliases (figure 1C).
    locking onto a harmonic of the TR. Breathing rate comes from breath-to-breath peaks.
    Cycle phases come from the analytic signal. All spectral steps run on the trace
    resampled to an even grid, since excitations are not evenly spaced in time.
-3. **Cardiac from the vessels.** The brain-mean magnitude trace dilutes the heartbeat:
-   pulsation lives in a small fraction of voxels, each with its own sign and delay. Starting
-   from the mean trace's cardiac phase, every voxel is fitted with cos/sin of that phase at
-   its own excitation's times (the pair absorbs its delay and sign), and the trace is rebuilt
-   excitation by excitation from the best-fitting 1 % of voxels, weighted by fit. Weights
-   are fitted on alternate 20 s blocks and applied to the others, so no voxel's noise feeds
-   its own weight; eight passes. Against a pulse oximeter on five TASKFORCE runs, phase
-   locking to the pulse rose from 0.88–0.91 to 0.95–0.99. Starts come from the mean
-   trace and from spatial ICA in each excitation (the aliased cardiac frequency is where
-   most excitations have a component).
-3b. **Is it the heartbeat? Judged by slice timing.** A heartbeat is physical, so every
-   vessel voxel samples it at its own slice's time: under the true cardiac phase, the best
-   voxels' fitted delays **line up across excitations**. Almost everything that impersonates
-   a heartbeat (drift, task residue, NORDIC's patch structure) is the same in every slice of
-   a volume and turns with the slice time instead. Each answer takes the alias that lines up
-   best (outside blind zones at k/TR and at k/TR ± the breathing rate), and is **found** only
-   if:
-   - its alignment beats 30 slice-time shuffles of itself per answer tested (Bonferroni), and
+3. **Cardiac: a start that needs no frequency.** At the volume rate the heartbeat is
+   aliased, and heart-rate variability smears it, often onto 0 or the Nyquist rate where a
+   spectral peak cannot be told from drift. But in every vessel voxel it is the same
+   rotating phasor e^{iφ(t)} seen with that voxel's own gain and delay, so its cos/sin pair
+   spans a 2-D temporal subspace of the whole-brain data **whose radius is constant**. The
+   search finds that subspace directly: whitened top-20 temporal principal components of the
+   magnitude (drift removed), and a 2-column rotation of them that makes the radius as flat
+   as possible (fourth moment over squared second moment, on the orthonormal frames; every
+   pair of components plus 64 random starts, all on the GPU at once). No band, rate or
+   waveform enters, so a heartbeat aliased anywhere can be found. The best three rotations
+   become candidate cardiac phases: each volume-to-volume step is lifted within π of the
+   minute's mean step (and that within π of the run's), so the clock follows heart-rate drift
+   without slipping a cycle.
+3b. **Which alias, and is it the heartbeat? Judged by slice timing.** A volume-rate phase
+   fixes the heart rate only up to multiples of 1/TR. A heartbeat is physical, so every
+   vessel voxel samples it at its own slice's time: under the true cardiac phase, at each
+   excitation's times, the best voxels' fitted delays **line up across excitations**, at the
+   fundamental and at the second harmonic. Each candidate takes the alias (of all those in
+   36–120/min) whose φ and 2φ line up best together. Almost everything that impersonates a
+   heartbeat (drift, task residue, NORDIC's patch structure) is the same in every slice of a
+   volume and does not line up. The best candidate is **found** only if:
+   - its alignment beats every one of 30 derangements of the excitation times per candidate
+     tried (Bonferroni; all drawn for the kept candidate), each re-choosing among the same
+     aliases, and
    - its **second harmonic** lines up better than the same measure at 21 non-harmonic
      multiples of its phase (1.2–1.8, 2.2–2.8, 3.2–3.8 ×). Slow physical signals aliased
-     into the band near k/TR also follow slice timing; a pulse's waveform has a harmonic and
-     they do not.
+     into the band also follow slice timing; a pulse's waveform has a harmonic and they do
+     not.
 
-   With one excitation time (3-D EPI) the test is **untestable**. Not found is reported, and
-   the cardiac columns are left out of the nuisance (`-card_unfound keep` keeps them).
-   `PREFIX.cardiac_weight` maps where it was found. No tuned thresholds: the cardiac band
-   (36–120/min) is the only fixed number. Wiki: *Slice-time alignment of the heartbeat*.
+   The phase is used as found: re-tracking it from the best voxels (the previous refinement)
+   dragged correct starts onto a wrong rate. When nothing is found, the previous path runs
+   (cos/sin fits to a start from the mean trace or per-excitation ICA, the trace rebuilt from
+   the best 1 % of voxels, eight passes, the same test); on the validation cohorts it never
+   found a run the new start missed. With one excitation time (3-D EPI) the test is
+   **untestable**. Not found is reported, and the cardiac columns are left out of the
+   nuisance (`-card_unfound keep` keeps them). `PREFIX.cardiac_weight` maps where it was
+   found. No tuned thresholds: the cardiac band (36–120/min) is the only fixed number.
 4. **Breath depth (RVT) from the field's spatial gradients.** A smooth field is fitted
    to each excitation's phase-change map. Breathing moves along a direction in the
    left–right, front–back and up–down gradients (figure 3D), and the first principal
@@ -98,7 +110,7 @@ order.
 
 Requirements: 2-D slice-by-slice acquisition, single echo for now. 3-D EPI has no
 excitation-rate samples. Without phase, respiration is read from magnitude, which was
-unreliable on task runs.
+unreliable on task runs and at long TR (*Limits*).
 
 ## Where in the pipeline
 
@@ -164,27 +176,74 @@ Against the recordings' own regressors (AFNI `physio_calc.py` and TAPAS PhysIO o
 logs), the data-derived set explains 85–100 % of the variance the recorded set does on raw
 slices, with voxel maps correlated at 0.94–0.98.
 
+### Cardiac detection, against recordings
+
+Detection decides whether the cardiac regressors are used at all, so it is tested
+separately on data it never saw during development. Each run is scored after the decision:
+**right** = found, and the phase locks to the recorded pulse (phase-locking value > 0.5);
+**wrong** = found, but not locked (a wrong rate or a drifting clock); **not found**. The
+recordings play no part in any choice the detector makes.
+
+- **Development:** TASKFORCE (above) and three OpenNeuro datasets used while building it.
+- **Held-out:** 66 runs from ds002603 (four sequences, TR 0.55–2 s), Rockland (TR 0.645,
+  1.4, 2.5 s) and ds002547 (TR 2 s, sequential), scored once the method was fixed.
+- **Fresh:** ds001168 (TR 3 s full brain; TR 4 s, 0.8 mm prefrontal slab), opened only after
+  the held-out results, with one fix made from it (the clock slip below), then all
+  cohorts rerun on the final code.
+
+![Cardiac detection per dataset, now and before](physio/fig6_detection.png)
+
+*Figure 6. (A) Per dataset, the share of runs where the heartbeat was found and right, found
+and wrong, or not found, for this detector (upper bar) and the previous one on the runs it
+scored (lower bar). (B) Phase locking of each find to the recorded pulse; black ticks are
+medians.*
+
+| Data | TR | Runs | Right | Wrong | Not found | Before (right / runs) |
+|---|---|---|---|---|---|---|
+| TASKFORCE (development) | 1 s | 91 | 90 | 0 | 1 | 14 / 19 |
+| ds002547, ds004645, ds006947 (development) | 0.23–2 s | 14 | 12 | 0 | 2 | 5 / 14 |
+| ds002603, 4 sequences (held-out) | 0.55–2 s | 32 | 27 | 0 | 5 | 13 / 32 |
+| Rockland 645 / 1400 / CAP (held-out) | 0.65–2.5 s | 22 | 22 | 0 | 0 | 11 / 22 |
+| ds002547 (held-out) | 2 s | 12 | 12 | 0 | 0 | 2 / 12 |
+| ds001168 full brain (fresh) | 3 s | 9 | 9 | 0 | 0 | 1 / 8 |
+| ds001168 prefrontal slab (fresh) | 4 s | 10 | 1 | 0 | 9 | 0 / 10 |
+| **All** | | **190** | **173** | **0** | **17** | |
+
+Median locking of the finds is 0.94–0.99 per dataset (ds006947's two runs, TR 0.56 s, lock
+at 0.61 and 0.71). Of the 17 not found, 9 are the prefrontal slab, where the recording
+itself shows almost no pulsation (the one found locks at 0.88). In 5 of the other 8 the best
+candidate did lock to the pulse (0.87–0.95) but fell short of the derangement floor: the
+test errs toward not found. Two of those are ds004645 (TR 0.23 s), with so few excitations
+per volume that the derangement null is coarse and high. The previous detector
+never found a run this one missed.
+
+**Choices checked against the data, not tuned on it.** The number of principal components
+(20) sits mid-plateau: on 105 runs, anywhere from 16 to 40 put the heartbeat among the
+candidates in 100–103 runs. Pooling candidates from several counts rescued one run (the
+breath-hold) at the cost of a stricter floor everywhere, so it is not used. The one fix
+made after opening the fresh data was a clock slip: a ds001168 run locked at 0.97 for
+7.5 min, then a noisy stretch shifted the unwrap reference by a whole cycle (reading 1/TR
+fast to the end); anchoring that reference to the run's mean step fixed it (a regression
+test reproduces the slip).
+
+**Cost.** The search and the derangement null run batched on the GPU: one candidate set's
+slice alignments (all aliases, both harmonics, every derangement) in one solve per
+excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0.4 s
+(was 3.6 s); both halves' covariances for the split-half check from one pass over the data.
+
 ## Limits
 
 - **3-D EPI**: not supported (no excitation-rate samples). Respiration might still be read
   from phase at the volume rate; not built.
 - **Multi-echo**: refused for now; it should work (more samples per excitation) once tested.
-- **Cardiac: how often it is found.** Judged against recordings (right = the heart rate
-  the recording gives; wrong = found, but at another rate):
-
-  | Data | TR | Right | Wrong | Not found |
-  |---|---|---|---|---|
-  | TASKFORCE (development) | 1 s | 14 | 0 | 5 |
-  | 66 held-out runs: ds002603 ×4 sequences, Rockland 645/1400/CAP, ds002547 | 0.55–2.5 s | 26 | 0 | 40 |
-  | ds001168 full-brain (fresh) | 3 s | 1 | 0 | 8 |
-  | ds001168 prefrontal 0.8 mm slab (fresh) | 4 s | 0 | 0 | 9 (correct: recording shows almost no pulsation there) |
-
-  It finds most runs at short TR (Rockland 645: 7/8; ds002603 550/700 ms: 5/8 each) and few at
-  TR ≥ 2 s (ds002603 sequential 0/8, Rockland CAP 1/7). At long TR the recorded heartbeat
-  itself passes the test in 17 of 18 runs checked, so the heartbeat is there; the estimate
-  of its phase is too rough to pass (see the wiki note's *Long TR* section). HiHiFaces (no
-  recording): fast (TR 0.67) found 7/9; fine (0.8 mm, TR 1.86) 1/17, its harmonic at the
-  noise level.
+- **Cardiac where pulsation is weak.** On a thin prefrontal slab (ds001168, 0.8 mm, TR 4 s)
+  the heartbeat was found in 1 of 10 runs; the recording shows almost no pulsation there.
+  Expect not found, not wrong, on slabs away from the large vessels. With few excitations per
+  volume (TR 0.23 s) the slice-timing null is coarse and runs that lock are rejected.
+- **Respiration from magnitude alone at long TR is unreliable.** Without phase, the
+  respiratory trace at TR 2 s sequential (ds002547) read the TR's own comb instead of
+  breathing in all 10 runs checked. Give the phase whenever it exists; a magnitude-only
+  respiration path at long TR is open work.
 - **A heart rate within ~3/min of k/TR** aliases to near zero in every voxel and cannot be
   told from drift; those rates are a blind zone, and so are k/TR ± the breathing rate.
 - **Run it on the raw magnitude**, before NORDIC: on HiHiFaces fine, NORDIC strengthened the
