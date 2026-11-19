@@ -107,8 +107,14 @@ def _init_lane() -> None:
     on six cores peaked at 36 running threads and 8.8 CPUs of time -- harmless on
     an idle desktop, but under a container CPU quota it is the over-subscription
     that freezes the whole process each period.
+
+    ATen sets each thread's OpenMP and MKL counts to the global one on that
+    thread's first parallel op (``lazy_init_num_threads``), which would undo the
+    1 below the moment a lane did any work. ``get_num_threads`` runs that init,
+    so call it first (the C entry point, which a test's monkeypatch cannot hide).
     """
     _in_lane.active = True
+    torch._C.get_num_threads()
     for set_threads in _thread_local_setters():
         set_threads(1)
 

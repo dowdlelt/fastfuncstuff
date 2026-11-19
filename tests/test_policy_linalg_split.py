@@ -186,7 +186,7 @@ def test_a_forked_child_builds_its_own_pool(monkeypatch):
     assert P._lane_pool(4) is not first
 
 
-def test_lanes_do_not_open_their_own_thread_teams():
+def test_lanes_do_not_open_their_own_thread_teams(monkeypatch):
     # Each lane's ATen/MKL call used to open a full OpenMP team: six lanes on six
     # cores peaked at 36 running threads, which a container CPU quota punishes by
     # freezing the process. A lane must report one OpenMP thread of its own.
@@ -202,7 +202,24 @@ def test_lanes_do_not_open_their_own_thread_teams():
             0
         ]
     get_max = ctypes.CDLL(path).omp_get_max_threads
-    assert P._lane_pool(4).submit(get_max).result() == 1
+
+    def after_real_work():
+        # ATen resets a thread's count on its first parallel op, so a fresh
+        # lane reading 1 proves nothing: check after the lane has done work.
+        torch.empty(1 << 20).copy_(torch.ones(1 << 20))
+        return get_max()
+
+    # The suite pins the real count to 1, which would make ATen's reset harmless;
+    # set a real 4 and build a fresh pool so every lane initialises under it.
+    real = torch._C.get_num_threads()
+    torch.set_num_threads(4)
+    monkeypatch.setattr(P.os, "getpid", lambda: -54321)
+    try:
+        pool = P._lane_pool(4)
+        got = list(pool.map(lambda _: after_real_work(), range(8)))
+    finally:
+        torch.set_num_threads(real)
+    assert got == [1] * 8
 
 
 @pytest.mark.parametrize("op", ["solve", "inv", "det", "slogdet", "lu_factor"])
