@@ -806,7 +806,8 @@ def observations(info: dict, scaling: list[dict], jobs: list[dict]) -> list[str]
         )
     if any(r.get("throttled", 0) > 0.02 for r in scaling + jobs):
         notes.append(
-            "[T..%] / THROTTLED: the cgroup CPU quota froze the process that share of the time --"
+            "[T..%] / THROTTLED: the cgroup CPU quota froze runnable threads -- frozen"
+            " CPU-seconds per wall second, summed over CPUs, so it can pass 100%;"
             " those thread counts exceed what the quota can feed"
         )
     if info["allocator"] == "glibc":
