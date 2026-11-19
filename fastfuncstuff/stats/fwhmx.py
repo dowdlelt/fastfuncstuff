@@ -408,7 +408,7 @@ def estimate_fwhmx_run(
             if first:
                 mc = mask[a0:a1, b0:b1, c0:c1]
                 ms = mask[a0 + o0 : a1 + o0, b0 + o1 : b1 + o1, c0 + o2 : c1 + o2]
-                nacf[oi] = float((mc & ms).sum().item())
+                nacf[oi] = (mc & ms).sum()  # stays on the device: no sync per offset
             bar2.update(1)
         first = False
         del vd
