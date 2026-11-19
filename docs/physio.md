@@ -240,6 +240,9 @@ excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0
   the heartbeat was found in 1 of 10 runs; the recording shows almost no pulsation there.
   Expect not found, not wrong, on slabs away from the large vessels. With few excitations per
   volume (TR 0.23 s) the slice-timing null is coarse and runs that lock are rejected.
+- **On data with no heartbeat at all**, "found" comes up about once in 100 runs (1 of 83
+  synthetic noise-only runs): the chance rate of a test against 90 derangements. Every
+  real run scored had a pulse, so this rate is not in the table above.
 - **Respiration from magnitude alone at long TR is unreliable.** Without phase, the
   respiratory trace at TR 2 s sequential (ds002547) read the TR's own comb instead of
   breathing in all 10 runs checked. Give the phase whenever it exists; a magnitude-only
