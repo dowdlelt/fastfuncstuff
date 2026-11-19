@@ -84,7 +84,8 @@ def test_frame_sites_names_ffs_frame_and_leaf():
 
     site, leaf = audit._frame_sites(sys._getframe())
     assert leaf.endswith(":test_frame_sites_names_ffs_frame_and_leaf")
-    assert site == "<outside fastfuncstuff>"  # tests/ is not the package
+    # tests/ is not the package, so the fallback names the caller's own frame.
+    assert "test_benchmark_speed_audit.py" in site
 
 
 def test_nvml_index_follows_device_spec_and_visible_devices(monkeypatch):

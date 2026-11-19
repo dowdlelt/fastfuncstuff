@@ -195,7 +195,12 @@ def _call_site(stack: traceback.StackSummary) -> str:
 
 
 def _frame_sites(frame: Any) -> tuple[str, str]:
-    """(innermost fastfuncstuff frame, innermost frame of any kind) of a live stack."""
+    """(innermost fastfuncstuff frame, innermost frame of any kind) of a live stack.
+
+    Walks frame objects directly: ``traceback.extract_stack`` reads source lines
+    through linecache, and on a sync-heavy tool that showed up in the idle
+    attribution as the audit's own cost.
+    """
     if frame is None:
         return "<no frame>", "<no frame>"
     leaf = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_code.co_name}"
@@ -207,6 +212,13 @@ def _frame_sites(frame: Any) -> tuple[str, str]:
                 if name.startswith(root):
                     rel = os.path.relpath(name, os.path.dirname(root.rstrip(os.sep)))
                     return f"{rel}:{f.f_lineno} {f.f_code.co_name}", leaf
+        f = f.f_back
+    # A script driving ffs from outside the package: name its own frame.
+    f = frame
+    while f is not None:
+        name = f.f_code.co_filename
+        if name not in _THIS_FILES and "site-packages" not in name and "/lib/python" not in name:
+            return f"{name}:{f.f_lineno} {f.f_code.co_name}", leaf
         f = f.f_back
     return "<outside fastfuncstuff>", leaf
 
@@ -226,7 +238,7 @@ class SyncRecorder:
 
         def show(message, category, filename, lineno, file=None, line=None):
             if "synchronizing CUDA operation" in str(message):
-                self.implicit[_call_site(traceback.extract_stack())] += 1
+                self.implicit[_frame_sites(sys._getframe(1))[0]] += 1
                 return
             previous_show(message, category, filename, lineno, file, line)
 
@@ -243,7 +255,7 @@ class SyncRecorder:
         original_sync = torch.cuda.synchronize
 
         def synchronize(device=None):
-            self.explicit[_call_site(traceback.extract_stack())] += 1
+            self.explicit[_frame_sites(sys._getframe(1))[0]] += 1
             return original_sync(device)
 
         torch.cuda.synchronize = synchronize
