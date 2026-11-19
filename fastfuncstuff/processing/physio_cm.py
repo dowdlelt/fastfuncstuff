@@ -31,25 +31,45 @@ def cm_components(nt: int) -> int:
     return int(min(20, max(4, nt // 6)))
 
 
-def temporal_gram(magnitude: np.ndarray, mask: np.ndarray, device: torch.device) -> torch.Tensor:
+def temporal_grams(
+    magnitude: np.ndarray, masks: list[np.ndarray], device: torch.device
+) -> list[torch.Tensor]:
     """(nt, nt) float64 Gram of the voxel series (fractional change, Legendre drift
-    out, unit variance), accumulated slice by slice: memory is O(nt^2 + one slice),
-    never the whole masked volume in float64."""
+    out, unit variance) inside each mask, in one pass, slice by slice: memory is
+    O(nt^2 + one slice), never the whole masked volume in float64. Each voxel adds its
+    own outer product, so the Gram of a union is the sum of its parts' Grams."""
     nt = magnitude.shape[-1]
     L = construct_polynomial_matrix(nt, CM_DEGREE, device=device, dtype=torch.float64)
     Q, _ = plinalg.qr(L.cpu())
     Q = Q.to(device)
-    G = torch.zeros((nt, nt), dtype=torch.float64, device=device)
+    grams = [torch.zeros((nt, nt), dtype=torch.float64, device=device) for _ in masks]
+    union = np.logical_or.reduce(masks)
     for k in range(magnitude.shape[2]):
-        sel = mask[:, :, k]
+        sel = union[:, :, k]
         if not sel.any():
             continue
         y = torch.from_numpy(np.asarray(magnitude[:, :, k][sel], dtype=np.float32))
         y = y.to(device).to(torch.float64)
         y = y - (y @ Q) @ Q.T
         y = y / (y.std(1, keepdim=True) + 1e-9)
-        G += y.T @ y
-    return G
+        for G, m in zip(grams, masks, strict=True):
+            rows = torch.from_numpy(m[:, :, k][sel]).to(device)
+            if bool(rows.all()):
+                G += y.T @ y
+            elif bool(rows.any()):
+                G += y[rows].T @ y[rows]
+    return grams
+
+
+def temporal_gram(magnitude: np.ndarray, mask: np.ndarray, device: torch.device) -> torch.Tensor:
+    return temporal_grams(magnitude, [mask], device)[0]
+
+
+def split_masks(mask: np.ndarray, split_axis: int) -> list[np.ndarray]:
+    """The brain mask's two halves along ``split_axis`` (a partition of ``mask``)."""
+    n = mask.shape[split_axis]
+    coord = np.arange(n).reshape([-1 if a == split_axis else 1 for a in range(3)])
+    return [mask & (coord < n // 2), mask & (coord >= n // 2)]
 
 
 def constant_modulus_traces(
@@ -60,8 +80,8 @@ def constant_modulus_traces(
     rotating phasor. Distinct subspaces only (smallest principal cosine < 0.9)."""
     nt = G.shape[0]
     k = cm_components(nt)
-    _, evecs = plinalg.eigh(G.cpu())
-    X = (evecs[:, -k:].T.flip(0) * math.sqrt(nt)).to(G.device)  # whitened (k, nt)
+    _, evecs = plinalg.eigh(G)
+    X = evecs[:, -k:].T.flip(0) * math.sqrt(nt)  # whitened (k, nt)
     # Starts: every pair of principal axes (the heartbeat is often nearly one, and the
     # landscape on ~100 volumes has many shallow minima random starts can all miss),
     # plus random ones.
@@ -75,10 +95,10 @@ def constant_modulus_traces(
     for _ in range(CM_ITERS):
         Z = W.transpose(1, 2) @ X  # (R, 2, nt)
         r2 = (Z * Z).sum(1, keepdim=True)
-        grad = (X.unsqueeze(0) * r2) @ Z.transpose(1, 2) * (4 / nt)  # d E[r^4] / dW
+        grad = X @ (Z * r2).transpose(1, 2) * (4 / nt)  # d E[r^4] / dW, (R, k, 2)
         sym = W.transpose(1, 2) @ grad
         grad = grad - W @ (sym + sym.transpose(1, 2)) / 2
-        W, _ = plinalg.qr(W - CM_STEP * grad)
+        W = _polar(W - CM_STEP * grad)
     Z = W.transpose(1, 2) @ X
     r2 = (Z * Z).sum(1)
     ratio = ((r2 * r2).mean(1) / r2.mean(1) ** 2).cpu().numpy()
@@ -93,6 +113,20 @@ def constant_modulus_traces(
         if len(out) == n_keep:
             break
     return out
+
+
+def _polar(M: torch.Tensor) -> torch.Tensor:
+    """Nearest orthonormal (k, 2) frames, M (M^T M)^(-1/2), with the 2 x 2 inverse
+    square root in closed form: the retraction without a batched QR, whose small-matrix
+    solver launches dominated the search on the GPU (8 ms of every 9 ms step)."""
+    A = M.transpose(1, 2) @ M
+    a, b, d = A[:, 0, 0], A[:, 0, 1], A[:, 1, 1]
+    s = (a * d - b * b).clamp_min(1e-300).sqrt()
+    t = (a + d + 2 * s).sqrt()
+    # sqrt(A) = (A + s I) / t, so its inverse is t (A + s I)^-1
+    inv = torch.stack([torch.stack([d + s, -b], -1), torch.stack([-b, a + s], -1)], -2)
+    inv = inv * (t / ((a + s) * (d + s) - b * b))[:, None, None]
+    return M @ inv
 
 
 def unwrap_around_rate(steps: np.ndarray, tr: float, window_s: float = 60.0) -> np.ndarray:
@@ -158,19 +192,22 @@ class ConstantModulusDetection:
     tried_phase: list = field(default_factory=list)
 
 
-def _alignment(Ys, phase, device) -> float:
-    from fastfuncstuff.processing.physio import _voxel_fits, slice_alignment
+def _alignments(Ys, phases, device) -> np.ndarray:
+    from fastfuncstuff.processing.physio import slice_alignments
 
-    return slice_alignment(_voxel_fits(Ys, phase, device))
+    return slice_alignments(Ys, phases, device)
+
+
+def _alias_phases(times, start, tr, band) -> list[np.ndarray]:
+    return [sign * start + 2 * np.pi * step * times / tr
+            for sign, step in complete_aliases(times, start, tr, band)]  # fmt: skip
 
 
 def _alias_rows(Ys, times, start, tr, device, band):
     """(phase, fundamental alignment, harmonic alignment) for every alias of ``start``."""
-    rows = []
-    for sign, step in complete_aliases(times, start, tr, band):
-        phase = sign * start + 2 * np.pi * step * times / tr
-        rows.append((phase, _alignment(Ys, phase, device), _alignment(Ys, 2 * phase, device)))
-    return rows
+    phases = _alias_phases(times, start, tr, band)
+    a = _alignments(Ys, phases + [2 * q for q in phases], device)
+    return list(zip(phases, a[: len(phases)], a[len(phases) :], strict=True))
 
 
 def _derange(G: int, rng) -> np.ndarray:
@@ -181,13 +218,19 @@ def _derange(G: int, rng) -> np.ndarray:
 
 
 def _null(Ys, times, start, tr, device, band, n, rng) -> np.ndarray:
-    """Best alias statistic after each of ``n`` derangements of the excitation times."""
+    """Best alias statistic after each of ``n`` derangements of the excitation times,
+    all scored in one batched pass. A derangement keeps the run's mean rate, so every
+    deranged clock has the same alias set as ``start``."""
     G = times.shape[1]
-    return np.array([
-        max(r[1] + r[2] for r in _alias_rows(Ys, times, start[:, _derange(G, rng)], tr,
-                                             device, band) or [(None, 0.0, 0.0)])
-        for _ in range(n)
-    ] or [0.0])  # fmt: skip
+    A = len(complete_aliases(times, start, tr, band))
+    if n == 0 or A == 0:
+        return np.zeros(1)
+    phases = []
+    for _ in range(n):
+        q = _alias_phases(times, start[:, _derange(G, rng)], tr, band)
+        phases += q + [2 * x for x in q]
+    a = _alignments(Ys, phases, device).reshape(n, 2, A)
+    return (a[:, 0] + a[:, 1]).max(1)
 
 
 def detect(
@@ -201,6 +244,7 @@ def detect(
     band: tuple[float, float] = (0.6, 2.0),
     shuffles: int = 30,
     controls: tuple[float, ...] = (),
+    gram: torch.Tensor | None = None,
 ) -> ConstantModulusDetection:
     """The heartbeat from constant-modulus starts, judged by slice timing.
 
@@ -216,14 +260,16 @@ def detect(
     """
     nt, G = times.shape
     answers = []
-    for i, (ratio, c) in enumerate(constant_modulus_traces(temporal_gram(magnitude, mask, device))):
+    if gram is None:
+        gram = temporal_gram(magnitude, mask, device)
+    for i, (ratio, c) in enumerate(constant_modulus_traces(gram)):
         start = excitation_phase(c, times, tr)
         rows = _alias_rows(Ys, times, start, tr, device, band)
         if not rows:
             continue
         phase, a1, a2 = max(rows, key=lambda r: r[1] + r[2])
         null = _null(Ys, times, start, tr, device, band, shuffles, rng)
-        hnull = max((_alignment(Ys, m * phase, device) for m in controls), default=0.0)
+        hnull = float(_alignments(Ys, [m * phase for m in controls], device).max(initial=0.0))
         rate = float(abs(phase[-1].mean() - phase[0].mean())
                      / (2 * np.pi * (times[-1].mean() - times[0].mean())) * 60)  # fmt: skip
         answers.append(dict(label=f"cm{i}@{ratio:.2f}", phase=phase, a1=a1, a2=a2, start=start,
@@ -249,19 +295,20 @@ def detect(
     )  # fmt: skip
 
 
-def split_half_locking(magnitude, mask, split_axis, phase, times, tr, device) -> float:
+def split_half_locking(magnitude, mask, split_axis, phase, times, tr, device, grams=None) -> float:
     """Diagnostic: each brain half's own best constant-modulus clock, on the alias
-    closest to ``phase``; their median 30 s phase locking."""
+    closest to ``phase``; their median 30 s phase locking. ``grams``: the halves'
+    Grams if already built (:func:`temporal_grams` on :func:`split_masks`)."""
     from fastfuncstuff.processing.physio import _split_locking
 
-    n = mask.shape[split_axis]
-    coord = np.arange(n).reshape([-1 if a == split_axis else 1 for a in range(3)])
+    masks = split_masks(mask, split_axis)
+    if any(m.sum() < 100 for m in masks):
+        return float("nan")
+    if grams is None:
+        grams = temporal_grams(magnitude, masks, device)
     halves = []
-    for side in (coord < n // 2, coord >= n // 2):
-        m = mask & side
-        if m.sum() < 100:
-            return float("nan")
-        _, c = constant_modulus_traces(temporal_gram(magnitude, m, device), n_keep=1)[0]
+    for G in grams:
+        _, c = constant_modulus_traces(G, n_keep=1)[0]
         start = excitation_phase(c, times, tr)
         cands = [s * start + 2 * np.pi * k * times / tr
                  for s, k in complete_aliases(times, start, tr, (0.3, 3.0))]  # fmt: skip

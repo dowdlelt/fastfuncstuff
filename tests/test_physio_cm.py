@@ -81,3 +81,28 @@ def test_without_a_heartbeat_the_constant_modulus_path_finds_nothing():
     traces = physio.excitation_traces(mag, st, tr, device=CPU)
     ref = physio.refine_cardiac(mag, traces, st, tr, "magnitude", split_axis=0, device=CPU)
     assert not ref.found
+
+
+def test_batched_slice_alignments_equal_the_one_phase_estimator():
+    """The batched null scorer must be the same estimator as slice_alignment of
+    _voxel_fits, including an empty excitation and voxels with a non-zero mean."""
+    rng = np.random.default_rng(0)
+    nt, G = 200, 5
+    times = np.arange(nt)[:, None] * 1.0 + np.arange(G)[None] / G
+    Ys = [
+        torch.from_numpy(rng.standard_normal((0 if g == 2 else 400 + 50 * g, nt)) + 3.0)
+        for g in range(G)
+    ]
+    phases = [2 * np.pi * f * times + rng.uniform(0, 6) for f in rng.uniform(0.5, 2, 12)]
+    got = physio.slice_alignments(Ys, phases, CPU)
+    want = [physio.slice_alignment(physio._voxel_fits(Ys, q, CPU)) for q in phases]
+    np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-12)
+
+
+def test_polar_retraction_returns_the_nearest_orthonormal_frame():
+    M = torch.randn((6, 9, 2), dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+    W = physio_cm._polar(M)
+    eye = torch.eye(2, dtype=torch.float64).expand(6, 2, 2)
+    torch.testing.assert_close(W.transpose(1, 2) @ W, eye)
+    U, _, Vh = torch.linalg.svd(M, full_matrices=False)  # nearest frame = U V^T
+    torch.testing.assert_close(W, U @ Vh)
