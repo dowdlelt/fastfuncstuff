@@ -42,6 +42,18 @@ noise, volume-locked artefacts and respiratory/task impostors. This is a propose
 experiment, not an implemented or validated replacement. A shorter TR alone does not
 establish that any in-band component is cardiac.
 
+## Follow-up review: the ds004645 rejection is the sidecar's slice order
+
+The recorded clock ranked near the *bottom* of the derangements (tail 0.93-0.98), which
+is anti-alignment, not absence of structure. Scoring it under all 120 column orders of the
+five excitation groups (not only the 44 derangements): sidecar timing ranks 113/120
+(sub-02, stat 0.27) and 118/120 (sub-04, 0.13); the time-reversed order ranks 2 and 1
+(stat 1.13, 1.15; second harmonic 0.76/0.65 against controls ~0.09). The image is LPS
+(dcm2niix, syngo B17 investigational 7T), so the sidecar's interleave runs opposite to the
+array's slice axis. The judge is behaving correctly; the "confirm without spatial
+alignment" experiment proposed above is not needed for these runs and is dropped.
+Not pursued further (one dataset): no slice-order search in production.
+
 ## Which other misses remain?
 
 `remaining_misses.json` is extracted from the previous **final production** evaluations

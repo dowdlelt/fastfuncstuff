@@ -213,10 +213,11 @@ Median locking of the finds is 0.94–0.99 per dataset (ds006947's two runs, TR 
 at 0.61 and 0.71). Of the 17 not found, 9 are the prefrontal slab, where the recording
 itself shows almost no pulsation (the one found locks at 0.88). In 5 of the other 8 the best
 candidate did lock to the pulse (0.87–0.95) but fell short of the derangement floor: the
-test errs toward not found. Two of those are ds004645 (TR 0.23 s): the candidate heartbeat
-is unaliased and recovered, but the slice-alignment judge rejects even the recorded pulse
-phase. This is a limitation of confirmation, not evidence that the heartbeat is absent
-(see the [short-TR audit](../research_notes/physio_direct_phase/short_tr_audit/NOTES.md)). The previous detector
+test errs toward not found. Two of those are ds004645 (TR 0.23 s), where the
+judge rejects even the recorded pulse at the sidecar's slice timing but accepts it, best of
+all 120 orders, with the excitation order reversed: the sidecar's slice order looks wrong
+for that dataset, and the judge is right to refuse a clock that does not fit it (see the
+[short-TR audit](../research_notes/physio_direct_phase/short_tr_audit/NOTES.md)). The previous detector
 never found a run this one missed.
 
 **Choices checked against the data, not tuned on it.** The number of principal components
@@ -241,9 +242,10 @@ excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0
 - **Cardiac where pulsation is weak.** On a thin prefrontal slab (ds001168, 0.8 mm, TR 4 s)
   the heartbeat was found in 1 of 10 runs; the recording shows almost no pulsation there.
   Expect not found, not wrong, on slabs away from the large vessels. With few excitations per
-  volume (TR 0.23 s), recovered unaliased heartbeats can fail spatial slice alignment;
-  even the recorded clock failed in both runs checked. Confirmation for this regime
-  remains open.
+  volume (TR 0.23 s) the slice-time null is coarse.
+- **Wrong slice timing in the sidecar means not found.** The judge tests the heartbeat
+  against the stated excitation times, so a sidecar whose slice order is wrong (as
+  ds004645's appears to be, reversed) rejects even the true pulse.
 - **On data with no heartbeat at all**, "found" comes up about once in 100 runs (1 of 83
   synthetic noise-only runs): the chance rate of a test against 90 derangements. Every
   real run scored had a pulse, so this rate is not in the table above.
