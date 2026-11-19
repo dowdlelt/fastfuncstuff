@@ -87,7 +87,9 @@ class BusySampler:
 
     def __init__(self, index: int, period: float = 0.1) -> None:
         self.period = period
-        self.samples: list[tuple[float, int]] = []
+        # (time, busy %, innermost ffs frame, leaf frame) of the main thread.
+        self.samples: list[tuple[float, int, str, str]] = []
+        self._main = threading.main_thread().ident
         self.error: str | None = None
         self._stop = threading.Event()
         self._lib: Any = None
@@ -115,7 +117,9 @@ class BusySampler:
         while not self._stop.is_set():
             value = self.read()
             if value is not None:
-                self.samples.append((time.monotonic(), value))
+                frame = sys._current_frames().get(self._main) if self._main else None
+                site, leaf = _frame_sites(frame)
+                self.samples.append((time.monotonic(), value, site, leaf))
             self._stop.wait(self.period)
 
     def start(self) -> None:
@@ -128,7 +132,7 @@ class BusySampler:
             self._thread.join(timeout=2)
 
     def summary(self, started: float, ended: float) -> dict[str, Any]:
-        samples = [(t, u) for t, u in self.samples if started <= t <= ended]
+        samples = [(t, u) for t, u, _, _ in self.samples if started <= t <= ended]
         if not samples:
             return {"available": False, "error": self.error}
         utils = [u for _, u in samples]
@@ -152,6 +156,17 @@ class BusySampler:
                     "active_idle_s": (t1 - t0) * (1 - sum(window) / (100 * len(window))),
                 }
             )
+            # Where the host was while the card sat idle: each sample charges its
+            # idle fraction of one period to the main thread's stack at that moment.
+            by_site: Counter[str] = Counter()
+            by_leaf: Counter[str] = Counter()
+            for t, u, site, leaf in self.samples:
+                if t0 <= t <= t1 and u < 100:
+                    w = self.period * (100 - u) / 100
+                    by_site[site] += w
+                    by_leaf[leaf] += w
+            out["idle_sites"] = [(k, round(v, 2)) for k, v in by_site.most_common(20)]
+            out["idle_leaves"] = [(k, round(v, 2)) for k, v in by_leaf.most_common(20)]
         # A coarse timeline (1 s bins) so a reader can see *where* it idles.
         bins: dict[int, list[int]] = defaultdict(list)
         for t, u in samples:
@@ -177,6 +192,23 @@ def _call_site(stack: traceback.StackSummary) -> str:
         if "site-packages" not in frame.filename and "/lib/python" not in frame.filename:
             return f"{frame.filename}:{frame.lineno} {frame.name}"
     return "<unattributed>"
+
+
+def _frame_sites(frame: Any) -> tuple[str, str]:
+    """(innermost fastfuncstuff frame, innermost frame of any kind) of a live stack."""
+    if frame is None:
+        return "<no frame>", "<no frame>"
+    leaf = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_code.co_name}"
+    f = frame
+    while f is not None:
+        name = f.f_code.co_filename
+        if name not in _THIS_FILES:
+            for root in _PKG_DIRS:
+                if name.startswith(root):
+                    rel = os.path.relpath(name, os.path.dirname(root.rstrip(os.sep)))
+                    return f"{rel}:{f.f_lineno} {f.f_code.co_name}", leaf
+        f = f.f_back
+    return "<outside fastfuncstuff>", leaf
 
 
 class SyncRecorder:
@@ -526,6 +558,14 @@ def aggregate_stage(stage_dir: Path, stage: str) -> dict[str, Any]:
     implicit: Counter[str] = Counter()
     explicit: Counter[str] = Counter()
     window = busy_weighted = idle = 0.0
+    idle_sites: Counter[str] = Counter()
+    idle_leaves: Counter[str] = Counter()
+    for r in runs:
+        g = r.get("gpu") or {}
+        for k, v in g.get("idle_sites", []):
+            idle_sites[k] += v
+        for k, v in g.get("idle_leaves", []):
+            idle_leaves[k] += v
     for r in runs:
         s = r.get("syncs")
         if s:
@@ -541,6 +581,9 @@ def aggregate_stage(stage_dir: Path, stage: str) -> dict[str, Any]:
         summary["explicit_synchronize"] = sum(explicit.values())
         summary["implicit_sites"] = implicit.most_common(15)
         summary["explicit_sites"] = explicit.most_common(10)
+    if idle_sites:
+        summary["idle_sites"] = [(k, round(v, 2)) for k, v in idle_sites.most_common(15)]
+        summary["idle_leaves"] = [(k, round(v, 2)) for k, v in idle_leaves.most_common(15)]
     if window:
         summary["active_window_s"] = window
         summary["active_busy_pct"] = busy_weighted / window
@@ -595,11 +638,18 @@ def format_report(stages: dict[str, dict[str, Any]], mode: str) -> str:
         lines.append("time inside that window with no kernel resident. syncs = implicit host syncs")
         lines.append("(set_sync_debug_mode), sync() = explicit torch.cuda.synchronize calls.")
         for name, s in stages.items():
+            idle_sites = s.get("idle_sites") or []
             sites = s.get("implicit_sites") or []
-            if not sites:
+            if not (sites or idle_sites):
                 continue
-            lines.append(f"\n[{name}] top implicit sync sites")
-            lines.extend(f"  {n:7d}  {site}" for site, n in sites[:8])
+            if idle_sites:
+                lines.append(f"\n[{name}] GPU-idle seconds by host location (ffs frame | leaf)")
+                lines.extend(f"  {v:7.1f}s  {k}" for k, v in idle_sites[:8])
+                leaves = s.get("idle_leaves") or []
+                lines.append("  leaves: " + ", ".join(f"{k} {v:.1f}s" for k, v in leaves[:6]))
+            if sites:
+                lines.append(f"[{name}] top implicit sync sites")
+                lines.extend(f"  {n:7d}  {site}" for site, n in sites[:8])
     else:
         rows = [dict(r, stage=name) for name, s in stages.items() for r in s.get("ops", [])]
         cpu = sorted((r for r in rows if r["device"] == "cpu"), key=lambda r: -r["cpu_seconds"])

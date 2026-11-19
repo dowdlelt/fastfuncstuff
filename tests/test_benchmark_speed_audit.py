@@ -62,15 +62,29 @@ def test_call_site_prefers_innermost_package_frame():
 
 def test_busy_summary_window_excludes_startup_and_tail():
     s = audit.BusySampler.__new__(audit.BusySampler)
-    s.error = None
+    s.error, s.period = None, 0.1
     # 2 s of startup at 0%, then 50%/100% alternating, then 1 s of tail at 0%.
-    s.samples = [(t / 10, 0) for t in range(20)]
-    s.samples += [(2 + t / 10, 100 if t % 2 else 50) for t in range(20)]
-    s.samples += [(4 + t / 10, 0) for t in range(10)]
+    s.samples = [(t / 10, 0, "load", "gzip.py:read") for t in range(20)]
+    s.samples += [
+        (2 + t / 10, 100 if t % 2 else 50, "fit" if t % 2 else "loop", "x.py:f") for t in range(20)
+    ]
+    s.samples += [(4 + t / 10, 0, "save", "gzip.py:write") for t in range(10)]
     got = s.summary(0.0, 5.0)
     assert got["first_kernel_s"] == pytest.approx(2.0)
     assert got["active_busy_pct"] == pytest.approx(75.0)
     assert got["mean_busy_pct"] < got["active_busy_pct"]
+    # Idle inside the window is charged to where the host was: the 50% samples,
+    # 10 of them x 0.1 s x half idle. Startup and tail are outside the window.
+    sites = dict(got["idle_sites"])
+    assert sites == {"loop": pytest.approx(0.5)}
+
+
+def test_frame_sites_names_ffs_frame_and_leaf():
+    import sys
+
+    site, leaf = audit._frame_sites(sys._getframe())
+    assert leaf.endswith(":test_frame_sites_names_ffs_frame_and_leaf")
+    assert site == "<outside fastfuncstuff>"  # tests/ is not the package
 
 
 def test_nvml_index_follows_device_spec_and_visible_devices(monkeypatch):
