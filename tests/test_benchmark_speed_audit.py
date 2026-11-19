@@ -98,3 +98,41 @@ def test_idle_mode_counts_hidden_syncs_by_site(tmp_path):
     assert "test_benchmark_speed_audit.py" in site
     # The hook must come off again: later code in the process is not audited.
     assert torch.cuda.get_sync_debug_mode() == 0
+
+
+def _replay_module():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "replay_op_census.py"
+    spec = importlib.util.spec_from_file_location("replay_op_census", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_every_census_entry_rebuilds_and_runs(tmp_path):
+    def work():
+        x = torch.randn(40, 12, device=torch.device("cpu"))
+        x.t().contiguous()  # memory_format kwarg
+        torch.linalg.cholesky(x.t() @ x + 12 * torch.eye(12))  # needs SPD input
+        x.unsqueeze(0).expand(3, -1, -1).sum(0)  # stride-0 operand
+        x[x > 0]  # boolean index
+        x.index_select(0, torch.arange(0, 40, 3))  # integer index
+        x.to(torch.float64)  # dtype literal
+
+    audit.capture_audit(
+        work,
+        tmp_path / "s" / "invocations" / "001-x.json",
+        mode="ops",
+        command=["x"],
+        label="x",
+        stage="s",
+    )
+    replay = _replay_module()
+    rows, threads = replay.load_census(tmp_path, "cpu")
+    assert threads is not None and len(rows) >= 6
+    for row in rows:
+        fn, _ = replay.build_call(row, torch.device("cpu"))
+        fn()  # raises if any template does not round-trip

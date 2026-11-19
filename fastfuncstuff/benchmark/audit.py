@@ -253,7 +253,10 @@ def _describe(args: Any) -> tuple[str, str, str]:
     def visit(a: Any) -> None:
         nonlocal device, dtype
         if isinstance(a, torch.Tensor):
-            shapes.append("x".join(map(str, a.shape)) or "scalar")
+            # "!" marks a strided view: the same op on a transposed operand can
+            # cost several times the contiguous one, so they are separate rows.
+            mark = "" if a.is_contiguous() else "!"
+            shapes.append(("x".join(map(str, a.shape)) or "scalar") + mark)
             if not device:
                 device, dtype = a.device.type, str(a.dtype).removeprefix("torch.")
         elif isinstance(a, (list, tuple)) and len(shapes) < 6:
@@ -263,6 +266,34 @@ def _describe(args: Any) -> tuple[str, str, str]:
     for a in args[:6]:
         visit(a)
     return device, dtype, ",".join(shapes[:6])
+
+
+def _template(value: Any) -> Any:
+    """A JSON stand-in for an op argument that ``replay_op_census.py`` can rebuild.
+
+    Tensors become their geometry (values are not kept; replays use random
+    data), everything else its literal or its repr.
+    """
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return {
+            "tensor": list(value.shape),
+            "stride": list(value.stride()),
+            "dtype": str(value.dtype).removeprefix("torch."),
+            "device": value.device.type,
+        }
+    if isinstance(value, (list, tuple)):
+        return [_template(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, torch.dtype):
+        return {"dtype_literal": str(value).removeprefix("torch.")}
+    if isinstance(value, torch.device):
+        return {"device_literal": value.type}
+    if isinstance(value, (torch.memory_format, torch.layout)):
+        return {"torch_attr": repr(value).removeprefix("torch.")}
+    return {"repr": repr(value)}
 
 
 def _out_bytes(out: Any) -> int:
@@ -302,6 +333,7 @@ def make_census() -> Any:
         def __init__(self) -> None:
             super().__init__()
             self.rows: dict[tuple[str, str, str, str], list[float]] = {}
+            self.templates: dict[tuple[str, str, str, str], Any] = {}
             self._lock = threading.Lock()
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ARG002
@@ -315,7 +347,13 @@ def make_census() -> Any:
             dt = time.perf_counter() - t0 if device == "cpu" else 0.0
             key = (name, device, dtype, shapes)
             with self._lock:
-                row = self.rows.setdefault(key, [0, 0.0, 0])
+                row = self.rows.get(key)
+                if row is None:
+                    row = self.rows[key] = [0, 0.0, 0]
+                    self.templates[key] = {
+                        "args": _template(list(args)),
+                        "kwargs": {k: _template(v) for k, v in (kwargs or {}).items()},
+                    }
                 row[0] += 1
                 row[1] += dt
                 row[2] += _out_bytes(out)
@@ -331,6 +369,7 @@ def make_census() -> Any:
                     "calls": int(v[0]),
                     "cpu_seconds": v[1],
                     "out_bytes": int(v[2]),
+                    "call": self.templates[k],
                 }
                 for k, v in self.rows.items()
             ]
@@ -406,6 +445,10 @@ def capture_audit[T](
             # Another process on the card inflates busy% and hides idling.
             payload["gpu"]["baseline_busy_pct"] = baseline
         if census is not None:
+            import torch
+
+            # The tool set it during its run; replay compares against this width.
+            payload["torch_threads"] = torch.get_num_threads()
             payload["ops"] = census.table()
         output_path.write_text(json.dumps(payload, indent=1) + "\n")
     return result
@@ -490,9 +533,11 @@ def aggregate_stage(stage_dir: Path, stage: str) -> dict[str, Any]:
         summary["active_busy_pct"] = busy_weighted / window
         summary["active_idle_s"] = idle
     ops: dict[tuple, list[float]] = {}
+    calls: dict[tuple, Any] = {}
     for r in runs:
         for row in r.get("ops", []):
             key = (row["op"], row["device"], row["dtype"], row["shapes"])
+            calls.setdefault(key, row.get("call"))
             acc = ops.setdefault(key, [0, 0.0, 0])
             acc[0] += row["calls"]
             acc[1] += row["cpu_seconds"]
@@ -507,6 +552,7 @@ def aggregate_stage(stage_dir: Path, stage: str) -> dict[str, Any]:
                 "calls": int(v[0]),
                 "cpu_seconds": v[1],
                 "out_bytes": int(v[2]),
+                "call": calls[k],
             }
             for k, v in ops.items()
         ]
