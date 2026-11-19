@@ -25,11 +25,13 @@ ARMA/REML noise model, which should drop the rows (ffs_reml ``-censor``).
 from __future__ import annotations
 
 import math
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from fastfuncstuff import policy_linalg as plinalg
+from fastfuncstuff._compile import safe_compile
 
 if TYPE_CHECKING:
     import torch
@@ -216,11 +218,113 @@ def _ipm_step_bound(v: torch.Tensor, dv: torch.Tensor) -> torch.Tensor:
     return f.amin(dim=0)
 
 
+def _normal_solve(
+    X: torch.Tensor, q: torch.Tensor, rhs: torch.Tensor, unrolled: bool = False
+) -> torch.Tensor:
+    """``(X' diag(q_v) X) d_v = X' rhs_v`` for every column v.
+
+    Eager, one batched LAPACK solve. ``unrolled`` (for the compiled step) does
+    the per-voxel Cholesky as elementwise ops over (V,) rows -- p is polort + 1,
+    2-4 -- so the whole interior-point step is one fusable graph; it is ~30%
+    slower than LAPACK eagerly. A singular voxel must not fail the run (one did,
+    on a real one): LAPACK falls back to the minimum-norm step, the unrolled
+    form gives non-finite entries that ``l1_detrend`` stops on.
+    """
+    import torch
+
+    if not unrolled:
+        p = X.shape[1]
+        XX = (X[:, :, None] * X[:, None, :]).reshape(-1, p * p)
+        a, b = (q.T @ XX).reshape(-1, p, p), rhs.T @ X
+        try:
+            return plinalg.solve(a, b).T  # (p, V)
+        except torch.linalg.LinAlgError:
+            return (plinalg.pinv(a) @ b.unsqueeze(-1)).squeeze(-1).T
+    p = X.shape[1]
+    A = [[(q * (X[:, i : i + 1] * X[:, j : j + 1])).sum(0) for j in range(i + 1)] for i in range(p)]
+    L: list[list] = [[None] * p for _ in range(p)]
+    for i in range(p):
+        for j in range(i + 1):
+            acc = A[i][j]
+            for k in range(j):
+                acc = acc - L[i][k] * L[j][k]
+            L[i][j] = acc.sqrt() if i == j else acc / L[j][j]
+    fwd: list = []
+    for i in range(p):
+        acc = (rhs * X[:, i : i + 1]).sum(0)
+        for k in range(i):
+            acc = acc - L[i][k] * fwd[k]
+        fwd.append(acc / L[i][i])
+    out: list = [None] * p
+    for i in reversed(range(p)):
+        acc = fwd[i]
+        for k in range(i + 1, p):
+            acc = acc - L[k][i] * out[k]
+        out[i] = acc / L[i][i]
+    return torch.stack(out)  # (p, V)
+
+
+def _ipm_step(X, c, x, s, yd, z, w, beta: float, n: float, unrolled: bool = False):
+    """One Frisch-Newton predictor-corrector step for every column (lp.fnm)."""
+    import torch
+
+    q = 1.0 / (z / x + w / s)
+    r = z - w
+    rhs = q * r
+    dy = _normal_solve(X, q, rhs, unrolled)
+    dx = q * (X @ dy - r)
+    ds = -dx
+    dz = -z * (dx / x + 1.0)
+    dw = -w * (ds / s + 1.0)
+    fp = (beta * torch.minimum(_ipm_step_bound(x, dx), _ipm_step_bound(s, ds))).clamp_max(1.0)
+    fd = (beta * torch.minimum(_ipm_step_bound(w, dw), _ipm_step_bound(z, dz))).clamp_max(1.0)
+    # Mehrotra corrector wherever the affine step was blocked. Computed for
+    # every column and selected, since columns are independent.
+    mu = (z * x).sum(0) + (w * s).sum(0)
+    g = ((z + fd * dz) * (x + fp * dx)).sum(0) + ((w + fd * dw) * (s + fp * ds)).sum(0)
+    mu = mu * (g / mu) ** 3 / (2.0 * n)
+    dxdz = dx * dz
+    dsdw = ds * dw
+    xinv = 1.0 / x
+    sinv = 1.0 / s
+    xi = mu * (xinv - sinv)
+    dy_c = _normal_solve(X, q, rhs + q * (dxdz - dsdw - xi), unrolled)
+    dx_c = q * (X @ dy_c + xi - r - dxdz + dsdw)
+    ds_c = -dx_c
+    dz_c = mu * xinv - z - xinv * z * dx_c - dxdz
+    dw_c = mu * sinv - w - sinv * w * ds_c - dsdw
+    fp_c = (beta * torch.minimum(_ipm_step_bound(x, dx_c), _ipm_step_bound(s, ds_c))).clamp_max(1.0)
+    fd_c = (beta * torch.minimum(_ipm_step_bound(w, dw_c), _ipm_step_bound(z, dz_c))).clamp_max(1.0)
+    corr = torch.minimum(fp, fd) < 1.0
+    dx = torch.where(corr, dx_c, dx)
+    ds = torch.where(corr, ds_c, ds)
+    dy = torch.where(corr, dy_c, dy)
+    dz = torch.where(corr, dz_c, dz)
+    dw = torch.where(corr, dw_c, dw)
+    fp = torch.where(corr, fp_c, fp)
+    fd = torch.where(corr, fd_c, fd)
+    return x + fp * dx, s + fp * ds, yd + fd * dy, w + fd * dw, z + fd * dz
+
+
+def _ipm_step_unrolled(X, c, x, s, yd, z, w, beta: float, n: float):
+    return _ipm_step(X, c, x, s, yd, z, w, beta, n, True)
+
+
+# Each step is ~170 elementwise passes over a (T, chunk) block, so eager torch
+# is memory-bound and barely threads. Fused, a 1024-voxel chunk took 30 ms
+# against 115 ms on six threads, with identical outlier counts. Compiling costs
+# ~12 s per process (dynamo re-traces; ~30 s the first time on a machine), so
+# outlier_counts asks for it only when the job is big enough to repay it.
+_ipm_step_fused = safe_compile(_ipm_step_unrolled, dynamic=True)
+_FUSE_MIN_SECONDS = 30.0
+
+
 def l1_detrend(
     y: torch.Tensor,
     basis: torch.Tensor,
     max_iter: int = 30,
     rtol: float = 1e-10,
+    fused: bool = False,
 ) -> torch.Tensor:
     """Residuals of a per-column L1 (least absolute deviation) fit, batched.
 
@@ -236,21 +340,9 @@ def l1_detrend(
 
     T, p = basis.shape
     X = basis.to(dtype=y.dtype)
-    XX = (X[:, :, None] * X[:, None, :]).reshape(T, p * p)
     beta = 0.99995
     n = float(T)
     b_rhs = 0.5 * X.sum(dim=0)  # (p,)
-
-    def solve(Q: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        a, b = (Q.T @ XX).reshape(-1, p, p), rhs.T @ X
-        try:
-            return plinalg.solve(a, b).T  # (p, V)
-        except torch.linalg.LinAlgError:
-            # One voxel's Newton matrix went exactly singular (seen once on a
-            # real run, never reproduced) and took the whole run down. Take the
-            # minimum-norm step for this iteration instead; every other voxel's
-            # step is the same solution, so results elsewhere don't move.
-            return (plinalg.pinv(a) @ b.unsqueeze(-1)).squeeze(-1).T
 
     c = -y
     x = torch.full_like(y, 0.5)  # dual variable a, feasible: X'a = 0.5 X'1
@@ -282,50 +374,20 @@ def l1_detrend(
                 w[:, keep],
                 tol[keep],
             )
-        q = 1.0 / (z / x + w / s)
-        r = z - w
-        rhs = q * r
-        dy = solve(q, rhs)
-        dx = q * (X @ dy - r)
-        ds = -dx
-        dz = -z * (dx / x + 1.0)
-        dw = -w * (ds / s + 1.0)
-        fp = (beta * torch.minimum(_ipm_step_bound(x, dx), _ipm_step_bound(s, ds))).clamp_max(1.0)
-        fd = (beta * torch.minimum(_ipm_step_bound(w, dw), _ipm_step_bound(z, dz))).clamp_max(1.0)
-        # Mehrotra corrector wherever the affine step was blocked. Computed for
-        # every column and selected, since columns are independent.
-        mu = (z * x).sum(0) + (w * s).sum(0)
-        g = ((z + fd * dz) * (x + fp * dx)).sum(0) + ((w + fd * dw) * (s + fp * ds)).sum(0)
-        mu = mu * (g / mu) ** 3 / (2.0 * n)
-        dxdz = dx * dz
-        dsdw = ds * dw
-        xinv = 1.0 / x
-        sinv = 1.0 / s
-        xi = mu * (xinv - sinv)
-        dy_c = solve(q, rhs + q * (dxdz - dsdw - xi))
-        dx_c = q * (X @ dy_c + xi - r - dxdz + dsdw)
-        ds_c = -dx_c
-        dz_c = mu * xinv - z - xinv * z * dx_c - dxdz
-        dw_c = mu * sinv - w - sinv * w * ds_c - dsdw
-        fp_c = (beta * torch.minimum(_ipm_step_bound(x, dx_c), _ipm_step_bound(s, ds_c))).clamp_max(
-            1.0
-        )
-        fd_c = (beta * torch.minimum(_ipm_step_bound(w, dw_c), _ipm_step_bound(z, dz_c))).clamp_max(
-            1.0
-        )
-        corr = torch.minimum(fp, fd) < 1.0
-        dx = torch.where(corr, dx_c, dx)
-        ds = torch.where(corr, ds_c, ds)
-        dy = torch.where(corr, dy_c, dy)
-        dz = torch.where(corr, dz_c, dz)
-        dw = torch.where(corr, dw_c, dw)
-        fp = torch.where(corr, fp_c, fp)
-        fd = torch.where(corr, fd_c, fd)
-        x = x + fp * dx
-        s = s + fp * ds
-        yd = yd + fd * dy
-        w = w + fd * dw
-        z = z + fd * dz
+        step = _ipm_step_fused if fused else _ipm_step
+        nx, ns, nyd, nw, nz = step(X, c, x, s, yd, z, w, beta, n)
+        # A voxel whose Newton matrix went singular (one did, on a real run,
+        # and the batched solve then failed the whole pipeline) stops at its
+        # last finite iterate, which is already close to the optimum.
+        ok = torch.isfinite(nyd).all(0)
+        if not bool(ok.all()):
+            coef[:, cols[~ok]] = yd[:, ~ok]
+            cols = cols[ok]
+            if cols.numel() == 0:
+                return y - X @ (-coef)
+            c, tol = c[:, ok], tol[ok]
+            nx, ns, nyd, nw, nz = nx[:, ok], ns[:, ok], nyd[:, ok], nw[:, ok], nz[:, ok]
+        x, s, yd, w, z = nx, ns, nyd, nw, nz
     coef[:, cols] = yd
     return y - X @ (-coef)
 
@@ -372,9 +434,14 @@ def outlier_counts(
             operation="l1_detrend",
             max_chunk_size=1024 if device.type == "cpu" else None,
         )
+
     counts = torch.zeros(T, dtype=torch.int64, device=device)
     starts = range(0, V, chunk_size)
-    for s in tqdm(starts, desc="outliers", leave=True, disable=not progress or len(starts) < 2):
+    fused = False
+    for i, s in enumerate(
+        tqdm(starts, desc="outliers", leave=True, disable=not progress or len(starts) < 2)
+    ):
+        t0 = time.perf_counter()
         y = series[:, s : s + chunk_size].to(device=device).to(dtype)
         # A non-finite voxel would not just lose its own count: LAPACK scales
         # the whole least-squares right-hand side by its largest entry, so one
@@ -386,11 +453,14 @@ def outlier_counts(
         if basis is None:
             r = y - afni_median(y, dim=0)
         else:
-            r = l1_detrend(y, basis)
+            r = l1_detrend(y, basis, fused=fused)
         mad = afni_median(r.abs(), dim=0)
         top = alpha * mad
         out = (r.abs() > top) & (mad > 0)
         counts += out.sum(dim=1)
+        if i == 1 and basis is not None and device.type == "cpu":
+            # Chunk 0 carries first-call warm-up; project from chunk 1.
+            fused = (time.perf_counter() - t0) * (len(starts) - 2) > _FUSE_MIN_SECONDS
     return counts
 
 

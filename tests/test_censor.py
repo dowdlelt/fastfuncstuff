@@ -95,13 +95,26 @@ def test_l1_detrend_reaches_the_lp_optimum():
         assert np.abs(r[:, v]).sum() == pytest.approx(res.fun, rel=1e-8)
 
 
-def test_l1_detrend_survives_a_singular_newton_step(monkeypatch):
-    # A singular per-voxel solve once failed a whole autoproc run. Force the
-    # fallback on every step: it must still reach the same optimum.
+def _l1_case():
     rng = np.random.default_rng(2)
     T, V, p = 60, 6, 2
     X = torch.from_numpy(np.polynomial.legendre.legvander(np.linspace(-1, 1, T), p - 1))
-    Y = torch.from_numpy(rng.standard_t(1.5, size=(T, V)))
+    return X, torch.from_numpy(rng.standard_t(1.5, size=(T, V)))
+
+
+def test_unrolled_step_reaches_the_same_optimum(monkeypatch):
+    # The compiled path's elementwise Cholesky, run eagerly (compiling here
+    # would cost the suite ~30 s): same L1 objective as the LAPACK path.
+    X, Y = _l1_case()
+    want = C.l1_detrend(Y, X)
+    monkeypatch.setattr(C, "_ipm_step_fused", C._ipm_step_unrolled)
+    got = C.l1_detrend(Y, X, fused=True)
+    np.testing.assert_allclose(got.abs().sum(0), want.abs().sum(0), rtol=1e-10)
+
+
+def test_lapack_solve_survives_a_singular_matrix(monkeypatch):
+    # A singular per-voxel solve once failed a whole autoproc run.
+    X, Y = _l1_case()
     want = C.l1_detrend(Y, X)
 
     def singular(*a, **k):
@@ -110,6 +123,32 @@ def test_l1_detrend_survives_a_singular_newton_step(monkeypatch):
     monkeypatch.setattr(C.plinalg, "solve", singular)
     got = C.l1_detrend(Y, X)
     np.testing.assert_allclose(got.abs().sum(0), want.abs().sum(0), rtol=1e-8)
+
+
+def test_a_non_finite_step_stops_only_that_voxel(monkeypatch):
+    # The unrolled solve gives NaN where LAPACK would raise. Voxel 3's second
+    # step goes non-finite: it stops near its optimum, the others don't notice.
+    X, Y = _l1_case()
+    V = Y.shape[1]
+    want = C.l1_detrend(Y, X)
+    calls = []
+
+    def nan_once(X, c, *rest):
+        out = list(C._ipm_step(X, c, *rest))
+        calls.append(c.shape[1])
+        if len(calls) == 2 and c.shape[1] == V:
+            out[2] = out[2].clone()
+            out[2][:, 3] = float("nan")
+        return tuple(out)
+
+    monkeypatch.setattr(C, "_ipm_step_fused", nan_once)
+    got = C.l1_detrend(Y, X, fused=True)
+    assert calls[1] == V  # the NaN really went in
+    assert torch.isfinite(got).all()
+    others = [v for v in range(V) if v != 3]
+    np.testing.assert_allclose(got[:, others], want[:, others], rtol=0, atol=0)
+    obj_got, obj_want = got[:, 3].abs().sum(), want[:, 3].abs().sum()
+    assert obj_want <= obj_got <= obj_want * 1.05
 
 
 def test_a_non_finite_voxel_does_not_blank_its_chunk():
