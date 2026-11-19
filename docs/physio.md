@@ -214,8 +214,8 @@ at 0.61 and 0.71). Of the 17 not found, 9 are the prefrontal slab, where the rec
 itself shows almost no pulsation (the one found locks at 0.88). In 5 of the other 8 the best
 candidate did lock to the pulse (0.87–0.95) but fell short of the derangement floor: the
 test errs toward not found. Two of those are ds004645 (TR 0.23 s), where the
-judge rejects even the recorded pulse at the sidecar's slice timing but accepts it, best of
-all 120 orders, with the excitation order reversed: the sidecar's slice order looks wrong
+judge rejects even the recorded pulse at the sidecar's slice timing but ranks it 1st or 2nd of
+all 120 orders with the excitation order reversed: the sidecar's slice order looks wrong
 for that dataset, and the judge is right to refuse a clock that does not fit it (see the
 [short-TR audit](../research_notes/physio_direct_phase/short_tr_audit/NOTES.md)). The previous detector
 never found a run this one missed.
