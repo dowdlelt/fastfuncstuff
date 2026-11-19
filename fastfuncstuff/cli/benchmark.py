@@ -110,11 +110,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-audit",
-        choices=("idle", "ops"),
+        choices=("idle", "syncs", "ops"),
         default=None,
         help="Low-overhead speed audit of FFS commands that execute, written under "
-        "<data-dir>/audits. 'idle': GPU-busy fraction (NVML) and the ffs lines that force "
-        "host syncs. 'ops': a census of (op, shapes, dtype, device) with CPU op times, "
+        "<data-dir>/audits. 'idle': GPU-busy fraction (NVML) and where the host is "
+        "while the GPU waits, at normal speed. 'syncs': the ffs lines that force host syncs "
+        "(slows sync-heavy tools; counts only). 'ops': a census of (op, shapes, dtype, device) with CPU op times, "
         "for scripts/replay_op_census.py. Does not imply -force-ffs; timings are not cached.",
     )
     parser.add_argument(

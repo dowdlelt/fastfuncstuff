@@ -1,6 +1,6 @@
 """Audit any ``ffs_*`` process, not only the ones ``ffs_benchmark`` launches.
 
-``FFS_AUDIT=idle`` (or ``ops``) makes every ffs CLI started with it in its
+``FFS_AUDIT=idle`` (or ``syncs`` / ``ops``) makes every ffs CLI started with it in its
 environment record the matching :mod:`fastfuncstuff.benchmark.audit` report
 from package import to interpreter exit, and write it to::
 

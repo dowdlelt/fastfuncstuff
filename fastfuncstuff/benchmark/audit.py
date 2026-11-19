@@ -5,13 +5,20 @@ with the torch profiler, whose own overhead hides exactly the launch-bound
 behaviour a GPU pipeline suffers from. These audits ask narrower questions
 cheaply enough to leave the tool's speed alone:
 
-``idle``  Is the GPU busy while the tool runs, and which lines of ffs force a
-          host<->device synchronisation? NVML is sampled from a side thread
-          (no CUDA calls in-process) and ``torch.cuda.set_sync_debug_mode``
-          reports each implicit sync (``.item()``, ``nonzero``, boolean
-          indexing, a device->host copy), attributed to the innermost ffs frame.
-          torch calls that mode a prototype that misses some syncs, so a low
-          count is a floor, not a clean bill.
+``idle``  Is the GPU busy while the tool runs, and where is the host while it
+          is not? NVML is sampled from a side thread (no CUDA calls
+          in-process), and each sample charges its idle fraction to the main
+          thread's stack at that moment. Ten samples a second and nothing on
+          the tool's own path, so the tool runs at its normal speed.
+``syncs`` Which lines of ffs force a host<->device synchronisation:
+          ``torch.cuda.set_sync_debug_mode`` reports each implicit sync
+          (``.item()``, ``nonzero``, boolean indexing, a device->host copy),
+          attributed to the innermost ffs frame. Each report goes through
+          Python's warnings machinery, ~100s of us, so this pass *slows* a
+          sync-heavy tool (reml: ~10 s on 41k syncs) and reports locations and
+          counts only -- never read its timings, and never judge a sync fix by
+          this pass: A/B it without the audit. torch calls the mode a
+          prototype that misses some syncs, so a low count is a floor.
 ``ops``   Which (op, shapes, dtype, device) the tool actually runs, counted by
           a ``TorchDispatchMode``. On the CPU each op is timed too, since CPU
           ops are synchronous; on CUDA only counts and output bytes are kept.
@@ -40,7 +47,7 @@ from typing import Any
 
 from .profiling import _requested_device, _slug, command_argv
 
-MODES = ("idle", "ops")
+MODES = ("idle", "syncs", "ops")
 # Frames carry the path the module was imported by, which need not be the
 # resolved one (the repo sits under a symlinked Dropbox), so keep both forms.
 _PKG_DIRS = tuple(
@@ -448,6 +455,7 @@ class AuditSession:
             self.sampler = BusySampler(_nvml_index(self.requested))
             self.baseline = self.sampler.read()
             self.sampler.start()
+        elif self.mode == "syncs" and wants_cuda:
             self.syncs = SyncRecorder()
             self.syncs.install()
         elif self.mode == "ops":
@@ -631,7 +639,7 @@ def aggregate_stage(stage_dir: Path, stage: str) -> dict[str, Any]:
 def format_report(stages: dict[str, dict[str, Any]], mode: str) -> str:
     """The human-readable run summary written next to the manifest."""
     lines: list[str] = []
-    if mode == "idle":
+    if mode in ("idle", "syncs"):
         lines.append(
             f"{'stage':28s} {'tool s':>8s} {'window s':>9s} {'busy%':>6s} {'idle s':>7s} "
             f"{'syncs':>7s} {'sync()':>7s}"
@@ -649,6 +657,10 @@ def format_report(stages: dict[str, dict[str, Any]], mode: str) -> str:
         lines.append("busy% = NVML utilisation between the first and last kernel; idle s is the")
         lines.append("time inside that window with no kernel resident. syncs = implicit host syncs")
         lines.append("(set_sync_debug_mode), sync() = explicit torch.cuda.synchronize calls.")
+        if mode == "syncs":
+            lines.append(
+                "syncs pass: the hook slows sync-heavy tools, so 'tool s' is not a timing."
+            )
         for name, s in stages.items():
             idle_sites = s.get("idle_sites") or []
             sites = s.get("implicit_sites") or []
@@ -748,7 +760,14 @@ def main(argv: list[str] | None = None) -> None:
         summary = aggregate_stage(stage_dir, stage_dir.name)
         if summary["invocation_count"]:
             stages[stage_dir.name] = summary
-            mode = mode or ("ops" if "ops" in summary else "idle")
+            if not mode:
+                mode = (
+                    "ops"
+                    if "ops" in summary
+                    else "syncs"
+                    if "implicit_syncs" in summary
+                    else "idle"
+                )
     if not stages:
         sys.exit(f"no audit invocations under {args.root}")
     print(format_report(stages, mode))

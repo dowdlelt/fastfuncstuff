@@ -99,14 +99,14 @@ def test_nvml_index_follows_device_spec_and_visible_devices(monkeypatch):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_idle_mode_counts_hidden_syncs_by_site(tmp_path):
+def test_syncs_mode_counts_hidden_syncs_by_site(tmp_path):
     def work():
         x = torch.randn(256, 256, device="cuda")
         for _ in range(7):
             float(x.sum())
 
     out = tmp_path / "idle.json"
-    audit.capture_audit(work, out, mode="idle", command=["ffs_x"], label="x", stage="s")
+    audit.capture_audit(work, out, mode="syncs", command=["ffs_x"], label="x", stage="s")
     syncs = json.loads(out.read_text())["syncs"]
     assert syncs["implicit_syncs"] >= 7
     site, _ = syncs["implicit_sites"][0]

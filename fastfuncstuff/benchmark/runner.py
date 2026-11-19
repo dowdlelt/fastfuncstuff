@@ -32,7 +32,7 @@ class BenchmarkContext:
     show_output: bool = False  # Stream subprocess stdout/stderr when True
     profile: bool = False  # Profile FFS commands that actually execute
     profile_trace: bool = False  # Also export potentially large Chrome traces
-    audit: str | None = None  # "idle" or "ops": low-overhead speed audit (benchmark/audit.py)
+    audit: str | None = None  # "idle"/"syncs"/"ops": low-overhead speed audit (benchmark/audit.py)
     config: Any = None  # BenchmarkConfig — typed as Any to avoid circular import
 
     # Per-stage scratch: how many items each role (ref/ffs) actually ran vs the
