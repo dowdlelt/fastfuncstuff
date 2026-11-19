@@ -213,8 +213,10 @@ Median locking of the finds is 0.94–0.99 per dataset (ds006947's two runs, TR 
 at 0.61 and 0.71). Of the 17 not found, 9 are the prefrontal slab, where the recording
 itself shows almost no pulsation (the one found locks at 0.88). In 5 of the other 8 the best
 candidate did lock to the pulse (0.87–0.95) but fell short of the derangement floor: the
-test errs toward not found. Two of those are ds004645 (TR 0.23 s), with so few excitations
-per volume that the derangement null is coarse and high. The previous detector
+test errs toward not found. Two of those are ds004645 (TR 0.23 s): the candidate heartbeat
+is unaliased and recovered, but the slice-alignment judge rejects even the recorded pulse
+phase. This is a limitation of confirmation, not evidence that the heartbeat is absent
+(see the [short-TR audit](../research_notes/physio_direct_phase/short_tr_audit/NOTES.md)). The previous detector
 never found a run this one missed.
 
 **Choices checked against the data, not tuned on it.** The number of principal components
@@ -239,13 +241,17 @@ excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0
 - **Cardiac where pulsation is weak.** On a thin prefrontal slab (ds001168, 0.8 mm, TR 4 s)
   the heartbeat was found in 1 of 10 runs; the recording shows almost no pulsation there.
   Expect not found, not wrong, on slabs away from the large vessels. With few excitations per
-  volume (TR 0.23 s) the slice-timing null is coarse and runs that lock are rejected.
+  volume (TR 0.23 s), recovered unaliased heartbeats can fail spatial slice alignment;
+  even the recorded clock failed in both runs checked. Confirmation for this regime
+  remains open.
 - **On data with no heartbeat at all**, "found" comes up about once in 100 runs (1 of 83
   synthetic noise-only runs): the chance rate of a test against 90 derangements. Every
   real run scored had a pulse, so this rate is not in the table above.
 - **Respiration from magnitude alone at long TR is unreliable.** Without phase, the
   respiratory trace at TR 2 s sequential (ds002547) read the TR's own comb instead of
-  breathing in all 10 runs checked. Give the phase whenever it exists; a magnitude-only
+  breathing in all 10 runs checked. Their belt rates (16–23/min) exceed the volume-rate
+  Nyquist limit (15/min), so recovery still depends on combining excitations correctly.
+  Give the phase whenever it exists; a magnitude-only
   respiration path at long TR is open work.
 - **A heart rate within ~3/min of k/TR** aliases to near zero in every voxel and cannot be
   told from drift; those rates are a blind zone, and so are k/TR ± the breathing rate.
