@@ -1395,10 +1395,15 @@ class LocomocoResult:
     refine_fwhms: list[float] | None = None
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
+        # A view, not a contiguous copy: nearly every caller goes on to write the
+        # array, and save_nifti's threaded reorder into file order reads a strided
+        # source as cheaply as a packed one -- so .contiguous() here was a whole
+        # extra pass over each 4-D output (4.4 s of GPU-idle host time on a 5-run
+        # batch, ffs -audit idle).
         inv = [0, 0, 0, 0]
         for new_pos, old_axis in enumerate(self.perm):
             inv[old_axis] = new_pos
-        return canon.permute(inv).contiguous()
+        return canon.permute(inv)
 
     def pe_displacement(self) -> torch.Tensor:
         """Per-frame SIGNED PE displacement ``(nx, ny, nz, T)`` in voxel units.
