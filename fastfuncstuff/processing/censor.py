@@ -242,7 +242,15 @@ def l1_detrend(
     b_rhs = 0.5 * X.sum(dim=0)  # (p,)
 
     def solve(Q: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        return plinalg.solve((Q.T @ XX).reshape(-1, p, p), rhs.T @ X).T  # (p, V)
+        a, b = (Q.T @ XX).reshape(-1, p, p), rhs.T @ X
+        try:
+            return plinalg.solve(a, b).T  # (p, V)
+        except torch.linalg.LinAlgError:
+            # One voxel's Newton matrix went exactly singular (seen once on a
+            # real run, never reproduced) and took the whole run down. Take the
+            # minimum-norm step for this iteration instead; every other voxel's
+            # step is the same solution, so results elsewhere don't move.
+            return (plinalg.pinv(a) @ b.unsqueeze(-1)).squeeze(-1).T
 
     c = -y
     x = torch.full_like(y, 0.5)  # dual variable a, feasible: X'a = 0.5 X'1
@@ -368,6 +376,13 @@ def outlier_counts(
     starts = range(0, V, chunk_size)
     for s in tqdm(starts, desc="outliers", leave=True, disable=not progress or len(starts) < 2):
         y = series[:, s : s + chunk_size].to(device=device).to(dtype)
+        # A non-finite voxel would not just lose its own count: LAPACK scales
+        # the whole least-squares right-hand side by its largest entry, so one
+        # inf turned the chunk's 1024 residuals to NaN and silently zeroed their
+        # outliers. Such a voxel counts as flat (MAD 0: no outliers, still in V).
+        finite = torch.isfinite(y).all(dim=0)
+        if not bool(finite.all()):
+            y[:, ~finite] = 0.0
         if basis is None:
             r = y - afni_median(y, dim=0)
         else:

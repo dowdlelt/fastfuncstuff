@@ -95,6 +95,34 @@ def test_l1_detrend_reaches_the_lp_optimum():
         assert np.abs(r[:, v]).sum() == pytest.approx(res.fun, rel=1e-8)
 
 
+def test_l1_detrend_survives_a_singular_newton_step(monkeypatch):
+    # A singular per-voxel solve once failed a whole autoproc run. Force the
+    # fallback on every step: it must still reach the same optimum.
+    rng = np.random.default_rng(2)
+    T, V, p = 60, 6, 2
+    X = torch.from_numpy(np.polynomial.legendre.legvander(np.linspace(-1, 1, T), p - 1))
+    Y = torch.from_numpy(rng.standard_t(1.5, size=(T, V)))
+    want = C.l1_detrend(Y, X)
+
+    def singular(*a, **k):
+        raise torch.linalg.LinAlgError("torch.linalg.solve: (Batch element 3): singular")
+
+    monkeypatch.setattr(C.plinalg, "solve", singular)
+    got = C.l1_detrend(Y, X)
+    np.testing.assert_allclose(got.abs().sum(0), want.abs().sum(0), rtol=1e-8)
+
+
+def test_a_non_finite_voxel_does_not_blank_its_chunk():
+    rng = np.random.default_rng(3)
+    T, V = 50, 300
+    y = rng.normal(size=(T, V))
+    y[10, :60] += 25.0
+    clean = C.outlier_counts(torch.from_numpy(y[:, 1:]).to(CPU), polort=1, chunk_size=128)
+    y[:, 0] = np.inf
+    dirty = C.outlier_counts(torch.from_numpy(y).to(CPU), polort=1, chunk_size=128)
+    np.testing.assert_array_equal(dirty.numpy(), clean.numpy())
+
+
 def test_outlier_counts_polort0_matches_the_definition():
     rng = np.random.default_rng(1)
     T, V = 40, 200
