@@ -1829,20 +1829,32 @@ def _stage_physio(plan: Plan) -> str:
     resample read the cleaned series (afni_proc's ricor order). On ImaginationStimulation
     clean lowered held-out R2 where nuisance did not. Reads the NORDIC magnitude when
     NORDIC ran (noise volumes trimmed), else the BIDS magnitude with -drop_last NOISE;
-    the raw phase, when the run has one, gives the respiratory trace."""
+    the raw phase, when the run has one, gives the respiratory trace. A multi-echo run
+    passes every echo (and its echo times); nuisance mode only."""
     opt = plan.options
     if not opt.physio:
         return ""
     clean = opt.physio_clean
     if opt.want_nordic:
-        src = f'  mag="{_nordic_mag(plan)}"; drop=0'
+        # NORDIC trims the noise volumes; its raw phase stays the BIDS one (ffs_physio
+        # trims a longer phase from its end)
+        src = (
+            "  drop=0; mags=(); phs=()\n  " + _ECHO_LOOP + "\n"
+            '    mags+=("stage00.nordic.${FRAG[$k]}${esfx}.nii$FMT")\n'
+            f'    p="{_ECHO_PHASE}"; [ -n "$p" ] && phs+=("$p")\n  done'
+        )
     else:
-        src = '  mag="${MAG[$k]}"; drop="${NOISE[$k]}"'
+        src = (
+            '  drop="${NOISE[$k]}"; mags=(); phs=()\n  ' + _ECHO_LOOP + "\n"
+            f'    mags+=("{_ECHO_MAG}")\n'
+            f'    p="{_ECHO_PHASE}"; [ -n "$p" ] && phs+=("$p")\n  done'
+        )
     cmd = _ffs(
         "ffs_physio",
         [
-            '-input "$mag"',
+            '-input "${mags[@]}"',
             '"${phase_arg[@]}"',
+            '"${te_arg[@]}"',
             f"-tpattern {_tpattern(plan)}",
             '-TR "${TR[$k]}"',
             '-drop_last "$drop"',
@@ -1880,7 +1892,8 @@ for k in "${{RUN_KEYS[@]}}"; do
   outf="{_physio_clean_out() if clean else _physio_out()}"
   [ "$skip_physio" -eq 1 ] && [ -f "$outf" ] && continue
 {src}
-  if [ -n "${{PHASE[$k]:-}}" ]; then phase_arg=(-phase "${{PHASE[$k]}}"); else phase_arg=(); fi
+  phase_arg=(); [ "${{#phs[@]}}" -eq "${{#mags[@]}}" ] && phase_arg=(-phase "${{phs[@]}}")
+  te_arg=(); [ "${{NECHO[$k]:-1}}" -gt 1 ] && te_arg=(-echo_times ${{TES[$k]}})
 {cmd}
 done
 """

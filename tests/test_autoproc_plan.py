@@ -4355,10 +4355,12 @@ def test_physio_writes_glm_regressors_and_leaves_the_series_alone(tmp_path, nord
     assert "ffs_physio" in stage and "-tzero 0.5" in stage and "-clean" not in stage
     assert 'outf="stage00.physio.${FRAG[$k]}.regs.nuisance.1D"' in stage
     if nordic:
-        assert 'mag="stage00.nordic.${FRAG[$k]}${E1[$k]:-}.nii$FMT"; drop=0' in stage
+        assert 'mags+=("stage00.nordic.${FRAG[$k]}${esfx}.nii$FMT")' in stage
+        assert "drop=0" in stage
         assert s.index("stage00: physio ====") > s.index("stage00: NORDIC")
     else:
-        assert 'mag="${MAG[$k]}"; drop="${NOISE[$k]}"' in stage
+        assert 'mags+=("${MAGE[$k|$e]:-${MAG[$k]}}")' in stage
+        assert 'drop="${NOISE[$k]}"' in stage
     assert "stage00.physio" not in _section(s, "stage02: moco")
     assert "skip_physio=1" in s
     assert "ffs_physio" in s.split("for t in", 1)[1].split("\n", 1)[0]  # preflight checks it
@@ -4427,3 +4429,29 @@ def test_physio_refuses_3d_and_warns_without_phase(tmp_path):
     assert not any("no 'physio'" in w for w in quiet)
     assert _physio_errors(Options(physio=True, acq_3d=True), subj, [])
     assert _physio_errors(Options(), subj, []) == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_physio_passes_every_echo_and_its_echo_times(tmp_path):
+    """Multi-echo -physio: all echoes' magnitudes and phases go to one ffs_physio call
+    with the run's echo times; the cleaned-series mode is refused (its echoes would
+    not reach the later stages), as is a run whose echo times are unknown."""
+    from fastfuncstuff.cli.autoproc import _physio_errors
+
+    run = _me_run("01", "foo", "1")
+    subj = Subject("X", [Session("01", [run])])
+    assert _physio_errors(Options(physio=True, glm_ortvec=["physio"]), subj, []) == []
+    errs = _physio_errors(Options(physio=True, physio_mode="clean"), subj, [])
+    assert any("multi-echo" in e for e in errs)
+    s = write_script(build_plan(subj, Options(physio=True, tzero=0.5)), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    stage = _section(s, "stage00: physio ====")
+    assert '-input "${mags[@]}"' in stage and 'phase_arg=(-phase "${phs[@]}")' in stage
+    assert "te_arg=(-echo_times ${TES[$k]})" in stage
+    run.echo_tes = []
+    assert any("EchoTime" in e for e in _physio_errors(Options(physio=True), subj, []))
