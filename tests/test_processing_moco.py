@@ -747,3 +747,20 @@ def test_moco_fourier_refuses_the_gather_paths():
     ts = torch.rand(3, 8, 16, 16)
     with pytest.raises(ValueError, match="shear estimator"):
         moco(ts, MocoConfig(device="cpu", verb=0, compile=False, interp="fourier", cost="lpa"))
+
+
+def test_slice_lowpass_is_estimation_only():
+    """-interp fourier blurs the slice axis for estimation; the corrected output
+    must still be the unblurred data (the base volume comes back as itself)."""
+    from fastfuncstuff.processing.ffs_moco import _slice_lowpass_sigma
+
+    assert _slice_lowpass_sigma(MocoConfig(interp="fourier")) == 1.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="fourier3d")) == 0.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="heptic")) == 0.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="heptic", slice_lowpass=0.5)) == 0.5
+
+    rng = np.random.default_rng(2)
+    vol = rng.normal(size=(12, 24, 24)).astype(np.float32) + 5.0
+    ts = torch.tensor(np.stack([vol, vol, vol]))
+    res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, interp="fourier"))
+    np.testing.assert_allclose(res.aligned[0].numpy(), vol, atol=1e-4)

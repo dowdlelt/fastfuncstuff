@@ -363,6 +363,20 @@ def parse_args(
         help="Pre-blur FWHM in mm for estimation (default: 0)",
     )
     method_group.add_argument(
+        "-slice_lowpass",
+        type=float,
+        default=None,
+        metavar="SIGMA",
+        help=(
+            "Estimation-only Gaussian along the slice axis (k), sigma in slices.\n"
+            "Default: 1.0 with -interp fourier, else 0. A 2D slice has no exact\n"
+            "interpolant, so once the in-plane axes are exact the slice kernel's\n"
+            "bias is what is left (a 2-4%% gain error on pitch/roll); one slice of\n"
+            "blur removes it. Costs one 1-D convolution per volume; the output is\n"
+            "not blurred. Set 0 for 3D EPI with -interp fourier3d."
+        ),
+    )
+    method_group.add_argument(
         "-fast",
         action="store_true",
         help="Fast mode: fixed iterations, no convergence check (runs exactly -maxiter)",
@@ -1096,6 +1110,7 @@ def _build_config(
         max_iter=max_iter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
+        slice_lowpass=args.slice_lowpass,
         chain_init=args.chain_init,
         use_shear=not args.no_shear,
         automask=args.automask,

@@ -71,6 +71,9 @@ class MocoConfig:
     max_iter: int = 23  # Per-volume GN iterations (matches 3dvolreg -maxite)
     twopass: bool = False  # Coarse blur + fine pass
     blur_fwhm: float = 0.0  # Pre-blur for estimation (mm)
+    # Estimation-only Gaussian along the slice axis (k), sigma in slices; None =
+    # auto (1.0 with interp="fourier", else 0). See _slice_lowpass_sigma.
+    slice_lowpass: float | None = None
     dxy_thresh: float = 0.01  # Translation convergence, voxels (3dvolreg -x_thresh)
     dph_thresh: float = 0.02  # Rotation convergence, degrees (3dvolreg -rot_thresh)
     chain_init: bool = (
@@ -1094,6 +1097,39 @@ def save_maxdisp_1D(
 # ---------------------------------------------------------------------------
 
 
+def _slice_lowpass_sigma(config: MocoConfig) -> float:
+    """Slice-axis estimation low-pass, sigma in slices.
+
+    A 2D slice is a discrete excitation through a slice profile, not a DFT
+    sample, so the slice axis has no exact interpolant and its polynomial
+    kernel smooths by an amount that depends on the fractional shift. Once the
+    in-plane axes are exact (``fourier``), that leftover bias is what remains,
+    and it shows up as a 2-4% gain error on pitch and roll. A Gaussian of one
+    slice on both images removes it: on whole-brain truth (0.35 mm T2* moved,
+    sampled to 2.1 mm 2D) random 6-DOF error fell 0.015 -> 0.003 mm, flat for
+    sigma 0.8-1.3 at 2% and 5% noise. Estimation only; the output is untouched.
+    """
+    if config.slice_lowpass is not None:
+        return config.slice_lowpass
+    return 1.0 if config.interp == "fourier" else 0.0
+
+
+def _estimation_view(vol: Tensor, config: MocoConfig) -> Tensor:
+    """The (optionally batched) volume the estimator sees: -blur, then the slice low-pass."""
+    if config.blur_fwhm > 0:
+        if vol.ndim == 4:
+            vol = torch.stack([_blur_volume(v, config.blur_fwhm) for v in vol])
+        else:
+            vol = _blur_volume(vol, config.blur_fwhm)
+    sigma = _slice_lowpass_sigma(config)
+    if sigma > 0:
+        if vol.ndim == 4:
+            vol = _separable_smooth_3d(vol[:, None], (sigma, 0.0, 0.0))[:, 0]
+        else:
+            vol = _separable_smooth_3d(vol, (sigma, 0.0, 0.0))
+    return vol
+
+
 def _blur_volume(vol: Tensor, fwhm: float) -> Tensor:
     """Apply Gaussian blur to a volume (fwhm in voxels)."""
     if fwhm <= 0:
@@ -1163,10 +1199,7 @@ def _run_batched_estimation(
         B = srcs_raw.shape[0]
 
         # Fine-pass sources (optionally pre-blurred for estimation).
-        if config.blur_fwhm > 0:
-            srcs = torch.stack([_blur_volume(srcs_raw[i], config.blur_fwhm) for i in range(B)])
-        else:
-            srcs = srcs_raw
+        srcs = _estimation_view(srcs_raw, config)
 
         src_flat = srcs.reshape(B, -1)
         rms_before[idx] = ((base_flat[None] - src_flat) ** 2).mean(dim=1).sqrt().cpu().numpy()
@@ -1459,7 +1492,7 @@ def moco(
     weight = weight.to(device=device, dtype=dtype)
 
     # Pre-blur if requested
-    base_est = _blur_volume(base, config.blur_fwhm) if config.blur_fwhm > 0 else base
+    base_est = _estimation_view(base, config)
 
     # Estimation-side shear. AFNI never interpolates in 3D to register: mri_3dalign.c
     # drives THD_rota3D, four stride-1 1D shears, so heptic costs 4x8=32 taps/voxel
@@ -1801,7 +1834,7 @@ def moco(
 
         # Load source volume to GPU
         source = timeseries[t].to(device=device, dtype=dtype)
-        source_est = _blur_volume(source, config.blur_fwhm) if config.blur_fwhm > 0 else source
+        source_est = _estimation_view(source, config)
 
         # Initial parameters
         if config.chain_init and t > 0:
