@@ -19,7 +19,7 @@ from fastfuncstuff.design.builder import (
 from fastfuncstuff.io.afni import read_afni_design_matrix
 
 # Test data directory
-TEST_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
+TEST_DATA_DIR = Path(__file__).parent / "data" / "afni"
 
 
 def test_spm_canonical_hrf():
@@ -101,8 +101,8 @@ def test_legendre_polynomials():
 def test_parse_afni_timing_file():
     """Test parsing AFNI timing files"""
     # Test with actual data
-    movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
-    prompt_file = TEST_DATA_DIR / "ses01_times.prompt.txt"
+    movie_file = TEST_DATA_DIR / "movie.txt"
+    prompt_file = TEST_DATA_DIR / "prompt.txt"
 
     assert movie_file.exists(), f"Test data not found: {movie_file}"
     assert prompt_file.exists(), f"Test data not found: {prompt_file}"
@@ -110,7 +110,7 @@ def test_parse_afni_timing_file():
     # Parse movie timing
     movie_onsets = parse_afni_timing_file(movie_file)
 
-    # Should have 2 runs (based on make_small_model.sh)
+    # Should have 2 runs (one per line in the synthetic fixture)
     assert len(movie_onsets) >= 2, f"Expected at least 2 runs, got {len(movie_onsets)}"
 
     # Check first run has onsets
@@ -263,10 +263,9 @@ def test_create_onset_regressors():
 def test_build_design_matrix_basic():
     """Test building complete design matrix"""
     # Use actual test data
-    movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
-    prompt_file = TEST_DATA_DIR / "ses01_times.prompt.txt"
+    movie_file = TEST_DATA_DIR / "movie.txt"
+    prompt_file = TEST_DATA_DIR / "prompt.txt"
 
-    # Parameters from make_small_model.sh
     # Based on AFNI X.xmat.1D: 720 timepoints total, 2 runs, TR=1.0s
     timing_files = [movie_file, prompt_file]
     stim_labels = ["movie", "prompt"]
@@ -318,9 +317,6 @@ def test_build_design_matrix_basic():
     print(f"Nuisance indices: {metadata['nuisance_indices']}")
 
 
-@pytest.mark.skipif(
-    not (TEST_DATA_DIR / "X.xmat.1D").exists(), reason="AFNI reference design matrix not found"
-)
 def test_compare_with_afni():
     """Compare our design matrix with AFNI's X.xmat.1D"""
     # Load AFNI design matrix
@@ -329,11 +325,11 @@ def test_compare_with_afni():
 
     print(f"\nAFNI design matrix shape: {afni_matrix.shape}")
     print(f"AFNI run starts: {afni_design.get('run_starts', 'Not found')}")
-    print(f"AFNI labels: {afni_design.get('col_labels', 'Not found')[:10]}...")
+    print(f"AFNI labels: {afni_design.get('column_labels', 'Not found')[:10]}...")
 
     # Build our design matrix
-    movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
-    prompt_file = TEST_DATA_DIR / "ses01_times.prompt.txt"
+    movie_file = TEST_DATA_DIR / "movie.txt"
+    prompt_file = TEST_DATA_DIR / "prompt.txt"
 
     # Get actual n_timepoints from AFNI matrix
     total_tps = afni_matrix.shape[0]
@@ -371,30 +367,11 @@ def test_compare_with_afni():
         f"Row count mismatch: ours={design.shape[0]}, AFNI={afni_matrix.shape[0]}"
     )
 
-    # Note: Column count might differ if AFNI includes extra regressors (motion, etc.)
-    # For now, just compare stimulus columns
-
-    # Extract stimulus columns from both
-    # AFNI matrix: first 2 columns should be stimulus
-    afni_stim = afni_matrix[:, :2]
-    our_stim = design[:, :2]
-
-    # Compare stimulus columns
-    # Allow some tolerance due to numerical differences in HRF implementation
-    corr_movie = np.corrcoef(afni_stim[:, 0], our_stim[:, 0])[0, 1]
-    corr_prompt = np.corrcoef(afni_stim[:, 1], our_stim[:, 1])[0, 1]
-
-    print("\nCorrelation with AFNI:")
-    print(f"  Movie regressor: {corr_movie:.6f}")
-    print(f"  Prompt regressor: {corr_prompt:.6f}")
-
-    # Should be very highly correlated (>0.99)
-    assert corr_movie > 0.95, f"Movie regressor correlation too low: {corr_movie}"
-    assert corr_prompt > 0.95, f"Prompt regressor correlation too low: {corr_prompt}"
-
-    # For very close match, check if highly correlated
-    if corr_movie > 0.999 and corr_prompt > 0.999:
-        print("  ✓ Excellent match with AFNI!")
+    # Match by label so the comparison exercises the task columns.
+    for label in ("movie#0", "prompt#0"):
+        afni_col = afni_matrix[:, afni_design["column_labels"].index(label)]
+        ffs_col = design[:, labels.index(label)]
+        assert np.corrcoef(afni_col, ffs_col)[0, 1] > 0.99, label
 
 
 def test_write_afni_xmat():
@@ -404,8 +381,8 @@ def test_write_afni_xmat():
     from fastfuncstuff.design.builder import write_afni_xmat
 
     # Build a simple design matrix
-    movie_file = TEST_DATA_DIR / "ses01_times.movie.txt"
-    prompt_file = TEST_DATA_DIR / "ses01_times.prompt.txt"
+    movie_file = TEST_DATA_DIR / "movie.txt"
+    prompt_file = TEST_DATA_DIR / "prompt.txt"
 
     design, labels, run_starts, metadata = build_design_matrix(
         timing_files=[movie_file, prompt_file],
@@ -795,9 +772,6 @@ def test_f_test_glt_matrix_round_trip(tmp_path):
     )
 
 
-@pytest.mark.skipif(
-    not (TEST_DATA_DIR / "X.xmat.1D").exists(), reason="AFNI reference design matrix not found"
-)
 def test_goodlist_utilities():
     """Test GoodList parsing and censoring utilities"""
     from fastfuncstuff.io.afni import (

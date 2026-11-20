@@ -3,17 +3,12 @@ Confirmation tests for high-level fMRI analysis pipelines.
 Verifies AFNI onset parsing, HRF library fitting, and cross-validation.
 """
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
 from fastfuncstuff.design.hrf import get_hrf_library
 from fastfuncstuff.glm.core import fit_glm_hrf_library
-
-# Test data directory
-TEST_DATA_DIR = Path(__file__).parent.parent / "test_data" / "small_validation_afni_data"
 
 
 @pytest.fixture

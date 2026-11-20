@@ -1,10 +1,4 @@
-"""
-Tests for AFNI I/O and NIfTI handling using synthetic data.
-
-Uses the synthetic_data/ folder with known test datasets:
-- afni_all_ones+orig: 64x64x16x40 AFNI format, all values = 1
-- afni_nii_all_ones.nii.gz: Same data in NIfTI format
-"""
+"""Tests for AFNI I/O and NIfTI handling using synthetic data."""
 
 import gzip
 import io
@@ -18,14 +12,11 @@ import nibabel as nib
 import numpy as np
 import pytest
 
-# Locate synthetic data directory
-SYNTHETIC_DATA_DIR = Path(__file__).parent.parent / "synthetic_data"
-AFNI_ALL_ONES_HEAD = SYNTHETIC_DATA_DIR / "afni_all_ones+orig.HEAD"
-AFNI_ALL_ONES_BRIK = SYNTHETIC_DATA_DIR / "afni_all_ones+orig.BRIK.gz"
-NIFTI_ALL_ONES = SYNTHETIC_DATA_DIR / "afni_nii_all_ones.nii.gz"
+FIXTURE_DIR = Path(__file__).parent / "data" / "afni"
+AFNI_ALL_ONES_HEAD = FIXTURE_DIR / "ones+orig.HEAD"
+NIFTI_ALL_ONES = FIXTURE_DIR / "ones.nii.gz"
 
-# Expected properties of synthetic data
-EXPECTED_SHAPE = (64, 64, 16, 40)
+EXPECTED_SHAPE = (4, 5, 6, 8)
 EXPECTED_VALUE = 1.0
 
 
@@ -42,9 +33,6 @@ class TestNIfTIReading:
 
     def test_read_nifti_all_ones(self):
         """Test reading the synthetic all-ones NIfTI dataset."""
-        if not NIFTI_ALL_ONES.exists():
-            pytest.skip("Synthetic NIfTI data not found")
-
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
         affine = img.affine
@@ -60,9 +48,6 @@ class TestNIfTIReading:
 
     def test_read_nifti_returns_numpy_array(self):
         """Test that nibabel returns numpy arrays."""
-        if not NIFTI_ALL_ONES.exists():
-            pytest.skip("Synthetic NIfTI data not found")
-
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
         affine = img.affine
@@ -76,9 +61,6 @@ class TestAFNIReading:
 
     def test_read_afni_all_ones(self):
         """Test reading the synthetic all-ones AFNI dataset."""
-        if not (AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists()):
-            pytest.skip("Synthetic AFNI data not found")
-
         # nibabel can read AFNI format too
         img = nib.load(str(AFNI_ALL_ONES_HEAD))
         data = img.get_fdata()
@@ -91,11 +73,6 @@ class TestAFNIReading:
 
     def test_afni_nifti_equivalence(self):
         """Test that AFNI and NIfTI versions have same data."""
-        if not (
-            AFNI_ALL_ONES_HEAD.exists() and AFNI_ALL_ONES_BRIK.exists() and NIFTI_ALL_ONES.exists()
-        ):
-            pytest.skip("Synthetic data not found")
-
         afni_img = nib.load(str(AFNI_ALL_ONES_HEAD))
         afni_data = afni_img.get_fdata()
 
@@ -809,9 +786,6 @@ class TestSyntheticDataProperties:
 
     def test_synthetic_data_statistics(self):
         """Verify synthetic data has expected statistical properties."""
-        if not NIFTI_ALL_ONES.exists():
-            pytest.skip("Synthetic NIfTI data not found")
-
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
 
@@ -823,9 +797,6 @@ class TestSyntheticDataProperties:
 
     def test_synthetic_data_dimensions(self):
         """Verify synthetic data has correct dimensions for typical fMRI."""
-        if not NIFTI_ALL_ONES.exists():
-            pytest.skip("Synthetic NIfTI data not found")
-
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
         _affine = img.affine
@@ -843,9 +814,6 @@ class TestSyntheticDataProperties:
 
     def test_synthetic_data_as_glm_input(self):
         """Test that synthetic data can be used as GLM input (correct shape/type)."""
-        if not NIFTI_ALL_ONES.exists():
-            pytest.skip("Synthetic NIfTI data not found")
-
         img = nib.load(str(NIFTI_ALL_ONES))
         data = img.get_fdata()
 
