@@ -4433,9 +4433,8 @@ def test_physio_refuses_3d_and_warns_without_phase(tmp_path):
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 def test_physio_passes_every_echo_and_its_echo_times(tmp_path):
-    """Multi-echo -physio: all echoes' magnitudes and phases go to one ffs_physio call
-    with the run's echo times; the cleaned-series mode is refused (its echoes would
-    not reach the later stages), as is a run whose echo times are unknown."""
+    """Multi-echo -physio: all echoes' magnitudes and phases go to one ffs_physio call;
+    the cleaned-series mode is refused (its echoes would not reach the later stages)."""
     from fastfuncstuff.cli.autoproc import _physio_errors
 
     run = _me_run("01", "foo", "1")
@@ -4452,6 +4451,4 @@ def test_physio_passes_every_echo_and_its_echo_times(tmp_path):
     )
     stage = _section(s, "stage00: physio ====")
     assert '-input "${mags[@]}"' in stage and 'phase_arg=(-phase "${phs[@]}")' in stage
-    assert "te_arg=(-echo_times ${TES[$k]})" in stage
-    run.echo_tes = []
-    assert any("EchoTime" in e for e in _physio_errors(Options(physio=True), subj, []))
+    assert "-echo_times" not in stage

@@ -1600,9 +1600,7 @@ def _physio_errors(opt, subject, warnings: list[str]) -> list[str]:
             "-physio_mode clean: multi-echo runs are not supported (the cleaned echoes are "
             "not wired into the stages after it); use -physio_mode nuisance."
         )
-    no_te = [f"{r.session or '-'}/{r.task}/{r.run or '-'}" for r in me if not r.echo_tes]
-    if no_te:
-        errors.append("-physio: no EchoTime in the sidecars of multi-echo " + ", ".join(no_te))
+
     if opt.physio_nuisance and getattr(opt, "run_glm", True) and "physio" not in opt.glm_ortvec:
         warnings.append(
             "-physio: the GLM nuisance list (-glm_ortvec) has no 'physio', so the regressors "

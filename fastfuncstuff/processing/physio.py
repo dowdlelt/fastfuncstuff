@@ -176,7 +176,6 @@ def excitation_traces(
     comb: bool = True,
     voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
     reference_s: float = 60.0,
-    echo_times: Sequence[float] | None = None,
 ) -> ExcitationTraces:
     """One physiological sample per (volume, excitation).
 
@@ -186,10 +185,8 @@ def excitation_traces(
         Raw slices -- before any motion correction or slice timing, so that every
         sample is still at its own acquisition time. ``phase`` may be raw scanner
         units; only its *change* over time is used, so no spatial unwrap is needed.
-        Multi-echo: a list of each, one per echo (see :func:`echo_views`), with
-        ``echo_times``.
-    echo_times : sequence of float, optional
-        Echo time of each echo (s); required with more than one.
+        Multi-echo: a list of each, one per echo, shortest TE first (see
+        :func:`echo_views`).
     slice_times : (nz,)
         Acquisition offset of each slice within the TR (s); slice ``k`` is the
         file's third axis.
@@ -210,25 +207,18 @@ def excitation_traces(
     divided by its mean, then averaged over the excitation's voxels. Phase: each
     voxel's change against its own running-mean phasor, ``angle(z_t * conj(zref_t))``,
     drift removed, averaged with weight ``mean magnitude**2`` (phase noise scales as
-    1/magnitude). Multi-echo: every echo's voxels join the magnitude average, and each
-    voxel's phase changes are fitted through the origin across echoes,
-    ``dphi_e = 2 pi df TE_e`` weighted by ``(magnitude_e TE_e)**2``, to one field
-    change, expressed in radians at the middle echo time so the units match a
-    single-echo run. The respiratory field is ~1 Hz at 3 T, a third of a radian at
-    TE 50 ms, so each echo stays inside one wrap of its running reference and no
-    unwrap is needed. (A free TE-independent offset per voxel was tried as well;
-    against belts on ds006926 it matched the through-origin fit and cost a degree of
-    freedom.)
+    1/magnitude). Multi-echo: every echo's voxels join the magnitude average, and
+    the phase is read from the middle echo alone. Fitting each voxel's phase change
+    across echoes (through the origin, inverse-variance weights) tied the middle echo
+    on breathing timing over 24 ds006926 runs and lost breath depth (field RVT vs
+    belt) in 16 of them; the first echo alone was worst (the likely reason, untested:
+    phase that does not grow with TE, which a fit across TE amplifies on short echoes).
     """
     device = device or torch.device("cpu")
     mags = [magnitude] if isinstance(magnitude, np.ndarray) else list(magnitude)
     phases = [] if phase is None else [phase] if isinstance(phase, np.ndarray) else list(phase)
     if phases and len(phases) != len(mags):
         raise ValueError(f"{len(phases)} phase echoes for {len(mags)} magnitude echoes")
-    if len(mags) > 1 and (echo_times is None or len(echo_times) != len(mags)):
-        raise ValueError(f"{len(mags)} echoes need as many echo_times")
-    tes = np.asarray(echo_times if len(mags) > 1 else [1.0], dtype=float)
-    te_ref = float(np.median(tes))
     _, _, nz, nt = mags[0].shape
     group, gtimes = excitation_groups(slice_times)
     G = len(gtimes)
@@ -244,14 +234,13 @@ def excitation_traces(
     per_slice_p = np.zeros((nt, nz))
     count_m = np.zeros(nz)
     count_p = np.zeros(nz)
-    ranges = []
-    for ph_e in phases:
+    pe = len(mags) // 2  # the echo the phase is read from: the middle one
+    if phases:
         # The run's own range onto [-pi, pi], as complex.scale_phase_to_radians does,
         # but with one min/max for every slice so all slices share the mapping.
-        lo, hi = float(ph_e.min()), float(ph_e.max())
+        lo, hi = float(phases[pe].min()), float(phases[pe].max())
         if not hi > lo:
             raise ValueError("phase has no range; expected raw scanner units or radians")
-        ranges.append((lo, hi))
     nx, ny = mags[0].shape[:2]
     gx, gy = np.meshgrid(
         (np.arange(nx) - nx / 2) * voxel_size[0] / 100.0,
@@ -283,36 +272,23 @@ def excitation_traces(
             continue
         count_m[k] = sum(n for _, n in sums)
         per_slice_m[:, k] = sum(x * (n / count_m[k]) for x, n in sums)
-        # one voxel set for the phase: echo 1's (the brightest), as for one echo
-        sel, mu = sels[0], mus[0]
+        sel, mu = sels[pe], mus[pe]
         if phases and mu is not None:
-            per_echo = []
-            for e, (ph_e, (lo, hi)) in enumerate(zip(phases, ranges, strict=True)):
-                p = _slice_rows(ph_e, k, device)[sel]
-                p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
-                z = torch.polar(torch.ones_like(p), p)
-                # Each voxel against its own running-mean phasor, not its whole-run
-                # mean: a global phase step (a head movement, a frequency adjustment)
-                # left every voxel's run mean below the stability cut and dropped
-                # 99.7 % of the brain on one TASKFORCE run. Breathing is far faster
-                # than the window and passes.
-                zref = _running_mean(z, ref_len)
-                ok = zref.abs().mean(1) > stability
-                d = torch.angle(z * torch.conj(zref / zref.abs().clamp_min(1e-6)))
-                mu_e = mu if e == 0 else _slice_rows(mags[e], k, device)[sel].mean(1)
-                per_echo.append((d, ok, mu_e**2 * ok))
-                del p, z, zref
-            if len(phases) == 1:
-                d, keep, _ = per_echo[0]
-                if int(keep.sum()) < 20:
-                    continue
-                dphi, w = d[keep], mu[keep] ** 2
-            else:
-                dphi, w, keep = _combine_echo_phase(per_echo, tes, te_ref)
-                if int(keep.sum()) < 20:
-                    continue
-            del per_echo
+            p = _slice_rows(phases[pe], k, device)[sel]
+            p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
+            z = torch.polar(torch.ones_like(p), p)
+            # Each voxel against its own running-mean phasor, not its whole-run mean:
+            # a global phase step (a head movement, a frequency adjustment) left every
+            # voxel's run mean below the stability cut and dropped 99.7 % of the brain
+            # on one TASKFORCE run. Breathing is far faster than the window and passes.
+            zref = _running_mean(z, ref_len)
+            keep = zref.abs().mean(1) > stability
+            if int(keep.sum()) < 20:
+                continue
+            zr = zref[keep]
+            dphi = torch.angle(z[keep] * torch.conj(zr / zr.abs().clamp_min(1e-6)))
             dphi = dphi - dphi @ proj.T
+            w = mu[keep] ** 2
             per_slice_p[:, k] = ((w[:, None] * dphi).sum(0) / w.sum()).cpu().numpy()
             count_p[k] = float(keep.sum())
             # second-order field over this slice's stable voxels (weighted like the mean)
@@ -359,23 +335,6 @@ def excitation_traces(
         mag_t = remove_tr_comb(mag_t, tr)
     times = np.arange(nt)[:, None] * tr + gtimes[None, :]
     return ExcitationTraces(times, group, mag_t, ph_t, int(count_m.sum()), field_coef=field_t)
-
-
-def _combine_echo_phase(per_echo, tes: np.ndarray, te_ref: float):
-    """One field change per voxel from several echoes' phase changes.
-
-    ``per_echo``: (dphi_e (V, nt), stable_e (V,), a_e (V,)) with ``a_e`` the echo's
-    inverse phase variance (mean magnitude squared, 0 where unstable). Weighted least
-    squares through the origin, ``dphi_e = s TE_e`` -> ``s = sum a TE dphi / sum a
-    TE^2``. Returns the field change in radians at ``te_ref``, each voxel's inverse
-    variance of it on the single-echo weight's scale, and which voxels have one
-    (at least one stable echo).
-    """
-    num = sum(a[:, None] * float(t) * d for (d, _, a), t in zip(per_echo, tes, strict=True))
-    den = sum(a * float(t) ** 2 for (_, _, a), t in zip(per_echo, tes, strict=True))
-    keep = den > 0
-    # var(s) = 1/den, so the field change at te_ref has inverse variance den/te_ref^2
-    return te_ref * num[keep] / den[keep, None], den[keep] / te_ref**2, keep
 
 
 def _bright_mask(magnitude: np.ndarray) -> np.ndarray:

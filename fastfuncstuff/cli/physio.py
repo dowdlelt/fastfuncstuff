@@ -38,9 +38,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "afni_proc -ricor_regs).\n\n"
             "Multi-echo: give every echo to -input (and -phase), shortest TE first. Each\n"
             "echo is another reading of the same excitation: the cardiac detector draws its\n"
-            "vessel voxels from all echoes, and respiration fits each voxel's phase change\n"
-            "across echoes to one field change. On ds006926 (3 echoes, 3 T) single echoes\n"
-            "were already near the recordings, so expect robustness rather than new finds."
+            "vessel voxels from all echoes (on ds006926 it found every run any single echo\n"
+            "did); respiration is read from the middle echo's phase, which a fit across\n"
+            "echoes did not beat."
         ),
     )
     parser.add_argument(
@@ -59,15 +59,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Raw phase 4-D series matching -input, one per echo (scanner units or "
         "radians; no unwrap needed -- only its change over time is used). Without it "
         "respiration is read from magnitude, which was unreliable on task runs.",
-    )
-    parser.add_argument(
-        "-echo_times",
-        nargs="+",
-        type=float,
-        default=None,
-        metavar="MS",
-        help="Echo times (ms), one per -input. Default: the sidecars' EchoTime. Only "
-        "used with 2+ echoes, to put each echo's phase change on one field scale.",
     )
     parser.add_argument(
         "-prefix",
@@ -182,19 +173,18 @@ def _split_axis(args) -> int:
     return 1 if pe.startswith("i") else 0
 
 
-def _echo_times(args, inputs: list[str]) -> list[float]:
-    """Echo times (ms) of a multi-echo -input, shortest first; [] for one echo."""
+def _echo_times(inputs: list[str]) -> list[float]:
+    """Sidecar echo times (ms) of a multi-echo -input, checked shortest first (the phase
+    is read from the middle echo by position); [] for one echo or no sidecars."""
     if len(inputs) == 1:
         return []
     from fastfuncstuff.processing.b0fmap import read_echo_times
 
-    tes = args.echo_times if args.echo_times is not None else read_echo_times(inputs)
-    if tes is None:
-        raise SystemExit("ffs_physio: no EchoTime in the -input sidecars; pass -echo_times (ms).")
-    if len(tes) != len(inputs):
-        raise SystemExit(f"ffs_physio: {len(tes)} echo times for {len(inputs)} -input echoes")
+    tes = read_echo_times(inputs) or []
     if any(b <= a for a, b in zip(tes, tes[1:], strict=False)):
-        raise SystemExit(f"ffs_physio: echo times {tes} must increase (shortest TE first)")
+        raise SystemExit(
+            f"ffs_physio: -input echo times {tes} ms must increase (shortest TE first)"
+        )
     return [float(t) for t in tes]
 
 
@@ -329,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     ne = len(inputs)
     if args.phase is not None and len(args.phase) != ne:
         raise SystemExit(f"ffs_physio: {len(args.phase)} -phase files for {ne} -input echoes")
-    echo_times = _echo_times(args, inputs)
+    echo_times = _echo_times(inputs)
     split_axis = _split_axis(args)
     mag_img = load_nifti(inputs[0])
     zooms = tuple(float(z) for z in mag_img.header.get_zooms()[:3])
@@ -378,9 +368,8 @@ def main(argv: list[str] | None = None) -> int:
     mags = mag if echo_axis is None else physio.echo_views(mag, ne, echo_axis)
     if verb >= 1:
         _, gt = physio.excitation_groups(st)
-        echoes = (
-            "" if ne == 1 else f", {ne} echoes (TE {', '.join(f'{t:g}' for t in echo_times)} ms)"
-        )
+        tes = f" (TE {', '.join(f'{t:g}' for t in echo_times)} ms)" if echo_times else ""
+        echoes = "" if ne == 1 else f", {ne} echoes{tes}, phase from echo {ne // 2 + 1}"
         print(
             f"ffs_physio: {nt} volumes (dropped {ndrop} at the end), {st.size} slices, "
             f"{gt.size} excitations per TR = {gt.size / tr:.1f} Hz, phase {'yes' if ph is not None else 'no'}"
@@ -389,7 +378,6 @@ def main(argv: list[str] | None = None) -> int:
 
     traces = physio.excitation_traces(
         mags, st, tr, phase=ph, device=device, voxel_size=zooms,
-        echo_times=[t / 1000.0 for t in echo_times] if ne > 1 else None,
     )  # fmt: skip
     del ph
     _, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
@@ -470,7 +458,8 @@ def main(argv: list[str] | None = None) -> int:
         "breathing_rate_per_min_median": float(np.median(rf) * 60),
         "columns_per_slice": 13,
         "echoes": ne,
-        "echo_times_ms": echo_times if ne > 1 else None,
+        "echo_times_ms": echo_times or None,
+        "phase_echo": ne // 2 + 1 if args.phase is not None else None,
         "layout": "slice-major (ffs_reml -slibase_sm, afni_proc -ricor_regs)",
     }
     if refined is not None:

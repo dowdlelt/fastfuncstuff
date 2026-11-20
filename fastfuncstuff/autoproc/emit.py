@@ -1830,7 +1830,7 @@ def _stage_physio(plan: Plan) -> str:
     clean lowered held-out R2 where nuisance did not. Reads the NORDIC magnitude when
     NORDIC ran (noise volumes trimmed), else the BIDS magnitude with -drop_last NOISE;
     the raw phase, when the run has one, gives the respiratory trace. A multi-echo run
-    passes every echo (and its echo times); nuisance mode only."""
+    passes every echo; nuisance mode only."""
     opt = plan.options
     if not opt.physio:
         return ""
@@ -1854,7 +1854,6 @@ def _stage_physio(plan: Plan) -> str:
         [
             '-input "${mags[@]}"',
             '"${phase_arg[@]}"',
-            '"${te_arg[@]}"',
             f"-tpattern {_tpattern(plan)}",
             '-TR "${TR[$k]}"',
             '-drop_last "$drop"',
@@ -1893,7 +1892,6 @@ for k in "${{RUN_KEYS[@]}}"; do
   [ "$skip_physio" -eq 1 ] && [ -f "$outf" ] && continue
 {src}
   phase_arg=(); [ "${{#phs[@]}}" -eq "${{#mags[@]}}" ] && phase_arg=(-phase "${{phs[@]}}")
-  te_arg=(); [ "${{NECHO[$k]:-1}}" -gt 1 ] && te_arg=(-echo_times ${{TES[$k]}})
 {cmd}
 done
 """

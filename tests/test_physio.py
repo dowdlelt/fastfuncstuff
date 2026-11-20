@@ -849,24 +849,19 @@ def _multiecho_phase(tes, nt=200, shape=(10, 10, 12), mb=2, seed=0, t2s=0.03):
     return mags, phs, st, t, field
 
 
-def test_multiecho_phase_is_one_field_change_at_the_middle_echo_scale():
-    """Through-origin fit across echoes: the trace is the field change in radians at
-    the middle TE (same scale as a single-echo run at that TE), and with three
-    readings it follows the field more closely than the middle echo alone."""
+def test_multiecho_phase_is_the_middle_echo_and_magnitude_pools_every_echo():
+    """Respiration is read from the middle echo's phase alone (a fit across echoes did
+    not beat it on ds006926 and lost breath depth); the magnitude trace pools every
+    echo's voxels, so it differs from any single echo's."""
     tes = [0.012, 0.030, 0.048]
-    mags, phs, st, t, field = _multiecho_phase(tes)
-    me = physio.excitation_traces(mags, st, TR, phase=phs, echo_times=tes, device=CPU)
-    one = physio.excitation_traces(mags[1], st, TR, phase=phs[1], device=CPU)
-    group, _ = physio.excitation_groups(st)
-    truth = np.stack([2 * np.pi * field[group == g][0] * tes[1] for g in range(group.max() + 1)], 1)
-    for tr_ in (me, one):
-        slope = float((tr_.phase * truth).sum() / (truth * truth).sum())
-        assert 0.9 < slope < 1.1  # the middle echo's radians
-    err_me, err_one = (np.std(tr_.phase - truth) for tr_ in (me, one))
-    # inverse-variance gain here is sqrt(1.21 / 2.79) = 0.66 in noise; measured 0.76
-    assert err_me < 0.85 * err_one
-    with pytest.raises(ValueError, match="echo_times"):
-        physio.excitation_traces(mags, st, TR, phase=phs, device=CPU)
+    mags, phs, st, _, _ = _multiecho_phase(tes)
+    me = physio.excitation_traces(mags, st, TR, phase=phs, device=CPU)
+    mid = physio.excitation_traces(mags[1], st, TR, phase=phs[1], device=CPU)
+    np.testing.assert_array_equal(me.phase, mid.phase)
+    np.testing.assert_array_equal(me.field_coef, mid.field_coef)
+    assert not np.array_equal(me.magnitude, mid.magnitude)
+    with pytest.raises(ValueError, match="phase echoes"):
+        physio.excitation_traces(mags, st, TR, phase=phs[:2], device=CPU)
 
 
 def test_a_heartbeat_carried_by_one_echo_is_found_from_the_stack():
@@ -879,8 +874,7 @@ def test_a_heartbeat_carried_by_one_echo_is_found_from_the_stack():
     echoes = [flat[0].astype(np.float32), flat[1].astype(np.float32), mag]
     stacked, axis = physio.stack_echoes(3, lambda e: echoes[e], split_axis=0)
     views = physio.echo_views(stacked, 3, axis)
-    tr_ = physio.excitation_traces(views, st, TR, phase=[ph, ph, ph],
-                                   echo_times=[0.01, 0.02, 0.03], device=CPU)  # fmt: skip
+    tr_ = physio.excitation_traces(views, st, TR, phase=[ph, ph, ph], device=CPU)
     ref = physio.refine_cardiac(stacked, tr_, st, TR, split_axis=0, device=CPU,
                                 n_echoes=3, echo_axis=axis)  # fmt: skip
     assert ref.found and abs(ref.heart_rate_per_min - F_CARD * 60) < 1.5
@@ -891,7 +885,7 @@ def test_a_heartbeat_carried_by_one_echo_is_found_from_the_stack():
                               n_echoes=3, echo_axis=axis)  # fmt: skip
 
 
-def test_cli_multiecho_reads_echo_times_from_sidecars_and_cleans_each_echo(tmp_path):
+def test_cli_multiecho_checks_echo_order_and_cleans_each_echo(tmp_path):
     import json
 
     import nibabel as nib
@@ -916,6 +910,7 @@ def test_cli_multiecho_reads_echo_times_from_sidecars_and_cleans_each_echo(tmp_p
     assert rc == 0
     summary = json.loads((tmp_path / "o" / "run.json").read_text())
     assert summary["echoes"] == 2 and summary["echo_times_ms"] == [12.0, 30.0]
+    assert summary["phase_echo"] == 2
     assert abs(summary["breathing_rate_per_min_median"] - F_RESP * 60) < 1.5
     assert len(summary["cardiac_weighted"]["echo_share"]) == 2
     for e in (1, 2):
@@ -925,4 +920,4 @@ def test_cli_multiecho_reads_echo_times_from_sidecars_and_cleans_each_echo(tmp_p
     with pytest.raises(SystemExit, match="-phase files"):
         main([*args, "-phase", phase[1], *common])
     with pytest.raises(SystemExit, match="must increase"):
-        main([*args, *common, "-echo_times", "30", "12"])
+        main(["-input", args[2], args[1], *common])
