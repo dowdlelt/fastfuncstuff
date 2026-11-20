@@ -61,6 +61,9 @@ class PartitionTraces:
     centre_cell: int  # its column in ``times``
     sweep_change: np.ndarray  # (nt,) field change across each volume's partition sweep (Hz)
     n_echoes: int
+    # (ne, nt, nz) whole-image line products sum_xy K_v conj(K_ref), fftshifted partition
+    # index; kept for kz_diagnostic (a few MB at most)
+    line_products: np.ndarray | None = None
 
     @property
     def cell_rate(self) -> float:
@@ -247,7 +250,67 @@ def partition_field_traces(
         times=times, field=field, halves=halves, rows_per_cell=rows_per_cell, order=order,
         order_agrees=agrees, boundary_ratio=ratio, centre_offset=float(times[0, centre_cell]),
         centre_cell=centre_cell,
-        sweep_change=sweep, n_echoes=ne,
+        sweep_change=sweep, n_echoes=ne, line_products=c[0],
+    )  # fmt: skip
+
+
+@dataclass
+class KzDiagnostic:
+    """The strongest volume-rate rhythm, read per partition line and echo.
+
+    A field change that is static within a volume would give every kz line one temporal
+    phase; a field sampled line by line across the TR gives a phase that advances across
+    kz by ~2 pi f tau(kz). Its span, its straightness, and whether the echoes agree (and
+    scale with TE) are the evidence that the partition axis carries timing at all."""
+
+    kz: np.ndarray  # (nz,) partition index about the k-space centre
+    freqs: np.ndarray  # (nf,) Hz, volume-rate spectrum
+    spectrum: np.ndarray  # (nf,) last echo's high-passed line phase, |c|-weighted over kz
+    alias_hz: float  # its strongest peak above 0.02 Hz
+    amplitude: np.ndarray  # (nz, ne) complex: each line's component at alias_hz
+    highpassed: np.ndarray  # (nt, nz) last echo's high-passed line phase (rad)
+    phase_span_rad: float  # unwrapped angle change of the last echo across the inner lines
+    nonlinearity: float  # share of the inner lines' complex A(kz) a straight line misses
+    echo_agreement: float  # |mean exp(i (angle A_e(n-1) - angle A_e(n)))|, inner lines
+    amp_ratio: list[float]  # median |A_e| / |A_last| per echo (TE ratio when it is field)
+    peak_over_median: float
+    inner: np.ndarray  # (nz,) bool: 2 <= |kz| <= 0.4 nz, the lines the numbers use
+
+
+def kz_diagnostic(pt: PartitionTraces, tr: float) -> KzDiagnostic:
+    """The partition-axis evidence behind the cell timing (the 3D research figure's
+    numbers). Needs ``pt.line_products``. Inner lines only: the centre rows carry the
+    bulk image change and the outermost ones little signal."""
+    if pt.line_products is None:
+        raise ValueError("PartitionTraces has no line_products")
+    c = np.moveaxis(pt.line_products, 0, -1)  # (nt, nz, ne)
+    nt, nz, ne = c.shape
+    el = ne - 1
+    k = np.arange(nz) - nz // 2
+    ph = np.unwrap(np.angle(c), axis=0)
+    ph -= ph.mean(0)
+    win = min(31, (nt // 4) * 2 + 1)
+    hp = ph - signal.savgol_filter(ph, max(win, 5), 2, axis=0)
+    f = np.fft.rfftfreq(nt, tr)
+    P = np.abs(np.fft.rfft(hp * np.hanning(nt)[:, None, None], axis=0)) ** 2
+    w = np.abs(c).mean(0)
+    pk = P[:, :, el] @ (w[:, el] / w[:, el].sum())
+    band = f > 0.02
+    fa = float(f[band][np.argmax(pk[band])])
+    A = (hp * np.exp(-2j * np.pi * fa * np.arange(nt) * tr)[:, None, None]).sum(0)
+    inner = (np.abs(k) <= int(0.4 * nz)) & (np.abs(k) >= CENTRE_EXCLUDE)
+    a = A[inner, el]
+    X = np.stack([np.ones(inner.sum()), k[inner]], 1).astype(complex)
+    res = a - X @ np.linalg.lstsq(X, a, rcond=None)[0]
+    nonlin = float((np.abs(res) ** 2).sum() / max((np.abs(a - a.mean()) ** 2).sum(), 1e-300))
+    ang = np.unwrap(np.angle(a))
+    prev = A[inner, max(el - 1, 0)]
+    return KzDiagnostic(
+        kz=k, freqs=f, spectrum=pk, alias_hz=fa, amplitude=A, highpassed=hp[:, :, el],
+        phase_span_rad=float(ang[-1] - ang[0]), nonlinearity=nonlin,
+        echo_agreement=float(np.abs(np.mean(np.exp(1j * np.angle(prev * a.conj()))))),
+        amp_ratio=[float(np.median(np.abs(A[inner, e]) / np.abs(a))) for e in range(ne)],
+        peak_over_median=float(pk[band].max() / np.median(pk[band])), inner=inner,
     )  # fmt: skip
 
 

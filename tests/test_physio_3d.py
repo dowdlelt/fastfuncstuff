@@ -24,7 +24,16 @@ F_CARD = 1.15  # Hz: 69/min
 TES = (0.010, 0.025, 0.040)
 
 
-def _run(nt=150, shape=(20, 20, 36), card=0.3, resp=1.2, noise=0.002, seed=0, descending=False):
+def _run(
+    nt=150,
+    shape=(20, 20, 36),
+    card=0.3,
+    resp=1.2,
+    noise=0.002,
+    seed=0,
+    descending=False,
+    static=False,
+):
     rng = np.random.default_rng(seed)
     nx, ny, nz = shape
     ncell = nz // RZ
@@ -40,7 +49,8 @@ def _run(nt=150, shape=(20, 20, 36), card=0.3, resp=1.2, noise=0.002, seed=0, de
         mag = np.zeros((*shape, nt), np.float32)
         ph = np.zeros((*shape, nt), np.float32)
         for v in range(nt):
-            t = v * TR + (cell + 0.5) * TR / ncell
+            # static: the whole volume sees one field (a 2D-like control, no line timing)
+            t = v * TR + (0.5 * TR if static else (cell + 0.5) * TR / ncell)
             theta = 2 * np.pi * F_CARD * t
             # breathing wanders in rate and depth, as it does (a perfectly steady period
             # near 2 TR would make reversed volumes line up at their boundaries)
@@ -100,6 +110,31 @@ def test_no_heartbeat_is_not_found():
     assert not physio_3d.cardiac(pt, TR, n_shuffles=49).found
 
 
+def test_kz_diagnostic_sees_line_timing_and_the_te_scaling(run):
+    """Breathing (0.27 Hz) aliases to 0.23 Hz at TR 2 s. Sampled line by line across the
+    TR, its component there advances in angle across kz, the same on every echo, with
+    |A| in proportion to TE (the field, not coil or motion phase)."""
+    mags, phs = run
+    d = physio_3d.kz_diagnostic(
+        physio_3d.partition_field_traces(mags, phs, TR, RZ, TES, device=CPU), TR
+    )
+    assert abs(d.alias_hz - (1 / TR - F_RESP)) < 0.01
+    assert d.echo_agreement > 0.99
+    np.testing.assert_allclose(d.amp_ratio, np.array(TES) / TES[-1], atol=0.05)
+    # inner lines span ~2/3 of the TR: 2 pi 0.27 Hz x 1.33 s ~ 2.3 rad, in cell steps
+    assert 1.5 < abs(d.phase_span_rad) < 3.0
+
+
+def test_kz_diagnostic_span_collapses_without_line_timing():
+    """Control: one field per volume (as if acquired at one instant) gives every line the
+    same temporal phase -- the span is what the timing adds, not a fixed property of A."""
+    mags, phs = _run(nt=100, static=True, card=0.0)
+    d = physio_3d.kz_diagnostic(
+        physio_3d.partition_field_traces(mags, phs, TR, RZ, TES, device=CPU), TR
+    )
+    assert abs(d.phase_span_rad) < 0.2
+
+
 def test_cli_picks_3d_from_the_sidecar_and_writes_its_outputs(tmp_path, run):
     import nibabel as nib
 
@@ -117,9 +152,12 @@ def test_cli_picks_3d_from_the_sidecar_and_writes_its_outputs(tmp_path, run):
         args.append(str(name))
     phase = ["-phase", *(str(tmp_path / f"run_echo-{e + 1}_ph.nii.gz") for e in range(3))]
     rc = main([*args, *phase, "-prefix", str(tmp_path / "o" / "run"), "-device", "cpu",
-               "-verb", "0", "-no_qc"])  # fmt: skip
+               "-verb", "0", "-no_qc", "-kz_plot"])  # fmt: skip
     assert rc == 0
     s = json.loads((tmp_path / "o" / "run.json").read_text())
+    assert (tmp_path / "o" / "run.kz.png").exists() and s["partition"]["kz"][
+        "echo_agreement"
+    ] > 0.99
     assert s["acquisition"] == "3d" and s["partition"]["cells_per_volume"] == 12
     assert abs(s["breathing_rate_per_min_median"] - F_RESP * 60) < 1.0
     assert s["cardiac_3d"]["found"]

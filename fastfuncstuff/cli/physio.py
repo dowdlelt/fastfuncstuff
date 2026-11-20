@@ -178,6 +178,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "taken). Costs 13 degrees of freedom per voxel that a later GLM does not see.",
     )
     parser.add_argument("-no_qc", action="store_true", help="Skip the QC spectrogram PNG.")
+    parser.add_argument(
+        "-kz_plot",
+        action="store_true",
+        help="3D: also write PREFIX.kz.png, the evidence that the partition axis carries "
+        "timing: the strongest volume-rate rhythm read per kz line and echo (spectrum, "
+        "|A(kz)|, angle A(kz) across kz, A(kz) in the complex plane, line phase over "
+        "volumes, each echo against the last). A timed field advances in angle across "
+        "kz, the same on every echo, with |A| scaling with TE. Its numbers go in the json "
+        "under partition.kz.",
+    )
     from fastfuncstuff.qc.record import add_qc_args
 
     add_qc_args(parser)
@@ -560,6 +570,21 @@ def _main_3d(args, device, t0: float) -> int:
             "in_nuisance": bool(cardiac_in_nuisance),
         },
     }
+    if args.kz_plot:
+        from fastfuncstuff.qc import checks, render
+
+        kz = physio_3d.kz_diagnostic(pt, tr)
+        summary["partition"]["kz"] = {
+            "file": base + ".kz.png",
+            "peak_hz": kz.alias_hz,
+            "peak_over_median": kz.peak_over_median,
+            "phase_span_rad": kz.phase_span_rad,
+            "nonlinearity": kz.nonlinearity,
+            "echo_agreement": kz.echo_agreement,
+            "amp_ratio_vs_last_echo": kz.amp_ratio,
+            "te_ratio_vs_last_echo": [t / tes_ms[-1] for t in tes_ms] if tes_ms else None,
+        }
+        render.save_png(checks.physio_kz_figure(kz, Path(inputs[0]).name), base + ".kz.png")
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
@@ -577,7 +602,8 @@ def _main_3d(args, device, t0: float) -> int:
             f"breathing {summary['breathing_rate_per_min_median']:.1f}/min from the partition field trace"
         )
         print(f"  wrote {base}.slibase.1D + nuisance, traces, rates, partition_shift, json"
-              f"{'' if args.no_qc else ', qc.png'}  [{time.time() - t0:.1f}s]")  # fmt: skip
+              f"{'' if args.no_qc else ', qc.png'}{', kz.png' if args.kz_plot else ''}"
+              f"  [{time.time() - t0:.1f}s]")  # fmt: skip
     return 0
 
 
@@ -589,6 +615,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if _acquisition(args) == "3d":
         return _main_3d(args, device, t0)
+    if args.kz_plot:
+        print("ffs_physio: -kz_plot applies to 3D EPI only; ignored")
 
     from fastfuncstuff.io.afni import load_nifti
     from fastfuncstuff.processing import physio

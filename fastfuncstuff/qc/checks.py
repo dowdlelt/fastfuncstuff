@@ -1768,6 +1768,56 @@ def physio_rates_figure(
         return render.figure_image(fig)
 
 
+def physio_kz_figure(diag, title: str = ""):
+    """3D EPI partition-axis evidence (processing/physio_3d.kz_diagnostic), six panels:
+    the volume-rate spectrum and its strongest peak; |A(kz)| and angle A(kz) per echo at
+    that frequency; A(kz) of the last echo in the complex plane (coloured by kz); the
+    high-passed line phase over volumes x kz; and each echo's angle against the last.
+    Timing across the partitions shows as an angle that advances across kz, identical
+    over echoes, with |A| scaling with TE. A PIL image."""
+    from matplotlib.figure import Figure
+
+    A, k, hp = diag.amplitude, diag.kz, diag.highpassed
+    ne, el, nz = A.shape[1], A.shape[1] - 1, A.shape[0]
+    ref = np.exp(-1j * np.angle(A[min(nz // 2 + 2, nz - 1), el]))
+    with style.mpl_style():
+        fig = Figure(figsize=(style.WIDTH / plots.DPI, 8.4), dpi=plots.DPI)
+        ax = fig.subplots(2, 3)
+        ax[0, 0].semilogy(diag.freqs, diag.spectrum, color=style.SERIES[0], lw=1.2)
+        ax[0, 0].axvline(diag.alias_hz, color=style.SERIES[1], lw=1.0)
+        ax[0, 0].set_title(f"line-phase spectrum, echo {ne} (peak {diag.alias_hz:.3f} Hz)")
+        ax[0, 0].set_xlabel("Hz (volume rate)")
+        for e in range(ne):
+            col = style.SERIES[e % len(style.SERIES)]
+            ax[0, 1].plot(k, np.abs(A[:, e]), color=col, lw=1.2, label=f"e{e + 1}")
+            ax[0, 2].plot(k, np.angle(A[:, e] * ref), ".", ms=3, color=col, label=f"e{e + 1}")
+            ax[1, 2].plot(k, np.angle(A[:, e] * A[:, el].conj()), ".", ms=3, color=col,
+                          label=f"e{e + 1} vs e{ne}")  # fmt: skip
+        ax[0, 1].set_title("|A(kz)| at the peak")
+        ax[0, 2].set_title(f"angle A(kz): span {diag.phase_span_rad:.2f} rad")
+        ax[1, 2].set_title(f"angle vs last echo (agreement {diag.echo_agreement:.3f})")
+        sc = ax[1, 0].scatter(A[:, el].real, A[:, el].imag, c=k, cmap="coolwarm", s=10)
+        fig.colorbar(sc, ax=ax[1, 0], label="kz")
+        ax[1, 0].set_title(f"A(kz), last echo (nonlinearity {diag.nonlinearity:.2f})")
+        lim = float(np.percentile(np.abs(hp), 99)) or 1.0
+        ax[1, 1].imshow(hp.T, aspect="auto", origin="lower", cmap="RdBu_r", vmin=-lim,
+                        vmax=lim, extent=(0, hp.shape[0], float(k[0]), float(k[-1])))  # fmt: skip
+        ax[1, 1].grid(False)
+        ax[1, 1].set_title("high-passed line phase, last echo")
+        ax[1, 1].set_xlabel("volume")
+        for a in (ax[0, 1], ax[0, 2], ax[1, 2]):
+            lo, hi = k[diag.inner][[0, -1]]
+            a.axvspan(k[0], lo, color=style.GRID, alpha=0.5, lw=0)
+            a.axvspan(hi, k[-1], color=style.GRID, alpha=0.5, lw=0)
+            a.set_xlabel("kz")
+            a.legend(loc="best", frameon=False, fontsize=8)
+        if title:
+            fig.suptitle(title)
+        fig.subplots_adjust(left=0.05, right=0.98, top=0.92 if title else 0.95, bottom=0.07,
+                            hspace=0.35, wspace=0.25)  # fmt: skip
+        return render.figure_image(fig)
+
+
 def physio_check(
     rec: QCRecord,
     step: int,
