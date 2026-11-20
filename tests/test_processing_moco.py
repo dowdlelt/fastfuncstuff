@@ -743,10 +743,14 @@ def test_moco_fourier_recovers_subvoxel_inplane_shifts():
     assert np.abs(res.params[1:, 2:6]).max() < 2e-3
 
 
-def test_moco_fourier_refuses_the_gather_paths():
-    ts = torch.rand(3, 8, 16, 16)
-    with pytest.raises(ValueError, match="shear estimator"):
-        moco(ts, MocoConfig(device="cpu", verb=0, compile=False, interp="fourier", cost="lpa"))
+def test_moco_fourier_falls_back_on_gather_paths(capsys):
+    """fourier is the default, so the estimators without a shear path (lpa here)
+    must still run -- on heptic -- and say so rather than fail."""
+    rng = np.random.default_rng(1)
+    ts = torch.tensor(rng.normal(size=(3, 8, 16, 16)).astype(np.float32) + 5.0)
+    res = moco(ts, MocoConfig(device="cpu", verb=1, compile=False, interp="fourier", cost="lpa"))
+    assert np.isfinite(res.params).all()
+    assert "interp fourier -> heptic" in capsys.readouterr().out
 
 
 def test_slice_lowpass_is_estimation_only():

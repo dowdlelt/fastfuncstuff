@@ -368,12 +368,12 @@ def parse_args(
         default=None,
         metavar="SIGMA",
         help=(
-            "Estimation-only Gaussian along the slice axis (k), sigma in slices.\n"
-            "Default: 1.0 with -interp fourier, else 0. A 2D slice has no exact\n"
-            "interpolant, so once the in-plane axes are exact the slice kernel's\n"
-            "bias is what is left (a 2-4%% gain error on pitch/roll); one slice of\n"
-            "blur removes it. Costs one 1-D convolution per volume; the output is\n"
-            "not blurred. Set 0 for 3D EPI with -interp fourier3d."
+            "Estimation-only Gaussian along the slice axis (k), sigma in slices. "
+            "Default: 1.0 with -interp fourier, else 0.\n"
+            "A 2D slice has no exact interpolant, so once the in-plane axes are exact "
+            "the slice kernel's bias is what is left (a 2-4%% gain error on pitch and "
+            "roll); one slice of blur removes it. Costs one 1-D convolution per "
+            "volume; the output is not blurred. Set 0 for 3D EPI with -interp fourier3d."
         ),
     )
     method_group.add_argument(
@@ -432,24 +432,36 @@ def parse_args(
     interp_group.add_argument(
         "-interp",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
-        default="heptic",
+        default="fourier",
         help=(
-            "During estimation (default: heptic).\n"
-            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp -- exact\n"
-            "  for DFT-reconstructed EPI rows -- and the slice axis (k) by heptic.\n"
-            "  Polynomial kernels bias sub-voxel estimates toward half-voxel\n"
-            "  positions (~1.5%% of a voxel; small motions read ~8%% large).\n"
-            "fourier3d: FFT along k too, for 3D (slab) EPI, whose partition axis\n"
-            "  is also DFT-encoded; on 2D multislice it is worse than fourier.\n"
-            "Both need -cost wls and the shear estimator."
+            "During estimation (default: fourier).\n"
+            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp -- exact for "
+            "DFT-reconstructed EPI rows -- and the slice axis (k) by heptic, with a "
+            "one-slice estimation low-pass along k (-slice_lowpass). Polynomial kernels "
+            "bias sub-voxel estimates toward half-voxel positions (~1.5%% of a voxel; "
+            "small motions read ~8%% large). On 0.35 mm anatomy moved by real motion "
+            "traces, fourier recovers the motion 6-8x more accurately than heptic, 2D "
+            "or 3D, any voxel shape.\n"
+            "fourier3d: FFT along k too, for 3D (slab) EPI, whose partition axis is "
+            "also DFT-encoded; best on thin 3D slabs, worse than fourier on 2D.\n"
+            "Paths without the shear estimator (-cost lpa/quad, -no_shear, -chain_init "
+            "on CUDA) use heptic, and say so."
         ),
     )
     interp_group.add_argument(
         "-final",
-        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
-        default="wsinc5",
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
+        default="fourier",
         dest="final_interp",
-        help="For output (default: wsinc5)",
+        help=(
+            "For the output (default: fourier; same choices as -interp).\n"
+            "Undoing known motion on truth data, fourier injected 30-40%% less "
+            "spurious temporal variance than wsinc5 or heptic, and less error outside "
+            "the brain: a Fourier shift of a band-limited image adds no ringing, while "
+            "polynomial kernels smooth by an amount that varies with the fractional "
+            "shift. Rows wrap periodically at the FOV edge, as the EPI itself does. "
+            "-no_shear uses heptic."
+        ),
     )
     interp_group.add_argument(
         "-no_shear",
