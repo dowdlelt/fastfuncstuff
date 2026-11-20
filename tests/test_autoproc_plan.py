@@ -4427,7 +4427,8 @@ def test_physio_refuses_3d_and_warns_without_phase(tmp_path):
     quiet: list[str] = []
     _physio_errors(Options(physio=True, glm_ortvec=["motion", "physio"]), subj, quiet)
     assert not any("no 'physio'" in w for w in quiet)
-    assert _physio_errors(Options(physio=True, acq_3d=True), subj, [])
+    # 3-D (BETA) reads the field from phase: refused only without it
+    assert any("no phase" in e for e in _physio_errors(Options(physio=True, acq_3d=True), subj, []))
     assert _physio_errors(Options(), subj, []) == []
 
 
@@ -4451,4 +4452,23 @@ def test_physio_passes_every_echo_and_its_echo_times(tmp_path):
     )
     stage = _section(s, "stage00: physio ====")
     assert '-input "${mags[@]}"' in stage and 'phase_arg=(-phase "${phs[@]}")' in stage
-    assert "-echo_times" not in stage
+    assert "-acquisition 3d" not in stage and "-tzero 0.5" in stage
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_physio_on_3d_runs_reads_partition_cells(tmp_path):
+    """3-D EPI -physio (BETA): ffs_physio -acquisition 3d with the echo times, no slice
+    timing and no -tzero (regressors at the k-space centre's time); refused without phase
+    or with -physio_mode clean."""
+    from fastfuncstuff.cli.autoproc import _physio_errors
+
+    subj = Subject("X", [Session("01", [_me_run("01", "foo", "1")])])
+    opt = Options(physio=True, acq_3d=True, tzero=0.5, slicetiming_method="none")
+    assert _physio_errors(opt, subj, []) == []
+    assert _physio_errors(Options(physio=True, acq_3d=True, physio_mode="clean"), subj, [])
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert subprocess.run(["bash", "-n", str(_write(tmp_path / "p.sh", s))],  # noqa: S603
+                          capture_output=True, text=True).returncode == 0  # fmt: skip
+    stage = _section(s, "stage00: physio ====")
+    assert "-acquisition 3d" in stage and '"${te_arg[@]}"' in stage
+    assert "-tzero" not in stage and "-tpattern" not in stage

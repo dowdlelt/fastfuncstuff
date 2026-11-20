@@ -1854,11 +1854,17 @@ def _stage_physio(plan: Plan) -> str:
         [
             '-input "${mags[@]}"',
             '"${phase_arg[@]}"',
-            f"-tpattern {_tpattern(plan)}",
+            # 3-D: no slice timing; regressors at the k-space centre's time (no -tzero);
+            # echo times passed because source paths may carry volume selectors
+            *(
+                ["-acquisition 3d", '"${te_arg[@]}"']
+                if opt.acq_3d
+                else [f"-tpattern {_tpattern(plan)}"]
+            ),
             '-TR "${TR[$k]}"',
             '-drop_last "$drop"',
             '-prefix "stage00.physio.${FRAG[$k]}.regs"',
-            '-clean "$outf"' if clean else f"-tzero {opt.tzero:g}",
+            *(['-clean "$outf"'] if clean else ([] if opt.acq_3d else [f"-tzero {opt.tzero:g}"])),
             *([f'-qc {QC_DIR} -qc_label "stage00.physio.${{FRAG[$k]}}"'] if _qc_on(plan) else []),
             '-device "$DEVICE"',
         ],
@@ -1892,6 +1898,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   [ "$skip_physio" -eq 1 ] && [ -f "$outf" ] && continue
 {src}
   phase_arg=(); [ "${{#phs[@]}}" -eq "${{#mags[@]}}" ] && phase_arg=(-phase "${{phs[@]}}")
+  te_arg=(); [ "${{NECHO[$k]:-1}}" -gt 1 ] && te_arg=(-echo_times ${{TES[$k]}})
 {cmd}
 done
 """

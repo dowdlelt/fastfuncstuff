@@ -482,7 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sampled once per multiband excitation: respiration from phase (when the runs "
         "have it), cardiac from magnitude. Cardiac + respiratory RETROICOR and RVT at -tzero enter the "
         "GLM as a per-run nuisance (-glm_ortvec physio; in the default set). Nothing is "
-        "regressed out of the series itself (see -physio_mode). 2-D runs; multi-echo runs pass every echo (nuisance mode only).",
+        "regressed out of the series itself (see -physio_mode). 2-D runs; multi-echo runs pass every echo (nuisance mode only); 3-D runs (BETA) need phase and read one sample per partition cell.",
     )
     g.add_argument(
         "-physio_mode",
@@ -1584,16 +1584,21 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
 
 
 def _physio_errors(opt, subject, warnings: list[str]) -> list[str]:
-    """-physio reads one physiological sample per multiband excitation of a 2-D run;
-    refuse what that does not describe, warn where phase is missing."""
+    """-physio reads one physiological sample per multiband excitation of a 2-D run, or
+    per partition cell of a 3-D run (BETA, from phase); refuse what that does not
+    describe, warn where phase is missing."""
     if not opt.physio:
         return []
     errors: list[str] = []
     runs = [r for s in subject.sessions for r in s.bold_runs]
-    if opt.acq_3d:
+    no_ph = [f"{r.session or '-'}/{r.task}/{r.run or '-'}" for r in runs if r.phase_path is None]
+    if opt.acq_3d and no_ph:
         errors.append(
-            "-physio needs 2-D (slice-by-slice) EPI; a 3-D acquisition has no excitation-rate samples."
+            "-physio on 3-D EPI reads the field from phase, one sample per partition cell; "
+            "these runs have no phase: " + ", ".join(no_ph)
         )
+    if opt.acq_3d and opt.physio_clean:
+        errors.append("-physio_mode clean is not available for 3-D EPI (BETA); use nuisance.")
     me = [r for r in runs if r.is_multiecho]
     if me and opt.physio_clean:
         errors.append(
