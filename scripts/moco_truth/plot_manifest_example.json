@@ -1,0 +1,227 @@
+{
+ "real_trace": {
+  "truth": "tf35b/syn",
+  "groups": {
+   "ds": "3T resting run",
+   "ohbm": "7T run"
+  },
+  "est": {
+   "fourier": "figs/est/tf35b_2d_n020_fourier.aff12.1D",
+   "heptic": "figs/est/tf35b_2d_n020_heptic.aff12.1D",
+   "vrheptic": "figs/est/tf35b_2d_n020_vrheptic.aff12.1D",
+   "vrFourier": "figs/est/tf35b_2d_n020_vrFourier.aff12.1D"
+  }
+ },
+ "battery": {
+  "truth": "bat_iso/syn",
+  "est_noisefree": {
+   "fourier": "figs/est/bat_iso_2d_n000_fourier.aff12.1D",
+   "heptic": "figs/est/bat_iso_2d_n000_heptic.aff12.1D",
+   "vrheptic": "figs/est/bat_iso_2d_n000_vrheptic.aff12.1D",
+   "vrFourier": "figs/est/bat_iso_2d_n000_vrFourier.aff12.1D"
+  }
+ },
+ "conditions": [
+  [
+   "2D cubic \u00b7 jitter",
+   "bat_iso/syn",
+   "jitter",
+   {
+    "fourier": "figs/est/bat_iso_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/bat_iso_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/bat_iso_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/bat_iso_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D cubic \u00b7 small",
+   "bat_iso/syn",
+   "small",
+   {
+    "fourier": "figs/est/bat_iso_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/bat_iso_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/bat_iso_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/bat_iso_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D cubic \u00b7 moderate",
+   "bat_iso/syn",
+   "moderate",
+   {
+    "fourier": "figs/est/bat_iso_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/bat_iso_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/bat_iso_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/bat_iso_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D cubic \u00b7 real 3T trace",
+   "tf35b/syn",
+   "ds",
+   {
+    "fourier": "figs/est/tf35b_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D cubic \u00b7 real 7T trace",
+   "tf35b/syn",
+   "ohbm",
+   {
+    "fourier": "figs/est/tf35b_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "3D cubic \u00b7 moderate",
+   "bat_iso/syn",
+   "moderate",
+   {
+    "fourier": "figs/est/bat_iso_3d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/bat_iso_3d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/bat_iso_3d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/bat_iso_3d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "3D cubic \u00b7 real 3T trace",
+   "tf35b/syn",
+   "ds",
+   {
+    "fourier": "figs/est/tf35b_3d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_3d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_3d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_3d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D 2.1\u00d72.1\u00d72.45 \u00b7 moderate",
+   "bat_an/syn",
+   "moderate",
+   {
+    "fourier": "figs/est/bat_an_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/bat_an_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/bat_an_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/bat_an_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D 2.1\u00d72.1\u00d72.45 \u00b7 real 3T trace",
+   "tf35an/syn",
+   "ds",
+   {
+    "fourier": "figs/est/tf35an_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35an_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35an_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35an_2d_n020_vrFourier.aff12.1D"
+   }
+  ],
+  [
+   "2D 2.1\u00d72.1\u00d72.45 \u00b7 real 7T trace",
+   "tf35an/syn",
+   "ohbm",
+   {
+    "fourier": "figs/est/tf35an_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35an_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35an_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35an_2d_n020_vrFourier.aff12.1D"
+   }
+  ]
+ ],
+ "noise": {
+  "truth": "tf35b/syn",
+  "group": "ds",
+  "title": "Real 3T trace, 2D cubic: error vs noise",
+  "levels": {
+   "0": {
+    "fourier": "figs/est/tf35b_2d_n000_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_2d_n000_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_2d_n000_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_2d_n000_vrFourier.aff12.1D"
+   },
+   "2": {
+    "fourier": "figs/est/tf35b_2d_n020_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_2d_n020_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_2d_n020_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_2d_n020_vrFourier.aff12.1D"
+   },
+   "5": {
+    "fourier": "figs/est/tf35b_2d_n050_fourier.aff12.1D",
+    "heptic": "figs/est/tf35b_2d_n050_heptic.aff12.1D",
+    "vrheptic": "figs/est/tf35b_2d_n050_vrheptic.aff12.1D",
+    "vrFourier": "figs/est/tf35b_2d_n050_vrFourier.aff12.1D"
+   }
+  }
+ },
+ "signature": {
+  "runs": [
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-1_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-localizer_run-1_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-localizer_run-1_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-2_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-localizer_run-2_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-localizer_run-2_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-3_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-localizer_run-3_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-localizer_run-3_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-4_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-localizer_run-4_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-localizer_run-4_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-localizer_run-5_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-localizer_run-5_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-localizer_run-5_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-rest_run-1_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-rest_run-1_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-rest_run-1_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-rest_run-2_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-rest_run-2_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-rest_run-2_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-rest_run-3_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-rest_run-3_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-rest_run-3_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-rest_run-4_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-rest_run-4_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-rest_run-4_fourierlp0.aff12.1D"
+   },
+   {
+    "bold": "ds005165/sub-01/ses-01/func/sub-01_ses-01_task-rest_run-5_bold.nii",
+    "heptic": "figs/real/sub-01_ses-01_task-rest_run-5_heptic.aff12.1D",
+    "fourier": "figs/real/sub-01_ses-01_task-rest_run-5_fourierlp0.aff12.1D"
+   }
+  ],
+  "title": "Real data: the heptic bias, measured without any simulation (10 runs, 2.5 mm; fourier without the slice low-pass)"
+ },
+ "resample": {
+  "truth": "tf35b/syn",
+  "series": "tf35b/syn_2d_n000.nii",
+  "group": "ds",
+  "modes": [
+   "heptic",
+   "wsinc5",
+   "fourier"
+  ],
+  "title": "Undoing the true 3T-trace motion: variance each output kernel injects (noise-free)"
+ }
+}

@@ -29,3 +29,7 @@ ffs_moco -input truth/syn_2d_n020.nii -base 0 -interp heptic -1Dmatrix_save est_
 python score_motion.py truth/syn est_fourier.aff12.1D est_heptic.aff12.1D est_vr.aff12.1D -sweeps -gain
 python score_resample.py truth/syn truth/syn_2d_n000.nii heptic,wsinc5,fourier
 ```
+
+4. **`plot_figures.py MANIFEST.json OUTDIR`** draws the seven figures in
+   `docs/moco/` from the testbeds and the estimate files a manifest names (see
+   `plot_manifest_example.json`, paths relative to the working directory).

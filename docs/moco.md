@@ -35,6 +35,8 @@ The truth is real 0.35 mm anatomy moved by known motion and sampled to 2.1 mm
 (Random 6-DOF motion, σ = 0.4 voxel and 0.4°. Small motion, σ = 0.1, and real
 motion traces give the same picture; see the tables below.)
 
+![Error across conditions](moco/conditions.png)
+
 | | result |
 |---|---|
 | Sub-voxel bias | heptic: a ±1.6% of a voxel sinusoid over each voxel, small motions read ~10% large. Fourier: flat within ±0.2% |
@@ -83,7 +85,17 @@ uses 2.45 mm slices. Gaussian noise at 0, 2% and 5% of the brain mean.
 implies over the brain, in mm. That is independent of how a tool parametrizes or
 pivots its rotations, which is where most "disagreements" between tools live.
 
-The generator and scorers are in [`scripts/moco_truth/`](../scripts/moco_truth/).
+The generator, scorers and figure script are in
+[`scripts/moco_truth/`](../scripts/moco_truth/).
+
+![Recovering real motion](moco/real_trace_recovery.png)
+
+The top row is the motion the head made in each real run (mean displacement of the
+brain from the first volume); the bottom row is how far each estimate is from it,
+volume by volume, on a log scale. `ffs_moco`'s default sits about an order of
+magnitude below the polynomial estimators throughout both runs. The heptic and
+3dvolreg errors grow with the motion's distance from the first volume, the signature
+of a kernel bias rather than noise.
 
 ## Question 1: sub-voxel motion and interpolation bias
 
@@ -102,7 +114,17 @@ Real data shows the same thing. On ten real 2.5 mm runs, the difference between
 heptic and Fourier estimates follows sin(2π × fractional position) at r = 0.98
 (amplitude 1.4% of a voxel along one in-plane axis, 1.1% along the other), with
 small motions 7-9% larger under heptic. That is the predicted curve, measured
-without any simulation.
+without any simulation. (The comparison uses `fourier` without its slice low-pass,
+so that only the in-plane kernel differs: the low-pass changes pitch estimates,
+which move the brain's mean position along one in-plane axis.)
+
+![Sub-voxel bias](moco/subvoxel_bias.png)
+
+On the slice axis the polynomial bias is smaller, and 3dvolreg `-Fourier` shows the
+largest one (±1.8% of a voxel): it zero-pads its rows, which breaks the slab's
+periodicity.
+
+![Real-data signature](moco/real_data_signature.png)
 
 | translation sweep, 2D, noise-free | error, % of a voxel |
 |---|---|
@@ -136,7 +158,14 @@ slab (17 slices: 0.005 / 0.021 against 0.010 / 0.038 mm).
 **At least two Gauss-Newton steps.** A motion below the convergence threshold (0.01
 voxel / 0.02°, 3dvolreg's values) made the first step read as converged, leaving the
 one-step linearization's gain error: rotations of 0.005-0.015° came back 2-8% large,
-for every kernel. Requiring a second step fixes it at no measurable cost. For mixed
+for every kernel. Requiring a second step fixes it at no measurable cost.
+
+![Small-rotation gain](moco/small_rotation_gain.png)
+
+`ffs_moco`'s default returns small rotations at their true size about every axis.
+The polynomial estimators over-size small yaw (the in-plane rotation) by 7-47%,
+the in-plane kernel bias again, and 3dvolreg `-Fourier` under-sizes pitch and roll
+by 12-17%, its slice-axis padding. For mixed
 sub-threshold jitter the thresholds themselves are the limit; `-workhard` halves that
 error (0.0028 → 0.0014 mm at 2% noise) for about a third more CPU time.
 
@@ -150,10 +179,17 @@ Estimation error, mean / max mm, 2% noise:
 | 2D cubic, real trace (3T) | 0.023 / 0.054 | **0.004 / 0.010** | 0.019 / 0.045 | 0.026 / 0.094 |
 | 2D cubic, real trace (7T) | 0.019 / 0.040 | **0.003 / 0.009** | 0.017 / 0.034 | 0.030 / 0.099 |
 | 3D cubic, moderate | 0.030 / 0.100 | **0.003 / 0.009** | 0.026 / 0.089 | 0.003 / 0.013 |
+| 3D cubic, real trace (3T) | 0.026 / 0.057 | **0.003 / 0.009** | 0.023 / 0.050 | 0.004 / 0.011 |
 | 2D 2.1×2.1×2.45, moderate | 0.031 / 0.099 | **0.003 / 0.011** | 0.029 / 0.093 | 0.050 / 0.194 |
-| 2D 2.1×2.1×2.45, real trace (3T) | 0.023 / 0.057 | **0.003 / 0.009** | 0.020 / 0.056 | 0.037 / 0.143 |
+| 2D 2.1×2.1×2.45, real trace (3T) | 0.023 / 0.057 | **0.003 / 0.010** | 0.020 / 0.056 | 0.037 / 0.143 |
+| 2D 2.1×2.1×2.45, real trace (7T) | 0.019 / 0.040 | **0.003 / 0.009** | 0.018 / 0.039 | 0.036 / 0.120 |
 
-At 5% noise `fourier` stays at 0.004-0.005 mm mean (max 0.013-0.020).
+![Error vs noise](moco/noise.png)
+
+Noise costs `fourier` a few microns: on the real 3T trace it goes 0.003 → 0.004 →
+0.006 mm mean from 0% to 2% to 5% noise (max 0.007 → 0.010 → 0.017), while the
+polynomial estimators sit at 0.019-0.028 mm throughout. With no noise at all the
+floor is not zero: a 2D slice profile cannot be un-moved exactly.
 
 ## A bug the truth found: rotations on non-cubic voxels
 
@@ -190,7 +226,15 @@ plan, on noise-free data:
 | wsinc5 (the previous `-final` default) | 3.14% | 0.66% | 2.41% |
 | **fourier** | **2.74%** | **0.47%** | **2.23%** |
 
-(% of the brain mean.) On the 7T trace the injected std is 0.61 / 0.56 / **0.35%**;
+(% of the brain mean.)
+
+![Variance injected by the output kernel](moco/resample_maps.png)
+
+One axial slice, one colour scale for all three (they measure the same quantity).
+The polynomial kernels inject most at sharp edges (cortex, the brain boundary,
+vessels), where a fraction-dependent smoothing changes the intensity most.
+
+On the 7T trace the injected std is 0.61 / 0.56 / **0.35%**;
 for tiny in-plane shifts Fourier injects 4x less. On 3D data `fourier3d` halves it
 again (0.22%).
 
