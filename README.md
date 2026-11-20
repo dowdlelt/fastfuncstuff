@@ -22,6 +22,12 @@ pip install -e .          # Python >= 3.11; add ".[dev]" for tests + linters
 See **[INSTALL.md](INSTALL.md)** for details about conda / uv,  `zstd` needed for `.nii.zst`, Bash requirements for `ffs_autoproc` scripts, FreeSurfer / AFNI / ROMEO / SPM-template expectations, and a list of the environment variable the tools read.
 If something fails at install or launch time, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
 
+### Try a synthetic GLM
+
+Run `python examples/synthetic_glm.py` from the checkout after installation.
+The example simulates two task responses, fits them on CPU, and writes a NIfTI
+stats bucket with a JSON sidecar. It needs no downloaded data or AFNI installation.
+
 ### File formats
 
 Inputs read `.nii`, `.nii.gz`, and `.nii.zst` (zstd) transparently. ZSTD is a fast option for
