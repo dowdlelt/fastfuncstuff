@@ -754,8 +754,8 @@ def test_moco_fourier_falls_back_on_gather_paths(capsys):
 
 
 def test_slice_lowpass_is_estimation_only():
-    """-interp fourier blurs the slice axis for estimation; the corrected output
-    must still be the unblurred data (the base volume comes back as itself)."""
+    """The slice low-pass and -blur are estimation-only: the
+    corrected output must still be the unblurred data (the base comes back as itself)."""
     from fastfuncstuff.processing.ffs_moco import _slice_lowpass_sigma
 
     assert _slice_lowpass_sigma(MocoConfig(interp="fourier")) == 1.0

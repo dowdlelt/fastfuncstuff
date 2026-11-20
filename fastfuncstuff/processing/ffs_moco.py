@@ -66,11 +66,14 @@ class MocoConfig:
     cost: str = "wls"  # "wls", "lpa", or "quad"
     # linear|cubic|quintic|heptic|wsinc5|fourier|fourier3d. fourier: see
     # shear.FOURIER_AXES; paths that cannot shear fall back to heptic.
-    interp: str = "fourier"  # during estimation
-    final_interp: str = "fourier"  # for the output
+    interp: str = "heptic"  # during estimation
+    final_interp: str = "wsinc5"  # for the output
     max_iter: int = 23  # Per-volume GN iterations (matches 3dvolreg -maxite)
     twopass: bool = False  # Coarse blur + fine pass
-    blur_fwhm: float = 0.0  # Pre-blur for estimation (mm)
+    # Estimation-only Gaussian FWHM in VOXELS (see _estimation_view). Off by
+    # default: 1.5 was best for motion parameters on complex-magnitude truth,
+    # but on real runs it left slightly more motion-locked variance.
+    blur_fwhm: float = 0.0
     # Estimation-only Gaussian along the slice axis (k), sigma in slices; None =
     # auto (1.0 with interp="fourier", else 0). See _slice_lowpass_sigma.
     slice_lowpass: float | None = None
@@ -1154,17 +1157,26 @@ def _slice_lowpass_sigma(config: MocoConfig) -> float:
     """Slice-axis estimation low-pass, sigma in slices.
 
     A 2D slice is a discrete excitation through a slice profile, not a DFT
-    sample, so the slice axis has no exact interpolant and its polynomial
-    kernel smooths by an amount that depends on the fractional shift. Once the
-    in-plane axes are exact (``fourier``), that leftover bias is what remains,
-    and it shows up as a 2-4% gain error on pitch and roll. A Gaussian of one
-    slice on both images removes it: on whole-brain truth (0.35 mm T2* moved,
-    sampled to 2.1 mm 2D) random 6-DOF error fell 0.015 -> 0.003 mm, flat for
-    sigma 0.8-1.3 at 2% and 5% noise. Estimation only; the output is untouched.
+    sample, so the slice axis has no exact interpolant and its kernel smooths
+    by an amount that depends on the fractional shift. A Gaussian of one slice
+    on both images (estimation only; the output is untouched) removes that
+    bias from the motion PARAMETERS: on complex-magnitude ground truth heptic
+    went from 0.024 to 0.008 mm mean error (0.004 with -blur 1.5). On real
+    runs, though, the corrected data kept ~3% more motion-locked variance than
+    with the full-resolution fit, so it is opt-in -- except under ``fourier``,
+    whose in-plane exactness leaves the slice-axis bias as a 2-4% pitch/roll
+    gain error without it.
     """
     if config.slice_lowpass is not None:
         return config.slice_lowpass
     return 1.0 if config.interp == "fourier" else 0.0
+
+
+def _estimation_smoothed(config: MocoConfig) -> bool:
+    """Whether the estimator holds a smoothed copy the memory model must count
+    (Fourier's measured figure already includes its own slice low-pass)."""
+    lp = _slice_lowpass_sigma(config) > 0 and not config.interp.startswith("fourier")
+    return config.blur_fwhm > 0 or lp
 
 
 def _estimation_view(vol: Tensor, config: MocoConfig) -> Tensor:
@@ -1236,7 +1248,16 @@ def _run_batched_estimation(
         rms_before[base_copy_idx] = 0.0
         n_iters[base_copy_idx] = 0
 
-    chunk = compute_moco_resample_batch_size(nz, ny, nx, nt, device, interp=config.interp)
+    chunk = compute_moco_resample_batch_size(
+        nz,
+        ny,
+        nx,
+        nt,
+        device,
+        interp=config.interp,
+        twopass=coarse is not None,
+        smoothed=_estimation_smoothed(config),
+    )
     chunk = max(1, chunk)
 
     pbar = tqdm(
@@ -1822,8 +1843,17 @@ def moco(
     if batched_eligible:
         # Batched estimation sizes its chunks with the resample model
         # (_run_batched_estimation), so that is the prediction to hold it to.
-        _reg_chunk = max(1, compute_moco_resample_batch_size(nz, ny, nx, nt, device, config.interp))
-        _reg_bytes = moco_resample_bytes(nz, ny, nx, _reg_chunk, config.interp)
+        _tp = config.twopass and config.cost == "wls"
+        _sm = _estimation_smoothed(config)
+        _reg_chunk = max(
+            1,
+            compute_moco_resample_batch_size(
+                nz, ny, nx, nt, device, config.interp, twopass=_tp, smoothed=_sm
+            ),
+        )
+        _reg_bytes = moco_resample_bytes(
+            nz, ny, nx, _reg_chunk, config.interp, twopass=_tp, smoothed=_sm
+        )
     else:
         _reg_chunk = 1
         _reg_bytes = nz * ny * nx * 4 * 10  # base + source + Jacobian intermediates (rough)

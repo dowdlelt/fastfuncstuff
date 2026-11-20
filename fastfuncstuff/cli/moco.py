@@ -360,7 +360,15 @@ def parse_args(
         "-blur",
         type=float,
         default=0.0,
-        help="Pre-blur FWHM in mm for estimation (default: 0)",
+        help=(
+            "Estimation-only Gaussian FWHM, in VOXELS (default: 0). For motion "
+            "PARAMETERS: on complex-magnitude ground truth, -blur 1.5 with "
+            "-slice_lowpass 1 cut heptic's error from 0.024 to 0.004 mm. On real runs "
+            "the corrected data then kept ~3%% more motion-locked variance than the "
+            "default full-resolution fit, so it is off by default; use it when the "
+            "parameters themselves matter (FD, censoring, regressors). The output is "
+            "never blurred."
+        ),
     )
     method_group.add_argument(
         "-slice_lowpass",
@@ -369,11 +377,10 @@ def parse_args(
         metavar="SIGMA",
         help=(
             "Estimation-only Gaussian along the slice axis (k), sigma in slices. "
-            "Default: 1.0 with -interp fourier, else 0.\n"
-            "A 2D slice has no exact interpolant, so once the in-plane axes are exact "
-            "the slice kernel's bias is what is left (a 2-4%% gain error on pitch and "
-            "roll); one slice of blur removes it. Costs one 1-D convolution per "
-            "volume; the output is not blurred. Set 0 for 3D EPI with -interp fourier3d."
+            "Default: 0 (1.0 with -interp fourier). Same trade as -blur: more accurate "
+            "motion parameters on ground truth (heptic 0.024 -> 0.008 mm), slightly more "
+            "motion-locked variance left in real corrected data. The output is not "
+            "blurred."
         ),
     )
     method_group.add_argument(
@@ -432,35 +439,29 @@ def parse_args(
     interp_group.add_argument(
         "-interp",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
-        default="fourier",
+        default="heptic",
         help=(
-            "During estimation (default: fourier).\n"
-            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp -- exact for "
-            "DFT-reconstructed EPI rows -- and the slice axis (k) by heptic, with a "
-            "one-slice estimation low-pass along k (-slice_lowpass). Polynomial kernels "
-            "bias sub-voxel estimates toward half-voxel positions (~1.5%% of a voxel; "
-            "small motions read ~8%% large). On 0.35 mm anatomy moved by real motion "
-            "traces, fourier recovers the motion 6-8x more accurately than heptic, 2D "
-            "or 3D, any voxel shape.\n"
-            "fourier3d: FFT along k too, for 3D (slab) EPI, whose partition axis is "
-            "also DFT-encoded; best on thin 3D slabs, worse than fourier on 2D.\n"
+            "During estimation (default: heptic, as 3dvolreg).\n"
+            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp, exact only for "
+            "band-limited rows. A magnitude image is not band-limited (the magnitude is "
+            "taken after reconstruction): on complex-magnitude ground truth fourier "
+            "was no better than heptic overall and worse for in-plane translation.\n"
+            "fourier3d: FFT along k too.\n"
             "Paths without the shear estimator (-cost lpa/quad, -no_shear, -chain_init "
-            "on CUDA) use heptic, and say so."
+            "on CUDA) use heptic for the Fourier modes, and say so."
         ),
     )
     interp_group.add_argument(
         "-final",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
-        default="fourier",
+        default="wsinc5",
         dest="final_interp",
         help=(
-            "For the output (default: fourier; same choices as -interp).\n"
-            "Undoing known motion on truth data, fourier injected 30-40%% less "
-            "spurious temporal variance than wsinc5 or heptic, and less error outside "
-            "the brain: a Fourier shift of a band-limited image adds no ringing, while "
-            "polynomial kernels smooth by an amount that varies with the fractional "
-            "shift. Rows wrap periodically at the FOV edge, as the EPI itself does. "
-            "-no_shear uses heptic."
+            "For the output (default: wsinc5; same choices as -interp). Undoing known "
+            "motion on complex-magnitude ground truth, heptic, quintic and wsinc5 were "
+            "within a few percent and fourier and cubic were worst; on real runs wsinc5 "
+            "left the least motion-locked variance. -no_shear uses heptic for the "
+            "Fourier modes."
         ),
     )
     interp_group.add_argument(
