@@ -353,6 +353,33 @@ Examples:
     reml_out.add_argument(
         "-Rnuisance", help="Output REML betas + statistics for NUISANCE regressors only"
     )
+    reml_out.add_argument(
+        "-nuisance_summary",
+        metavar="PREFIX",
+        default=None,
+        help="Where each nuisance regressor, and each GROUP of them, did work: a bucket "
+        "with, per group (motion, motion derivatives, physio card / resp / rvt, dsort, "
+        "drift...) and then per column of it, the size of its fitted signal first and its "
+        "significance last -- PSC (temporal SD of the fitted signal, %% of the voxel "
+        "mean), R2unique (share of the voxel's variance lost without it; approximate: "
+        "whitened F, unwhitened R2), R2partial (share of what the rest leaves; exact), "
+        "then the group's Wald F / the column's t (AFNI stat-tagged). Columns lead with "
+        "their Coef; drift (degree >= 1, run means left out) gets the group only. Groups come from the column labels "
+        "(mot_demean.r01[3] -> mot_demean, ffs_physio card.c1 -> card) or "
+        "-nuisance_group. Works on -events/-onsets/-spec designs too (their nuisance "
+        "betas are otherwise not kept). Off by default: one joint test per group and "
+        "column inside the fit, and a bucket of ~5 bricks per nuisance column.",
+    )
+    reml_out.add_argument(
+        "-nuisance_group",
+        nargs=2,
+        action="append",
+        metavar=("NAME", "REGEX"),
+        default=None,
+        help="With -nuisance_summary: nuisance columns whose label matches REGEX form "
+        "group NAME (checked before the label-derived default). Repeatable, first "
+        "match wins. E.g. -nuisance_group motion 'mot_(demean|deriv)'.",
+    )
     reml_out.add_argument("-Rfitts", help="Output REML fitted model time series")
     reml_out.add_argument("-Rerrts", help="Output REML residuals")
     reml_out.add_argument("-Rwherr", help="Output REML whitened residuals")
@@ -1789,6 +1816,7 @@ _SURFACE_OUTPUT_EXT = {
             "Rbuck",
             "Rbeta",
             "Rnuisance",
+            "nuisance_summary",
             "Rfitts",
             "Rerrts",
             "Rwherr",
@@ -2422,6 +2450,7 @@ def main():
         args.Rbuck,
         args.Rbeta,
         args.Rnuisance,
+        args.nuisance_summary,
         args.Rfitts,
         args.Rerrts,
         args.Rwherr,
@@ -2516,6 +2545,14 @@ def main():
 
     if args.handle_missing and args.no_guard:
         raise SystemExit("❌ -handle_missing needs the guard's detection; drop -no_guard.")
+    if args.nuisance_group and not args.nuisance_summary:
+        raise SystemExit("❌ -nuisance_group only shapes -nuisance_summary; add it or drop it.")
+    if args.nuisance_summary and args.handle_missing:
+        # the family refits overwrite rows after the in-fit set tests ran
+        raise SystemExit(
+            "❌ -nuisance_summary cannot be combined with -handle_missing (the censored "
+            "family refits would leave its maps from the uncensored fit)."
+        )
     if args.handle_missing:
         # OLS-only and REML-only both refit families fine. What cannot work is
         # the OLS *baseline alongside* REML: that bucket is streamed out by a
@@ -2788,6 +2825,7 @@ def main():
             args.Rbuck,
             args.Rbeta,
             args.Rnuisance,
+            args.nuisance_summary,
             args.Rfitts,
             args.Rerrts,
             args.Rwherr,
@@ -4430,6 +4468,8 @@ def main():
             slibase_files_sm=args.slibase_sm,
             censor_file=args.censor,
             censor_trim=trim,
+            want_nuisance_summary=bool(args.nuisance_summary),
+            nuisance_groups=[tuple(g) for g in args.nuisance_group or []],
             want_residuals=bool(args.Rerrts)
             or bool(args.save_clean)
             or (analysis_method == "ols" and bool(args.Oerrts))
@@ -4943,6 +4983,9 @@ def main():
             condition_names=nuisance_names,
             add_fdr=args.add_fdr,
         )
+
+    if args.nuisance_summary:
+        _write_nuisance_summary(args.nuisance_summary, results)
 
     if args.Rvar:
         from fastfuncstuff.glm.arma import ARMA11Results
@@ -5510,6 +5553,47 @@ def main():
     print("=" * 70)
     print("✅ ffs_reml completed successfully!")
     print("=" * 70)
+
+
+def _write_nuisance_summary(path_arg: str, results) -> None:
+    """-nuisance_summary: the per-group / per-column bucket (glm/nuisance_summary.py)."""
+    from fastfuncstuff.glm.nuisance_summary import nuisance_summary_bricks
+    from fastfuncstuff.glm.outputs import _get_voxel_mask, _resolve_shape
+    from fastfuncstuff.io.afni import save_nifti, stat_type_to_stataux
+
+    groups = getattr(results, "nuisance_sets", None)
+    if not groups or results.set_fstats is None:
+        print("  ⚠️  -nuisance_summary: no nuisance columns in this design; nothing written")
+        return
+    vals, labels, stat = nuisance_summary_bricks(
+        groups,
+        results.set_fstats.numpy(),
+        results.set_sd.numpy(),
+        results.set_coef.numpy(),
+        results.r2.numpy(),
+        results.voxel_mean.numpy(),
+        int(results.dof),
+    )
+    path = Path(path_arg)
+    if not has_imaging_ext(path):
+        path = Path(str(path) + ".nii.gz")
+    shape = tuple(_resolve_shape(results, None))
+    mask = _get_voxel_mask(results)
+    vol = np.zeros((int(np.prod(shape)), vals.shape[1]), np.float32)
+    if mask is not None:
+        vol[np.asarray(mask, bool).reshape(-1)] = vals
+    else:
+        vol[:] = vals
+    save_nifti(
+        vol.reshape(*shape, vals.shape[1]),
+        output_path=path,
+        affine=getattr(results, "affine", None),
+        header=getattr(results, "nifti_header", None),
+        brick_labels=labels,
+        brick_stataux={i: stat_type_to_stataux(t, prm) for i, (t, prm) in stat.items()},
+    )
+    names = ", ".join(f"{g.name} ({len(g.columns)})" for g in groups)
+    print(f"  • Writing nuisance summary ({len(labels)} sub-bricks): {path}\n      groups: {names}")
 
 
 def _write_glm_qc(args, design_info: dict, data=None, device=None) -> None:

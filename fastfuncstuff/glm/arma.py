@@ -196,6 +196,7 @@ VOXEL_SCATTER_ATTRS = [
     "ljung_box",
     "set_fstats",
     "set_sd",
+    "set_coef",
 ]
 
 # The GLMResults equivalent of VOXEL_SCATTER_ATTRS (OLS has stderr/meanvol/r2_run
@@ -631,6 +632,11 @@ class ARMA11Results:
         # signal (data units). (n_voxels, n_sets) each.
         self.set_fstats: torch.Tensor | None = None
         self.set_sd: torch.Tensor | None = None
+        # the coefficient of each one-column set (NaN for wider sets): a fit that keeps
+        # only the task betas (task_indices) still reports its nuisance columns here
+        self.set_coef: torch.Tensor | None = None
+        self.nuisance_sets: list | None = None  # glm.nuisance_summary.NuisanceSet, in order
+        self.voxel_mean: torch.Tensor | None = None  # (n_voxels,) PSC denominator
         self.dof: int | None = None  # Degrees of freedom (n_timepoints - n_regressors)
         self.tr: float | None = None  # Repetition time
         self.voxel_mask: torch.Tensor | None = None  # Optional boolean mask for sparse analyses
@@ -3469,6 +3475,8 @@ def _fit_dsort_gls_pass(
                     results.set_fstats[idx, g] = (quad / (ix.numel() * sigma2 + 1e-30)).cpu()
                     sig = torch.einsum("bti,bi->bt", Xo.index_select(2, ix), b)
                     results.set_sd[idx, g] = sig.std(dim=1, correction=0).cpu()
+                    if ix.numel() == 1 and results.set_coef is not None:
+                        results.set_coef[idx, g] = b[:, 0].cpu()
 
             # Partial / semi-partial R² per base regressor (from t and R²).
             if want_r2_partial or want_r2_semipartial:
@@ -3557,13 +3565,14 @@ def _column_set_stats(
     betas: torch.Tensor,
     sigma2: torch.Tensor,
     mats: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """(F, SD) per voxel and set: F = b_S' A_SS^-1 b_S / (q sigma2), the Wald test of
-    the set; SD = sqrt(b_S' C_S b_S), the temporal SD of X_S b_S. NaN where a set is
-    not in this design."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(F, SD, coef) per voxel and set: F = b_S' A_SS^-1 b_S / (q sigma2), the Wald test
+    of the set; SD = sqrt(b_S' C_S b_S), the temporal SD of X_S b_S; coef = b for a
+    one-column set. NaN where a set is not in this design (coef: or is wider)."""
     B, G = betas.shape[0], len(mats)
     F = torch.full((B, G), float("nan"), device=betas.device, dtype=betas.dtype)
     sd = torch.full_like(F, float("nan"))
+    coef = torch.full_like(F, float("nan"))
     for g, m in enumerate(mats):
         if m is None:
             continue
@@ -3571,7 +3580,16 @@ def _column_set_stats(
         b = betas.index_select(1, ix)
         F[:, g] = torch.einsum("bi,ij,bj->b", b, Minv, b) / (ix.numel() * sigma2 + 1e-30)
         sd[:, g] = torch.einsum("bi,ij,bj->b", b, C, b).clamp(min=0).sqrt()
-    return F, sd
+        if ix.numel() == 1:
+            coef[:, g] = b[:, 0]
+    return F, sd, coef
+
+
+def _store_set_stats(results, idx, stats) -> None:
+    assert results.set_fstats is not None and results.set_sd is not None
+    assert results.set_coef is not None
+    for dst, x in zip((results.set_fstats, results.set_sd, results.set_coef), stats, strict=True):
+        dst[idx] = x.cpu()
 
 
 def _store_partial_semipartial(
@@ -4174,6 +4192,7 @@ def fit_glm_arma11(
             (n_voxels, len(column_sets)), float("nan"), device=storage_device, dtype=dtype
         )
         results.set_sd = torch.full_like(results.set_fstats, float("nan"))
+        results.set_coef = torch.full_like(results.set_fstats, float("nan"))
 
     # MEMORY OPTIMIZATION: Compute contrasts in-loop, never store full var_betas!
     # OLD approach: Store (n_voxels, n_reg, n_reg) covariance = 381 GB for 322 regressors
@@ -5501,10 +5520,11 @@ def fit_glm_arma11(
                 results.fstats[sub_voxel_indices] = fstats_batch.cpu()
                 results.r2[sub_voxel_indices] = r2_batch.cpu()
                 if set_mats_group is not None:
-                    assert results.set_fstats is not None and results.set_sd is not None
-                    _sf, _ssd = _column_set_stats(betas_batch, sigma2_batch, set_mats_group)
-                    results.set_fstats[sub_voxel_indices] = _sf.cpu()
-                    results.set_sd[sub_voxel_indices] = _ssd.cpu()
+                    _store_set_stats(
+                        results,
+                        sub_voxel_indices,
+                        _column_set_stats(betas_batch, sigma2_batch, set_mats_group),
+                    )
 
                 # Store partial R² if requested
                 # NOTE: r2_partial_batch is already filtered to task columns in the computation above
@@ -5658,14 +5678,18 @@ def fit_glm_arma11(
             results.sigma2[v] = sigma2_cpu
 
             if column_sets:
-                assert results.set_fstats is not None and results.set_sd is not None
                 if _set_mats_global is None:
                     _set_mats_global = _column_set_matrices(
                         plinalg.inv(XwTXw_reg), design_dev, column_sets
                     )
-                _sf, _ssd = _column_set_stats(beta[None], sigma2.reshape(1), _set_mats_global)
-                results.set_fstats[v] = _sf[0].cpu()
-                results.set_sd[v] = _ssd[0].cpu()
+                _store_set_stats(
+                    results,
+                    v,
+                    [
+                        x[0]
+                        for x in _column_set_stats(beta[None], sigma2.reshape(1), _set_mats_global)
+                    ],
+                )
 
             # t-statistics
             var_beta = sigma2 * plinalg.inv(XwTXw_reg)
@@ -5820,6 +5844,8 @@ def fit_glm_arma11(
             results.dsort_betas.mul_(scale_col)
         if results.set_sd is not None:
             results.set_sd.mul_(scale_col)
+        if results.set_coef is not None:
+            results.set_coef.mul_(scale_col)
         # The _nods snapshot was taken in normalized units — unscale it too.
         _nods = results.nods_results
         if isinstance(_nods, ARMA11Results):

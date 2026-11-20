@@ -439,6 +439,8 @@ def analyze_from_design_matrix(
     slibase_files_sm: list[str | Path] | None = None,
     censor_file: str | Path | None = None,
     censor_trim=None,
+    want_nuisance_summary: bool = False,
+    nuisance_groups: list[tuple[str, str]] | None = None,
     want_residuals: bool = False,
     want_predicted: bool = False,
     want_ljung_box: bool = False,
@@ -1412,6 +1414,24 @@ def analyze_from_design_matrix(
         if has_hrf:
             hrf_idx_tensor = _masked_hrf_indices(hrf_indices, mask_tensor, data.shape[0])
 
+        # -nuisance_summary: group the non-task columns now that the labels are final
+        # (slibase appended above, dsort known); the fit tests each set in-loop.
+        column_sets = None
+        nuisance_sets = None
+        if want_nuisance_summary:
+            from fastfuncstuff.glm.nuisance_summary import build_nuisance_sets
+
+            if use_stimulus_only:
+                raise ValueError(
+                    "-nuisance_summary needs the full design fitted (this fit keeps only "
+                    "the stimulus columns)"
+                )
+
+            nuisance_sets, column_sets = build_nuisance_sets(
+                design_info.get("column_labels") or [], stim_indices or [],
+                dsort_labels or [], nuisance_groups or [],
+            )  # fmt: skip
+
         if has_hrf or has_sli:
             from fastfuncstuff.glm.arma import fit_glm_arma11_grouped
 
@@ -1478,6 +1498,7 @@ def analyze_from_design_matrix(
                 want_residuals=want_residuals,
                 want_predicted=want_predicted,
                 want_ljung_box=want_ljung_box,
+                column_sets=column_sets,
             )
 
         else:
@@ -1517,7 +1538,12 @@ def analyze_from_design_matrix(
                 want_residuals=want_residuals,
                 want_predicted=want_predicted,
                 want_ljung_box=want_ljung_box,
+                column_sets=column_sets,
             )
+        results.nuisance_sets = nuisance_sets
+        if nuisance_sets is not None:
+            # PSC denominator: the mean of the series the GLM saw (100 under -do_scale)
+            results.voxel_mean = torch.as_tensor(data).float().mean(dim=1).cpu()
 
     else:
         raise ValueError(f"Unknown method: {method}. Choose 'ols' or 'arma11'")
