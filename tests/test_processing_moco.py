@@ -700,3 +700,104 @@ def test_moco_slab_moved_by_slices_recovers_the_shift(twopass):
     res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, twopass=twopass))
     np.testing.assert_allclose(res.params[1:, 2], [-s for s in shifts], atol=0.1)
     assert np.abs(res.params[1:, 3:]).max() < 0.3
+
+
+def test_moco_fourier_recovers_subvoxel_inplane_shifts():
+    """Band-limited in-plane data shifted by a quarter voxel, the position where
+    a polynomial kernel's bias peaks: -interp fourier recovers it exactly."""
+    rng = np.random.default_rng(5)
+    nz, ny, nx = 10, 40, 44
+    vol = rng.normal(size=(nz, ny, nx))
+    spec = np.fft.fftn(vol, axes=(1, 2))
+    ky = np.abs(np.fft.fftfreq(ny))[:, None]
+    kx = np.abs(np.fft.fftfreq(nx))[None, :]
+    spec *= (ky < 0.3) & (kx < 0.3) & (np.hypot(ky, kx) > 0.02)
+    vol = np.fft.ifftn(spec, axes=(1, 2)).real
+    vol = vol / vol.std() + 4.0
+
+    def moved(sy, sx):
+        ramp = np.exp(
+            -2j * np.pi * (np.fft.fftfreq(ny)[:, None] * sy + np.fft.fftfreq(nx)[None] * sx)
+        )
+        return np.fft.ifftn(np.fft.fftn(vol, axes=(1, 2)) * ramp, axes=(1, 2)).real
+
+    shifts = [(0.25, 0.0), (0.0, 0.25), (-0.25, 0.4), (0.1, -0.15)]
+    ts = torch.tensor(np.stack([vol] + [moved(*s) for s in shifts]), dtype=torch.float32)
+    # Tight convergence so the GN stopping rule (0.01 vox by default) is not
+    # what the tolerance measures.
+    cfg = MocoConfig(
+        base_index=0,
+        device="cpu",
+        verb=0,
+        compile=False,
+        interp="fourier",
+        dxy_thresh=1e-4,
+        dph_thresh=1e-4,
+        max_iter=60,
+    )
+    res = moco(ts, cfg)
+    # params[:, :3] are the base->source pull: minus the content shift.
+    want = np.array([[-sx, -sy] for sy, sx in shifts])
+    # Measured: fourier within 6e-4 vox; heptic misses by 3.9e-3.
+    np.testing.assert_allclose(res.params[1:, :2], want, atol=1.5e-3)
+    assert np.abs(res.params[1:, 2:6]).max() < 2e-3
+
+
+def test_moco_fourier_falls_back_on_gather_paths(capsys):
+    """fourier is the default, so the estimators without a shear path (lpa here)
+    must still run -- on heptic -- and say so rather than fail."""
+    rng = np.random.default_rng(1)
+    ts = torch.tensor(rng.normal(size=(3, 8, 16, 16)).astype(np.float32) + 5.0)
+    res = moco(ts, MocoConfig(device="cpu", verb=1, compile=False, interp="fourier", cost="lpa"))
+    assert np.isfinite(res.params).all()
+    assert "interp fourier -> heptic" in capsys.readouterr().out
+
+
+def test_slice_lowpass_is_estimation_only():
+    """The slice low-pass and -blur are estimation-only: the
+    corrected output must still be the unblurred data (the base comes back as itself)."""
+    from fastfuncstuff.processing.ffs_moco import _slice_lowpass_sigma
+
+    assert _slice_lowpass_sigma(MocoConfig(interp="fourier")) == 1.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="fourier3d")) == 0.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="heptic")) == 0.0
+    assert _slice_lowpass_sigma(MocoConfig(interp="heptic", slice_lowpass=0.5)) == 0.5
+
+    rng = np.random.default_rng(2)
+    vol = rng.normal(size=(12, 24, 24)).astype(np.float32) + 5.0
+    ts = torch.tensor(np.stack([vol, vol, vol]))
+    res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, interp="fourier"))
+    np.testing.assert_allclose(res.aligned[0].numpy(), vol, atol=1e-4)
+
+
+def test_moco_rotates_in_mm_on_anisotropic_voxels():
+    """A head turns rigidly in millimetres. On 2x2x3 mm voxels an index-space
+    rotation is a rotation plus stretch/shear, so it cannot fit the motion:
+    the recovered matrix must be rigid in mm and match the true rotation."""
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    from scipy.spatial.transform import Rotation
+
+    vs = np.array([2.0, 2.0, 3.0])  # x, y, z
+    rng = np.random.default_rng(4)
+    vol_xyz = gaussian_filter(rng.normal(size=(48, 48, 32)), 2.0)
+    vol_xyz = (vol_xyz - vol_xyz.min()) / np.ptp(vol_xyz) + 0.5
+    n = np.array(vol_xyz.shape)
+    c = (n - 1) / 2
+    R = Rotation.from_euler("xyz", [3.0, -2.0, 1.5], degrees=True).as_matrix()
+    L = (R * vs) / vs[:, None]  # D^-1 R D: the true pull in index space
+    g = np.mgrid[0 : n[0], 0 : n[1], 0 : n[2]].reshape(3, -1)
+    moved = map_coordinates(vol_xyz, c[:, None] + L @ (g - c[:, None]), order=5, mode="nearest")
+    moved = moved.reshape(n)
+    ts = torch.tensor(np.stack([vol_xyz, moved]).transpose(0, 3, 2, 1).copy(), dtype=torch.float32)
+    affine = np.diag([*vs, 1.0])
+    cfg = MocoConfig(
+        base_index=0, device="cpu", verb=0, compile=False, dxy_thresh=1e-3, dph_thresh=1e-3
+    )
+    res = moco(ts, cfg, header_info={"affine": affine})
+    Mv = res.matrices_vox[1].double().numpy()[:3, :3]
+    Rmm = (Mv * (1 / vs)) / (1 / vs)[:, None]  # D Mv D^-1
+    np.testing.assert_allclose(np.linalg.svd(Rmm, compute_uv=False), 1.0, atol=1e-5)
+    # Measured: 0.01 deg with mm rotations; index-space rotations miss by ~0.2 deg.
+    # matrices_vox is the correcting pull, so it undoes the motion: Rmm ~ R^-1.
+    err = np.degrees(np.arccos(np.clip((np.trace(Rmm @ R) - 1) / 2, -1, 1)))
+    assert err < 0.05, err

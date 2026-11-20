@@ -343,3 +343,188 @@ def test_cpu_shear_backends_agree_on_resampled_volume(monkeypatch, mode):
         outputs.append(shear.shear_resample(vol, matrix, vol.shape, mode))
     assert all(out is not None for out in outputs)
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=2e-6)
+
+
+# ---------------------------------------------------------------------------
+# Fourier shears. EPI rows are DFT-reconstructed, so a phase ramp shifts them
+# exactly; polynomial kernels bias sub-voxel moco toward half-voxel positions.
+# ---------------------------------------------------------------------------
+
+
+def _bandlimited_inplane(nz=10, ny=36, nx=40, seed=0):
+    """Random volume whose (y, x) spectrum stops below Nyquist, as an EPI row."""
+    g = torch.Generator().manual_seed(seed)
+    vol = torch.randn(nz, ny, nx, generator=g, dtype=torch.float64)
+    spec = torch.fft.fftn(vol, dim=(1, 2))
+    ky = torch.fft.fftfreq(ny, dtype=torch.float64).abs()[:, None]
+    kx = torch.fft.fftfreq(nx, dtype=torch.float64).abs()[None, :]
+    spec = spec * ((ky < 0.4) & (kx < 0.4))
+    vol = torch.fft.ifftn(spec, dim=(1, 2)).real
+    return vol + 0.0 * vol.mean()
+
+
+def _exact_shift(vol, sy, sx):
+    """Content moved by (sy, sx) voxels: the exact shift of a periodic band-limited image."""
+    ny, nx = vol.shape[1:]
+    ky = torch.fft.fftfreq(ny, dtype=torch.float64)[:, None]
+    kx = torch.fft.fftfreq(nx, dtype=torch.float64)[None, :]
+    ramp = torch.exp(-2j * torch.pi * (ky * sy + kx * sx))
+    return torch.fft.ifftn(torch.fft.fftn(vol, dim=(1, 2)) * ramp, dim=(1, 2)).real
+
+
+def test_fft_shift_rows_is_exact_on_a_trig_polynomial():
+    from fastfuncstuff.processing.shear import fft_shift_rows
+
+    n, af = 32, 0.37
+    p = torch.arange(n, dtype=torch.float64)
+    g = torch.Generator().manual_seed(1)
+    coef = torch.randn(15, 2, generator=g, dtype=torch.float64)
+
+    def signal(x):
+        k = torch.arange(1, 16, dtype=torch.float64)[:, None]
+        w = 2 * torch.pi * k * x[None] / n
+        return (coef[:, :1] * torch.cos(w) + coef[:, 1:] * torch.sin(w)).sum(0)
+
+    out = fft_shift_rows(signal(p)[None], 1, torch.tensor([[af]], dtype=torch.float64))
+    torch.testing.assert_close(out[0], signal(p - af), rtol=0, atol=1e-10)
+
+
+def test_fourier_shear_translates_inplane_exactly():
+    """In-plane fractional shift through the shear plan equals the exact phase
+    ramp; catches sign, axis-mapping and Nyquist mistakes in the Fourier step."""
+    vol = _bandlimited_inplane()
+    sx, sy = 0.37, -0.23
+    # out(p) = source(p + t) moves content by -t.
+    mat = torch.eye(4, dtype=torch.float64)
+    mat[0, 3], mat[1, 3] = -sx, -sy
+    out = shear_resample(vol, mat, tuple(vol.shape), "fourier")
+    torch.testing.assert_close(out, _exact_shift(vol, sy, sx), rtol=0, atol=1e-8)
+    heptic = shear_resample(vol, mat, tuple(vol.shape), "heptic")
+    assert (heptic - _exact_shift(vol, sy, sx)).abs().max() > 100 * (
+        out - _exact_shift(vol, sy, sx)
+    ).abs().max()
+
+
+def test_fourier_shear_rotation_tracks_heptic():
+    """A small rotation through the Fourier plan agrees with the polynomial plan
+    away from the border (they differ only in the 1D kernel)."""
+    vol = _make_volume(20, 36, 40, seed=4).double()
+    mat = _rigid_matrix(0.3, -0.2, 0.1, 1.5, 0.8, -0.6).double()
+    four = shear_resample(vol, mat, tuple(vol.shape), "fourier")
+    hept = shear_resample(vol, mat, tuple(vol.shape), "heptic")
+    inner = (slice(4, -4), slice(6, -6), slice(6, -6))
+    rel = (four - hept)[inner].abs().mean() / vol[inner].abs().mean()
+    assert rel < 0.02, rel
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["fourier", "fourier3d"])
+@pytest.mark.parametrize("perm", range(6))
+def test_shared_fourier_path_matches_general_path(mode, perm):
+    """The shared-order fast path (one FFT or Triton pass per step, fused ramp)
+    must equal the general per-lane implementation on the same plan, for every
+    axis order. Order z,x,y,z once returned uninitialized memory: a Triton step
+    after a y-axis inverse FFT wrote into a reshape copy of a strided buffer."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/Triton required")
+    from fastfuncstuff.processing import shear as S
+    from fastfuncstuff.processing.shear_triton import (
+        _MODE_ID,
+        _fourier_shears,
+        _fourier_shears_shared,
+        _unpack_ab,
+    )
+
+    nt, nz, ny, nx = 6, 20, 36, 40
+    base = _make_volume(nz, ny, nx, seed=7)
+    g = torch.Generator().manual_seed(3)
+    mats = []
+    for _ in range(nt):
+        r = torch.randn(6, generator=g)
+        mats.append(_rigid_matrix(*(r[:3] * 0.6).tolist(), *(r[3:] * 1.0).tolist()))
+    M = torch.stack(mats).double()
+    # the plan for one forced permutation, as _shear_best builds it
+    c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    A, t = M[:, :3, :3], M[:, :3, 3]
+    q = torch.linalg.inv(A)
+    d = -(q @ ((A @ c) + t - c).unsqueeze(-1)).squeeze(-1)
+    pi = list(S._PERMS[perm])
+    idx = torch.tensor(pi)
+    ax, scl, sft, valid = S._shear_xzyx(q[:, idx][:, :, idx], d[:, idx])
+    ax, scl, sft = S._permute_back(ax, scl, sft, pi)
+    assert bool(valid.all())
+    a4, b4 = _unpack_ab(ax, scl)
+    fft_axes, poly = S.split_fourier_mode(mode)
+    src = base[None].expand(nt, nz, ny, nx).contiguous().cuda()
+    a4, b4, sft, ax = a4.float().cuda(), b4.float().cuda(), sft.float().cuda(), ax.cuda()
+    order = ax[0].tolist()
+    shared = _fourier_shears_shared(src, order, a4, b4, sft, fft_axes, _MODE_ID[poly])
+    general = _fourier_shears(src, ax, a4, b4, sft, fft_axes, _MODE_ID[poly])
+    torch.testing.assert_close(shared, general, rtol=1e-4, atol=1e-4)
+
+
+def test_common_plan_rejects_badly_conditioned_lanes():
+    """One axis order for the batch is only taken where it is well conditioned:
+    near a lane's degenerate axis the factorization returns large cancelling
+    shears (0.65 on a real 0.9 deg run), which sent GN 7 mm astray. Every lane
+    left valid must have a shear norm within 2x (+0.01) of its own best."""
+    from fastfuncstuff.processing import shear as S
+
+    g = torch.Generator().manual_seed(5)
+    mats = [
+        _rigid_matrix(
+            *(torch.randn(3, generator=g) * 0.3).tolist(),
+            *(torch.randn(3, generator=g) * 0.6).tolist(),
+        )
+        for _ in range(12)
+    ]
+    mats.append(_rigid_matrix(0.1, 0.0, 0.0, 0.9, 1e-4, 1e-4))  # nearly single-axis
+    mats.append(_rigid_matrix(0.0, 0.1, 0.0, 1e-4, 0.9, 1e-4))
+    M = torch.stack(mats).double()
+    ax, scl, sft, valid = rigid_matrix_to_shears(M, (24, 40, 44), common=True)
+    # recompute each lane's per-permutation norms the way _shear_best does
+    q = torch.linalg.inv(M[:, :3, :3])
+    B = len(M)
+    idxs = [torch.tensor(p) for p in S._PERMS]
+    qq = torch.cat([q[:, i][:, :, i] for i in idxs])
+    xx = torch.zeros(6 * B, 3, dtype=torch.float64)
+    a6, s6, f6, v6 = S._shear_xzyx(qq, xx)
+    norms = torch.stack(
+        [
+            S._norm_3shear(
+                *S._permute_back(
+                    a6[k * B : (k + 1) * B],
+                    s6[k * B : (k + 1) * B],
+                    f6[k * B : (k + 1) * B],
+                    list(p),
+                )[:2],
+                v6[k * B : (k + 1) * B],
+            )
+            for k, p in enumerate(S._PERMS)
+        ],
+        dim=1,
+    )
+    chosen = S._norm_3shear(ax, scl, torch.ones(B, dtype=torch.bool))
+    best = norms.min(dim=1).values
+    assert bool((chosen[valid] <= 2 * best[valid] + 0.01 + 1e-9).all())
+
+
+def test_plan_reproduces_mm_rotation_on_anisotropic_voxels():
+    """A rotation in mm on 2.1x2.1x2.45 voxels is D^-1 R D in index space: unit
+    determinant, not orthogonal. Taking A^T for A^-1 left such plans 4e-3 off in
+    the linear part and 0.2 voxel in the shift while passing the old guard."""
+    from scipy.spatial.transform import Rotation
+
+    from fastfuncstuff.processing.shear import _reconstruct_pull
+
+    shape = (48, 94, 94)
+    vs = torch.tensor([2.1, 2.1, 2.45], dtype=torch.float64)
+    R = torch.tensor(Rotation.from_euler("xyz", [0.86, 0.1, 0.05], degrees=True).as_matrix())
+    M = torch.eye(4, dtype=torch.float64)
+    M[:3, :3] = R * vs / vs[:, None]
+    M[:3, 3] = torch.tensor([0.3, -0.2, 0.1], dtype=torch.float64)
+    ax, scl, sft, valid = rigid_matrix_to_shears(M[None], shape)
+    assert bool(valid[0])
+    Lt, bt = _reconstruct_pull(ax.long(), scl.double(), sft.double(), shape)
+    torch.testing.assert_close(Lt[0], M[:3, :3], rtol=0, atol=1e-9)
+    torch.testing.assert_close(bt[0], M[:3, 3], rtol=0, atol=1e-9)

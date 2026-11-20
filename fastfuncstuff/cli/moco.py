@@ -360,7 +360,24 @@ def parse_args(
         "-blur",
         type=float,
         default=0.0,
-        help="Pre-blur FWHM in mm for estimation (default: 0)",
+        help=(
+            "EXPERIMENTAL. Estimation-only Gaussian FWHM, in voxels (default: 0). On "
+            "simulated truth it made the motion parameters more accurate; on real runs "
+            "it did not improve the corrected data (slightly more motion-locked "
+            "variance). See docs/moco.md. The output is never blurred."
+        ),
+    )
+    method_group.add_argument(
+        "-slice_lowpass",
+        type=float,
+        default=None,
+        metavar="SIGMA",
+        help=(
+            "EXPERIMENTAL. Estimation-only Gaussian along the slice axis (k), sigma in "
+            "slices (default: 0; 1.0 with -interp fourier). Same finding as -blur: "
+            "better parameters on simulated truth, no real-data benefit. See "
+            "docs/moco.md."
+        ),
     )
     method_group.add_argument(
         "-fast",
@@ -417,16 +434,27 @@ def parse_args(
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
-        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
         default="heptic",
-        help="During estimation (default: heptic)",
+        help=(
+            "During estimation (default: heptic, as 3dvolreg).\n"
+            "fourier / fourier3d (EXPERIMENTAL): shift rows by an FFT phase ramp, exact "
+            "only for band-limited data. Magnitude images are not band-limited, and on "
+            "real runs neither mode improved the corrected data. See docs/moco.md.\n"
+            "Paths without the shear estimator (-cost lpa/quad, -no_shear, -chain_init "
+            "on CUDA) use heptic for the Fourier modes, and say so."
+        ),
     )
     interp_group.add_argument(
         "-final",
-        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
         default="wsinc5",
         dest="final_interp",
-        help="For output (default: wsinc5)",
+        help=(
+            "For the output (default: wsinc5; same choices as -interp). On real runs "
+            "wsinc5 left the least motion-locked variance; the Fourier modes "
+            "(EXPERIMENTAL) left 3-4%% more."
+        ),
     )
     interp_group.add_argument(
         "-no_shear",
@@ -1087,6 +1115,7 @@ def _build_config(
         max_iter=max_iter,
         twopass=args.twopass,
         blur_fwhm=args.blur,
+        slice_lowpass=args.slice_lowpass,
         chain_init=args.chain_init,
         use_shear=not args.no_shear,
         automask=args.automask,

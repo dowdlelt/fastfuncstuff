@@ -43,7 +43,7 @@ from .affine import (  # noqa: E402
 )
 from .cost import _separable_smooth_3d, lpa_correlation  # noqa: E402
 from .interp import _separable_resample_3d, no_gather_compile, warp_image  # noqa: E402
-from .shear import shear_resample  # noqa: E402
+from .shear import FOURIER_POLY, shear_resample, split_fourier_mode  # noqa: E402
 
 try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
     from .shear_triton import shear_resample_triton
@@ -64,11 +64,19 @@ class MocoConfig:
 
     base_index: int = 0  # Reference volume index (0 = first)
     cost: str = "wls"  # "wls", "lpa", or "quad"
-    interp: str = "heptic"  # During estimation: linear|cubic|quintic|heptic|wsinc5
-    final_interp: str = "wsinc5"  # For output: linear|cubic|quintic|heptic|wsinc5
+    # linear|cubic|quintic|heptic|wsinc5|fourier|fourier3d. fourier: see
+    # shear.FOURIER_AXES; paths that cannot shear fall back to heptic.
+    interp: str = "heptic"  # during estimation
+    final_interp: str = "wsinc5"  # for the output
     max_iter: int = 23  # Per-volume GN iterations (matches 3dvolreg -maxite)
     twopass: bool = False  # Coarse blur + fine pass
-    blur_fwhm: float = 0.0  # Pre-blur for estimation (mm)
+    # Estimation-only Gaussian FWHM in VOXELS (see _estimation_view). Off by
+    # default: 1.5 was best for motion parameters on complex-magnitude truth,
+    # but on real runs it left slightly more motion-locked variance.
+    blur_fwhm: float = 0.0
+    # Estimation-only Gaussian along the slice axis (k), sigma in slices; None =
+    # auto (1.0 with interp="fourier", else 0). See _slice_lowpass_sigma.
+    slice_lowpass: float | None = None
     dxy_thresh: float = 0.01  # Translation convergence, voxels (3dvolreg -x_thresh)
     dph_thresh: float = 0.02  # Rotation convergence, degrees (3dvolreg -rot_thresh)
     chain_init: bool = (
@@ -146,7 +154,9 @@ def _rigid_params(device, dtype) -> Tensor:
     return identity_params(device=device, dtype=dtype)
 
 
-def centered_rigid_p2m(shape: tuple[int, int, int]):
+def centered_rigid_p2m(
+    shape: tuple[int, int, int], voxel_sizes: tuple[float, float, float] | None = None
+):
     """``params_to_matrix`` (and batched) with the rotation pivot at the grid centre.
 
     ``params_to_matrix`` rotates about voxel index (0,0,0), a corner of the
@@ -159,21 +169,37 @@ def centered_rigid_p2m(shape: tuple[int, int, int]):
 
     Only the parametrization moves: the matrices returned are ordinary
     voxel-index pulls, so everything downstream of ``matrices_vox`` is unchanged.
+
+    ``voxel_sizes`` (dx, dy, dz) puts the rotation in millimetres: the pull is
+    ``D^-1 R D`` in index space. A head moves rigidly in mm, so a rotation built
+    in index space is, on anisotropic voxels, a rotation plus a stretch and shear
+    of about angle x anisotropy -- singular values 0.9989..1.0011 on a 0.9 deg
+    run at 2.5x2.5x2.75 mm, where 3dvolreg's are exactly 1. Translations stay in
+    voxels, which is exact. ``None`` keeps the index-space rotation.
     """
     nz, ny, nx = shape
     c64 = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    vs = None if voxel_sizes is None else torch.tensor(voxel_sizes, dtype=torch.float64)
+
+    def _rot(L: Tensor) -> Tensor:
+        if vs is None:
+            return L
+        v = vs.to(device=L.device, dtype=L.dtype)
+        return L * v / v[:, None]  # D^-1 L D
 
     def p2m(params: Tensor) -> Tensor:
         M = params_to_matrix(params)
         c = c64.to(device=M.device, dtype=M.dtype)
-        t = M[:3, 3] + c - M[:3, :3] @ c
-        return torch.cat([torch.cat([M[:3, :3], t[:, None]], dim=1), M[3:]], dim=0)
+        L = _rot(M[:3, :3])
+        t = M[:3, 3] + c - L @ c
+        return torch.cat([torch.cat([L, t[:, None]], dim=1), M[3:]], dim=0)
 
     def p2m_batched(params: Tensor) -> Tensor:
         M = params_to_matrix_batched(params)
         c = c64.to(device=M.device, dtype=M.dtype)
-        t = M[:, :3, 3] + c - M[:, :3, :3] @ c
-        return torch.cat([torch.cat([M[:, :3, :3], t[:, :, None]], dim=2), M[:, 3:]], dim=1)
+        L = _rot(M[:, :3, :3])
+        t = M[:, :3, 3] + c - L @ c
+        return torch.cat([torch.cat([L, t[:, :, None]], dim=2), M[:, 3:]], dim=1)
 
     return p2m, p2m_batched
 
@@ -307,6 +333,12 @@ def compute_derivative_images(
 # ---------------------------------------------------------------------------
 
 
+def _gather_mode(interp: str) -> str:
+    """The kernel a general (gather) resampler uses for ``interp``: it has no
+    Fourier kernel, so the Fourier modes take their polynomial."""
+    return split_fourier_mode(interp)[1]
+
+
 def _shear_resample_fn(
     source: Tensor,
     matrix: Tensor,
@@ -324,7 +356,8 @@ def _shear_resample_fn(
     """
     warped = shear_resample(source, matrix, tuple(output_shape), interp)
     if warped is None:
-        warped = resample_affine_fast(source, matrix, coords, interp, output_shape)
+        poly = split_fourier_mode(interp)[1]
+        warped = resample_affine_fast(source, matrix, coords, poly, output_shape)
     return warped
 
 
@@ -546,10 +579,12 @@ def gauss_newton_rigid(
         coords = _build_homo_coords(output_shape, device, dtype)
 
     normal_solve = _prepare_normal_solve(JtWJ, device, dtype)
+    # Only the shear resampler has a Fourier kernel; a gather gets the polynomial.
+    interp = config.interp if resample_fn is _shear_resample_fn else _gather_mode(config.interp)
 
     for it in range(config.max_iter):
         matrix = p2m_fn(params)
-        warped = resample_fn(source, matrix, coords, config.interp, output_shape)
+        warped = resample_fn(source, matrix, coords, interp, output_shape)
         warped_flat = warped.reshape(-1)
         weight_it, solve_it = weight_flat, normal_solve
         if support_corners is not None and bool(
@@ -582,7 +617,7 @@ def gauss_newton_rigid(
         # Convergence check
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
         rot_converged = (dp[3:].abs() < config.dph_thresh).all()
-        if trans_converged and rot_converged:
+        if it >= 1 and trans_converged and rot_converged:
             return params, it + 1
 
     return params, config.max_iter
@@ -609,7 +644,7 @@ def gauss_newton_rigid_masked(
         matrix = p2m_fn(params)
         src_coords = matrix @ coords_masked  # (4, M)
         warped = _separable_resample_3d(
-            source, src_coords[0], src_coords[1], src_coords[2], config.interp
+            source, src_coords[0], src_coords[1], src_coords[2], _gather_mode(config.interp)
         )  # (M,)
         residual = weight_flat_masked * (base_flat_masked - warped)
 
@@ -620,7 +655,7 @@ def gauss_newton_rigid_masked(
 
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
         rot_converged = (dp[3:].abs() < config.dph_thresh).all()
-        if trans_converged and rot_converged:
+        if it >= 1 and trans_converged and rot_converged:
             return params, it + 1
 
     return params, config.max_iter
@@ -787,6 +822,7 @@ def batched_gn_estimate(
 
         if not fixed_iter:
             conv = (dp[:, :3].abs() < dxy_thresh).all(1) & (dp[:, 3:].abs() < dph_thresh).all(1)
+            conv = conv & (it >= 1)
             newly = active & conv
             n_iters = torch.where(newly, torch.full_like(n_iters, it + 1), n_iters)
             active = active & ~conv
@@ -858,7 +894,7 @@ def gn_lpa_rigid(
         p = identity_params(device=device, dtype=dtype)
         p[:6] = torch.tensor(x6, device=device, dtype=dtype)
         matrix = p2m_fn(p)
-        warped = apply_affine_interp(source, matrix, config.interp, output_shape)
+        warped = apply_affine_interp(source, matrix, _gather_mode(config.interp), output_shape)
         # lpa_correlation returns higher = better, so negate for minimization
         cost = -lpa_correlation(
             base, warped, weight, sigma=config.lpa_sigma, kernel_type=config.lpa_kernel
@@ -1091,6 +1127,74 @@ def save_maxdisp_1D(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_fourier(config: MocoConfig, device: torch.device) -> MocoConfig:
+    """Fall back to heptic where a Fourier kernel cannot run, and say so.
+
+    Only the shear solvers move rows by FFT: plain WLS with shear resampling,
+    batched on CUDA (no -chain_init) or per volume elsewhere. -cost lpa/quad,
+    -chain_init on CUDA and -no_shear go through the general gather, which has
+    no Fourier kernel; the output resample needs shear resampling likewise.
+    """
+    est_ok = (
+        config.cost == "wls"
+        and config.use_shear
+        and (device.type != "cuda" or (not config.chain_init and shear_resample_triton is not None))
+    )
+    changes = {}
+    if split_fourier_mode(config.interp)[0] and not est_ok:
+        changes["interp"] = FOURIER_POLY
+    if split_fourier_mode(config.final_interp)[0] and not config.use_shear:
+        changes["final_interp"] = FOURIER_POLY
+    if not changes:
+        return config
+    if config.verb >= 1:
+        what = ", ".join(f"{k} {getattr(config, k)} -> {v}" for k, v in changes.items())
+        print(f"  Fourier kernel needs the shear path here; using {what}")
+    return replace(config, **changes)
+
+
+def _slice_lowpass_sigma(config: MocoConfig) -> float:
+    """Slice-axis estimation low-pass, sigma in slices.
+
+    A 2D slice is a discrete excitation through a slice profile, not a DFT
+    sample, so the slice axis has no exact interpolant and its kernel smooths
+    by an amount that depends on the fractional shift. A Gaussian of one slice
+    on both images (estimation only; the output is untouched) removes that
+    bias from the motion PARAMETERS: on complex-magnitude ground truth heptic
+    went from 0.024 to 0.008 mm mean error (0.004 with -blur 1.5). On real
+    runs, though, the corrected data kept ~3% more motion-locked variance than
+    with the full-resolution fit, so it is opt-in -- except under ``fourier``,
+    whose in-plane exactness leaves the slice-axis bias as a 2-4% pitch/roll
+    gain error without it.
+    """
+    if config.slice_lowpass is not None:
+        return config.slice_lowpass
+    return 1.0 if config.interp == "fourier" else 0.0
+
+
+def _estimation_smoothed(config: MocoConfig) -> bool:
+    """Whether the estimator holds a smoothed copy the memory model must count
+    (Fourier's measured figure already includes its own slice low-pass)."""
+    lp = _slice_lowpass_sigma(config) > 0 and not config.interp.startswith("fourier")
+    return config.blur_fwhm > 0 or lp
+
+
+def _estimation_view(vol: Tensor, config: MocoConfig) -> Tensor:
+    """The (optionally batched) volume the estimator sees: -blur, then the slice low-pass."""
+    if config.blur_fwhm > 0:
+        if vol.ndim == 4:
+            vol = torch.stack([_blur_volume(v, config.blur_fwhm) for v in vol])
+        else:
+            vol = _blur_volume(vol, config.blur_fwhm)
+    sigma = _slice_lowpass_sigma(config)
+    if sigma > 0:
+        if vol.ndim == 4:
+            vol = _separable_smooth_3d(vol[:, None], (sigma, 0.0, 0.0))[:, 0]
+        else:
+            vol = _separable_smooth_3d(vol, (sigma, 0.0, 0.0))
+    return vol
+
+
 def _blur_volume(vol: Tensor, fwhm: float) -> Tensor:
     """Apply Gaussian blur to a volume (fwhm in voxels)."""
     if fwhm <= 0:
@@ -1144,7 +1248,16 @@ def _run_batched_estimation(
         rms_before[base_copy_idx] = 0.0
         n_iters[base_copy_idx] = 0
 
-    chunk = compute_moco_resample_batch_size(nz, ny, nx, nt, device, interp=config.interp)
+    chunk = compute_moco_resample_batch_size(
+        nz,
+        ny,
+        nx,
+        nt,
+        device,
+        interp=config.interp,
+        twopass=coarse is not None,
+        smoothed=_estimation_smoothed(config),
+    )
     chunk = max(1, chunk)
 
     pbar = tqdm(
@@ -1160,10 +1273,7 @@ def _run_batched_estimation(
         B = srcs_raw.shape[0]
 
         # Fine-pass sources (optionally pre-blurred for estimation).
-        if config.blur_fwhm > 0:
-            srcs = torch.stack([_blur_volume(srcs_raw[i], config.blur_fwhm) for i in range(B)])
-        else:
-            srcs = srcs_raw
+        srcs = _estimation_view(srcs_raw, config)
 
         src_flat = srcs.reshape(B, -1)
         rms_before[idx] = ((base_flat[None] - src_flat) ** 2).mean(dim=1).sqrt().cpu().numpy()
@@ -1220,6 +1330,7 @@ def _run_batched_estimation(
                     init_params[j] if init_params is not None else identity.clone(),
                     config,
                     coords=homo,
+                    resample_fn=_shear_resample_fn,
                     p2m_fn=p2m_fn,
                     support_corners=support_corners[0],
                 )
@@ -1281,6 +1392,7 @@ def resample_timeseries(
     batch_size = compute_moco_resample_batch_size(
         nz, ny, nx, nt, device, interp=config.final_interp
     )
+    poly_final = split_fourier_mode(config.final_interp)[1]  # for the gather fallbacks
     if config.verb >= 1:
         print(f"  Resampling batch size: {batch_size} volumes")
 
@@ -1333,7 +1445,7 @@ def resample_timeseries(
         )
         if config.use_shear and not bool(rigid.all()):
             aligned_batch = apply_affine_interp_batched(
-                sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
+                sources_batch, matrices_batch, poly_final, vol_shape, zero_outside=True
             )
         elif use_triton:
             # Fused Triton shears (AFNI THD_rota_vol), batched over the whole
@@ -1346,14 +1458,21 @@ def resample_timeseries(
             if not bool(valid.all()):
                 bad = (~valid).nonzero(as_tuple=True)[0].tolist()
                 for j in bad:
-                    aligned_batch[j] = resample_affine_fast(
-                        sources_batch[j],
-                        matrices_batch[j],
-                        homo_coords,
-                        config.final_interp,
-                        vol_shape,
-                        zero_outside=True,
+                    # An exact single-axis rotation: the three-shear plan, then the
+                    # general resampler (which has no Fourier kernel).
+                    w = shear_resample(
+                        sources_batch[j], matrices_batch[j], vol_shape, config.final_interp
                     )
+                    if w is None:
+                        w = resample_affine_fast(
+                            sources_batch[j],
+                            matrices_batch[j],
+                            homo_coords,
+                            poly_final,
+                            vol_shape,
+                            zero_outside=True,
+                        )
+                    aligned_batch[j] = w
         elif config.use_shear:
             # CPU/MPS shear path (no Triton): per-volume gather shears.
             outs = []
@@ -1366,7 +1485,7 @@ def resample_timeseries(
                         sources_batch[j],
                         matrices_batch[j],
                         homo_coords,
-                        config.final_interp,
+                        poly_final,
                         vol_shape,
                         zero_outside=True,
                     )
@@ -1374,7 +1493,7 @@ def resample_timeseries(
             aligned_batch = torch.stack(outs)
         else:
             aligned_batch = apply_affine_interp_batched(
-                sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
+                sources_batch, matrices_batch, poly_final, vol_shape, zero_outside=True
             )
 
         for i, t in enumerate(resample_indices):
@@ -1427,6 +1546,7 @@ def moco(
     nt = timeseries.shape[0]
     nz, ny, nx = timeseries.shape[1:]
     vol_shape = (nz, ny, nx)
+    config = _resolve_fourier(config, device)
 
     if config.verb >= 1:
         print(f"ffs_moco: {nt} volumes, {vol_shape}, device={device}, cost={config.cost}")
@@ -1456,7 +1576,7 @@ def moco(
     weight = weight.to(device=device, dtype=dtype)
 
     # Pre-blur if requested
-    base_est = _blur_volume(base, config.blur_fwhm) if config.blur_fwhm > 0 else base
+    base_est = _estimation_view(base, config)
 
     # Estimation-side shear. AFNI never interpolates in 3D to register: mri_3dalign.c
     # drives THD_rota3D, four stride-1 1D shears, so heptic costs 4x8=32 taps/voxel
@@ -1474,7 +1594,9 @@ def moco(
     if config.cost == "quad":
         p2m_piv, p2m_piv_b = params_to_matrix, params_to_matrix_batched
     else:
-        p2m_piv, p2m_piv_b = centered_rigid_p2m(vol_shape)
+        _aff = header_info["affine"] if header_info else None
+        _vs = None if _aff is None else tuple(float(v) for v in _get_voxel_sizes(_aff))
+        p2m_piv, p2m_piv_b = centered_rigid_p2m(vol_shape, _vs)
     # 3dvolreg's -delta 0.7 for both steps; its -twopass coarse pass doubles it.
     deriv_kw = {"p2m_batched_fn": p2m_piv_b, "trans_delta": 0.7, "rot_delfac": 0.7}
     deriv_kw_coarse = {**deriv_kw, "trans_delta": 1.4, "rot_delfac": 1.4}
@@ -1721,8 +1843,17 @@ def moco(
     if batched_eligible:
         # Batched estimation sizes its chunks with the resample model
         # (_run_batched_estimation), so that is the prediction to hold it to.
-        _reg_chunk = max(1, compute_moco_resample_batch_size(nz, ny, nx, nt, device, config.interp))
-        _reg_bytes = moco_resample_bytes(nz, ny, nx, _reg_chunk, config.interp)
+        _tp = config.twopass and config.cost == "wls"
+        _sm = _estimation_smoothed(config)
+        _reg_chunk = max(
+            1,
+            compute_moco_resample_batch_size(
+                nz, ny, nx, nt, device, config.interp, twopass=_tp, smoothed=_sm
+            ),
+        )
+        _reg_bytes = moco_resample_bytes(
+            nz, ny, nx, _reg_chunk, config.interp, twopass=_tp, smoothed=_sm
+        )
     else:
         _reg_chunk = 1
         _reg_bytes = nz * ny * nx * 4 * 10  # base + source + Jacobian intermediates (rough)
@@ -1788,7 +1919,7 @@ def moco(
 
         # Load source volume to GPU
         source = timeseries[t].to(device=device, dtype=dtype)
-        source_est = _blur_volume(source, config.blur_fwhm) if config.blur_fwhm > 0 else source
+        source_est = _estimation_view(source, config)
 
         # Initial parameters
         if config.chain_init and t > 0:
@@ -2175,7 +2306,7 @@ def _motion_correct_series(
         yd = s[1].reshape(nz, ny, nx) - jj
         zd = s[2].reshape(nz, ny, nx) - kk
         frame = timeseries[f].to(device=device, dtype=dtype)
-        aligned[f] = warp_image(frame, xd, yd, zd, mode=interp).cpu()
+        aligned[f] = warp_image(frame, xd, yd, zd, mode=split_fourier_mode(interp)[1]).cpu()
     return aligned
 
 

@@ -25,6 +25,7 @@ import time
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device, prefer_cpu_row_convolution
 
 from . import interp as _interp
@@ -38,6 +39,85 @@ _FLOOR_KERNELS = {
     "quintic": (_quintic_kernel, 3),
     "heptic": (_heptic_kernel, 4),
 }
+
+
+# Shear modes that move rows by a DFT phase ramp instead of a polynomial kernel.
+# EPI is reconstructed by a DFT in-plane, so every image row is a periodic
+# trigonometric polynomial and a phase ramp is its exact shift. A polynomial
+# kernel instead smooths by an amount that varies with the fractional shift,
+# which pulls the GN fit toward half-voxel positions: ~1.5% of a voxel at 1/4
+# and 3/4, small motions read ~8% large, on real data as on synthetic truth.
+# "fourier" keeps the polynomial along the slice axis (k), which a 2D
+# acquisition samples by slice profile, not by DFT (a phase ramp there tripled
+# the z error); "fourier3d" shifts k by FFT too, for 3D slab EPI.
+FOURIER_AXES = {"fourier": (0, 1), "fourier3d": (0, 1, 2)}
+FOURIER_POLY = "heptic"
+
+
+def split_fourier_mode(mode: str) -> tuple[tuple[int, ...], str]:
+    """(shear axes moved by FFT, polynomial mode for the rest) for ``mode``."""
+    axes = FOURIER_AXES.get(mode)
+    return (axes, FOURIER_POLY) if axes is not None else ((), mode)
+
+
+def fft_shift_rows(vol: Tensor, dim: int, af: Tensor) -> Tensor:
+    """``out[..,p,..] = vol[..,p-af,..]`` by a DFT phase ramp along ``dim``.
+
+    Periodic and unpadded on purpose: a DFT-reconstructed row is periodic, and
+    AFNI's zero-padded -Fourier breaks that at a slab's ends (its z bias on a
+    thin slab). ``af`` has size 1 along ``dim`` and broadcasts over the rest.
+    """
+    n = vol.shape[dim]
+    spec = torch.fft.rfft(vol, dim=dim)
+    k = torch.fft.rfftfreq(n, device=vol.device, dtype=vol.dtype)
+    shape = [1] * vol.dim()
+    shape[dim] = k.numel()
+    spec *= torch.exp((af * k.reshape(shape)) * (-2j * math.pi))
+    return torch.fft.irfft(spec, n=n, dim=dim)
+
+
+def fft_shear_rows_batched(
+    vol: Tensor, out: Tensor, lanes: Tensor, fr_axis: int, a: Tensor, b: Tensor, s: Tensor
+) -> None:
+    """:func:`_apply_one_shear` along ``fr_axis`` by FFT, for volumes ``lanes``.
+
+    Reads ``vol`` (B, nz, ny, nx), writes those lanes of ``out`` in place;
+    ``a``, ``b``, ``s`` are (B,). A lane whose shear is below AFNI's 1e-3 voxel
+    floor is copied through, as in the single-volume path. The shift is linear
+    in the two driving coordinates, so its phase ramp is applied as three small
+    broadcast factors: a full-size complex ramp per volume cost the VRAM that
+    pushed a 160x160x114 batch into an allocator OOM.
+    """
+    _, nz, ny, nx = vol.shape
+    sizes = {0: nx, 1: ny, 2: nz}
+    centers = {k: (v - 1) / 2.0 for k, v in sizes.items()}
+    tdim, (p1fr, p1dim), (p2fr, p2dim) = _AXIS_INFO[fr_axis]
+    st = a[lanes].abs() * centers[p1fr] + b[lanes].abs() * centers[p2fr] + s[lanes].abs()
+    move = st >= 1.0e-3
+    still = lanes[~move]
+    if still.numel():
+        out[still] = vol[still]
+    rows = lanes[move]
+    if rows.numel() == 0:
+        return
+    device, dtype = vol.device, vol.dtype
+    dim = tdim + 1
+    k_shape = [1, 1, 1, 1]
+    k_shape[dim] = sizes[fr_axis] // 2 + 1
+    k = torch.fft.rfftfreq(sizes[fr_axis], device=device, dtype=dtype).reshape(k_shape)
+    shp1 = [1, 1, 1, 1]
+    shp1[p1dim + 1] = sizes[p1fr]
+    shp2 = [1, 1, 1, 1]
+    shp2[p2dim + 1] = sizes[p2fr]
+    c1 = (torch.arange(sizes[p1fr], device=device, dtype=dtype) - centers[p1fr]).reshape(shp1)
+    c2 = (torch.arange(sizes[p2fr], device=device, dtype=dtype) - centers[p2fr]).reshape(shp2)
+    col = (-1, 1, 1, 1)
+    w = -2j * math.pi
+    spec = torch.fft.rfft(vol[rows], dim=dim)
+    spec *= torch.exp((a[rows].to(dtype).reshape(col) * k * c1) * w)
+    spec *= torch.exp((b[rows].to(dtype).reshape(col) * k * c2) * w)
+    spec *= torch.exp((s[rows].to(dtype).reshape(col) * k) * w)
+    out[rows] = torch.fft.irfft(spec, n=sizes[fr_axis], dim=dim)
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +435,12 @@ def _permute_back(ax: Tensor, scl: Tensor, sft: Tensor, pi: list[int]):
 _PERMS = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
 
 
-def _shear_best(q: Tensor, d: Tensor):
+def _shear_best(q: Tensor, d: Tensor, common: bool = False):
     """6-way axis-permutation search; returns the min-shear-norm plan per lane.
 
+    ``common``: one permutation for every lane -- the valid-everywhere one with
+    the smallest worst-lane shear -- so each of the four steps runs along a
+    single axis for the whole batch (per-lane choice when none is valid for all).
     Returns (ax (B,4), scl (B,4,3), sft (B,4), valid (B,)).
     """
     B = q.shape[0]
@@ -388,6 +471,24 @@ def _shear_best(q: Tensor, d: Tensor):
         norms.append(_norm_3shear(ax, scl, valid))
 
     norms = torch.stack(norms, dim=1)  # (B,6)
+    if common:
+        # Lanes no permutation can factor (identity, exact single-axis) take
+        # their own route downstream, so they do not get a vote.
+        valid_k = norms < _BIG_NORM  # (B,6)
+        voters = valid_k.any(dim=1)
+        ok = (valid_k | ~voters[:, None]).all(dim=0)  # (6,)
+        if bool(ok.any()) and bool(voters.any()):
+            big = torch.full_like(norms[0], _BIG_NORM)
+            worst = torch.where(ok, torch.where(voters[:, None], norms, 0.0).max(dim=0).values, big)
+            k = int(worst.argmin())
+            ax_k, scl_k, sft_k, _ = plans[k]
+            # Valid is not well conditioned: near a lane's degenerate axis the
+            # factorization returns large cancelling shears, whose zero-filled
+            # slice-axis step lost content and sent GN 7 mm astray on a sweep of
+            # single-axis rotations. Such lanes go back to the per-lane route.
+            own_best = norms.min(dim=1).values
+            fine = norms[:, k] <= 2.0 * own_best + 0.01
+            return ax_k, scl_k, sft_k, voters & fine
     best = norms.argmin(dim=1)
     any_valid = norms.min(dim=1).values < _BIG_NORM
     ar = torch.arange(B, device=device)
@@ -435,7 +536,7 @@ def _reconstruct_pull(
     return Lt, bt
 
 
-def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
+def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int], common: bool = False):
     """Decompose a voxel-index pull matrix into a 4-shear plan (shear_best).
 
     ``matrix`` (4,4) or (B,4,4) maps output index (i,j,k) to source sample
@@ -465,11 +566,13 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], device=device, dtype=dtype)
 
     # Re-express the pull about the centre, then map to the centred forward
-    # map the shear apply realises: q = A^T, d = -A^T (A c + t - c).
+    # map the shear apply realises: q = A^-1, d = -A^-1 (A c + t - c). A true
+    # inverse, not A^T: a rotation in mm seen through anisotropic voxels is
+    # D^-1 R D, whose inverse is D^-1 R^T D. The transpose left those plans off
+    # by ~4e-3 in the linear part and 0.2 voxel in the shift, inside the guard.
     d_c = (A @ c) + t - c
-    AT = A.transpose(-1, -2)
-    q = AT
-    d = -(AT @ d_c.unsqueeze(-1)).squeeze(-1)
+    q = plinalg.inv(A)
+    d = -(q @ d_c.unsqueeze(-1)).squeeze(-1)
 
     # near-identity special case (shear_best): trivial shears, shifts only.
     trace = q[:, 0, 0] + q[:, 1, 1] + q[:, 2, 2]
@@ -483,17 +586,31 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     )
     near_id = (trace >= 2.99999) & (esum / trace.clamp(min=1e-12) < 1.0e-6)
 
-    ax, scl, sft, any_valid = _shear_best(q, d)
+    ax, scl, sft, any_valid = _shear_best(q, d, common=common)
+    shared = common and bool((ax == ax[:1]).all())
 
     # overwrite near-identity lanes with a trivial plan (shifts d only)
     if bool(near_id.any()):
-        triv_ax = torch.tensor([0, 1, 2, 0], device=device).expand(B, 4)
-        triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
-        triv_scl[:, 0, 0] = 1.0
-        triv_scl[:, 1, 1] = 1.0
-        triv_scl[:, 2, 2] = 1.0
-        triv_scl[:, 3, 0] = 1.0
-        triv_sft = torch.stack([torch.zeros_like(d[:, 0]), d[:, 1], d[:, 2], d[:, 0]], dim=-1)
+        if shared:
+            # Same axis order as the batch: zero shears, each axis's shift on its
+            # last step (the order is a,b,c,a, so the first step carries none).
+            order = ax[0].tolist()
+            triv_ax = ax[:1].expand(B, 4)
+            triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
+            cols = []
+            for st, a_st in enumerate(order):
+                triv_scl[:, st, a_st] = 1.0
+                last = a_st not in order[st + 1 :]
+                cols.append(d[:, a_st] if last else torch.zeros_like(d[:, 0]))
+            triv_sft = torch.stack(cols, dim=-1)
+        else:
+            triv_ax = torch.tensor([0, 1, 2, 0], device=device).expand(B, 4)
+            triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
+            triv_scl[:, 0, 0] = 1.0
+            triv_scl[:, 1, 1] = 1.0
+            triv_scl[:, 2, 2] = 1.0
+            triv_scl[:, 3, 0] = 1.0
+            triv_sft = torch.stack([torch.zeros_like(d[:, 0]), d[:, 1], d[:, 2], d[:, 0]], dim=-1)
         m = near_id
         ax = torch.where(m[:, None], triv_ax, ax)
         scl = torch.where(m[:, None, None], triv_scl, scl)
@@ -503,11 +620,14 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     # Safety net: the plan must reproduce the requested pull. In float64 this
     # rejects only the genuinely degenerate exact-single-axis rotation (where the
     # factorization is NaN regardless of precision); those lanes fall back to a
-    # general resample. The linear-part error is scale-free; honest motion is
-    # ~1e-11 here, so the 1e-2 cutoff has enormous margin.
-    Lt, _bt = _reconstruct_pull(ax, scl, sft, shape)
+    # general resample. Honest plans reproduce the pull to ~1e-11; the loosest
+    # legitimate one is the near-identity shortcut (~3e-6 linear, ~5e-5 voxel
+    # shift). The shift is checked too: a 1e-2 linear-only guard let plans
+    # through that were 0.2 voxel off (transpose taken for the inverse).
+    Lt, bt = _reconstruct_pull(ax, scl, sft, shape)
     recon_err = (Lt - A).abs().amax(dim=(1, 2))
-    any_valid = any_valid & (recon_err <= 1.0e-2)
+    shift_err = (bt - t).abs().amax(dim=1)
+    any_valid = any_valid & (recon_err <= 1.0e-5) & (shift_err <= 1.0e-3)
 
     # Plan returns to the caller's device (CPU→original when MPS).
     return (
@@ -735,8 +855,24 @@ def _apply_one_shear(
     shp1[p1dim] = sizes[p1fr]
     shp2 = [1, 1, 1]
     shp2[p2dim] = sizes[p2fr]
+    fft_axes, poly = split_fourier_mode(mode)
+    if fr_axis in fft_axes:
+        # The ramp exp(-2 pi i k (a c1 + b c2 + s)) as three small broadcast
+        # factors: a full-size complex exp was the costliest op of a CPU moco run.
+        n = sizes[fr_axis]
+        spec = torch.fft.rfft(vol, dim=tdim)
+        k_shape = [1, 1, 1]
+        k_shape[tdim] = n // 2 + 1
+        k = torch.fft.rfftfreq(n, device=device, dtype=dtype).reshape(k_shape)
+        w = -2j * math.pi
+        for coef, crd in ((a, coord1.reshape(shp1)), (b, coord2.reshape(shp2))):
+            if coef != 0.0:
+                spec *= torch.exp((coef * k * crd) * w)
+        if s != 0.0:
+            spec *= torch.exp((s * k) * w)
+        return torch.fft.irfft(spec, n=n, dim=tdim)
     af = a * coord1.reshape(shp1) + b * coord2.reshape(shp2) + s
-    return (interp_fn or _interp_1d_along)(vol, tdim, af, mode)
+    return (interp_fn or _interp_1d_along)(vol, tdim, af, poly)
 
 
 # unpack MCW_3shear (ax, scl) -> per-shear (a, b) (matches fr_gpu_unpack)
@@ -774,11 +910,16 @@ def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
         off = A[k, u].abs() + A[k, v].abs() + A[u, k].abs() + A[v, k].abs()
         if off > 1e-12 or abs(float(A[k, k]) - 1.0) > 1e-12:
             continue
-        cos_t, sin_t = float(A[u, u]), float(A[v, u])
-        if abs(float(A[v, v]) - cos_t) > 1e-9 or abs(float(A[u, v]) + sin_t) > 1e-9:
-            return None  # not a proper rotation in the (u, v) plane
-        theta = math.atan2(sin_t, cos_t)
-        alpha, beta = -math.tan(theta / 2.0), math.sin(theta)
+        a_uu, a_uv, a_vu, a_vv = (float(A[u, u]), float(A[u, v]), float(A[v, u]), float(A[v, v]))
+        # Any unit-determinant plane matrix is Su(alpha) Sv(beta) Su(gamma) with
+        # beta = a_vu, alpha = (a_uu - 1)/a_vu, gamma = (a_vv - 1)/a_vu. For a
+        # rotation that is Paeth's -tan(t/2), sin t, -tan(t/2); for a rotation
+        # in mm seen through anisotropic voxels (D^-1 R D) it is the same three
+        # shears with unequal outer coefficients.
+        # 1e-5: a float32 rotation's determinant is only good to ~1e-7.
+        if abs(a_uu * a_vv - a_uv * a_vu - 1.0) > 1e-5 or abs(a_vu) < 1e-12:
+            return None
+        alpha, beta, gamma = (a_uu - 1.0) / a_vu, a_vu, (a_vv - 1.0) / a_vu
         d = A @ c + t - c  # out(p) = src(c + A (p - c) + d), p centred
 
         def step(axis: int, other: int, coef: float, off: float):
@@ -790,7 +931,7 @@ def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
         # src(S1 (S2 (S3 p) + s2 e_v) + s1 e_u) = src(A p + S1 s2 e_v + s1 e_u)
         s2 = float(d[v])
         s1 = float(d[u]) - alpha * s2
-        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, alpha, 0.0)]
+        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, gamma, 0.0)]
         if abs(float(d[k])) > 0.0:
             steps.insert(0, (k, 0.0, 0.0, -float(d[k])))
         return steps

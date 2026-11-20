@@ -1204,7 +1204,28 @@ def bytes_per_row_slicetime(n_timepoints: int) -> int:
 _MOCO_RESAMPLE_NTAPS = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
 
 
-def moco_resample_bytes(nz: int, ny: int, nx: int, batch: int, interp: str = "wsinc5") -> int:
+def _moco_per_volume(interp: str, twopass: bool, smoothed: bool = False) -> int:
+    """Volume-sized buffers per batch lane, measured with FFS_DEBUG_VRAM on a
+    160x160x114 run: heptic peaks at 4.8, Fourier (shear spectra plus the slice
+    low-pass copies) at 10.6, and -twopass holds ~3 more (the coarse-blurred
+    sources and their blur temporaries). At 5/9 with no twopass term, heptic
+    -twopass ran 1.47x over and ran out of memory on a 130x130x85x391 run.
+    ``smoothed`` (an estimation -blur or slice low-pass beyond what the Fourier
+    figure already holds) keeps a smoothed copy plus its convolution temporaries:
+    without it heptic -blur 1.5 -slice_lowpass 1 ran 1.10x over."""
+    base = 11 if interp.startswith("fourier") else 5
+    return base + (3 if twopass else 0) + (2 if smoothed else 0)
+
+
+def moco_resample_bytes(
+    nz: int,
+    ny: int,
+    nx: int,
+    batch: int,
+    interp: str = "wsinc5",
+    twopass: bool = False,
+    smoothed: bool = False,
+) -> int:
     """GPU bytes for one Pass-2 resampling batch of ``batch`` volumes.
 
     The one formula behind both :func:`compute_moco_resample_batch_size` and the
@@ -1214,7 +1235,7 @@ def moco_resample_bytes(nz: int, ny: int, nx: int, batch: int, interp: str = "ws
     """
     ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
     vol_bytes = nz * ny * nx * 4  # float32
-    return (5 * batch + 6 * ntaps) * vol_bytes
+    return (_moco_per_volume(interp, twopass, smoothed) * batch + 6 * ntaps) * vol_bytes
 
 
 def compute_moco_resample_batch_size(
@@ -1224,6 +1245,8 @@ def compute_moco_resample_batch_size(
     nt: int,
     device: torch.device,
     interp: str = "wsinc5",
+    twopass: bool = False,
+    smoothed: bool = False,
 ) -> int:
     """Compute batch size for Pass 2 motion-correction resampling.
 
@@ -1260,7 +1283,7 @@ def compute_moco_resample_batch_size(
     ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
 
     vol_bytes = nz * ny * nx * 4  # float32
-    per_vol_bytes = 5 * vol_bytes
+    per_vol_bytes = _moco_per_volume(interp, twopass, smoothed) * vol_bytes
     kernel_overhead_bytes = 6 * ntaps * vol_bytes
 
     available = get_available_memory(device)
