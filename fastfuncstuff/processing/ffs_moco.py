@@ -614,7 +614,7 @@ def gauss_newton_rigid(
         # Convergence check
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
         rot_converged = (dp[3:].abs() < config.dph_thresh).all()
-        if trans_converged and rot_converged:
+        if it >= 1 and trans_converged and rot_converged:
             return params, it + 1
 
     return params, config.max_iter
@@ -652,7 +652,7 @@ def gauss_newton_rigid_masked(
 
         trans_converged = (dp[:3].abs() < config.dxy_thresh).all()
         rot_converged = (dp[3:].abs() < config.dph_thresh).all()
-        if trans_converged and rot_converged:
+        if it >= 1 and trans_converged and rot_converged:
             return params, it + 1
 
     return params, config.max_iter
@@ -819,6 +819,7 @@ def batched_gn_estimate(
 
         if not fixed_iter:
             conv = (dp[:, :3].abs() < dxy_thresh).all(1) & (dp[:, 3:].abs() < dph_thresh).all(1)
+            conv = conv & (it >= 1)
             newly = active & conv
             n_iters = torch.where(newly, torch.full_like(n_iters, it + 1), n_iters)
             active = active & ~conv
