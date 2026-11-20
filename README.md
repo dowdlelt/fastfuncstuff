@@ -4,20 +4,12 @@ A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-f
 CPU paths also receive performance work and can be faster for smaller linear-algebra workloads.
 CUDA is preferred where available; see the Apple Silicon guidance below for CPU versus MPS.
 
-## Why this exists
+## Validation
 
-I have a slow CPU but I was able to get my hands on a good GPU. 
-The tools I like to use, namely AFNI, are great, but they are really built to take advantage of server CPU setups.
-This project started as an experiment - how well can current models port good code to a pytorch like set up? 
-It has since evolved dramatically.
-
-
-Python chosen not because of speed, of course, but because I can at least review the code for sanity.
-It also makes installion much easier - sure, pure CUDA/C++/Rust would be faster but what a nightmare...
-These are offered as-is, no guarantees.
-I've tested the CLI tools below extensively on real data (my own and some from openneuro), and there is also an (in-progress) CLI tool to benchmark (`ffs_benchmark`) that compares outputs and timing against reference implementations on public datasets.
-
-The current validation/benchmark data is in `notebooks/ffs_benchmark_showcase.ipynb` - they you can see how well ffs is able to match the reference implementations. 
+Run `ffs_benchmark -help` to see the available reference comparisons. Use
+`ffs_benchmark -download` to fetch the OpenNeuro datasets over anonymous AWS S3.
+See the [benchmark prerequisites](INSTALL.md#requirements-and-environment), the
+[pRF validation](docs/prf_validation.md), and the [physio validation](docs/physio.md).
 
 ## Install
 
