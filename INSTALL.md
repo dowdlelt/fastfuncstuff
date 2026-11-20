@@ -104,6 +104,8 @@ checks its input files and every `ffs_*` / `mri_synthstrip` tool it will call be
 
 **Installed with pip, nothing to do:** `warpkit` (MEDIC, with ROMEO built in), `rapidgzip`,
 `numba`, `connected-components-3d`.
+On native Windows pip skips `warpkit` (it has no Windows wheel and needs MSVC to build), so
+`ffs_medic` and phase unwrapping need WSL2 there; everything else installs normally.
 
 **External software.** 
 We expect to find FreeSurfer, AFNI, and SPM (for TPMs only). All of the FreeSurfer, SUMA and AFNI rows below are conditional on the option named in the first column. 
