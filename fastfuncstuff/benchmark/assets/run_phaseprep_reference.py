@@ -1,19 +1,16 @@
 """Run phaseprep PhaseFitOdr directly on the already-MC'd, already-unwrapped data.
 
-Skips the BIDS/nipype workflow and the heavy preprocessing wrapper — calls into
-phaseprep's actual ODR math per voxel. Output naming mirrors phaseprep so its
-R²/slope maps can be compared voxelwise against ffs_phasereg outputs.
-
-Run in the py37_phaseprep env:
-    conda run -n py37_phaseprep python run_phaseprep_reference.py
+Reimplements the standalone ODR fit with SciPy and writes maps and time
+series using the phaseprep output labels. Run from the benchmark processing
+directory with its prepared magnitude, phase, and optional mask.
 """
 
-import os
-import sys
-import time
 import multiprocessing as mp
-import numpy as np
+import os
+import time
+
 import nibabel as nb
+import numpy as np
 from scipy import odr
 from tqdm import tqdm
 
@@ -73,8 +70,8 @@ def multiplelinear(beta, x):
 linear_model = odr.Model(multiplelinear)
 
 # ── allocate outputs ────────────────────────────────────────────────────────
-beta_A = np.zeros(nv)  # phase coefficient
-beta_B = np.zeros(nv)  # intercept
+beta_a = np.zeros(nv)  # phase coefficient
+beta_b = np.zeros(nv)  # intercept
 r2 = np.zeros(nv)
 stdm_arr = np.zeros(nv)
 stdp_arr = np.zeros(nv)
@@ -156,8 +153,8 @@ if __name__ == "__main__":
             if code == 0:
                 r2_v, A, B, stdm, stdp, sim_ts, filt_ts = payload
                 r2[idx] = r2_v
-                beta_A[idx] = A
-                beta_B[idx] = B
+                beta_a[idx] = A
+                beta_b[idx] = B
                 stdm_arr[idx] = stdm
                 stdp_arr[idx] = stdp
                 sim[idx] = sim_ts
@@ -209,8 +206,8 @@ def save4d(arr, suffix):
 
 if __name__ == "__main__":
     save3d(r2, "r2")
-    save3d(beta_A, "slope")  # the A in M = A·φ + B
-    save3d(beta_B, "intercept")
+    save3d(beta_a, "slope")  # the A in M = A·φ + B
+    save3d(beta_b, "intercept")
     save3d(stdm_arr, "stdm")
     save3d(stdp_arr, "stdp")
     save4d(sim, "macro")  # equivalent to ffs_phasereg's _macro

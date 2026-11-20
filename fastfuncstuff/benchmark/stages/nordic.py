@@ -11,7 +11,6 @@ Validation:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from pathlib import Path
 
@@ -56,18 +55,12 @@ def _nordic_dir(ctx: BenchmarkContext) -> Path:
 
 
 def _nordic_toolbox() -> str | None:
-    """Find NORDIC MATLAB toolbox path via env var or the reference .m script."""
+    """Find the NORDIC MATLAB toolbox configured by the caller."""
     env = os.environ.get("NORDIC_MATLAB_PATH")
-    if env and Path(env).exists():
-        return env
-    script = Path(__file__).resolve().parents[3] / "test_data" / "temp_run_nordic_defaults.m"
-    if script.exists():
-        for line in script.read_text().splitlines():
-            m = re.search(r"addpath\(genpath\('([^']+)'\)\)", line)
-            if m:
-                p = Path(m.group(1).replace("~", str(Path.home())))
-                if p.exists():
-                    return str(p)
+    if env:
+        toolbox = Path(env).expanduser().resolve()
+        if toolbox.is_dir():
+            return str(toolbox)
     return None
 
 
@@ -92,8 +85,7 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
             elif _nordic_toolbox() is None:
                 missing.append(
                     "NORDIC MATLAB toolbox not found — "
-                    "set NORDIC_MATLAB_PATH env var or ensure test_data/temp_run_nordic_defaults.m "
-                    "has a valid addpath line"
+                    "set NORDIC_MATLAB_PATH to the toolbox directory"
                 )
 
     return missing

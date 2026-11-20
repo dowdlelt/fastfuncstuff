@@ -69,7 +69,7 @@ def _proc_dir(ctx: BenchmarkContext) -> Path:
 
 
 def _ref_script_source() -> Path:
-    return Path(__file__).resolve().parents[3] / "test_data" / "phasereg_refs" / REF_SCRIPT
+    return Path(__file__).resolve().parents[1] / "assets" / REF_SCRIPT
 
 
 def _find_romeo() -> str:

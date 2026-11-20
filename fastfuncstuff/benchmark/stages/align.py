@@ -45,11 +45,7 @@ def _anat_input(ctx: BenchmarkContext) -> Path:
 
 
 def _afni_template() -> str:
-    """MNI template — prefers test_data/ copy, falls back to AFNI binary directory."""
-    # Bundled copy in test_data/ works on any machine (including Colab)
-    bundled = Path(__file__).resolve().parents[3] / "test_data" / "MNI152_2009_template.nii.gz"
-    if bundled.exists():
-        return str(bundled)
+    """Find the MNI template alongside the AFNI installation."""
     afni_bin = shutil.which("afni")
     if afni_bin:
         return str(Path(afni_bin).parent / "MNI152_2009_template.nii.gz")

@@ -3,20 +3,8 @@
 # This config is used ONLY for the phasereg stage. The phasereg benchmark
 # compares ffs_phasereg against phaseprep's PhaseFitOdr (scipy.odr reference).
 #
-# PREP WORK (run once, not timed):
-#   cd ~/.fastfuncstuff/test_data
-#   bash ~/Dropbox/Resources/code/fastfuncstuff/test_data/phase_stage_prep.sh
-#
-# That script:
-#   1. Downloads sub-03_task-checkerboard_acq-ge_run-01 bold+phase from AWS
-#   2. Runs 3dvolreg to get motion params from the magnitude
-#   3. Unwraps phase with ROMEO
-#   4. Applies motion correction to both mag and phase with ffs_nwarp (direct mode)
-#   5. Creates an automask from the magnitude
-#
-# The resulting method_direct_aligned.nii.gz (MC'd magnitude) and
-# method_direct_aligned_phase.nii.gz (MC'd, unwrapped phase in radians)
-# are the inputs that both the reference and FFS use.
+# Fetch with ffs_benchmark -download. The stage prepares and masks the
+# motion-corrected magnitude and unwrapped phase before timing either fit.
 
 dataset_id: ds003427
 subject: "03"
@@ -44,4 +32,3 @@ stage_params:
     task_removal: none
     phase_filter: none
     regression: deming
-    prep_script: phase_stage_prep.sh

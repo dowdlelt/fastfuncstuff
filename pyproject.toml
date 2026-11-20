@@ -203,7 +203,7 @@ exclude = ["tests*", "examples*"]
 "fastfuncstuff" = ["_native/*.c"]
 "fastfuncstuff.design" = ["*.tsv"]
 "fastfuncstuff.benchmark.configs" = ["*.yaml"]
-"fastfuncstuff.benchmark" = ["assets/*.m"]
+"fastfuncstuff.benchmark" = ["assets/*.m", "assets/*.py"]
 "fastfuncstuff.viewer.shaders" = ["*.qsb", "*.vert", "*.frag"]
 
 [tool.pytest.ini_options]
