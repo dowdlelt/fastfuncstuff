@@ -151,7 +151,9 @@ def _rigid_params(device, dtype) -> Tensor:
     return identity_params(device=device, dtype=dtype)
 
 
-def centered_rigid_p2m(shape: tuple[int, int, int]):
+def centered_rigid_p2m(
+    shape: tuple[int, int, int], voxel_sizes: tuple[float, float, float] | None = None
+):
     """``params_to_matrix`` (and batched) with the rotation pivot at the grid centre.
 
     ``params_to_matrix`` rotates about voxel index (0,0,0), a corner of the
@@ -164,21 +166,37 @@ def centered_rigid_p2m(shape: tuple[int, int, int]):
 
     Only the parametrization moves: the matrices returned are ordinary
     voxel-index pulls, so everything downstream of ``matrices_vox`` is unchanged.
+
+    ``voxel_sizes`` (dx, dy, dz) puts the rotation in millimetres: the pull is
+    ``D^-1 R D`` in index space. A head moves rigidly in mm, so a rotation built
+    in index space is, on anisotropic voxels, a rotation plus a stretch and shear
+    of about angle x anisotropy -- singular values 0.9989..1.0011 on a 0.9 deg
+    run at 2.5x2.5x2.75 mm, where 3dvolreg's are exactly 1. Translations stay in
+    voxels, which is exact. ``None`` keeps the index-space rotation.
     """
     nz, ny, nx = shape
     c64 = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    vs = None if voxel_sizes is None else torch.tensor(voxel_sizes, dtype=torch.float64)
+
+    def _rot(L: Tensor) -> Tensor:
+        if vs is None:
+            return L
+        v = vs.to(device=L.device, dtype=L.dtype)
+        return L * v / v[:, None]  # D^-1 L D
 
     def p2m(params: Tensor) -> Tensor:
         M = params_to_matrix(params)
         c = c64.to(device=M.device, dtype=M.dtype)
-        t = M[:3, 3] + c - M[:3, :3] @ c
-        return torch.cat([torch.cat([M[:3, :3], t[:, None]], dim=1), M[3:]], dim=0)
+        L = _rot(M[:3, :3])
+        t = M[:3, 3] + c - L @ c
+        return torch.cat([torch.cat([L, t[:, None]], dim=1), M[3:]], dim=0)
 
     def p2m_batched(params: Tensor) -> Tensor:
         M = params_to_matrix_batched(params)
         c = c64.to(device=M.device, dtype=M.dtype)
-        t = M[:, :3, 3] + c - M[:, :3, :3] @ c
-        return torch.cat([torch.cat([M[:, :3, :3], t[:, :, None]], dim=2), M[:, 3:]], dim=1)
+        L = _rot(M[:, :3, :3])
+        t = M[:, :3, 3] + c - L @ c
+        return torch.cat([torch.cat([L, t[:, :, None]], dim=2), M[:, 3:]], dim=1)
 
     return p2m, p2m_batched
 
@@ -1510,7 +1528,9 @@ def moco(
     if config.cost == "quad":
         p2m_piv, p2m_piv_b = params_to_matrix, params_to_matrix_batched
     else:
-        p2m_piv, p2m_piv_b = centered_rigid_p2m(vol_shape)
+        _aff = header_info["affine"] if header_info else None
+        _vs = None if _aff is None else tuple(float(v) for v in _get_voxel_sizes(_aff))
+        p2m_piv, p2m_piv_b = centered_rigid_p2m(vol_shape, _vs)
     # 3dvolreg's -delta 0.7 for both steps; its -twopass coarse pass doubles it.
     deriv_kw = {"p2m_batched_fn": p2m_piv_b, "trans_delta": 0.7, "rot_delfac": 0.7}
     deriv_kw_coarse = {**deriv_kw, "trans_delta": 1.4, "rot_delfac": 1.4}

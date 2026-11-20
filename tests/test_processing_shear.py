@@ -438,3 +438,24 @@ def test_batched_fourier_shear_matches_single_volume(mode):
     for i in range(nt):
         single = shear_resample(base, mats[i], (nz, ny, nx), mode)
         torch.testing.assert_close(batched[i].cpu(), single, rtol=1e-4, atol=1e-4)
+
+
+def test_plan_reproduces_mm_rotation_on_anisotropic_voxels():
+    """A rotation in mm on 2.1x2.1x2.45 voxels is D^-1 R D in index space: unit
+    determinant, not orthogonal. Taking A^T for A^-1 left such plans 4e-3 off in
+    the linear part and 0.2 voxel in the shift while passing the old guard."""
+    from scipy.spatial.transform import Rotation
+
+    from fastfuncstuff.processing.shear import _reconstruct_pull
+
+    shape = (48, 94, 94)
+    vs = torch.tensor([2.1, 2.1, 2.45], dtype=torch.float64)
+    R = torch.tensor(Rotation.from_euler("xyz", [0.86, 0.1, 0.05], degrees=True).as_matrix())
+    M = torch.eye(4, dtype=torch.float64)
+    M[:3, :3] = R * vs / vs[:, None]
+    M[:3, 3] = torch.tensor([0.3, -0.2, 0.1], dtype=torch.float64)
+    ax, scl, sft, valid = rigid_matrix_to_shears(M[None], shape)
+    assert bool(valid[0])
+    Lt, bt = _reconstruct_pull(ax.long(), scl.double(), sft.double(), shape)
+    torch.testing.assert_close(Lt[0], M[:3, :3], rtol=0, atol=1e-9)
+    torch.testing.assert_close(bt[0], M[:3, 3], rtol=0, atol=1e-9)

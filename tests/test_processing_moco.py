@@ -764,3 +764,36 @@ def test_slice_lowpass_is_estimation_only():
     ts = torch.tensor(np.stack([vol, vol, vol]))
     res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, interp="fourier"))
     np.testing.assert_allclose(res.aligned[0].numpy(), vol, atol=1e-4)
+
+
+def test_moco_rotates_in_mm_on_anisotropic_voxels():
+    """A head turns rigidly in millimetres. On 2x2x3 mm voxels an index-space
+    rotation is a rotation plus stretch/shear, so it cannot fit the motion:
+    the recovered matrix must be rigid in mm and match the true rotation."""
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    from scipy.spatial.transform import Rotation
+
+    vs = np.array([2.0, 2.0, 3.0])  # x, y, z
+    rng = np.random.default_rng(4)
+    vol_xyz = gaussian_filter(rng.normal(size=(48, 48, 32)), 2.0)
+    vol_xyz = (vol_xyz - vol_xyz.min()) / np.ptp(vol_xyz) + 0.5
+    n = np.array(vol_xyz.shape)
+    c = (n - 1) / 2
+    R = Rotation.from_euler("xyz", [3.0, -2.0, 1.5], degrees=True).as_matrix()
+    L = (R * vs) / vs[:, None]  # D^-1 R D: the true pull in index space
+    g = np.mgrid[0 : n[0], 0 : n[1], 0 : n[2]].reshape(3, -1)
+    moved = map_coordinates(vol_xyz, c[:, None] + L @ (g - c[:, None]), order=5, mode="nearest")
+    moved = moved.reshape(n)
+    ts = torch.tensor(np.stack([vol_xyz, moved]).transpose(0, 3, 2, 1).copy(), dtype=torch.float32)
+    affine = np.diag([*vs, 1.0])
+    cfg = MocoConfig(
+        base_index=0, device="cpu", verb=0, compile=False, dxy_thresh=1e-3, dph_thresh=1e-3
+    )
+    res = moco(ts, cfg, header_info={"affine": affine})
+    Mv = res.matrices_vox[1].double().numpy()[:3, :3]
+    Rmm = (Mv * (1 / vs)) / (1 / vs)[:, None]  # D Mv D^-1
+    np.testing.assert_allclose(np.linalg.svd(Rmm, compute_uv=False), 1.0, atol=1e-5)
+    # Measured: 0.01 deg with mm rotations; index-space rotations miss by ~0.2 deg.
+    # matrices_vox is the correcting pull, so it undoes the motion: Rmm ~ R^-1.
+    err = np.degrees(np.arccos(np.clip((np.trace(Rmm @ R) - 1) / 2, -1, 1)))
+    assert err < 0.05, err

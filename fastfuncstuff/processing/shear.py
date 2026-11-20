@@ -544,11 +544,13 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], device=device, dtype=dtype)
 
     # Re-express the pull about the centre, then map to the centred forward
-    # map the shear apply realises: q = A^T, d = -A^T (A c + t - c).
+    # map the shear apply realises: q = A^-1, d = -A^-1 (A c + t - c). A true
+    # inverse, not A^T: a rotation in mm seen through anisotropic voxels is
+    # D^-1 R D, whose inverse is D^-1 R^T D. The transpose left those plans off
+    # by ~4e-3 in the linear part and 0.2 voxel in the shift, inside the guard.
     d_c = (A @ c) + t - c
-    AT = A.transpose(-1, -2)
-    q = AT
-    d = -(AT @ d_c.unsqueeze(-1)).squeeze(-1)
+    q = torch.linalg.inv(A)
+    d = -(q @ d_c.unsqueeze(-1)).squeeze(-1)
 
     # near-identity special case (shear_best): trivial shears, shifts only.
     trace = q[:, 0, 0] + q[:, 1, 1] + q[:, 2, 2]
@@ -582,11 +584,14 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     # Safety net: the plan must reproduce the requested pull. In float64 this
     # rejects only the genuinely degenerate exact-single-axis rotation (where the
     # factorization is NaN regardless of precision); those lanes fall back to a
-    # general resample. The linear-part error is scale-free; honest motion is
-    # ~1e-11 here, so the 1e-2 cutoff has enormous margin.
-    Lt, _bt = _reconstruct_pull(ax, scl, sft, shape)
+    # general resample. Honest plans reproduce the pull to ~1e-11; the loosest
+    # legitimate one is the near-identity shortcut (~3e-6 linear, ~5e-5 voxel
+    # shift). The shift is checked too: a 1e-2 linear-only guard let plans
+    # through that were 0.2 voxel off (transpose taken for the inverse).
+    Lt, bt = _reconstruct_pull(ax, scl, sft, shape)
     recon_err = (Lt - A).abs().amax(dim=(1, 2))
-    any_valid = any_valid & (recon_err <= 1.0e-2)
+    shift_err = (bt - t).abs().amax(dim=1)
+    any_valid = any_valid & (recon_err <= 1.0e-5) & (shift_err <= 1.0e-3)
 
     # Plan returns to the caller's device (CPU→original when MPS).
     return (
@@ -856,11 +861,16 @@ def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
         off = A[k, u].abs() + A[k, v].abs() + A[u, k].abs() + A[v, k].abs()
         if off > 1e-12 or abs(float(A[k, k]) - 1.0) > 1e-12:
             continue
-        cos_t, sin_t = float(A[u, u]), float(A[v, u])
-        if abs(float(A[v, v]) - cos_t) > 1e-9 or abs(float(A[u, v]) + sin_t) > 1e-9:
-            return None  # not a proper rotation in the (u, v) plane
-        theta = math.atan2(sin_t, cos_t)
-        alpha, beta = -math.tan(theta / 2.0), math.sin(theta)
+        a_uu, a_uv, a_vu, a_vv = (float(A[u, u]), float(A[u, v]), float(A[v, u]), float(A[v, v]))
+        # Any unit-determinant plane matrix is Su(alpha) Sv(beta) Su(gamma) with
+        # beta = a_vu, alpha = (a_uu - 1)/a_vu, gamma = (a_vv - 1)/a_vu. For a
+        # rotation that is Paeth's -tan(t/2), sin t, -tan(t/2); for a rotation
+        # in mm seen through anisotropic voxels (D^-1 R D) it is the same three
+        # shears with unequal outer coefficients.
+        # 1e-5: a float32 rotation's determinant is only good to ~1e-7.
+        if abs(a_uu * a_vv - a_uv * a_vu - 1.0) > 1e-5 or abs(a_vu) < 1e-12:
+            return None
+        alpha, beta, gamma = (a_uu - 1.0) / a_vu, a_vu, (a_vv - 1.0) / a_vu
         d = A @ c + t - c  # out(p) = src(c + A (p - c) + d), p centred
 
         def step(axis: int, other: int, coef: float, off: float):
@@ -872,7 +882,7 @@ def _single_axis_plan(matrix: Tensor, shape: tuple[int, int, int]):
         # src(S1 (S2 (S3 p) + s2 e_v) + s1 e_u) = src(A p + S1 s2 e_v + s1 e_u)
         s2 = float(d[v])
         s1 = float(d[u]) - alpha * s2
-        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, alpha, 0.0)]
+        steps = [step(u, v, alpha, s1), step(v, u, beta, s2), step(u, v, gamma, 0.0)]
         if abs(float(d[k])) > 0.0:
             steps.insert(0, (k, 0.0, 0.0, -float(d[k])))
         return steps
