@@ -112,8 +112,8 @@ In `ffs_autoproc`, `-physio` runs it for every run and adds the nuisance to the 
 (`-glm_ortvec physio`, in the default set). `-physio_mode clean` switches to the `ricor`
 order.
 
-Requirements: 2-D slice-by-slice acquisition (single- or multi-echo). 3-D EPI has no
-excitation-rate samples. In `ffs_autoproc`, multi-echo runs pass every echo, with
+Requirements: 2-D slice-by-slice acquisition (single- or multi-echo), or 3D EPI with phase
+(beta, see *3D EPI (beta)*). In `ffs_autoproc`, multi-echo and 3D runs pass every echo, with
 `-physio_mode nuisance` only. Without phase, respiration is read from magnitude, which was
 unreliable on task runs and at long TR (*Limits*).
 
@@ -281,10 +281,67 @@ slice alignments (all aliases, both harmonics, every derangement) in one solve p
 excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0.4 s
 (was 3.6 s); both halves' covariances for the split-half check from one pass over the data.
 
+## 3D EPI (beta)
+
+3D EPI has no slice timing, but it is filled shot by shot along the partition (kz) axis, so
+each kz line is acquired at its own moment in the TR. A field change between shots puts a
+phase 2π·TE·Δf(t) on that line. ffs_physio transforms the complex image along the partition
+axis only and compares every line with the run's mean k-space. With two or more echoes the
+line's field is the TE slope of its phase (the intercept, phase that does not grow with TE,
+is dropped). Lines of one CAIPI cell (Rz rows, finished in S consecutive shots; Stirnberg &
+Stöcker 2020) share a time, and the cells step across the volume, so the run becomes a field
+trace at cells/TR: 5–24 Hz on the protocols tested, against one sample per TR.
+
+```sh
+ffs_physio -input e1.nii.gz e2.nii.gz e3.nii.gz -phase p1.nii.gz p2.nii.gz p3.nii.gz \
+    -prefix physio/run01
+```
+
+- Chosen when the sidecar says `MRAcquisitionType: 3D` (or `-acquisition 3d`). **Phase is
+  required.** Rz comes from `ParallelReductionFactorOutOfPlane` (or `-partition_accel`).
+- `-TR` must be the **volume** TR; some 3D sidecars store the per-shot TR, and anything under
+  0.3 s is refused.
+- The fill direction (ascending or descending in the file's partition index) is read from the
+  data: the order that makes the trace continuous across volume boundaries. A second opinion
+  (the order that stitches the sharper spectral line) is reported; when they disagree the
+  output warns. That happened on the two runs whose breathing sat at the volume Nyquist rate,
+  where breathing alone cannot tell the direction.
+- Breathing's cycle is removed before the heart is sought (its harmonics reach the cardiac
+  band in a field trace). **Cardiac counts as found** only if the strongest cardiac-band peak at
+  the true cell times beats all 99 derangements of the cell times, the search repeated for each
+  (the 2D slice-timing judge's logic). Untestable when the 1/TR lines and their breathing
+  sidebands cover the cardiac band (TR 3.5 s).
+- Regressors are evaluated at the acquisition time of the k-space centre cell (a 3D voxel's
+  contrast is set by the low partition lines): every slice gets the same columns in the
+  slibase, and `PREFIX.nuisance.1D` is written at that time unless `-tzero` is given.
+- `PREFIX.partition_shift.1D`: per volume and echo, the partition shift implied by the field
+  change across the volume's sweep (−TE·Δf, voxels). This is what ffs_moco `-me_3depi` measures
+  from the magnitudes, here from phase alone; locomoco's whole-brain flow matched it at
+  r 0.87 with the same amplitude (one run). A diagnostic, not a correction.
+
+**Tested on** 8 multi-echo 3D runs at 7 T (OHBMPILOT; TR 1.1–3.5 s, 1.25–2 mm, Rz 3–6), with
+no recordings. The checks available were same-session 2D runs (ffs_physio on multi-echo 2D)
+and internal consistency:
+
+| Run | TR | Breathing, 3D (2D) | Cardiac, 3D | Verdict (2D heart rate) |
+|---|---|---|---|---|
+| fov208 2·3×5z3 | 1.71 | 19.4 (19.6) | 76.4 | found (77) |
+| A02Db 1·4×3z1 | 1.54 | 19.5 | 73.7 | found (69–71) |
+| A01D 1·4×3z1 | 1.70 | 17.3 (16.8) | 50.6 | not found (~70) |
+| B20R1 2·2×6z3 | 1.72 | 19.9 | 72.8 | found (69–71) |
+| A02Dz 1·4×3z1 | 1.10 | 19.2 (19.2) | 80.7 | found (82.5) |
+| E01Rb 4·2×6z | 2.65 | 26.9 | – | not found |
+| E02Da run 1 4·2×6z3 | 3.50 | 13.6 | – | untestable |
+| E02Da run 2 4·2×6z3 | 3.50 | 16.3 | – | not found |
+
+The 2D runs are different runs of the same session, so rates can differ by a few per minute.
+Wiki: *Partition-encode field sampling in 3D EPI* (method, prior art, what failed).
+
 ## Limits
 
-- **3-D EPI**: not supported (no excitation-rate samples). Respiration might still be read
-  from phase at the volume rate; not built.
+- **3D EPI is beta**: no recordings yet; GRAPPA has already mixed acquired lines into the
+  filled ones, so per-cell timing is blurred; the coil combination is only approximately
+  linear; no cardiac at TR >= 2.65 s in the runs tested. See *3D EPI (beta)*.
 - **Multi-echo** is validated on one 3 T dataset (ds006926), where single echoes were already
   near the recordings; the gain on harder data (slabs, 7 T, high resolution) is untested.
 - **Cardiac where pulsation is weak.** On a thin prefrontal slab (ds001168, 0.8 mm, TR 4 s)

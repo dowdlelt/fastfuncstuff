@@ -40,7 +40,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "echo is another reading of the same excitation: the cardiac detector draws its\n"
             "vessel voxels from all echoes (on ds006926 it found every run any single echo\n"
             "did); respiration is read from the middle echo's phase, which a fit across\n"
-            "echoes did not beat."
+            "echoes did not beat.\n\n"
+            "3D EPI (BETA; sidecar MRAcquisitionType 3D, or -acquisition 3d): needs -phase.\n"
+            "Each partition cell (Rz kz lines, shot together) is one sample of the field:\n"
+            "the complex image is transformed along the partition axis and each line's\n"
+            "phase change read against the run mean (with 2+ echoes, its TE slope). That\n"
+            "trace gives breathing and, at short TR, the heartbeat; cardiac counts as found\n"
+            "only if it lines up under the true cell times better than under every shuffle\n"
+            "of them. Regressors are evaluated at the k-space centre's acquisition time.\n"
+            "Not yet checked against recordings (docs/physio.md, 3D EPI)."
         ),
     )
     parser.add_argument(
@@ -75,7 +83,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-TR",
         type=float,
         default=None,
-        help="Repetition time (s). Default: sidecar JSON, then header.",
+        help="Repetition time (s). Default: sidecar JSON, then header. 3D: the VOLUME TR "
+        "(some 3D sidecars store the per-shot TR; below 0.3 s it is refused).",
+    )
+    parser.add_argument(
+        "-acquisition",
+        choices=["auto", "2d", "3d"],
+        default="auto",
+        help="auto = the -input sidecar's MRAcquisitionType (2d when absent).",
+    )
+    parser.add_argument(
+        "-partition_accel",
+        type=int,
+        default=None,
+        metavar="RZ",
+        help="3D: partition lines acquired together (the CAIPI pattern's Rz). Default: the "
+        "sidecar's ParallelReductionFactorOutOfPlane, else 1.",
+    )
+    parser.add_argument(
+        "-echo_times",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="3D with 2+ echoes: echo times (ms), for each partition line's TE slope. "
+        "Default: the sidecars' EchoTime.",
     )
     parser.add_argument(
         "-drop_last",
@@ -305,11 +337,258 @@ def _write_qc(
     rec.write(args.verb)
 
 
+def _write_rates(base: str, diag: dict) -> tuple[np.ndarray, np.ndarray]:
+    """PREFIX.rates.tsv; returns the cardiac and respiratory rates (Hz)."""
+    ct, cf = diag["cardiac_rate_hz"]
+    rt, rf = diag["respiration_rate_hz"]
+    with open(base + ".rates.tsv", "w") as fh:
+        fh.write("band\ttime_s\trate_per_min\n")
+        for name, tt, ff in (("cardiac", ct, cf), ("respiration", rt, rf)):
+            for a, b in zip(tt, ff, strict=True):
+                fh.write(f"{name}\t{a:.2f}\t{b * 60:.2f}\n")
+    return cf, rf
+
+
+def _write_nuisance(args, base, summary, traces, sources, diag, nt, tr, tzero,
+                    cardiac_in_nuisance) -> None:  # fmt: skip
+    """PREFIX.nuisance.1D: the -nuisance_set at f*TR + tzero."""
+    from fastfuncstuff.processing import physio
+
+    times = np.arange(nt) * tr + tzero
+    if args.nuisance_set == "tapas":
+        model = physio.model_from_traces(traces, sources["cardiac"], sources["respiration"])
+        no_card = {} if cardiac_in_nuisance else {"card_order": 0, "inter_order": 0, "hrv": False}
+        Xv, vlabels = physio.standard_regressors(model, times, **no_card)
+    else:
+        Xv, vlabels = physio.volume_regressors(diag, times, cardiac=cardiac_in_nuisance)
+    with open(base + ".nuisance.1D", "w") as fh:
+        fh.write(f"# ffs_physio volume regressors at f*TR + {tzero:g} s\n")
+        fh.write('# ColumnLabels = "' + " ; ".join(vlabels) + '"\n')
+        np.savetxt(fh, Xv, fmt="%.6f")
+    summary["nuisance"] = {"file": base + ".nuisance.1D", "tzero": tzero,
+                           "set": args.nuisance_set, "columns": vlabels}  # fmt: skip
+    Path(base + ".json").write_text(json.dumps(summary, indent=2))
+
+
+def _write_clean(args, base, summary, parts, hdr, verb) -> None:
+    """-clean outputs: each echo's cleaned series (OUT, or OUT.echo-N) and its
+    _physio_removed variance map."""
+    import torch
+
+    from fastfuncstuff.cli_utils import entity_path
+    from fastfuncstuff.processing.io import save_image
+
+    outs = []
+    for e, (c_e, r_e) in enumerate(parts):
+        stem = str(args.clean) if len(parts) == 1 else entity_path(args.clean, echo=e + 1)
+        for ext in (".nii.gz", ".nii.zst", ".nii"):
+            if stem.endswith(ext):
+                rm_path = stem[: -len(ext)] + "_physio_removed" + ext
+                break
+        else:
+            rm_path = stem + "_physio_removed.nii.gz"
+        r_e = r_e if r_e.ndim == 3 else r_e[..., 0]
+        save_image(torch.from_numpy(np.ascontiguousarray(c_e.transpose(3, 2, 1, 0))), stem,
+                   header_info=hdr)  # fmt: skip
+        save_image(torch.from_numpy(np.ascontiguousarray(r_e.transpose(2, 1, 0))), rm_path,
+                   header_info=hdr)  # fmt: skip
+        outs.append({"output": stem, "removed_map": rm_path})
+        if verb >= 1:
+            print(f"  cleaned magnitude -> {stem} (variance-removed map {rm_path})")
+    summary["clean"] = outs[0] if len(parts) == 1 else outs
+    Path(base + ".json").write_text(json.dumps(summary, indent=2))
+
+
+def _sidecar(path: str) -> dict:
+    """The BIDS sidecar beside a NIfTI path, or {}."""
+    stem = str(path)
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    try:
+        return json.loads(Path(stem + ".json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _acquisition(args) -> str:
+    if args.acquisition != "auto":
+        return args.acquisition
+    kind = str(_sidecar(args.input[0]).get("MRAcquisitionType", "")).upper()
+    return "3d" if kind == "3D" else "2d"
+
+
+def _main_3d(args, device, t0: float) -> int:
+    """3D EPI (BETA): the field per partition cell from phase (processing/physio_3d)."""
+    from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
+    from fastfuncstuff.processing import physio, physio_3d
+
+    verb = args.verb
+    inputs = [str(p) for p in args.input]
+    ne = len(inputs)
+    if args.phase is None:
+        raise SystemExit("ffs_physio: 3D EPI needs -phase (the field is read from it)")
+    if len(args.phase) != ne:
+        raise SystemExit(f"ffs_physio: {len(args.phase)} -phase files for {ne} -input echoes")
+    side = _sidecar(inputs[0])
+    tr = args.TR or side.get("RepetitionTime") or get_tr_from_file(inputs[0])
+    if not tr or tr < 0.3:
+        raise SystemExit(
+            f"ffs_physio: TR {tr} s looks like the per-shot TR some 3D sidecars store; "
+            "pass the volume TR with -TR"
+        )
+    tr = float(tr)
+    if args.echo_times is not None:
+        tes_ms = [float(t) for t in args.echo_times]
+        if len(tes_ms) != ne or any(b <= a for a, b in zip(tes_ms, tes_ms[1:], strict=False)):
+            raise SystemExit(f"ffs_physio: -echo_times {tes_ms} must give {ne} increasing values")
+    elif ne > 1:
+        tes_ms = _echo_times(inputs)
+    else:
+        tes_ms = [float(side["EchoTime"]) * 1e3] if "EchoTime" in side else []
+    if ne > 1 and len(tes_ms) != ne:
+        raise SystemExit("ffs_physio: no EchoTime in the -input sidecars; pass -echo_times (ms)")
+    rz = int(args.partition_accel or side.get("ParallelReductionFactorOutOfPlane") or 1)
+    mag_img = load_nifti(inputs[0])
+    mags = [_read_series(mag_img)] + [_read_series(load_nifti(p)) for p in inputs[1:]]
+    phs = [_read_series(load_nifti(p), affine_invariant=True) for p in args.phase]
+    shape = mags[0].shape
+    if len(shape) != 4:
+        raise SystemExit("ffs_physio: -input must be 4-D")
+    for name, arr in [*zip(inputs, mags, strict=True), *zip(args.phase, phs, strict=True)]:
+        if arr.shape[:3] != shape[:3] or arr.shape[3] < shape[3]:
+            raise SystemExit(f"ffs_physio: {name} shape {arr.shape} does not match {shape}")
+    ndrop = (
+        args.drop_last
+        if args.drop_last is not None
+        else physio.trailing_noise_volumes(mags[0].mean(axis=(0, 1, 2)))
+    )
+    nt = shape[3] - ndrop
+    mags = [m[..., :nt] for m in mags]
+    phs = [p[..., :nt] for p in phs]
+    pt = physio_3d.partition_field_traces(
+        mags, phs, tr, rz, [t / 1e3 for t in tes_ms] or None, device=device,
+        split_axis=_split_axis(args),
+    )  # fmt: skip
+    del phs
+    if verb >= 1:
+        tes = f", TE {', '.join(f'{t:g}' for t in tes_ms)} ms" if tes_ms else ""
+        print(
+            f"ffs_physio (3D, BETA): {nt} volumes (dropped {ndrop} at the end), {shape[2]} "
+            f"partitions in {pt.times.shape[1]} cells of {rz} = {pt.cell_rate:.1f} Hz, {ne} "
+            f"echo(es){tes}; fill {pt.order} (boundary/within step {pt.boundary_ratio:.2f}); "
+            f"k-space centre at {pt.centre_offset:.2f} s into the TR"
+        )
+        if not pt.order_agrees:
+            print(
+                "  WARNING: the fill-order second opinion (spectral line) disagrees -- check "
+                "the breathing rate against the volume Nyquist rate"
+            )
+    traces = physio_3d.excitation_view(pt, shape[2])
+    card = physio_3d.cardiac(pt, tr)
+    traces.cardiac, traces.cardiac_phase = card.trace, card.phase
+    sources = {"cardiac": "weighted", "respiration": "phase"}
+    if not card.testable:
+        # no open cardiac band: the slibase keeps its layout from the plain tracker on
+        # the breathing-removed trace (k/TR avoided only); out of the nuisance by default
+        traces.magnitude, traces.cardiac_phase = card.trace, None
+        sources["cardiac"] = "magnitude"
+    cardiac_in_nuisance = card.found or args.card_unfound == "keep"
+    if verb >= 1:
+        if not card.testable:
+            print(
+                "  cardiac UNTESTABLE: the 1/TR lines and their breathing sidebands cover the band"
+            )
+        else:
+            print(
+                f"  cardiac {card.rate_per_min:.1f}/min: {'FOUND' if card.found else 'NOT FOUND'} "
+                f"(peak prominence {card.prominence:.1f} at the true cell times must beat all "
+                f"{card.n_shuffles} shuffles, best {card.shuffled_max:.1f})"
+            )
+    X, labels, diag = physio.slice_regressors(traces, sources["cardiac"], sources["respiration"])
+    prefix = Path(args.prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    base = str(prefix)
+    _write_slibase(Path(base + ".slibase.1D"), X, labels)
+    t_f, x_f = traces.series("phase")
+    _, x_c = traces.series("weighted")
+    np.savetxt(base + ".traces.tsv", np.column_stack([t_f, x_f, x_c]), delimiter="\t",
+               header="time_s\tfield_hz\tfield_minus_breathing_hz", comments="", fmt="%.6f")  # fmt: skip
+    cf, rf = _write_rates(base, diag)
+    # Field change across each volume's sweep, as the TE-scaled partition shift it implies
+    # (voxels, sign in the file's partition index): what ffs_moco -me_3depi measures from
+    # the magnitudes, here from phase alone.
+    shift = (
+        -np.outer(pt.sweep_change, np.asarray(tes_ms) / 1e3) if tes_ms else pt.sweep_change[:, None]
+    )
+    np.savetxt(base + ".partition_shift.1D", shift, fmt="%.5f",
+               header="partition shift per volume (voxels) per echo, -TE x field change across the sweep")  # fmt: skip
+    summary = {
+        "acquisition": "3d",
+        "beta": True,
+        "n_volumes": int(nt),
+        "dropped_last": int(ndrop),
+        "tr": tr,
+        "sources": sources,
+        "heart_rate_per_min_median": float(np.median(cf) * 60),
+        "breathing_rate_per_min_median": float(np.median(rf) * 60),
+        "columns_per_slice": 13,
+        "echoes": ne,
+        "echo_times_ms": tes_ms or None,
+        "layout": "slice-major (ffs_reml -slibase_sm, afni_proc -ricor_regs); every slice "
+        "evaluated at the k-space centre's acquisition time",
+        "partition": {
+            "rows_per_cell": rz,
+            "cells_per_volume": int(pt.times.shape[1]),
+            "cell_rate_hz": pt.cell_rate,
+            "fill_order": pt.order,
+            "fill_order_second_opinion_agrees": bool(pt.order_agrees),
+            "boundary_step_ratio": pt.boundary_ratio,
+            "kspace_centre_offset_s": pt.centre_offset,
+            "shift_file": base + ".partition_shift.1D",
+        },
+        "cardiac_3d": {
+            "found": bool(card.found),
+            "testable": bool(card.testable),
+            "rate_per_min": card.rate_per_min,
+            "prominence": card.prominence,
+            "shuffled_max": card.shuffled_max,
+            "rule": f"found = cardiac-band peak prominence of the breathing-removed cell trace "
+            f"at the true cell times beats all {card.n_shuffles} derangements of the cell times "
+            f"(search repeated for each)",
+            "in_nuisance": bool(cardiac_in_nuisance),
+        },
+    }
+    Path(base + ".json").write_text(json.dumps(summary, indent=2))
+    if not args.no_qc:
+        _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
+    _write_qc(args, mags[0], X, labels, traces, sources, diag, mag_img.affine, tr, device)
+    _write_nuisance(args, base, summary, traces, sources, diag, nt, tr,
+                    pt.centre_offset if args.tzero is None else args.tzero, cardiac_in_nuisance)  # fmt: skip
+    if args.clean is not None:
+        hdr = {"affine": mag_img.affine.copy(), "header": mag_img.header.copy()}
+        parts = [physio.regress_out(m, X, tr, device=device) for m in mags]
+        _write_clean(args, base, summary, parts, hdr, verb)
+    if verb >= 1:
+        print(
+            f"  heart rate {summary['heart_rate_per_min_median']:.1f}/min"
+            f"{'' if card.found else ' (NOT FOUND: left out of the nuisance)' if not cardiac_in_nuisance else ' (not found; kept)'}, "
+            f"breathing {summary['breathing_rate_per_min_median']:.1f}/min from the partition field trace"
+        )
+        print(f"  wrote {base}.slibase.1D + nuisance, traces, rates, partition_shift, json"
+              f"{'' if args.no_qc else ', qc.png'}  [{time.time() - t0:.1f}s]")  # fmt: skip
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     t0 = time.time()
     device = setup_device(args.device)
     verb = args.verb
+
+    if _acquisition(args) == "3d":
+        return _main_3d(args, device, t0)
 
     from fastfuncstuff.io.afni import load_nifti
     from fastfuncstuff.processing import physio
@@ -440,13 +719,7 @@ def main(argv: list[str] | None = None) -> int:
         cols["phase_rad"] = traces.series("phase")[1]
     np.savetxt(base + ".traces.tsv", np.column_stack(list(cols.values())), delimiter="\t",
                header="\t".join(cols), comments="", fmt="%.6f")  # fmt: skip
-    ct, cf = diag["cardiac_rate_hz"]
-    rt, rf = diag["respiration_rate_hz"]
-    with open(base + ".rates.tsv", "w") as fh:
-        fh.write("band\ttime_s\trate_per_min\n")
-        for name, tt, ff in (("cardiac", ct, cf), ("respiration", rt, rf)):
-            for a, b in zip(tt, ff, strict=True):
-                fh.write(f"{name}\t{a:.2f}\t{b * 60:.2f}\n")
+    cf, rf = _write_rates(base, diag)
     summary = {
         "n_volumes": int(nt),
         "dropped_last": int(ndrop),
@@ -522,32 +795,9 @@ def main(argv: list[str] | None = None) -> int:
     mag1 = mags if echo_axis is None else mags[0]
     _write_qc(args, mag1, X, labels, traces, sources, diag, mag_img.affine, tr, device, refined)
     if args.tzero is not None:
-        times = np.arange(nt) * tr + args.tzero
-        if args.nuisance_set == "tapas":
-            model = physio.model_from_traces(traces, sources["cardiac"], sources["respiration"])
-            no_card = (
-                {} if cardiac_in_nuisance else {"card_order": 0, "inter_order": 0, "hrv": False}
-            )
-            Xv, vlabels = physio.standard_regressors(model, times, **no_card)
-        else:
-            Xv, vlabels = physio.volume_regressors(diag, times, cardiac=cardiac_in_nuisance)
-        with open(base + ".nuisance.1D", "w") as fh:
-            fh.write(f"# ffs_physio volume regressors at f*TR + {args.tzero:g} s\n")
-            fh.write('# ColumnLabels = "' + " ; ".join(vlabels) + '"\n')
-            np.savetxt(fh, Xv, fmt="%.6f")
-        summary["nuisance"] = {
-            "file": base + ".nuisance.1D",
-            "tzero": args.tzero,
-            "set": args.nuisance_set,
-            "columns": vlabels,
-        }
-        Path(base + ".json").write_text(json.dumps(summary, indent=2))
+        _write_nuisance(args, base, summary, traces, sources, diag, nt, tr, args.tzero,
+                        cardiac_in_nuisance)  # fmt: skip
     if args.clean is not None:
-        import torch
-
-        from fastfuncstuff.cli_utils import entity_path
-        from fastfuncstuff.processing.io import save_image
-
         # every echo at once: the fit is per voxel, and an echo's voxels are voxels
         cleaned, removed = physio.regress_out(mag, X, tr, device=device)
         hdr = {"affine": mag_img.affine.copy(), "header": mag_img.header.copy()}
@@ -561,25 +811,7 @@ def main(argv: list[str] | None = None) -> int:
                     strict=True,
                 )
             )
-        outs = []
-        for e, (c_e, r_e) in enumerate(parts):
-            stem = str(args.clean) if ne == 1 else entity_path(args.clean, echo=e + 1)
-            for ext in (".nii.gz", ".nii.zst", ".nii"):
-                if stem.endswith(ext):
-                    rm_path = stem[: -len(ext)] + "_physio_removed" + ext
-                    break
-            else:
-                rm_path = stem + "_physio_removed.nii.gz"
-            r_e = r_e if r_e.ndim == 3 else r_e[..., 0]
-            save_image(torch.from_numpy(np.ascontiguousarray(c_e.transpose(3, 2, 1, 0))), stem,
-                       header_info=hdr)  # fmt: skip
-            save_image(torch.from_numpy(np.ascontiguousarray(r_e.transpose(2, 1, 0))), rm_path,
-                       header_info=hdr)  # fmt: skip
-            outs.append({"output": stem, "removed_map": rm_path})
-            if verb >= 1:
-                print(f"  cleaned magnitude -> {stem} (variance-removed map {rm_path})")
-        summary["clean"] = outs[0] if ne == 1 else outs
-        Path(base + ".json").write_text(json.dumps(summary, indent=2))
+        _write_clean(args, base, summary, parts, hdr, verb)
     if verb >= 1:
         print(
             f"  heart rate {summary['heart_rate_per_min_median']:.1f}/min from {sources['cardiac']}, "

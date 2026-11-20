@@ -741,6 +741,21 @@ def bytes_per_voxel_cardiac_refine(n_timepoints: int) -> int:
     return int(n_timepoints * (4 + 8 + 8) * 1.5)
 
 
+def bytes_per_volume_partition_fft(n_voxels: int) -> int:
+    """Per-volume peak of ``physio_3d``'s hybrid-space pass: float32 magnitude and phase,
+    the complex64 image, its FFT along the partition axis and the product with the
+    reference (8 bytes each); 1.25x for cuFFT workspace."""
+    return int(n_voxels * (4 + 4 + 8 + 8 + 8) * 1.25)
+
+
+def partition_fft_volume_chunk(n_voxels: int, n_volumes: int, device: torch.device) -> int:
+    """Volumes per chunk for :func:`bytes_per_volume_partition_fft` passes (the
+    reference k-space, 8 bytes per voxel, stays resident)."""
+    avail = get_available_memory(device, empty_cache=False) - 8 * n_voxels
+    n = avail // max(1, bytes_per_volume_partition_fft(n_voxels))
+    return int(max(1, min(n_volumes, n)))
+
+
 def spectral_voxel_chunk(n_voxels: int, n_timepoints: int, device: torch.device) -> int:
     """Voxels per chunk for :func:`bytes_per_voxel_spectral` passes."""
     avail = get_available_memory(device, empty_cache=False)
