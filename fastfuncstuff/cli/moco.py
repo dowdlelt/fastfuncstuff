@@ -361,13 +361,10 @@ def parse_args(
         type=float,
         default=0.0,
         help=(
-            "Estimation-only Gaussian FWHM, in VOXELS (default: 0). For motion "
-            "PARAMETERS: on complex-magnitude ground truth, -blur 1.5 with "
-            "-slice_lowpass 1 cut heptic's error from 0.024 to 0.004 mm. On real runs "
-            "the corrected data then kept ~3%% more motion-locked variance than the "
-            "default full-resolution fit, so it is off by default; use it when the "
-            "parameters themselves matter (FD, censoring, regressors). The output is "
-            "never blurred."
+            "EXPERIMENTAL. Estimation-only Gaussian FWHM, in voxels (default: 0). On "
+            "simulated truth it made the motion parameters more accurate; on real runs "
+            "it did not improve the corrected data (slightly more motion-locked "
+            "variance). See docs/moco.md. The output is never blurred."
         ),
     )
     method_group.add_argument(
@@ -376,11 +373,10 @@ def parse_args(
         default=None,
         metavar="SIGMA",
         help=(
-            "Estimation-only Gaussian along the slice axis (k), sigma in slices. "
-            "Default: 0 (1.0 with -interp fourier). Same trade as -blur: more accurate "
-            "motion parameters on ground truth (heptic 0.024 -> 0.008 mm), slightly more "
-            "motion-locked variance left in real corrected data. The output is not "
-            "blurred."
+            "EXPERIMENTAL. Estimation-only Gaussian along the slice axis (k), sigma in "
+            "slices (default: 0; 1.0 with -interp fourier). Same finding as -blur: "
+            "better parameters on simulated truth, no real-data benefit. See "
+            "docs/moco.md."
         ),
     )
     method_group.add_argument(
@@ -442,11 +438,9 @@ def parse_args(
         default="heptic",
         help=(
             "During estimation (default: heptic, as 3dvolreg).\n"
-            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp, exact only for "
-            "band-limited rows. A magnitude image is not band-limited (the magnitude is "
-            "taken after reconstruction): on complex-magnitude ground truth fourier "
-            "was no better than heptic overall and worse for in-plane translation.\n"
-            "fourier3d: FFT along k too.\n"
+            "fourier / fourier3d (EXPERIMENTAL): shift rows by an FFT phase ramp, exact "
+            "only for band-limited data. Magnitude images are not band-limited, and on "
+            "real runs neither mode improved the corrected data. See docs/moco.md.\n"
             "Paths without the shear estimator (-cost lpa/quad, -no_shear, -chain_init "
             "on CUDA) use heptic for the Fourier modes, and say so."
         ),
@@ -457,11 +451,9 @@ def parse_args(
         default="wsinc5",
         dest="final_interp",
         help=(
-            "For the output (default: wsinc5; same choices as -interp). Undoing known "
-            "motion on complex-magnitude ground truth, heptic, quintic and wsinc5 were "
-            "within a few percent and fourier and cubic were worst; on real runs wsinc5 "
-            "left the least motion-locked variance. -no_shear uses heptic for the "
-            "Fourier modes."
+            "For the output (default: wsinc5; same choices as -interp). On real runs "
+            "wsinc5 left the least motion-locked variance; the Fourier modes "
+            "(EXPERIMENTAL) left 3-4%% more."
         ),
     )
     interp_group.add_argument(

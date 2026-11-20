@@ -162,7 +162,7 @@ Tools marked *(beta)* are working but less tested; *(experimental)* means explor
 
 | command | description |
 |---|---|
-| `ffs_moco` | Rigid-body motion correction (Gauss–Newton, Fourier shears in-plane; ~8x more accurate than heptic against ground truth, see [docs/moco.md](docs/moco.md)). Writes AFNI-compatible motion files. Multi-echo: echo 1 drives the estimate; for 3-D multi-echo EPI it applies the partition shift/stretch tables from the phase. |
+| `ffs_moco` | Rigid-body motion correction (Gauss–Newton, wsinc5/heptic shear resampling; validation in [docs/moco.md](docs/moco.md)). Writes AFNI-compatible motion files. Multi-echo: echo 1 drives the estimate; for 3-D multi-echo EPI it applies the partition shift/stretch tables from the phase. |
 | `ffs_locomoco` | Exceedingly quick nonlinear motion correction: the time-varying displacement left after rigid moco, from B0 changes with head position. Optical flow (default, best), local cross-correlation (*experiemntal*), or a qwarp backend. Single- or multi-echo; 3-D acquisitions solve the in-plane PE and partition axes together, with the partition shift scaled by echo time. Writes a per-frame warp for `ffs_nwarp`; multi-echo can write one shared warp (reduce ram/storage) applied per echo with `VSCALE:`. Phase input is an experimental option. |
 | `ffs_medic` | Multi-echo distortion correction (uses MEDIC in part; Van et al. 2026): frame-wise B0 field maps from phase, for dynamic distortion under motion. Field estimate from warpkit, the GPU unwrapper, or a given field map; undistortion on the GPU. Writes a 5-D warp usable with `ffs_nwarp`. |
 | `ffs_util_convert_medic` | Convert warpkit MEDIC output into `ffs_nwarp` warps. |

@@ -26,7 +26,7 @@ FLIP = np.diag([-1.0, -1.0, 1.0, 1.0])
 # Categorical slots 1-4 of the validated reference palette, fixed order; each
 # also carries a line style and marker so identity is never colour alone.
 EST = {
-    "fourier": dict(label="ffs fourier (default)", color="#2a78d6", ls="-", marker="o"),
+    "fourier": dict(label="ffs fourier", color="#2a78d6", ls="-", marker="o"),
     "heptic": dict(label="ffs heptic", color="#eb6834", ls="--", marker="s"),
     "vrheptic": dict(label="3dvolreg -heptic", color="#1baf7a", ls="-.", marker="^"),
     "vrFourier": dict(label="3dvolreg -Fourier", color="#eda100", ls=":", marker="D"),
