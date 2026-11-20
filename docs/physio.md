@@ -99,6 +99,10 @@ ffs_physio -input run_mag.nii.gz -phase run_phase.nii.gz -prefix physio/run01 \
   cardiac × respiratory 1st order, HRV × CRF, RVT × RRF).
 - `-clean OUT` regresses each voxel's own-slice regressors out of the raw series
   (afni_proc's `ricor` order). See *Where in the pipeline* before using it.
+- **Multi-echo:** give every echo, shortest TE first:
+  `-input e1.nii.gz e2.nii.gz e3.nii.gz -phase p1.nii.gz p2.nii.gz p3.nii.gz`. The cardiac
+  detector draws its vessel voxels from all echoes; respiration reads the middle echo's
+  phase (*Multi-echo*, below). `-clean` writes each echo as `OUT.echo-N`.
 - `-qc DIR` writes three figures and a metrics record: the tracked rates on each trace's
   spectrogram, maps of where cardiac, respiration and RVT explain variance, and maximum
   intensity projections of the cardiac weight map. A found heartbeat draws the arterial
@@ -108,8 +112,9 @@ In `ffs_autoproc`, `-physio` runs it for every run and adds the nuisance to the 
 (`-glm_ortvec physio`, in the default set). `-physio_mode clean` switches to the `ricor`
 order.
 
-Requirements: 2-D slice-by-slice acquisition, single echo for now. 3-D EPI has no
-excitation-rate samples. Without phase, respiration is read from magnitude, which was
+Requirements: 2-D slice-by-slice acquisition (single- or multi-echo). 3-D EPI has no
+excitation-rate samples. In `ffs_autoproc`, multi-echo runs pass every echo, with
+`-physio_mode nuisance` only. Without phase, respiration is read from magnitude, which was
 unreliable on task runs and at long TR (*Limits*).
 
 ## Where in the pipeline
@@ -229,6 +234,48 @@ made after opening the fresh data was a clock slip: a ds001168 run locked at 0.9
 fast to the end); anchoring that reference to the run's mean step fixed it (a regression
 test reproduces the slip).
 
+### Multi-echo
+
+Each echo is another reading of the same excitation, so nothing in the method changes;
+the question is how to use the extra readings. Tested on ds006926 (3 T Prisma, 3 echoes
+at TE 12–17 / 30–35 / 46–53 ms, 3.5 mm, MB4 TR 0.8 s and MB2 TR 1.8 s, magnitude and phase):
+24 rest runs from 12 subjects across both scanners, against ECG R-peaks (gradient artifact
+removed by averaged-artifact subtraction; the clock is scanner-synced) and the belt.
+
+**Cardiac: the echoes are stacked, not combined.** Every echo's voxels are candidates for
+the top 1 %, as if they were more voxels (tiled along the in-plane axis the halves test
+does not split). A fixed combination assumes how pulsation scales with TE, and vessels
+differ: inflow is strongest on the first echo, dephasing grows on the later ones. In
+the runs checked the found weight splits about 45 / 30 / 25 % over echoes 1–3.
+
+| Magnitude used | Right | Wrong | Not found | Median locking of finds |
+|---|---|---|---|---|
+| Echo 1 alone | 21 | 0 | 3 | 0.97 |
+| Echo 2 alone | 22 | 0 | 2 | 0.97 |
+| Echo 3 alone | 21 | 0 | 3 | 0.97 |
+| Sum of echoes | 21 | 0 | 3 | 0.98 |
+| **Stacked echoes (used)** | **23** | **0** | **1** | **0.97** |
+
+The stack found every run any variant found; the one miss (none found it) had a candidate
+locked at 0.87 below the floor. In round one, the T2*-weighted and signal-weighted
+combinations behaved like the sum and lost the same run that every single echo found.
+Heart-rate error of the finds is 0.3/min either way. Cost: ~7 s per run on the GPU
+against ~2–3 s for one echo.
+
+**Respiration: the middle echo's phase.** Fitting each voxel's phase change across echoes
+to one field change (through the origin, inverse-variance weights) gave breathing timing
+identical to the middle echo alone to three decimals, and lower breath depth (field RVT vs
+the belt's) in 16 of 24 runs, by up to 0.15. Echo 1 alone was the worst single echo
+(depth lower in 16/24, worst-window locking lower, p 0.03); echoes 2 and 3 tied. A free
+TE-independent offset in the fit did no better. Plausibly the short echoes' errors are
+phase that does not grow with TE, which a fit across TE amplifies; this was not tested.
+On this dataset field RVT is weaker than on TASKFORCE for every variant (median r ≈ 0.3–0.4
+raw, before RRF convolution).
+
+Single echoes were already near the recordings here, so this shows robustness, not new
+finds. Thin slabs, high resolution or weak pulsation, where extra readings should matter
+most, are not in it.
+
 **Cost.** The search and the derangement null run batched on the GPU: one candidate set's
 slice alignments (all aliases, both harmonics, every derangement) in one solve per
 excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0.4 s
@@ -238,7 +285,8 @@ excitation, 0.18 s where one-at-a-time took 1.5 s; the constant-modulus search 0
 
 - **3-D EPI**: not supported (no excitation-rate samples). Respiration might still be read
   from phase at the volume rate; not built.
-- **Multi-echo**: refused for now; it should work (more samples per excitation) once tested.
+- **Multi-echo** is validated on one 3 T dataset (ds006926), where single echoes were already
+  near the recordings; the gain on harder data (slabs, 7 T, high resolution) is untested.
 - **Cardiac where pulsation is weak.** On a thin prefrontal slab (ds001168, 0.8 mm, TR 4 s)
   the heartbeat was found in 1 of 10 runs; the recording shows almost no pulsation there.
   Expect not found, not wrong, on slabs away from the large vessels. With few excitations per
