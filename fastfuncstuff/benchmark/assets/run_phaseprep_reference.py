@@ -23,9 +23,16 @@ MASK_PATH = os.path.join(HERE, "automask.nii.gz")
 OUT_PREFIX = os.path.join(HERE, "phaseprep_ref")
 NOISE_LB = 0.15  # Hz, Stanley §2.2.3 / phaseprep default
 
+def load_nifti(path: str) -> nb.Nifti1Image | nb.Nifti2Image:
+    image = nb.load(path)
+    if not isinstance(image, (nb.Nifti1Image, nb.Nifti2Image)):
+        raise ValueError(f"Expected a NIfTI image: {path}")
+    return image
+
+
 # ── load ────────────────────────────────────────────────────────────────────
-mag_img = nb.load(MAG_PATH)
-pha_img = nb.load(PHASE_PATH)
+mag_img = load_nifti(MAG_PATH)
+pha_img = load_nifti(PHASE_PATH)
 TR = float(mag_img.header.get_zooms()[-1])
 print(f"TR={TR}s  shape={mag_img.shape}")
 
@@ -34,7 +41,7 @@ pha = np.asarray(pha_img.get_fdata(), dtype=np.float64)
 nx, ny, nz, nt = mag.shape
 
 if os.path.exists(MASK_PATH):
-    mask3d = nb.load(MASK_PATH).get_fdata().astype(bool)
+    mask3d = load_nifti(MASK_PATH).get_fdata().astype(bool)
     print(f"Using mask: {mask3d.sum():,} voxels")
 else:
     mm = mag.mean(axis=-1)

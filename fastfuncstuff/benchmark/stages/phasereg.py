@@ -28,8 +28,10 @@ Validation:
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -237,10 +239,10 @@ def run_ref(ctx: BenchmarkContext) -> float:
         print("  Skipping phaseprep ref (output exists, use -force-ref to re-run)")
         return 0.0
 
-    n_workers = ctx.get_stage_params("phasereg").get("ref_n_workers", 8)
+    n_workers = int(ctx.get_stage_params("phasereg").get("ref_n_workers", 8))
 
     elapsed, _ = run_timed(
-        f"FFS_BENCHMARK_PHASEPREP_WORKERS={n_workers} python {REF_SCRIPT}",
+        f"FFS_BENCHMARK_PHASEPREP_WORKERS={n_workers} {shlex.quote(sys.executable)} {REF_SCRIPT}",
         label=f"phaseprep reference ({n_workers} workers, scipy.odr)",
         cwd=pd,
     )
