@@ -34,9 +34,15 @@ DEV = torch.device("cuda")
 def shift_axis(vol, axis, s):
     """Pull along axis: out(u) = vol(u + s); s broadcastable, size 1 along axis."""
     n = vol.shape[axis]
+    shape = [1, 1, 1]
+    if vol.is_complex():  # a complex image needs the full (two-sided) spectrum
+        spec = torch.fft.fft(vol, dim=axis)
+        k = torch.fft.fftfreq(n, device=vol.device, dtype=torch.float64).to(torch.float32) * n
+        shape[axis] = n
+        spec *= torch.exp((s * k.reshape(shape)) * (2j * math.pi / n))
+        return torch.fft.ifft(spec, dim=axis)
     spec = torch.fft.rfft(vol, dim=axis)
     k = torch.fft.rfftfreq(n, device=vol.device, dtype=torch.float64).to(torch.float32) * n
-    shape = [1, 1, 1]
     shape[axis] = k.numel()
     spec *= torch.exp((s * k.reshape(shape)) * (2j * math.pi / n))
     return torch.fft.irfft(spec, n=n, dim=axis)
@@ -97,7 +103,8 @@ def truncate(vol, axis, nc):
         parts.append(X.index_select(axis, torch.tensor(list(range(n - h, n)), device=vol.device)))
     del idx
     C = torch.cat(parts, dim=axis) * (nc / n)
-    return torch.fft.ifft(C, dim=axis).real
+    out = torch.fft.ifft(C, dim=axis)
+    return out if vol.is_complex() else out.real
 
 
 def rigid(rx, ry, rz, tx, ty, tz):
@@ -143,10 +150,31 @@ def main():
     ap.add_argument(
         "-battery", action="store_true", help="dense sub-voxel battery instead of tiny set"
     )
+    ap.add_argument("-large", action="store_true", help="large-motion battery (1-6 deg, 1-5 vox)")
+    ap.add_argument(
+        "-phase",
+        default=None,
+        help="phase image matching FINE (radians, or Siemens +-4096): move and sample the "
+        "complex image, write its magnitude",
+    )
+    ap.add_argument(
+        "-coilfield",
+        type=float,
+        default=0.0,
+        help="static smooth receive-field amplitude applied after the motion (0.3 = +-30%%)",
+    )
     a = ap.parse_args()
 
     img = nb.load(a.fine)
     base = torch.tensor(np.asarray(img.dataobj, dtype=np.float32), device=DEV)
+    if a.phase:
+        # A scanner reconstructs a complex image and only then takes its
+        # magnitude. That magnitude is NOT band-limited (|z| is nonlinear), so
+        # truncating a magnitude image would hand Fourier interpolation the one
+        # case where it is exact. Move and sample the complex image instead.
+        ph = np.asarray(nb.load(a.phase).dataobj, dtype=np.float32)
+        ph = ph * (np.pi / 4096.0) if np.abs(ph).max() > 4 else ph
+        base = torch.polar(base, torch.tensor(ph, device=DEV))
     h = [float(z) for z in img.header.get_zooms()[:3]]
     N = base.shape
     F = a.factor
@@ -187,12 +215,31 @@ def main():
                 t = rng.normal(0, sd, 3) * vox_c
                 Ts.append(rigid(*r, *t))
                 tags.append(f"{name}_{i:02d}")
-    for frac in [] if a.battery else [0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1]:
+    if a.large:
+        rng = np.random.default_rng(13)
+        for ax, nm in enumerate("xyz"):
+            vox_a = F[ax] * h[ax]
+            for nvox in (1.0, 1.5, 2.25, 3.25, 5.0):
+                t = [0.0, 0.0, 0.0]
+                t[ax] = nvox * vox_a
+                Ts.append(rigid(0, 0, 0, *t))
+                tags.append(f"large_t{nm}_{nvox}")
+        for ax, nm in enumerate("xyz"):
+            for deg in (1.0, 2.0, 3.0, 4.5, 6.0):
+                r = [0.0, 0.0, 0.0]
+                r[ax] = deg
+                Ts.append(rigid(*r, 0, 0, 0))
+                tags.append(f"large_r{nm}_{deg}")
+        for i in range(40):
+            Ts.append(rigid(*rng.normal(0, 2.0, 3), *rng.normal(0, 2.0, 3)))
+            tags.append(f"bigrandom_{i:02d}")
+    no_tiny = a.battery or a.large or bool(a.trace)
+    for frac in [] if no_tiny else [0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1]:
         Ts.append(rigid(0, 0, 0, frac * vox_c, 0, 0))
         tags.append(f"tiny_tx_{frac}")
         Ts.append(rigid(0, 0, 0, 0, 0, frac * vox_c))
         tags.append(f"tiny_tz_{frac}")
-    for deg in [] if a.battery else [0.004, 0.01, 0.02, 0.04, 0.06, 0.1, 0.15, 0.2]:
+    for deg in [] if no_tiny else [0.004, 0.01, 0.02, 0.04, 0.06, 0.1, 0.15, 0.2]:
         Ts.append(rigid(deg, 0, 0, 0, 0, 0))
         tags.append(f"tiny_rx_{deg}")
         Ts.append(rigid(0, 0, deg, 0, 0, 0))
@@ -221,12 +268,21 @@ def main():
             ip = truncate(truncate(moved[sl[0], sl[1], :], 0, nc[0]), 1, nc[1])
             v2 = sum(w * ip.index_select(2, zi + (k - half)) for k, w in enumerate(box))
             v3 = truncate(ip[:, :, sl[2]], 2, nc[2])
-        out2d[..., t] = v2.cpu().numpy()
-        out3d[..., t] = v3.cpu().numpy()
+        out2d[..., t] = (v2.abs() if v2.is_complex() else v2).cpu().numpy()
+        out3d[..., t] = (v3.abs() if v3.is_complex() else v3).cpu().numpy()
         rows.append((FLIP @ Tc @ FLIP)[:3].ravel())
         if t % 50 == 0:
             print(t, len(Ts), flush=True)
 
+    if a.coilfield:
+        # The receive field belongs to the scanner, not the head: it multiplies
+        # every volume identically after the motion. A smooth low-order pattern,
+        # brighter at the back and sides like a head array.
+        gx, gy, gz = np.meshgrid(*(np.linspace(-1, 1, n) for n in nc), indexing="ij")
+        field = 0.5 * gx + 0.3 * gy - 0.4 * gz**2 + 0.25 * gx * gy + 0.35 * (gx**2 + gy**2)
+        field = 1.0 + a.coilfield * field / np.abs(field).max()
+        out2d *= field[..., None].astype(np.float32)
+        out3d *= field[..., None].astype(np.float32)
     b2 = out2d[..., 0]
     mask = ndimage.binary_opening(b2 > 0.15 * np.percentile(b2, 98), iterations=2)
     lab, n = ndimage.label(mask)
