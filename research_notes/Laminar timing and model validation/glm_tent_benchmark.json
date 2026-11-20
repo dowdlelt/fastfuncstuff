@@ -17,8 +17,7 @@
     "commit_short": "f06340fb",
     "branch": "review/laminar-curves",
     "message": "Respect each laminar condition window when reporting peaks",
-    "dirty": true,
-    "source_root": "/home/logan/Dropbox/Resources/code/fastfuncstuff"
+    "dirty": true
   },
   "stages": {
     "glm_tent": {

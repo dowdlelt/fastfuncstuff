@@ -1,8 +1,7 @@
 """CPU audit of TR-spaced response estimates, independent analytic truth and AFNI.
 
 Run from the repository root with:
-    UV_CACHE_DIR=/tmp/uv-cache uv run --no-project --no-managed-python \
-        python scripts/laminar_curve_review/tr_knots_audit.py --output /tmp/tr_knots_audit.json
+    python scripts/laminar_curve_review/tr_knots_audit.py --output tr_knots_audit.json
 """
 
 import argparse

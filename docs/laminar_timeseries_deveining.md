@@ -33,5 +33,8 @@ ffs_laminar_tdv -input run-0{1..6}.nii.zst -fs_subj $SUBJECTS_DIR/sub-01 \
   -ridge 0.8 -prefix ltdv/sub-01
 ```
 
-`ffs_laminar_tdv -help` documents every flag. ds003427 GE/SE validation:
-`scripts/bench_laminar_tdv_se.py`, `scripts/plot_laminar_tdv_se.py`.
+`ffs_laminar_tdv -help` documents every flag. The historical GE/SE validation
+used OpenNeuro ds003427 with aligned, frame-fixed GE and SE runs and cortical
+depth maps on the same grid. The [scoring script](../scripts/bench_laminar_tdv_se.py)
+takes the prepared derivatives directory as `-dataset`. The
+[plotting script](../scripts/plot_laminar_tdv_se.py) reads its report.

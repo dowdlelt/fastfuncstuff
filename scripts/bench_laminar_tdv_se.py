@@ -278,7 +278,8 @@ def main():
     p.add_argument(
         "-dataset",
         type=Path,
-        default=Path("/mnt/belegost/openneuro_data/ds003427/derivatives/autoproc"),
+        required=True,
+        help="Directory with prepared, same-grid GE, SE, and depth derivatives for ds003427",
     )
     p.add_argument("-output", type=Path, required=True)
     p.add_argument("-subjects", nargs="+", default=["03", "04", "05", "07"])

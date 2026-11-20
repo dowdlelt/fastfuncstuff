@@ -1,10 +1,15 @@
-Scripts behind `../fmri_wiki/concepts/Response curves for the laminar model.md` (2026-11-10).
-One-off experiment code, kept as the record of what was run; paths are the session's.
+# Laminar timing and model audits
 
-- `cmp.py`, `run_orig.m`, `make_cbf.py`, `const.py` — our vascular model against Havlicek's 2020
-  `LBR_model.m` and analytic steady state; the `eps_v` typo and TE sensitivity.
-- `gen.py` — ground-truth laminar time series on the real sub-3010 ses-fine event timing.
-- `ev2.py`, `proj2.py` — estimator bias/noise against truth; projection of the truth on the tents.
-- `inv.py` — invert an estimator's curves through the model space.
-- `nonlin.py`, `nonlin2.py` — the model's response to the real event train against a sum of isolated ones.
-- `run.sh`, `show.py`, `scan.py` — real ROI x depth refits, and fits across estimator / latency / free parameters.
+These CPU audits reproduce the synthetic experiments in the
+[laminar validation report](../../reports/Laminar%20timing%20and%20model%20validation.md).
+Run from the repository root with fastfuncstuff installed.
+
+```sh
+python scripts/laminar_curve_review/tr_knots_audit.py --output tr_knots_audit.json
+python scripts/laminar_curve_review/observation_operator.py
+python scripts/laminar_curve_review/physiology_audit.py
+python scripts/laminar_curve_review/integration_audit.py
+```
+
+The timing audit also runs an independent AFNI comparison if `3dDeconvolve`
+is available. All four audits generate their synthetic inputs in code.
