@@ -68,6 +68,7 @@ And because the work is *host-bound*, a batch of 9 costs the same as a batch of
 """)
 
 code("""
+import os
 import time
 from pathlib import Path
 
@@ -303,11 +304,14 @@ produced with it.
 
 md("""
 ## Configuration
+
+Set `PREDICTIVE_TONES_DIR` to the [predictive_tones reference checkout](https://github.com/lonikefaes/predictive_tones),
+or place it in `predictive_tones/` beside this notebook.
 """)
 
 code("""
 CFG = dict(
-    data_root=Path("/home/logan/Dropbox/Resources/code/matlab_toolboxes/predictive_tones"),
+    data_root=Path(os.environ.get("PREDICTIVE_TONES_DIR", "predictive_tones")).expanduser(),
 
     # Model sizes. Three neuronal depths is fixed across the literature; the
     # vascular depths are the set Uludag & Havlicek (2021) recommend for it --

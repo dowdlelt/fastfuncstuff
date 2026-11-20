@@ -4,7 +4,8 @@
 % Run once:  matlab -batch "run('make_oracle.m')"
 % Writes laminar_oracle.json next to this script.
 
-REF = '/home/logan/Dropbox/Resources/code/matlab_toolboxes/predictive_tones';
+REF = getenv('PREDICTIVE_TONES_DIR');
+assert(isfolder(REF), 'Set PREDICTIVE_TONES_DIR to the predictive_tones checkout');
 addpath(genpath(fullfile(REF,'Code_laminar_BOLD_model')));
 addpath(fullfile(REF,'SPM12_download2019','spm12'));
 

@@ -8,7 +8,8 @@
 % same quantity in one pass; the loop form is spot-checked below on a subset so
 % this stays an oracle and not an assumption.
 
-REF = '/home/logan/Dropbox/Resources/code/matlab_toolboxes/predictive_tones';
+REF = getenv('PREDICTIVE_TONES_DIR');
+assert(isfolder(REF), 'Set PREDICTIVE_TONES_DIR to the predictive_tones checkout');
 addpath(genpath(fullfile(REF,'Code_laminar_BOLD_model')));
 addpath(genpath(fullfile(REF,'Code_layering')));
 load(fullfile(REF,'PP_LH_testData.mat'));
