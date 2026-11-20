@@ -700,3 +700,50 @@ def test_moco_slab_moved_by_slices_recovers_the_shift(twopass):
     res = moco(ts, MocoConfig(base_index=0, device="cpu", verb=0, compile=False, twopass=twopass))
     np.testing.assert_allclose(res.params[1:, 2], [-s for s in shifts], atol=0.1)
     assert np.abs(res.params[1:, 3:]).max() < 0.3
+
+
+def test_moco_fourier_recovers_subvoxel_inplane_shifts():
+    """Band-limited in-plane data shifted by a quarter voxel, the position where
+    a polynomial kernel's bias peaks: -interp fourier recovers it exactly."""
+    rng = np.random.default_rng(5)
+    nz, ny, nx = 10, 40, 44
+    vol = rng.normal(size=(nz, ny, nx))
+    spec = np.fft.fftn(vol, axes=(1, 2))
+    ky = np.abs(np.fft.fftfreq(ny))[:, None]
+    kx = np.abs(np.fft.fftfreq(nx))[None, :]
+    spec *= (ky < 0.3) & (kx < 0.3) & (np.hypot(ky, kx) > 0.02)
+    vol = np.fft.ifftn(spec, axes=(1, 2)).real
+    vol = vol / vol.std() + 4.0
+
+    def moved(sy, sx):
+        ramp = np.exp(
+            -2j * np.pi * (np.fft.fftfreq(ny)[:, None] * sy + np.fft.fftfreq(nx)[None] * sx)
+        )
+        return np.fft.ifftn(np.fft.fftn(vol, axes=(1, 2)) * ramp, axes=(1, 2)).real
+
+    shifts = [(0.25, 0.0), (0.0, 0.25), (-0.25, 0.4), (0.1, -0.15)]
+    ts = torch.tensor(np.stack([vol] + [moved(*s) for s in shifts]), dtype=torch.float32)
+    # Tight convergence so the GN stopping rule (0.01 vox by default) is not
+    # what the tolerance measures.
+    cfg = MocoConfig(
+        base_index=0,
+        device="cpu",
+        verb=0,
+        compile=False,
+        interp="fourier",
+        dxy_thresh=1e-4,
+        dph_thresh=1e-4,
+        max_iter=60,
+    )
+    res = moco(ts, cfg)
+    # params[:, :3] are the base->source pull: minus the content shift.
+    want = np.array([[-sx, -sy] for sy, sx in shifts])
+    # Measured: fourier within 6e-4 vox; heptic misses by 3.9e-3.
+    np.testing.assert_allclose(res.params[1:, :2], want, atol=1.5e-3)
+    assert np.abs(res.params[1:, 2:6]).max() < 2e-3
+
+
+def test_moco_fourier_refuses_the_gather_paths():
+    ts = torch.rand(3, 8, 16, 16)
+    with pytest.raises(ValueError, match="shear estimator"):
+        moco(ts, MocoConfig(device="cpu", verb=0, compile=False, interp="fourier", cost="lpa"))

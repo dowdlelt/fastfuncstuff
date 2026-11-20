@@ -343,3 +343,98 @@ def test_cpu_shear_backends_agree_on_resampled_volume(monkeypatch, mode):
         outputs.append(shear.shear_resample(vol, matrix, vol.shape, mode))
     assert all(out is not None for out in outputs)
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=2e-6)
+
+
+# ---------------------------------------------------------------------------
+# Fourier shears. EPI rows are DFT-reconstructed, so a phase ramp shifts them
+# exactly; polynomial kernels bias sub-voxel moco toward half-voxel positions.
+# ---------------------------------------------------------------------------
+
+
+def _bandlimited_inplane(nz=10, ny=36, nx=40, seed=0):
+    """Random volume whose (y, x) spectrum stops below Nyquist, as an EPI row."""
+    g = torch.Generator().manual_seed(seed)
+    vol = torch.randn(nz, ny, nx, generator=g, dtype=torch.float64)
+    spec = torch.fft.fftn(vol, dim=(1, 2))
+    ky = torch.fft.fftfreq(ny, dtype=torch.float64).abs()[:, None]
+    kx = torch.fft.fftfreq(nx, dtype=torch.float64).abs()[None, :]
+    spec = spec * ((ky < 0.4) & (kx < 0.4))
+    vol = torch.fft.ifftn(spec, dim=(1, 2)).real
+    return vol + 0.0 * vol.mean()
+
+
+def _exact_shift(vol, sy, sx):
+    """Content moved by (sy, sx) voxels: the exact shift of a periodic band-limited image."""
+    ny, nx = vol.shape[1:]
+    ky = torch.fft.fftfreq(ny, dtype=torch.float64)[:, None]
+    kx = torch.fft.fftfreq(nx, dtype=torch.float64)[None, :]
+    ramp = torch.exp(-2j * torch.pi * (ky * sy + kx * sx))
+    return torch.fft.ifftn(torch.fft.fftn(vol, dim=(1, 2)) * ramp, dim=(1, 2)).real
+
+
+def test_fft_shift_rows_is_exact_on_a_trig_polynomial():
+    from fastfuncstuff.processing.shear import fft_shift_rows
+
+    n, af = 32, 0.37
+    p = torch.arange(n, dtype=torch.float64)
+    g = torch.Generator().manual_seed(1)
+    coef = torch.randn(15, 2, generator=g, dtype=torch.float64)
+
+    def signal(x):
+        k = torch.arange(1, 16, dtype=torch.float64)[:, None]
+        w = 2 * torch.pi * k * x[None] / n
+        return (coef[:, :1] * torch.cos(w) + coef[:, 1:] * torch.sin(w)).sum(0)
+
+    out = fft_shift_rows(signal(p)[None], 1, torch.tensor([[af]], dtype=torch.float64))
+    torch.testing.assert_close(out[0], signal(p - af), rtol=0, atol=1e-10)
+
+
+def test_fourier_shear_translates_inplane_exactly():
+    """In-plane fractional shift through the shear plan equals the exact phase
+    ramp; catches sign, axis-mapping and Nyquist mistakes in the Fourier step."""
+    vol = _bandlimited_inplane()
+    sx, sy = 0.37, -0.23
+    # out(p) = source(p + t) moves content by -t.
+    mat = torch.eye(4, dtype=torch.float64)
+    mat[0, 3], mat[1, 3] = -sx, -sy
+    out = shear_resample(vol, mat, tuple(vol.shape), "fourier")
+    torch.testing.assert_close(out, _exact_shift(vol, sy, sx), rtol=0, atol=1e-8)
+    heptic = shear_resample(vol, mat, tuple(vol.shape), "heptic")
+    assert (heptic - _exact_shift(vol, sy, sx)).abs().max() > 100 * (
+        out - _exact_shift(vol, sy, sx)
+    ).abs().max()
+
+
+def test_fourier_shear_rotation_tracks_heptic():
+    """A small rotation through the Fourier plan agrees with the polynomial plan
+    away from the border (they differ only in the 1D kernel)."""
+    vol = _make_volume(20, 36, 40, seed=4).double()
+    mat = _rigid_matrix(0.3, -0.2, 0.1, 1.5, 0.8, -0.6).double()
+    four = shear_resample(vol, mat, tuple(vol.shape), "fourier")
+    hept = shear_resample(vol, mat, tuple(vol.shape), "heptic")
+    inner = (slice(4, -4), slice(6, -6), slice(6, -6))
+    rel = (four - hept)[inner].abs().mean() / vol[inner].abs().mean()
+    assert rel < 0.02, rel
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["fourier", "fourier3d"])
+def test_batched_fourier_shear_matches_single_volume(mode):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/Triton required")
+    from fastfuncstuff.processing.shear_triton import shear_resample_triton
+
+    nt, nz, ny, nx = 6, 20, 36, 40
+    base = _make_volume(nz, ny, nx, seed=7)
+    g = torch.Generator().manual_seed(3)
+    mats = []
+    for _ in range(nt):
+        r = torch.randn(6, generator=g)
+        mats.append(_rigid_matrix(*(r[:3] * 0.6).tolist(), *(r[3:] * 1.0).tolist()))
+    mats = torch.stack(mats)
+    src = base[None].expand(nt, nz, ny, nx).contiguous()
+    batched, valid = shear_resample_triton(src.cuda(), mats.cuda(), (nz, ny, nx), mode)
+    assert bool(valid.all())
+    for i in range(nt):
+        single = shear_resample(base, mats[i], (nz, ny, nx), mode)
+        torch.testing.assert_close(batched[i].cpu(), single, rtol=1e-4, atol=1e-4)

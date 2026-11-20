@@ -21,7 +21,7 @@ from torch import Tensor
 
 from fastfuncstuff.triton_key import install_triton_key_cache
 
-from .shear import rigid_matrix_to_shears
+from .shear import fft_shear_rows_batched, rigid_matrix_to_shears, split_fourier_mode
 
 # Triton hashes its whole installation on the first kernel launch of every
 # process (~1s).  Do this before any @triton.jit function can be launched.
@@ -164,6 +164,68 @@ def _unpack_ab(ax: Tensor, scl: Tensor) -> tuple[Tensor, Tensor]:
     return a, b
 
 
+def _fourier_shears(
+    sources: Tensor,
+    ax: Tensor,
+    a4: Tensor,
+    b4: Tensor,
+    s4: Tensor,
+    fft_axes: tuple[int, ...],
+    mode_id: int,
+) -> Tensor:
+    """Four shears, each one either the Triton polynomial or an FFT phase ramp.
+
+    The plan's axis order differs per volume, so a step mixes both kinds. The
+    Triton pass runs every volume with the FFT lanes' shear zeroed -- exactly
+    the identity for an interpolating kernel -- and the FFT then overwrites
+    those lanes from the step's input.
+    """
+    B, nz, ny, nx = sources.shape
+    nxyz = nx * ny * nz
+    BLOCK = 256
+    blocks_per_vol = (nxyz + BLOCK - 1) // BLOCK
+    on_fft = torch.zeros_like(ax, dtype=torch.bool)
+    for v in fft_axes:
+        on_fft |= ax == v
+    zero = torch.zeros((), device=a4.device, dtype=a4.dtype)
+    ax_i = ax.to(torch.int32).contiguous()
+    a_p = torch.where(on_fft, zero, a4).to(torch.float32).contiguous()
+    b_p = torch.where(on_fft, zero, b4).to(torch.float32).contiguous()
+    s_p = torch.where(on_fft, zero, s4).to(torch.float32).contiguous()
+    cur = sources.reshape(B, nxyz).contiguous()
+    for step in range(4):
+        out = torch.empty_like(cur)
+        if bool((~on_fft[:, step]).any()):
+            _shear_step_kernel[(B * blocks_per_vol,)](
+                cur,
+                out,
+                ax_i,
+                a_p,
+                b_p,
+                s_p,
+                B,
+                nx,
+                ny,
+                nz,
+                blocks_per_vol,
+                step,
+                MODE=mode_id,
+                BLOCK=BLOCK,
+            )
+        else:
+            out.copy_(cur)
+        vol_in = cur.reshape(B, nz, ny, nx)
+        vol_out = out.reshape(B, nz, ny, nx)
+        for v in fft_axes:
+            lanes = (ax[:, step] == v).nonzero(as_tuple=True)[0]
+            if lanes.numel():
+                vol_out[lanes] = fft_shear_rows_batched(
+                    vol_in[lanes], v, a4[lanes, step], b4[lanes, step], s4[lanes, step]
+                )
+        cur = out
+    return cur.reshape(B, nz, ny, nx)
+
+
 def shear_resample_triton(
     sources: Tensor, matrices: Tensor, shape: tuple[int, int, int], mode: str
 ) -> tuple[Tensor, Tensor]:
@@ -175,9 +237,12 @@ def shear_resample_triton(
     general resample).
     """
     B, nz, ny, nx = sources.shape
-    mode_id = _MODE_ID[mode]
+    fft_axes, poly = split_fourier_mode(mode)
+    mode_id = _MODE_ID[poly]
     ax, scl, sft, valid = rigid_matrix_to_shears(matrices, shape)
     a4, b4 = _unpack_ab(ax, scl)  # (B,4)
+    if fft_axes:
+        return _fourier_shears(sources, ax, a4, b4, sft, fft_axes, mode_id), valid
     ax_i = ax.to(torch.int32).contiguous()
     a4 = a4.to(torch.float32).contiguous()
     b4 = b4.to(torch.float32).contiguous()

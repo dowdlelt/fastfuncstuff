@@ -40,6 +40,73 @@ _FLOOR_KERNELS = {
 }
 
 
+# Shear modes that move rows by a DFT phase ramp instead of a polynomial kernel.
+# EPI is reconstructed by a DFT in-plane, so every image row is a periodic
+# trigonometric polynomial and a phase ramp is its exact shift. A polynomial
+# kernel instead smooths by an amount that varies with the fractional shift,
+# which pulls the GN fit toward half-voxel positions: ~1.5% of a voxel at 1/4
+# and 3/4, small motions read ~8% large, on real data as on synthetic truth.
+# "fourier" keeps the polynomial along the slice axis (k), which a 2D
+# acquisition samples by slice profile, not by DFT (a phase ramp there tripled
+# the z error); "fourier3d" shifts k by FFT too, for 3D slab EPI.
+FOURIER_AXES = {"fourier": (0, 1), "fourier3d": (0, 1, 2)}
+FOURIER_POLY = "heptic"
+
+
+def split_fourier_mode(mode: str) -> tuple[tuple[int, ...], str]:
+    """(shear axes moved by FFT, polynomial mode for the rest) for ``mode``."""
+    axes = FOURIER_AXES.get(mode)
+    return (axes, FOURIER_POLY) if axes is not None else ((), mode)
+
+
+def fft_shift_rows(vol: Tensor, dim: int, af: Tensor) -> Tensor:
+    """``out[..,p,..] = vol[..,p-af,..]`` by a DFT phase ramp along ``dim``.
+
+    Periodic and unpadded on purpose: a DFT-reconstructed row is periodic, and
+    AFNI's zero-padded -Fourier breaks that at a slab's ends (its z bias on a
+    thin slab). ``af`` has size 1 along ``dim`` and broadcasts over the rest.
+    """
+    n = vol.shape[dim]
+    spec = torch.fft.rfft(vol, dim=dim)
+    k = torch.fft.rfftfreq(n, device=vol.device, dtype=vol.dtype)
+    shape = [1] * vol.dim()
+    shape[dim] = k.numel()
+    spec *= torch.exp((af * k.reshape(shape)) * (-2j * math.pi))
+    return torch.fft.irfft(spec, n=n, dim=dim)
+
+
+def fft_shear_rows_batched(vol: Tensor, fr_axis: int, a: Tensor, b: Tensor, s: Tensor) -> Tensor:
+    """:func:`_apply_one_shear` along ``fr_axis`` for a batch, by FFT.
+
+    ``vol`` (B, nz, ny, nx); ``a``, ``b``, ``s`` (B,). Volumes whose shear is
+    below AFNI's 1e-3 voxel floor pass through, as in the single-volume path.
+    """
+    _, nz, ny, nx = vol.shape
+    sizes = {0: nx, 1: ny, 2: nz}
+    centers = {k: (v - 1) / 2.0 for k, v in sizes.items()}
+    tdim, (p1fr, p1dim), (p2fr, p2dim) = _AXIS_INFO[fr_axis]
+    st = a.abs() * centers[p1fr] + b.abs() * centers[p2fr] + s.abs()
+    rows = (st >= 1.0e-3).nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return vol
+    device, dtype = vol.device, vol.dtype
+    shp1 = [1, 1, 1, 1]
+    shp1[p1dim + 1] = sizes[p1fr]
+    shp2 = [1, 1, 1, 1]
+    shp2[p2dim + 1] = sizes[p2fr]
+    c1 = (torch.arange(sizes[p1fr], device=device, dtype=dtype) - centers[p1fr]).reshape(shp1)
+    c2 = (torch.arange(sizes[p2fr], device=device, dtype=dtype) - centers[p2fr]).reshape(shp2)
+    col = (-1, 1, 1, 1)
+    af = (
+        a[rows].to(dtype).reshape(col) * c1
+        + b[rows].to(dtype).reshape(col) * c2
+        + s[rows].to(dtype).reshape(col)
+    )
+    out = vol.clone()
+    out[rows] = fft_shift_rows(vol[rows], tdim + 1, af)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # xzyx shear factorization (ported from thd_shear3d.c:shear_xzyx, vectorized)
 # ---------------------------------------------------------------------------
@@ -736,7 +803,10 @@ def _apply_one_shear(
     shp2 = [1, 1, 1]
     shp2[p2dim] = sizes[p2fr]
     af = a * coord1.reshape(shp1) + b * coord2.reshape(shp2) + s
-    return (interp_fn or _interp_1d_along)(vol, tdim, af, mode)
+    fft_axes, poly = split_fourier_mode(mode)
+    if fr_axis in fft_axes:
+        return fft_shift_rows(vol, tdim, af)
+    return (interp_fn or _interp_1d_along)(vol, tdim, af, poly)
 
 
 # unpack MCW_3shear (ax, scl) -> per-shear (a, b) (matches fr_gpu_unpack)

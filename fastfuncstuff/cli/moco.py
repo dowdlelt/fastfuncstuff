@@ -417,9 +417,18 @@ def parse_args(
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
-        choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "fourier", "fourier3d"],
         default="heptic",
-        help="During estimation (default: heptic)",
+        help=(
+            "During estimation (default: heptic).\n"
+            "fourier: shift the in-plane axes (i, j) by an FFT phase ramp -- exact\n"
+            "  for DFT-reconstructed EPI rows -- and the slice axis (k) by heptic.\n"
+            "  Polynomial kernels bias sub-voxel estimates toward half-voxel\n"
+            "  positions (~1.5%% of a voxel; small motions read ~8%% large).\n"
+            "fourier3d: FFT along k too, for 3D (slab) EPI, whose partition axis\n"
+            "  is also DFT-encoded; on 2D multislice it is worse than fourier.\n"
+            "Both need -cost wls and the shear estimator."
+        ),
     )
     interp_group.add_argument(
         "-final",

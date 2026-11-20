@@ -43,7 +43,7 @@ from .affine import (  # noqa: E402
 )
 from .cost import _separable_smooth_3d, lpa_correlation  # noqa: E402
 from .interp import _separable_resample_3d, no_gather_compile, warp_image  # noqa: E402
-from .shear import shear_resample  # noqa: E402
+from .shear import shear_resample, split_fourier_mode  # noqa: E402
 
 try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
     from .shear_triton import shear_resample_triton
@@ -64,7 +64,9 @@ class MocoConfig:
 
     base_index: int = 0  # Reference volume index (0 = first)
     cost: str = "wls"  # "wls", "lpa", or "quad"
-    interp: str = "heptic"  # During estimation: linear|cubic|quintic|heptic|wsinc5
+    interp: str = (
+        "heptic"  # During estimation: linear|cubic|quintic|heptic|wsinc5|fourier|fourier3d
+    )
     final_interp: str = "wsinc5"  # For output: linear|cubic|quintic|heptic|wsinc5
     max_iter: int = 23  # Per-volume GN iterations (matches 3dvolreg -maxite)
     twopass: bool = False  # Coarse blur + fine pass
@@ -324,7 +326,8 @@ def _shear_resample_fn(
     """
     warped = shear_resample(source, matrix, tuple(output_shape), interp)
     if warped is None:
-        warped = resample_affine_fast(source, matrix, coords, interp, output_shape)
+        poly = split_fourier_mode(interp)[1]
+        warped = resample_affine_fast(source, matrix, coords, poly, output_shape)
     return warped
 
 
@@ -1619,6 +1622,16 @@ def moco(
     # ~69% of voxels with non-zero weight saves nothing and would cost the
     # decomposition. The full-volume shear beats the masked gather outright
     # (66ms vs 179ms eager, 104x104x66 heptic), so keep the volume intact.
+    if split_fourier_mode(config.interp)[0] and not (
+        config.cost == "wls" and (batched_eligible or use_shear_est)
+    ):
+        # Only the shear solvers move rows by FFT; the gather paths have no
+        # Fourier kernel, and substituting heptic would quietly undo the request.
+        raise ValueError(
+            f"-interp {config.interp} needs the shear estimator: -cost wls, shear "
+            "resampling on, and (on CUDA) no -chain_init"
+        )
+
     use_masked = False
     if config.cost == "wls" and not batched_eligible and not use_shear_est:
         mask_idx = (weight.reshape(-1) > 0).nonzero(as_tuple=True)[0]

@@ -1214,7 +1214,10 @@ def moco_resample_bytes(nz: int, ny: int, nx: int, batch: int, interp: str = "ws
     """
     ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
     vol_bytes = nz * ny * nx * 4  # float32
-    return (5 * batch + 6 * ntaps) * vol_bytes
+    # A Fourier shear holds, per volume, the gathered lanes, their spectrum,
+    # the phase ramp and the inverse on top of the ping-pong buffers.
+    per_vol = 9 if interp.startswith("fourier") else 5
+    return (per_vol * batch + 6 * ntaps) * vol_bytes
 
 
 def compute_moco_resample_batch_size(
@@ -1260,7 +1263,7 @@ def compute_moco_resample_batch_size(
     ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
 
     vol_bytes = nz * ny * nx * 4  # float32
-    per_vol_bytes = 5 * vol_bytes
+    per_vol_bytes = (9 if interp.startswith("fourier") else 5) * vol_bytes
     kernel_overhead_bytes = 6 * ntaps * vol_bytes
 
     available = get_available_memory(device)
