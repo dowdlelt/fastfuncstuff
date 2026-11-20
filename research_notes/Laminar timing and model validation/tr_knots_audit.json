@@ -521,7 +521,7 @@
   },
   "afni_referee": {
     "available": true,
-    "binary": "/opt/mrisoftware/abin/3dDeconvolve",
+    "binary": "3dDeconvolve",
     "cases": {
       "0.0": {
         "corrected_vs_afni_max": 0.0,

@@ -181,7 +181,7 @@ def afni_referee():
                     np.abs(reference_design(onsets, bot, top, 400) - expected).max()
                 ),
             }
-    return {"available": True, "binary": afni, "cases": results}
+    return {"available": True, "binary": Path(afni).name, "cases": results}
 
 
 def rank_checks():
