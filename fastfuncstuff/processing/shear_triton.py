@@ -164,6 +164,160 @@ def _unpack_ab(ax: Tensor, scl: Tensor) -> tuple[Tensor, Tensor]:
     return a, b
 
 
+@triton.jit
+def _phase_ramp_kernel(
+    spec,  # float32 view of a complex64 (B, S0, S1, S2) spectrum, any strides
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    S0,
+    S1,
+    S2,
+    sb,  # strides in complex elements: rfft along a middle axis returns the
+    s0,  # frequency axis innermost, and a .contiguous() copy of it cost more
+    s1,  # than the ramp itself
+    s2,
+    n_fft,
+    c1,
+    c2,
+    blocks_per_vol,
+    K_DIM: tl.constexpr,
+    P1_DIM: tl.constexpr,
+    P2_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """spec *= exp(-2 pi i (k/n) (a (p1 - c1) + b (p2 - c2) + s)), in place.
+
+    One pass over the spectrum with the ramp computed on the fly; building it
+    as three broadcast factors cost three full complex passes (22 of 59 ms per
+    58-volume 160x160x114 batch).
+    """
+    pid = tl.program_id(0)
+    vol = pid // blocks_per_vol
+    r = (pid % blocks_per_vol) * BLOCK + tl.arange(0, BLOCK)
+    per_vol = S0 * S1 * S2
+    m = r < per_vol
+    i0 = r // (S1 * S2)
+    i1 = (r // S2) % S1
+    i2 = r % S2
+    k = tl.where(K_DIM == 0, i0, tl.where(K_DIM == 1, i1, i2)).to(tl.float32)
+    p1 = tl.where(P1_DIM == 0, i0, tl.where(P1_DIM == 1, i1, i2)).to(tl.float32)
+    p2 = tl.where(P2_DIM == 0, i0, tl.where(P2_DIM == 1, i1, i2)).to(tl.float32)
+    a = tl.load(a_ptr + vol)
+    b = tl.load(b_ptr + vol)
+    s = tl.load(s_ptr + vol)
+    ang = -6.283185307179586 * (k / n_fft) * (a * (p1 - c1) + b * (p2 - c2) + s)
+    # The inverse FFT's 1/n rides here: irfft(norm="forward") skips its own pass.
+    cs = tl.cos(ang) / n_fft
+    sn = tl.sin(ang) / n_fft
+    base = (vol.to(tl.int64) * sb + i0.to(tl.int64) * s0 + i1 * s1 + i2 * s2) * 2
+    re = tl.load(spec + base, mask=m)
+    im = tl.load(spec + base + 1, mask=m)
+    tl.store(spec + base, re * cs - im * sn, mask=m)
+    tl.store(spec + base + 1, re * sn + im * cs, mask=m)
+
+
+# fr-axis -> (tensor dim within (nz, ny, nx), p1 dim, p2 dim), as shear._AXIS_INFO
+_FFT_DIMS = {0: (2, 1, 0), 1: (1, 2, 0), 2: (0, 2, 1)}
+
+
+def _fourier_shears_shared(
+    sources: Tensor,
+    order: list[int],
+    a4: Tensor,
+    b4: Tensor,
+    s4: Tensor,
+    fft_axes: tuple[int, ...],
+    mode_id: int,
+) -> Tensor:
+    """The four shears when every volume shares the axis order (``common`` plan):
+    each step is one in-place FFT ramp or one Triton pass over the whole batch,
+    with no per-axis gathers."""
+    B, nz, ny, nx = sources.shape
+    sizes = (nz, ny, nx)
+    nxyz = nx * ny * nz
+    BLOCK = 256
+    blocks_per_vol = (nxyz + BLOCK - 1) // BLOCK
+    half = {0: (nx - 1) / 2.0, 1: (ny - 1) / 2.0, 2: (nz - 1) / 2.0}
+    p_axes = {0: (1, 2), 1: (0, 2), 2: (0, 1)}  # fr ids of the two driving axes
+    # AFNI skips a shear under 1e-3 voxel; a zero ramp is exactly that.
+    st = torch.stack(
+        [
+            a4[:, i].abs() * half[p_axes[order[i]][0]]
+            + b4[:, i].abs() * half[p_axes[order[i]][1]]
+            + s4[:, i].abs()
+            for i in range(4)
+        ],
+        dim=1,
+    )
+    live = (st >= 1.0e-3).to(torch.float32)
+    a_l = (a4.to(torch.float32) * live).contiguous()
+    b_l = (b4.to(torch.float32) * live).contiguous()
+    s_l = (s4.to(torch.float32) * live).contiguous()
+    ax_i = torch.tensor(order, dtype=torch.int32, device=sources.device).expand(B, 4).contiguous()
+    cur = sources.contiguous()
+    for step, v in enumerate(order):
+        if v in fft_axes:
+            kd, p1d, p2d = _FFT_DIMS[v]
+            n = sizes[kd]
+            spec = torch.fft.rfft(cur, dim=kd + 1)
+            # Walk the spectrum in memory order (innermost stride last) so the
+            # loads coalesce; logical (i0, i1, i2) indices follow the permutation.
+            shp, std = spec.shape[1:], spec.stride()[1:]
+            phys = sorted(range(3), key=lambda dd: -std[dd])
+            S0, S1, S2 = (shp[dd] for dd in phys)
+            s0, s1, s2 = (std[dd] for dd in phys)
+            sb = spec.stride(0)
+            kd_p, p1d_p, p2d_p = phys.index(kd), phys.index(p1d), phys.index(p2d)
+            bpv = (S0 * S1 * S2 + BLOCK - 1) // BLOCK
+            _phase_ramp_kernel[(B * bpv,)](
+                torch.view_as_real(spec),
+                a_l[:, step].contiguous(),
+                b_l[:, step].contiguous(),
+                s_l[:, step].contiguous(),
+                S0,
+                S1,
+                S2,
+                sb,
+                s0,
+                s1,
+                s2,
+                float(n),
+                half[p_axes[v][0]],
+                half[p_axes[v][1]],
+                bpv,
+                K_DIM=kd_p,
+                P1_DIM=p1d_p,
+                P2_DIM=p2d_p,
+                BLOCK=BLOCK,
+            )
+            cur = torch.fft.irfft(spec, n=n, dim=kd + 1, norm="forward")
+        else:
+            # Explicitly contiguous: after a y-axis inverse FFT ``cur`` is strided,
+            # empty_like would copy that layout, and out.reshape would then be a
+            # copy the kernel writes into while ``out`` stays uninitialized.
+            cur = cur.contiguous()
+            out = torch.empty((B, nz, ny, nx), device=cur.device, dtype=cur.dtype)
+            _shear_step_kernel[(B * blocks_per_vol,)](
+                cur.reshape(B, nxyz),
+                out.reshape(B, nxyz),
+                ax_i,
+                a_l,
+                b_l,
+                s_l,
+                B,
+                nx,
+                ny,
+                nz,
+                blocks_per_vol,
+                step,
+                MODE=mode_id,
+                BLOCK=BLOCK,
+            )
+            cur = out
+    return cur
+
+
 def _fourier_shears(
     sources: Tensor,
     ax: Tensor,
@@ -226,6 +380,41 @@ def _fourier_shears(
     return cur.reshape(B, nz, ny, nx)
 
 
+def _fourier_grouped(sources, matrices, shape, ax, a4, b4, sft, valid, fft_axes, mode_id):
+    """Fourier shears in groups that each share one axis order.
+
+    The common plan rejects lanes it would condition badly; those form the
+    next group with an order of their own (one or two groups in practice), so
+    every factorizable lane stays batched. Re-solving them one volume at a
+    time instead cost 6x the whole estimation. Lanes no order can factor
+    (exact single-axis) come back invalid for the caller, as before.
+    """
+    B = sources.shape[0]
+    out = sources.clone()
+    done = torch.zeros(B, dtype=torch.bool, device=sources.device)
+    lanes = torch.arange(B, device=sources.device)
+    for _ in range(6):
+        if not bool(valid.any()):
+            break
+        sel = lanes[valid]
+        order = ax[valid][0].tolist()
+        whole = sel.numel() == B and lanes.numel() == B
+        src = sources if whole else sources[sel]
+        res = _fourier_shears_shared(
+            src, order, a4[valid], b4[valid], sft[valid], fft_axes, mode_id
+        )
+        if whole:
+            return res, valid
+        out[sel] = res
+        done[sel] = True
+        lanes = lanes[~valid]
+        if lanes.numel() == 0:
+            break
+        ax, scl, sft, valid = rigid_matrix_to_shears(matrices[lanes], shape, common=True)
+        a4, b4 = _unpack_ab(ax, scl)
+    return out, done
+
+
 def shear_resample_triton(
     sources: Tensor, matrices: Tensor, shape: tuple[int, int, int], mode: str
 ) -> tuple[Tensor, Tensor]:
@@ -239,10 +428,10 @@ def shear_resample_triton(
     B, nz, ny, nx = sources.shape
     fft_axes, poly = split_fourier_mode(mode)
     mode_id = _MODE_ID[poly]
-    ax, scl, sft, valid = rigid_matrix_to_shears(matrices, shape)
+    ax, scl, sft, valid = rigid_matrix_to_shears(matrices, shape, common=bool(fft_axes))
     a4, b4 = _unpack_ab(ax, scl)  # (B,4)
     if fft_axes:
-        return _fourier_shears(sources, ax, a4, b4, sft, fft_axes, mode_id), valid
+        return _fourier_grouped(sources, matrices, shape, ax, a4, b4, sft, valid, fft_axes, mode_id)
     ax_i = ax.to(torch.int32).contiguous()
     a4 = a4.to(torch.float32).contiguous()
     b4 = b4.to(torch.float32).contiguous()

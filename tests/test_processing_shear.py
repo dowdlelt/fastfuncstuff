@@ -419,10 +419,21 @@ def test_fourier_shear_rotation_tracks_heptic():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("mode", ["fourier", "fourier3d"])
-def test_batched_fourier_shear_matches_single_volume(mode):
+@pytest.mark.parametrize("perm", range(6))
+def test_shared_fourier_path_matches_general_path(mode, perm):
+    """The shared-order fast path (one FFT or Triton pass per step, fused ramp)
+    must equal the general per-lane implementation on the same plan, for every
+    axis order. Order z,x,y,z once returned uninitialized memory: a Triton step
+    after a y-axis inverse FFT wrote into a reshape copy of a strided buffer."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA/Triton required")
-    from fastfuncstuff.processing.shear_triton import shear_resample_triton
+    from fastfuncstuff.processing import shear as S
+    from fastfuncstuff.processing.shear_triton import (
+        _MODE_ID,
+        _fourier_shears,
+        _fourier_shears_shared,
+        _unpack_ab,
+    )
 
     nt, nz, ny, nx = 6, 20, 36, 40
     base = _make_volume(nz, ny, nx, seed=7)
@@ -431,13 +442,71 @@ def test_batched_fourier_shear_matches_single_volume(mode):
     for _ in range(nt):
         r = torch.randn(6, generator=g)
         mats.append(_rigid_matrix(*(r[:3] * 0.6).tolist(), *(r[3:] * 1.0).tolist()))
-    mats = torch.stack(mats)
-    src = base[None].expand(nt, nz, ny, nx).contiguous()
-    batched, valid = shear_resample_triton(src.cuda(), mats.cuda(), (nz, ny, nx), mode)
+    M = torch.stack(mats).double()
+    # the plan for one forced permutation, as _shear_best builds it
+    c = torch.tensor([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0], dtype=torch.float64)
+    A, t = M[:, :3, :3], M[:, :3, 3]
+    q = torch.linalg.inv(A)
+    d = -(q @ ((A @ c) + t - c).unsqueeze(-1)).squeeze(-1)
+    pi = list(S._PERMS[perm])
+    idx = torch.tensor(pi)
+    ax, scl, sft, valid = S._shear_xzyx(q[:, idx][:, :, idx], d[:, idx])
+    ax, scl, sft = S._permute_back(ax, scl, sft, pi)
     assert bool(valid.all())
-    for i in range(nt):
-        single = shear_resample(base, mats[i], (nz, ny, nx), mode)
-        torch.testing.assert_close(batched[i].cpu(), single, rtol=1e-4, atol=1e-4)
+    a4, b4 = _unpack_ab(ax, scl)
+    fft_axes, poly = S.split_fourier_mode(mode)
+    src = base[None].expand(nt, nz, ny, nx).contiguous().cuda()
+    a4, b4, sft, ax = a4.float().cuda(), b4.float().cuda(), sft.float().cuda(), ax.cuda()
+    order = ax[0].tolist()
+    shared = _fourier_shears_shared(src, order, a4, b4, sft, fft_axes, _MODE_ID[poly])
+    general = _fourier_shears(src, ax, a4, b4, sft, fft_axes, _MODE_ID[poly])
+    torch.testing.assert_close(shared, general, rtol=1e-4, atol=1e-4)
+
+
+def test_common_plan_rejects_badly_conditioned_lanes():
+    """One axis order for the batch is only taken where it is well conditioned:
+    near a lane's degenerate axis the factorization returns large cancelling
+    shears (0.65 on a real 0.9 deg run), which sent GN 7 mm astray. Every lane
+    left valid must have a shear norm within 2x (+0.01) of its own best."""
+    from fastfuncstuff.processing import shear as S
+
+    g = torch.Generator().manual_seed(5)
+    mats = [
+        _rigid_matrix(
+            *(torch.randn(3, generator=g) * 0.3).tolist(),
+            *(torch.randn(3, generator=g) * 0.6).tolist(),
+        )
+        for _ in range(12)
+    ]
+    mats.append(_rigid_matrix(0.1, 0.0, 0.0, 0.9, 1e-4, 1e-4))  # nearly single-axis
+    mats.append(_rigid_matrix(0.0, 0.1, 0.0, 1e-4, 0.9, 1e-4))
+    M = torch.stack(mats).double()
+    ax, scl, sft, valid = rigid_matrix_to_shears(M, (24, 40, 44), common=True)
+    # recompute each lane's per-permutation norms the way _shear_best does
+    q = torch.linalg.inv(M[:, :3, :3])
+    B = len(M)
+    idxs = [torch.tensor(p) for p in S._PERMS]
+    qq = torch.cat([q[:, i][:, :, i] for i in idxs])
+    xx = torch.zeros(6 * B, 3, dtype=torch.float64)
+    a6, s6, f6, v6 = S._shear_xzyx(qq, xx)
+    norms = torch.stack(
+        [
+            S._norm_3shear(
+                *S._permute_back(
+                    a6[k * B : (k + 1) * B],
+                    s6[k * B : (k + 1) * B],
+                    f6[k * B : (k + 1) * B],
+                    list(p),
+                )[:2],
+                v6[k * B : (k + 1) * B],
+            )
+            for k, p in enumerate(S._PERMS)
+        ],
+        dim=1,
+    )
+    chosen = S._norm_3shear(ax, scl, torch.ones(B, dtype=torch.bool))
+    best = norms.min(dim=1).values
+    assert bool((chosen[valid] <= 2 * best[valid] + 0.01 + 1e-9).all())
 
 
 def test_plan_reproduces_mm_rotation_on_anisotropic_voxels():

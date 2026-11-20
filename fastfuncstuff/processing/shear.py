@@ -435,9 +435,12 @@ def _permute_back(ax: Tensor, scl: Tensor, sft: Tensor, pi: list[int]):
 _PERMS = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
 
 
-def _shear_best(q: Tensor, d: Tensor):
+def _shear_best(q: Tensor, d: Tensor, common: bool = False):
     """6-way axis-permutation search; returns the min-shear-norm plan per lane.
 
+    ``common``: one permutation for every lane -- the valid-everywhere one with
+    the smallest worst-lane shear -- so each of the four steps runs along a
+    single axis for the whole batch (per-lane choice when none is valid for all).
     Returns (ax (B,4), scl (B,4,3), sft (B,4), valid (B,)).
     """
     B = q.shape[0]
@@ -468,6 +471,24 @@ def _shear_best(q: Tensor, d: Tensor):
         norms.append(_norm_3shear(ax, scl, valid))
 
     norms = torch.stack(norms, dim=1)  # (B,6)
+    if common:
+        # Lanes no permutation can factor (identity, exact single-axis) take
+        # their own route downstream, so they do not get a vote.
+        valid_k = norms < _BIG_NORM  # (B,6)
+        voters = valid_k.any(dim=1)
+        ok = (valid_k | ~voters[:, None]).all(dim=0)  # (6,)
+        if bool(ok.any()) and bool(voters.any()):
+            big = torch.full_like(norms[0], _BIG_NORM)
+            worst = torch.where(ok, torch.where(voters[:, None], norms, 0.0).max(dim=0).values, big)
+            k = int(worst.argmin())
+            ax_k, scl_k, sft_k, _ = plans[k]
+            # Valid is not well conditioned: near a lane's degenerate axis the
+            # factorization returns large cancelling shears, whose zero-filled
+            # slice-axis step lost content and sent GN 7 mm astray on a sweep of
+            # single-axis rotations. Such lanes go back to the per-lane route.
+            own_best = norms.min(dim=1).values
+            fine = norms[:, k] <= 2.0 * own_best + 0.01
+            return ax_k, scl_k, sft_k, voters & fine
     best = norms.argmin(dim=1)
     any_valid = norms.min(dim=1).values < _BIG_NORM
     ar = torch.arange(B, device=device)
@@ -515,7 +536,7 @@ def _reconstruct_pull(
     return Lt, bt
 
 
-def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
+def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int], common: bool = False):
     """Decompose a voxel-index pull matrix into a 4-shear plan (shear_best).
 
     ``matrix`` (4,4) or (B,4,4) maps output index (i,j,k) to source sample
@@ -565,17 +586,31 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     )
     near_id = (trace >= 2.99999) & (esum / trace.clamp(min=1e-12) < 1.0e-6)
 
-    ax, scl, sft, any_valid = _shear_best(q, d)
+    ax, scl, sft, any_valid = _shear_best(q, d, common=common)
+    shared = common and bool((ax == ax[:1]).all())
 
     # overwrite near-identity lanes with a trivial plan (shifts d only)
     if bool(near_id.any()):
-        triv_ax = torch.tensor([0, 1, 2, 0], device=device).expand(B, 4)
-        triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
-        triv_scl[:, 0, 0] = 1.0
-        triv_scl[:, 1, 1] = 1.0
-        triv_scl[:, 2, 2] = 1.0
-        triv_scl[:, 3, 0] = 1.0
-        triv_sft = torch.stack([torch.zeros_like(d[:, 0]), d[:, 1], d[:, 2], d[:, 0]], dim=-1)
+        if shared:
+            # Same axis order as the batch: zero shears, each axis's shift on its
+            # last step (the order is a,b,c,a, so the first step carries none).
+            order = ax[0].tolist()
+            triv_ax = ax[:1].expand(B, 4)
+            triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
+            cols = []
+            for st, a_st in enumerate(order):
+                triv_scl[:, st, a_st] = 1.0
+                last = a_st not in order[st + 1 :]
+                cols.append(d[:, a_st] if last else torch.zeros_like(d[:, 0]))
+            triv_sft = torch.stack(cols, dim=-1)
+        else:
+            triv_ax = torch.tensor([0, 1, 2, 0], device=device).expand(B, 4)
+            triv_scl = torch.zeros(B, 4, 3, device=device, dtype=dtype)
+            triv_scl[:, 0, 0] = 1.0
+            triv_scl[:, 1, 1] = 1.0
+            triv_scl[:, 2, 2] = 1.0
+            triv_scl[:, 3, 0] = 1.0
+            triv_sft = torch.stack([torch.zeros_like(d[:, 0]), d[:, 1], d[:, 2], d[:, 0]], dim=-1)
         m = near_id
         ax = torch.where(m[:, None], triv_ax, ax)
         scl = torch.where(m[:, None, None], triv_scl, scl)
@@ -820,10 +855,23 @@ def _apply_one_shear(
     shp1[p1dim] = sizes[p1fr]
     shp2 = [1, 1, 1]
     shp2[p2dim] = sizes[p2fr]
-    af = a * coord1.reshape(shp1) + b * coord2.reshape(shp2) + s
     fft_axes, poly = split_fourier_mode(mode)
     if fr_axis in fft_axes:
-        return fft_shift_rows(vol, tdim, af)
+        # The ramp exp(-2 pi i k (a c1 + b c2 + s)) as three small broadcast
+        # factors: a full-size complex exp was the costliest op of a CPU moco run.
+        n = sizes[fr_axis]
+        spec = torch.fft.rfft(vol, dim=tdim)
+        k_shape = [1, 1, 1]
+        k_shape[tdim] = n // 2 + 1
+        k = torch.fft.rfftfreq(n, device=device, dtype=dtype).reshape(k_shape)
+        w = -2j * math.pi
+        for coef, crd in ((a, coord1.reshape(shp1)), (b, coord2.reshape(shp2))):
+            if coef != 0.0:
+                spec *= torch.exp((coef * k * crd) * w)
+        if s != 0.0:
+            spec *= torch.exp((s * k) * w)
+        return torch.fft.irfft(spec, n=n, dim=tdim)
+    af = a * coord1.reshape(shp1) + b * coord2.reshape(shp2) + s
     return (interp_fn or _interp_1d_along)(vol, tdim, af, poly)
 
 
