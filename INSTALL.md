@@ -124,6 +124,15 @@ With no `-suma` and no `-fs_subj`, a pipeline needs FreeSurfer only for `mri_syn
 | `ffs_viewer` | PySide6 (installed by default) | `fd` is optional and makes browsing large result trees faster. |
 | Benchmark (`ffs_benchmark`) | `aws` CLI; AFNI; MATLAB; FSL `melodic` | `aws` downloads the OpenNeuro datasets (`ds005165`, `ds003427`) from `s3://openneuro.org` with `--no-sign-request` into `$FFS_BENCHMARK_DATA_DIR` (default `test_data/`). AFNI (`3dvolreg`, `3dDeconvolve`, `3dREMLfit`, ...), MATLAB (NORDIC, GLMsingle) and `melodic` are the *reference* implementations. A stage whose reference is missing is skipped. |
 
+The optional `nordic` and `sauna` benchmark stages use a paired magnitude and
+phase scan supplied by the caller. Place exactly one BIDS
+`*_part-mag_bold.nii.gz` and matching `*_part-phase_bold.nii.gz` in
+`nordic_test_data/` under the benchmark data directory. This protocol expects
+three trailing noise volumes. Set `NORDIC_MATLAB_PATH` to generate the reference
+with MATLAB, then run the optional stages with `-stages nordic,sauna`.
+Use a fresh benchmark data directory for a different pair so cached outputs
+belong to the selected scan.
+
 **Templates**
 - **SPM tissue-probability map** (`tpm/TPM.nii` from your SPM install). It is the group prior for
   `-anat_nonlin`, `-presurf` and `ffs_segment` when there is no `-suma`. Give it as `-spm_tpm FILE`

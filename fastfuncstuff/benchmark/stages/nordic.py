@@ -11,6 +11,7 @@ Validation:
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 from pathlib import Path
 
@@ -21,10 +22,6 @@ from ..runner import BenchmarkContext, run_timed
 name = "nordic"
 description = "NORDIC denoising (MATLAB NIFTI_NORDIC vs ffs_nordic)"
 
-MAGN = "sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii.gz"
-PHASE = "sub-3003_ses-fine_task-expres_run-1_part-phase_bold.nii.gz"
-REF_OUT = "NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii"
-REF_GFACTOR = "gfactor_NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.nii"
 FFS_PREFIX = "ffs_nordic_defaults"
 NOISE_VOLS = 3
 
@@ -54,6 +51,26 @@ def _nordic_dir(ctx: BenchmarkContext) -> Path:
     return get_benchmark_data_dir() / "nordic_test_data"
 
 
+def _nordic_inputs(directory: Path) -> tuple[Path, Path]:
+    """Resolve the single magnitude/phase pair selected for this benchmark."""
+    magnitudes = sorted(directory.glob("*_part-mag_bold.nii.gz"))
+    if len(magnitudes) != 1:
+        raise ValueError(
+            f"Expected one *_part-mag_bold.nii.gz in {directory}; found {len(magnitudes)}"
+        )
+    magnitude = magnitudes[0]
+    phase = magnitude.with_name(
+        magnitude.name.removesuffix("_part-mag_bold.nii.gz") + "_part-phase_bold.nii.gz"
+    )
+    if not phase.is_file():
+        raise ValueError(f"Missing phase input: {phase}")
+    return magnitude, phase
+
+
+def _reference_path(magnitude: Path) -> Path:
+    return magnitude.with_name(f"NORDIC_{magnitude.name.removesuffix('.gz')}")
+
+
 def _nordic_toolbox() -> str | None:
     """Find the NORDIC MATLAB toolbox configured by the caller."""
     env = os.environ.get("NORDIC_MATLAB_PATH")
@@ -66,19 +83,25 @@ def _nordic_toolbox() -> str | None:
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     nd = _nordic_dir(ctx)
+    try:
+        magnitude, _ = _nordic_inputs(nd)
+    except ValueError as exc:
+        return [str(exc)]
+    ref = _reference_path(magnitude)
     missing = []
 
-    for f in (MAGN, PHASE):
-        if not (nd / f).exists():
-            missing.append(str(nd / f))
-
     if ctx.validate_only:
-        for f in (REF_OUT, REF_GFACTOR, f"{FFS_PREFIX}.nii.gz", f"{FFS_PREFIX}_gfactor.nii.gz"):
+        for f in (
+            ref.name,
+            f"gfactor_{ref.name}",
+            f"{FFS_PREFIX}.nii.gz",
+            f"{FFS_PREFIX}_gfactor.nii.gz",
+        ):
             if not (nd / f).exists():
                 missing.append(str(nd / f))
     else:
         # Need MATLAB + toolbox to regenerate ref, OR pre-computed ref output
-        ref_exists = (nd / REF_OUT).exists()
+        ref_exists = ref.is_file() and not ctx.force_ref
         if not ref_exists:
             if not shutil.which("matlab"):
                 missing.append("matlab not found on PATH (needed to generate NORDIC reference)")
@@ -94,7 +117,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run MATLAB NIFTI_NORDIC to produce reference denoised output."""
     nd = _nordic_dir(ctx)
-    ref = nd / REF_OUT
+    magnitude, phase = _nordic_inputs(nd)
+    ref = _reference_path(magnitude)
 
     if ref.exists() and not ctx.force_ref:
         print("  Skipping MATLAB NORDIC (output exists, use -force-ref to re-run)")
@@ -104,20 +128,22 @@ def run_ref(ctx: BenchmarkContext) -> float:
     if toolbox is None or not shutil.which("matlab"):
         raise RuntimeError("MATLAB or NORDIC toolbox not available for run_ref")
 
-    fn_out = REF_OUT[:-4]  # strip .nii — NIFTI_NORDIC appends it
-    matlab_cmd = (
-        f'matlab -batch "'
-        f"cd('{nd}'); "
-        f"addpath(genpath('{toolbox}')); "
-        f"ARGA.temporal_phase = 1; "
-        f"ARGA.phase_filter_width = 10; "
+    toolbox_mat, magn_mat, phase_mat, output_mat = (
+        value.replace("'", "''") for value in (toolbox, magnitude.name, phase.name, ref.stem)
+    )
+    script = (
+        f"addpath(genpath('{toolbox_mat}')); "
+        "ARGA.temporal_phase = 1; "
+        "ARGA.phase_filter_width = 10; "
         f"ARGA.noise_volume_last = {NOISE_VOLS}; "
-        f"ARGA.NORDIC = 1; "
-        f"ARGA.save_gfactor_map = 1; "
-        f"NIFTI_NORDIC('{MAGN}', '{PHASE}', '{fn_out}', ARGA);\""
+        "ARGA.NORDIC = 1; "
+        "ARGA.save_gfactor_map = 1; "
+        f"NIFTI_NORDIC('{magn_mat}', '{phase_mat}', '{output_mat}', ARGA);"
     )
 
-    elapsed, _ = run_timed(matlab_cmd, label="MATLAB NIFTI_NORDIC", cwd=nd)
+    elapsed, _ = run_timed(
+        f"matlab -batch {shlex.quote(script)}", label="MATLAB NIFTI_NORDIC", cwd=nd
+    )
     return elapsed
 
 
@@ -130,10 +156,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         print("  Skipping ffs_nordic (output exists, use -force-ffs to re-run)")
         return 0.0
 
+    magnitude, phase = _nordic_inputs(nd)
     elapsed, _ = run_timed(
         f"ffs_nordic "
-        f"-input-magn {MAGN} "
-        f"-input-phase {PHASE} "
+        f"-input-magn {shlex.quote(magnitude.name)} "
+        f"-input-phase {shlex.quote(phase.name)} "
         f"-prefix {FFS_PREFIX} "
         f"-noise-volume-last {NOISE_VOLS} "
         # MATLAB's estimator and g-factor overlap, so the reference stays apples-to-apples
@@ -153,9 +180,10 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare ffs_nordic output against MATLAB NORDIC reference."""
     nd = _nordic_dir(ctx)
 
-    ref_path = nd / REF_OUT
+    magnitude, _ = _nordic_inputs(nd)
+    ref_path = _reference_path(magnitude)
     ffs_path = nd / f"{FFS_PREFIX}.nii.gz"
-    ref_gf_path = nd / REF_GFACTOR
+    ref_gf_path = nd / f"gfactor_{ref_path.name}"
     ffs_gf_path = nd / f"{FFS_PREFIX}_gfactor.nii.gz"
 
     for p in (ref_path, ffs_path):

@@ -11,17 +11,17 @@ Validation:
 
 from __future__ import annotations
 
+import shlex
+
 import numpy as np
 
 from ..runner import BenchmarkContext, run_timed
 from .nordic import (
-    MAGN,
     NOISE_VOLS,
-    PHASE,
-    REF_GFACTOR,
-    REF_OUT,
     _get_fdata,
     _nordic_dir,
+    _nordic_inputs,
+    _reference_path,
     _ts_corr_median,
 )
 
@@ -38,17 +38,14 @@ THRESHOLDS = {
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     nd = _nordic_dir(ctx)
+    try:
+        magnitude, _ = _nordic_inputs(nd)
+    except ValueError as exc:
+        return [str(exc)]
+    ref = _reference_path(magnitude)
     missing = []
-
-    for f in (MAGN, PHASE):
-        if not (nd / f).exists():
-            missing.append(str(nd / f))
-
-    # NORDIC reference must exist (produced by the nordic stage)
-    if not (nd / REF_OUT).exists():
-        missing.append(
-            f"{nd / REF_OUT}  (run the 'nordic' stage first to produce NORDIC reference)"
-        )
+    if not ref.is_file():
+        missing.append(f"{ref}  (run the 'nordic' stage first to produce NORDIC reference)")
 
     if ctx.validate_only:
         for f in (f"{FFS_PREFIX}.nii.gz", f"{FFS_PREFIX}_gfactor.nii.gz"):
@@ -67,10 +64,11 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         print("  Skipping ffs_sauna (output exists, use -force-ffs to re-run)")
         return 0.0
 
+    magnitude, phase = _nordic_inputs(nd)
     elapsed, _ = run_timed(
         f"ffs_sauna "
-        f"-input-magn {MAGN} "
-        f"-input-phase {PHASE} "
+        f"-input-magn {shlex.quote(magnitude.name)} "
+        f"-input-phase {shlex.quote(phase.name)} "
         f"-prefix {FFS_PREFIX} "
         f"-noise-volume-last {NOISE_VOLS} "
         f"-decomp-method eigh "
@@ -89,9 +87,10 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare ffs_sauna output against MATLAB NORDIC reference."""
     nd = _nordic_dir(ctx)
 
-    ref_path = nd / REF_OUT
+    magnitude, _ = _nordic_inputs(nd)
+    ref_path = _reference_path(magnitude)
     ffs_path = nd / f"{FFS_PREFIX}.nii.gz"
-    ref_gf_path = nd / REF_GFACTOR
+    ref_gf_path = nd / f"gfactor_{ref_path.name}"
     ffs_gf_path = nd / f"{FFS_PREFIX}_gfactor.nii.gz"
 
     for p in (ref_path, ffs_path):
