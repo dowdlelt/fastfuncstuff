@@ -25,6 +25,7 @@ import time
 import torch
 from torch import Tensor
 
+from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.utils import linalg_device, prefer_cpu_row_convolution
 
 from . import interp as _interp
@@ -549,7 +550,7 @@ def rigid_matrix_to_shears(matrix: Tensor, shape: tuple[int, int, int]):
     # D^-1 R D, whose inverse is D^-1 R^T D. The transpose left those plans off
     # by ~4e-3 in the linear part and 0.2 voxel in the shift, inside the guard.
     d_c = (A @ c) + t - c
-    q = torch.linalg.inv(A)
+    q = plinalg.inv(A)
     d = -(q @ d_c.unsqueeze(-1)).squeeze(-1)
 
     # near-identity special case (shear_best): trivial shears, shifts only.
