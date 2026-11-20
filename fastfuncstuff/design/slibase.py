@@ -15,6 +15,7 @@ Slices are the 3rd spatial (z) axis, matching AFNI's storage-order convention.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -67,18 +68,40 @@ def build_slice_blocks(
     ``files`` use slice-minor ordering (``-slibase``); ``files_sm`` use slice-major
     (``-slibase_sm``). Regressors from every file are concatenated along the last
     axis (``M`` = total regressors per slice). Returns the block plus one nuisance
-    label per regressor (``slibase#k``).
+    label per regressor: the file's own ColumnLabels for slice 0 with the slice
+    prefix dropped (ffs_physio's ``s000.card.c1`` -> ``card.c1``), else ``slibase#k``.
     """
     blocks: list[torch.Tensor] = []
-    for path in files or []:
-        blocks.append(_one_file_block(path, n_slices, n_timepoints, slice_major=False))
-    for path in files_sm or []:
-        blocks.append(_one_file_block(path, n_slices, n_timepoints, slice_major=True))
+    names: list[str | None] = []
+    for path, sm in [*((f, False) for f in files or []), *((f, True) for f in files_sm or [])]:
+        b = _one_file_block(path, n_slices, n_timepoints, slice_major=sm)
+        blocks.append(b)
+        got = _slice_labels(path, n_slices, b.shape[2], slice_major=sm)
+        names.extend(got if got is not None else [None] * b.shape[2])
     if not blocks:
         raise ValueError("build_slice_blocks called with no slibase files")
     slice_blocks = torch.cat(blocks, dim=2)  # (n_slices, n_time, M)
-    labels = [f"slibase#{k}" for k in range(slice_blocks.shape[2])]
+    labels = [n if n is not None else f"slibase#{k}" for k, n in enumerate(names)]
+    if len(set(labels)) < len(labels):  # two files with the same names
+        labels = [f"slibase#{k}" if n is None else f"{n}#{k}" for k, n in enumerate(names)]
     return slice_blocks, labels
+
+
+def _slice_labels(path: str, n_slices: int, m: int, slice_major: bool) -> list[str] | None:
+    """Slice 0's regressor names from a ``# ColumnLabels = "a ; b ; ..."`` header, the
+    leading ``sNNN.`` slice tag removed; None when absent or not one per column."""
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith("#"):
+                break
+            m_ = re.search(r'ColumnLabels\s*=\s*"([^"]*)"', line)
+            if m_:
+                labs = [x.strip() for x in m_.group(1).split(";")]
+                if len(labs) != n_slices * m:
+                    return None
+                first = labs[:m] if slice_major else labs[::n_slices][:m]
+                return [re.sub(r"^s\d+\.", "", x) for x in first]
+    return None
 
 
 def _one_file_block(path: str, n_slices: int, n_timepoints: int, slice_major: bool) -> torch.Tensor:

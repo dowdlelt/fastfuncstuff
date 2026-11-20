@@ -194,6 +194,8 @@ VOXEL_SCATTER_ATTRS = [
     "dsort_betas",
     "dsort_tstats",
     "ljung_box",
+    "set_fstats",
+    "set_sd",
 ]
 
 # The GLMResults equivalent of VOXEL_SCATTER_ATTRS (OLS has stderr/meanvol/r2_run
@@ -624,6 +626,11 @@ class ARMA11Results:
         self.fstats: torch.Tensor | None = (
             None  # (n_voxels,) - omnibus F-statistic across regressors
         )
+        # -nuisance_summary: per requested column set (fit_glm_arma11 column_sets), the
+        # Wald F of the set (whitened, df q and dof) and the SD over time of its fitted
+        # signal (data units). (n_voxels, n_sets) each.
+        self.set_fstats: torch.Tensor | None = None
+        self.set_sd: torch.Tensor | None = None
         self.dof: int | None = None  # Degrees of freedom (n_timepoints - n_regressors)
         self.tr: float | None = None  # Repetition time
         self.voxel_mask: torch.Tensor | None = None  # Optional boolean mask for sparse analyses
@@ -3258,6 +3265,7 @@ def _fit_dsort_gls_pass(
     want_ljung_box: bool = False,
     lj_max_lag: int | None = None,
     lj_tau: torch.Tensor | None = None,
+    column_sets: list[list[int]] | None = None,
 ) -> None:
     """Redo the final GLS per voxel with an extended ``[design | dsort_v]`` design.
 
@@ -3444,6 +3452,23 @@ def _fit_dsort_gls_pass(
             results.sigma2[idx] = sigma2.cpu()
             results.fstats[idx] = fstats.cpu()
             results.r2[idx] = r2.cpu()
+            if column_sets:
+                # Per voxel: the extended design differs, so its (X'X)^-1 block does.
+                assert results.set_fstats is not None and results.set_sd is not None
+                Xd = design.to(device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+                Xo = torch.cat([Xd, D.transpose(1, 2).to(dtype)], 2)
+                Xo = Xo - Xo.mean(1, keepdim=True)  # (B, n_time, p_ext), unwhitened
+                for g, cols in enumerate(column_sets):
+                    ix = torch.as_tensor(cols, device=device, dtype=torch.long)
+                    A = XtX_inv.index_select(1, ix).index_select(2, ix)
+                    b = betas.index_select(1, ix)
+                    eye_g = torch.eye(ix.numel(), device=device, dtype=dtype)
+                    quad = torch.einsum(
+                        "bi,bi->b", b, plinalg.solve(A + 1e-8 * eye_g, b.unsqueeze(2)).squeeze(2)
+                    )
+                    results.set_fstats[idx, g] = (quad / (ix.numel() * sigma2 + 1e-30)).cpu()
+                    sig = torch.einsum("bti,bi->bt", Xo.index_select(2, ix), b)
+                    results.set_sd[idx, g] = sig.std(dim=1, correction=0).cpu()
 
             # Partial / semi-partial R² per base regressor (from t and R²).
             if want_r2_partial or want_r2_semipartial:
@@ -3504,6 +3529,49 @@ def _fit_dsort_gls_pass(
     # Flush once at the end of the pass, not per sub-batch (a device sync each).
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+
+def _column_set_matrices(
+    XtX_inv: torch.Tensor, design: torch.Tensor, column_sets: list[list[int]]
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+    """Per column set: (indices, inverse of its (X'WX)^-1 block, covariance over time of
+    its unwhitened design columns). None for a set with no column in this design (a
+    -dsort column, before the per-voxel pass). Constant within an (a, b) group."""
+    p = design.shape[1]
+    Xc = design - design.mean(0, keepdim=True)
+    out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None] = []
+    for cols in column_sets:
+        keep = [c for c in cols if c < p]
+        if len(keep) != len(cols) or not keep:
+            out.append(None)
+            continue
+        ix = torch.as_tensor(keep, device=design.device, dtype=torch.long)
+        A = XtX_inv.index_select(0, ix).index_select(1, ix)
+        eye = torch.eye(len(keep), device=A.device, dtype=A.dtype)
+        Xs = Xc.index_select(1, ix)
+        out.append((ix, plinalg.inv(A + 1e-8 * eye), Xs.T @ Xs / design.shape[0]))
+    return out
+
+
+def _column_set_stats(
+    betas: torch.Tensor,
+    sigma2: torch.Tensor,
+    mats: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(F, SD) per voxel and set: F = b_S' A_SS^-1 b_S / (q sigma2), the Wald test of
+    the set; SD = sqrt(b_S' C_S b_S), the temporal SD of X_S b_S. NaN where a set is
+    not in this design."""
+    B, G = betas.shape[0], len(mats)
+    F = torch.full((B, G), float("nan"), device=betas.device, dtype=betas.dtype)
+    sd = torch.full_like(F, float("nan"))
+    for g, m in enumerate(mats):
+        if m is None:
+            continue
+        ix, Minv, C = m
+        b = betas.index_select(1, ix)
+        F[:, g] = torch.einsum("bi,ij,bj->b", b, Minv, b) / (ix.numel() * sigma2 + 1e-30)
+        sd[:, g] = torch.einsum("bi,ij,bj->b", b, C, b).clamp(min=0).sqrt()
+    return F, sd
 
 
 def _store_partial_semipartial(
@@ -3602,6 +3670,7 @@ def fit_glm_arma11(
     dsort_run_bounds: list[int] | None = None,
     want_dsort_nods: bool = False,
     tau: torch.Tensor | None = None,
+    column_sets: list[list[int]] | None = None,
 ) -> ARMA11Results:
     """
     Fit GLM with ARMA(1,1) prewhitening (AFNI 3dREMLfit style)
@@ -3695,6 +3764,12 @@ def fit_glm_arma11(
         Contrasts are evaluated inside the voxel-chunk loop, so the full
         ``var_betas`` (n_voxels × n_regressors × n_regressors) is never
         materialised -- at 322 regressors × 918k voxels that would be 762 GB.
+    column_sets : list of list of int, optional
+        Column sets of the full design (with -dsort, index ``n_regressors + k`` is
+        dsort column k) to test jointly: fills ``results.set_fstats`` (Wald F, df
+        ``len(set)`` and ``dof``) and ``results.set_sd`` (temporal SD of the set's
+        fitted signal, data units). Evaluated in-loop from each (a, b) group's
+        ``(X'WX)^-1``, so slicewise and voxelwise designs get their own.
 
     Returns
     -------
@@ -4094,6 +4169,11 @@ def fit_glm_arma11(
     results.reml_likelihood = torch.zeros(n_voxels, device=storage_device, dtype=dtype)
     results.sigma2 = torch.zeros(n_voxels, device=storage_device, dtype=dtype)
     results.fstats = torch.zeros(n_voxels, device=storage_device, dtype=dtype)
+    if column_sets:
+        results.set_fstats = torch.full(
+            (n_voxels, len(column_sets)), float("nan"), device=storage_device, dtype=dtype
+        )
+        results.set_sd = torch.full_like(results.set_fstats, float("nan"))
 
     # MEMORY OPTIMIZATION: Compute contrasts in-loop, never store full var_betas!
     # OLD approach: Store (n_voxels, n_reg, n_reg) covariance = 381 GB for 322 regressors
@@ -4801,6 +4881,9 @@ def fit_glm_arma11(
                     A_full_inv_group = R_qr_group.T @ R_qr_group
                 else:
                     A_full_inv_group = XwTXw_group  # already computed above
+            set_mats_group = (
+                _column_set_matrices(XwTXw_inv_group, design, column_sets) if column_sets else None
+            )
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -5417,6 +5500,11 @@ def fit_glm_arma11(
                 results.sigma2[sub_voxel_indices] = sigma2_batch.cpu()
                 results.fstats[sub_voxel_indices] = fstats_batch.cpu()
                 results.r2[sub_voxel_indices] = r2_batch.cpu()
+                if set_mats_group is not None:
+                    assert results.set_fstats is not None and results.set_sd is not None
+                    _sf, _ssd = _column_set_stats(betas_batch, sigma2_batch, set_mats_group)
+                    results.set_fstats[sub_voxel_indices] = _sf.cpu()
+                    results.set_sd[sub_voxel_indices] = _ssd.cpu()
 
                 # Store partial R² if requested
                 # NOTE: r2_partial_batch is already filtered to task columns in the computation above
@@ -5535,6 +5623,7 @@ def fit_glm_arma11(
         voxel_iterator = range(n_voxels)
         if verbose and n_voxels > 1000:
             voxel_iterator = tqdm(voxel_iterator, desc="Global ARMA fitting", unit="voxel")
+        _set_mats_global = None
 
         for v in voxel_iterator:
             y_v_cpu = data[v]
@@ -5567,6 +5656,16 @@ def fit_glm_arma11(
             sigma2 = (resid_w.to(_accum_dtype).pow(2).sum() / df).to(dtype)
             sigma2_cpu = sigma2.cpu()
             results.sigma2[v] = sigma2_cpu
+
+            if column_sets:
+                assert results.set_fstats is not None and results.set_sd is not None
+                if _set_mats_global is None:
+                    _set_mats_global = _column_set_matrices(
+                        plinalg.inv(XwTXw_reg), design_dev, column_sets
+                    )
+                _sf, _ssd = _column_set_stats(beta[None], sigma2.reshape(1), _set_mats_global)
+                results.set_fstats[v] = _sf[0].cpu()
+                results.set_sd[v] = _ssd[0].cpu()
 
             # t-statistics
             var_beta = sigma2 * plinalg.inv(XwTXw_reg)
@@ -5693,6 +5792,7 @@ def fit_glm_arma11(
             want_ljung_box=want_ljung_box,
             lj_max_lag=lj_max_lag,
             lj_tau=lj_tau,
+            column_sets=column_sets,
         )
         _n_dsort_cols = int(dsort.shape[1]) * (
             (len(dsort_run_bounds) - 1) if dsort_run_bounds is not None else 1
@@ -5718,6 +5818,8 @@ def fit_glm_arma11(
         # dsort coefficients scale like any beta (Y was divided by its std).
         if results.dsort_betas is not None:
             results.dsort_betas.mul_(scale_col)
+        if results.set_sd is not None:
+            results.set_sd.mul_(scale_col)
         # The _nods snapshot was taken in normalized units — unscale it too.
         _nods = results.nods_results
         if isinstance(_nods, ARMA11Results):
