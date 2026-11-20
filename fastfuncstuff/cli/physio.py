@@ -35,18 +35,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "samples away from their acquisition times. Output regressors are per slice,\n"
             "evaluated at each slice's own acquisition time, in the same 13-per-slice\n"
             "slice-major layout as AFNI physio_calc.py (ffs_reml -slibase_sm, or\n"
-            "afni_proc -ricor_regs)."
+            "afni_proc -ricor_regs).\n\n"
+            "Multi-echo: give every echo to -input (and -phase), shortest TE first. Each\n"
+            "echo is another reading of the same excitation: the cardiac detector draws its\n"
+            "vessel voxels from all echoes, and respiration fits each voxel's phase change\n"
+            "across echoes to one field change. On ds006926 (3 echoes, 3 T) single echoes\n"
+            "were already near the recordings, so expect robustness rather than new finds."
         ),
     )
     parser.add_argument(
-        "-input", required=True, help="Raw magnitude 4-D series (.nii/.nii.gz/.nii.zst)."
+        "-input",
+        nargs="+",
+        required=True,
+        metavar="FILE",
+        help="Raw magnitude 4-D series (.nii/.nii.gz/.nii.zst); multi-echo: one per echo, "
+        "shortest TE first. Slice timing and TR come from the first one's sidecar.",
     )
     parser.add_argument(
         "-phase",
+        nargs="+",
         default=None,
-        help="Raw phase 4-D series matching -input (scanner units or radians; no unwrap "
-        "needed -- only its change over time is used). Without it respiration is read "
-        "from magnitude, which was unreliable on task runs.",
+        metavar="FILE",
+        help="Raw phase 4-D series matching -input, one per echo (scanner units or "
+        "radians; no unwrap needed -- only its change over time is used). Without it "
+        "respiration is read from magnitude, which was unreliable on task runs.",
+    )
+    parser.add_argument(
+        "-echo_times",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Echo times (ms), one per -input. Default: the sidecars' EchoTime. Only "
+        "used with 2+ echoes, to put each echo's phase change on one field scale.",
     )
     parser.add_argument(
         "-prefix",
@@ -123,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-clean",
         default=None,
-        help="Also write the magnitude with each voxel's physiological fit removed "
+        help="Also write the magnitude (multi-echo: each echo, as OUT.echo-N) with each voxel's physiological fit removed "
         "(its own slice's regressors, fitted jointly with drift; mean and drift kept), "
         "as afni_proc's ricor block does. CAUTION: on ImaginationStimulation this, done "
         "before motion correction and slice timing, LOWERED held-out task R2 in all four "
@@ -148,7 +169,7 @@ def _split_axis(args) -> int:
     would hand both halves the same voxel. Read from the sidecar; j (A/P) if unknown."""
     src = args.tpattern
     if src is None or not str(src).endswith(".json"):
-        stem = str(args.input)
+        stem = str(args.input[0])
         for ext in (".nii.gz", ".nii.zst", ".nii"):
             if stem.endswith(ext):
                 stem = stem[: -len(ext)]
@@ -161,13 +182,29 @@ def _split_axis(args) -> int:
     return 1 if pe.startswith("i") else 0
 
 
+def _echo_times(args, inputs: list[str]) -> list[float]:
+    """Echo times (ms) of a multi-echo -input, shortest first; [] for one echo."""
+    if len(inputs) == 1:
+        return []
+    from fastfuncstuff.processing.b0fmap import read_echo_times
+
+    tes = args.echo_times if args.echo_times is not None else read_echo_times(inputs)
+    if tes is None:
+        raise SystemExit("ffs_physio: no EchoTime in the -input sidecars; pass -echo_times (ms).")
+    if len(tes) != len(inputs):
+        raise SystemExit(f"ffs_physio: {len(tes)} echo times for {len(inputs)} -input echoes")
+    if any(b <= a for a, b in zip(tes, tes[1:], strict=False)):
+        raise SystemExit(f"ffs_physio: echo times {tes} must increase (shortest TE first)")
+    return [float(t) for t in tes]
+
+
 def _slice_times_and_tr(args) -> tuple[np.ndarray, float]:
     from fastfuncstuff.io.afni import get_tr_from_file
     from fastfuncstuff.processing.slicetime import load_slice_timing
 
     src = args.tpattern
     if src is None:
-        stem = str(args.input)
+        stem = str(args.input[0])
         for ext in (".nii.gz", ".nii.zst", ".nii"):
             if stem.endswith(ext):
                 stem = stem[: -len(ext)]
@@ -180,7 +217,7 @@ def _slice_times_and_tr(args) -> tuple[np.ndarray, float]:
     if tr is None and str(src).endswith(".json"):
         tr = json.loads(Path(src).read_text()).get("RepetitionTime")
     if tr is None:
-        tr = get_tr_from_file(args.input)
+        tr = get_tr_from_file(args.input[0])
     if not tr or tr <= 0:
         raise SystemExit("ffs_physio: no TR in the sidecar or header; pass -TR.")
     return st, float(tr)
@@ -242,7 +279,7 @@ def _write_qc(
     from fastfuncstuff.qc import checks
     from fastfuncstuff.qc.record import QCRecord
 
-    rec = QCRecord.for_args(args, "physio", args.input)
+    rec = QCRecord.for_args(args, "physio", args.input[0])
     if rec is None:
         return
     m = X.shape[1] // mag.shape[2]
@@ -259,7 +296,9 @@ def _write_qc(
         "respiration": traces.series(sources["respiration"], uniform=True),
     }
     rates = {"cardiac": diag["cardiac_rate_hz"], "respiration": diag["respiration_rate_hz"]}
-    rec.info["input"] = str(args.input)
+    rec.info["input"] = " ".join(map(str, args.input))
+    if len(args.input) > 1:
+        rec.info["maps"] = "variance explained on echo 1"
     rec.info["sources"] = f"cardiac {sources['cardiac']}, respiration {sources['respiration']}"
     cardiac = (
         None
@@ -286,28 +325,46 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.processing import physio
 
     st, tr = _slice_times_and_tr(args)
-    mag_img = load_nifti(args.input)
-    mag = _read_series(mag_img)
+    inputs = [str(p) for p in args.input]
+    ne = len(inputs)
+    if args.phase is not None and len(args.phase) != ne:
+        raise SystemExit(f"ffs_physio: {len(args.phase)} -phase files for {ne} -input echoes")
+    echo_times = _echo_times(args, inputs)
+    split_axis = _split_axis(args)
+    mag_img = load_nifti(inputs[0])
     zooms = tuple(float(z) for z in mag_img.header.get_zooms()[:3])
+    echo_axis = None
+    if ne == 1:
+        mag = _read_series(mag_img)
+    else:
+        # one array, echoes tiled in-plane: the cardiac detector's voxels are every echo's
+        mag, echo_axis = physio.stack_echoes(
+            ne, lambda e: _read_series(mag_img if e == 0 else load_nifti(inputs[e])), split_axis
+        )
     if mag.ndim != 4:
         raise SystemExit("ffs_physio: -input must be 4-D")
     if mag.shape[2] != st.size:
         raise SystemExit(f"ffs_physio: {st.size} slice times but {mag.shape[2]} slices")
+    echo_shape = mag_img.shape[:3]
     ph = None
     if args.phase is not None:
-        ph = _read_series(load_nifti(args.phase), affine_invariant=True)
-        if ph.shape[:3] != mag.shape[:3] or ph.shape[3] < mag.shape[3]:
-            raise SystemExit(
-                f"ffs_physio: -phase shape {ph.shape} does not cover -input {mag.shape}"
-            )
-        if ph.shape[3] > mag.shape[3]:
-            # A NORDIC magnitude has its noise volumes trimmed; the raw phase still
-            # carries them at the end.
-            if verb >= 1:
-                print(
-                    f"  phase has {ph.shape[3] - mag.shape[3]} more volumes than -input: trimmed from its end"
+        ph = []
+        for path in args.phase:
+            p_e = _read_series(load_nifti(path), affine_invariant=True)
+            if p_e.shape[:3] != echo_shape or p_e.shape[3] < mag.shape[3]:
+                raise SystemExit(
+                    f"ffs_physio: -phase {path} shape {p_e.shape} does not cover the "
+                    f"-input echoes {(*echo_shape, mag.shape[3])}"
                 )
-            ph = ph[..., : mag.shape[3]]
+            if p_e.shape[3] > mag.shape[3]:
+                # A NORDIC magnitude has its noise volumes trimmed; the raw phase still
+                # carries them at the end.
+                if verb >= 1:
+                    print(
+                        f"  phase has {p_e.shape[3] - mag.shape[3]} more volumes than -input: trimmed from its end"
+                    )
+                p_e = p_e[..., : mag.shape[3]]
+            ph.append(p_e)
     ndrop = (
         args.drop_last
         if args.drop_last is not None
@@ -317,15 +374,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     nt = mag.shape[-1] - ndrop
     mag = mag[..., :nt]
-    ph = ph[..., :nt] if ph is not None else None
+    ph = [p_e[..., :nt] for p_e in ph] if ph is not None else None
+    mags = mag if echo_axis is None else physio.echo_views(mag, ne, echo_axis)
     if verb >= 1:
         _, gt = physio.excitation_groups(st)
+        echoes = (
+            "" if ne == 1 else f", {ne} echoes (TE {', '.join(f'{t:g}' for t in echo_times)} ms)"
+        )
         print(
             f"ffs_physio: {nt} volumes (dropped {ndrop} at the end), {st.size} slices, "
             f"{gt.size} excitations per TR = {gt.size / tr:.1f} Hz, phase {'yes' if ph is not None else 'no'}"
+            f"{echoes}"
         )
 
-    traces = physio.excitation_traces(mag, st, tr, phase=ph, device=device, voxel_size=zooms)
+    traces = physio.excitation_traces(
+        mags, st, tr, phase=ph, device=device, voxel_size=zooms,
+        echo_times=[t / 1000.0 for t in echo_times] if ne > 1 else None,
+    )  # fmt: skip
     del ph
     _, card_scores = physio.choose_source(traces, physio.CARDIAC_BAND, 20.0)
     resp_auto, resp_scores = physio.choose_source(traces, physio.RESP_BAND, 40.0)
@@ -339,8 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     cardiac_in_nuisance = True
     if sources["cardiac"] == "weighted":
         refined = physio.refine_cardiac(
-            mag, traces, st, tr, sources["respiration"], split_axis=_split_axis(args),
-            device=device,
+            mag, traces, st, tr, sources["respiration"], split_axis=split_axis,
+            device=device, n_echoes=ne, echo_axis=echo_axis,
         )  # fmt: skip
         traces.cardiac = refined.trace
         traces.cardiac_phase = refined.phase
@@ -366,6 +431,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"every slice-time shuffle, best {refined.alignment_null:.2f}; harmonic "
                 f"{refined.harmonic:.2f} must beat {refined.harmonic_null:.2f}; halves {refined.split_half:.2f})"
             )
+            if refined.echo_share:
+                share = ", ".join(
+                    f"echo {e + 1} {100 * x:.0f}%" for e, x in enumerate(refined.echo_share)
+                )
+                print(f"  cardiac weight by echo: {share}")
         if not refined.found:
             # The slibase keeps its layout, built from the mean trace as before.
             sources["cardiac"] = "magnitude"
@@ -399,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         "heart_rate_per_min_median": float(np.median(cf) * 60),
         "breathing_rate_per_min_median": float(np.median(rf) * 60),
         "columns_per_slice": 13,
+        "echoes": ne,
+        "echo_times_ms": echo_times if ne > 1 else None,
         "layout": "slice-major (ffs_reml -slibase_sm, afni_proc -ricor_regs)",
     }
     if refined is not None:
@@ -452,12 +524,14 @@ def main(argv: list[str] | None = None) -> int:
                 for t in refined.tried
             ],
             "weight_map": wpath,
+            "echo_share": list(refined.echo_share) or None,
             "in_nuisance": bool(cardiac_in_nuisance),
         }
     Path(base + ".json").write_text(json.dumps(summary, indent=2))
     if not args.no_qc:
         _qc_figure(Path(base + ".qc.png"), traces, sources, diag)
-    _write_qc(args, mag, X, labels, traces, sources, diag, mag_img.affine, tr, device, refined)
+    mag1 = mags if echo_axis is None else mags[0]
+    _write_qc(args, mag1, X, labels, traces, sources, diag, mag_img.affine, tr, device, refined)
     if args.tzero is not None:
         times = np.arange(nt) * tr + args.tzero
         if args.nuisance_set == "tapas":
@@ -482,24 +556,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.clean is not None:
         import torch
 
+        from fastfuncstuff.cli_utils import entity_path
         from fastfuncstuff.processing.io import save_image
 
+        # every echo at once: the fit is per voxel, and an echo's voxels are voxels
         cleaned, removed = physio.regress_out(mag, X, tr, device=device)
-        img = load_nifti(args.input)  # header only; the data stays unread
-        hdr = {"affine": img.affine.copy(), "header": img.header.copy()}
-        save_image(torch.from_numpy(cleaned.transpose(3, 2, 1, 0)), args.clean, header_info=hdr)
-        stem = str(args.clean)
-        for ext in (".nii.gz", ".nii.zst", ".nii"):
-            if stem.endswith(ext):
-                rm_path = stem[: -len(ext)] + "_physio_removed" + ext
-                break
+        hdr = {"affine": mag_img.affine.copy(), "header": mag_img.header.copy()}
+        if echo_axis is None:
+            parts = [(cleaned, removed)]
         else:
-            rm_path = stem + "_physio_removed.nii.gz"
-        save_image(torch.from_numpy(removed.transpose(2, 1, 0)), rm_path, header_info=hdr)
-        summary["clean"] = {"output": stem, "removed_map": rm_path}
+            parts = list(
+                zip(
+                    physio.echo_views(cleaned, ne, echo_axis),
+                    physio.echo_views(removed[..., None], ne, echo_axis),
+                    strict=True,
+                )
+            )
+        outs = []
+        for e, (c_e, r_e) in enumerate(parts):
+            stem = str(args.clean) if ne == 1 else entity_path(args.clean, echo=e + 1)
+            for ext in (".nii.gz", ".nii.zst", ".nii"):
+                if stem.endswith(ext):
+                    rm_path = stem[: -len(ext)] + "_physio_removed" + ext
+                    break
+            else:
+                rm_path = stem + "_physio_removed.nii.gz"
+            r_e = r_e if r_e.ndim == 3 else r_e[..., 0]
+            save_image(torch.from_numpy(np.ascontiguousarray(c_e.transpose(3, 2, 1, 0))), stem,
+                       header_info=hdr)  # fmt: skip
+            save_image(torch.from_numpy(np.ascontiguousarray(r_e.transpose(2, 1, 0))), rm_path,
+                       header_info=hdr)  # fmt: skip
+            outs.append({"output": stem, "removed_map": rm_path})
+            if verb >= 1:
+                print(f"  cleaned magnitude -> {stem} (variance-removed map {rm_path})")
+        summary["clean"] = outs[0] if ne == 1 else outs
         Path(base + ".json").write_text(json.dumps(summary, indent=2))
-        if verb >= 1:
-            print(f"  cleaned magnitude -> {stem} (variance-removed map {rm_path})")
     if verb >= 1:
         print(
             f"  heart rate {summary['heart_rate_per_min_median']:.1f}/min from {sources['cardiac']}, "

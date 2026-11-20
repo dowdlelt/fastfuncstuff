@@ -25,6 +25,7 @@ own noise contributes a negligible share of the regressor it is later fitted wit
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -165,16 +166,17 @@ def _drift_degree(nt: int, tr: float) -> int:
 
 
 def excitation_traces(
-    magnitude: np.ndarray,
+    magnitude: np.ndarray | Sequence[np.ndarray],
     slice_times: np.ndarray,
     tr: float,
-    phase: np.ndarray | None = None,
+    phase: np.ndarray | Sequence[np.ndarray] | None = None,
     device: torch.device | None = None,
     mask: np.ndarray | None = None,
     stability: float = 0.7,
     comb: bool = True,
     voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
     reference_s: float = 60.0,
+    echo_times: Sequence[float] | None = None,
 ) -> ExcitationTraces:
     """One physiological sample per (volume, excitation).
 
@@ -184,12 +186,16 @@ def excitation_traces(
         Raw slices -- before any motion correction or slice timing, so that every
         sample is still at its own acquisition time. ``phase`` may be raw scanner
         units; only its *change* over time is used, so no spatial unwrap is needed.
+        Multi-echo: a list of each, one per echo (see :func:`echo_views`), with
+        ``echo_times``.
+    echo_times : sequence of float, optional
+        Echo time of each echo (s); required with more than one.
     slice_times : (nz,)
         Acquisition offset of each slice within the TR (s); slice ``k`` is the
         file's third axis.
     mask : (nx, ny, nz) bool, optional
         Voxels to average. Default: brighter than a quarter of the 98th percentile
-        of the mean image.
+        of the mean image (each echo's own image, multi-echo).
     stability : float
         Phase voxels must have a running-mean phasor (``reference_s`` window) whose
         magnitude averages above this: steady enough for a change to be read. Slow
@@ -204,16 +210,32 @@ def excitation_traces(
     divided by its mean, then averaged over the excitation's voxels. Phase: each
     voxel's change against its own running-mean phasor, ``angle(z_t * conj(zref_t))``,
     drift removed, averaged with weight ``mean magnitude**2`` (phase noise scales as
-    1/magnitude).
+    1/magnitude). Multi-echo: every echo's voxels join the magnitude average, and each
+    voxel's phase changes are fitted through the origin across echoes,
+    ``dphi_e = 2 pi df TE_e`` weighted by ``(magnitude_e TE_e)**2``, to one field
+    change, expressed in radians at the middle echo time so the units match a
+    single-echo run. The respiratory field is ~1 Hz at 3 T, a third of a radian at
+    TE 50 ms, so each echo stays inside one wrap of its running reference and no
+    unwrap is needed. (A free TE-independent offset per voxel was tried as well;
+    against belts on ds006926 it matched the through-origin fit and cost a degree of
+    freedom.)
     """
     device = device or torch.device("cpu")
-    _, _, nz, nt = magnitude.shape
+    mags = [magnitude] if isinstance(magnitude, np.ndarray) else list(magnitude)
+    phases = [] if phase is None else [phase] if isinstance(phase, np.ndarray) else list(phase)
+    if phases and len(phases) != len(mags):
+        raise ValueError(f"{len(phases)} phase echoes for {len(mags)} magnitude echoes")
+    if len(mags) > 1 and (echo_times is None or len(echo_times) != len(mags)):
+        raise ValueError(f"{len(mags)} echoes need as many echo_times")
+    tes = np.asarray(echo_times if len(mags) > 1 else [1.0], dtype=float)
+    te_ref = float(np.median(tes))
+    _, _, nz, nt = mags[0].shape
     group, gtimes = excitation_groups(slice_times)
     G = len(gtimes)
-    mean_img = magnitude.mean(-1)
     if mask is None:
-        thr = 0.25 * np.percentile(mean_img[mean_img > 0], 98)
-        mask = mean_img > thr
+        masks = [_bright_mask(m) for m in mags]
+    else:
+        masks = [mask] * len(mags)
     deg = _drift_degree(nt, tr)
     ref_len = min(nt, max(3, int(round(reference_s / tr)) | 1))
     L = construct_polynomial_matrix(nt, deg, device=device)
@@ -222,13 +244,15 @@ def excitation_traces(
     per_slice_p = np.zeros((nt, nz))
     count_m = np.zeros(nz)
     count_p = np.zeros(nz)
-    if phase is not None:
+    ranges = []
+    for ph_e in phases:
         # The run's own range onto [-pi, pi], as complex.scale_phase_to_radians does,
         # but with one min/max for every slice so all slices share the mapping.
-        lo, hi = float(phase.min()), float(phase.max())
+        lo, hi = float(ph_e.min()), float(ph_e.max())
         if not hi > lo:
             raise ValueError("phase has no range; expected raw scanner units or radians")
-    nx, ny = magnitude.shape[:2]
+        ranges.append((lo, hi))
+    nx, ny = mags[0].shape[:2]
     gx, gy = np.meshgrid(
         (np.arange(nx) - nx / 2) * voxel_size[0] / 100.0,
         (np.arange(ny) - ny / 2) * voxel_size[1] / 100.0,
@@ -239,34 +263,56 @@ def excitation_traces(
     field_A = np.zeros((nz, 10, 10))
     field_b = np.zeros((nz, 10, nt))
     for k in range(nz):
-        sel = torch.from_numpy(mask[:, :, k].reshape(-1, order="F")).to(device)
-        if int(sel.sum()) < 20:
-            continue
-        m = _slice_rows(magnitude, k, device)[sel]
-        mu = m.mean(1)
-        # Centred before the projection: the constant is in the drift space, so the
-        # result is the same, but TF32 matmuls (on by default on CUDA) keep ~3 digits,
-        # which on raw intensities is the size of the cardiac pulsation itself.
-        mc = m - mu[:, None]
-        frac = (mc - mc @ proj.T) / mu.clamp_min(1e-6)[:, None]
-        per_slice_m[:, k] = frac.mean(0).cpu().numpy()
-        count_m[k] = float(m.shape[0])
-        if phase is not None:
-            p = _slice_rows(phase, k, device)[sel]
-            p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
-            z = torch.polar(torch.ones_like(p), p)
-            # Each voxel against its own running-mean phasor, not its whole-run mean:
-            # a global phase step (a head movement, a frequency adjustment) left every
-            # voxel's run mean below the stability cut and dropped 99.7 % of the brain
-            # on one TASKFORCE run. Breathing is far faster than the window and passes.
-            zref = _running_mean(z, ref_len)
-            keep = zref.abs().mean(1) > stability
-            if int(keep.sum()) < 20:
+        sels = [torch.from_numpy(mk[:, :, k].reshape(-1, order="F")).to(device) for mk in masks]
+        mus, sums = [], []
+        for mag_e, sel_e in zip(mags, sels, strict=True):
+            if int(sel_e.sum()) < 20:
+                mus.append(None)
                 continue
-            zr = zref[keep]
-            dphi = torch.angle(z[keep] * torch.conj(zr / zr.abs().clamp_min(1e-6)))
+            m = _slice_rows(mag_e, k, device)[sel_e]
+            mu_e = m.mean(1)
+            # Centred before the projection: the constant is in the drift space, so the
+            # result is the same, but TF32 matmuls (on by default on CUDA) keep ~3
+            # digits, which on raw intensities is the size of the cardiac pulsation.
+            mc = m - mu_e[:, None]
+            frac = (mc - mc @ proj.T) / mu_e.clamp_min(1e-6)[:, None]
+            sums.append((frac.mean(0).cpu().numpy(), float(m.shape[0])))
+            mus.append(mu_e)
+            del m, mc, frac
+        if not sums:
+            continue
+        count_m[k] = sum(n for _, n in sums)
+        per_slice_m[:, k] = sum(x * (n / count_m[k]) for x, n in sums)
+        # one voxel set for the phase: echo 1's (the brightest), as for one echo
+        sel, mu = sels[0], mus[0]
+        if phases and mu is not None:
+            per_echo = []
+            for e, (ph_e, (lo, hi)) in enumerate(zip(phases, ranges, strict=True)):
+                p = _slice_rows(ph_e, k, device)[sel]
+                p = (p - lo) * (2 * np.pi / (hi - lo)) - np.pi
+                z = torch.polar(torch.ones_like(p), p)
+                # Each voxel against its own running-mean phasor, not its whole-run
+                # mean: a global phase step (a head movement, a frequency adjustment)
+                # left every voxel's run mean below the stability cut and dropped
+                # 99.7 % of the brain on one TASKFORCE run. Breathing is far faster
+                # than the window and passes.
+                zref = _running_mean(z, ref_len)
+                ok = zref.abs().mean(1) > stability
+                d = torch.angle(z * torch.conj(zref / zref.abs().clamp_min(1e-6)))
+                mu_e = mu if e == 0 else _slice_rows(mags[e], k, device)[sel].mean(1)
+                per_echo.append((d, ok, mu_e**2 * ok))
+                del p, z, zref
+            if len(phases) == 1:
+                d, keep, _ = per_echo[0]
+                if int(keep.sum()) < 20:
+                    continue
+                dphi, w = d[keep], mu[keep] ** 2
+            else:
+                dphi, w, keep = _combine_echo_phase(per_echo, tes, te_ref)
+                if int(keep.sum()) < 20:
+                    continue
+            del per_echo
             dphi = dphi - dphi @ proj.T
-            w = mu[keep] ** 2
             per_slice_p[:, k] = ((w[:, None] * dphi).sum(0) / w.sum()).cpu().numpy()
             count_p[k] = float(keep.sum())
             # second-order field over this slice's stable voxels (weighted like the mean)
@@ -291,8 +337,8 @@ def excitation_traces(
             field_A[k] = (bas.T @ (wn * bas)).cpu().double().numpy() * count_p[k]
             field_b[k] = (bas.T @ (wn * dphi)).cpu().double().numpy() * count_p[k]
     mag_t = np.zeros((nt, G))
-    ph_t = np.zeros((nt, G)) if phase is not None else None
-    field_t = np.zeros((nt, G, 10)) if phase is not None else None
+    ph_t = np.zeros((nt, G)) if phases else None
+    field_t = np.zeros((nt, G, 10)) if phases else None
     if field_t is not None:
         for g in range(G):
             ks = np.flatnonzero((group == g) & (count_p > 0))
@@ -313,6 +359,75 @@ def excitation_traces(
         mag_t = remove_tr_comb(mag_t, tr)
     times = np.arange(nt)[:, None] * tr + gtimes[None, :]
     return ExcitationTraces(times, group, mag_t, ph_t, int(count_m.sum()), field_coef=field_t)
+
+
+def _combine_echo_phase(per_echo, tes: np.ndarray, te_ref: float):
+    """One field change per voxel from several echoes' phase changes.
+
+    ``per_echo``: (dphi_e (V, nt), stable_e (V,), a_e (V,)) with ``a_e`` the echo's
+    inverse phase variance (mean magnitude squared, 0 where unstable). Weighted least
+    squares through the origin, ``dphi_e = s TE_e`` -> ``s = sum a TE dphi / sum a
+    TE^2``. Returns the field change in radians at ``te_ref``, each voxel's inverse
+    variance of it on the single-echo weight's scale, and which voxels have one
+    (at least one stable echo).
+    """
+    num = sum(a[:, None] * float(t) * d for (d, _, a), t in zip(per_echo, tes, strict=True))
+    den = sum(a * float(t) ** 2 for (_, _, a), t in zip(per_echo, tes, strict=True))
+    keep = den > 0
+    # var(s) = 1/den, so the field change at te_ref has inverse variance den/te_ref^2
+    return te_ref * num[keep] / den[keep, None], den[keep] / te_ref**2, keep
+
+
+def _bright_mask(magnitude: np.ndarray) -> np.ndarray:
+    """Voxels brighter than a quarter of the mean image's 98th percentile."""
+    mean_img = magnitude.mean(-1)
+    return mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
+
+
+def stack_echoes(
+    n_echoes: int, load: Callable[[int], np.ndarray], split_axis: int
+) -> tuple[np.ndarray, int]:
+    """Echoes side by side in one 4-D array, and the axis they are tiled along.
+
+    The cardiac detector then treats every echo's voxels as more voxels: each echo is
+    another reading of the same excitation, and the vessels it shows best differ
+    (inflow on the first echo, dephasing on the later ones), so its top voxels are
+    drawn from all echoes rather than from one fixed combination. Tiled along the
+    in-plane axis the found-a-heartbeat halves test does NOT split, so both halves keep
+    their own side of every echo. ``load(e)`` returns echo ``e``; each is copied in and
+    dropped, so the peak is the stack plus one echo. Fortran order, as NIfTI is read.
+    """
+    axis = 1 - split_axis
+    first = load(0)
+    shape = list(first.shape)
+    n = shape[axis]
+    shape[axis] = n * n_echoes
+    out = np.empty(shape, dtype=first.dtype, order="F")
+    idx: list = [slice(None)] * first.ndim
+    for e in range(n_echoes):
+        a = first if e == 0 else load(e)
+        if a.shape != first.shape:
+            raise ValueError(f"echo {e + 1} shape {a.shape} differs from echo 1 {first.shape}")
+        if (
+            not np.can_cast(a.dtype, out.dtype, "same_kind")
+            or a.dtype.itemsize > out.dtype.itemsize
+        ):
+            out = out.astype(np.result_type(out.dtype, a.dtype, np.float32), order="F")
+        idx[axis] = slice(e * n, (e + 1) * n)
+        out[tuple(idx)] = a
+        del a
+    return out, axis
+
+
+def echo_views(stacked: np.ndarray, n_echoes: int, axis: int) -> list[np.ndarray]:
+    """The echoes of :func:`stack_echoes` as views (no copy)."""
+    n = stacked.shape[axis] // n_echoes
+    idx = [slice(None)] * stacked.ndim
+    views = []
+    for e in range(n_echoes):
+        idx[axis] = slice(e * n, (e + 1) * n)
+        views.append(stacked[tuple(idx)])
+    return views
 
 
 def field_breathing_trace(traces: ExcitationTraces) -> tuple[np.ndarray, np.ndarray]:
@@ -702,6 +817,8 @@ class CardiacRefinement:
     # for the former, alignment/null/harmonic hold its fundamental+harmonic statistic
     method: str = "refine"
     phase: np.ndarray | None = None  # (nt, G) phase to use as is (constant_modulus only)
+    # multi-echo: each echo's share of the summed squared weight (diagnostic)
+    echo_share: tuple[float, ...] = ()
 
 
 def cardiac_avoid(
@@ -1273,6 +1390,21 @@ def _ica_starts(Ys: list[torch.Tensor], times: np.ndarray, tr: float, avoid, dev
 
 
 def refine_cardiac(
+    magnitude: np.ndarray, *args, n_echoes: int = 1, echo_axis: int | None = None, **kwargs
+) -> CardiacRefinement:
+    """:func:`_refine_cardiac`, with a stacked multi-echo weight map folded back to one
+    volume (see there)."""
+    out = _refine_cardiac(magnitude, *args, n_echoes=n_echoes, echo_axis=echo_axis, **kwargs)
+    if n_echoes > 1:
+        assert echo_axis is not None
+        per = np.stack(echo_views(out.weight, n_echoes, echo_axis))
+        sq = (per.astype(np.float64) ** 2).sum(axis=tuple(range(1, per.ndim)))
+        out.echo_share = tuple(float(x) for x in sq / max(float(sq.sum()), 1e-30))
+        out.weight = np.take_along_axis(per, np.abs(per).argmax(0)[None], 0)[0]
+    return out
+
+
+def _refine_cardiac(
     magnitude: np.ndarray,
     traces: ExcitationTraces,
     slice_times: np.ndarray,
@@ -1285,6 +1417,8 @@ def refine_cardiac(
     n_iter: int = REFINE_ITER,
     ica: bool = True,
     constant_modulus: bool = True,
+    n_echoes: int = 1,
+    echo_axis: int | None = None,
 ) -> CardiacRefinement:
     """A cardiac trace from the voxels that carry the heartbeat, not from all of them.
 
@@ -1302,8 +1436,15 @@ def refine_cardiac(
     signals aliased into the band pass the first and fail the second. One excitation
     time: untestable. Two brain halves (split along ``split_axis``, the in-plane axis
     NOT phase-encoded) are refitted from the kept answer as a diagnostic only.
+
+    Multi-echo: ``magnitude`` is :func:`stack_echoes` output (``n_echoes`` tiled along
+    ``echo_axis``); every echo's voxels are candidates, the default mask is each
+    echo's own, and the returned weight map is per voxel the largest over echoes,
+    with ``echo_share`` saying how much of the weight each echo carried.
     """
     device = device or torch.device("cpu")
+    if n_echoes > 1 and (echo_axis is None or echo_axis == split_axis):
+        raise ValueError("stacked echoes need echo_axis, and not the split axis")
     nt, G = traces.times.shape
     times = traces.times
     if G < 2:  # one excitation time: no within-volume samples, nothing to shuffle
@@ -1313,9 +1454,13 @@ def refine_cardiac(
             start_rate_per_min=float("nan"), start="none", testable=False,
             resolvability=slice_resolvability(slice_times, tr),
         )  # fmt: skip
-    mean_img = magnitude[..., :nt].mean(-1)
     if mask is None:
-        mask = mean_img > 0.25 * np.percentile(mean_img[mean_img > 0], 98)
+        if n_echoes > 1:
+            assert echo_axis is not None
+            views = echo_views(magnitude[..., :nt], n_echoes, echo_axis)
+            mask = np.concatenate([_bright_mask(v) for v in views], axis=echo_axis)
+        else:
+            mask = _bright_mask(magnitude[..., :nt])
     if resp_from == "phase" and traces.phase is None:
         resp_from = "magnitude"
     t_r, x_r = traces.series(resp_from, uniform=True)

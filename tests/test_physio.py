@@ -803,3 +803,126 @@ def test_slice_resolvability_reads_how_sharp_the_slice_timing_is():
     bunched = physio.slice_resolvability(np.repeat(np.linspace(0, 0.17, 5), 3), 0.227)
     assert spread["excitations"] == 17 and spread["alias_leak"] < 0.05
     assert bunched["excitations"] == 5 and bunched["alias_leak"] > 0.3
+
+
+# ---------------------------------------------------------------------------
+# Multi-echo
+# ---------------------------------------------------------------------------
+
+
+def test_stacked_echoes_tile_off_the_split_axis_and_view_back_without_copying():
+    """The halves test splits along ``split_axis``; tiling the echoes along it would
+    hand one half a whole echo. Views must come back as the arrays given, uncopied."""
+    rng = np.random.default_rng(0)
+    echoes = [rng.integers(0, 1000, (4, 5, 3, 6)).astype(np.int16) for _ in range(3)]
+    for split in (0, 1):
+        st, axis = physio.stack_echoes(3, lambda e: echoes[e], split)
+        assert axis == 1 - split and st.flags.f_contiguous and st.dtype == np.int16
+        assert st.shape[axis] == 3 * echoes[0].shape[axis] and st.shape[split] == 4 + split
+        for v, a in zip(physio.echo_views(st, 3, axis), echoes, strict=True):
+            np.testing.assert_array_equal(v, a)
+            assert np.shares_memory(v, st)
+    # a later echo stored as float is not truncated into the first one's integers
+    mixed = [echoes[0], echoes[1] + np.float32(0.5)]
+    st, axis = physio.stack_echoes(2, lambda e: mixed[e], 0)
+    np.testing.assert_array_equal(physio.echo_views(st, 2, axis)[1], mixed[1])
+
+
+def _multiecho_phase(tes, nt=200, shape=(10, 10, 12), mb=2, seed=0, t2s=0.03):
+    """Breathing as a field change (Hz), so each echo's phase change grows with TE;
+    magnitude decays with T2*, and phase noise is 1/magnitude."""
+    rng = np.random.default_rng(seed)
+    nx, ny, nz = shape
+    st = _mb_slice_times(nz, mb)
+    t = np.arange(nt)[None, :] * TR + st[:, None]
+    field = 1.0 * np.sin(2 * np.pi * F_RESP * t)  # Hz
+    s0 = 100.0 + 20.0 * rng.random(shape)
+    mags, phs = [], []
+    for te in tes:
+        s = s0 * np.exp(-te / t2s)
+        m = s[..., None] * (1 + 0.01 * rng.standard_normal((nx, ny, nz, nt)))
+        static = rng.uniform(-np.pi, np.pi, shape)
+        noise = 3.0 / s[..., None] * rng.standard_normal((nx, ny, nz, nt))
+        p = static[..., None] + 2 * np.pi * field[None, None] * te + noise
+        mags.append(m.astype(np.float32))
+        phs.append((np.angle(np.exp(1j * p)) * (4096 / np.pi)).astype(np.float32))
+    return mags, phs, st, t, field
+
+
+def test_multiecho_phase_is_one_field_change_at_the_middle_echo_scale():
+    """Through-origin fit across echoes: the trace is the field change in radians at
+    the middle TE (same scale as a single-echo run at that TE), and with three
+    readings it follows the field more closely than the middle echo alone."""
+    tes = [0.012, 0.030, 0.048]
+    mags, phs, st, t, field = _multiecho_phase(tes)
+    me = physio.excitation_traces(mags, st, TR, phase=phs, echo_times=tes, device=CPU)
+    one = physio.excitation_traces(mags[1], st, TR, phase=phs[1], device=CPU)
+    group, _ = physio.excitation_groups(st)
+    truth = np.stack([2 * np.pi * field[group == g][0] * tes[1] for g in range(group.max() + 1)], 1)
+    for tr_ in (me, one):
+        slope = float((tr_.phase * truth).sum() / (truth * truth).sum())
+        assert 0.9 < slope < 1.1  # the middle echo's radians
+    err_me, err_one = (np.std(tr_.phase - truth) for tr_ in (me, one))
+    # inverse-variance gain here is sqrt(1.21 / 2.79) = 0.66 in noise; measured 0.76
+    assert err_me < 0.85 * err_one
+    with pytest.raises(ValueError, match="echo_times"):
+        physio.excitation_traces(mags, st, TR, phase=phs, device=CPU)
+
+
+def test_a_heartbeat_carried_by_one_echo_is_found_from_the_stack():
+    """Vessels that pulse only on the last echo (dephasing, not inflow): the stacked
+    detector must draw its voxels from that echo and say so in echo_share."""
+    mag, ph, st = _vascular_run()
+    rng = np.random.default_rng(5)
+    flat = [(100.0 + 20.0 * rng.random(mag.shape[:3]))[..., None]
+            * (1 + 0.01 * rng.standard_normal(mag.shape)) for _ in range(2)]  # fmt: skip
+    echoes = [flat[0].astype(np.float32), flat[1].astype(np.float32), mag]
+    stacked, axis = physio.stack_echoes(3, lambda e: echoes[e], split_axis=0)
+    views = physio.echo_views(stacked, 3, axis)
+    tr_ = physio.excitation_traces(views, st, TR, phase=[ph, ph, ph],
+                                   echo_times=[0.01, 0.02, 0.03], device=CPU)  # fmt: skip
+    ref = physio.refine_cardiac(stacked, tr_, st, TR, split_axis=0, device=CPU,
+                                n_echoes=3, echo_axis=axis)  # fmt: skip
+    assert ref.found and abs(ref.heart_rate_per_min - F_CARD * 60) < 1.5
+    assert ref.weight.shape == mag.shape[:3]
+    assert ref.echo_share[2] > 0.5 and abs(sum(ref.echo_share) - 1) < 1e-6
+    with pytest.raises(ValueError, match="split axis"):
+        physio.refine_cardiac(stacked, tr_, st, TR, split_axis=axis, device=CPU,
+                              n_echoes=3, echo_axis=axis)  # fmt: skip
+
+
+def test_cli_multiecho_reads_echo_times_from_sidecars_and_cleans_each_echo(tmp_path):
+    import json
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli.physio import main
+
+    tes = [0.012, 0.030]
+    mags, phs, st, _, _ = _multiecho_phase(tes, nt=150)
+    heart = 1 + 0.01 * np.cos(2 * np.pi * F_CARD * (np.arange(150)[None, :] * TR + st[:, None]))
+    args = ["-input"]
+    for e, te in enumerate(tes):
+        name = tmp_path / f"run_echo-{e + 1}_mag.nii.gz"
+        nib.save(nib.Nifti1Image(mags[e] * heart[None, None], np.eye(4)), name)
+        (tmp_path / f"run_echo-{e + 1}_mag.json").write_text(
+            json.dumps({"SliceTiming": st.tolist(), "RepetitionTime": TR, "EchoTime": te})
+        )
+        nib.save(nib.Nifti1Image(phs[e], np.eye(4)), tmp_path / f"run_echo-{e + 1}_ph.nii.gz")
+        args.append(str(name))
+    phase = ["-phase", *(str(tmp_path / f"run_echo-{e + 1}_ph.nii.gz") for e in range(2))]
+    common = ["-prefix", str(tmp_path / "o" / "run"), "-device", "cpu", "-verb", "0", "-no_qc"]
+    rc = main([*args, *phase, *common, "-clean", str(tmp_path / "o" / "clean.nii.gz")])
+    assert rc == 0
+    summary = json.loads((tmp_path / "o" / "run.json").read_text())
+    assert summary["echoes"] == 2 and summary["echo_times_ms"] == [12.0, 30.0]
+    assert abs(summary["breathing_rate_per_min_median"] - F_RESP * 60) < 1.5
+    assert len(summary["cardiac_weighted"]["echo_share"]) == 2
+    for e in (1, 2):
+        out = nib.load(tmp_path / "o" / f"clean.echo-{e}.nii.gz")
+        assert out.shape == mags[0].shape
+        assert (tmp_path / "o" / f"clean.echo-{e}_physio_removed.nii.gz").exists()
+    with pytest.raises(SystemExit, match="-phase files"):
+        main([*args, "-phase", phase[1], *common])
+    with pytest.raises(SystemExit, match="must increase"):
+        main([*args, *common, "-echo_times", "30", "12"])
