@@ -75,21 +75,35 @@ def fft_shift_rows(vol: Tensor, dim: int, af: Tensor) -> Tensor:
     return torch.fft.irfft(spec, n=n, dim=dim)
 
 
-def fft_shear_rows_batched(vol: Tensor, fr_axis: int, a: Tensor, b: Tensor, s: Tensor) -> Tensor:
-    """:func:`_apply_one_shear` along ``fr_axis`` for a batch, by FFT.
+def fft_shear_rows_batched(
+    vol: Tensor, out: Tensor, lanes: Tensor, fr_axis: int, a: Tensor, b: Tensor, s: Tensor
+) -> None:
+    """:func:`_apply_one_shear` along ``fr_axis`` by FFT, for volumes ``lanes``.
 
-    ``vol`` (B, nz, ny, nx); ``a``, ``b``, ``s`` (B,). Volumes whose shear is
-    below AFNI's 1e-3 voxel floor pass through, as in the single-volume path.
+    Reads ``vol`` (B, nz, ny, nx), writes those lanes of ``out`` in place;
+    ``a``, ``b``, ``s`` are (B,). A lane whose shear is below AFNI's 1e-3 voxel
+    floor is copied through, as in the single-volume path. The shift is linear
+    in the two driving coordinates, so its phase ramp is applied as three small
+    broadcast factors: a full-size complex ramp per volume cost the VRAM that
+    pushed a 160x160x114 batch into an allocator OOM.
     """
     _, nz, ny, nx = vol.shape
     sizes = {0: nx, 1: ny, 2: nz}
     centers = {k: (v - 1) / 2.0 for k, v in sizes.items()}
     tdim, (p1fr, p1dim), (p2fr, p2dim) = _AXIS_INFO[fr_axis]
-    st = a.abs() * centers[p1fr] + b.abs() * centers[p2fr] + s.abs()
-    rows = (st >= 1.0e-3).nonzero(as_tuple=True)[0]
+    st = a[lanes].abs() * centers[p1fr] + b[lanes].abs() * centers[p2fr] + s[lanes].abs()
+    move = st >= 1.0e-3
+    still = lanes[~move]
+    if still.numel():
+        out[still] = vol[still]
+    rows = lanes[move]
     if rows.numel() == 0:
-        return vol
+        return
     device, dtype = vol.device, vol.dtype
+    dim = tdim + 1
+    k_shape = [1, 1, 1, 1]
+    k_shape[dim] = sizes[fr_axis] // 2 + 1
+    k = torch.fft.rfftfreq(sizes[fr_axis], device=device, dtype=dtype).reshape(k_shape)
     shp1 = [1, 1, 1, 1]
     shp1[p1dim + 1] = sizes[p1fr]
     shp2 = [1, 1, 1, 1]
@@ -97,14 +111,12 @@ def fft_shear_rows_batched(vol: Tensor, fr_axis: int, a: Tensor, b: Tensor, s: T
     c1 = (torch.arange(sizes[p1fr], device=device, dtype=dtype) - centers[p1fr]).reshape(shp1)
     c2 = (torch.arange(sizes[p2fr], device=device, dtype=dtype) - centers[p2fr]).reshape(shp2)
     col = (-1, 1, 1, 1)
-    af = (
-        a[rows].to(dtype).reshape(col) * c1
-        + b[rows].to(dtype).reshape(col) * c2
-        + s[rows].to(dtype).reshape(col)
-    )
-    out = vol.clone()
-    out[rows] = fft_shift_rows(vol[rows], tdim + 1, af)
-    return out
+    w = -2j * math.pi
+    spec = torch.fft.rfft(vol[rows], dim=dim)
+    spec *= torch.exp((a[rows].to(dtype).reshape(col) * k * c1) * w)
+    spec *= torch.exp((b[rows].to(dtype).reshape(col) * k * c2) * w)
+    spec *= torch.exp((s[rows].to(dtype).reshape(col) * k) * w)
+    out[rows] = torch.fft.irfft(spec, n=sizes[fr_axis], dim=dim)
 
 
 # ---------------------------------------------------------------------------

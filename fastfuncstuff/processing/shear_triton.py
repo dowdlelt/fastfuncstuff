@@ -219,8 +219,8 @@ def _fourier_shears(
         for v in fft_axes:
             lanes = (ax[:, step] == v).nonzero(as_tuple=True)[0]
             if lanes.numel():
-                vol_out[lanes] = fft_shear_rows_batched(
-                    vol_in[lanes], v, a4[lanes, step], b4[lanes, step], s4[lanes, step]
+                fft_shear_rows_batched(
+                    vol_in, vol_out, lanes, v, a4[:, step], b4[:, step], s4[:, step]
                 )
         cur = out
     return cur.reshape(B, nz, ny, nx)
