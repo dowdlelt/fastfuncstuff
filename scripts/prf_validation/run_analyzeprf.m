@@ -10,7 +10,9 @@ function run_analyzeprf(infile, outfile, nworkers)
 % analyzePRF bundles 68 utilities that knkutils also ships; whichever is added
 % last wins, so add analyzePRF last and check it stuck (wiki: analyzePRF MATLAB
 % path shadowing).
-apdir = fullfile(getenv('HOME'), 'Dropbox/Resources/code/matlab_toolboxes/analyzePRF');
+apdir = getenv('ANALYZEPRF_DIR');
+assert(isfile(fullfile(apdir, 'analyzePRF.m')), ...
+       'Set ANALYZEPRF_DIR to the folder containing analyzePRF.m');
 addpath(genpath(apdir));
 assert(strncmp(which('posrect'), apdir, numel(apdir)), 'posrect shadowed: %s', which('posrect'));
 in = load(infile);

@@ -586,11 +586,12 @@ fits, against 4% for denoising.
 ## Reproducing
 
 ```sh
-scripts/prf_validation/run.sh            # downloads, fits, figures
+ANALYZEPRF_DIR=/path/to/analyzePRF scripts/prf_validation/run.sh
 ```
 
 Needs the AWS CLI (anonymous S3 access), MATLAB with the Parallel Computing Toolbox,
-and analyzePRF. Data go under `$FFS_BENCHMARK_DATA_DIR` (default: the repository's
+and analyzePRF. Activate an environment with `fastfuncstuff` installed before
+running. Set `DEVICE=cpu` to run the Python fits on CPU. Data go under `$FFS_BENCHMARK_DATA_DIR` (default: the repository's
 `test_data/`). analyzePRF dominates the runtime (about 4 hours on 6 workers). Each
 `ffs_pyrf` fit takes minutes on a GPU. Steps whose output already exists are skipped.
 
