@@ -333,6 +333,13 @@ def _group_key(n: BidsName) -> tuple:
     )
 
 
+def acquisition_id(n: BidsName) -> str:
+    """The manifest's name for the acquisition a file belongs to."""
+    key = _group_key(n)
+    ent = "_".join(f"{k}-{v}" for k, v in key if not k.startswith("_"))
+    return f"{ent}_{dict(key)['_suffix']}"
+
+
 def _is_phase(n: BidsName) -> bool:
     return n.ent.get("part") == "phase" or n.suffix == "phase"
 
@@ -449,7 +456,7 @@ def census(src) -> dict[str, Any]:
 
         acquisitions.append(
             {
-                "id": "_".join(f"{k}-{v}" for k, v in ent.items()) + f"_{suffix}",
+                "id": acquisition_id(sample),
                 "suffix": suffix,
                 "entities": ent,
                 "n_subjects": len({r[0] for r in recordings}),

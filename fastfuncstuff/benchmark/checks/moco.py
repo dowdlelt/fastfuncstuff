@@ -1,0 +1,102 @@
+"""moco: ffs_moco against 3dvolreg on the raw run, both with heptic interpolation.
+
+The frozen input is the raw first-echo magnitude itself, so nothing upstream can differ.
+Judged against the reference (motion parameters, matrices, mean image, corrected series).
+Synthetic-truth scoring (scripts/moco_truth) is the next judge to add.
+"""
+
+from __future__ import annotations
+
+import os
+
+from ..validation import compare_1d_params, compare_aff12_series, compare_moco_ssd, compare_volumes
+from .base import Check, UnitResult, afni_version, ffs_version, timed
+
+MOTION_PARAM_NAMES = ["roll", "pitch", "yaw", "dS", "dL", "dP"]
+
+# Same settings as the old stage (stages/moco.py), whose thresholds stay the fastbench gate.
+REF_ARGS = ["-heptic", "-base", "0"]
+FFS_ARGS = ["-interp", "heptic", "-final", "heptic", "-weight_automask", "-base", "0", "-save_mean"]
+
+
+class MocoCheck(Check):
+    name = "moco"
+    description = "Motion correction: ffs_moco vs 3dvolreg (heptic), raw run as input"
+    needs = [[]]  # any functional run
+    sampling = "breadth"
+    reference = "AFNI 3dvolreg"
+
+    def unit_inputs(self, files, index):
+        mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]
+        first = sorted(mags, key=lambda f: int(f.ent.get("echo", "1")))[0]
+        return [first.rel]
+
+    def run(self, key, inputs, work, device):
+        (src,) = inputs.values()
+        ref, ffs = work / "ref", work / "ffs"
+        ref.mkdir(parents=True, exist_ok=True)
+        ffs.mkdir(parents=True, exist_ok=True)
+        log = work / "commands.log"
+        res = UnitResult()
+
+        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        t_ref = timed(
+            [
+                "3dvolreg", "-overwrite", *REF_ARGS, "-prefix", str(ref / "moco.nii"),
+                "-1Dfile", str(ref / "motion.1D"), "-1Dmatrix_save", str(ref / "moco.aff12.1D"),
+                str(src),
+            ],
+            work, log,
+        )  # fmt: skip
+        timed(
+            ["3dTstat", "-overwrite", "-prefix", str(ref / "mean.nii"), str(ref / "moco.nii")],
+            work,
+            log,
+        )
+        res.timings.append(("ref", "cpu", t_ref, threads))
+
+        t_ffs = timed(
+            [
+                "ffs_moco", *FFS_ARGS, "-input", str(src), "-prefix", str(ffs / "moco.nii"),
+                "-1Dfile", str(ffs / "motion.1D"), "-1Dmatrix_save", str(ffs / "moco.aff12.1D"),
+                "-device", device,
+            ],
+            work, log,
+        )  # fmt: skip
+        (ffs / "mean_moco.nii").replace(ffs / "mean.nii")
+        res.timings.append(("ffs", device.split(",")[0], t_ffs, None))
+
+        mp = compare_1d_params(str(ref / "motion.1D"), str(ffs / "motion.1D"))
+        af = compare_aff12_series(str(ref / "moco.aff12.1D"), str(ffs / "moco.aff12.1D"))
+        mv = compare_volumes(str(ref / "mean.nii"), str(ffs / "mean.nii"))
+        sd = compare_moco_ssd(str(ref / "moco.nii"), str(ffs / "moco.nii"))
+        m: dict[str, float | None] = {
+            "motion_min_r": mp.get("min_r"),
+            "motion_mean_r": mp.get("mean_r"),
+            "aff12_max_trans_mm": af.get("max_trans_diff"),
+            "aff12_max_rot": af.get("max_rot_diff"),
+            "mean_image_r": mv.get("r"),
+            "series_nrmsd": sd.get("nrmsd"),
+        }
+        for name, r in zip(MOTION_PARAM_NAMES, mp.get("per_column_r", []), strict=False):
+            m[f"motion_r_{name}"] = r
+        res.metrics["reference"] = m
+
+        for p in (ref / "moco.nii", ffs / "moco.nii"):
+            res.artifacts.append((p, "regenerable"))
+        for p in (
+            ref / "motion.1D", ffs / "motion.1D", ref / "moco.aff12.1D", ffs / "moco.aff12.1D",
+            ref / "mean.nii", ffs / "mean.nii", log,
+        ):  # fmt: skip
+            res.artifacts.append((p, "keep"))
+
+        res.provenance["ref"] = {
+            "tool": "3dvolreg",
+            "version": afni_version("3dvolreg"),
+            "args": REF_ARGS,
+        }
+        res.provenance["ffs"] = {
+            "tool": "ffs_moco", **ffs_version(), "args": FFS_ARGS, "device": device,
+            "note": "single-run process: timing includes interpreter and compile warm-up",
+        }  # fmt: skip
+        return res
