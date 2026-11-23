@@ -93,3 +93,28 @@ def test_local_fetch_never_offers_originals_for_pruning(tmp_path):
     rel = "sub-01/func/sub-01_task-rest_run-1_echo-1_bold.nii.gz"
     paths, downloaded = fetch(m, [rel], tmp_path / "cache")
     assert paths[rel] == root / rel and downloaded == []
+
+
+def test_reml_events_to_stim_times(tmp_path):
+    """Fixed durations -> BLOCK(d,1), varying -> married dmBLOCK, n/a and singletons dropped."""
+    from fastfuncstuff.benchmark.checks.reml import _conditions, _stim_args
+
+    ev = tmp_path / "x_events.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n"
+        "0\t2\tface\n10\t2\tface\n"
+        "5\t1\thouse\n15\t3\thouse\n"
+        "20\t0\tn/a\n25\t0\tn/a\n"
+        "30\t1\tlonely\n"
+    )
+    conds = _conditions(ev)
+    assert set(conds) == {"face", "house", "event"}  # n/a pooled as 'event', singleton dropped
+    args = _stim_args(conds, tmp_path)
+    assert args[:2] == ["-num_stimts", "3"]
+    models = {args[i + 3]: args[i + 6] for i, a in enumerate(args) if a == "-stim_times"}
+    by_label = dict(zip(models.values(), models.keys(), strict=True))
+    assert by_label["face"] == "BLOCK(2,1)"
+    assert by_label["house"] == "dmBLOCK(1)"
+    assert by_label["event"] == "GAM"
+    house_file = next(p for p in tmp_path.glob("c*.1D") if ":" in p.read_text())
+    assert house_file.read_text().split() == ["5.000:1.000", "15.000:3.000"]
