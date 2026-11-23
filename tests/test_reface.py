@@ -178,7 +178,8 @@ def test_cli_single_flag_allineate_opts_parses():
             "o",
             "-mode_deface",
             "-allineate_opts",
-            "-shift_rotate_scale",
+            "-slow",
         ]
     )
-    assert args.allineate_opts == "-shift_rotate_scale"
+    assert args.allineate_opts == "-slow"
+    assert args.dof == 9  # the shell keeps the template's shape unless asked

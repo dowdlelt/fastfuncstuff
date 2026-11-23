@@ -64,10 +64,6 @@ The default template and shell are the ones AFNI installs
 beside the afni on $PATH, in $AFNI_ATLAS_PATH or ~/.afni/atlases.
 
 Differences from @afni_refacer_run:
-  - The fit is a 12-DoF affine by default, not shift_rotate_scale (9 DoF).
-    On the T1 it was checked on, the 12-DoF fit scored better than AFNI's on
-    every cost (lpa 0.35 vs 0.45); -allineate_opts -shift_rotate_scale asks
-    for AFNI's 9.
   - No 3dUnifize before the fit: lpa is a local correlation, which the
     bias field barely moves, and it costs 30 s.
   - No QC montage images.
@@ -124,12 +120,22 @@ def parse_args(
 
     al = parser.add_argument_group("alignment")
     al.add_argument("-cost", default="lpa", help="ffs_allineate cost for the template fit")
+    al.add_argument(
+        "-dof",
+        type=int,
+        choices=(9, 12),
+        default=9,
+        help="Fit shift+rotate+scale (9, AFNI's choice) or a full affine (12). "
+        "12 matches the template better but its shear can bend the shell's inner "
+        "edge toward the brain: on one T1 it took the back of the shell onto the "
+        "skull's inner table, where 9 kept AFNI's clearance or more",
+    )
     option_string_value(
         al.add_argument(
             "-allineate_opts",
             default="",
             metavar="'OPTS'",
-            help="More ffs_allineate flags for the fit, quoted, e.g. '-shift_rotate_scale -slow'",
+            help="More ffs_allineate flags for the fit, quoted, e.g. '-slow'",
         )
     )
     al.add_argument(
@@ -276,6 +282,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         [
             *("-base", template_path, "-source", args.input, "-prefix", "unused.nii"),
             *("-cost", args.cost, "-automask", "-noautoweight"),
+            *(("-shift_rotate_scale",) if args.dof == 9 else ()),
             *("-base_mask", f"{template_path}[{TEMPLATE_WEIGHT_BRICK}]"),
             *("-verb", str(max(verb - 1, 0))),
             *shlex.split(args.allineate_opts),
