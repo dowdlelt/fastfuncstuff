@@ -112,7 +112,9 @@ def shell_on_subject(
     from fastfuncstuff.processing.affine import dicom_matrix_to_voxel
     from fastfuncstuff.processing.grid import resample_to_grid
 
-    inv = torch.linalg.inv(template_to_subject_dicom.cpu().to(torch.float64)).to(torch.float32)
+    inv = torch.from_numpy(
+        np.linalg.inv(template_to_subject_dicom.detach().cpu().double().numpy())
+    ).to(torch.float32)
     # subject voxel -> shell voxel; resample_to_grid takes it as a header pair
     vox = dicom_matrix_to_voxel(inv, subject_affine, shell_affine).numpy()
     subject_affine = np.asarray(subject_affine, dtype=np.float64)
