@@ -535,6 +535,10 @@ def _run(args, verbose: bool) -> int:
     meta.update(
         tool="ffs_fc",
         inputs=list(args.input),
+        # Absolute, so a viewer (or a later group step) can find the ROIs behind the rows.
+        atlas=[str(Path(a.split("[")[0]).resolve()) for a in (args.atlas or [])],
+        mask=str(Path(args.mask).resolve()) if args.mask else None,
+        seeds=list(args.seed_1D or []),
         n_rois=len(ids),
         n_timepoints=n_t,
         n_kept=cleaner.n_kept,
