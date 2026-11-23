@@ -37,6 +37,24 @@ from tqdm import tqdm
 from fastfuncstuff.utils import full_fp32_matmul
 
 
+def stopband_bins(n_t: int, tr: float, fbot: float, ftop: float) -> np.ndarray:
+    """``(n_t // 2 + 1,)`` bool over the rfft bins: True where the passband removes it.
+
+    The run's own Fourier grid ``j / (n_t * tr)``; bin 0 (the mean) is never in the
+    stopband -- it belongs to the drift model. ``ftop <= 0`` means no lowpass,
+    ``fbot <= 0`` no highpass. The one definition both cleaning algorithms use.
+    """
+    j = np.arange(n_t // 2 + 1)
+    f = j / (n_t * tr) if n_t > 0 and tr > 0 else np.zeros_like(j, dtype=float)
+    stop = np.zeros(j.size, bool)
+    if fbot > 0:
+        stop |= f < fbot
+    if ftop > 0:
+        stop |= f > ftop
+    stop[0] = False
+    return stop
+
+
 def stopband_regressors(n_t: int, tr: float, fbot: float, ftop: float) -> np.ndarray:
     """``(n_t, k)`` sines and cosines at every DFT frequency of a run outside ``[fbot, ftop]``.
 
@@ -49,10 +67,7 @@ def stopband_regressors(n_t: int, tr: float, fbot: float, ftop: float) -> np.nda
         return np.zeros((max(n_t, 0), 0))
     t = np.arange(n_t, dtype=np.float64)
     cols = []
-    for j in range(1, n_t // 2 + 1):
-        f = j / (n_t * tr)
-        if not ((fbot > 0 and f < fbot) or (ftop > 0 and f > ftop)):
-            continue
+    for j in np.flatnonzero(stopband_bins(n_t, tr, fbot, ftop)):
         arg = 2.0 * np.pi * j * t / n_t
         cols.append(np.cos(arg))
         if 2 * j != n_t:
@@ -62,7 +77,19 @@ def stopband_regressors(n_t: int, tr: float, fbot: float, ftop: float) -> np.nda
 
 @dataclass
 class Cleaner:
-    """Per-run orthonormal nuisance bases over the kept TRs, and how to apply them."""
+    """Per-run nuisance removal over the kept TRs, and how to apply it.
+
+    Two exact algorithms for the same projection, chosen per run:
+
+    * **regression** -- one orthonormal basis of ``[nuisance | stopband sines]`` on the
+      kept rows, removed as ``y - Q Q^T y``. Works across censored gaps.
+    * **fft** -- for a run with every TR kept: zero the stopband rfft bins, then remove
+      the basis of the *band-filtered* nuisance. The DFT basis is orthogonal on a full
+      run, so zeroing bins is the stopband projection, and
+      ``span(stop, N) = span(stop) + span(P_band N)``: the same residual, O(T log T) per
+      row instead of O(T k) with k in the hundreds. (This is also what InstaCorr did by
+      hand; filtering the nuisance before projecting is what keeps it exact.)
+    """
 
     keep: np.ndarray  # (T,) bool over the concatenated TRs
     run_cols: list[np.ndarray]  # per run: indices of its kept TRs into the full axis
@@ -72,6 +99,9 @@ class Cleaner:
     #: passband alone costs (its sines overlap the drift polynomials, so it is not
     #: simply the number of stopband columns).
     band_free_ranks: list[int] | None = None
+    #: Per run: the rfft bins kept (float 1/0) when the run uses the fft algorithm,
+    #: in which case ``bases[r]`` spans the band-filtered nuisance; None = regression.
+    band_masks: list[Tensor | None] | None = None
 
     @property
     def passband_cost(self) -> int:
@@ -140,7 +170,9 @@ class Cleaner:
         out = torch.empty(n_rows, self.n_kept, dtype=torch.float32, device=out_device)
         bases = [b.to(device=device, dtype=torch.float32) for b in self.bases]
         cols_t = [torch.as_tensor(c, device=device) for c in self.run_cols]
-        pieces = [(c, b) for c, b in zip(cols_t, bases, strict=True) if c.numel()]
+        masks = self.band_masks or [None] * len(bases)
+        masks_t = [None if m is None else m.to(device) for m in masks]
+        pieces = [(c, b, m) for c, b, m in zip(cols_t, bases, masks_t, strict=True) if c.numel()]
         bar = tqdm(
             range(0, n_rows, chunk),
             desc="Cleaning",
@@ -151,8 +183,10 @@ class Cleaner:
         for r0 in bar:
             block = data[r0 : r0 + chunk].to(device=device, dtype=torch.float32)
             parts = []
-            for cols, q in pieces:
+            for cols, q, m in pieces:
                 y = block.index_select(1, cols)
+                if m is not None:
+                    y = torch.fft.irfft(torch.fft.rfft(y, dim=1) * m, n=y.shape[1], dim=1)
                 if q.shape[1]:
                     y = y - (y @ q) @ q.T
                 parts.append(y)
@@ -172,6 +206,28 @@ def _rank_safe_basis(cols: list[np.ndarray], rows: np.ndarray) -> Tensor:
     return _orthonormal_basis(torch.as_tensor(mat, dtype=torch.float64))
 
 
+def _filtered_basis(cols: list[np.ndarray], keep_bins: np.ndarray, n_t: int) -> Tensor:
+    """Orthonormal basis of the nuisance columns after the passband (rfft bins ``keep_bins``).
+
+    A column the band removes entirely (a slow polynomial under a highpass) is dropped
+    by comparing its filtered norm with its own unfiltered one -- normalising the
+    remnant first would turn roundoff into a unit-length regressor of noise.
+    """
+    from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+
+    if not cols:
+        return torch.zeros(n_t, 0, dtype=torch.float64)
+    mat = np.concatenate(cols, axis=1)
+    filt = np.fft.irfft(np.fft.rfft(mat, axis=0) * keep_bins[:, None], n=n_t, axis=0)
+    before = np.linalg.norm(mat, axis=0)
+    after = np.linalg.norm(filt, axis=0)
+    alive = after > 1e-6 * np.maximum(before, 1e-300)
+    if not alive.any():
+        return torch.zeros(n_t, 0, dtype=torch.float64)
+    filt = filt[:, alive] / after[alive]
+    return _orthonormal_basis(torch.as_tensor(filt, dtype=torch.float64))
+
+
 def build_cleaner(
     nuisance_per_run: Sequence[Tensor | np.ndarray | None],
     run_starts: Sequence[int],
@@ -180,6 +236,7 @@ def build_cleaner(
     keep: np.ndarray | None = None,
     tr: float | None = None,
     passband: tuple[float, float] | None = None,
+    method: str = "auto",
 ) -> Cleaner:
     """Orthonormal per-run bases of ``[nuisance | stopband]`` over each run's kept TRs.
 
@@ -189,7 +246,13 @@ def build_cleaner(
     one in radians are judged on shape, not units; collinear columns (a passband sine
     that a polynomial already spans, a motion column that censoring has flattened) are
     dropped rather than handed back as directions of noise.
+
+    ``method``: ``auto`` uses the fft algorithm for every run that has a passband and
+    no censored TR, regression otherwise; ``regression`` / ``fft`` force one (``fft``
+    refuses a censored run). Both give the same residual and the same dof.
     """
+    if method not in ("auto", "regression", "fft"):
+        raise ValueError(f"method must be auto, regression or fft, got {method!r}")
     run_starts = list(run_starts)
     n_runs = len(run_starts)
     keep = np.ones(n_timepoints, bool) if keep is None else np.asarray(keep, bool).reshape(-1)
@@ -200,7 +263,7 @@ def build_cleaner(
     if len(nuisance_per_run) != n_runs:
         raise ValueError(f"{len(nuisance_per_run)} nuisance blocks for {n_runs} runs")
 
-    run_cols, bases, ranks, free = [], [], [], []
+    run_cols, bases, ranks, free, masks = [], [], [], [], []
     for r in range(n_runs):
         a = run_starts[r]
         b = run_starts[r + 1] if r + 1 < n_runs else n_timepoints
@@ -221,19 +284,34 @@ def build_cleaner(
             bases.append(torch.zeros(local.size, 0, dtype=torch.float64))
             ranks.append(0)
             free.append(0)
+            masks.append(None)
             continue
 
-        q = _rank_safe_basis(blocks, local)
-        free.append(
-            int(_rank_safe_basis(blocks[:-1], local).shape[1])
-            if passband is not None
-            else int(q.shape[1])
-        )
-        if q.shape[1] >= local.size:
+        uncensored = local.size == n_r
+        if method == "fft" and passband is not None and not uncensored:
+            raise ValueError(f"run {r + 1} has censored TRs; the fft algorithm needs whole runs")
+        nuis_cols = blocks[:-1] if passband is not None else blocks
+        free_basis = _rank_safe_basis(nuis_cols, local)
+        free.append(int(free_basis.shape[1]))
+        if passband is not None and uncensored and method != "regression":
+            assert tr is not None
+            stop = stopband_bins(n_r, tr, passband[0], passband[1])
+            n_stop = 2 * int(stop.sum()) - int(n_r % 2 == 0 and bool(stop[-1]))
+            q = _filtered_basis(nuis_cols, ~stop, n_r)
+            masks.append(torch.as_tensor(~stop, dtype=torch.float32))
+            rank = n_stop + int(q.shape[1])
+        else:
+            q = _rank_safe_basis(blocks, local)
+            masks.append(None)
+            rank = int(q.shape[1])
+        if rank >= local.size:
             raise ValueError(
-                f"run {r + 1}: {q.shape[1]} nuisance dimensions for {local.size} kept TRs "
+                f"run {r + 1}: {rank} nuisance dimensions for {local.size} kept TRs "
                 "leave nothing to correlate; lower -polort, narrow the stopband, or censor less"
             )
         bases.append(q)
-        ranks.append(int(q.shape[1]))
-    return Cleaner(keep=keep, run_cols=run_cols, bases=bases, ranks=ranks, band_free_ranks=free)
+        ranks.append(rank)
+    return Cleaner(
+        keep=keep, run_cols=run_cols, bases=bases, ranks=ranks, band_free_ranks=free,
+        band_masks=masks,
+    )  # fmt: skip

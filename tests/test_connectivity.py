@@ -381,3 +381,32 @@ def test_passband_cost_counts_only_what_drift_does_not_already_remove():
     # some of whose span the Legendre drift already covers.
     assert cl.passband_cost <= 293 and cl.ranks[0] == cl.passband_cost + 4
     assert build_cleaner([poly], [0], n).passband_cost == 0
+
+
+@pytest.mark.parametrize("band", [(0.01, 0.1), (0.01, 0.0), (0.0, 0.2)])
+def test_fft_and_regression_cleaning_agree(band):
+    """The two algorithms are the same projection: same residual, same dof."""
+    rng = np.random.default_rng(14)
+    lens, tr = [120, 97], 1.5
+    n = sum(lens)
+    y = 100 + rng.standard_normal((20, n)).cumsum(1) * 0.1 + rng.standard_normal((20, n))
+    nuis = [np.concatenate([_legendre(L, 2), rng.standard_normal((L, 3))], 1) for L in lens]
+    kw = dict(tr=tr, passband=band)
+    reg = build_cleaner(nuis, [0, 120], n, method="regression", **kw)
+    fft = build_cleaner(nuis, [0, 120], n, method="fft", **kw)
+    assert all(m is not None for m in fft.band_masks)
+    assert reg.ranks == fft.ranks and reg.dof == fft.dof
+    yt = torch.as_tensor(y, dtype=torch.float32)
+    np.testing.assert_allclose(fft.apply(yt).numpy(), reg.apply(yt).numpy(), atol=2e-3)
+
+
+def test_auto_cleaning_uses_regression_for_a_censored_run():
+    n = 100
+    keep = np.ones(2 * n, bool)
+    keep[n + 5] = False
+    cl = build_cleaner([_legendre(n, 1)] * 2, [0, n], 2 * n, keep=keep, tr=1.0,
+                       passband=(0.01, 0.1))  # fmt: skip
+    assert cl.band_masks[0] is not None and cl.band_masks[1] is None
+    with pytest.raises(ValueError, match="censored"):
+        build_cleaner([_legendre(n, 1)] * 2, [0, n], 2 * n, keep=keep, tr=1.0,
+                      passband=(0.01, 0.1), method="fft")  # fmt: skip
