@@ -542,3 +542,109 @@ def test_cli_per_run_loro_and_cv_shrinkage(toy):
     curve = np.loadtxt(prefix + "_shrink_cv.tsv", skiprows=1)
     assert curve.shape == (101, 4)  # shrinkage, mean, one column per held-out run
     assert curve[np.argmax(curve[:, 1]), 0] == pytest.approx(meta["shrink_cv"]["best"])
+
+
+def _explicit_efc(z: np.ndarray) -> np.ndarray:
+    iu, ju = np.triu_indices(z.shape[0], 1)
+    e = z[iu] * z[ju]
+    e = e / np.linalg.norm(e, axis=1, keepdims=True)
+    return e @ e.T
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "correlation"])
+def test_efc_embedding_has_the_distances_of_efc_rows(metric):
+    """k-means on the E x rank embedding is k-means on the E x E eFC: same distances."""
+    from fastfuncstuff.connectivity.edge import efc_embedding, zscore_rows
+
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal((14, 40)) + rng.standard_normal(40)  # shared component
+    z = zscore_rows(torch.as_tensor(x))
+    efc = _explicit_efc(z.numpy().astype(np.float64))
+    if metric == "correlation":
+        efc = efc - efc.mean(1, keepdims=True)
+        efc = efc / np.linalg.norm(efc, axis=1, keepdims=True)
+    emb = efc_embedding(z, metric, max_bytes=4096).numpy().astype(np.float64)  # many blocks
+    assert emb.shape[1] <= 40  # rank <= T, never E
+    d_full = ((efc[:, None] - efc[None]) ** 2).sum(-1)
+    d_emb = ((emb[:, None] - emb[None]) ** 2).sum(-1)
+    np.testing.assert_allclose(d_emb, d_full, atol=2e-4 * d_full.max())
+
+
+def test_edge_communities_find_planted_edge_groups():
+    """Two ROI groups co-fluctuating at different times: within-group edges of each
+    group form their own community, and the node overlap is low inside a group."""
+    from fastfuncstuff.connectivity.edge import edge_communities, zscore_rows
+
+    rng = np.random.default_rng(0)
+    t = 300
+    a, b = np.zeros(t), np.zeros(t)
+    a[:150] = rng.standard_normal(150) * 3
+    b[150:] = rng.standard_normal(150) * 3
+    x = np.vstack([a + rng.standard_normal((5, t)) * 0.5, b + rng.standard_normal((5, t)) * 0.5])
+    z = zscore_rows(torch.as_tensor(x))
+    com = edge_communities(z, 3, replicates=5)
+    m = com.matrix(10)
+    within_a = m[:5, :5][np.triu_indices(5, 1)]
+    within_b = m[5:, 5:][np.triu_indices(5, 1)]
+    assert len(set(within_a)) == 1 and len(set(within_b)) == 1
+    assert within_a[0] != within_b[0]
+    frac, h = com.node_profile(10)
+    np.testing.assert_allclose(frac.sum(1), 1.0)
+    assert np.all((h >= 0) & (h <= 1))
+
+
+def test_write_efc_is_the_explicit_matrix(tmp_path):
+    from fastfuncstuff.connectivity.edge import efc_bytes, write_efc, zscore_rows
+
+    rng = np.random.default_rng(1)
+    z = zscore_rows(torch.as_tensor(rng.standard_normal((9, 30))))
+    path = tmp_path / "efc.npy"
+    write_efc(z, path, max_bytes=2048)
+    got = np.load(path)
+    assert got.nbytes == efc_bytes(9)
+    np.testing.assert_allclose(got, _explicit_efc(z.numpy().astype(np.float64)), atol=1e-5)
+
+
+def test_cli_efc_writes_communities_overlap_and_full_matrix(toy):
+    from fastfuncstuff.cli.fc import main
+
+    tmp, runs, atlas, labels, lens = toy
+    prefix = str(tmp / "efc")
+    assert main(["-input", *runs, "-atlas", atlas, "-efc", "2", "-efc_full", "-plot",
+                 "-device", "cpu", "-quiet", "-prefix", prefix]) == 0  # fmt: skip
+    edges = np.loadtxt(prefix + "_efc_edges.tsv", skiprows=1)
+    assert edges.shape == (3, 4) and set(edges[:, 3]) <= {1, 2}
+    nodes = np.genfromtxt(prefix + "_efc_nodes.tsv", skip_header=1, usecols=(2, 3, 4))
+    np.testing.assert_allclose(nodes[:, 1:].sum(1), 1.0)
+    assert np.load(prefix + "_efc.npy").shape == (3, 3)
+    npz = np.load(prefix + "_efc.npz")
+    assert npz["communities"].shape == (3, 3) and np.all(np.diag(npz["communities"]) == 0)
+    np.testing.assert_allclose(np.diag(npz["profile_similarity"]), 1.0)
+    meta = json.loads(open(prefix + ".json").read())
+    assert meta["efc"]["k"] == 2 and sum(meta["efc"]["edges_per_community"]) == 3
+    assert (tmp / "efc_efc.png").exists() and (tmp / "efc_rss.tsv").exists()
+
+
+def test_node_entropy_and_profile_similarity_match_the_reference_formulas():
+    """fcn_node_entropy.m (log2, / log2 k) and fcn_profilesim.m (1 - mean(row_i ~= row_j)
+    over the community matrix with 0 on its diagonal), ported line by line."""
+    from fastfuncstuff.connectivity.edge import EdgeCommunities
+
+    rng = np.random.default_rng(5)
+    n, k = 12, 4
+    labels = rng.integers(0, k, n * (n - 1) // 2)
+    com = EdgeCommunities(labels=labels, k=k, inertia=0.0)
+    mat = np.zeros((n, n))
+    iu, ju = np.triu_indices(n, 1)
+    mat[iu, ju] = labels + 1
+    mat = mat + mat.T
+    h = np.stack([np.bincount(mat[i][np.arange(n) != i].astype(int) - 1, minlength=k)
+                  for i in range(n)])  # fmt: skip
+    p = h / h.sum(1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        enorm = -np.nansum(p * np.log2(p), 1) / np.log2(k)
+    sim = 1 - (mat[:, None, :] != mat[None, :, :]).mean(-1)
+    np.fill_diagonal(sim, 1.0)
+    _, overlap = com.node_profile(n)
+    np.testing.assert_allclose(overlap, enorm, atol=1e-12)
+    np.testing.assert_allclose(com.profile_similarity(n), sim, atol=1e-12)

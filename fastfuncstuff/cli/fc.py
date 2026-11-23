@@ -12,6 +12,11 @@ is cleaned per run on the uncensored TRs, then correlated:
   * whole-brain maps (-wb_corr / -wb_z): every voxel against every ROI and seed.
   * edge time series (-edge): the co-fluctuation amplitude RSS(t) per TR, and with
     -edge_ts every z_i(t) z_j(t) product streamed to a .npy.
+  * edge communities (-efc K): k-means over the edge series (Faskowitz et al. 2020,
+    as their reference code does), each ROI's overlap (how its edges spread over
+    communities) and community-profile similarity. -efc_on efc clusters the rows of
+    the edge x edge similarity (eFC) instead, exactly, without forming it. -efc_full
+    writes the whole E x E eFC when it fits on disk (17 GB at 360 ROIs).
   * graph metrics per ROI (-graph): strength, clustering, betweenness, efficiency.
 
 Cleaning (per run, on the kept TRs only): Legendre drift (-polort), -ortvec
@@ -28,6 +33,9 @@ Outputs (PREFIX = -prefix without extension):
   PREFIX_ts.tsv      cleaned ROI series (-ts_out)
   PREFIX_wb_r / _wb_z  whole-brain maps, one sub-brick per ROI/seed
   PREFIX_rss.tsv     RSS per TR (-edge); PREFIX_edge_ts.npy + _edges.tsv (-edge_ts)
+  PREFIX_efc_edges.tsv / _efc_nodes.tsv / _efc.npz  edge communities, ROI overlap,
+                     profile similarity (-efc); PREFIX_efc.npy full eFC (-efc_full);
+                     PREFIX_efc.png (-efc with -plot)
   PREFIX_fc.png      the matrix, clustered, and the RSS trace (-plot)
 
 Examples
@@ -207,6 +215,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "PREFIX_edge_ts.npy (400 ROIs x 600 TRs = 192 MB) with PREFIX_edges.tsv.",
     )
     me.add_argument(
+        "-efc",
+        type=int,
+        default=None,
+        metavar="K",
+        help="K edge communities by k-means (k-means++, 10 restarts, lowest inertia\n"
+        "kept). Default: cluster the edge series themselves, as the reference code\n"
+        "of Faskowitz et al. (2020) does. Writes PREFIX_efc_edges.tsv (community per\n"
+        "edge), PREFIX_efc_nodes.tsv (per ROI: fraction of its edges per community\n"
+        "and the normalised entropy of that profile, its overlap) and PREFIX_efc.npz\n"
+        "(the ROI x ROI community map and community-profile similarity). Implies -edge.",
+    )
+    me.add_argument(
+        "-efc_on",
+        choices=["ets", "efc", "efc_corr"],
+        default="ets",
+        help="What -efc clusters. ets: the edge series (the reference). efc: the rows\n"
+        "of the edge x edge similarity, Euclidean; efc_corr: the same rows centred\n"
+        "and scaled (MATLAB kmeans 'correlation'). Both efc forms are exact without\n"
+        "the E x E matrix: its rank is at most the kept TRs, so they run on an\n"
+        "E x TRs embedding with the same distances.",
+    )
+    me.add_argument(
+        "-efc_full",
+        action="store_true",
+        help="Also write the full E x E float32 eFC to PREFIX_efc.npy. Big: 200 ROIs\n"
+        "= 1.6 GB, 360 = 17 GB, 1000 = 1 TB. Refused when the disk lacks room.",
+    )
+    me.add_argument(
         "-graph",
         action="store_true",
         help="Graph metrics per ROI on the CC matrix (added to PREFIX_rois.tsv).",
@@ -311,6 +347,12 @@ def _run(args, verbose: bool) -> int:
     want_maps = args.wb_corr or args.wb_z
     if not args.atlas and not want_maps:
         raise ValueError("-seed_1D alone needs -wb_corr or -wb_z (nothing else to correlate)")
+    if args.efc_full and args.efc is None:
+        raise ValueError("-efc_full needs -efc K")
+    if args.efc is not None:
+        if args.efc < 2:
+            raise ValueError(f"-efc needs K >= 2, got {args.efc}")
+        args.edge = True
     if args.edge_ts:
         args.edge = True
     if args.passband is not None:
@@ -607,6 +649,8 @@ def _run(args, verbose: bool) -> int:
                     fh.write(f"{e}\t{ids[a]}\t{ids[b]}\t{names[a]}\t{names[b]}\n")
             written += [f"{stem}_edge_ts.npy", f"{stem}_edges.tsv"]
             _say(verbose, f"   {n_e:,} edge series written")
+        if args.efc is not None:
+            written += _write_efc(args, z, stem, ids, names, mats, meta, verbose)
 
     if args.plot:
         from fastfuncstuff.connectivity.plots import plot_fc
@@ -669,6 +713,50 @@ def _run(args, verbose: bool) -> int:
     for path in written:
         _say(verbose, f"   wrote {path}")
     return 0
+
+
+def _write_efc(args, z, stem, ids, names, mats, meta, verbose) -> list[str]:
+    """-efc outputs: communities per edge, overlap per ROI, optional full matrix, plot."""
+    from fastfuncstuff.connectivity import edge as edge_mod
+
+    n = len(ids)
+    out = []
+    _say(
+        verbose, f"   edge communities: {n * (n - 1) // 2:,} edges, k = {args.efc} ({args.efc_on})"
+    )
+    com = edge_mod.edge_communities(z, args.efc, on=args.efc_on)
+    iu, ju = edge_mod.edge_index(n)
+    with open(f"{stem}_efc_edges.tsv", "w") as fh:
+        fh.write("edge\troi_i\troi_j\tcommunity\n")
+        for e, (a, b) in enumerate(zip(iu, ju, strict=True)):
+            fh.write(f"{e}\t{ids[a]}\t{ids[b]}\t{com.labels[e] + 1}\n")
+    frac, overlap = com.node_profile(n)
+    with open(f"{stem}_efc_nodes.tsv", "w") as fh:
+        fh.write("roi\tname\toverlap\t" + "\t".join(f"c{c + 1}" for c in range(com.k)) + "\n")
+        for i in range(n):
+            fh.write(f"{ids[i]}\t{names[i]}\t{overlap[i]:.6g}\t"
+                     + "\t".join(f"{v:.6g}" for v in frac[i]) + "\n")  # fmt: skip
+    np.savez_compressed(
+        f"{stem}_efc.npz", ids=np.asarray(ids), names=np.asarray(names),
+        communities=com.matrix(n) + 1, profile_similarity=com.profile_similarity(n),
+        overlap=overlap, fraction=frac,
+    )  # fmt: skip
+    out += [f"{stem}_efc_edges.tsv", f"{stem}_efc_nodes.tsv", f"{stem}_efc.npz"]
+    meta["efc"] = {
+        "k": com.k, "on": args.efc_on, "inertia": com.inertia,
+        "edges_per_community": np.bincount(com.labels, minlength=com.k).tolist(),
+        "mean_overlap": float(overlap.mean()),
+    }  # fmt: skip
+    if args.efc_full:
+        _say(verbose, f"   writing full eFC ({edge_mod.efc_bytes(n) / 1e9:.1f} GB)")
+        edge_mod.write_efc(z, f"{stem}_efc.npy")
+        out.append(f"{stem}_efc.npy")
+    if args.plot:
+        from fastfuncstuff.connectivity.plots import plot_efc
+
+        key = "CC" if "CC" in mats else "CC_W1"
+        out.append(plot_efc(f"{stem}_efc.png", com.matrix(n), overlap, mats[key], names))
+    return out
 
 
 if __name__ == "__main__":

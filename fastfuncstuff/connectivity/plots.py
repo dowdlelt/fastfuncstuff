@@ -88,3 +88,65 @@ def plot_fc(
     fig.savefig(path, dpi=150, facecolor=_SURFACE)
     plt.close(fig)
     return str(path)
+
+
+def plot_efc(
+    path: str | Path,
+    communities: np.ndarray,
+    overlap: np.ndarray,
+    r: np.ndarray,
+    names: Sequence[str],
+) -> str:
+    """Edge communities as an ROI x ROI map, in the correlation matrix's clustered
+    order (so it lines up with ``PREFIX_fc.png``), and each ROI's overlap beside it."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    from fastfuncstuff.connectivity.order import seriate
+    from fastfuncstuff.dynamics.plots import (
+        _INK,
+        _INK2,
+        _SURFACE,
+        STATE_COLORS,
+        _style_axes,
+        golden_palette,
+    )
+
+    order, _ = seriate(r)
+    m = np.asarray(communities)[order][:, order]
+    n = m.shape[0]
+    k = int(m.max()) + 1
+    # The validated eight, then two more distinct in hue and lightness (brown, grey);
+    # the golden-angle ramp only beyond ten, where it starts repeating greens.
+    fixed = [*STATE_COLORS, "#8a5a2b", "#8f8e89"]
+    colours = fixed[:k] if k <= len(fixed) else golden_palette(k)
+    shown = np.ma.masked_less(m, 0)
+    fig = plt.figure(figsize=(9.6, 7.0), facecolor=_SURFACE)
+    ax = fig.add_axes((0.05, 0.1, 0.62, 0.8))
+    ax.imshow(shown, cmap=ListedColormap(colours), vmin=-0.5, vmax=k - 0.5,
+              interpolation="nearest")  # fmt: skip
+    if n <= MAX_LABELLED:
+        labels = [str(names[i]) for i in order]
+        ax.set_xticks(range(n), labels, rotation=90, fontsize=6)
+        ax.set_yticks(range(n), labels, fontsize=6)
+    else:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(f"{n} ROIs, clustered order of the correlation matrix", color=_INK2)
+    ax.set_title(f"Edge communities (k = {k})", color=_INK)
+    for c, col in enumerate(colours):
+        ax.plot([], [], "s", color=col, label=f"{c + 1}: {int((m == c).sum() // 2):,}")
+    fig.legend(loc="upper left", bbox_to_anchor=(0.8, 0.9), fontsize=7, frameon=False,
+               title="community: edges", title_fontsize=7)  # fmt: skip
+    ax2 = fig.add_axes((0.69, 0.1, 0.08, 0.8), sharey=ax)
+    ax2.barh(np.arange(n), np.asarray(overlap)[order], height=1.0, color="#52514e")
+    ax2.set_xlim(0, 1)
+    ax2.set_xlabel("overlap", fontsize=8)
+    ax2.tick_params(labelleft=False)
+    _style_axes(ax2)
+    fig.savefig(path, dpi=150, facecolor=_SURFACE)
+    plt.close(fig)
+    return str(path)
