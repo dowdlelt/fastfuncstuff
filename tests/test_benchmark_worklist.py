@@ -129,3 +129,18 @@ def test_reml_events_to_stim_times(tmp_path):
     assert by_label["event"] == "GAM"
     house_file = next(p for p in tmp_path.glob("c*.1D") if ":" in p.read_text())
     assert house_file.read_text().split() == ["5.000:1.000", "15.000:3.000"]
+
+
+def test_allineate_affine_distance(tmp_path):
+    """A 2 mm shift reads as 2 mm RMS; the aff12 row parses as base->source 3x4."""
+    from fastfuncstuff.benchmark.checks.allineate import read_aff12, rms_displacement
+
+    f = tmp_path / "m.aff12.1D"
+    f.write_text("# 3dAllineate matrix\n 1 0 0 2  0 1 0 0  0 0 1 0\n")
+    m = read_aff12(f)
+    assert m[0, 3] == 2 and m[3, 3] == 1
+    pts = np.random.default_rng(0).normal(size=(100, 3)) * 50
+    assert abs(rms_displacement(m, np.eye(4), pts) - 2.0) < 1e-9
+    rot = np.eye(4)
+    rot[:2, :2] = [[0, -1], [1, 0]]  # 90 degrees: displacement grows with distance
+    assert rms_displacement(rot, np.eye(4), pts) > 50

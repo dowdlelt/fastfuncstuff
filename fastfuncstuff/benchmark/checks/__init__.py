@@ -6,6 +6,7 @@ A check declares what a dataset must offer (``needs``), how it draws units
 
 from __future__ import annotations
 
+from .allineate import AllineateCheck
 from .base import Check, UnitResult
 from .blipflip import BlipflipCheck
 from .moco import MocoCheck
@@ -16,7 +17,15 @@ from .slicetime import SlicetimeCheck
 
 CHECKS: dict[str, type[Check]] = {
     c.name: c
-    for c in (MocoCheck, SlicetimeCheck, BlipflipCheck, RemlCheck, PhysioCheck, QwarpCheck)
+    for c in (
+        MocoCheck,
+        SlicetimeCheck,
+        BlipflipCheck,
+        RemlCheck,
+        PhysioCheck,
+        QwarpCheck,
+        AllineateCheck,
+    )
 }
 
 __all__ = ["CHECKS", "Check", "UnitResult"]
