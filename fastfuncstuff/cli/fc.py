@@ -145,9 +145,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     me.add_argument(
         "-shrink",
-        choices=["none", "lw"],
+        choices=["none", "lw", "cv"],
         default="none",
-        help="lw: also write the Ledoit-Wolf shrunk correlation (LW; with -part_corr,\n"
+        help="cv: shrink toward the identity by the intensity that maximises the\n"
+        "leave-one-run-out Gaussian likelihood of the held-out run (CV, PC_CV; needs\n"
+        "2+ runs); both Ledoit-Wolf variants are scored on the same folds in\n"
+        "PREFIX.json for comparison.\n"
+        "lw: also write the Ledoit-Wolf shrunk correlation (LW; with -part_corr,\n"
         "PC_LW from it). Needed for a partial correlation when ROIs approach the\n"
         "residual dof. Sampling noise is counted in residual dof, not TRs (a passband\n"
         "leaves far fewer independent samples than time points); the shrinkage used\n"
@@ -170,6 +174,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-TR non-negative weights (full concatenated length, one column per\n"
         "weighting): a weighted Pearson r for each column, written as CC_W1, FZ_W1, ...\n"
         "(3dNetCorr -weight_corr). Censored TRs get weight 0 regardless.",
+    )
+    me.add_argument(
+        "-per_run",
+        action="store_true",
+        help="Also store each run's own matrix (CC_runs, runs x N x N) in PREFIX_fc.npz.\n"
+        "Every run is cleaned with its own drift and ortvecs, so these come from the\n"
+        "same single cleaning pass.",
+    )
+    me.add_argument(
+        "-loro",
+        action="store_true",
+        help="Leave-one-run-out reproducibility: each run's matrix against the matrix\n"
+        "of all the others (r over the upper triangle, in Fisher z), written to\n"
+        "PREFIX_loro.tsv with the mean in PREFIX.json. Every fold is exact from\n"
+        "per-run sums of products -- no re-cleaning per fold. Caveat: anything that\n"
+        "repeats across runs for non-neural reasons (global signal, vessels) is\n"
+        "reproducible too.",
     )
     me.add_argument("-wb_corr", action="store_true", help="Whole-brain r map per ROI/seed.")
     me.add_argument("-wb_z", action="store_true", help="Whole-brain Fisher-z map per ROI/seed.")
@@ -424,7 +445,9 @@ def _run(args, verbose: bool) -> int:
 
     # -- matrices -----------------------------------------------------------------
     mats: dict[str, np.ndarray] = {}
+    mats_runs: dict[str, np.ndarray] = {}
     meta: dict = {}
+    written: list[str] = []
     for tag, wt in weight_sets:
         r = correlation_matrix(clean, weights=wt).cpu().numpy()
         mats[f"CC{tag}"] = r
@@ -434,11 +457,68 @@ def _run(args, verbose: bool) -> int:
                 pc, pcb = partial_correlation(r, dof=cleaner.dof)
                 mats[f"PC{tag}"], mats[f"PCB{tag}"] = pc, pcb
             except ValueError as exc:
-                if args.shrink != "lw" or tag:
+                if args.shrink == "none" or tag:
                     raise
                 # The shrunk PC below is the answer the user asked for as well.
-                _say(verbose, f"   PC skipped, PC_LW only: {exc}")
+                _say(verbose, f"   PC skipped, shrunk PC only: {exc}")
                 meta["pc_skipped"] = str(exc)
+    want_xval = args.per_run or args.loro or args.shrink == "cv"
+    if want_xval:
+        from fastfuncstuff.connectivity.xval import (
+            cross_products,
+            loro_reproducibility,
+            shrink,
+            shrinkage_cv,
+        )
+
+        run_starts_kept = cleaner.kept_run_starts
+        if (args.loro or args.shrink == "cv") and len(run_starts_kept) < 2:
+            raise ValueError("-loro and -shrink cv need at least two runs with kept TRs")
+        loro_rows = []
+        for tag, wt in weight_sets:
+            if not (args.per_run or args.loro):
+                break
+            cp = cross_products(clean, run_starts_kept, weights=wt)
+            res = loro_reproducibility(cp) if cp.n_runs >= 2 else None
+            if args.per_run:
+                mats_runs[f"CC_runs{tag}"] = (
+                    res.per_run if res is not None else cp.correlation()[None]
+                ).numpy()
+            if args.loro and res is not None:
+                meta[f"loro_mean{tag}"] = res.mean
+                loro_rows.append((tag, res.reproducibility))
+                _say(
+                    verbose,
+                    f"   LORO reproducibility{tag}: mean r = {res.mean:.3f} "
+                    f"(runs {res.reproducibility.min():.3f}..{res.reproducibility.max():.3f})",
+                )
+        if loro_rows:
+            n_per = np.diff([*run_starts_kept, cleaner.n_kept])
+            with open(f"{stem}_loro.tsv", "w") as fh:
+                fh.write("run\tweights\tn_kept\treproducibility\n")
+                for tag, rep in loro_rows:
+                    for k, v in enumerate(rep):
+                        fh.write(f"{k + 1}\t{tag.lstrip('_') or 'none'}\t{n_per[k]}\t{v:.6f}\n")
+            written.append(f"{stem}_loro.tsv")
+
+        if args.shrink == "cv":
+            if args.weight_corr:
+                raise ValueError("-shrink cv is not defined for weighted correlations")
+            cv = shrinkage_cv(cross_products(clean, run_starts_kept))
+            mats["CV"] = shrink(mats["CC"], cv.best)
+            info: dict = {"best": cv.best, "heldout_loglik": cv.score(cv.best)}
+            for name, n_eff in (("lw_dof", cleaner.dof), ("lw_tr", None)):
+                _, a = ledoit_wolf(clean, n_effective=n_eff)
+                info[name] = {"shrinkage": a, "heldout_loglik": cv.score(a)}
+            meta["shrink_cv"] = info
+            _say(
+                verbose,
+                f"   CV shrinkage {cv.best:.3f} (LW dof {info['lw_dof']['shrinkage']:.3f}, "
+                f"LW tr {info['lw_tr']['shrinkage']:.3f})",
+            )
+            if args.part_corr:
+                mats["PC_CV"] = partial_correlation(mats["CV"])[0]
+
     if args.shrink == "lw":
         if args.weight_corr:
             raise ValueError("-shrink lw is not defined for weighted correlations")
@@ -451,10 +531,11 @@ def _run(args, verbose: bool) -> int:
         if args.part_corr:
             mats["PC_LW"] = partial_correlation(mats["LW"])[0]  # PD by construction
 
-    written = []
     if not args.no_netcc:
         written.append(write_netcc(f"{stem}.netcc", mats, ids, names))
-    np.savez_compressed(f"{stem}_fc.npz", ids=np.asarray(ids), names=np.asarray(names), **mats)
+    np.savez_compressed(
+        f"{stem}_fc.npz", ids=np.asarray(ids), names=np.asarray(names), **mats, **mats_runs
+    )
     written.append(f"{stem}_fc.npz")
 
     table = {"roi": ids, "name": names, "n_voxels": sizes}

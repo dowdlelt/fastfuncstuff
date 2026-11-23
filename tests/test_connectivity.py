@@ -470,3 +470,71 @@ def test_cleaner_keep_mean_restores_each_rows_level():
     plain = cl.apply(yt).numpy()
     np.testing.assert_allclose(kept.mean(1), y.mean(1), rtol=1e-5)
     np.testing.assert_allclose(kept - kept.mean(1, keepdims=True), plain, atol=1e-3)
+
+
+# -- cross-validation across runs ----------------------------------------------------
+
+
+def _three_runs(rng, n=6, lens=(50, 70, 60)):
+    x = rng.standard_normal((n, sum(lens))) + rng.standard_normal(sum(lens))
+    starts = list(np.cumsum([0, *lens[:-1]]))
+    return torch.as_tensor(x), starts, lens
+
+
+def test_cross_products_are_exact_for_any_subset_of_runs():
+    from fastfuncstuff.connectivity.xval import cross_products
+
+    rng = np.random.default_rng(16)
+    x, starts, lens = _three_runs(rng)
+    cp = cross_products(x, starts)
+    np.testing.assert_allclose(cp.correlation(), correlation_matrix(x), atol=1e-12)
+    cols = np.r_[0 : lens[0], lens[0] + lens[1] : sum(lens)]  # runs 1 and 3
+    np.testing.assert_allclose(cp.correlation([0, 2]), correlation_matrix(x[:, cols]), atol=1e-12)
+    w = rng.uniform(0, 2, sum(lens))
+    cpw = cross_products(x, starts, weights=w)
+    np.testing.assert_allclose(cpw.correlation(), correlation_matrix(x, weights=w), atol=1e-12)
+
+
+def test_loro_compares_each_run_with_the_others():
+    from fastfuncstuff.connectivity.xval import cross_products, loro_reproducibility
+
+    rng = np.random.default_rng(17)
+    x, starts, lens = _three_runs(rng)
+    res = loro_reproducibility(cross_products(x, starts))
+    a = lens[0]
+    np.testing.assert_allclose(res.per_run[0], correlation_matrix(x[:, :a]), atol=1e-12)
+    assert res.reproducibility.shape == (3,) and np.all(np.abs(res.reproducibility) <= 1)
+
+
+def test_shrinkage_cv_shrinks_more_when_runs_are_short():
+    """Held-out likelihood wants more shrinkage when each run carries little information."""
+    from fastfuncstuff.connectivity.xval import cross_products, shrinkage_cv
+
+    rng = np.random.default_rng(18)
+    n = 40
+    true = np.linalg.cholesky(0.7 * np.eye(n) + 0.3)  # one shared factor
+    best = {}
+    for t in (30, 600):
+        x = true @ rng.standard_normal((n, 4 * t))
+        best[t] = shrinkage_cv(cross_products(torch.as_tensor(x), [0, t, 2 * t, 3 * t])).best
+    assert best[30] > best[600]
+    # Not ~0 even at 1800 training samples: with N/T = 0.022 the smallest sample
+    # eigenvalues sit ~30% low (Marchenko-Pastur), and the identity target corrects
+    # that. With the TRUE matrix as the training estimate the optimum is 0.02
+    # (checked over 20 repeats); with a sample estimate it is 0.15.
+    assert 0.0 < best[600] < 0.3
+
+
+def test_cli_per_run_loro_and_cv_shrinkage(toy):
+    from fastfuncstuff.cli.fc import main
+
+    tmp, runs, atlas, labels, lens = toy
+    prefix = str(tmp / "xv")
+    assert main(["-input", *runs, "-atlas", atlas, "-per_run", "-loro", "-shrink", "cv",
+                 "-part_corr", "-device", "cpu", "-quiet", "-prefix", prefix]) == 0  # fmt: skip
+    fc = np.load(prefix + "_fc.npz")
+    assert fc["CC_runs"].shape == (2, 3, 3) and {"CV", "PC_CV"} <= set(fc.files)
+    meta = json.loads(open(prefix + ".json").read())
+    assert -1 <= meta["loro_mean"] <= 1
+    assert {"best", "lw_dof", "lw_tr"} <= set(meta["shrink_cv"])
+    assert open(prefix + "_loro.tsv").read().count("\n") == 3
