@@ -202,6 +202,8 @@ def save_image(
     affine: np.ndarray | None = None,
     brick_labels: list[str] | None = None,
     brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None,
+    dtype: np.dtype | type = np.float32,
+    anonymize: bool = False,
 ) -> None:
     """Save a torch tensor as a NIfTI image.
 
@@ -214,6 +216,10 @@ def save_image(
             extension (BRICK_LABS) so AFNI viewers show them.
         brick_stataux: Optional ``{sub_brick: (stat_code, params)}`` so AFNI can
             threshold those sub-bricks (BRICK_STATAUX).
+        dtype: On-disk type. An integer type is rounded and clipped to its range
+            first, rather than wrapped.
+        anonymize: Strip header extensions and identifying text fields (see
+            ``save_nifti``).
     """
     arr = data.detach().cpu().numpy()
 
@@ -230,13 +236,17 @@ def save_image(
 
     # Extract header from header_info to preserve TR, xyzt_units, etc.
     header = header_info.get("header") if header_info is not None else None
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        arr = np.clip(np.rint(arr), info.min, info.max)
     save_nifti(
-        arr.astype(np.float32, copy=False),
+        arr.astype(dtype, copy=False),
         output_path=path,
         affine=affine,
         header=header,
         brick_labels=brick_labels,
         brick_stataux=brick_stataux,
+        anonymize=anonymize,
     )
 
 
