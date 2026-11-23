@@ -1378,17 +1378,15 @@ def load_matrix_1D(
     Returns:
         (4, 4) affine matrix.
     """
-    with open(str(path)) as f:
-        text = f.read().strip()
-
-    vals = [float(x) for x in text.split()]
+    # Skip '#' lines: AFNI writes a comment header into its own -1Dmatrix_save
+    # files. Tokens, not rows, so a 3x4 layout still reads.
+    lines = Path(path).read_text().splitlines()
+    vals = [float(x) for ln in lines if not ln.lstrip().startswith("#") for x in ln.split()]
     if len(vals) != 12:
         raise ValueError(f"Expected 12 values in .aff12.1D, got {len(vals)}")
 
     M = torch.eye(4, dtype=torch.float32)
-    for i in range(3):
-        for j in range(4):
-            M[i, j] = vals[i * 4 + j]
+    M[:3, :4] = torch.tensor(vals, dtype=torch.float32).reshape(3, 4)
 
     if base_affine is not None and source_affine is not None:
         M = dicom_matrix_to_voxel(M, base_affine, source_affine)
