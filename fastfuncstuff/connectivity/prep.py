@@ -40,17 +40,35 @@ from fastfuncstuff.utils import full_fp32_matmul
 def stopband_bins(n_t: int, tr: float, fbot: float, ftop: float) -> np.ndarray:
     """``(n_t // 2 + 1,)`` bool over the rfft bins: True where the passband removes it.
 
-    The run's own Fourier grid ``j / (n_t * tr)``; bin 0 (the mean) is never in the
-    stopband -- it belongs to the drift model. ``ftop <= 0`` means no lowpass,
-    ``fbot <= 0`` no highpass. The one definition both cleaning algorithms use.
+    3dTproject's rule, verbatim, so a ``-passband`` here removes exactly the frequencies
+    it does: the passband becomes the stopbands ``[0, fbot - 1e-4]`` and
+    ``[ftop + 1e-4, inf)``, each mapped to bins by ``rint((edge -/+ df/6) / df)`` with
+    ``df = 1 / (n_t * tr)``. The effect is that a bin within ~df/3 *inside* either edge
+    is removed too -- at 360 TRs of 1 s, 0.1 Hz itself is in the stopband of
+    ``-passband 0.01 0.1``. Bin 0 (the mean) is never in the stopband; the drift model
+    owns it. ``ftop <= 0`` means no lowpass, ``fbot <= 0`` no highpass. The one
+    definition both cleaning algorithms use.
     """
-    j = np.arange(n_t // 2 + 1)
-    f = j / (n_t * tr) if n_t > 0 and tr > 0 else np.zeros_like(j, dtype=float)
-    stop = np.zeros(j.size, bool)
+    nf = n_t // 2
+    stop = np.zeros(nf + 1, bool)
+    if n_t < 2 or tr <= 0:
+        return stop
+    df = np.float32(1.0) / np.float32(n_t * tr)
+    nudge = np.float32(0.1666666) * df
+    qtop = (np.float32(nf) + np.float32(0.1)) * df
+
+    def mark(a: float, b: float) -> None:
+        a = min(max(np.float32(a), np.float32(0.0)), qtop)
+        b = min(max(np.float32(b), np.float32(0.0)), qtop)
+        jbot = max(int(np.rint((a + nudge) / df)), 0)
+        jtop = min(int(np.rint((b - nudge) / df)), nf)
+        if jtop >= jbot:
+            stop[jbot : jtop + 1] = True
+
     if fbot > 0:
-        stop |= f < fbot
+        mark(0.0, fbot - 0.0001)
     if ftop > 0:
-        stop |= f > ftop
+        mark(ftop + 0.0001, 999999.9)
     stop[0] = False
     return stop
 

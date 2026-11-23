@@ -42,8 +42,9 @@ def test_stopband_keeps_the_band_and_removes_the_rest():
     q, _ = np.linalg.qr(sb)
     assert np.linalg.norm(q.T @ inside) < 1e-8
     assert np.linalg.norm(outside - q @ (q.T @ outside)) < 1e-8
-    # j = 1..3 (< 0.01 Hz) and j = 41..100 (> 0.1 Hz); Nyquist (j=100) has no sine.
-    assert sb.shape[1] == 2 * 3 + 2 * 60 - 1
+    # 3dTproject's edge rule removes the edge bins themselves (0.01 Hz is j=4, 0.1 Hz is
+    # j=40): j = 1..4 and 40..100, Nyquist (j=100) cosine-only. 3dTproject -verb agrees.
+    assert sb.shape[1] == 2 * 4 + 2 * 61 - 1
 
 
 def test_cleaner_matches_per_run_least_squares_on_kept_rows():
@@ -377,9 +378,9 @@ def test_passband_cost_counts_only_what_drift_does_not_already_remove():
     poly = _legendre(n, 3)
     cl = build_cleaner([poly], [0], n, tr=tr, passband=(0.01, 0.1))
     assert cl.band_free_ranks == [4]
-    # 0.01-0.1 Hz at TR 1: 3 low + 144 high frequencies, Nyquist cosine-only = 293 columns,
-    # some of whose span the Legendre drift already covers.
-    assert cl.passband_cost <= 293 and cl.ranks[0] == cl.passband_cost + 4
+    # 0.01-0.1 Hz at TR 1, 360 TRs: 295 stopband columns, as 3dTproject -verb reports;
+    # some of their span the Legendre drift already covers.
+    assert cl.passband_cost <= 295 and cl.ranks[0] == cl.passband_cost + 4
     assert build_cleaner([poly], [0], n).passband_cost == 0
 
 
