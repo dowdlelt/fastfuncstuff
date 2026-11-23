@@ -16,7 +16,7 @@ from __future__ import annotations
 import gzip
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +50,18 @@ def cmrr_volume_zero(info_path) -> float:
     return first
 
 
+def cmrr_volume_starts(info_path) -> np.ndarray:
+    """First-slice start of every logged volume (s since midnight), in volume order."""
+    first: dict[int, int] = {}
+    for line in open(info_path):
+        p = line.split()
+        if len(p) == 5 and all(x.isdigit() for x in p):
+            v, tick = int(p[0]), int(p[2])
+            if v not in first or tick < first[v]:
+                first[v] = tick
+    return np.array([first[v] * TICK_S for v in sorted(first)])
+
+
 def cmrr_num_volumes(info_path) -> int | None:
     for line in open(info_path):
         m = re.match(r"\s*NumVolumes\s*=\s*(\d+)", line)
@@ -62,8 +74,10 @@ def cmrr_num_volumes(info_path) -> int | None:
 class CmrrRecording:
     info: Path
     channels: dict[str, Path]  # 'PULS' / 'RESP' / 'ECG1' -> log
-    t0: float  # first acquisition, seconds since midnight
+    t0: float  # first image volume, seconds since midnight (set per match)
     n_vols: int | None
+    vol_starts: np.ndarray  # every logged volume, dummies included when the sequence logs them
+    skipped: int = 0  # logged volumes before the image's first (dummies, discarded volumes)
 
 
 def find_cmrr_recordings(root: Path) -> list[CmrrRecording]:
@@ -78,11 +92,10 @@ def find_cmrr_recordings(root: Path) -> list[CmrrRecording]:
                 chans[ch] = p
         if not chans:
             continue
-        try:
-            t0 = cmrr_volume_zero(info)
-        except ValueError:
+        starts = cmrr_volume_starts(info)
+        if not len(starts):
             continue
-        out.append(CmrrRecording(info, chans, t0, cmrr_num_volumes(info)))
+        out.append(CmrrRecording(info, chans, float(starts[0]), cmrr_num_volumes(info), starts))
     return out
 
 
@@ -98,23 +111,32 @@ def acquisition_seconds(sidecar: dict) -> float | None:
 def match_runs(
     recordings: list[CmrrRecording], bolds: list[tuple[Path, dict, int]], tol_s: float = 0.5
 ) -> list[tuple[Path, CmrrRecording | None, str]]:
-    """Pair each BOLD (path, sidecar, n_vols) with the recording whose first tick is its
-    AcquisitionTime. A match needs |dt| <= tol_s and, when the log says, the same volume count."""
+    """Pair each BOLD (path, sidecar, n_vols) with the logged volume whose start is its
+    AcquisitionTime (|dt| <= tol_s). Logged volumes before it (dummies, volumes dropped at
+    conversion) are skipped; the volumes from there on must number exactly the image's."""
     out = []
     for path, meta, nv in bolds:
         t = acquisition_seconds(meta)
         if t is None:
             out.append((path, None, "no AcquisitionTime in sidecar"))
             continue
-        best = min(recordings, key=lambda r: abs(r.t0 - t), default=None)
-        if best is None or abs(best.t0 - t) > tol_s:
-            dt = "" if best is None else f" (nearest {best.t0 - t:+.1f} s)"
-            out.append((path, None, f"no recording at {meta['AcquisitionTime']}{dt}"))
+        best, k, dt = None, 0, np.inf
+        for r in recordings:
+            i = int(np.argmin(np.abs(r.vol_starts - t)))
+            d = float(r.vol_starts[i] - t)
+            if abs(d) < abs(dt):
+                best, k, dt = r, i, d
+        if best is None or abs(dt) > tol_s:
+            near = "" if best is None else f" (nearest {dt:+.1f} s)"
+            out.append((path, None, f"no logged volume at {meta['AcquisitionTime']}{near}"))
             continue
-        if best.n_vols is not None and best.n_vols != nv:
-            out.append((path, None, f"volume count {best.n_vols} in log vs {nv} in image"))
+        remaining = len(best.vol_starts) - k
+        if remaining != nv:
+            out.append((path, None, f"{remaining} logged volumes from the match vs {nv} in image"))
             continue
-        out.append((path, best, f"dt {best.t0 - t:+.3f} s"))
+        matched = replace(best, t0=float(best.vol_starts[k]), skipped=k)
+        note = f", {k} leading logged volumes skipped" if k else ""
+        out.append((path, matched, f"dt {dt:+.3f} s{note}"))
     return out
 
 

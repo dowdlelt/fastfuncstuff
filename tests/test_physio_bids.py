@@ -98,4 +98,19 @@ def test_volume_count_mismatch_refuses(tmp_path):
     nii = _run(tmp_path / "f", "sub-01_task-a_run-1", 16_000_000 * 0.0025, 5)
     meta = json.loads(nii.with_name(nii.name.replace(".nii.gz", ".json")).read_text())
     ((_, rec, why),) = P.match_runs(P.find_cmrr_recordings(tmp_path / "l"), [(nii, meta, 5)])
-    assert rec is None and "volume count" in why
+    assert rec is None and "logged volumes" in why
+
+
+def test_leading_dummies_in_log_are_skipped(tmp_path):
+    """Info logs 3 dummy volumes the image doesn't hold: match on the 4th, start from it."""
+    _cmrr(tmp_path / "l", "ddd", acq_tick=16_000_000, n_vols=8)
+    first_kept = 16_000_000 + 400 * 3
+    nii = _run(tmp_path / "f", "sub-01_task-a_run-1", first_kept * 0.0025, 5)
+    meta = json.loads(nii.with_name(nii.name.replace(".nii.gz", ".json")).read_text())
+    ((_, rec, why),) = P.match_runs(P.find_cmrr_recordings(tmp_path / "l"), [(nii, meta, 5)])
+    assert rec is not None and rec.skipped == 3 and "3 leading" in why
+    P.write_bids_physio(rec, nii)
+    side = json.loads(
+        (tmp_path / "f" / "sub-01_task-a_run-1_recording-cardiac_physio.json").read_text()
+    )
+    assert abs(side["StartTime"] - (-(8000 + 1200) * 0.0025)) < 1e-6

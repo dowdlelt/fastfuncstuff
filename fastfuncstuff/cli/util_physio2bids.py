@@ -89,8 +89,8 @@ def main(argv: list[str] | None = None) -> int:
                 n_written += len(write_bids_physio(rec, bold, overwrite=args.overwrite)) // 2
             except FileExistsError as e:
                 print(f"      exists, skipped: {Path(str(e)).name}")
-    used = {id(r) for _, r, _ in pairs if r is not None}
-    orphans = [r for r in recs if id(r) not in used]
+    used = {r.info for _, r, _ in pairs if r is not None}
+    orphans = [r for r in recs if r.info not in used]
     print(f"{n_ok}/{len(pairs)} runs matched; {len(orphans)} recordings matched no run")
     if not args.dry_run:
         print(f"{n_written} channel files written")
