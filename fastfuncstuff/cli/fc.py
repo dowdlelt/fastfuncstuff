@@ -511,6 +511,18 @@ def _run(args, verbose: bool) -> int:
                 _, a = ledoit_wolf(clean, n_effective=n_eff)
                 info[name] = {"shrinkage": a, "heldout_loglik": cv.score(a)}
             meta["shrink_cv"] = info
+            with open(f"{stem}_shrink_cv.tsv", "w") as fh:
+                fh.write(
+                    "shrinkage\tmean_loglik\t"
+                    + "\t".join(f"run{k + 1}" for k in range(cv.loglik.shape[0]))
+                    + "\n"
+                )
+                for g, a in enumerate(cv.grid):
+                    col = cv.loglik[:, g]
+                    fh.write(
+                        f"{a:.4f}\t{col.mean():.6f}\t" + "\t".join(f"{v:.6f}" for v in col) + "\n"
+                    )
+            written.append(f"{stem}_shrink_cv.tsv")
             _say(
                 verbose,
                 f"   CV shrinkage {cv.best:.3f} (LW dof {info['lw_dof']['shrinkage']:.3f}, "

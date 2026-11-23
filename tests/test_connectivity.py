@@ -539,3 +539,6 @@ def test_cli_per_run_loro_and_cv_shrinkage(toy):
     assert -1 <= meta["loro_mean"] <= 1
     assert {"best", "lw_dof", "lw_tr"} <= set(meta["shrink_cv"])
     assert open(prefix + "_loro.tsv").read().count("\n") == 3
+    curve = np.loadtxt(prefix + "_shrink_cv.tsv", skiprows=1)
+    assert curve.shape == (101, 4)  # shrinkage, mean, one column per held-out run
+    assert curve[np.argmax(curve[:, 1]), 0] == pytest.approx(meta["shrink_cv"]["best"])
