@@ -145,3 +145,17 @@ def test_blur_axis_routes_cuda_float32_to_the_fused_kernel_but_not_autograd():
     xg = x.clone().requires_grad_(True)
     blur_axis(xg, k, 1).sum().backward()  # the shift-add path keeps gradients
     assert xg.grad is not None
+
+
+def test_blur_in_mask_keeps_outside_and_ignores_it():
+    # 3dBlurInMask -preserve: values outside the mask neither change nor leak in.
+    from fastfuncstuff.stats.smooth3d import blur_in_mask
+
+    torch.manual_seed(0)
+    mask = torch.zeros(12, 14, 16, dtype=torch.bool)
+    mask[3:9, 4:10, 5:12] = True
+    x = torch.randn(1, 12, 14, 16) * 100.0
+    x[0][mask] = 7.0  # constant inside: a normalised blur must leave it at 7
+    out = blur_in_mask(x, mask, fwhm_mm=4.0, voxel_size_mm=(1.0, 1.0, 2.0))
+    assert torch.equal(out[0][~mask], x[0][~mask])
+    torch.testing.assert_close(out[0][mask], torch.full_like(out[0][mask], 7.0))

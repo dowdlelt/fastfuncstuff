@@ -117,3 +117,19 @@ def test_history_appends_on_resave(tmp_path, monkeypatch):
     assert "ffs_first -x" in hist
     assert "ffs_second -y" in hist
     assert "&#x0a;" in hist
+
+
+def test_anonymize_drops_history_and_text_fields(tmp_path, monkeypatch):
+    # A defaced output must not carry the input's history (paths, user@host)
+    # or free-text header fields, which is the point of -anonymize_output.
+    monkeypatch.setattr("sys.argv", ["ffs_first", "-input", "/data/sub-02_T1w.nii.gz"])
+    src = tmp_path / "src.nii.gz"
+    save_nifti(np.zeros((3, 3, 3), np.float32), src, affine=np.eye(4))
+    hdr = nib.load(str(src)).header.copy()
+    hdr["descrip"] = b"scanned 2026-11-23 sub-02"
+    monkeypatch.setattr("sys.argv", ["ffs_util_reface", "-anonymize_output"])
+    out = tmp_path / "anon.nii.gz"
+    save_nifti(np.ones((3, 3, 3), np.float32), out, affine=np.eye(4), header=hdr, anonymize=True)
+    h = nib.load(str(out)).header
+    assert len(h.extensions) == 0
+    assert h["descrip"].item() == b""

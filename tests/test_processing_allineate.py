@@ -139,6 +139,16 @@ class TestParameterMasks:
         assert mask[9]
         assert mask[10]
 
+    def test_scale_mask(self):
+        mask = _get_free_mask("scale")
+        assert mask[:9].all()
+        assert not mask[9:].any()
+
+    def test_unknown_dof_raises(self):
+        # Used to fall through to all-free, so a typo fitted a full affine.
+        with pytest.raises(ValueError):
+            _get_free_mask("shift_rotate_scale")
+
     def test_identity_physical(self):
         p = _identity_physical()
         assert p.shape == (12,)

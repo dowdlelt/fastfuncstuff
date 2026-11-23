@@ -29,6 +29,23 @@ def test_single_element_matches_load_matrix_1D(tmp_path):
     assert torch.allclose(a, b, atol=1e-5)
 
 
+def test_load_matrix_1D_reads_afni_commented_file(tmp_path):
+    # 3dAllineate -1Dmatrix_save writes a '#' header; this crashed the parser.
+    vals = [1, 0, 0, 5, 0, 1, 0, -2, 0, 0, 1, 3]
+    p = tmp_path / "afni.aff12.1D"
+    p.write_text(
+        "# 3dAllineate matrices (DICOM-to-DICOM, row-by-row):\n"
+        + " ".join(str(v) for v in vals)
+        + "\n"
+    )
+    M = load_matrix_1D(str(p))
+    assert torch.equal(M[:3, :4], torch.tensor(vals, dtype=torch.float32).reshape(3, 4))
+    # The 3x4 layout (cat_matvec -P style) still reads too.
+    q = tmp_path / "grid.aff12.1D"
+    q.write_text("1 0 0 5\n0 1 0 -2\n0 0 1 3\n")
+    assert torch.equal(load_matrix_1D(str(q)), M)
+
+
 def test_two_matrix_composition_order(tmp_path):
     # Non-commuting: D1 scales x by 2, D2 translates x by +3 (DICOM mm).
     D1 = np.eye(4)

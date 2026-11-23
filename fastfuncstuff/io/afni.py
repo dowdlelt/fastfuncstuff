@@ -4057,6 +4057,7 @@ def save_nifti(
     header: Any = None,
     brick_labels: list[str] | None = None,
     brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None,
+    anonymize: bool = False,
 ):
     """Save data as a NIfTI file with efficient compression.
 
@@ -4082,6 +4083,10 @@ def save_nifti(
     header : nibabel header, optional
         NIfTI header to copy (preserves TR, xyzt_units, etc.).
         Overridden by *reference_img* if both are given.
+    anonymize : bool
+        Drop every header extension (the AFNI one carries the input's history,
+        i.e. paths and user names) and blank descrip/aux_file/db_name, and write
+        no history note -- AFNI's ``@djunct_anonymize``. For defaced outputs.
     """
     try:
         import nibabel as nib
@@ -4143,16 +4148,23 @@ def save_nifti(
         # "dimensions altered since AFNI extension was added".
         header.set_data_dtype(data.dtype)
 
-    # Update AFNI NIfTI extension if present (ecode=4):
-    #   - new IDCODE so AFNI treats this as a distinct dataset
-    #   - NIfTI_nums consistency string matching actual data
-    #   - IDCODE_DATE with current timestamp
-    #   - HISTORY_NOTE appended with our command
-    _update_afni_extension(header, data.shape, data.dtype)
+    if anonymize:
+        if hasattr(header, "extensions"):
+            header.extensions.clear()
+        for key in ("descrip", "aux_file", "db_name"):
+            if key in header:
+                header[key] = b""
+    else:
+        # Update AFNI NIfTI extension if present (ecode=4):
+        #   - new IDCODE so AFNI treats this as a distinct dataset
+        #   - NIfTI_nums consistency string matching actual data
+        #   - IDCODE_DATE with current timestamp
+        #   - HISTORY_NOTE appended with our command
+        _update_afni_extension(header, data.shape, data.dtype)
 
-    # Provenance: append this command to HISTORY_NOTE (creates the AFNI
-    # extension when the input had none), matching AFNI's tross_Append_History.
-    _append_history_note(header)
+        # Provenance: append this command to HISTORY_NOTE (creates the AFNI
+        # extension when the input had none), matching AFNI's tross_Append_History.
+        _append_history_note(header)
 
     # Per-sub-brick labels for AFNI viewers (NIfTI has no native equivalent).
     if brick_labels is not None:
@@ -4167,7 +4179,7 @@ def save_nifti(
     # header the caller passed counts as "nothing" when it is one it built
     # itself: a fabricated header names no template, and neither does one
     # inherited from a native-space dataset that the output no longer lives in.
-    if inherit_space and not _names_a_template(header):
+    if inherit_space and not anonymize and not _names_a_template(header):
         space = _inherited_grid_space(affine)
         if space is not None:
             set_afni_space_info(header, view=2, space=space)

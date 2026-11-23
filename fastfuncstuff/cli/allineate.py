@@ -391,6 +391,11 @@ Examples:
     mode_ex.add_argument(
         "-EPI", action="store_true", help="9 DoF: EPI-specific (freeze x/z scale, z shear)"
     )
+    mode_ex.add_argument(
+        "-shift_rotate_scale",
+        action="store_true",
+        help="9 DoF: translation + rotation + scale, no shears (AFNI -warp shift_rotate_scale)",
+    )
 
     # --- Cost function ---
     cost_group = parser.add_argument_group("Cost function")
@@ -872,6 +877,125 @@ def main(argv: list[str] | None = None) -> None:
     _dispatch_run(args, _select_device(args.device))
 
 
+def build_align_config(
+    args: argparse.Namespace, base: torch.Tensor, base_header: dict, device: torch.device
+) -> tuple[AffineAlignConfig, str, str | None]:
+    """The AffineAlignConfig an ffs_allineate command line asks for.
+
+    Shared so a tool that embeds an alignment (ffs_util_reface) takes the same
+    presets and defaults, and can pass ``-allineate_opts`` straight through.
+    Returns ``(config, preset name, -1Dmatrix_init path or None)``.
+    """
+    verb = args.verb
+    # --- Build config with speed/quality presets ---
+    dof = "affine"
+    if args.rigid:
+        dof = "rigid"
+    elif args.EPI:
+        dof = "epi"
+    elif args.shift_rotate_scale:
+        dof = "scale"
+
+    # Iteration counts are *ceilings*: Adam stops early once the cost plateaus
+    # (relative tolerance), so a generous cap costs nothing when converged but
+    # lets hard cases keep improving instead of cutting off mid-descent.
+    adam_iters_2x = 300
+    adam_iters_1x = 400
+    # The polish is opt-in. Measured on same-modality EPI->EPI lpa it was rejected
+    # by the never-worse guard in 4 of 9 pairs and gained at most 9e-5 on a cost of
+    # ~3.6 in the rest -- below allineate's own ~2e-2 run-to-run spread -- for ~15%
+    # of the runtime. A +ZZ cost is the exception: there the "polish" is the pass
+    # that re-optimizes on the pure cost after the basin-widening terms are dropped,
+    # so it stays on unless -no_polish.
+    _is_zz = args.cost.lower().endswith("+zz")
+    powell_maxfev = 500 if (args.polish or _is_zz) and not args.no_polish else 0
+    twopass = not args.onepass
+
+    init_matrix = None
+    init_path = getattr(args, "1Dmatrix_init", None)
+    if init_path is not None:
+        from fastfuncstuff.processing.affine import read_aff12_rows
+
+        init_matrix = read_aff12_rows(init_path)[0]
+
+    # Apply presets
+    preset = "standard"
+    if args.superfast:
+        adam_iters_2x = 150
+        adam_iters_1x = 150
+        powell_maxfev = 0
+        twopass = False
+        preset = "superfast"
+    elif args.fast:
+        adam_iters_2x = 300
+        adam_iters_1x = 300
+        powell_maxfev = 0
+        preset = "fast"
+    elif args.slow:
+        adam_iters_2x = 600
+        adam_iters_1x = 800
+        # -slow is a request for maximum accuracy, so it opts into the polish.
+        powell_maxfev = 0 if args.no_polish else 2000
+        preset = "slow"
+
+    # Auto-size box radius if requested
+    lpa_sigma = args.lpa_sigma
+    if args.lpa_kernel == "box" and lpa_sigma <= 0:
+        from fastfuncstuff.processing.cost import auto_box_radius
+
+        lpa_sigma = float(auto_box_radius(500))
+        if verb >= 1:
+            side = 2 * int(lpa_sigma) + 1
+            print(f"Auto box radius: {int(lpa_sigma)} ({side}³ = {side**3} voxels)")
+
+    config = AffineAlignConfig(
+        dof=dof,
+        cost=args.cost,
+        lpa_sigma=lpa_sigma,
+        lpa_kernel=args.lpa_kernel,
+        bloktype=args.bloktype,
+        blokrad=args.blokrad,
+        ov=_resolve_ov(args),
+        n_match=args.n_match,
+        compile=args.compile,
+        optimizer=args.optimizer,
+        twopass=twopass,
+        coarse_range=args.coarse_range,
+        coarse_step=args.coarse_step,
+        coarse_shift_frac=args.coarse_shift_frac,
+        range_scale=(
+            0.25
+            if args.verysmallrange
+            else 0.5
+            if args.smallrange or args.use_headers
+            else 1.5
+            if args.hugerange
+            else 1.0
+        ),
+        adam_lr=args.adam_lr,
+        tbest=args.tbest,
+        reanchor=args.reanchor,
+        adam_iters_2x=adam_iters_2x,
+        adam_iters_1x=adam_iters_1x,
+        powell_maxfev=powell_maxfev,
+        cmass=not (args.nocmass or args.use_headers) and init_matrix is None,
+        cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
+        interp=args.interp,
+        final_interp=args.final_interp,
+        source_automask=args.source_automask,
+        autoweight=not args.noautoweight,
+        base_mask=None
+        if args.base_mask is None
+        else _mask_on(args.base_mask, base_header, tuple(base.shape), device),
+        autocrop=not args.noautocrop,
+        work_dxyz=_parse_work_dxyz(args.work_dxyz),
+        init_matrix=init_matrix,
+        device=str(device),
+        verb=verb,
+    )
+    return config, preset, init_path
+
+
 def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     """Align one self-contained base/source pair (the entire per-pair body).
 
@@ -973,118 +1097,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             print_cli_footer("ffs_allineate", elapsed_seconds=time.time() - t0)
         return
 
-    # --- Build config with speed/quality presets ---
-    dof = "affine"
-    if args.rigid:
-        dof = "rigid"
-    elif args.EPI:
-        dof = "epi"
-
-    # Iteration counts are *ceilings*: Adam stops early once the cost plateaus
-    # (relative tolerance), so a generous cap costs nothing when converged but
-    # lets hard cases keep improving instead of cutting off mid-descent.
-    adam_iters_2x = 300
-    adam_iters_1x = 400
-    # The polish is opt-in. Measured on same-modality EPI->EPI lpa it was rejected
-    # by the never-worse guard in 4 of 9 pairs and gained at most 9e-5 on a cost of
-    # ~3.6 in the rest -- below allineate's own ~2e-2 run-to-run spread -- for ~15%
-    # of the runtime. A +ZZ cost is the exception: there the "polish" is the pass
-    # that re-optimizes on the pure cost after the basin-widening terms are dropped,
-    # so it stays on unless -no_polish.
-    _is_zz = args.cost.lower().endswith("+zz")
-    powell_maxfev = 500 if (args.polish or _is_zz) and not args.no_polish else 0
-    twopass = not args.onepass
-
-    init_matrix = None
-    init_path = getattr(args, "1Dmatrix_init", None)
-    if init_path is not None:
-        from fastfuncstuff.processing.affine import read_aff12_rows
-
-        init_matrix = read_aff12_rows(init_path)[0]
-
-    # Apply presets
-    preset = "standard"
-    if args.superfast:
-        adam_iters_2x = 150
-        adam_iters_1x = 150
-        powell_maxfev = 0
-        twopass = False
-        preset = "superfast"
-    elif args.fast:
-        adam_iters_2x = 300
-        adam_iters_1x = 300
-        powell_maxfev = 0
-        preset = "fast"
-    elif args.slow:
-        adam_iters_2x = 600
-        adam_iters_1x = 800
-        # -slow is a request for maximum accuracy, so it opts into the polish.
-        powell_maxfev = 0 if args.no_polish else 2000
-        preset = "slow"
-
-    # Auto-size box radius if requested
-    lpa_sigma = args.lpa_sigma
-    if args.lpa_kernel == "box" and lpa_sigma <= 0:
-        from fastfuncstuff.processing.cost import auto_box_radius
-
-        lpa_sigma = float(auto_box_radius(500))
-        if verb >= 1:
-            side = 2 * int(lpa_sigma) + 1
-            print(f"Auto box radius: {int(lpa_sigma)} ({side}³ = {side**3} voxels)")
-
-    config = AffineAlignConfig(
-        dof=dof,
-        cost=args.cost,
-        lpa_sigma=lpa_sigma,
-        lpa_kernel=args.lpa_kernel,
-        bloktype=args.bloktype,
-        blokrad=args.blokrad,
-        ov=_resolve_ov(args),
-        n_match=args.n_match,
-        compile=args.compile,
-        optimizer=args.optimizer,
-        twopass=twopass,
-        coarse_range=args.coarse_range,
-        coarse_step=args.coarse_step,
-        coarse_shift_frac=args.coarse_shift_frac,
-        range_scale=(
-            0.25
-            if args.verysmallrange
-            else 0.5
-            if args.smallrange or args.use_headers
-            else 1.5
-            if args.hugerange
-            else 1.0
-        ),
-        adam_lr=args.adam_lr,
-        tbest=args.tbest,
-        reanchor=args.reanchor,
-        adam_iters_2x=adam_iters_2x,
-        adam_iters_1x=adam_iters_1x,
-        powell_maxfev=powell_maxfev,
-        cmass=not (args.nocmass or args.use_headers) and init_matrix is None,
-        cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
-        interp=args.interp,
-        final_interp=args.final_interp,
-        source_automask=args.source_automask,
-        autoweight=not args.noautoweight,
-        base_mask=None
-        if args.base_mask is None
-        else _mask_on(args.base_mask, base_header, tuple(base.shape), device),
-        autocrop=not args.noautocrop,
-        work_dxyz=_parse_work_dxyz(args.work_dxyz),
-        init_matrix=init_matrix,
-        device=str(device),
-        verb=verb,
-    )
+    config, preset, init_path = build_align_config(args, base, base_header, device)
 
     if verb >= 1:
         print_cli_section("Configuration")
-        print(f"  Transform: {dof}")
+        print(f"  Transform: {config.dof}")
         print(f"  Cost: {args.cost}")
         print(f"  Preset: {preset}")
         print(f"  Optimizer: {args.optimizer}")
-        print(f"  Search: {'two-pass' if twopass else 'one-pass'}")
+        print(f"  Search: {'two-pass' if config.twopass else 'one-pass'}")
         if init_path is not None:
             print(f"  Start: {init_path} (center of mass off)")
         else:

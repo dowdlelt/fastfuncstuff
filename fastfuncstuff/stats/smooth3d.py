@@ -134,6 +134,29 @@ def gaussian3d_batched(
     return x
 
 
+def blur_in_mask(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    fwhm_mm: float,
+    voxel_size_mm: tuple[float, float, float],
+) -> torch.Tensor:
+    """``(N, A, B, C)`` blurred inside ``mask``; voxels outside it are kept as they were.
+
+    Normalised by the blurred mask, so a voxel at the mask's edge is an average
+    of mask voxels only, not of them and the zeros (or noise) beyond -- AFNI's
+    ``3dBlurInMask -preserve``. ``voxel_size_mm`` is per spatial axis of ``x``,
+    in ``x``'s own axis order.
+    """
+    # Reflect padding needs a kernel narrower than the volume; cap it there.
+    sigma = tuple(
+        min(s, (n - 1) / 4.0)
+        for s, n in zip(fwhm_mm_to_sigma_vox(fwhm_mm, voxel_size_mm), x.shape[1:], strict=True)
+    )
+    m = mask.to(x.dtype)
+    num = gaussian3d_batched(torch.cat([x * m, m[None]]), sigma)  # type: ignore[arg-type]
+    return torch.where(mask, num[:-1] / num[-1].clamp(min=1e-6), x)
+
+
 def smooth_var_per_perm(
     var_pv: torch.Tensor,  # [P, V_in_mask], float32
     mask: np.ndarray,  # [X, Y, Z] bool
