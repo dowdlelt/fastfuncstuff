@@ -28,6 +28,7 @@ Outputs (PREFIX = -prefix without extension):
   PREFIX_ts.tsv      cleaned ROI series (-ts_out)
   PREFIX_wb_r / _wb_z  whole-brain maps, one sub-brick per ROI/seed
   PREFIX_rss.tsv     RSS per TR (-edge); PREFIX_edge_ts.npy + _edges.tsv (-edge_ts)
+  PREFIX_fc.png      the matrix, clustered, and the RSS trace (-plot)
 
 Examples
 --------
@@ -191,6 +192,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FRAC",
         help="Keep the strongest FRAC of edges for -graph (default: all).",
+    )
+    me.add_argument(
+        "-plot",
+        action="store_true",
+        help="PREFIX_fc.png: the CC matrix in clustered order with module lines, on a\n"
+        "fixed -1..1 scale (with -edge, the RSS trace under it).",
     )
     me.add_argument(
         "-no_netcc",
@@ -477,6 +484,7 @@ def _run(args, verbose: bool) -> int:
                 fh.write(f"{t}\t{t * tr:.6g}\t" + "\t".join(f"{v:.6g}" for v in ts[:, j]) + "\n")
         written.append(f"{stem}_ts.tsv")
 
+    amp = None
     if args.edge:
         z = edge_mod.zscore_rows(clean)
         amp = edge_mod.rss(z)
@@ -494,6 +502,15 @@ def _run(args, verbose: bool) -> int:
                     fh.write(f"{e}\t{ids[a]}\t{ids[b]}\t{names[a]}\t{names[b]}\n")
             written += [f"{stem}_edge_ts.npy", f"{stem}_edges.tsv"]
             _say(verbose, f"   {n_e:,} edge series written")
+
+    if args.plot:
+        from fastfuncstuff.connectivity.plots import plot_fc
+
+        key = "CC" if "CC" in mats else "CC_W1"
+        written.append(
+            plot_fc(f"{stem}_fc.png", mats[key], names, rss=amp, times=kept_idx * tr,
+                    title=f"{Path(stem).name}: {key}, {len(ids)} ROIs, dof {cleaner.dof}")
+        )  # fmt: skip
 
     if want_maps:
         vox = cleaner.apply(data, device=device, out_device=data.device, verbose=verbose)

@@ -424,3 +424,22 @@ def test_cli_refuses_percent_change_without_a_baseline(toy, capsys):
     assert main([*args, "-prefix", str(tmp / "nb")]) == 2
     assert "-no_scale" in capsys.readouterr().err
     assert main([*args, "-no_scale", "-prefix", str(tmp / "nb2")]) == 0
+
+
+def test_cli_plot(toy):
+    from fastfuncstuff.cli.fc import main
+
+    tmp, runs, atlas, *_ = toy
+    prefix = str(tmp / "p")
+    assert main(["-input", *runs, "-atlas", atlas, "-edge", "-plot", "-device", "cpu",
+                 "-quiet", "-prefix", prefix]) == 0  # fmt: skip
+    assert open(prefix + "_fc.png", "rb").read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+def test_plot_draws_only_major_module_boundaries():
+    from fastfuncstuff.connectivity.plots import _major_boundaries
+
+    # modules 1, 40, 1, 1, 50, 2: the singletons fold into the 40; one line, at the 50
+    assert _major_boundaries([1, 41, 42, 43, 93], 95, 3) == [43]
+    assert _major_boundaries([1, 41, 93], 95, 3) == [41]
+    assert _major_boundaries([], 10, 3) == []
