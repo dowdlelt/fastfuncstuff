@@ -30,6 +30,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from fastfuncstuff.connectivity.matrix import correlation_matrix
+from fastfuncstuff.connectivity.order import seriate
 from fastfuncstuff.viewer.rois import RoiSet, roi_means
 from fastfuncstuff.viewer.series import (
     ProgressFn,
@@ -37,7 +39,6 @@ from fastfuncstuff.viewer.series import (
     bin_representatives,
     bin_rows,
     correlate,
-    correlation_matrix,
     first_pc,
     prepare_rows,
 )
@@ -47,11 +48,6 @@ from fastfuncstuff.viewer.series import (
 #: that would have been on screen -- while an optimal leaf ordering of it is
 #: still under a second.
 MAX_NODES = 400
-
-#: Above this, seriation drops the optimal-leaf-ordering refinement. It is
-#: O(K^3) and the dendrogram's own leaf order is already close; the refinement
-#: is worth a second at 300 nodes and is not worth a minute at 1200.
-MAX_OPTIMAL_LEAF = 300
 
 ORDERINGS = ("hierarchical", "input", "pc1", "strength", "size")
 
@@ -130,41 +126,6 @@ def _node_colors(n: int) -> tuple[tuple[int, int, int], ...]:
     return tuple(out)
 
 
-def seriate(matrix: torch.Tensor) -> tuple[np.ndarray, tuple[int, ...]]:
-    """Leaf order and module boundaries from average-linkage clustering.
-
-    The distance is ``1 - r``, which is the one every connectivity paper uses
-    and is a metric on the unit sphere of normalised time courses. Average
-    linkage rather than Ward: Ward assumes Euclidean coordinates, and these are
-    correlations.
-
-    The cut is the classic dendrogram default -- 70% of the tallest merge --
-    rather than a fixed module count, because the number of networks in a run
-    is not something the viewer knows.
-    """
-    from scipy.cluster.hierarchy import fcluster, leaves_list, linkage, optimal_leaf_ordering
-    from scipy.spatial.distance import squareform
-
-    r = matrix.detach().cpu().numpy().astype(np.float64)
-    k = r.shape[0]
-    if k < 3:
-        return np.arange(k), ()
-    # squareform demands exact symmetry and an exact zero diagonal; float
-    # arithmetic gives neither, and it raises rather than rounding.
-    d = 1.0 - (r + r.T) / 2.0
-    np.fill_diagonal(d, 0.0)
-    condensed = squareform(np.clip(d, 0.0, 2.0), checks=False)
-    tree = linkage(condensed, method="average")
-    if k <= MAX_OPTIMAL_LEAF:
-        tree = optimal_leaf_ordering(tree, condensed)
-    order = np.asarray(leaves_list(tree), dtype=np.int64)
-
-    heights = tree[:, 2]
-    modules = fcluster(tree, t=0.7 * float(heights.max()), criterion="distance")[order]
-    edges = tuple(int(i + 1) for i in range(len(order) - 1) if modules[i] != modules[i + 1])
-    return order, edges
-
-
 def _order_nodes(
     matrix: torch.Tensor,
     series: torch.Tensor,
@@ -226,8 +187,28 @@ def build_matrix(
         selected = rois.labels > 0
         node_mask = selected if mask is None else (selected & np.asarray(mask, dtype=bool))
 
+    # ROI nodes follow ffs_fc exactly: percent change per voxel, averaged, then the
+    # drift removed from the ROI means by the shared cleaner (linear, so cleaning the
+    # means equals cleaning every voxel). The display scaling is a carpet choice and
+    # does not decide what an ROI's time course is. Voxel bins keep the carpet's
+    # reduction -- they are the carpet's rows.
+    roi_scale = normalize
+    if rois is not None:
+        from fastfuncstuff.connectivity.prep import has_baseline
+
+        assert node_mask is not None  # set from the ROIs above
+        flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
+        probe = flat[np.flatnonzero(node_mask.reshape(-1))[:: max(1, int(node_mask.sum()) // 4096)]]
+        # A derived layer (residuals, z-scores) has no baseline to be a percentage of;
+        # its voxels are then averaged in z, which is what the matrix showed before.
+        roi_scale = "psc" if has_baseline(torch.as_tensor(probe)) else "z"
     rows, flat_mask, _units, _limit = prepare_rows(
-        data, mask=node_mask, polort=polort, normalize=normalize, device=device, progress=progress
+        data,
+        mask=node_mask,
+        polort=-1 if rois is not None else polort,
+        normalize=roi_scale if rois is not None else normalize,
+        device=device,
+        progress=progress,
     )
     n_voxels = int(rows.shape[0])
 
@@ -240,6 +221,13 @@ def build_matrix(
         if not present:
             raise ValueError("no ROI has a voxel inside the run's mask")
         series = roi_means(rows, labels_v, present)
+        if polort >= 0:
+            from fastfuncstuff.connectivity.prep import build_cleaner
+            from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+            n_t = series.shape[1]
+            poly = construct_polynomial_matrix(n_t, polort, torch.device("cpu"), torch.float64)
+            series = build_cleaner([poly], [0], n_t).apply(series)
         described = [rois.find(i) for i in present]
         names = tuple(r.name if r else f"#{i}" for r, i in zip(described, present, strict=True))
         colors = tuple(r.color if r else (200, 200, 200) for r in described)
@@ -269,7 +257,7 @@ def build_matrix(
         indices = tuple(-1 for _ in names)
 
     step(0.8, "correlating")
-    matrix = correlation_matrix(series)
+    matrix = correlation_matrix(series).to(torch.float32)
 
     step(0.92, "ordering")
     index, blocks = _order_nodes(matrix, series, sizes, order)

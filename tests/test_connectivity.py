@@ -410,3 +410,17 @@ def test_auto_cleaning_uses_regression_for_a_censored_run():
     with pytest.raises(ValueError, match="censored"):
         build_cleaner([_legendre(n, 1)] * 2, [0, n], 2 * n, keep=keep, tr=1.0,
                       passband=(0.01, 0.1), method="fft")  # fmt: skip
+
+
+def test_cli_refuses_percent_change_without_a_baseline(toy, capsys):
+    from fastfuncstuff.cli.fc import main
+
+    tmp, runs, atlas, labels, lens = toy
+    demeaned = []
+    for k, path in enumerate(runs):
+        d = np.asarray(nib.load(path).dataobj)
+        demeaned.append(_write(tmp / f"r{k}.nii.gz", d - d.mean(-1, keepdims=True), tr=2.0))
+    args = ["-input", *demeaned, "-atlas", atlas, "-device", "cpu", "-quiet"]
+    assert main([*args, "-prefix", str(tmp / "nb")]) == 2
+    assert "-no_scale" in capsys.readouterr().err
+    assert main([*args, "-no_scale", "-prefix", str(tmp / "nb2")]) == 0

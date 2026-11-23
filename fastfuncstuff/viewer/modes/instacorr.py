@@ -35,7 +35,6 @@ from fastfuncstuff.viewer.modes.base import (
     PathListControl,
     ProgressFn,
     Trace,
-    correlation_stat,
     mode,
 )
 from fastfuncstuff.viewer.vocab import SetSeed
@@ -175,7 +174,8 @@ class InstaCorrMode(Mode):
         self._tr = 0.0
         self._window = slice(0, None)
         #: Ortvec columns projected out, for the p's degrees of freedom.
-        self._n_ort = 0
+        #: (samples, dimensions removed) of the last preparation, for the map's p.
+        self._stat: tuple[float, float] = (0.0, 1.0)
         self._roi_message = ""
         self._zooms = (1.0, 1.0, 1.0)
         super().__init__()
@@ -361,21 +361,22 @@ class InstaCorrMode(Mode):
             data = torch.as_tensor(source, dtype=torch.float32).reshape(-1, nt)
             data = data[flat.cpu()].to(device)
 
-        # Time is the last axis from here on, which is also the axis every
-        # operation below runs along -- so each one reads contiguously.
-        step(0.45, "filter")
-        data = self._bandpass(data)
-        step(0.65, "detrend")
-        data = self._project_out(data, nuisance)
+        # The cleaning ffs_fc does, by the same code: drift, ortvecs and the band in
+        # one projection (the FFT algorithm here -- a viewer run is never censored).
+        step(0.45, "filter + detrend")
+        from fastfuncstuff.connectivity.matrix import unit_rows
+        from fastfuncstuff.connectivity.prep import build_cleaner
+
+        cleaner = build_cleaner(
+            [nuisance], [0], nt, tr=self._tr if self._tr > 0 else None, passband=self._band()
+        )
+        self._stat = (float(cleaner.n_kept), float(cleaner.n_removed))
+        data = cleaner.apply(data, device=device)
 
         step(0.85, "normalize")
-        data = data - data.mean(-1, keepdim=True)
-        norm = data.norm(dim=-1, keepdim=True)
-        # Constant voxels would divide by zero and then correlate perfectly
-        # with everything; they become zero rows instead.
-        valid = norm > 1e-9
-        data.div_(norm.clamp_(min=1e-9))
-        return data.masked_fill_(~valid, 0.0)
+        # Constant voxels come back as zero rows, so they correlate 0 with everything.
+        data, _valid = unit_rows(data)
+        return data
 
     def _nuisance(self, nt_full: int) -> np.ndarray | None:
         """``(T, k)`` float64: the Legendre drift, then every ticked ortvec column.
@@ -397,52 +398,21 @@ class InstaCorrMode(Mode):
             keep=self._window,
             n_full=nt_full,
         )
-        self._n_ort = 0 if ort is None else int(ort.shape[1])
         if ort is not None:
             blocks.append(ort)
         return np.concatenate(blocks, axis=1) if blocks else None
 
-    def _project_out(self, data: torch.Tensor, nuisance: np.ndarray | None) -> torch.Tensor:
-        """Remove the nuisance span, after putting it through the data's band.
+    def _band(self) -> tuple[float, float] | None:
+        """``(fbot, ftop)`` for the cleaner, or None.
 
-        One projection for drift and ortvecs together, so each is removed
-        *given* the others. The columns are filtered first because the data
-        already was: projecting the raw columns out of filtered data leaves the
-        result correlated with them again (Lindquist et al. 2019), where the
-        filtered columns leave it orthogonal to both the band's complement and
-        the originals. SVD rather than QR, because a filtered constant is a
-        zero column and collinear ortvecs are one click away.
-        """
-        if nuisance is None:
-            return data
-        from fastfuncstuff.viewer.derive import orthonormal_basis
-
-        columns = self._bandpass(torch.as_tensor(nuisance.T)).numpy().T
-        if not np.abs(columns).max() > 1e-9:
-            return data  # a mean under a highpass: the filter already took it
-        q = torch.as_tensor(orthonormal_basis(columns), dtype=data.dtype, device=data.device)
-        return data - (data @ q) @ q.T
-
-    def _bandpass(self, data: torch.Tensor) -> torch.Tensor:
-        """Zero the rFFT bins outside the band.
-
-        Skipped without a TR: a filter specified in Hz against an assumed 1 s
+        None without a TR: a filter specified in Hz against an assumed 1 s
         sampling interval is not the filter anyone asked for.
         """
         fbot = float(self.params.get("fbot") or 0.0)
         ftop = float(self.params.get("ftop") or 0.0)
         if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0:
-            return data
-        nt = data.shape[-1]
-        freqs = torch.fft.rfftfreq(nt, d=self._tr).to(data.device)
-        keep = torch.ones_like(freqs, dtype=torch.bool)
-        if fbot > 0:
-            keep &= freqs >= fbot
-        if ftop > 0:
-            keep &= freqs <= ftop
-        keep[0] = False  # the mean is handled by centring, not by the filter
-        spec = torch.fft.rfft(data, dim=-1) * keep
-        return torch.fft.irfft(spec, n=nt, dim=-1)
+            return None
+        return (fbot, ftop)
 
     # -- seed ----------------------------------------------------------
     def _to_source(self, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -541,34 +511,13 @@ class InstaCorrMode(Mode):
             colormap="redblue",
             display_range=(-1.0, 1.0),
             threshold=0.3,
-            threshold_stat=correlation_stat(
-                self._effective_samples(), self._polort(), n_ort=self._n_ort
-            ),
+            # AFNI fico(samples, 1, removed): the band's dimensions are counted
+            # exactly, the way ffs_fc writes its maps.
+            threshold_stat=("fico", (self._stat[0], 1.0, self._stat[1])),
         )
 
     def _polort(self) -> int:
         return int(self.params.get("polort", 2))
-
-    def _effective_samples(self) -> float:
-        """Volumes' worth of independent samples left after the band is cut.
-
-        A bandpass keeps a fraction of the spectrum, and the samples it leaves
-        are that fraction of the run, not all of them. Approximate -- the
-        filter's edges are not sharp -- but the alternative, quoting a p on
-        every volume, is wrong by a factor of several for a typical 0.01-0.1 Hz.
-        """
-        nt = self._n_time if self._hold_key is not None else 0
-        fbot = float(self.params.get("fbot") or 0.0)
-        ftop = float(self.params.get("ftop") or 0.0)
-        if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0 or nt < 2:
-            return float(nt)
-        freqs = np.fft.rfftfreq(nt, d=self._tr)[1:]
-        keep = np.ones(freqs.shape, dtype=bool)
-        if fbot > 0:
-            keep &= freqs >= fbot
-        if ftop > 0:
-            keep &= freqs <= ftop
-        return float(nt) * float(keep.mean()) if freqs.size else float(nt)
 
     # -- reaction ------------------------------------------------------
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:

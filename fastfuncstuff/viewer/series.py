@@ -122,22 +122,6 @@ def correlate(rows: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     return centred @ ref
 
 
-def correlation_matrix(rows: torch.Tensor) -> torch.Tensor:
-    """``(K, K)`` Pearson correlation between every pair of rows.
-
-    One normalisation then one matmul. The diagonal is forced to exactly 1
-    rather than left at whatever the arithmetic produced, because a picture
-    whose diagonal is 0.9999 has a visible off-white stripe down it that reads
-    as a result.
-    """
-    centred = rows - rows.mean(-1, keepdim=True)
-    centred = centred / centred.norm(dim=-1, keepdim=True).clamp(min=1e-9)
-    out = centred @ centred.T
-    out = out.clamp(-1.0, 1.0)
-    out.fill_diagonal_(1.0)
-    return out
-
-
 def bin_rows(rows: torch.Tensor, max_rows: int) -> torch.Tensor:
     """Average ordering-contiguous blocks down to at most ``max_rows``."""
     n = int(rows.shape[0])
@@ -249,7 +233,6 @@ __all__ = [
     "bin_rows",
     "bin_values",
     "correlate",
-    "correlation_matrix",
     "first_pc",
     "normalize_rows",
     "prepare_rows",

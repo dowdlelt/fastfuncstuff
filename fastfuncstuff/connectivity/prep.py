@@ -75,6 +75,29 @@ def stopband_regressors(n_t: int, tr: float, fbot: float, ftop: float) -> np.nda
     return np.stack(cols, axis=1) if cols else np.zeros((n_t, 0))
 
 
+def has_baseline(rows: Tensor, run_starts: Sequence[int] = (0,)) -> bool:
+    """Whether ``(V, T)`` rows have a positive baseline that percent change can divide by.
+
+    BOLD intensities do (a mean far above the fluctuation); residuals, demeaned or
+    z-scored series and difference images do not, and percent change of those divides
+    by ~0 -- every ROI mean is then whichever voxels happen to sit nearest zero.
+    Judged per run on the median voxel: mean above 5 standard deviations, and almost
+    no voxel with a non-positive mean.
+    """
+    if rows.numel() == 0:
+        return False
+    starts = list(run_starts) + [rows.shape[1]]
+    for a, b in zip(starts[:-1], starts[1:], strict=True):
+        seg = rows[:, a:b].float()
+        mean = seg.mean(1)
+        sd = seg.std(1)
+        if float((mean <= 0).float().mean()) > 0.01:
+            return False
+        if not float(mean.median()) > 5.0 * float(sd.median()):
+            return False
+    return True
+
+
 @dataclass
 class Cleaner:
     """Per-run nuisance removal over the kept TRs, and how to apply it.

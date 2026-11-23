@@ -297,7 +297,7 @@ def _run(args, verbose: bool) -> int:
     roi_set, rows = _resolve_rows(args, shape3, mask3, want_maps, img0.header, args.input[0])
 
     loaded = load_and_preprocess_runs(
-        args.input, tr=args.tr, mask_array=rows, do_scale=not args.no_scale, device=device,
+        args.input, tr=args.tr, mask_array=rows, do_scale=False, device=device,
         verbose=verbose,
     )  # fmt: skip
     data, run_starts, n_t, tr = loaded.data, list(loaded.run_starts), loaded.n_timepoints, loaded.tr
@@ -318,6 +318,19 @@ def _run(args, verbose: bool) -> int:
         _say(verbose, f"   {n_drop:,} constant voxel(s) left out")
     if roi_set is not None and roi_set.rows.sum() != data.shape[0]:
         raise ValueError("internal: ROI rows and loaded voxels disagree")
+
+    if not args.no_scale:
+        from fastfuncstuff.connectivity.prep import has_baseline
+        from fastfuncstuff.utils import scale_to_percent_signal
+
+        if not has_baseline(data, run_starts):
+            raise ValueError(
+                "the input has no positive baseline (residuals, demeaned or z-scored data?): "
+                "percent change would divide by ~0. Use -no_scale."
+            )
+        data, _, _ = scale_to_percent_signal(
+            data, run_starts, verbose=False, track_violations=False
+        )
 
     # -- series -------------------------------------------------------------------
     names: list[str] = []

@@ -298,23 +298,23 @@ def roi_means(
 ) -> torch.Tensor:
     """Mean time course of each ROI: ``(V, T)`` rows to ``(K, T)``.
 
-    A scatter-add rather than a mask per ROI. Both are correct; this one is a
-    single pass over the data instead of K of them, which is the difference
-    between a matrix that redraws as you change a setting and one that does not.
+    The toolbox's one ROI averager (:func:`processing.roi_collapse.collapse_to_rois`,
+    a single scatter-add pass) with the viewer's label-value addressing in front.
     """
     if not indices:
         raise ValueError("no ROIs to average")
+    from fastfuncstuff.processing.roi_collapse import collapse_to_rois
+
     lookup = torch.full((max(indices) + 1,), -1, dtype=torch.long, device=rows.device)
     for position, value in enumerate(indices):
         lookup[value] = position
-    slot = lookup[labels_v.clamp(min=0, max=len(lookup) - 1).long()]
-    keep = slot >= 0
-    slot, kept = slot[keep], rows[keep]
-    out = torch.zeros((len(indices), rows.shape[1]), dtype=rows.dtype, device=rows.device)
-    out.index_add_(0, slot, kept)
-    counts = torch.zeros(len(indices), dtype=rows.dtype, device=rows.device)
-    counts.index_add_(0, slot, torch.ones_like(slot, dtype=rows.dtype))
-    return out / counts.clamp(min=1).unsqueeze(1)
+    labels_v = labels_v.long()
+    in_range = (labels_v >= 0) & (labels_v < len(lookup))
+    slot = torch.where(in_range, lookup[labels_v.clamp(0, len(lookup) - 1)], -1)
+    slot_np = slot.cpu().numpy()
+    sizes = np.bincount(slot_np[slot_np >= 0], minlength=len(indices)).astype(np.float64)
+    out = collapse_to_rois(rows, slot_np, np.maximum(sizes, 1.0), device=rows.device)
+    return out.to(rows.dtype)
 
 
 __all__ = [

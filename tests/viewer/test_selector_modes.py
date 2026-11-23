@@ -1243,12 +1243,15 @@ def test_a_correlation_map_carries_its_dof_so_it_earns_a_p(corr_session):
     assert stat_value_to_pvalue(pvalue_to_stat(p, code, dof), code, dof) == pytest.approx(p)
 
 
-def test_a_bandpass_shrinks_the_samples_the_p_counts(corr_session):
+def test_a_bandpass_shrinks_the_dof_the_p_counts(corr_session):
+    """The band's dimensions are counted exactly, as ffs_fc writes its maps."""
     s = corr_session
     s.do(SetMode("instacorr"))
     s.set_mode_param("live", "1")
     s.do(SetSeed(3, 4, 2))
+    _, (n0, _, removed0) = s.state.layers.find_by_source("mode:instacorr").stat_spec()
     s.set_mode_param("fbot", "0.05")
     s.set_mode_param("ftop", "0.2")
-    n = s.state.layers.find_by_source("mode:instacorr").stat_spec()[1][0]
-    assert 0 < n < 60
+    _, (n, _, removed) = s.state.layers.find_by_source("mode:instacorr").stat_spec()
+    assert n == n0 == 60
+    assert removed > removed0 and n - 1 - removed > 0

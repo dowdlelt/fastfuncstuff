@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.connectivity.matrix import correlation_matrix
 from fastfuncstuff.viewer.matrix import ORDERINGS, build_matrix, seriate
 from fastfuncstuff.viewer.rois import rois_from_labels
-from fastfuncstuff.viewer.series import correlation_matrix
 
 CPU = torch.device("cpu")
 
@@ -145,3 +145,36 @@ def test_a_voxel_bin_points_at_a_voxel_inside_the_mask():
     m = build_matrix(data, mask=mask, order="input", polort=-1, max_nodes=10, device=CPU)
     assert m.locations is not None and m.locations.shape == (m.n_nodes, 3)
     assert all(mask[m.location_of(node)] for node in range(m.n_nodes))
+
+
+def test_roi_matrix_is_the_ffs_fc_matrix():
+    """One computation: the viewer's ROI matrix equals ffs_fc's on the same run and atlas."""
+    from fastfuncstuff.connectivity.prep import build_cleaner
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.processing.roi_collapse import build_roi_weights, collapse_to_rois
+    from fastfuncstuff.utils import scale_to_percent_signal
+
+    rng = np.random.default_rng(5)
+    data, labels = _networks(rng)
+    gain = rng.uniform(200, 2000, size=data.shape[:3])[..., None]  # brightness varies by voxel
+    data = (gain + 20 * data + 0.05 * np.arange(data.shape[3])).astype(np.float32)
+    m = build_matrix(data, rois=rois_from_labels(labels, names=None), order="input", polort=2,
+                     device=CPU)  # fmt: skip
+
+    rows = labels.reshape(-1) > 0
+    vox = torch.as_tensor(data.reshape(-1, data.shape[3])[rows])
+    psc, _, _ = scale_to_percent_signal(vox, [0], verbose=False, track_violations=False)
+    slot, _, sizes = build_roi_weights(labels.reshape(-1)[rows].reshape(-1, 1, 1))
+    means = collapse_to_rois(psc, slot, sizes)
+    poly = construct_polynomial_matrix(data.shape[3], 2, CPU, torch.float64)
+    clean = build_cleaner([poly], [0], data.shape[3]).apply(means)
+    np.testing.assert_allclose(m.matrix, correlation_matrix(clean).numpy(), atol=1e-5)
+
+
+def test_a_layer_without_baseline_is_averaged_in_z():
+    """Residual-like data has no baseline to be a percentage of; the matrix still draws."""
+    rng = np.random.default_rng(6)
+    data, labels = _networks(rng)  # zero-mean by construction
+    m = build_matrix(data, rois=rois_from_labels(labels, names=None), order="input", polort=-1,
+                     device=CPU)  # fmt: skip
+    assert m.matrix[0, 1] > 0.8 and abs(m.matrix[0, 2]) < 0.4
