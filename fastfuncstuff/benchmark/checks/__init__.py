@@ -7,9 +7,10 @@ A check declares what a dataset must offer (``needs``), how it draws units
 from __future__ import annotations
 
 from .base import Check, UnitResult
+from .blipflip import BlipflipCheck
 from .moco import MocoCheck
 from .slicetime import SlicetimeCheck
 
-CHECKS: dict[str, type[Check]] = {c.name: c for c in (MocoCheck, SlicetimeCheck)}
+CHECKS: dict[str, type[Check]] = {c.name: c for c in (MocoCheck, SlicetimeCheck, BlipflipCheck)}
 
 __all__ = ["CHECKS", "Check", "UnitResult"]
