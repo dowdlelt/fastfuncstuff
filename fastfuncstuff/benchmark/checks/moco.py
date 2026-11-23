@@ -46,7 +46,7 @@ class MocoCheck(Check):
                 "-1Dfile", str(ref / "motion.1D"), "-1Dmatrix_save", str(ref / "moco.aff12.1D"),
                 str(src),
             ],
-            work, log,
+            work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         timed(
             ["3dTstat", "-overwrite", "-prefix", str(ref / "mean.nii"), str(ref / "moco.nii")],
@@ -61,7 +61,7 @@ class MocoCheck(Check):
                 "-1Dfile", str(ffs / "motion.1D"), "-1Dmatrix_save", str(ffs / "moco.aff12.1D"),
                 "-device", device,
             ],
-            work, log,
+            work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         (ffs / "mean_moco.nii").replace(ffs / "mean.nii")
         res.timings.append(("ffs", device.split(",")[0], t_ffs, None))
@@ -80,6 +80,15 @@ class MocoCheck(Check):
         }
         for name, r in zip(MOTION_PARAM_NAMES, mp.get("per_column_r", []), strict=False):
             m[f"motion_r_{name}"] = r
+        # The old stage's gate (stages/moco.py THRESHOLDS), so results read on the known scale.
+        from ..stages.moco import THRESHOLDS as T
+
+        m["old_gate_pass"] = float(
+            (m["mean_image_r"] or 0) >= T["mean_image_min_r"]
+            and (m["motion_mean_r"] or 0) >= T["motion_param_mean_r"]
+            and (m["aff12_max_trans_mm"] or 1e9) <= T["aff12_max_trans_diff_mm"]
+            and (m["aff12_max_rot"] or 1e9) <= T["aff12_max_rot_diff"]
+        )
         res.metrics["reference"] = m
 
         for p in (ref / "moco.nii", ffs / "moco.nii"):

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from .base import Check, UnitResult
 from .moco import MocoCheck
+from .slicetime import SlicetimeCheck
 
-CHECKS: dict[str, type[Check]] = {c.name: c for c in (MocoCheck,)}
+CHECKS: dict[str, type[Check]] = {c.name: c for c in (MocoCheck, SlicetimeCheck)}
 
 __all__ = ["CHECKS", "Check", "UnitResult"]

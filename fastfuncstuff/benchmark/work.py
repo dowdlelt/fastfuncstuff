@@ -46,14 +46,78 @@ def plan(wl, manifests: Path, check_name: str, datasets: list[str], n: int) -> N
         print(f"{ds}: {len(units)} units planned for {check.name}, {added} new")
 
 
+def deadline_from(hhmm: str | None) -> float | None:
+    """Next occurrence of HH:MM local time, as a timestamp (tomorrow if already past)."""
+    if not hhmm:
+        return None
+    import datetime as dt
+
+    h, m = (int(x) for x in hhmm.split(":"))
+    now = dt.datetime.now()
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t <= now:
+        t += dt.timedelta(days=1)
+    return t.timestamp()
+
+
+def gpu_busy(device: str, min_free_gb: float = 6.0, util_pct: float = 20.0) -> str | None:
+    """Why the card should be left alone right now, or None.
+
+    Called between units, when this runner has nothing on the card, so any sustained
+    utilization belongs to someone else's fit. Idle contexts (a viewer, a notebook kernel)
+    hold a few hundred MB at 0 % and must not block a night's run."""
+    import subprocess
+    import time
+
+    if not device.startswith("cuda"):
+        return None
+    idx = device.split(",")[1] if "," in device else "0"
+    q = ["nvidia-smi", f"--id={idx}", "--query-gpu=utilization.gpu,memory.used,memory.total",
+         "--format=csv,noheader,nounits"]  # fmt: skip
+    samples = []
+    for _ in range(5):
+        try:
+            out = subprocess.run(q, capture_output=True, text=True, timeout=30).stdout
+            u, used, total = (float(x) for x in out.strip().split(","))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+        samples.append((u, used, total))
+        time.sleep(2)
+    util = min(s[0] for s in samples)
+    free_gb = (samples[-1][2] - samples[-1][1]) / 1024
+    if util >= util_pct:
+        return f"utilization {util:.0f}% sustained over 10 s"
+    if free_gb < min_free_gb:
+        return f"only {free_gb:.1f} GB free"
+    return None
+
+
 def run(
-    wl, root: Path, manifests: Path, check: str | None, max_units: int, device: str, keep: bool
+    wl,
+    root: Path,
+    manifests: Path,
+    check: str | None,
+    max_units: int,
+    device: str,
+    keep: bool,
+    until: float | None = None,
+    gpu_wait_s: float = 300.0,
 ) -> int:
+    import time
+
     from .checks import CHECKS
     from .fetch import fetch, sha256
 
     n_done = 0
     while n_done < max_units:
+        if until is not None and time.time() >= until:
+            print("stop time reached; leaving the rest pending", flush=True)
+            break
+        busy = gpu_busy(device)
+        if busy:
+            print(f"GPU in use by someone else ({busy}); waiting {gpu_wait_s:.0f} s", flush=True)
+            time.sleep(gpu_wait_s)
+            continue
         u = wl.claim_next(check=check)
         if u is None:
             break
@@ -128,6 +192,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-max_units", type=int, default=10**9, help="Stop after this many units.")
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
     p.add_argument("-keep", action="store_true", help="Do not prune regenerable outputs.")
+    p.add_argument(
+        "-until",
+        metavar="HH:MM",
+        help="Claim no new unit after this local time (next occurrence), e.g. 07:00.",
+    )
     args = p.parse_args(argv)
     if args.root is None:
         p.error("-root is required (or set FFS_BENCH_ROOT / FFS_BENCHMARK_DATA_DIR)")
@@ -142,7 +211,16 @@ def main(argv: list[str] | None = None) -> int:
             p.error("-plan needs -datasets")
         plan(wl, args.manifests, args.plan, args.datasets, args.n)
     elif args.run:
-        run(wl, args.root, args.manifests, args.check, args.max_units, args.device, args.keep)
+        run(
+            wl,
+            args.root,
+            args.manifests,
+            args.check,
+            args.max_units,
+            args.device,
+            args.keep,
+            until=deadline_from(args.until),
+        )
     elif args.status:
         for r in wl.status():
             print(f"{r['check_name']:<12} {r['dataset']:<24} {r['status']:<10} {r['n']}")

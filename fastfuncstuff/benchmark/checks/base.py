@@ -28,20 +28,64 @@ def _stable_rank(*parts: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()
 
 
-def timed(cmd: list[str], cwd: Path, log: Path, env: dict[str, str] | None = None) -> float:
-    """Run ``cmd``, send output to ``log``, return wall seconds; raise with the log tail."""
+def timed(
+    cmd: list[str],
+    cwd: Path,
+    log: Path,
+    env: dict[str, str] | None = None,
+    timeout_s: float = 3600.0,
+) -> float:
+    """Run ``cmd``, send output to ``log``, return wall seconds; raise with the log tail.
+
+    The command gets its own process group and is killed as a group at ``timeout_s``:
+    MATLAB (and AFNI scripts) fork helpers, and a hung child holding the parent open is
+    exactly how an unattended night stalls on one unit.
+    """
     t = time.monotonic()
     with open(log, "a") as f:
         f.write(f"$ {shlex.join(cmd)}\n")
         f.flush()
-        r = subprocess.run(
-            cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env={**os.environ, **(env or {})}
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, **(env or {})},
+            start_new_session=True,
         )
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            f.write(f"!! killed after {timeout_s:.0f} s\n")
+            raise TimeoutError(
+                f"{cmd[0]} exceeded {timeout_s:.0f} s (process group killed)"
+            ) from None
+        except BaseException:
+            kill_group(proc)
+            raise
     dt = time.monotonic() - t
-    if r.returncode != 0:
+    if rc != 0:
         tail = "".join(open(log).readlines()[-15:])
-        raise RuntimeError(f"{cmd[0]} exited {r.returncode}:\n{tail}")
+        raise RuntimeError(f"{cmd[0]} exited {rc}:\n{tail}")
     return dt
+
+
+def kill_group(proc: subprocess.Popen, grace_s: float = 10.0) -> None:
+    """SIGTERM the process group, then SIGKILL whatever is left after ``grace_s``."""
+    import signal
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace_s)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 @lru_cache(maxsize=1)
@@ -76,6 +120,7 @@ class Check:
     needs: list[list[str]] = [[]]  # alternatives; tags as in census.CORE_NEEDS
     sampling = "breadth"  # breadth | depth | session
     reference = ""  # the reference tool, for reports
+    timeout_s = 3600.0  # per command; a hung tool is killed and the unit marked failed
 
     # -- planning ----------------------------------------------------------
 
