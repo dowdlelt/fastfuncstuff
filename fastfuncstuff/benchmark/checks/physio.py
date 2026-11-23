@@ -142,7 +142,7 @@ class PhysioCheck(Check):
         found = bool(cw.get("found", False))
         m: dict[str, float | None] = {"card_found": float(found)}
         for kind, band, short in (("cardiac", CARDIAC_BAND, "card"), ("respiratory", RESP_BAND, "resp")):  # fmt: skip
-            if kind not in rec or (short == "resp" and not phase):
+            if kind not in rec:  # respiration scored from magnitude too: docs call it unreliable
                 continue
             phi_ffs = _slibase_phase(f"{prefix}.slibase.1D", short)
             nt = phi_ffs.shape[0]
@@ -170,7 +170,8 @@ class PhysioCheck(Check):
             res.artifacts.append((f, "regenerable" if f.suffix == ".gz" else "keep"))
         res.artifacts += [(tp, "keep"), (log, "keep")]
         res.provenance["ffs"] = {"tool": "ffs_physio", **ffs_version(), "device": device,
-                                 "phase_given": bool(phase)}  # fmt: skip
+                                 "phase_given": bool(phase),
+                                 "sources": summary.get("sources")}  # fmt: skip
         res.provenance["truth"] = {
             "recordings": sorted(rec),
             "scoring": "PLV of slibase c1/s1 phase vs beat_phase(find_beats(recording))",
