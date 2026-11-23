@@ -163,3 +163,22 @@ def test_cli_requires_a_mode():
     assert isinstance(args, argparse.Namespace)
     with pytest.raises(SystemExit, match="mode"):
         _validate(args)
+
+
+def test_cli_single_flag_allineate_opts_parses():
+    # argparse refuses a '-'-leading value with no space in it; this died with
+    # "expected one argument" on the first real use.
+    from fastfuncstuff.cli.util_reface import parse_args
+
+    args = parse_args(
+        [
+            "-input",
+            "t1.nii",
+            "-prefix",
+            "o",
+            "-mode_deface",
+            "-allineate_opts",
+            "-shift_rotate_scale",
+        ]
+    )
+    assert args.allineate_opts == "-shift_rotate_scale"

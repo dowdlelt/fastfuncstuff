@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, option_string_value
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -124,11 +124,13 @@ def parse_args(
 
     al = parser.add_argument_group("alignment")
     al.add_argument("-cost", default="lpa", help="ffs_allineate cost for the template fit")
-    al.add_argument(
-        "-allineate_opts",
-        default="",
-        metavar="'OPTS'",
-        help="More ffs_allineate flags for the fit, quoted, e.g. '-shift_rotate_scale -slow'",
+    option_string_value(
+        al.add_argument(
+            "-allineate_opts",
+            default="",
+            metavar="'OPTS'",
+            help="More ffs_allineate flags for the fit, quoted, e.g. '-shift_rotate_scale -slow'",
+        )
     )
     al.add_argument(
         "-1Dmatrix_save",
