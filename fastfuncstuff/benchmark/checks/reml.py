@@ -16,6 +16,7 @@ ridge, so lambda and stdev are the meaningful parity numbers (see stages/glm.py)
 from __future__ import annotations
 
 import csv
+import json
 import os
 from pathlib import Path
 
@@ -110,6 +111,18 @@ class RemlCheck(Check):
         events = next((p for rel, p in inputs.items() if rel.endswith("_events.tsv")), None)
         if events is None:
             raise ValueError("no events file among the inputs")
+        meta: dict = {}
+        for rel, p in inputs.items():
+            if rel.endswith(".json"):
+                meta.update(json.loads(p.read_text()))
+        tr = meta.get("RepetitionTime")
+        if meta.get("MRAcquisitionType") == "3D" and isinstance(tr, (int, float)) and tr < 0.3:
+            # Some 3D sidecars (and headers) carry the per-shot TR; every onset would then
+            # fall past the run's end and the design comes out all zeros.
+            raise ValueError(
+                f"3D run with RepetitionTime {tr} s: the shot TR, not the volume TR; "
+                "fix the sidecar (or curated block) before this run can be modelled"
+            )
         conds = _conditions(events)
         if not conds:
             raise ValueError(f"no trial_type with >= {MIN_EVENTS} events in {events.name}")
