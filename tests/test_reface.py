@@ -15,6 +15,7 @@ from fastfuncstuff.processing.reface import (
     remove_isolated_mask_voxels,
     shell_gain,
     shell_on_subject,
+    widen_keep,
 )
 
 
@@ -183,3 +184,14 @@ def test_cli_single_flag_allineate_opts_parses():
     )
     assert args.allineate_opts == "-slow"
     assert args.dof == 9  # the shell keeps the template's shape unless asked
+
+
+def test_widen_keep_moves_the_inner_edge_by_the_margin():
+    shell = _shell()  # face slab starts at x=16, brain box x=4..15
+    vox = (1.0, 1.0, 2.0)
+    assert torch.equal(widen_keep(shell, 0.0, vox), shell)
+    out = widen_keep(shell, 3.0, vox)
+    # 3 mm at 2 mm/voxel along x is one voxel: x=16 goes back to the subject, x=17 stays
+    assert (out[0, 4:16, 4:18, 16] == 0).all()
+    torch.testing.assert_close(out[0, 4:16, 4:18, 17:20], shell[0, 4:16, 4:18, 17:20])
+    assert torch.equal(out[shell <= 0], shell[shell <= 0])  # outside and brain untouched

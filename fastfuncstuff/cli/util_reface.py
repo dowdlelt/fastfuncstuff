@@ -48,6 +48,7 @@ from fastfuncstuff.processing.reface import (
     apply_shell,
     shell_gain,
     shell_on_subject,
+    widen_keep,
 )
 from fastfuncstuff.utils import REGISTRATION_TF32
 
@@ -129,6 +130,16 @@ def parse_args(
         "12 matches the template better but its shear can bend the shell's inner "
         "edge toward the brain: on one T1 it took the back of the shell onto the "
         "skull's inner table, where 9 kept AFNI's clearance or more",
+    )
+    ref.add_argument(
+        "-margin",
+        type=float,
+        default=3.0,
+        metavar="MM",
+        help="Keep the subject's own voxels for the first MM of the shell's replaced "
+        "region next to the brain, so the shell stays at least MM further from the "
+        "brain than the fit alone puts it. Costs a thin band of the subject's inner "
+        "skull left in place (not face). 0 = AFNI's shell exactly",
     )
     option_string_value(
         al.add_argument(
@@ -307,6 +318,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     # Tensor order is (z, y, x); NIfTI zooms are (x, y, z).
     zooms = tuple(float(z) for z in sh["header"].get_zooms()[:3])
     voxel_size = (zooms[2], zooms[1], zooms[0])
+    # After the gain, so the synthetic face is scaled exactly as AFNI scales it.
+    shell_subj = widen_keep(shell_subj, args.margin, voxel_size)
 
     # A short input comes back short, as @afni_refacer_run does, when it fits.
     short_in = np.dtype(sh["header"].get_data_dtype()) == np.int16

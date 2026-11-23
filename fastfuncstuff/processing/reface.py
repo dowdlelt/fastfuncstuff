@@ -125,6 +125,33 @@ def shell_on_subject(
     return torch.stack([remove_isolas(b) for b in moved])
 
 
+def widen_keep(
+    shell_subj: Tensor, margin_mm: float, voxel_size_mm: tuple[float, float, float]
+) -> Tensor:
+    """Hand shell voxels within ``margin_mm`` of the brain (``0``) region back to the subject.
+
+    Not in AFNI. The shell's inner edge sits where the fit puts it, a few mm from
+    the brain on a typical head; this keeps the subject's own voxels for the first
+    ``margin_mm`` of the replaced region, so the clearance is at least that much
+    more whatever the fit does. The kept band is inner skull, not face.
+    ``voxel_size_mm`` is in tensor order ``(z, y, x)``.
+    """
+    if margin_mm <= 0:
+        return shell_subj
+    radius = [int(margin_mm // v) for v in voxel_size_mm]
+    grids = torch.meshgrid(
+        *[
+            torch.arange(-r, r + 1, device=shell_subj.device) * v
+            for r, v in zip(radius, voxel_size_mm, strict=True)
+        ],
+        indexing="ij",
+    )
+    ball = (torch.stack(grids).pow(2).sum(0) <= margin_mm**2 + 1e-6).to(torch.float32)
+    keep = (shell_subj == 0).to(torch.float32)[:, None]
+    near = F.conv3d(keep, ball[None, None], padding=tuple(radius))[:, 0] > 0
+    return shell_subj.masked_fill(near & (shell_subj > 0), 0.0)
+
+
 def shell_gain(subject: Tensor, shell_subj: Tensor) -> float:
     """@afni_refacer_run's ``ifac``: ``1.222 * ibar / mbar``.
 
