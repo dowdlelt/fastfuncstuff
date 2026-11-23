@@ -96,7 +96,7 @@ class AffineAlignConfig:
     """Configuration for affine/rigid alignment."""
 
     # Degrees of freedom
-    dof: str = "affine"  # "rigid" (6), "affine" (12), "epi" (9)
+    dof: str = "affine"  # "rigid" (6), "affine" (12), "epi" (9), "scale" (9)
 
     # Cost function. AFNI-faithful: ls, lpa, lpc, mi, nmi, je, hel,
     # cru/cra/crm (correlation ratio). ffs-special per-voxel Gaussian local
@@ -1223,6 +1223,10 @@ def _get_free_mask(dof: str) -> np.ndarray:
         free[6] = False  # sx
         free[8] = False  # sz
         free[11] = False  # shzy
+    elif dof == "scale":
+        free[9:12] = False  # AFNI -warp shift_rotate_scale: no shears
+    elif dof != "affine":
+        raise ValueError(f"unknown dof {dof!r}")
     return free
 
 

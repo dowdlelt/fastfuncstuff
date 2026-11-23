@@ -391,6 +391,11 @@ Examples:
     mode_ex.add_argument(
         "-EPI", action="store_true", help="9 DoF: EPI-specific (freeze x/z scale, z shear)"
     )
+    mode_ex.add_argument(
+        "-shift_rotate_scale",
+        action="store_true",
+        help="9 DoF: translation + rotation + scale, no shears (AFNI -warp shift_rotate_scale)",
+    )
 
     # --- Cost function ---
     cost_group = parser.add_argument_group("Cost function")
@@ -979,6 +984,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         dof = "rigid"
     elif args.EPI:
         dof = "epi"
+    elif args.shift_rotate_scale:
+        dof = "scale"
 
     # Iteration counts are *ceilings*: Adam stops early once the cost plateaus
     # (relative tolerance), so a generous cap costs nothing when converged but
