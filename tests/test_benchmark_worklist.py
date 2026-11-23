@@ -144,3 +144,13 @@ def test_allineate_affine_distance(tmp_path):
     rot = np.eye(4)
     rot[:2, :2] = [[0, -1], [1, 0]]  # 90 degrees: displacement grows with distance
     assert rms_displacement(rot, np.eye(4), pts) > 50
+
+
+def test_reml_events_non_bids_columns(tmp_path):
+    from fastfuncstuff.benchmark.checks.reml import _conditions
+
+    ev = tmp_path / "y_events.tsv"
+    ev.write_text(
+        "event_onset\tduration\tstimulus\n1\t20\tcheck\n60\t20\tcheck\n3\t0.4\tletter\n9\t0.4\tletter\n"
+    )
+    assert {k: len(v) for k, v in _conditions(ev).items()} == {"check": 2, "letter": 2}

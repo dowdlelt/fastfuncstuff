@@ -27,18 +27,33 @@ MIN_EVENTS = 2
 FFS_VARIANTS = {"ffs": ["-afni_mode"], "ffs_default": []}
 
 
+# Non-BIDS spellings seen in private trees (MassedEvents9pt4T: event_onset, stimulus);
+# BIDS names win when present. The columns used go into the unit's provenance.
+ONSET_COLS = ("onset", "event_onset", "onset_s", "onsets")
+CONDITION_COLS = ("trial_type", "stimulus", "condition", "event_type", "stim_type")
+
+
+def event_columns(header: list[str]) -> tuple[str | None, str | None]:
+    pick = lambda opts: next((c for c in opts if c in header), None)  # noqa: E731
+    return pick(ONSET_COLS), pick(CONDITION_COLS)
+
+
 def _conditions(events_tsv: Path) -> dict[str, list[tuple[float, float]]]:
-    """trial_type -> [(onset, duration)], the commonest types first, n/a dropped."""
+    """condition -> [(onset, duration)], the commonest first, n/a dropped."""
     with open(events_tsv, newline="") as f:
-        rows = list(csv.DictReader(f, delimiter="\t"))
+        reader = csv.DictReader(f, delimiter="\t")
+        rows = list(reader)
+        onset_col, cond_col = event_columns(list(reader.fieldnames or []))
+    if onset_col is None:
+        return {}
     out: dict[str, list[tuple[float, float]]] = {}
     for r in rows:
         try:
-            onset = float(r["onset"])
+            onset = float(r[onset_col])
             dur = float(r.get("duration") or 0)
         except (KeyError, ValueError):
             continue
-        tt = (r.get("trial_type") or "event").strip()
+        tt = ((r.get(cond_col) if cond_col else None) or "event").strip()
         if tt in ("", "n/a"):
             tt = "event"
         out.setdefault(tt, []).append((onset, dur if dur == dur else 0.0))  # NaN -> 0
@@ -191,5 +206,6 @@ class RemlCheck(Check):
         res.provenance["inputs_prep"] = {
             "scaling": "3dcalc c*step(b)*min(200,a/b*100), b = 3dTstat mean, c = 3dAutomask",
             "conditions": {k: len(v) for k, v in conds.items()},
+            "event_columns": event_columns(events.read_text().splitlines()[0].split("\t")),
         }
         return res
