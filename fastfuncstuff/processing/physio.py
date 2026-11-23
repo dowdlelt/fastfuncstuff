@@ -37,6 +37,7 @@ from fastfuncstuff.stats.task_coupling import _orthonormal_basis
 from fastfuncstuff.utils import accum_dtype
 
 from ..glm.core import construct_polynomial_matrix
+from ..io.physio_bids import cmrr_volume_zero, read_cmrr_log  # noqa: F401  (moved; old import path)
 
 CARDIAC_BAND = (0.6, 2.0)  # Hz: 36-120 bpm
 RESP_BAND = (0.1, 0.6)  # Hz: 6-36 breaths per minute
@@ -2026,28 +2027,3 @@ def standard_regressors(
         cols.append(_convolve_at(model.resp_t, model.rvt, times, respiration_response))
         labels.append("rvt.rrf")
     return np.stack(cols, 1), labels
-
-
-def read_cmrr_log(path) -> tuple[np.ndarray, np.ndarray]:
-    """(times in s, values) from a CMRR physio log (RESP / PULS / ECG channel 1),
-    placed by each sample's own 2.5 ms tick -- gaps cost nothing."""
-    t, v = [], []
-    for line in open(path):
-        p = line.split()
-        if len(p) >= 3 and p[0].isdigit() and p[1] in ("RESP", "PULS", "ECG1", "ECG"):
-            t.append(int(p[0]))
-            v.append(float(p[2]))
-    return np.asarray(t, dtype=float) * 0.0025, np.asarray(v, dtype=float)
-
-
-def cmrr_volume_zero(info_path) -> float:
-    """Start of the first acquisition (s, same clock as the logs) from a CMRR Info log."""
-    first = None
-    for line in open(info_path):
-        p = line.split()
-        if len(p) == 5 and all(x.isdigit() for x in p):
-            t = int(p[2]) * 0.0025
-            first = t if first is None else min(first, t)
-    if first is None:
-        raise ValueError(f"no acquisition rows in {info_path}")
-    return first
