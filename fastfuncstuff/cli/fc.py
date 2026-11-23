@@ -154,6 +154,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "is in PREFIX.json.",
     )
     me.add_argument(
+        "-lw_samples",
+        choices=["dof", "tr"],
+        default="dof",
+        help="What -shrink lw counts as its sample size. dof: the residual degrees of\n"
+        "freedom -- after a passband far fewer independent samples than TRs, so the\n"
+        "shrinkage is larger (0.058 vs 0.009 on one TASKFORCE run, which predicted the\n"
+        "held-out run better; one subject, one split). tr: the textbook formula with\n"
+        "n = TRs, as scikit-learn / nilearn compute it, for comparison with them.",
+    )
+    me.add_argument(
         "-weight_corr",
         default=None,
         metavar="FILE.1D",
@@ -432,9 +442,11 @@ def _run(args, verbose: bool) -> int:
     if args.shrink == "lw":
         if args.weight_corr:
             raise ValueError("-shrink lw is not defined for weighted correlations")
-        lw, shrinkage = ledoit_wolf(clean, n_effective=cleaner.dof)
+        n_eff = cleaner.dof if args.lw_samples == "dof" else None
+        lw, shrinkage = ledoit_wolf(clean, n_effective=n_eff)
         mats["LW"] = lw.cpu().numpy()
         meta["lw_shrinkage"] = shrinkage
+        meta["lw_samples"] = args.lw_samples
         _say(verbose, f"   Ledoit-Wolf shrinkage {shrinkage:.4f}")
         if args.part_corr:
             mats["PC_LW"] = partial_correlation(mats["LW"])[0]  # PD by construction

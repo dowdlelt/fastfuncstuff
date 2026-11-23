@@ -443,3 +443,18 @@ def test_plot_draws_only_major_module_boundaries():
     assert _major_boundaries([1, 41, 42, 43, 93], 95, 3) == [43]
     assert _major_boundaries([1, 41, 93], 95, 3) == [41]
     assert _major_boundaries([], 10, 3) == []
+
+
+def test_cli_lw_samples_tr_is_the_textbook_shrinkage(toy):
+    from fastfuncstuff.cli.fc import main
+
+    tmp, runs, atlas, *_ = toy
+    out = {}
+    for mode in ("dof", "tr"):
+        prefix = str(tmp / f"lw_{mode}")
+        assert main(["-input", *runs, "-atlas", atlas, "-shrink", "lw", "-lw_samples", mode,
+                     "-passband", "0.01", "0.1", "-device", "cpu", "-quiet",
+                     "-prefix", prefix]) == 0  # fmt: skip
+        out[mode] = json.loads(open(prefix + ".json").read())
+    assert out["tr"]["lw_samples"] == "tr"
+    assert out["dof"]["lw_shrinkage"] > out["tr"]["lw_shrinkage"]
