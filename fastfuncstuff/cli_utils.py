@@ -6229,3 +6229,29 @@ def run_with_preallineate(
         progress=lambda message: spinner(message, enabled=args.verb >= 1),
     )
     return 0
+
+
+def find_afni_file(name: str) -> str | None:
+    """A file AFNI ships (a template, the refacer shell), found the way a user would.
+
+    Beside the ``afni`` (or ``3dinfo``) on ``$PATH`` first -- the abin directory,
+    where the installer puts them -- then ``$AFNI_ATLAS_PATH`` and
+    ``~/.afni/atlases``, the places ``@FindAfniDsetPath`` also searches.
+    """
+    import os
+    import shutil
+
+    dirs: list[Path] = []
+    for prog in ("afni", "3dinfo"):
+        exe = shutil.which(prog)
+        if exe is not None:
+            dirs.append(Path(exe).resolve().parent)
+    for entry in os.environ.get("AFNI_ATLAS_PATH", "").split(":"):
+        if entry:
+            dirs.append(Path(entry).expanduser())
+    dirs.append(Path.home() / ".afni" / "atlases")
+    for d in dirs:
+        cand = d / name
+        if cand.is_file():
+            return str(cand)
+    return None

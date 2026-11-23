@@ -1521,11 +1521,9 @@ def _resolve_mni(args) -> tuple[str, str | None]:
 def find_mni_template() -> str | None:
     """AFNI's MNI152_2009_template_SSW.nii.gz, found the way a user would: next to
     the afni on $PATH. Sub-brick 0 is its skull-off volume."""
-    afni = shutil.which("afni")
-    if afni is None:
-        return None
-    cand = Path(afni).resolve().parent / "MNI152_2009_template_SSW.nii.gz"
-    return str(cand) if cand.is_file() else None
+    from fastfuncstuff.cli_utils import find_afni_file
+
+    return find_afni_file("MNI152_2009_template_SSW.nii.gz")
 
 
 def _resolve_nl_backends(args) -> dict[str, str]:
