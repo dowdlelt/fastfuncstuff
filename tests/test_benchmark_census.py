@@ -108,3 +108,37 @@ def test_gaps_report_flags_uncovered_tools(tmp_path):
     assert "lab" in t2
     blip = next(line for line in rep.splitlines() if line.startswith("blipflip"))
     assert "NONE" in blip  # no reverse-PE fieldmap in the tree
+
+
+def test_curated_block_survives_recensus_and_applies(tmp_path):
+    import yaml
+
+    bids = _tree(tmp_path)
+    out = tmp_path / "manifests"
+    path = C.write_manifest(C.census(C.LocalSource(bids)), out)
+    m = yaml.safe_load(path.read_text())
+    m["curated"].update(
+        {"set": {"field_T": 3}, "source": "protocol PDF", "exclude_acquisitions": {}}
+    )
+    path.write_text(yaml.safe_dump(m, sort_keys=False))
+
+    C.write_manifest(C.census(C.LocalSource(bids)), out)  # re-census must not wipe edits
+    (cm,) = C.load_manifests(out)
+    assert cm["curated"]["source"] == "protocol PDF"
+    assert cm["acquisitions"][0]["field_T"] == 3  # overrides the sidecar's 7
+    assert C.acquisition_axes(cm["acquisitions"][0])["field"] == "3T"
+
+    raw = yaml.safe_load(path.read_text())
+    raw["curated"]["exclude"] = "odd design, public data covers it"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    rep = C.gaps_report(C.load_manifests(out))
+    assert "## Excluded" in rep and "odd design" in rep
+    assert "faces" not in rep.split("## Excluded")[0]
+
+
+def test_curated_set_without_source_is_refused():
+    import pytest
+
+    m = {"dataset_id": "x", "acquisitions": [], "curated": {"set": {"field_T": 3}}}
+    with pytest.raises(ValueError, match="source"):
+        C.apply_curation(m)
