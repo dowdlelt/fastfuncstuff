@@ -877,107 +877,16 @@ def main(argv: list[str] | None = None) -> None:
     _dispatch_run(args, _select_device(args.device))
 
 
-def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
-    """Align one self-contained base/source pair (the entire per-pair body).
+def build_align_config(
+    args: argparse.Namespace, base: torch.Tensor, base_header: dict, device: torch.device
+) -> tuple[AffineAlignConfig, str, str | None]:
+    """The AffineAlignConfig an ffs_allineate command line asks for.
 
-    Both the standalone path and every batch job go through here, so a manifest
-    line reproduces a solo invocation bit-for-bit."""
+    Shared so a tool that embeds an alignment (ffs_util_reface) takes the same
+    presets and defaults, and can pass ``-allineate_opts`` straight through.
+    Returns ``(config, preset name, -1Dmatrix_init path or None)``.
+    """
     verb = args.verb
-    if verb >= 1:
-        print_cli_header("ffs_allineate", "Affine and rigid-body registration")
-
-    # Validate follower pairing before the (long) alignment, not after it.
-    _follower_pairs(args)
-
-    # --- Load images ---
-    t0 = time.time()
-    # Read to the host and move only the volumes the fit uses: a 4D source stays
-    # there and is resampled a volume at a time (_resample_series).
-    with spinner(f"Loading {Path(args.base).name}"):
-        base, base_header = load_image(args.base)
-    with spinner(f"Loading {Path(args.source).name}"):
-        source, source_header = load_image(args.source)
-
-    # Handle 4D base
-    if base.ndim == 4:
-        idx = args.base_index if args.base_index is not None else 0
-        if verb >= 1:
-            print(f"  Base volume: {idx} of {base.shape[0]}")
-        base = base[idx]
-    base = base.to(device)
-
-    # Handle 4D source
-    source_4d = None
-    if source.ndim == 4:
-        source_4d = source
-        source = source[0]
-        if verb >= 1:
-            print(f"  Estimation volume: first of {source_4d.shape[0]}")
-    source = source.to(device)
-    source_whole = source  # what the output is resampled from
-    if args.source_mask is not None and getattr(args, "1Dmatrix_apply", None) is None:
-        # The fit only: the output (and source_4d) comes from the unmasked source.
-        source = source * _mask_on(args.source_mask, source_header, tuple(source.shape), device)
-
-    if verb >= 1:
-        print_cli_section("Inputs", leading_blank=False)
-        print(f"  Base:   {args.base} {tuple(base.shape)}")
-        print(f"  Source: {args.source} {tuple(source.shape)}")
-        print(f"  Output: {args.prefix}")
-        print(f"  Loaded: {time.time() - t0:.2f}s")
-
-    # Output grid: the base's grid by default, or a -dxyz master grid (base space/FOV/centre
-    # at a new voxel size). The transform is applied into `out_shape` and saved with `out_affine`.
-    if args.dxyz is not None and len(args.dxyz) not in (1, 3):
-        raise SystemExit(f"-dxyz takes 1 (isotropic) or 3 (x y z) values, got {len(args.dxyz)}")
-    out_affine, out_shape = _output_grid(base_header["affine"], tuple(base.shape), args.dxyz)
-    if args.dxyz is not None and verb >= 1:
-        print(f"Output grid (-dxyz {args.dxyz}): {base.shape} -> {out_shape}")
-
-    # --- Apply existing matrix ---
-    if getattr(args, "1Dmatrix_apply", None) is not None:
-        matrix_path = getattr(args, "1Dmatrix_apply")
-        if verb >= 1:
-            print_cli_section("Applying existing transform")
-            print(f"  Matrix: {matrix_path}")
-        if args.movie is not None and verb >= 1:
-            print("  WARNING: -movie records a search; ignored with -1Dmatrix_apply")
-
-        matrix = load_matrix_1D(
-            matrix_path,
-            base_affine=base_header["affine"],
-            source_affine=source_header["affine"],
-        )
-        matrix = matrix.to(device)
-        om = _out_matrix(matrix, base_header["affine"], out_affine, device)
-        if source_4d is None:
-            warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
-        else:
-            warped = _resample_series(
-                source_4d, om, out_shape, args.final_interp, args.no_neg,
-                desc=f"  Resampling {source_4d.shape[0]} volumes", verb=verb,
-            )  # fmt: skip
-        if verb >= 1:
-            print_cli_section("Outputs")
-        with spinner(f"Writing {Path(args.prefix).name}"):
-            save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
-        if verb >= 1:
-            print(f"  Aligned data: {args.prefix}")
-        _apply_followers(
-            args, om, base_header, source_header["affine"], out_affine, out_shape, device
-        )
-        if source_4d is not None and args.save_mean:
-            mean_path = derive_mean_output_path(args.prefix)
-            with spinner(f"Writing {Path(mean_path).name}"):
-                save_image(
-                    warped.mean(dim=0), mean_path, header_info=base_header, affine=out_affine
-                )
-            if verb >= 1:
-                print(f"  Mean: {mean_path}")
-        if verb >= 1:
-            print_cli_footer("ffs_allineate", elapsed_seconds=time.time() - t0)
-        return
-
     # --- Build config with speed/quality presets ---
     dof = "affine"
     if args.rigid:
@@ -1084,14 +993,119 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         device=str(device),
         verb=verb,
     )
+    return config, preset, init_path
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
+    """Align one self-contained base/source pair (the entire per-pair body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
+    verb = args.verb
+    if verb >= 1:
+        print_cli_header("ffs_allineate", "Affine and rigid-body registration")
+
+    # Validate follower pairing before the (long) alignment, not after it.
+    _follower_pairs(args)
+
+    # --- Load images ---
+    t0 = time.time()
+    # Read to the host and move only the volumes the fit uses: a 4D source stays
+    # there and is resampled a volume at a time (_resample_series).
+    with spinner(f"Loading {Path(args.base).name}"):
+        base, base_header = load_image(args.base)
+    with spinner(f"Loading {Path(args.source).name}"):
+        source, source_header = load_image(args.source)
+
+    # Handle 4D base
+    if base.ndim == 4:
+        idx = args.base_index if args.base_index is not None else 0
+        if verb >= 1:
+            print(f"  Base volume: {idx} of {base.shape[0]}")
+        base = base[idx]
+    base = base.to(device)
+
+    # Handle 4D source
+    source_4d = None
+    if source.ndim == 4:
+        source_4d = source
+        source = source[0]
+        if verb >= 1:
+            print(f"  Estimation volume: first of {source_4d.shape[0]}")
+    source = source.to(device)
+    source_whole = source  # what the output is resampled from
+    if args.source_mask is not None and getattr(args, "1Dmatrix_apply", None) is None:
+        # The fit only: the output (and source_4d) comes from the unmasked source.
+        source = source * _mask_on(args.source_mask, source_header, tuple(source.shape), device)
+
+    if verb >= 1:
+        print_cli_section("Inputs", leading_blank=False)
+        print(f"  Base:   {args.base} {tuple(base.shape)}")
+        print(f"  Source: {args.source} {tuple(source.shape)}")
+        print(f"  Output: {args.prefix}")
+        print(f"  Loaded: {time.time() - t0:.2f}s")
+
+    # Output grid: the base's grid by default, or a -dxyz master grid (base space/FOV/centre
+    # at a new voxel size). The transform is applied into `out_shape` and saved with `out_affine`.
+    if args.dxyz is not None and len(args.dxyz) not in (1, 3):
+        raise SystemExit(f"-dxyz takes 1 (isotropic) or 3 (x y z) values, got {len(args.dxyz)}")
+    out_affine, out_shape = _output_grid(base_header["affine"], tuple(base.shape), args.dxyz)
+    if args.dxyz is not None and verb >= 1:
+        print(f"Output grid (-dxyz {args.dxyz}): {base.shape} -> {out_shape}")
+
+    # --- Apply existing matrix ---
+    if getattr(args, "1Dmatrix_apply", None) is not None:
+        matrix_path = getattr(args, "1Dmatrix_apply")
+        if verb >= 1:
+            print_cli_section("Applying existing transform")
+            print(f"  Matrix: {matrix_path}")
+        if args.movie is not None and verb >= 1:
+            print("  WARNING: -movie records a search; ignored with -1Dmatrix_apply")
+
+        matrix = load_matrix_1D(
+            matrix_path,
+            base_affine=base_header["affine"],
+            source_affine=source_header["affine"],
+        )
+        matrix = matrix.to(device)
+        om = _out_matrix(matrix, base_header["affine"], out_affine, device)
+        if source_4d is None:
+            warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
+        else:
+            warped = _resample_series(
+                source_4d, om, out_shape, args.final_interp, args.no_neg,
+                desc=f"  Resampling {source_4d.shape[0]} volumes", verb=verb,
+            )  # fmt: skip
+        if verb >= 1:
+            print_cli_section("Outputs")
+        with spinner(f"Writing {Path(args.prefix).name}"):
+            save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
+        if verb >= 1:
+            print(f"  Aligned data: {args.prefix}")
+        _apply_followers(
+            args, om, base_header, source_header["affine"], out_affine, out_shape, device
+        )
+        if source_4d is not None and args.save_mean:
+            mean_path = derive_mean_output_path(args.prefix)
+            with spinner(f"Writing {Path(mean_path).name}"):
+                save_image(
+                    warped.mean(dim=0), mean_path, header_info=base_header, affine=out_affine
+                )
+            if verb >= 1:
+                print(f"  Mean: {mean_path}")
+        if verb >= 1:
+            print_cli_footer("ffs_allineate", elapsed_seconds=time.time() - t0)
+        return
+
+    config, preset, init_path = build_align_config(args, base, base_header, device)
 
     if verb >= 1:
         print_cli_section("Configuration")
-        print(f"  Transform: {dof}")
+        print(f"  Transform: {config.dof}")
         print(f"  Cost: {args.cost}")
         print(f"  Preset: {preset}")
         print(f"  Optimizer: {args.optimizer}")
-        print(f"  Search: {'two-pass' if twopass else 'one-pass'}")
+        print(f"  Search: {'two-pass' if config.twopass else 'one-pass'}")
         if init_path is not None:
             print(f"  Start: {init_path} (center of mass off)")
         else:
