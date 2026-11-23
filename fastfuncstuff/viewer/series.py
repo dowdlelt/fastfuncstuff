@@ -212,12 +212,12 @@ def prepare_rows(
 
     if polort >= 0:
         step(0.25, f"detrend {polort}")
-        from fastfuncstuff.viewer.derive import legendre_columns, orthonormal_basis, project_out
+        from fastfuncstuff.connectivity.prep import build_cleaner
+        from fastfuncstuff.viewer.derive import legendre_columns
 
-        basis = torch.as_tensor(
-            orthonormal_basis(legendre_columns(nt, polort)), dtype=torch.float32
-        ).to(device)
-        flat = project_out(flat, basis, keep_mean=True)
+        # The shared cleaner: the carpet detrends exactly as ffs_fc and InstaCorr do.
+        cleaner = build_cleaner([legendre_columns(nt, polort)], [0], nt)
+        flat = cleaner.apply(flat, device=device, keep_mean=True)
 
     step(0.45, "normalising")
     rows, units, limit = normalize_rows(flat, normalize)

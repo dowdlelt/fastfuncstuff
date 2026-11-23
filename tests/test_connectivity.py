@@ -458,3 +458,15 @@ def test_cli_lw_samples_tr_is_the_textbook_shrinkage(toy):
         out[mode] = json.loads(open(prefix + ".json").read())
     assert out["tr"]["lw_samples"] == "tr"
     assert out["dof"]["lw_shrinkage"] > out["tr"]["lw_shrinkage"]
+
+
+def test_cleaner_keep_mean_restores_each_rows_level():
+    rng = np.random.default_rng(15)
+    n = 80
+    y = 500 + rng.standard_normal((4, n)) + 0.1 * np.arange(n)
+    cl = build_cleaner([_legendre(n, 1)], [0], n)
+    yt = torch.as_tensor(y, dtype=torch.float32)
+    kept = cl.apply(yt, keep_mean=True).numpy()
+    plain = cl.apply(yt).numpy()
+    np.testing.assert_allclose(kept.mean(1), y.mean(1), rtol=1e-5)
+    np.testing.assert_allclose(kept - kept.mean(1, keepdims=True), plain, atol=1e-3)

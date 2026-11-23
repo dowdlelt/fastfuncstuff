@@ -146,7 +146,7 @@ def _read_matrix(path: Path) -> tuple[np.ndarray, list[str], str]:
     return matrix, [f"{path.stem}#{i}" for i in range(matrix.shape[1])], "1D"
 
 
-def orthonormal_basis(columns: np.ndarray, *, tol: float = RANK_TOL) -> np.ndarray:
+def orthonormal_basis(columns: np.ndarray, *, tol: float | None = None) -> np.ndarray:
     """An orthonormal basis for the nuisance column space, rank-safe.
 
     SVD rather than QR. Collinear nuisance columns are not an edge case here --
@@ -158,16 +158,12 @@ def orthonormal_basis(columns: np.ndarray, *, tol: float = RANK_TOL) -> np.ndarr
     the true statement.
 
     Computed in float64 whatever the data is: this is the numerically sensitive
-    step and the matrix is (T, k), so the cost is nothing.
+    step and the matrix is (T, k), so the cost is nothing. The toolbox's one
+    implementation, :func:`connectivity.prep.nuisance_basis`.
     """
-    matrix = np.asarray(columns, dtype=np.float64)
-    if matrix.ndim != 2 or matrix.shape[1] == 0:
-        raise ValueError("nuisance columns must be a non-empty (T, k) matrix")
-    u, s, _ = np.linalg.svd(matrix, full_matrices=False)
-    if s.size == 0 or s[0] <= 0:
-        raise ValueError("nuisance matrix is all zeros")
-    rank = int(np.sum(s > s[0] * tol))
-    return np.ascontiguousarray(u[:, :rank])
+    from fastfuncstuff.connectivity.prep import nuisance_basis
+
+    return nuisance_basis(columns) if tol is None else nuisance_basis(columns, tol=tol)
 
 
 #: Highest polynomial order offered anywhere in the viewer. Past this a drift
@@ -213,24 +209,6 @@ def detrend_trace(values: np.ndarray, order: int) -> np.ndarray:
     return np.ascontiguousarray(v - basis @ (basis.T @ v), dtype=np.float32)
 
 
-def project_out(
-    flat: torch.Tensor,
-    basis: torch.Tensor,
-    *,
-    keep_mean: bool = True,
-) -> torch.Tensor:
-    """Residualise ``(V, T)`` against an orthonormal ``(T, r)`` basis.
-
-    The one-block form, so the carpet plot and the derived layer residualise
-    through the same three lines rather than two that drift.
-    """
-    mean = flat.mean(-1, keepdim=True)
-    out = flat - (flat @ basis) @ basis.T
-    if keep_mean:
-        out = out - out.mean(-1, keepdim=True) + mean
-    return out
-
-
 def denoise(
     data: np.ndarray,
     nuisance: Nuisance,
@@ -260,8 +238,11 @@ def denoise(
         raise ValueError(f"nuisance has {nuisance.columns.shape[0]} rows, dataset has {nt} volumes")
 
     device = device or torch.device("cpu")
-    basis = torch.as_tensor(orthonormal_basis(nuisance.columns), dtype=torch.float32)
-    basis = basis.to(device)  # (T, r)
+    from fastfuncstuff.connectivity.prep import build_cleaner
+
+    # The shared cleaner, so a DERIVE layer is residualised exactly as ffs_fc would.
+    cleaner = build_cleaner([nuisance.columns], [0], nt)
+    n_basis = int(cleaner.ranks[0])
 
     # The store keeps arrays C-contiguous, so (V, T) is a free view and time --
     # the axis every operation below runs along -- stays last.
@@ -273,7 +254,7 @@ def denoise(
     chunk = estimate_chunk_size(
         n_voxels=flat.shape[0],
         n_timepoints=nt,
-        n_regressors=int(basis.shape[1]),
+        n_regressors=n_basis,
         device=device,
         operation="denoise",
     )
@@ -282,7 +263,7 @@ def denoise(
     for start in range(0, flat.shape[0], chunk):
         stop = min(start + chunk, flat.shape[0])
         block = torch.as_tensor(flat[start:stop]).to(device)
-        cleaned = project_out(block, basis, keep_mean=keep_mean)
+        cleaned = cleaner.apply(block, device=device, chunk=stop - start, keep_mean=keep_mean)
         _land(cleaned, block, out, removed, start, stop)
         if progress is not None:
             progress(stop / flat.shape[0], f"projecting {nuisance.n_columns} columns")
@@ -415,7 +396,6 @@ __all__ = [
     "denoise_partial",
     "legendre_columns",
     "orthonormal_basis",
-    "project_out",
     "read_nuisance",
     "variance_removed",
 ]

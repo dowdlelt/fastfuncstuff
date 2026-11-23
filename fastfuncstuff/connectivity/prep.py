@@ -165,8 +165,13 @@ class Cleaner:
         out_device: torch.device | None = None,
         chunk: int | None = None,
         verbose: bool = False,
+        keep_mean: bool = False,
     ) -> Tensor:
         """``(R, T)`` -> ``(R, n_kept)`` float32 residuals, rows streamed through ``device``.
+
+        ``keep_mean`` puts each row's original mean (over the kept TRs) back, for a
+        cleaned series that still shares an axis with its source (the carpet, a
+        derived "denoised BOLD" layer). Correlation ignores it either way.
 
         ``data`` may live on the host (a voxel matrix too big for the card); it is
         moved ``chunk`` rows at a time and the result is gathered on ``out_device``
@@ -193,6 +198,7 @@ class Cleaner:
         out = torch.empty(n_rows, self.n_kept, dtype=torch.float32, device=out_device)
         bases = [b.to(device=device, dtype=torch.float32) for b in self.bases]
         cols_t = [torch.as_tensor(c, device=device) for c in self.run_cols]
+        cols_all = torch.as_tensor(np.flatnonzero(self.keep), device=device)
         masks = self.band_masks or [None] * len(bases)
         masks_t = [None if m is None else m.to(device) for m in masks]
         pieces = [(c, b, m) for c, b, m in zip(cols_t, bases, masks_t, strict=True) if c.numel()]
@@ -206,6 +212,7 @@ class Cleaner:
         for r0 in bar:
             block = data[r0 : r0 + chunk].to(device=device, dtype=torch.float32)
             parts = []
+            mean = block.index_select(1, cols_all).mean(1, keepdim=True) if keep_mean else None
             for cols, q, m in pieces:
                 y = block.index_select(1, cols)
                 if m is not None:
@@ -213,20 +220,50 @@ class Cleaner:
                 if q.shape[1]:
                     y = y - (y @ q) @ q.T
                 parts.append(y)
-            out[r0 : r0 + chunk] = torch.cat(parts, dim=1).to(out_device)
+            res = torch.cat(parts, dim=1)
+            if mean is not None:
+                res = res - res.mean(1, keepdim=True) + mean
+            out[r0 : r0 + chunk] = res.to(out_device)
         return out
 
 
-def _rank_safe_basis(cols: list[np.ndarray], rows: np.ndarray) -> Tensor:
-    """Orthonormal float64 basis of ``cols`` on ``rows``, columns judged on shape not units."""
-    from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+#: Singular values below this fraction of the largest (after unit-norm columns) are
+#: rank deficiency, not regressors.
+RANK_TOL = 1e-6
 
+
+def nuisance_basis(columns: np.ndarray, *, tol: float = RANK_TOL) -> np.ndarray:
+    """Orthonormal float64 basis for a ``(T, k)`` nuisance matrix, rank-safe.
+
+    The toolbox's one answer to "what does this nuisance span": columns scaled to unit
+    norm first (a regressor in mm and one in radians are judged on shape, not units),
+    then an SVD whose small singular values are dropped -- collinear columns (an xmat's
+    own drift plus a requested polort, a stopband sine a polynomial already spans) are
+    rank deficiency, and QR would hand them back as directions of noise. Used by the
+    cleaner, ffs_fc, and every viewer path that residualises.
+    """
+    from fastfuncstuff import policy_linalg as plinalg
+
+    mat = np.asarray(columns, dtype=np.float64)
+    if mat.ndim != 2 or mat.shape[1] == 0:
+        raise ValueError("nuisance columns must be a non-empty (T, k) matrix")
+    norms = np.linalg.norm(mat, axis=0)
+    if not (norms > 1e-12).any():
+        raise ValueError("nuisance matrix is all zeros")
+    mat = mat[:, norms > 1e-12] / norms[norms > 1e-12]
+    u, s, _ = plinalg.svd(torch.as_tensor(mat), full_matrices=False)
+    keep = s > tol * s[0]
+    return np.ascontiguousarray(u[:, keep].numpy())
+
+
+def _rank_safe_basis(cols: list[np.ndarray], rows: np.ndarray) -> Tensor:
+    """:func:`nuisance_basis` of ``cols`` restricted to ``rows``, as a tensor."""
     if not cols:
         return torch.zeros(rows.size, 0, dtype=torch.float64)
     mat = np.concatenate(cols, axis=1)[rows]
-    norms = np.linalg.norm(mat, axis=0)
-    mat = mat[:, norms > 1e-12] / norms[norms > 1e-12]
-    return _orthonormal_basis(torch.as_tensor(mat, dtype=torch.float64))
+    if not (np.linalg.norm(mat, axis=0) > 1e-12).any():
+        return torch.zeros(rows.size, 0, dtype=torch.float64)
+    return torch.as_tensor(nuisance_basis(mat))
 
 
 def _filtered_basis(cols: list[np.ndarray], keep_bins: np.ndarray, n_t: int) -> Tensor:
@@ -236,8 +273,6 @@ def _filtered_basis(cols: list[np.ndarray], keep_bins: np.ndarray, n_t: int) -> 
     by comparing its filtered norm with its own unfiltered one -- normalising the
     remnant first would turn roundoff into a unit-length regressor of noise.
     """
-    from fastfuncstuff.stats.task_coupling import _orthonormal_basis
-
     if not cols:
         return torch.zeros(n_t, 0, dtype=torch.float64)
     mat = np.concatenate(cols, axis=1)
@@ -247,8 +282,7 @@ def _filtered_basis(cols: list[np.ndarray], keep_bins: np.ndarray, n_t: int) -> 
     alive = after > 1e-6 * np.maximum(before, 1e-300)
     if not alive.any():
         return torch.zeros(n_t, 0, dtype=torch.float64)
-    filt = filt[:, alive] / after[alive]
-    return _orthonormal_basis(torch.as_tensor(filt, dtype=torch.float64))
+    return torch.as_tensor(nuisance_basis(filt[:, alive]))
 
 
 def build_cleaner(
