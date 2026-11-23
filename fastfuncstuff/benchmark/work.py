@@ -92,6 +92,32 @@ def gpu_busy(device: str, min_free_gb: float = 6.0, util_pct: float = 20.0) -> s
     return None
 
 
+def _load_checks(previous: dict) -> dict:
+    """The checks registry, re-imported from disk between units.
+
+    A night's runner then picks up checks written (and committed) while it runs, and
+    their planned units join the queue. A broken edit mid-night keeps the last good set
+    rather than stopping the loop."""
+    import importlib
+    import sys
+
+    names = sorted(n for n in sys.modules if n.startswith(f"{__package__}.checks."))
+    try:
+        if names:
+            base = f"{__package__}.checks.base"
+            for n in [base] + [n for n in names if n != base]:
+                importlib.reload(sys.modules[n])
+            pkg = importlib.reload(sys.modules[f"{__package__}.checks"])
+        else:
+            pkg = importlib.import_module(f"{__package__}.checks")
+        return dict(pkg.CHECKS)
+    except Exception as e:
+        if not previous:
+            raise
+        print(f"    checks reload failed ({type(e).__name__}: {e}); keeping the last set")
+        return previous
+
+
 def run(
     wl,
     root: Path,
@@ -105,11 +131,12 @@ def run(
 ) -> int:
     import time
 
-    from .checks import CHECKS
     from .fetch import fetch, sha256
 
+    checks: dict = {}
     n_done = 0
     while n_done < max_units:
+        checks = _load_checks(checks)
         if until is not None and time.time() >= until:
             print("stop time reached; leaving the rest pending", flush=True)
             break
@@ -118,7 +145,7 @@ def run(
             print(f"GPU in use by someone else ({busy}); waiting {gpu_wait_s:.0f} s", flush=True)
             time.sleep(gpu_wait_s)
             continue
-        u = wl.claim_next(check=check)
+        u = wl.claim_next(check=check, known_checks=checks)
         if u is None:
             break
         key = json.loads(u["unit_key"])
@@ -133,7 +160,7 @@ def run(
                 "inputs",
                 {rel: sha256(p) for rel, p in paths.items()} | {"source": m["source"]["uri"]},
             )
-            res = CHECKS[u["check_name"]]().run(key, paths, work, device)
+            res = checks[u["check_name"]]().run(key, paths, work, device)
             for judge, vals in res.metrics.items():
                 wl.record_metrics(u["id"], judge, vals)
             for side, dev, sec, thr in res.timings:

@@ -125,9 +125,17 @@ class Worklist:
     # -- running -----------------------------------------------------------
 
     def claim_next(
-        self, check: str | None = None, dataset: str | None = None
+        self,
+        check: str | None = None,
+        dataset: str | None = None,
+        known_checks: Iterable[str] | None = None,
     ) -> sqlite3.Row | None:
-        """Atomically take the oldest pending unit (optionally of one check / dataset)."""
+        """Atomically take the next pending unit (optionally of one check / dataset).
+
+        Round-robin over (check, dataset): every pair's first pending unit goes before any
+        pair's second, so a night cut off at its stop time still covers every dataset and
+        check instead of finishing one and never reaching the rest. ``known_checks`` leaves
+        units of checks this runner cannot load (planned by newer code) pending."""
         where, args = ["status = 'pending'"], []
         if check:
             where.append("check_name = ?")
@@ -135,9 +143,18 @@ class Worklist:
         if dataset:
             where.append("dataset = ?")
             args.append(dataset)
+        if known_checks is not None:
+            names = list(known_checks)
+            where.append(f"check_name IN ({','.join('?' * len(names))})")
+            args += names
         with self._tx():
             row = self.db.execute(
-                f"SELECT * FROM units WHERE {' AND '.join(where)} ORDER BY id LIMIT 1", args
+                # Rank over all of a pair's units, not just the pending ones, or the rank
+                # restarts at 1 after every claim and the order collapses back to by-id.
+                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER"
+                " (PARTITION BY check_name, dataset ORDER BY id) AS rr FROM units)"
+                f" WHERE {' AND '.join(where)} ORDER BY rr, id LIMIT 1",
+                args,
             ).fetchone()
             if row is None:
                 return None

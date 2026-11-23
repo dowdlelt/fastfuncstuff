@@ -33,6 +33,20 @@ def test_add_is_idempotent_and_claims_in_order(tmp_path):
     assert {(r["status"], r["n"]) for r in wl.status()} == {("done", 1), ("pending", 2)}
 
 
+def test_claims_round_robin_over_check_and_dataset(tmp_path):
+    """A night cut off early must have touched every (check, dataset), not finished one."""
+    wl = Worklist(tmp_path / "w.sqlite")
+    wl.add_units("moco", "dsA", [({"sub": f"{i}"}, []) for i in range(3)])
+    wl.add_units("moco", "dsB", [({"sub": f"{i}"}, []) for i in range(2)])
+    wl.add_units("blipflip", "dsA", [({"sub": "0"}, [])])
+    order = [(u["check_name"], u["dataset"]) for u in iter(wl.claim_next, None)]
+    assert order[:3] == [("moco", "dsA"), ("moco", "dsB"), ("blipflip", "dsA")]
+    assert len(order) == 6
+    wl.add_units("newcheck", "dsA", [({"sub": "0"}, [])])
+    assert wl.claim_next(known_checks=["moco"]) is None  # unknown check stays pending
+    assert wl.claim_next(known_checks=["moco", "newcheck"])["check_name"] == "newcheck"
+
+
 def test_prune_removes_regenerable_only_and_keeps_rows(tmp_path):
     wl = Worklist(tmp_path / "w.sqlite")
     wl.add_units("moco", "dsX", [({"sub": "01"}, [])])
