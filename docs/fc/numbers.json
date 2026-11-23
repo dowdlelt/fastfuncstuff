@@ -1,0 +1,225 @@
+{
+  "prepare": {
+    "n_runs": 10,
+    "n_rois": 360,
+    "censor_threshold_mm": 0.3,
+    "censored_fraction_per_run": [
+      0.0,
+      0.002777777777777768,
+      0.0,
+      0.0,
+      0.0,
+      0.005555555555555536,
+      0.0,
+      0.0,
+      0.0,
+      0.005555555555555536
+    ],
+    "trs_per_run": 360
+  },
+  "netcorr": {
+    "data": "ds005165 rest run 1 (MNI 3 mm, 212 TRs)",
+    "n_rois": 345,
+    "ids_equal": true,
+    "cc_max_abs_diff_netcc": 0.00010000000000010001,
+    "cc_max_abs_diff_vs_full_precision": 0.00010028677227878063,
+    "fz_max_abs_diff": 0.00010000000000021103,
+    "wb_maps_max_abs_diff_all_rois": 6.899237632751465e-05,
+    "afni_pc_block_all_zero": true,
+    "time_3dnetcorr_s": 79.10759459203109,
+    "time_ffs_cpu_s": 3.367476986721158,
+    "time_ffs_gpu_s": 4.054356629028916
+  },
+  "tproject": {
+    "polort2": {
+      "max_abs_diff": 5.9138846535439216e-05,
+      "median_abs_diff": 2.486246240507306e-05,
+      "r": 0.9999999886025674,
+      "dof": 714,
+      "time_afni_s": 78.36621967190877,
+      "time_ffs_s": 8.38994998531416
+    },
+    "polort2_motion": {
+      "max_abs_diff": 0.00013874363106292087,
+      "median_abs_diff": 2.5055264723322646e-05,
+      "r": 0.9999999865269446,
+      "dof": 702,
+      "time_afni_s": 79.88550037611276,
+      "time_ffs_s": 8.534656882286072
+    },
+    "polort2_motion_passband": {
+      "max_abs_diff": 0.0006771188324175559,
+      "median_abs_diff": 3.387528287532304e-05,
+      "r": 0.9999999578516228,
+      "dof": 112,
+      "time_afni_s": 104.8514532991685,
+      "time_ffs_s": 8.687463335692883
+    },
+    "polort2_motion_highpass_censor": {
+      "max_abs_diff": 0.000149170823017436,
+      "median_abs_diff": 2.524851411964124e-05,
+      "r": 0.9999999858523652,
+      "dof": 644,
+      "time_afni_s": 76.7604876649566,
+      "time_ffs_s": 8.933220739942044
+    }
+  },
+  "tcorr1d": {
+    "n_seeds": 3,
+    "max_abs_diff": 1.430511474609375e-06,
+    "time_3dtcorr1d_s": 11.20381834404543,
+    "time_ffs_s": 8.052532079163939
+  },
+  "nilearn": {
+    "version": "0.14.0",
+    "max_abs_diff": 1.895841473092963e-05,
+    "median_abs_diff": 1.4774872211104073e-06,
+    "r": 0.9999999999048281,
+    "time_nilearn_s": 66.52517935913056,
+    "time_ffs_s": 8.683259070850909,
+    "n_rois": 360,
+    "n_runs": 2
+  },
+  "fft": {
+    "device": "cuda",
+    "n_voxels": 310004,
+    "n_timepoints": 3600,
+    "dof_regression": 620,
+    "dof_fft": 620,
+    "relative_residual_difference": 3.844541424768977e-05,
+    "time_regression_s": 3.96898571588099,
+    "time_fft_s": 3.926255166064948
+  },
+  "edge": {
+    "edge_ts_shape": [
+      64620,
+      720
+    ],
+    "edge_ts_gb": 0.1861056,
+    "mean_edge_equals_r_max_abs_diff": 1.6101257438450034e-07,
+    "rss2_share_top5pct_frames": 0.34405035711520404,
+    "r_top5pct_vs_full_r": 0.8133979978037059
+  },
+  "xval": {
+    "drift": {
+      "dof": 3560,
+      "n_kept": 3600,
+      "loro_mean": 0.8393370890778584,
+      "loro_min": 0.752484,
+      "loro_max": 0.874338,
+      "shrink_cv": {
+        "best": 0.06,
+        "heldout_loglik": 29.38084272166169,
+        "lw_dof": {
+          "shrinkage": 0.0030235492858273843,
+          "heldout_loglik": 9.795034575189387
+        },
+        "lw_tr": {
+          "shrinkage": 0.0029899542937626357,
+          "heldout_loglik": 9.761119213112496
+        }
+      },
+      "time_s": 28.903807220980525
+    },
+    "drift+motion": {
+      "dof": 3500,
+      "n_kept": 3600,
+      "loro_mean": 0.8701241519784993,
+      "loro_min": 0.831983,
+      "loro_max": 0.906464,
+      "shrink_cv": {
+        "best": 0.05,
+        "heldout_loglik": 29.937211948178764,
+        "lw_dof": {
+          "shrinkage": 0.0032070424655334007,
+          "heldout_loglik": 19.584707020171084
+        },
+        "lw_tr": {
+          "shrinkage": 0.0031179579526019172,
+          "heldout_loglik": 19.528606905872383
+        }
+      },
+      "time_s": 30.429954510647804
+    },
+    "drift+motion+highpass": {
+      "dof": 3440,
+      "n_kept": 3600,
+      "loro_mean": 0.8796833783070002,
+      "loro_min": 0.837395,
+      "loro_max": 0.913884,
+      "shrink_cv": {
+        "best": 0.05,
+        "heldout_loglik": 25.98149643905441,
+        "lw_dof": {
+          "shrinkage": 0.0032591404738519904,
+          "heldout_loglik": 17.653840450766356
+        },
+        "lw_tr": {
+          "shrinkage": 0.003114289786125235,
+          "heldout_loglik": 17.578001404287395
+        }
+      },
+      "time_s": 29.76811281265691
+    },
+    "drift+motion+bandpass": {
+      "dof": 550,
+      "n_kept": 3600,
+      "loro_mean": 0.83204318372354,
+      "loro_min": 0.760781,
+      "loro_max": 0.877427,
+      "shrink_cv": {
+        "best": 0.07,
+        "heldout_loglik": 104.9793262631169,
+        "lw_dof": {
+          "shrinkage": 0.014969154498287573,
+          "heldout_loglik": 35.560355609829365
+        },
+        "lw_tr": {
+          "shrinkage": 0.0022869541594606013,
+          "heldout_loglik": -277.53108605159326
+        }
+      },
+      "time_s": 31.311613075900823
+    },
+    "drift+motion+highpass+censor": {
+      "dof": 3435,
+      "n_kept": 3595,
+      "loro_mean": 0.8794124737218689,
+      "loro_min": 0.836222,
+      "loro_max": 0.913244,
+      "shrink_cv": {
+        "best": 0.05,
+        "heldout_loglik": 25.901571752784786,
+        "lw_dof": {
+          "shrinkage": 0.003268067278214923,
+          "heldout_loglik": 17.561091094042332
+        },
+        "lw_tr": {
+          "shrinkage": 0.0031226178305057742,
+          "heldout_loglik": 17.484860771998026
+        }
+      },
+      "time_s": 31.27800120599568
+    }
+  },
+  "loro_speed": {
+    "n_runs": 10,
+    "time_one_pass_s": 31.017039267811924,
+    "time_tool_per_fold_s": 323.0044848541729,
+    "speedup_vs_tool_loop": 10.413775540122952,
+    "in_memory_sufficient_stats_s": 0.03679572264663875,
+    "in_memory_reconcatenate_s": 0.08716737576760351,
+    "afni_train_fold_s_mean": 419.97100851824507,
+    "afni_train_folds_extrapolated_s": 4199.710085182451,
+    "afni_note": "train folds only (2 measured, scaled to 10); held-out runs not counted"
+  },
+  "speed": {
+    "matrix_cpu_s": 28.81574563868344,
+    "matrix_cuda_s": 27.412692852783948,
+    "matrix+maps_cpu_s": 48.564982342068106,
+    "matrix+maps_cuda_s": 42.958282303996384,
+    "matrix+maps+edges_cpu_s": 50.36885245190933,
+    "matrix+maps+edges_cuda_s": 44.30454840278253,
+    "load_only_s": 24.838317929767072
+  }
+}
