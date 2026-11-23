@@ -440,7 +440,10 @@ class ColourSource:
             self.chans.raw(t, self.window), self.spec.signal, eps=self.chans.eps, mean=mean
         )
         if self.blur > 0:
-            chans = blur_in_mask(chans, self.brain, self.blur, self.chans.affine)
+            from fastfuncstuff.stats.smooth3d import blur_in_mask
+
+            vox = np.sqrt((np.asarray(self.chans.affine, dtype=float)[:3, :3] ** 2).sum(0))
+            chans = blur_in_mask(chans, self.brain, self.blur, tuple(vox))
         mask = self.brain if self.masked else torch.ones_like(self.brain)
         out = torch.cat([chans, mask.to(chans.dtype)[None], self.anatomy[None]])
         self._frames.clear()
@@ -589,26 +592,6 @@ class ColourSource:
             else:
                 where += "; TE unknown, echoes taken as evenly spaced"
         return where
-
-
-def blur_in_mask(x: Tensor, mask: Tensor, fwhm_mm: float, affine: np.ndarray) -> Tensor:
-    """``(N, X, Y, Z)`` blurred inside ``mask``, normalised by the blurred mask.
-
-    Normalised so the edge of the brain is an average of brain, not of brain
-    and the zeros (or the noise) outside it -- otherwise every edge would
-    take on a colour of its own.
-    """
-    from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
-
-    vox = np.sqrt((np.asarray(affine, dtype=float)[:3, :3] ** 2).sum(0))
-    # Reflect padding needs a kernel narrower than the slab; cap it there.
-    sigma = tuple(
-        min(s, (n - 1) / 4.0)
-        for s, n in zip(fwhm_mm_to_sigma_vox(fwhm_mm, tuple(vox)), x.shape[1:], strict=True)
-    )
-    m = mask.to(x.dtype)
-    num = gaussian3d_batched(torch.cat([x * m, m[None]]), sigma)  # type: ignore[arg-type]
-    return torch.where(mask, num[:-1] / num[-1].clamp(min=1e-6), x)
 
 
 def lightness_from(ref: Tensor, region: Tensor) -> Tensor:
