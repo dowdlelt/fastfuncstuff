@@ -1,9 +1,9 @@
 """Benchmark runner: plan units into the worklist, then work through them one at a time.
 
-    python -m fastfuncstuff.benchmark.work -root R -manifests M -plan moco -datasets ds002603 -n 2
-    python -m fastfuncstuff.benchmark.work -root R -manifests M -run [-check moco] [-max_units 5]
-    python -m fastfuncstuff.benchmark.work -root R -status
-    python -m fastfuncstuff.benchmark.work -root R -results moco
+    python -m fastfuncstuff.benchmark.work -plan moco -datasets ds002603 -n 2
+    python -m fastfuncstuff.benchmark.work -run [-check moco] [-max_units 5]
+    python -m fastfuncstuff.benchmark.work -status
+    python -m fastfuncstuff.benchmark.work -results moco
 
 Each unit: fetch inputs (S3 into R/cache, local trees in place) -> reference -> ffs ->
 score -> record -> prune regenerable outputs and downloaded inputs. ``-keep`` skips pruning.
@@ -12,11 +12,11 @@ score -> record -> prune regenerable outputs and downloaded inputs. ``-keep`` sk
 from __future__ import annotations
 
 import json
-import os
 import sys
 import traceback
 from pathlib import Path
 
+from fastfuncstuff._paths import get_bench_root
 from fastfuncstuff.cli_help import FfsArgumentParser
 
 
@@ -109,10 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "-root",
         type=Path,
-        default=os.environ.get("FFS_BENCH_ROOT"),
-        help="Benchmark root (worklist.sqlite, cache/, units/).",
+        default=get_bench_root(),
+        help="Benchmark root (worklist.sqlite, cache/, units/). Default: FFS_BENCH_ROOT, "
+        "else bench/ beside FFS_BENCHMARK_DATA_DIR.",
     )
-    p.add_argument("-manifests", type=Path, help="Directory of census manifests.")
+    p.add_argument(
+        "-manifests", type=Path, help="Directory of census manifests (default ROOT/manifests)."
+    )
     act = p.add_mutually_exclusive_group(required=True)
     act.add_argument("-plan", metavar="CHECK", help="Add units of CHECK for -datasets.")
     act.add_argument("-run", action="store_true", help="Work through pending units.")
@@ -127,18 +130,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-keep", action="store_true", help="Do not prune regenerable outputs.")
     args = p.parse_args(argv)
     if args.root is None:
-        p.error("-root (or FFS_BENCH_ROOT) is required")
+        p.error("-root is required (or set FFS_BENCH_ROOT / FFS_BENCHMARK_DATA_DIR)")
+    if args.manifests is None:
+        args.manifests = args.root / "manifests"
 
     from .worklist import Worklist
 
     wl = Worklist(args.root / "worklist.sqlite")
     if args.plan:
-        if not args.manifests or not args.datasets:
-            p.error("-plan needs -manifests and -datasets")
+        if not args.datasets:
+            p.error("-plan needs -datasets")
         plan(wl, args.manifests, args.plan, args.datasets, args.n)
     elif args.run:
-        if not args.manifests:
-            p.error("-run needs -manifests")
         run(wl, args.root, args.manifests, args.check, args.max_units, args.device, args.keep)
     elif args.status:
         for r in wl.status():
