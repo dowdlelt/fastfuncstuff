@@ -40,11 +40,22 @@ def test_claims_round_robin_over_check_and_dataset(tmp_path):
     wl.add_units("moco", "dsB", [({"sub": f"{i}"}, []) for i in range(2)])
     wl.add_units("blipflip", "dsA", [({"sub": "0"}, [])])
     order = [(u["check_name"], u["dataset"]) for u in iter(wl.claim_next, None)]
-    assert order[:3] == [("moco", "dsA"), ("moco", "dsB"), ("blipflip", "dsA")]
+    assert order[:3] == [("moco", "dsA"), ("blipflip", "dsA"), ("moco", "dsB")]
     assert len(order) == 6
     wl.add_units("newcheck", "dsA", [({"sub": "0"}, [])])
     assert wl.claim_next(known_checks=["moco"]) is None  # unknown check stays pending
     assert wl.claim_next(known_checks=["moco", "newcheck"])["check_name"] == "newcheck"
+
+
+def test_new_check_first_unit_jumps_the_queue(tmp_path):
+    wl = Worklist(tmp_path / "w.sqlite")
+    for ds in ("dsA", "dsB", "dsC"):
+        wl.add_units("moco", ds, [({"sub": f"{i}"}, []) for i in range(2)])
+    wl.add_units("reml", "dsC", [({"sub": f"{i}"}, []) for i in range(2)])
+    first, second = wl.claim_next(), wl.claim_next()
+    assert first["check_name"] == "moco" and second["check_name"] == "reml"  # smoke unit
+    rest = [(u["check_name"], u["dataset"]) for u in iter(wl.claim_next, None)]
+    assert rest[:2] == [("moco", "dsB"), ("moco", "dsC")]  # then round-robin resumes
 
 
 def test_prune_removes_regenerable_only_and_keeps_rows(tmp_path):

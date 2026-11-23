@@ -151,9 +151,12 @@ class Worklist:
             row = self.db.execute(
                 # Rank over all of a pair's units, not just the pending ones, or the rank
                 # restarts at 1 after every claim and the order collapses back to by-id.
-                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER"
-                " (PARTITION BY check_name, dataset ORDER BY id) AS rr FROM units)"
-                f" WHERE {' AND '.join(where)} ORDER BY rr, id LIMIT 1",
+                # A check's very first unit goes ahead of everything: a newly added check
+                # is smoke-tested at the next unit boundary, not hours into the night.
+                "SELECT * FROM (SELECT *,"
+                " ROW_NUMBER() OVER (PARTITION BY check_name, dataset ORDER BY id) AS rr,"
+                " ROW_NUMBER() OVER (PARTITION BY check_name ORDER BY id) AS cr FROM units)"
+                f" WHERE {' AND '.join(where)} ORDER BY cr > 1, rr, id LIMIT 1",
                 args,
             ).fetchone()
             if row is None:
