@@ -10,11 +10,13 @@ from .base import Check, UnitResult
 from .blipflip import BlipflipCheck
 from .moco import MocoCheck
 from .physio import PhysioCheck
+from .qwarp import QwarpCheck
 from .reml import RemlCheck
 from .slicetime import SlicetimeCheck
 
 CHECKS: dict[str, type[Check]] = {
-    c.name: c for c in (MocoCheck, SlicetimeCheck, BlipflipCheck, RemlCheck, PhysioCheck)
+    c.name: c
+    for c in (MocoCheck, SlicetimeCheck, BlipflipCheck, RemlCheck, PhysioCheck, QwarpCheck)
 }
 
 __all__ = ["CHECKS", "Check", "UnitResult"]

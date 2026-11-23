@@ -1,0 +1,174 @@
+"""qwarp: ffs_qwarp against 3dQwarp, judged by transported manual labels (NIREP16).
+
+Unit: an ordered pair (source, base) from a labelled cohort, sampled in depth: many pairs
+of one dataset, because label agreement is a distribution. Frozen inputs: both brains and
+tracings resampled to 1 mm (wsinc5 / NN), and one 3dAllineate affine of source to base,
+shared by both nonlinear fits. Both tools get identical arguments.
+
+The labels are carried through each tool's warp by the same applier (3dNwarpApply, NN),
+so only the warp differs. Judges:
+- truth: mean Dice over the base's traced parcels, against the affine-only baseline.
+- deformation: share of voxels with Jacobian <= 0 (3dNwarpFuncs -bulk) for each warp.
+- reference: correlation of the two warped brains inside the base mask.
+
+The pairwise design follows ffs_tunewarp's cohort judge (wiki: tuning registration on
+anatomical labels); NIREP: Christensen et al. 2006, LNCS 4057.
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+
+from .base import Check, UnitResult, _stable_rank, afni_version, ffs_version, timed
+
+DXYZ = "1"
+QWARP_ARGS = ["-minpatch", "9", "-blur", "0", "3"]
+
+
+def _dice_per_label(a: np.ndarray, b: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    out = []
+    for lab in labels:
+        x, y = a == lab, b == lab
+        s = x.sum() + y.sum()
+        out.append(2.0 * (x & y).sum() / s if s else np.nan)
+    return np.asarray(out)
+
+
+class QwarpCheck(Check):
+    name = "qwarp"
+    description = "Nonlinear warp: ffs_qwarp vs 3dQwarp, Dice of transported manual labels"
+    needs = [["@ds:labels_cohort"]]
+    sampling = "depth"
+    reference = "AFNI 3dQwarp"
+    timeout_s = 3 * 3600.0  # 3dQwarp at minpatch 9 on a 1 mm brain is tens of minutes
+
+    def plan(self, manifest, index, n):
+        """``n`` ordered pairs, spread so sources and bases repeat as little as possible."""
+        cohort = manifest.get("cohort") or []
+        ds = manifest["dataset_id"]
+        pairs = [(s, b) for s in cohort for b in cohort if s["id"] != b["id"]]
+        pairs.sort(key=lambda p: _stable_rank(ds, p[0]["id"], p[1]["id"]))
+        picked, used = [], set()
+        for s, b in pairs:  # first pass: no subject twice
+            if len(picked) < n and s["id"] not in used and b["id"] not in used:
+                picked.append((s, b))
+                used |= {s["id"], b["id"]}
+        for p in pairs:
+            if len(picked) < n and p not in picked:
+                picked.append(p)
+        return [
+            ({"acq": manifest.get("cohort_acq", "T1w"), "src": s["id"], "base": b["id"]},
+             [s["image"], s["labels"], b["image"], b["labels"]])
+            for s, b in picked
+        ]  # fmt: skip
+
+    def run(self, key, inputs, work, device):
+        import nibabel as nib
+
+        src_img, src_lab, base_img, base_lab = (inputs[r] for r in list(inputs)[:4])
+        work.mkdir(parents=True, exist_ok=True)
+        log = work / "commands.log"
+        prep = work / "prep"
+        prep.mkdir(exist_ok=True)
+
+        def resample(src, out, mode):
+            timed(["3dresample", "-overwrite", "-dxyz", DXYZ, DXYZ, DXYZ, "-rmode", mode,
+                   "-input", str(src), "-prefix", str(out)], work, log)  # fmt: skip
+
+        S, SL = prep / "src.nii.gz", prep / "src_lab.nii.gz"
+        B, BL = prep / "base.nii.gz", prep / "base_lab.nii.gz"
+        resample(src_img, S, "Cu")
+        resample(src_lab, SL, "NN")
+        resample(base_img, B, "Cu")
+        resample(base_lab, BL, "NN")
+        SA, SLA, aff = prep / "src_al.nii.gz", prep / "src_lab_al.nii.gz", prep / "src_al.aff12.1D"
+        timed(
+            ["3dAllineate", "-overwrite", "-base", str(B), "-source", str(S), "-prefix", str(SA),
+             "-1Dmatrix_save", str(aff), "-cost", "ls", "-twopass", "-final", "wsinc5"],
+            work, log, timeout_s=1800,
+        )  # fmt: skip
+        timed(
+            ["3dAllineate", "-overwrite", "-master", str(B), "-source", str(SL),
+             "-1Dmatrix_apply", str(aff), "-final", "NN", "-prefix", str(SLA)],
+            work, log,
+        )  # fmt: skip
+
+        res = UnitResult()
+        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        sides = {"ref": work / "ref", "ffs": work / "ffs"}
+        for d in sides.values():
+            d.mkdir(exist_ok=True)
+        t = timed(
+            ["3dQwarp", "-overwrite", "-base", str(B), "-source", str(SA),
+             "-prefix", str(sides["ref"] / "qw.nii.gz"), *QWARP_ARGS],
+            work, log, timeout_s=self.timeout_s,
+        )  # fmt: skip
+        res.timings.append(("ref", "cpu", t, threads))
+        t = timed(
+            ["ffs_qwarp", "-base", str(B), "-source", str(SA),
+             "-prefix", str(sides["ffs"] / "qw"), *QWARP_ARGS, "-device", device],
+            work, log, timeout_s=self.timeout_s,
+        )  # fmt: skip
+        res.timings.append(("ffs", device.split(",")[0], t, None))
+
+        def load(p):
+            return np.asarray(nib.Nifti1Image.from_filename(str(p)).dataobj)
+
+        base_lab_v = load(BL).astype(np.int32)
+        labels = np.unique(base_lab_v)
+        labels = labels[labels != 0]
+        truth: dict[str, float | None] = {}
+        d_aff = _dice_per_label(load(SLA).astype(np.int32), base_lab_v, labels)
+        truth["dice_mean_affine"] = float(np.nanmean(d_aff))
+        warped = {}
+        for side, d in sides.items():
+            warp = next((w for w in sorted(d.glob("qw_WARP*.nii*")) if "INV" not in w.name), None)
+            if warp is None:
+                raise FileNotFoundError(f"no qw_WARP in {d}")
+            lab_w = d / "lab_warped.nii.gz"
+            timed(
+                ["3dNwarpApply", "-overwrite", "-nwarp", str(warp), "-source", str(SLA),
+                 "-master", str(B), "-ainterp", "NN", "-prefix", str(lab_w)],
+                work, log,
+            )  # fmt: skip
+            dl = _dice_per_label(load(lab_w).astype(np.int32), base_lab_v, labels)
+            truth[f"dice_mean_{side}"] = float(np.nanmean(dl))
+            truth[f"dice_median_{side}"] = float(np.nanmedian(dl))
+            truth[f"dice_min_{side}"] = float(np.nanmin(dl))
+            jac = d / "jac.nii.gz"
+            timed(["3dNwarpFuncs", "-overwrite", "-nwarp", str(warp), "-bulk",
+                   "-prefix", str(jac)], work, log)  # fmt: skip
+            j = load(jac).astype(np.float64)
+            inside = load(B) > 0
+            truth[f"fold_frac_{side}"] = float((j[inside] <= 0).mean())
+            warped[side] = next(iter(sorted(d.glob("qw.nii*"))))
+        truth["dice_gain_ffs_minus_ref"] = truth["dice_mean_ffs"] - truth["dice_mean_ref"]
+        truth["n_labels"] = len(labels)
+        res.metrics["truth"] = truth
+
+        mask = load(B) > 0
+        a, b = (load(warped[s]).astype(np.float64)[mask] for s in ("ref", "ffs"))
+        a, b = a - a.mean(), b - b.mean()
+        res.metrics["reference"] = {
+            "warped_r": float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum())),
+            "dice_mean_ref": truth["dice_mean_ref"],
+            "dice_mean_ffs": truth["dice_mean_ffs"],
+        }
+
+        for d in sides.values():
+            res.artifacts += [(p, "regenerable") for p in sorted(d.glob("qw*"))]
+            res.artifacts += [(d / "jac.nii.gz", "regenerable"), (d / "lab_warped.nii.gz", "keep")]
+        res.artifacts += [(p, "regenerable") for p in (S, SL, B, SA)]
+        res.artifacts += [(BL, "keep"), (SLA, "keep"), (aff, "keep"), (log, "keep")]
+        res.provenance["ref"] = {"tool": "3dQwarp", "version": afni_version("3dQwarp"),
+                                 "args": QWARP_ARGS}  # fmt: skip
+        res.provenance["ffs"] = {"tool": "ffs_qwarp", **ffs_version(), "args": QWARP_ARGS,
+                                 "device": device}  # fmt: skip
+        res.provenance["inputs_prep"] = {
+            "resample": f"3dresample -dxyz {DXYZ} (Cu image, NN labels)",
+            "affine": "3dAllineate -cost ls -twopass -final wsinc5, shared by both",
+            "label_transport": "3dNwarpApply -ainterp NN for both warps",
+        }
+        return res
