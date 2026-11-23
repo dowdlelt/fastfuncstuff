@@ -184,6 +184,7 @@ def test_cli_single_flag_allineate_opts_parses():
     )
     assert args.allineate_opts == "-slow"
     assert args.dof == 9  # the shell keeps the template's shape unless asked
+    assert args.margin == 0.0  # AFNI's shell unless the user turns the knob
 
 
 def test_widen_keep_moves_the_inner_edge_by_the_margin():

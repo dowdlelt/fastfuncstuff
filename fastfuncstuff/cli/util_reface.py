@@ -134,12 +134,13 @@ def parse_args(
     ref.add_argument(
         "-margin",
         type=float,
-        default=3.0,
+        default=0.0,
         metavar="MM",
-        help="Keep the subject's own voxels for the first MM of the shell's replaced "
-        "region next to the brain, so the shell stays at least MM further from the "
-        "brain than the fit alone puts it. Costs a thin band of the subject's inner "
-        "skull left in place (not face). 0 = AFNI's shell exactly",
+        help="Safety knob for when the shell sits too close to the brain on some "
+        "head: keep the subject's own voxels for the first MM of the shell's "
+        "replaced region next to the brain, moving the shell's inner edge MM "
+        "further out (e.g. 3). Leaves a thin band of the subject's inner skull "
+        "in place, not face. 0 = AFNI's shell",
     )
     option_string_value(
         al.add_argument(
