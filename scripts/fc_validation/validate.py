@@ -19,6 +19,9 @@ Stages:
                tool call) vs 3dTproject + 3dNetCorr per fold
   speed        ffs_fc CPU vs GPU on the 10-run Glasser problem, plus the read alone
   edge         edge-series identities and RSS on real data
+  efc          edge communities vs the Faskowitz et al. (2020) MATLAB reference on its
+               example data (needs MATLAB and $EFC_DEMO); timing and a figure on
+               TASKFORCE Glasser 360
   figures      docs figures from the saved outputs
 
 Reference runs are slow and need not be repeated: netcorr, tproject, tcorr1d,
@@ -549,6 +552,68 @@ def stage_edge(work: Path) -> None:
     })  # fmt: skip
 
 
+EFC_DEMO = Path(os.environ.get("EFC_DEMO", Path.home() / "local_code/edge-centric_demo"))
+
+
+def stage_efc(work: Path) -> None:
+    import scipy.io as sio
+    import torch
+    from sklearn.metrics import adjusted_rand_score as ari
+
+    from fastfuncstuff.connectivity.edge import EdgeCommunities, edge_communities, zscore_rows
+
+    d = work / "efc"
+    d.mkdir(exist_ok=True)
+    ref_mat = d / "reference.mat"
+    script = Path(__file__).with_name("efc_reference.m")
+    run(["matlab", "-batch",
+         f"demo='{EFC_DEMO}'; out_mat='{ref_mat}'; run('{script}')"])  # fmt: skip
+    ref = sio.loadmat(ref_mat)
+    ts = sio.loadmat(EFC_DEMO / "example_data.mat")["ts"].astype(np.float64)
+    n_t, n = ts.shape
+    iu, ju = np.triu_indices(n, 1)
+    pos = {(a, b): e for e, (a, b) in enumerate(zip(iu, ju, strict=True))}
+    to_ours = np.array([pos[(a - 1, b - 1)] for a, b in zip(ref["u"].ravel(), ref["v"].ravel(),
+                                                            strict=True)])  # fmt: skip
+    ci = np.zeros_like(ref["CI"])
+    ci[to_ours] = ref["CI"]  # MATLAB's column-major edge order -> triu_indices order
+    best = ci[:, 5]
+    scale = ((n_t - 1) / n_t) ** 2  # MATLAB zscore (T-1): every point x (T-1)/T
+    out = {
+        "data": f"edge-centric_demo example ({n} ROIs, {n_t} TRs), k = 10",
+        "matlab_inertia_single": ref["SUMD"].ravel()[:5].tolist(),
+        "matlab_inertia_best_of_10": float(ref["SUMD"].ravel()[5]),
+        "matlab_single_vs_best_ari": [float(ari(ci[:, s], best)) for s in range(5)],
+        "matlab_time_single_s": float(ref["t_single"].item()),
+        "matlab_time_best_of_10_s": float(ref["t_rep"].item()),
+    }
+    devices = ["cpu"] + (["cuda"] if gpu_free() else [])
+    for dev in devices:
+        z = zscore_rows(torch.as_tensor(ts.T).to(dev))
+        t0 = time.perf_counter()
+        com = edge_communities(z, 10)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        out[f"ffs_{dev}_time_best_of_10_s"] = time.perf_counter() - t0
+        out[f"ffs_{dev}_inertia_matlab_scale"] = com.inertia * scale
+        out[f"ffs_{dev}_vs_matlab_best_ari"] = float(ari(com.labels, best))
+    mine = EdgeCommunities(labels=best - 1, k=10, inertia=0.0)
+    out["entropy_max_abs_diff"] = float(np.abs(mine.node_profile(n)[1] - ref["enorm"].ravel()).max())
+    out["profilesim_max_abs_diff"] = float(np.abs(mine.profile_similarity(n) - ref["S"]).max())
+    # real data: the whole ffs_fc job with -efc on two TASKFORCE runs, and the figure
+    runs = TF_RUNS[:2]
+    base = ["-input", *[tf_run(*r) for r in runs], "-atlas", work / "glasser.nii.gz", "-mask",
+            work / "brainmask.nii.gz", *_ffs_ortvec_run(runs), "-passband", "0.01", "0",
+            "-efc", "10"]  # fmt: skip
+    for dev in devices:
+        out[f"taskforce_job_{dev}_s"] = ffs_fc([*base, "-prefix", d / f"g360_{dev}"], device=dev)
+    ffs_fc([*base, "-plot", "-prefix", d / "g360_plot"], device=devices[-1])
+    shutil.copy(d / "g360_plot_efc.png", DOCS / "efc.png")
+    meta = json.loads((d / "g360_plot.json").read_text())
+    out["taskforce"] = {"n_rois": 360, "n_trs": 720, **meta["efc"]}
+    save_numbers("efc", out)
+
+
 def stage_figures(work: Path) -> None:
     """Figures for the docs page."""
     import matplotlib
@@ -616,7 +681,7 @@ STAGES = {
     "prepare": stage_prepare, "netcorr": stage_netcorr, "tproject": stage_tproject,
     "tcorr1d": stage_tcorr1d, "nilearn": stage_nilearn, "fft": stage_fft, "xval": stage_xval,
     "loro_speed": stage_loro_speed, "speed": stage_speed, "edge": stage_edge,
-    "figures": stage_figures,
+    "efc": stage_efc, "figures": stage_figures,
 }  # fmt: skip
 
 

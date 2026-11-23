@@ -221,5 +221,55 @@
     "matrix+maps+edges_cpu_s": 50.36885245190933,
     "matrix+maps+edges_cuda_s": 44.30454840278253,
     "load_only_s": 24.838317929767072
+  },
+  "efc": {
+    "data": "edge-centric_demo example (200 ROIs, 1200 TRs), k = 10",
+    "matlab_inertia_single": [
+      21831867.407251548,
+      21830864.609798368,
+      21830921.106881704,
+      21854516.053091586,
+      21845769.74983423
+    ],
+    "matlab_inertia_best_of_10": 21830723.31591665,
+    "matlab_single_vs_best_ari": [
+      0.8696334811326145,
+      0.6622357588202558,
+      0.6640777751153636,
+      0.6473964576676747,
+      0.6482793052355275
+    ],
+    "matlab_time_single_s": 5.4526851999999995,
+    "matlab_time_best_of_10_s": 59.004853,
+    "ffs_cpu_time_best_of_10_s": 11.767005141824484,
+    "ffs_cpu_inertia_matlab_scale": 21830699.968840275,
+    "ffs_cpu_vs_matlab_best_ari": 0.988326246481079,
+    "ffs_cuda_time_best_of_10_s": 6.947697314899415,
+    "ffs_cuda_inertia_matlab_scale": 21830811.782251388,
+    "ffs_cuda_vs_matlab_best_ari": 0.9693387089273655,
+    "entropy_max_abs_diff": 3.3306690738754696e-16,
+    "profilesim_max_abs_diff": 1.1102230246251565e-16,
+    "taskforce_job_cpu_s": 33.84524455387145,
+    "taskforce_job_cuda_s": 20.877716498915106,
+    "taskforce": {
+      "n_rois": 360,
+      "n_trs": 720,
+      "k": 10,
+      "on": "ets",
+      "inertia": 39615804.0,
+      "edges_per_community": [
+        5169,
+        6664,
+        7696,
+        5313,
+        5112,
+        9742,
+        6385,
+        9600,
+        5423,
+        3516
+      ],
+      "mean_overlap": 0.6575561307393337
+    }
   }
 }

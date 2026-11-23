@@ -28,6 +28,7 @@ Every number on this page is in `docs/fc/numbers.json`.
 | Same cleaning as `3dTproject` | ≤ 7e-4 max, ~3e-5 median, same dof, with bandpass / motion / censoring | 3 |
 | Same as `3dTcorr1D` and nilearn | 1.4e-6 and 1.9e-5 | 3 |
 | FFT cleaning = regression | same dof, 4e-5 relative difference on 310k voxels × 3600 TRs | 3 |
+| Edge communities match the reference MATLAB code | same best inertia, ARI 0.97–0.99 vs MATLAB's best (its own reruns: 0.65–0.87); node measures to 1e-16; 5–8× faster | 3 |
 | Networks reproduce across runs | each 6-min run vs the other nine: r = 0.83–0.88 under every cleaning | 4 |
 | Shrinkage by held-out runs beats Ledoit–Wolf | CV picks ~0.05, LW ~0.003; CV wins the held-out likelihood | 4 |
 | Leave-one-run-out costs one pass | 31 s for 10 runs and 10 folds, vs 323 s as per-fold calls and ~70 min as per-fold AFNI | 5 |
@@ -217,6 +218,38 @@ RSS(t) = sqrt( Σ_{i<j} e_ij(t)² ) = sqrt( ((Σ_i z_i²)² - Σ_i z_i⁴) / 2 )
 needs no edge matrix, so `-edge` costs O(N·T) for any number of ROIs. `-edge_ts`
 writes all N(N - 1)/2 edge series (float32, streamed through a memory map).
 
+### Edge communities and edge functional connectivity
+
+`-efc K` groups the E = N(N - 1)/2 edges into K communities by k-means
+(Faskowitz et al., 2020). It clusters the edge series themselves, each edge a point
+in T dimensions with squared Euclidean distance, as the authors' reference code does
+(`kmeans(ets', k, 'distance', 'sqeuclidean')`). It uses k-means++ seeding, 10
+restarts, and keeps the lowest inertia. Each ROI's N - 1 edges then spread over the
+communities, which gives two node measures:
+
+```
+overlap_i  = -Σ_c p_ic log p_ic / log K      p_ic = fraction of i's edges in community c
+sim_ij     = fraction of positions where rows i and j of the community map agree
+```
+
+Overlap is 0 when all of an ROI's edges share one community and 1 when they spread
+evenly. These are the reference's `fcn_node_entropy` and `fcn_profilesim`.
+
+**eFC** is the cosine similarity of every pair of edge series, `eFC = Ê Êᵀ` with each
+row of Ê (E×T) scaled to unit length. It is E×E: 4.2 × 10⁹ entries (17 GB) for 360
+ROIs. Clustering eFC's rows instead of the series (`-efc_on efc`) needs only the
+distances between rows, and
+
+```
+‖eFC_k − eFC_l‖² = (ê_k − ê_l)ᵀ G (ê_k − ê_l),     G = ÊᵀÊ  (T×T) = V Λ Vᵀ
+```
+
+so the rows of `Ê V Λ^½` (E × rank, rank ≤ T) have exactly those distances, and
+k-means on them *is* k-means on eFC. The correlation distance (`-efc_on efc_corr`,
+MATLAB's `'correlation'`) is the same with `G − s sᵀ/E`, `s = Σ ê_k`, and the embedded
+rows normalised. At 360 ROIs and 720 TRs the embedding is 0.19 GB. `-efc_full` writes
+the whole matrix when the disk has room.
+
 ### Outputs
 
 | file | contents |
@@ -228,6 +261,8 @@ writes all N(N - 1)/2 edge series (float32, streamed through a memory map).
 | `PREFIX_ts.tsv` | cleaned ROI time series (`-ts_out`) |
 | `PREFIX_wb_r` / `_wb_z` | whole-brain maps, one sub-brick per ROI or seed |
 | `PREFIX_rss.tsv`, `PREFIX_edge_ts.npy`, `PREFIX_edges.tsv` | edge outputs |
+| `PREFIX_efc_edges.tsv`, `_efc_nodes.tsv`, `_efc.npz` | community per edge; overlap and community fractions per ROI; the ROI × ROI community map and profile similarity (`-efc`) |
+| `PREFIX_efc.npy`, `PREFIX_efc.png` | the full E × E eFC (`-efc_full`); the community map and overlap (`-efc -plot`) |
 | `PREFIX_loro.tsv` | reproducibility of each held-out run |
 | `PREFIX_shrink_cv.tsv` | held-out log-likelihood per shrinkage value, mean and per run (`-shrink cv`) |
 | `PREFIX_fc.png` | the matrix in clustered order with module lines, and the RSS trace (`-plot`) |
@@ -257,6 +292,25 @@ settings, then compares the outputs at full precision.
 | + highpass + censoring | same | same | 1.5e-4 | 2.5e-5 |
 | seed maps (`-seed_1D`, 3 seeds) | TASKFORCE, 1 run | `3dTcorr1D` | 1.4e-6 | — |
 | matrix, same cleaning | TASKFORCE, 2 runs, 360 ROIs | nilearn 0.14 `NiftiLabelsMasker` + `ConnectivityMeasure` | 1.9e-5 | 1.5e-6 |
+| node overlap (entropy), profile similarity | Faskowitz example, 200 ROIs, 1200 TRs, same labels | `fcn_node_entropy.m`, `fcn_profilesim.m` | 3e-16, 1e-16 | — |
+
+**Edge communities against the MATLAB reference.** k-means starts from random points,
+so two runs never give identical labels, even in MATLAB. The comparison is how closely
+partitions agree (adjusted Rand index, ARI) and the k-means objective (inertia), on the
+reference's own example data with k = 10:
+
+| run | inertia | ARI vs MATLAB best of 10 |
+|---|---|---|
+| MATLAB, best of 10 restarts | 21,830,723 | 1 |
+| MATLAB, single runs (the demo's call), 5 seeds | 21,830,865 – 21,854,516 | 0.65 – 0.87 |
+| `ffs_fc`, best of 10, CPU | 21,830,700 | 0.99 |
+| `ffs_fc`, best of 10, GPU | 21,830,812 | 0.97 |
+
+`ffs_fc` reaches the reference's best objective, and its partition is closer to
+MATLAB's best than MATLAB's own single runs are. Inertia is given on MATLAB's scale:
+its `zscore` divides by T - 1, which scales every point by the same factor and leaves
+the partition unchanged. A test pins the eFC-row embedding's distances to an
+explicitly formed eFC, for both distances.
 
 The residual dof agree with `3dTproject` in every variant (714, 702, 112, 644). Where
 `ffs_fc` refuses a partial correlation because ROIs ≥ dof, `3dNetCorr` writes an
@@ -350,6 +404,20 @@ All times are wall clock, from compressed NIfTI to files on disk, on the same ma
 | clean + matrix, + highpass + censor | same | same | 77 s | 8.9 s |
 | 3 seed maps | TASKFORCE, 1 run | `3dTcorr1D` | 11.2 s | 8.1 s |
 | clean + matrix | TASKFORCE, 2 runs, 360 ROIs | nilearn 0.14 | 66.5 s | 8.7 s |
+
+**Edge communities**
+
+| task | reference | `ffs_fc` |
+|---|---|---|
+| k = 10, best of 10, 200 ROIs × 1200 TRs (19,900 edges) | MATLAB `kmeans`: 59.0 s | 11.8 s CPU, 6.9 s GPU |
+| whole job with `-efc 10`: TASKFORCE, 2 runs, Glasser 360 (64,620 edges) | — | 33.8 s CPU, 20.9 s GPU |
+
+![Edge communities on TASKFORCE](fc/efc.png)
+
+*`ffs_fc -efc 10 -plot` on two TASKFORCE rest runs, Glasser 360. The community map
+is in the correlation matrix's clustered order, so it lines up with the matrix
+figure. The weak-signal ROIs at the end of that order have their own community and
+low overlap.*
 
 **Leave-one-run-out** (10 runs, 360 ROIs, highpass + motion)
 
