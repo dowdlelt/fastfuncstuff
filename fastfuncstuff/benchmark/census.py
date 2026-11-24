@@ -611,6 +611,9 @@ _CURATED_TEMPLATE: dict[str, Any] = {
     "source": "",  # where any 'set'/'sidecar' value comes from: required with either
     "sidecar": {},  # BIDS sidecar key -> value, overriding every run's sidecar at check time
     "sidecar_acquisitions": {},  # acquisition id -> {BIDS key: value}
+    # per-file rules for keys that differ within an acquisition (AP vs PA fmaps):
+    # [{"match": {"dir": "AP", "suffix": "epi"}, "set": {"PhaseEncodingDirection": "j-"}}]
+    "sidecar_files": [],
     "noise_volumes": None,  # trailing noise volumes per run (int); None = detect from data
     "noise_volumes_acquisitions": {},  # acquisition id -> int
     # acquisition id -> how the stimulus is modelled when the events file cannot say it
@@ -648,7 +651,7 @@ def write_manifest(manifest: dict[str, Any], out_dir: Path) -> Path:
 def apply_curation(manifest: dict[str, Any]) -> dict[str, Any]:
     """The manifest as checks see it: exclusions dropped, curated values set."""
     cur = {**_CURATED_TEMPLATE, **(manifest.get("curated") or {})}
-    if (cur["set"] or cur["set_acquisitions"] or cur["sidecar"] or cur["sidecar_acquisitions"]) and not cur["source"]:  # fmt: skip
+    if (cur["set"] or cur["set_acquisitions"] or cur["sidecar"] or cur["sidecar_acquisitions"] or cur["sidecar_files"]) and not cur["source"]:  # fmt: skip
         raise ValueError(
             f"{manifest['dataset_id']}: curated 'set'/'sidecar' values need a 'source'"
         )
@@ -677,6 +680,7 @@ def unit_curation(manifest: dict[str, Any], acq: str | None) -> dict[str, Any]:
         },
         "noise_volumes": None if nv is None else int(nv),
         "stimulus_model": (cur["stimulus_models"] or {}).get(acq),
+        "sidecar_files": list(cur["sidecar_files"] or []),
         "source": cur["source"],
     }
 

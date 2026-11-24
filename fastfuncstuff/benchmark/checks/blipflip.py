@@ -133,6 +133,8 @@ class BlipflipCheck(Check):
             meta = _meta(
                 [inputs[r] for r in inputs if r.endswith(".json") and self._applies(r, rel)]
             )
+            meta.update(self.curation.get("sidecar") or {})
+            meta.update(self.file_overrides(rel))
             pe = meta.get("PhaseEncodingDirection")
             if not pe:
                 raise ValueError(f"no PhaseEncodingDirection for {rel}")

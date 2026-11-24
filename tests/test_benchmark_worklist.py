@@ -201,7 +201,7 @@ def test_unit_curation_and_read_meta_overrides(tmp_path):
         "noise_volumes": 3, "noise_volumes_acquisitions": {"task-b_bold": 0}}}  # fmt: skip
     a, b = unit_curation(m, "task-a_bold"), unit_curation(m, "task-b_bold")
     assert a == {"sidecar": {"RepetitionTime": 1.184}, "noise_volumes": 3,
-                 "stimulus_model": None, "source": "dataset owner"}  # fmt: skip
+                 "stimulus_model": None, "sidecar_files": [], "source": "dataset owner"}  # fmt: skip
     assert b["noise_volumes"] == 0
     side = tmp_path / "run_bold.json"
     side.write_text(json.dumps({"RepetitionTime": 0.037, "EchoTime": 0.02}))
@@ -229,3 +229,19 @@ def test_sinusoid_regressors_phase_free():
     y = np.cos(0.7) * shifted["sin"] + np.sin(0.7) * shifted["cos"]
     resid = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
     assert np.abs(resid).max() < 1e-9
+
+
+def test_file_overrides_match_entities():
+    """AP and PA fmaps of one acquisition get different PhaseEncodingDirection."""
+    from fastfuncstuff.benchmark.checks.base import Check
+
+    chk = Check()
+    chk.curation = {"sidecar_files": [
+        {"match": {"dir": "AP", "suffix": "epi"}, "set": {"PhaseEncodingDirection": "j-"}},
+        {"match": {"dir": "PA", "suffix": "epi"}, "set": {"PhaseEncodingDirection": "j"}},
+    ]}  # fmt: skip
+    ap = "sub-01/ses-02/fmap/sub-01_ses-02_dir-AP_run-01_part-mag_epi.nii.gz"
+    pa = ap.replace("dir-AP", "dir-PA")
+    assert chk.file_overrides(ap) == {"PhaseEncodingDirection": "j-"}
+    assert chk.file_overrides(pa) == {"PhaseEncodingDirection": "j"}
+    assert chk.file_overrides("sub-01/func/sub-01_task-x_bold.nii.gz") == {}

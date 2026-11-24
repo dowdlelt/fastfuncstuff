@@ -188,6 +188,19 @@ class Check:
         meta.update(self.curation.get("sidecar") or {})
         return meta
 
+    def file_overrides(self, rel: str) -> dict:
+        """Curated ``sidecar_files`` rules matching this image's BIDS entities (``dir-AP``)
+        or suffix; later rules win."""
+        name = Path(rel).name.split(".")[0]
+        parts = name.split("_")
+        ents = dict(p.split("-", 1) for p in parts[:-1] if "-" in p)
+        ents["suffix"] = parts[-1]
+        out: dict = {}
+        for rule in self.curation.get("sidecar_files") or []:
+            if all(ents.get(k) == str(v) for k, v in (rule.get("match") or {}).items()):
+                out.update(rule.get("set") or {})
+        return out
+
     def trim_noise(
         self, image: Path, work: Path, log: Path, res: UnitResult, also: tuple[Path, ...] = ()
     ) -> tuple[Path, tuple[Path, ...]]:
