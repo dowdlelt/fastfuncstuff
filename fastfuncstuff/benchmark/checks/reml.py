@@ -219,11 +219,11 @@ class RemlCheck(Check):
             stim = _stim_args(conds, tdir)
         xmat = work / "X.xmat.1D"
         timed(
-            ["3dDeconvolve", "-overwrite", "-input", str(scaled), "-polort", "A",
+            ["3dDeconvolve", "-overwrite",
              # the sidecar TR (curated if wrong), not the header's: MassedEvents' header
-             # carries the 3D shot TR too
+             # carries the 3D shot TR too. 3dDeconvolve refuses -force_TR after -input.
              *(["-force_TR", f"{float(tr):g}"] if isinstance(tr, (int, float)) else []),
-             *stim, "-x1D", str(xmat), "-x1D_stop"],
+             "-input", str(scaled), "-polort", "A", *stim, "-x1D", str(xmat), "-x1D_stop"],
             work, log, timeout_s=600,
         )  # fmt: skip
 
