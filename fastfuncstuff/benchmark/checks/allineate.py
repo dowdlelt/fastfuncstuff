@@ -12,8 +12,9 @@ units, not a per-unit pass.
 Judge (yardstick): each tool's aligned mean scored against the stripped T1 by one
 program (3dAllineate -allcostX -nocmass, no source automask: with it ls is 0.52 for an
 image against itself). Histogram costs (hel, nmi, mi) are the comparison, since neither
-tool optimises them; AFNI's allcostX lpc/lpa are recorded raw (they print +24 for an
-identical pair, so read them only as a ranking). Lower is better for all of them.
+tool optimises them; AFNI's allcostX lpc/lpa/ls are recorded too (lpc reads normally on
+real pairs, -0.54 for 3dAllineate's fit on the first unit, but +24 for an image against
+itself, so not for self-pairs). Lower is better except mi (AFNI prints it unsigned).
 """
 
 from __future__ import annotations
