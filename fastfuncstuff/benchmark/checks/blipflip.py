@@ -149,6 +149,11 @@ class BlipflipCheck(Check):
         ro_note = (
             "sidecar" if readout else "missing: 0.05 s assumed (Hz scale arbitrary, same for both)"
         )
+        if readout and not 0.01 <= readout <= 0.2:
+            # topup refuses outside 0.01-0.2 s (ds001499 sidecars say 0.00065 s); field r and
+            # up/down consistency do not depend on the scale, only the Hz numbers do
+            ro_note = f"implausible sidecar {readout:g} s: 0.05 s assumed (Hz scale arbitrary)"
+            readout = None
         readout = readout or 0.05
         up, down = work / "up.nii.gz", work / "down.nii.gz"
         for p, v in ((up, vols[0]), (down, vols[1])):
