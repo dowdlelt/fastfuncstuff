@@ -8,7 +8,8 @@ Scored as in docs/physio.md, *Cardiac detection, against recordings*: the cardia
 ffs evaluates at every slice's acquisition time (slibase ``card.c1/s1``) against the
 RETROICOR phase of the recorded pulse at the same times. Phase-locking value (PLV)
 = |mean exp(i(phi_ffs - phi_rec))|. **right** = found and PLV > 0.5, **wrong** = found
-and not locked, otherwise not found. Respiration is scored the same way (no verdict).
+and not locked, **unscored** = the recording gave no PLV (too few beats), otherwise not
+found. Respiration is scored the same way (no verdict).
 """
 
 from __future__ import annotations
@@ -172,7 +173,8 @@ class PhysioCheck(Check):
             m["card_rate_abs_err_per_min"] = abs(float(hr_ffs) - m["card_rate_rec_per_min"])
         p = m.get("card_plv")
         m["card_right"] = float(found and p is not None and p > PLV_RIGHT)
-        m["card_wrong"] = float(found and (p is None or p <= PLV_RIGHT))
+        m["card_wrong"] = float(found and p is not None and p <= PLV_RIGHT)
+        m["card_unscored"] = float(p is None)  # a recording we cannot read is not an ffs miss
         res.metrics["truth"] = m
 
         for f in sorted((work / "ffs").glob("run.*")):
