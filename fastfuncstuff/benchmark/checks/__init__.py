@@ -9,10 +9,13 @@ from __future__ import annotations
 from .allineate import AllineateCheck
 from .base import Check, UnitResult
 from .blipflip import BlipflipCheck
+from .fc import FcCheck
 from .moco import MocoCheck
+from .nordic import NordicCheck
 from .physio import PhysioCheck
 from .qwarp import QwarpCheck
 from .reml import RemlCheck
+from .segment import SegmentCheck
 from .slicetime import SlicetimeCheck
 
 CHECKS: dict[str, type[Check]] = {
@@ -25,6 +28,9 @@ CHECKS: dict[str, type[Check]] = {
         PhysioCheck,
         QwarpCheck,
         AllineateCheck,
+        NordicCheck,
+        FcCheck,
+        SegmentCheck,
     )
 }
 
