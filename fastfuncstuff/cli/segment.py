@@ -686,6 +686,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "geodesic front leaks through).",
     )
     knobs.add_argument(
+        "-brain",
+        nargs="?",
+        type=float,
+        const=0.95,
+        default=None,
+        metavar="THR",
+        help="Also write a skull strip from the tissue maps: prefix_brainmask (GM+WM+CSF "
+        "posterior sum > THR, default 0.95; largest cluster, holes filled), prefix_brain "
+        "(bias-corrected input inside it) and prefix_brain_raw (the input as given inside "
+        "it, bias field kept). Follows the tissue model, so it survives bias fields that "
+        "defeat an intensity-surface strip (7T).",
+    )
+    knobs.add_argument(
         "-save_precleanup",
         action="store_true",
         help="Also write the tissue maps as they were BEFORE the -mrf/-debridge/-cleanup "
@@ -1023,6 +1036,19 @@ def main(argv: list[str] | None = None) -> int:
             bias_c = out["bias"] if n_chan == 1 else out["bias"][c]
             _save_input(corr_c, f"{prefix}_biascorrected{suffix}{ext}")
             _save_input(bias_c, f"{prefix}_biasfield{suffix}{ext}", fill=1.0)
+        if args.brain is not None:
+            from fastfuncstuff.processing.segment import brain_mask_from_tissues
+
+            classes = tuple(i - 1 for i in (*args.gm_class, *args.wm_class, *args.csf_class))
+            brain = brain_mask_from_tissues(out["posteriors"], classes, args.brain)
+            _save_input(brain.to(torch.uint8), f"{prefix}_brainmask{ext}")
+            for c in range(n_chan):
+                suffix = "" if n_chan == 1 else f"_ch{c + 1}"
+                corr_c = out["corrected"] if n_chan == 1 else out["corrected"][c]
+                bf = brain.to(corr_c.device, corr_c.dtype)
+                _save_input(corr_c * bf, f"{prefix}_brain{suffix}{ext}")
+                raw = channels[c].to(bf.device, bf.dtype)
+                _save_input(raw * bf, f"{prefix}_brain_raw{suffix}{ext}")
 
     if args.save_histogram is not None:
         hist_path = (
@@ -1051,6 +1077,8 @@ def main(argv: list[str] | None = None) -> int:
     extra = []
     if "posteriors_precleanup" in out:
         extra.append(", _cN_precleanup")
+    if args.brain is not None:
+        extra.append(", _brainmask, _brain, _brain_raw")
     if args.save_histogram is not None:
         extra.append(", _histogram.png")
     norm_step = _step("Writing normalisation outputs (warp + template space)", enabled=verbose)

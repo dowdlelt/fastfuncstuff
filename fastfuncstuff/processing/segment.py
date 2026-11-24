@@ -3435,3 +3435,24 @@ def plot_intensity_fit(
         plt.close(fig)
         return None
     return fig
+
+
+def brain_mask_from_tissues(
+    posteriors: Tensor,
+    classes: tuple[int, ...] = (0, 1, 2),
+    threshold: float = 0.95,
+) -> Tensor:
+    """Brain mask from tissue posteriors: sum of ``classes`` above ``threshold``.
+
+    The largest 6-connected cluster, holes filled (ventricles, deep sulcal CSF the
+    threshold may leave out). This is a strip that follows the tissue model rather than
+    an intensity surface: on a 7T T1 with a strong bias field 3dSkullStrip removed the
+    cerebellum and the occipital and inferior temporal lobes (ds004645), where the
+    segmentation, which fits its own bias field, keeps them.
+    """
+    from fastfuncstuff.processing.mask import _fill_holes_3d, largest_cluster_6conn
+
+    brain = posteriors[list(classes)].sum(dim=0) > threshold
+    if not bool(brain.any()):
+        return brain
+    return _fill_holes_3d(largest_cluster_6conn(brain))

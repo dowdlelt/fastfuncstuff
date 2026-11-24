@@ -1642,3 +1642,24 @@ def test_warp_prior_grad_keeps_autograd_when_the_field_needs_it():
     energy = seg.warp_penalty(f, (0.0, 0.0, 0.1, 0.01, 0.04), (8.0, 8.0, 8.0))
     energy.backward()
     assert f.grad is not None and torch.isfinite(f.grad).all()
+
+
+def test_brain_mask_from_tissues_keeps_one_filled_brain():
+    import torch
+
+    from fastfuncstuff.processing.segment import brain_mask_from_tissues
+
+    shape = (24, 24, 24)
+    z, y, x = torch.meshgrid(*(torch.arange(n, dtype=torch.float32) for n in shape), indexing="ij")
+    ball = ((z - 12) ** 2 + (y - 12) ** 2 + (x - 12) ** 2) < 64
+    hole = ((z - 12) ** 2 + (y - 12) ** 2 + (x - 12) ** 2) < 4  # labelled "other" inside
+    island = (z < 3) & (y < 3) & (x < 3)  # a dura/eye fleck outside the brain
+    post = torch.zeros(4, *shape)
+    post[0][ball & ~hole] = 0.6
+    post[1][ball & ~hole] = 0.39
+    post[2][island] = 1.0
+    post[3] = 1.0 - post[:3].sum(0)
+    m = brain_mask_from_tissues(post, (0, 1, 2), 0.95)
+    assert bool(m[hole].all()), "interior hole not filled"
+    assert not bool(m[island].any()), "island outside the brain kept"
+    assert int(m.sum()) == int(ball.sum())
