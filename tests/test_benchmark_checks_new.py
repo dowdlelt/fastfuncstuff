@@ -53,7 +53,7 @@ def test_nordic_memory_guard_and_tsnr():
     from fastfuncstuff.benchmark.checks.nordic import MATLAB_MAX_GB, matlab_gb, median_tsnr
 
     assert matlab_gb((96, 96, 60, 300)) < MATLAB_MAX_GB
-    assert matlab_gb((200, 200, 120, 400)) > MATLAB_MAX_GB
+    assert matlab_gb((256, 256, 160, 600)) > MATLAB_MAX_GB
     rng = np.random.default_rng(0)
     x = 100 + rng.standard_normal((4, 4, 2, 200)).astype(np.float32)
     mask = np.ones((4, 4, 2), bool)

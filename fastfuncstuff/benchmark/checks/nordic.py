@@ -30,7 +30,9 @@ from .base import Check, UnitResult, ffs_version, timed_cached, trailing_noise_c
 
 NORDIC_TOOLBOX = Path.home() / "Dropbox/Resources/code/matlab_toolboxes/NORDIC_Raw"
 MATLAB = "/usr/local/MATLAB/R2025a/bin/matlab"
-MATLAB_MAX_GB = 24.0
+# under the overnight service MemoryMax (scripts/bench_overnight.sh, 200G) with room for
+# the check's own float32 copies; override per host with FFS_MATLAB_MAX_GB
+MATLAB_MAX_GB = float(os.environ.get("FFS_MATLAB_MAX_GB") or 160)
 MATLAB_COPIES = 4  # complex double working copies NIFTI_NORDIC holds at its peak (estimate)
 
 REF_ARGA = {"temporal_phase": 1, "phase_filter_width": 10, "NORDIC": 1, "save_gfactor_map": 1}

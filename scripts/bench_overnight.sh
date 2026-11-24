@@ -13,6 +13,7 @@ set -euo pipefail
 
 UNTIL="${1:-07:00}"
 DEVICE="${2:-cuda}"
+# whole-run cap; this host has 251 GB. Lower it (and FFS_MATLAB_MAX_GB) on smaller hosts.
 PY="${FFS_PYTHON:-/home/logan/miniconda3/envs/py314_ffs/bin/python}"
 : "${FFS_BENCHMARK_DATA_DIR:?set FFS_BENCHMARK_DATA_DIR (the bench root sits beside it)}"
 ROOT="${FFS_BENCH_ROOT:-$(dirname "$FFS_BENCHMARK_DATA_DIR")/bench}"
@@ -22,8 +23,8 @@ LOG="$ROOT/logs/night-$STAMP.log"
 UNIT="ffs-bench-$STAMP"
 
 systemd-run --user --unit="$UNIT" --collect \
-    -p MemoryMax=96G -p MemorySwapMax=0 \
-    --setenv=PATH --setenv=FFS_TPM --setenv=FSLDIR --setenv=FSLOUTPUTTYPE --setenv=FFS_BENCHMARK_DATA_DIR \
+    -p MemoryMax="${FFS_BENCH_MEMORY_MAX:-200G}" -p MemorySwapMax=0 \
+    --setenv=PATH --setenv=FFS_TPM --setenv=FSLDIR --setenv=FSLOUTPUTTYPE --setenv=FFS_BENCHMARK_DATA_DIR --setenv=FFS_MATLAB_MAX_GB \
     --setenv=FFS_BENCH_ROOT="$ROOT" --setenv=PYTHONUNBUFFERED=1 \
     --working-directory="$ROOT" \
     bash -c "exec '$PY' -m fastfuncstuff.benchmark.work -run -until '$UNTIL' -device '$DEVICE' >> '$LOG' 2>&1"
