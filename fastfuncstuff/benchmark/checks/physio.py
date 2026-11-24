@@ -109,10 +109,7 @@ class PhysioCheck(Check):
         imgs = [r for r in inputs if r.endswith((".nii", ".nii.gz")) and "_physio" not in r]
         mag = next(r for r in imgs if "part-phase" not in r and not r.endswith("_phase.nii.gz"))
         phase = next((r for r in imgs if r != mag), None)
-        meta: dict = {}
-        for r, p in inputs.items():
-            if r.endswith(".json") and "_physio" not in r:
-                meta.update(json.loads(p.read_text()))
+        meta = self.read_meta(inputs)
         st, tr = meta.get("SliceTiming"), meta.get("RepetitionTime")
         if not st or not tr:
             raise ValueError("SliceTiming and RepetitionTime are needed")
@@ -135,11 +132,15 @@ class PhysioCheck(Check):
         tp = work / "tpattern.txt"
         tp.write_text("\n".join(f"{t:.6f}" for t in st) + "\n")
         prefix = work / "ffs" / "run"
-        cmd = ["ffs_physio", "-input", str(inputs[mag])]
-        if phase:
-            cmd += ["-phase", str(inputs[phase])]
-        cmd += ["-tpattern", str(tp), "-TR", f"{tr:g}", "-prefix", str(prefix), "-no_qc"]
         res = UnitResult()
+        # trailing noise volumes come off the end, so volume v keeps its time v*TR
+        mag_p, ph = self.trim_noise(
+            inputs[mag], work, log, res, also=(inputs[phase],) if phase else ()
+        )
+        cmd = ["ffs_physio", "-input", str(mag_p)]
+        if phase:
+            cmd += ["-phase", str(ph[0])]
+        cmd += ["-tpattern", str(tp), "-TR", f"{tr:g}", "-prefix", str(prefix), "-no_qc"]
         t = timed([*cmd, "-device", device], work, log, timeout_s=self.timeout_s)
         res.timings.append(("ffs", device.split(",")[0], t, None))
 

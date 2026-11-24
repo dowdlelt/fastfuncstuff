@@ -175,3 +175,41 @@ def test_parse_allcost_reads_named_costs():
 
     text = "++ allcost output: init #0\n   ls   = 0.2856\n   nmi  = 0.946878\n   lpc+ = 1\n   hel  = -0.0854437\n"
     assert parse_allcost(text) == {"ls": 0.2856, "nmi": 0.946878, "hel": -0.0854437}
+
+
+def test_trailing_noise_count_finds_rf_off_volumes():
+    """HiHiFaces-like: ~5280 signal, 3 trailing volumes at ~449 (8%); nothing else dropped."""
+    from fastfuncstuff.benchmark.checks.base import trailing_noise_count
+
+    sig = [5280.0 + (i % 7) for i in range(100)]
+    assert trailing_noise_count(sig + [449.7, 449.1, 448.8]) == 3
+    assert trailing_noise_count(sig) == 0
+    assert trailing_noise_count([449.0] + sig) == 0  # leading low volume is not trailing noise
+
+
+def test_unit_curation_and_read_meta_overrides(tmp_path):
+    """Curated sidecar values beat the run's sidecar; per-acquisition entries beat the dataset's."""
+    import json
+
+    import pytest
+
+    from fastfuncstuff.benchmark.census import apply_curation, unit_curation
+    from fastfuncstuff.benchmark.checks.base import Check
+
+    m = {"dataset_id": "X", "acquisitions": [], "curated": {
+        "source": "dataset owner", "sidecar": {"RepetitionTime": 1.184},
+        "noise_volumes": 3, "noise_volumes_acquisitions": {"task-b_bold": 0}}}  # fmt: skip
+    a, b = unit_curation(m, "task-a_bold"), unit_curation(m, "task-b_bold")
+    assert a == {
+        "sidecar": {"RepetitionTime": 1.184},
+        "noise_volumes": 3,
+        "source": "dataset owner",
+    }
+    assert b["noise_volumes"] == 0
+    side = tmp_path / "run_bold.json"
+    side.write_text(json.dumps({"RepetitionTime": 0.037, "EchoTime": 0.02}))
+    chk = Check()
+    chk.curation = a
+    assert chk.read_meta({"run_bold.json": side}) == {"RepetitionTime": 1.184, "EchoTime": 0.02}
+    with pytest.raises(ValueError, match="source"):
+        apply_curation({**m, "curated": {"sidecar": {"RepetitionTime": 1.0}}})

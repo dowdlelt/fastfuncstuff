@@ -16,7 +16,6 @@ ridge, so lambda and stdev are the meaningful parity numbers (see stages/glm.py)
 from __future__ import annotations
 
 import csv
-import json
 import os
 from pathlib import Path
 
@@ -111,10 +110,7 @@ class RemlCheck(Check):
         events = next((p for rel, p in inputs.items() if rel.endswith("_events.tsv")), None)
         if events is None:
             raise ValueError("no events file among the inputs")
-        meta: dict = {}
-        for rel, p in inputs.items():
-            if rel.endswith(".json"):
-                meta.update(json.loads(p.read_text()))
+        meta = self.read_meta(inputs)
         tr = meta.get("RepetitionTime")
         if meta.get("MRAcquisitionType") == "3D" and isinstance(tr, (int, float)) and tr < 0.3:
             # Some 3D sidecars (and headers) carry the per-shot TR; every onset would then
@@ -130,6 +126,8 @@ class RemlCheck(Check):
         log = work / "commands.log"
         tdir = work / "timing"
         tdir.mkdir(exist_ok=True)
+        res = UnitResult()
+        image, _ = self.trim_noise(image, work, log, res)
 
         # Frozen inputs: percent-of-mean series, its mask, the design.
         mean, mask, scaled = work / "mean.nii.gz", work / "mask.nii.gz", work / "scaled.nii.gz"
@@ -143,11 +141,13 @@ class RemlCheck(Check):
         xmat = work / "X.xmat.1D"
         timed(
             ["3dDeconvolve", "-overwrite", "-input", str(scaled), "-polort", "A",
+             # the sidecar TR (curated if wrong), not the header's: MassedEvents' header
+             # carries the 3D shot TR too
+             *(["-force_TR", f"{float(tr):g}"] if isinstance(tr, (int, float)) else []),
              *_stim_args(conds, tdir), "-x1D", str(xmat), "-x1D_stop"],
             work, log, timeout_s=600,
         )  # fmt: skip
 
-        res = UnitResult()
         ref = work / "ref"
         ref.mkdir(exist_ok=True)
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()

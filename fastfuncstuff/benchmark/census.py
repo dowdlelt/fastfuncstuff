@@ -608,7 +608,11 @@ _CURATED_TEMPLATE: dict[str, Any] = {
     "exclude_acquisitions": {},  # acquisition id -> reason
     "set": {},  # acquisition field -> value for every acquisition (e.g. field_T a sidecar lacks)
     "set_acquisitions": {},  # acquisition id -> {field: value}
-    "source": "",  # where any 'set' value comes from (paper, scanner protocol): required with 'set'
+    "source": "",  # where any 'set'/'sidecar' value comes from: required with either
+    "sidecar": {},  # BIDS sidecar key -> value, overriding every run's sidecar at check time
+    "sidecar_acquisitions": {},  # acquisition id -> {BIDS key: value}
+    "noise_volumes": None,  # trailing noise volumes per run (int); None = detect from data
+    "noise_volumes_acquisitions": {},  # acquisition id -> int
     "notes": "",
 }
 
@@ -641,8 +645,10 @@ def write_manifest(manifest: dict[str, Any], out_dir: Path) -> Path:
 def apply_curation(manifest: dict[str, Any]) -> dict[str, Any]:
     """The manifest as checks see it: exclusions dropped, curated values set."""
     cur = {**_CURATED_TEMPLATE, **(manifest.get("curated") or {})}
-    if (cur["set"] or cur["set_acquisitions"]) and not cur["source"]:
-        raise ValueError(f"{manifest['dataset_id']}: curated 'set' values need a 'source'")
+    if (cur["set"] or cur["set_acquisitions"] or cur["sidecar"] or cur["sidecar_acquisitions"]) and not cur["source"]:  # fmt: skip
+        raise ValueError(
+            f"{manifest['dataset_id']}: curated 'set'/'sidecar' values need a 'source'"
+        )
     m = dict(manifest)
     m["excluded"] = cur["exclude"]
     kept, dropped = [], {}
@@ -655,6 +661,20 @@ def apply_curation(manifest: dict[str, Any]) -> dict[str, Any]:
     m["acquisitions"] = kept
     m["excluded_acquisitions"] = dropped
     return m
+
+
+def unit_curation(manifest: dict[str, Any], acq: str | None) -> dict[str, Any]:
+    """What a check needs from the curated block for one acquisition's unit."""
+    cur = {**_CURATED_TEMPLATE, **(manifest.get("curated") or {})}
+    nv = (cur["noise_volumes_acquisitions"] or {}).get(acq, cur["noise_volumes"])
+    return {
+        "sidecar": {
+            **(cur["sidecar"] or {}),
+            **((cur["sidecar_acquisitions"] or {}).get(acq) or {}),
+        },
+        "noise_volumes": None if nv is None else int(nv),
+        "source": cur["source"],
+    }
 
 
 def load_manifests(out_dir: Path, curated: bool = True) -> list[dict[str, Any]]:

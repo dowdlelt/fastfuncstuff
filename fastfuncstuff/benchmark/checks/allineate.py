@@ -87,11 +87,12 @@ class AllineateCheck(Check):
         work.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
         mean, brain = work / "epi_mean.nii.gz", work / "t1_brain.nii.gz"
+        res = UnitResult()
+        epi, _ = self.trim_noise(epi, work, log, res)
         timed(["3dTstat", "-overwrite", "-mean", "-prefix", str(mean), str(epi)], work, log)
         timed(["3dSkullStrip", "-overwrite", "-input", str(t1), "-prefix", str(brain)],
               work, log, timeout_s=1800)  # fmt: skip
 
-        res = UnitResult()
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
         out = {s: work / s for s in ("ref", "ffs")}
         for d in out.values():
@@ -132,6 +133,18 @@ class AllineateCheck(Check):
             "scale_ref": float(abs(np.linalg.det(m_ref[:3, :3])) ** (1 / 3)),
             "scale_ffs": float(abs(np.linalg.det(m_ffs[:3, :3])) ** (1 / 3)),
         }
+        # How much of the problem the EPI poses: a thin slab or partial field of view is the
+        # hard case for both tools, so failures are read against coverage.
+        e = nib.Nifti1Image.from_filename(str(mean))
+        vox = np.sqrt((e.affine[:3, :3] ** 2).sum(0))
+        ext = vox * np.asarray(e.shape[:3])
+        res.metrics["data"] = {
+            "epi_extent_min_mm": float(ext.min()), "epi_extent_max_mm": float(ext.max()),
+            "epi_n_min_axis": float(min(e.shape[:3])), "epi_voxel_max_mm": float(vox.max()),
+            # share of the T1 brain inside the EPI's field of view under each fit
+            "brain_coverage_ref": float((np.abs(a[mask]) > 0).mean()),
+            "brain_coverage_ffs": float((np.abs(c[mask]) > 0).mean()),
+        }  # fmt: skip
         yard: dict[str, float | None] = {}
         for s in out:
             ylog = out[s] / "allcost.txt"

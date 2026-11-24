@@ -38,6 +38,7 @@ class MocoCheck(Check):
         ffs.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
         res = UnitResult()
+        src, _ = self.trim_noise(src, work, log, res)
 
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
         t_ref = timed(

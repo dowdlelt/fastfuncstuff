@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shlex
 import subprocess
@@ -101,6 +102,26 @@ def timed_cached(
     return dt
 
 
+NOISE_FRAC = 0.25
+
+
+def volume_means(image: Path) -> list[float]:
+    """Whole-volume mean of every volume (3dmaskave streams it: ~4 s for 353 volumes)."""
+    out = subprocess.run(["3dmaskave", "-quiet", str(image)], capture_output=True, text=True,
+                         check=True, timeout=1800).stdout  # fmt: skip
+    return [float(ln.split()[0]) for ln in out.splitlines() if ln.strip()]
+
+
+def trailing_noise_count(means: list[float], frac: float = NOISE_FRAC) -> int:
+    if len(means) < 4:
+        return 0
+    med = sorted(means)[len(means) // 2]
+    k = 0
+    while k < len(means) - 1 and means[-1 - k] < frac * med:
+        k += 1
+    return k
+
+
 def kill_group(proc: subprocess.Popen, grace_s: float = 10.0) -> None:
     """SIGTERM the process group, then SIGKILL whatever is left after ``grace_s``."""
     import signal
@@ -150,6 +171,50 @@ class Check:
     sampling = "breadth"  # breadth | depth | session
     reference = ""  # the reference tool, for reports
     timeout_s = 3600.0  # per command; a hung tool is killed and the unit marked failed
+    # Set by the runner per unit from the manifest's curated block (census.unit_curation):
+    # {"sidecar": {BIDS key: value}, "noise_volumes": int | None, "source": str}.
+    curation: dict = {}
+
+    # -- inputs ------------------------------------------------------------
+
+    def read_meta(self, inputs: dict[str, Path], exclude: tuple[str, ...] = ("_physio",)) -> dict:
+        """The run's sidecars merged shallowest first (BIDS inheritance), then the curated
+        overrides: a private tree whose sidecar is wrong (MassedEvents: RepetitionTime is
+        the 3D shot TR) is corrected in the manifest, never in the data."""
+        meta: dict = {}
+        for rel, p in inputs.items():
+            if rel.endswith(".json") and not any(x in rel for x in exclude):
+                meta.update(json.loads(p.read_text()))
+        meta.update(self.curation.get("sidecar") or {})
+        return meta
+
+    def trim_noise(
+        self, image: Path, work: Path, log: Path, res: UnitResult, also: tuple[Path, ...] = ()
+    ) -> tuple[Path, tuple[Path, ...]]:
+        """Drop trailing noise volumes (RF-off scans some private protocols append: HiHiFaces
+        3, at ~8% of the run's mean) from ``image`` and the same count from ``also`` (its
+        phase). A curated count wins; otherwise trailing volumes under NOISE_FRAC of the
+        median volume mean are taken as noise. Both tools then get the trimmed copy."""
+        curated = self.curation.get("noise_volumes")
+        means = volume_means(image)
+        detected = trailing_noise_count(means)
+        k = int(curated) if curated is not None else detected
+        res.provenance["noise_volumes"] = {
+            "dropped": k, "detected": detected, "curated": curated, "n_volumes": len(means),
+            "rule": f"trailing volume mean < {NOISE_FRAC} x median (when not curated)",
+        }  # fmt: skip
+        if k <= 0:
+            return image, also
+        if k >= len(means) - 2:
+            raise ValueError(f"{k} noise volumes of {len(means)}: nothing left to compare")
+        out = []
+        for i, src in enumerate((image, *also)):
+            dst = work / f"input{i}_trim{k}.nii.gz"
+            timed(["3dTcat", "-overwrite", "-prefix", str(dst),
+                   f"{src}[0..{len(means) - k - 1}]"], work, log)  # fmt: skip
+            res.artifacts.append((dst, "regenerable"))
+            out.append(dst)
+        return out[0], tuple(out[1:])
 
     # -- planning ----------------------------------------------------------
 

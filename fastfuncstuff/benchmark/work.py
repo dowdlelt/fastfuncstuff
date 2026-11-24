@@ -160,7 +160,13 @@ def run(
                 "inputs",
                 {rel: sha256(p) for rel, p in paths.items()} | {"source": m["source"]["uri"]},
             )
-            res = checks[u["check_name"]]().run(key, paths, work, device)
+            from .census import unit_curation
+
+            chk = checks[u["check_name"]]()
+            chk.curation = unit_curation(m, key.get("acq"))
+            if chk.curation["sidecar"] or chk.curation["noise_volumes"] is not None:
+                wl.record_provenance(u["id"], "curation", chk.curation)
+            res = chk.run(key, paths, work, device)
             for judge, vals in res.metrics.items():
                 wl.record_metrics(u["id"], judge, vals)
             for side, dev, sec, thr in res.timings:

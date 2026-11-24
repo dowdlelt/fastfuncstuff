@@ -6,7 +6,6 @@ The frozen input is the raw first-echo magnitude and the SliceTiming its sidecar
 
 from __future__ import annotations
 
-import json
 import os
 
 from ..validation import compare_timeseries_4d
@@ -31,10 +30,7 @@ class SlicetimeCheck(Check):
 
     def run(self, key, inputs, work, device):
         image = next(p for rel, p in inputs.items() if not rel.endswith(".json"))
-        meta: dict = {}
-        for rel, p in inputs.items():
-            if rel.endswith(".json"):
-                meta.update(json.loads(p.read_text()))
+        meta = self.read_meta(inputs)
         st = meta.get("SliceTiming")
         if not st:
             raise ValueError("no SliceTiming in the run's sidecars")
@@ -44,6 +40,7 @@ class SlicetimeCheck(Check):
         log = work / "commands.log"
         ref_out, ffs_out = work / "ref_tshift.nii", work / "ffs_tshift.nii"
         res = UnitResult()
+        image, _ = self.trim_noise(image, work, log, res)
 
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
         t_ref = timed(
