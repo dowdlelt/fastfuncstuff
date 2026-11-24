@@ -484,6 +484,29 @@ _BLOK_COSTS = ("lpa", "lpc")
 # more of the coarse lottery costs nothing. The other costs refine on the full
 # grid without that batching, where each extra trial is paid in full — measured
 # on one pair, tbest 3 -> 10 took ls from 34s to 86s and nmi from 60s to 159s.
+
+
+def _blurred_ctx(ctx: CostContext) -> CostContext:
+    """The cost a BLURRED stage scores ``lpc`` with: ``lpa`` (|r| per blok).
+
+    lpc rewards negative local correlation, which holds for an EPI against a T1 only
+    while the interior tissue contrast is resolved. A blur of a few voxels washes the
+    GM/WM contrast out and leaves the brain outline, which correlates POSITIVELY when
+    the images are aligned -- so blurred lpc ranks the right pose worst. On ds002785
+    sub-0178 (AFNI allcostX, lower better, 5.4 mm blur) the right pose reads lpc 2.10
+    and the spurious ffs pose 0.22, while lpa reads -1.10 against +0.78. AFNI's own
+    twopass has the same inversion (its coarse pass scores lpc blurred); it survives
+    by judging its null set unblurred, and fails where that set starts too far off
+    (ds004499: AFNI lpc -0.13, the start refined sharp -0.72). |r| keeps the outline
+    as the basin-finder; the sharp stages still optimise and judge signed lpc.
+    ``FFS_ALLINEATE_BLUR_LPC=signed`` restores signed lpc everywhere, for A/B.
+    Shares the blok and subset caches (dataclasses.replace copies the references).
+    """
+    if ctx.name != "lpc" or os.environ.get("FFS_ALLINEATE_BLUR_LPC") == "signed":
+        return ctx
+    return replace(ctx, name="lpa")
+
+
 _TBEST_DEFAULT_BLOK = 10
 _TBEST_DEFAULT_OTHER = 3
 
@@ -1351,6 +1374,7 @@ def _coarse_search_joint(
     old split+downsample one despite covering more of the space jointly.
     """
     free_mask = _get_free_mask(config.dof)
+    ctx = _blurred_ctx(ctx)  # the whole pass is blurred; see _blurred_ctx
     is_lpc = ctx.name == "lpc"
     voxdims = ctx.base_voxdims
     vmean = sum(voxdims) / 3.0
@@ -2713,6 +2737,7 @@ def _refine_progressive(
     sample: SampleSet | None = None,
     skip_blur: bool = False,
     late_seeds: list[np.ndarray] | tuple = (),
+    out_trials: list | None = None,
 ) -> tuple[np.ndarray, float]:
     """Progressive multi-resolution refinement: Adam (GPU) + Powell polish.
 
@@ -2737,6 +2762,9 @@ def _refine_progressive(
     the wrong pose scores better than the right one at every blur from 5 to 8 mm,
     in AFNI's cost as in ours -- so a good start sent through the blur is walked
     away from the answer before the sharp cost, which ranks it 50x better, can see it.
+
+    ``out_trials``, when given, receives every (cost, params) of the last stage,
+    best first, before the polish -- the resolution ladder carries runners-up on.
 
     Returns:
         (params, cost): the (12,) best refined parameters (physical units) and
@@ -2813,6 +2841,7 @@ def _refine_progressive(
             base_s, source_s = base, source
             label = movie_label = "Full resolution"
         blokrad_stage = _stage_blokrad(sigma_vox)
+        stage_ctx = _blurred_ctx(ctx) if sigma_vox > 0.0 else ctx
 
         trace = _cost_trace.get()
         if trace is not None:
@@ -2830,7 +2859,7 @@ def _refine_progressive(
             base_pts = base_s.reshape(-1)[sample.idx_flat]
             blokset_s = sample.blokset(blokrad_stage, device)
             bcost = _batched_sampled_cost(
-                source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, ctx
+                source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, stage_ctx
             )
             stage_opt = _pick_optimizer(
                 config.optimizer,
@@ -2910,7 +2939,7 @@ def _refine_progressive(
                     weight,
                     params,
                     config,
-                    ctx,
+                    stage_ctx,
                     voxdims,
                     bounds,
                     device,
@@ -2922,6 +2951,13 @@ def _refine_progressive(
                 )
                 refined.append((cost, params_out))
         refined.sort(key=lambda c: -c[0])
+        if verb >= 2:
+            for c, p in refined:
+                print(
+                    f"    cost {c:+.4f}  shift ({p[0]:+.1f},{p[1]:+.1f},{p[2]:+.1f}) vox  "
+                    f"rot ({p[3]:+.1f},{p[4]:+.1f},{p[5]:+.1f})  "
+                    f"scale ({p[6]:.3f},{p[7]:.3f},{p[8]:.3f})"
+                )
         if movie is not None:
             movie.capture(refined[0][1], f"best of {len(refined)}  cost {refined[0][0]:.6f}", True)
 
@@ -2944,6 +2980,8 @@ def _refine_progressive(
             del base_s, source_s
 
     best_cost, best_params = trials[0]
+    if out_trials is not None:
+        out_trials.extend((c, p.copy()) for c, p in trials)
 
     # AFNI's +ZZ: the combination widened the basin and got us here, but the
     # answer we want is the pure lpc/lpa optimum, so drop the extra terms before
@@ -3669,6 +3707,8 @@ def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
 
 
 _CMASS_START_MARGIN = 1.25
+# Work-grid runners-up carried to the base-grid rung beside the best and the starts.
+_LADDER_RUNNERS_UP = 1
 
 
 def _cmass_wins(c_cmass: float, c_hdr: float) -> bool:
@@ -3729,7 +3769,7 @@ def _header_or_cmass_start(
                     _separable_smooth_3d(stp.base_opt, sigma),
                     _separable_smooth_3d(stp.source_opt, sigma),
                     stp.weight_opt,
-                    stp.ctx,
+                    _blurred_ctx(stp.ctx),
                     stp.voxdims,
                     blokrad_mm=math.sqrt(rad**2 + (sigma * vmean) ** 2) if rad else None,
                 )
@@ -3965,6 +4005,7 @@ def _align(
     late_seeds = [] if not config.twopass else [_identity_physical()]
     if other_start is not None:
         late_seeds.append(other_start)
+    work_trials: list = []
     with _recording_cost_trace(save_cost_trace_path is not None) as cost_trace:
         best_params_phys, best_refine_cost = _refine_progressive(
             base_opt,
@@ -3979,6 +4020,7 @@ def _align(
             verb,
             sample=sample,
             late_seeds=late_seeds,
+            out_trials=work_trials,
         )
     if cost_trace is not None and save_cost_trace_path is not None:
         cost_trace.save(save_cost_trace_path)
@@ -3999,6 +4041,22 @@ def _align(
         # the fit means the same thing on either side of the hand-off.
         if verb >= 1:
             print(f"Final stage at base resolution {tuple(base_out.shape)}:")
+        # Decimating the base to the work grid blurs it: on ds006926 (3 mm EPI, 1 mm
+        # T1) lpc near the answer read ~0.05 on the 3 mm grid, flat enough that every
+        # work-grid trial ran to the bounds, while the base grid reads 0.43 there. So
+        # the winner is picked HERE, among the work-grid best, its runner-up and the
+        # raw starts (AFNI judges its null set at full resolution, unblurred too).
+        # Matrices first: the work-grid params read about the work grid's pivot.
+        carry = [best_params_phys] + [p for _, p in work_trials[1 : _LADDER_RUNNERS_UP + 1]]
+        carry += list(late_seeds)
+        carry_mats = [
+            _residual_to_final(
+                _p2m_fns()[0](torch.tensor(p, dtype=torch.float32, device=device)),
+                setup,
+                full_to_work,
+            )
+            for p in carry
+        ]
         setup = _prepare_grid(
             base_out,
             base_header_out,
@@ -4013,17 +4071,19 @@ def _align(
         if movie is not None:
             movie.set_map(lambda m, stp=setup: _residual_to_final(m, stp, None))
             movie.set_prefix("base grid")
-        residual_f = _crop_conj(
-            plinalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
-        )
         # The hand-off is a matrix, so it re-reads as params about the NEW grid's
         # centre -- a fit means the same transform on either side.
         _pivot.set(_grid_centre(setup.base_opt.shape, device))
+        inv_align = plinalg.inv(setup.align_matrix)
+        rung_trials = [
+            _p2m_fns()[2](_crop_conj(inv_align @ m, setup.crop_offset, forward=False)).cpu().numpy()
+            for m in carry_mats
+        ]
         best_params_phys, best_refine_cost = _refine_progressive(
             setup.base_opt,
             setup.source_opt,
             setup.weight_opt,
-            [_p2m_fns()[2](residual_f).cpu().numpy()],
+            rung_trials,
             config,
             setup.ctx,
             setup.voxdims,
