@@ -8,7 +8,8 @@ shared by both nonlinear fits. Both tools get identical arguments.
 The labels are carried through each tool's warp by the same applier (3dNwarpApply, NN),
 so only the warp differs. Judges:
 - truth: mean Dice over the base's traced parcels, against the affine-only baseline.
-- deformation: share of voxels with Jacobian <= 0 (3dNwarpFuncs -bulk) for each warp.
+- deformation: share of voxels with Jacobian <= 0 for each warp (3dNwarpFuncs -bulk
+  writes det(J) - 1, so the test is bulk <= -1).
 - reference: correlation of the two warped brains inside the base mask.
 
 The pairwise design follows ffs_tunewarp's cohort judge (wiki: tuning registration on
@@ -151,7 +152,7 @@ class QwarpCheck(Check):
                    "-input", str(jac), "-prefix", str(jac_b)], work, log)  # fmt: skip
             j = load(jac_b).astype(np.float64)
             inside = load(B) > 0
-            truth[f"fold_frac_{side}"] = float((j[inside] <= 0).mean())
+            truth[f"fold_frac_{side}"] = float((j[inside] <= -1).mean())  # bulk = det(J) - 1
             warped[side] = next(iter(sorted(d.glob("qw.nii*"))))
         truth["dice_gain_ffs_minus_ref"] = truth["dice_mean_ffs"] - truth["dice_mean_ref"]
         truth["n_labels"] = len(labels)
@@ -167,7 +168,10 @@ class QwarpCheck(Check):
         }
 
         for d in sides.values():
-            res.artifacts += [(p, "regenerable") for p in sorted(d.glob("qw*"))]
+            # the warps are kept: the reference fit costs hours, and fold/Jacobian
+            # judges may change after the night (they did, the first night)
+            res.artifacts += [(p, "keep" if "WARP" in p.name else "regenerable")
+                              for p in sorted(d.glob("qw*"))]  # fmt: skip
             res.artifacts += [
                 (d / "jac.nii.gz", "regenerable"),
                 (d / "jac_base.nii.gz", "regenerable"),
