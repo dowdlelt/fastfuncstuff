@@ -32,9 +32,9 @@ def _recording(tsv: dict, meta: dict) -> dict[str, tuple[np.ndarray, np.ndarray]
         low = name.lower()
         kind = (
             "cardiac"
-            if any(k in low for k in ("cardiac", "pulse", "ppg", "ecg", "puls"))
+            if any(k in low for k in ("cardiac", "pulse", "ppg", "ecg", "ekg", "puls"))
             else "respiratory"
-            if "resp" in low
+            if "resp" in low or "belt" in low  # ds004499: belt, EKG
             else None
         )
         if kind and kind not in out:

@@ -318,9 +318,9 @@ def _physio_columns(src, index: Index, physio: BidsName, cache: dict) -> set[str
     kinds = set()
     for c in meta.get("Columns", []) or []:
         c = str(c).lower()
-        if any(k in c for k in ("cardiac", "pulse", "ppg", "ecg", "puls")):
+        if any(k in c for k in ("cardiac", "pulse", "ppg", "ecg", "ekg", "puls")):
             kinds.add("cardiac")
-        elif "resp" in c:
+        elif "resp" in c or "belt" in c:
             kinds.add("respiratory")
     return kinds
 
