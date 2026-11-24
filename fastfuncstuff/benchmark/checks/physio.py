@@ -24,10 +24,24 @@ from .base import Check, UnitResult, ffs_version, timed
 PLV_RIGHT = 0.5
 
 
-def _recording(tsv: dict, meta: dict) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+def recording_start(meta: dict, n_samples: int, scan_s: float, tr: float) -> tuple[float, str]:
+    """(StartTime, how it was chosen). A StartTime of 0 or none on a recording more than a
+    TR longer than the scan is taken as end-aligned: the log started with the scanner, whose
+    dummy volumes were discarded (ds000030), and it stopped with the last volume. Uses only
+    the recording and the scan, never ffs, so the judge stays independent."""
+    t0 = float(meta.get("StartTime") or 0.0)
+    rec_s = n_samples / float(meta["SamplingFrequency"])
+    if t0 == 0.0 and rec_s > scan_s + tr:
+        return scan_s - rec_s, "end-aligned (StartTime 0/absent, recording longer than scan)"
+    return t0, "sidecar StartTime"
+
+
+def _recording(
+    tsv: dict, meta: dict, t0: float | None = None
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """kind -> (times from volume 0, samples) for each cardiac / respiratory column."""
     fs = float(meta["SamplingFrequency"])
-    t0 = float(meta.get("StartTime", 0.0))
+    t0 = float(meta.get("StartTime", 0.0)) if t0 is None else t0
     out = {}
     for name, col in tsv.items():
         low = name.lower()
@@ -117,17 +131,6 @@ class PhysioCheck(Check):
         st = np.asarray(st, dtype=float)
         tr = float(tr)
 
-        rec: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for r, p in inputs.items():
-            if r.endswith("_physio.tsv.gz"):
-                own = r.removesuffix(".tsv.gz") + ".json"
-                side = [j for j in inputs if j.endswith("_physio.json")]
-                pm = json.loads(inputs[own if own in inputs else side[0]].read_text())
-                for kind, v in _recording(_read_physio(p, pm), pm).items():
-                    rec.setdefault(kind, v)
-        if "cardiac" not in rec:
-            raise ValueError("no cardiac column in the recordings")
-
         work.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
         tp = work / "tpattern.txt"
@@ -138,6 +141,23 @@ class PhysioCheck(Check):
         mag_p, ph = self.trim_noise(
             inputs[mag], work, log, res, also=(inputs[phase],) if phase else ()
         )
+        # the recording spans every volume the scanner kept, trailing noise volumes included
+        scan_s = res.provenance["noise_volumes"]["n_volumes"] * tr
+        rec: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        starts = {}
+        for r, p in inputs.items():
+            if r.endswith("_physio.tsv.gz"):
+                own = r.removesuffix(".tsv.gz") + ".json"
+                side = [j for j in inputs if j.endswith("_physio.json")]
+                pm = json.loads(inputs[own if own in inputs else side[0]].read_text())
+                cols = _read_physio(p, pm)
+                n = max((c.size for c in cols.values()), default=0)
+                t0, how = recording_start(pm, n, scan_s, tr)
+                starts[r] = {"start_s": t0, "rule": how}
+                for kind, v in _recording(cols, pm, t0).items():
+                    rec.setdefault(kind, v)
+        if "cardiac" not in rec:
+            raise ValueError("no cardiac column in the recordings")
         cmd = ["ffs_physio", "-input", str(mag_p)]
         if phase:
             cmd += ["-phase", str(ph[0])]
@@ -185,6 +205,7 @@ class PhysioCheck(Check):
                                  "sources": summary.get("sources")}  # fmt: skip
         res.provenance["truth"] = {
             "recordings": sorted(rec),
+            "start": starts,
             "scoring": "PLV of slibase c1/s1 phase vs beat_phase(find_beats(recording))",
         }
         return res

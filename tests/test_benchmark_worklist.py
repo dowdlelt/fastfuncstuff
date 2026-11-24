@@ -308,3 +308,15 @@ def test_allineate_tissue_judge_separates_on_and_off_brain():
     assert epi_in_brain(off, brain, vox) < 0.5
     flat = np.where(brain, 80.0, 0.0).astype(np.float32)  # no tissue contrast seen
     assert abs(boundary_contrast(flat, wm, brain, vox)["contrast"]) < 1e-3
+
+
+def test_physio_recording_start_end_aligns_only_without_a_start_time():
+    """ds000030: StartTime 0 on a log 8 s longer than the scan (dummy volumes discarded)
+    means the log ends with the scan; a sidecar StartTime is believed as given."""
+    from fastfuncstuff.benchmark.checks.physio import recording_start
+
+    fs = {"SamplingFrequency": 1000.0}
+    assert recording_start({**fs, "StartTime": 0}, 312_000, 304.0, 2.0)[0] == -8.0
+    assert recording_start(fs, 312_000, 304.0, 2.0)[0] == -8.0
+    assert recording_start({**fs, "StartTime": -8.18}, 166_400, 158.0, 2.0)[0] == -8.18
+    assert recording_start({**fs, "StartTime": 0}, 305_000, 304.0, 2.0)[0] == 0.0  # within a TR
