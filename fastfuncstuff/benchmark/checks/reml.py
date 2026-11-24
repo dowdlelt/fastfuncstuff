@@ -61,6 +61,37 @@ def _conditions(events_tsv: Path) -> dict[str, list[tuple[float, float]]]:
     return {k: out[k] for k in keep[:MAX_CONDITIONS]}
 
 
+def _gam(t):
+    """AFNI's GAM impulse response (p=8.6, q=0.547), peak 1."""
+    import numpy as np
+
+    t = np.clip(t, 0, None)
+    return (t / (8.6 * 0.547)) ** 8.6 * np.exp(8.6 - t / 0.547)
+
+
+def sinusoid_regressors(
+    blocks: list[tuple[float, float]], freq_hz: float, tr: float, nt: int, dt: float = 0.05
+):
+    """Boxcar, sine and cosine of ``freq_hz`` inside each (onset, duration) block, each
+    convolved with GAM and sampled at the volume times: a phase-free model of a stimulus
+    whose drive oscillates (ds004645: checkerboard contrast at 0.05 Hz for 240 s)."""
+    import numpy as np
+
+    t = np.arange(0, nt * tr + 40, dt)
+    box = np.zeros_like(t)
+    ph = np.zeros_like(t)
+    for on, dur in blocks:
+        inside = (t >= on) & (t < on + dur)
+        box[inside] = 1.0
+        ph[inside] = 2 * np.pi * freq_hz * (t[inside] - on)
+    h = _gam(np.arange(0, 30, dt))
+    out = {}
+    for name, w in (("block", box), ("sin", box * np.sin(ph)), ("cos", box * np.cos(ph))):
+        y = np.convolve(w, h)[: t.size] * dt
+        out[name] = np.interp(np.arange(nt) * tr, t, y)
+    return out
+
+
 def _label(tt: str, i: int) -> str:
     safe = "".join(c if c.isalnum() else "_" for c in tt)[:24].strip("_")
     return safe or f"c{i}"
@@ -105,6 +136,25 @@ class RemlCheck(Check):
             + [m.rel for m in ev[-1:]]  # the most specific events file
         )
 
+    def _model_stim_args(self, model, key, events, image, tr, tdir) -> list[str]:
+        import nibabel as nib
+        import numpy as np
+
+        if model.get("kind") != "sinusoid":
+            raise ValueError(f"unknown curated stimulus model {model.get('kind')!r}")
+        freq = float((model.get("freq_hz_subjects") or {}).get(key.get("sub"), model["freq_hz"]))
+        with open(events, newline="") as f:
+            blocks = [(float(r["onset"]), float(r["duration"]))
+                      for r in csv.DictReader(f, delimiter="\t")]  # fmt: skip
+        nt = nib.Nifti1Image.from_filename(str(image)).shape[3]
+        regs = sinusoid_regressors(blocks, freq, float(tr), nt)
+        args = ["-num_stimts", str(len(regs))]
+        for i, (name, y) in enumerate(regs.items(), 1):
+            f = tdir / f"{name}.1D"
+            np.savetxt(f, y, fmt="%.6f")
+            args += ["-stim_file", str(i), str(f), "-stim_label", str(i), f"{name}{freq:g}Hz"]
+        return args
+
     def run(self, key, inputs, work, device):
         image = next(p for rel, p in inputs.items() if rel.endswith((".nii", ".nii.gz")))
         events = next((p for rel, p in inputs.items() if rel.endswith("_events.tsv")), None)
@@ -119,8 +169,9 @@ class RemlCheck(Check):
                 f"3D run with RepetitionTime {tr} s: the shot TR, not the volume TR; "
                 "fix the sidecar (or curated block) before this run can be modelled"
             )
-        conds = _conditions(events)
-        if not conds:
+        model = self.curation.get("stimulus_model")
+        conds = {} if model else _conditions(events)
+        if not model and not conds:
             raise ValueError(f"no trial_type with >= {MIN_EVENTS} events in {events.name}")
         work.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
@@ -138,13 +189,17 @@ class RemlCheck(Check):
              "-expr", "c*step(b)*min(200,a/b*100)", "-float", "-prefix", str(scaled)],
             work, log,
         )  # fmt: skip
+        if model:
+            stim = self._model_stim_args(model, key, events, image, tr, tdir)
+        else:
+            stim = _stim_args(conds, tdir)
         xmat = work / "X.xmat.1D"
         timed(
             ["3dDeconvolve", "-overwrite", "-input", str(scaled), "-polort", "A",
              # the sidecar TR (curated if wrong), not the header's: MassedEvents' header
              # carries the 3D shot TR too
              *(["-force_TR", f"{float(tr):g}"] if isinstance(tr, (int, float)) else []),
-             *_stim_args(conds, tdir), "-x1D", str(xmat), "-x1D_stop"],
+             *stim, "-x1D", str(xmat), "-x1D_stop"],
             work, log, timeout_s=600,
         )  # fmt: skip
 
@@ -199,7 +254,7 @@ class RemlCheck(Check):
                     and (vr.get("stdev") or 0) >= T["reml_stdev_min_r"]
                 )
             res.metrics.setdefault("reference", {}).update(m)
-        res.metrics["reference"]["n_conditions"] = len(conds)
+        res.metrics["reference"]["n_conditions"] = len(conds) if not model else 1.0
         first_row = next(ln for ln in xmat.read_text().splitlines() if ln and ln[0] != "#")
         res.metrics["reference"]["n_regressors"] = len(first_row.split())
 
@@ -220,5 +275,6 @@ class RemlCheck(Check):
             "scaling": "3dcalc c*step(b)*min(200,a/b*100), b = 3dTstat mean, c = 3dAutomask",
             "conditions": {k: len(v) for k, v in conds.items()},
             "event_columns": event_columns(events.read_text().splitlines()[0].split("\t")),
+            "stimulus_model": model,
         }
         return res

@@ -613,6 +613,9 @@ _CURATED_TEMPLATE: dict[str, Any] = {
     "sidecar_acquisitions": {},  # acquisition id -> {BIDS key: value}
     "noise_volumes": None,  # trailing noise volumes per run (int); None = detect from data
     "noise_volumes_acquisitions": {},  # acquisition id -> int
+    # acquisition id -> how the stimulus is modelled when the events file cannot say it
+    # (ds004645 checker: one 240 s row, the stimulus is a 0.05 Hz contrast oscillation)
+    "stimulus_models": {},
     "notes": "",
 }
 
@@ -673,6 +676,7 @@ def unit_curation(manifest: dict[str, Any], acq: str | None) -> dict[str, Any]:
             **((cur["sidecar_acquisitions"] or {}).get(acq) or {}),
         },
         "noise_volumes": None if nv is None else int(nv),
+        "stimulus_model": (cur["stimulus_models"] or {}).get(acq),
         "source": cur["source"],
     }
 

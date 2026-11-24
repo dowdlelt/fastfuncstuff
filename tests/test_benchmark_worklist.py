@@ -200,11 +200,8 @@ def test_unit_curation_and_read_meta_overrides(tmp_path):
         "source": "dataset owner", "sidecar": {"RepetitionTime": 1.184},
         "noise_volumes": 3, "noise_volumes_acquisitions": {"task-b_bold": 0}}}  # fmt: skip
     a, b = unit_curation(m, "task-a_bold"), unit_curation(m, "task-b_bold")
-    assert a == {
-        "sidecar": {"RepetitionTime": 1.184},
-        "noise_volumes": 3,
-        "source": "dataset owner",
-    }
+    assert a == {"sidecar": {"RepetitionTime": 1.184}, "noise_volumes": 3,
+                 "stimulus_model": None, "source": "dataset owner"}  # fmt: skip
     assert b["noise_volumes"] == 0
     side = tmp_path / "run_bold.json"
     side.write_text(json.dumps({"RepetitionTime": 0.037, "EchoTime": 0.02}))
@@ -213,3 +210,22 @@ def test_unit_curation_and_read_meta_overrides(tmp_path):
     assert chk.read_meta({"run_bold.json": side}) == {"RepetitionTime": 1.184, "EchoTime": 0.02}
     with pytest.raises(ValueError, match="source"):
         apply_curation({**m, "curated": {"sidecar": {"RepetitionTime": 1.0}}})
+
+
+def test_sinusoid_regressors_phase_free():
+    """sin and cos at 0.05 Hz span any phase; zero before the block, HRF-delayed."""
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.reml import sinusoid_regressors
+
+    tr, nt = 0.5, 600
+    r = sinusoid_regressors([(14.0, 240.0)], 0.05, tr, nt)
+    assert set(r) == {"block", "sin", "cos"} and all(v.shape == (nt,) for v in r.values())
+    t = np.arange(nt) * tr
+    assert np.abs(r["sin"][t < 14]).max() == 0 and r["block"][(t > 40) & (t < 250)].min() > 0
+    # a 0.05 Hz drive at any phase is fit by the sin/cos pair
+    shifted = sinusoid_regressors([(14.0, 240.0)], 0.05, tr, nt, dt=0.05)
+    X = np.c_[r["sin"], r["cos"]]
+    y = np.cos(0.7) * shifted["sin"] + np.sin(0.7) * shifted["cos"]
+    resid = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+    assert np.abs(resid).max() < 1e-9
