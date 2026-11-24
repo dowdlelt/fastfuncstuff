@@ -245,3 +245,24 @@ def test_file_overrides_match_entities():
     assert chk.file_overrides(ap) == {"PhaseEncodingDirection": "j-"}
     assert chk.file_overrides(pa) == {"PhaseEncodingDirection": "j"}
     assert chk.file_overrides("sub-01/func/sub-01_task-x_bold.nii.gz") == {}
+
+
+def test_allineate_tissue_judge_separates_on_and_off_brain():
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.allineate import boundary_contrast, epi_in_brain
+
+    n = 48
+    z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float32),) * 3, indexing="ij")
+    r = np.sqrt((z - 24) ** 2 + (y - 24) ** 2 + (x - 24) ** 2)
+    brain = r < 16
+    wm = np.clip(10.0 - r, 0.0, 1.0)  # WM core r < 9.5, boundary at r ~ 9.5
+    epi = np.where(brain, np.where(r < 9.5, 60.0, 100.0), 0.0).astype(np.float32)  # GM > WM
+    vox = (1.0, 1.0, 1.0)
+    right = boundary_contrast(epi, wm, brain, vox)
+    assert right["pos_frac"] > 0.9 and right["contrast"] > 0.2
+    assert epi_in_brain(epi, brain, vox) > 0.95
+    off = np.roll(epi, 30, axis=2)  # the data moved off the brain
+    assert epi_in_brain(off, brain, vox) < 0.5
+    flat = np.where(brain, 80.0, 0.0).astype(np.float32)  # no tissue contrast seen
+    assert abs(boundary_contrast(flat, wm, brain, vox)["contrast"]) < 1e-3

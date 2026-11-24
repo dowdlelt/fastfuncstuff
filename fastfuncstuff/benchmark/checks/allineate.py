@@ -1,8 +1,10 @@
 """allineate: ffs_allineate against 3dAllineate, mean EPI to the subject's T1w (lpc).
 
 Unit: one run. Frozen inputs: the run's mean (3dTstat) and the subject's T1w stripped
-once by 3dSkullStrip, given to both tools with identical arguments (lpc, source automask)
-and each tool's default centring, since the defaults are what users get.
+once by ``ffs_segment -brain`` (bias-corrected, inside GM+WM+CSF > 0.95), given to both
+tools with identical arguments (lpc, source automask) and each tool's default centring,
+since the defaults are what users get. Not 3dSkullStrip: on a 7T T1 (ds004645) it removed
+the cerebellum, occipital and inferior temporal lobes, where the slab EPI sat.
 
 Judge (reference): RMS displacement in mm between the two fitted affines over the
 stripped T1's brain voxels, and the correlation of the two aligned means. ffs_allineate's
@@ -15,11 +17,22 @@ image against itself). Histogram costs (hel, nmi, mi) are the comparison, since 
 tool optimises them; AFNI's allcostX lpc/lpa/ls are recorded too (lpc reads normally on
 real pairs, -0.54 for 3dAllineate's fit on the first unit, but +24 for an image against
 itself, so not for self-pairs). Lower is better except mi (AFNI prints it unsigned).
+
+Judge (truth, tissue boundary): none of the above sees a fit that moves the data off the
+brain. allcostX scores only the voxels the two images share, so on the ds004645 slab it
+preferred 3dAllineate's fit (-0.17) with the slab off the brain over ffs's on-brain fit
+(-0.07). Two checks that need no cost either tool optimises: the share of the aligned
+EPI's bright voxels inside the T1 brain (dilated 3 mm), and the GM-WM contrast of the
+aligned EPI across the T1's WM boundary (c2 = 0.5), sampled 1.5 mm either side along the
+boundary normal. T2*-weighted GM is brighter than WM, so a right fit reads positive and a
+wrong one near zero; only boundary points inside the EPI's field of view count, so slabs
+are judged where they are.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -29,6 +42,12 @@ ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
 
 
 YARD_COSTS = ("hel", "nmi", "mi", "lpc", "lpa", "ls")
+
+# Tissue-judge verdict. Set on 10 fits known right or wrong by eye (ds002785, ds006926,
+# ds004645 slabs; 11-24): right fits read in-brain 0.87-0.97 and positive-contrast share
+# 0.64-0.85, wrong ones 0.00-0.20 and ~0.50 (or too few boundary points to score).
+IN_BRAIN_MIN = 0.7
+POS_FRAC_MIN = 0.6
 
 
 def parse_allcost(text: str) -> dict[str, float]:
@@ -47,6 +66,58 @@ def read_aff12(path) -> np.ndarray:
     m = np.eye(4)
     m[:3, :] = np.asarray(rows[-1][:12], dtype=float).reshape(3, 4)
     return m
+
+
+def epi_in_brain(epi: np.ndarray, brain: np.ndarray, vox_mm, dilate_mm: float = 3.0) -> float:
+    """Share of the aligned EPI's bright voxels (> 30% of its 98th percentile) inside
+    ``brain`` dilated by ``dilate_mm`` (scalp and dura sit just outside a strip)."""
+    from scipy import ndimage
+
+    pos = epi[epi > 0]
+    if pos.size == 0:
+        return float("nan")
+    bright = epi > 0.3 * np.percentile(pos, 98)
+    it = max(1, round(dilate_mm / float(np.mean(vox_mm))))
+    grown = ndimage.binary_dilation(brain, iterations=it)
+    return float((bright & grown).sum() / max(1, bright.sum()))
+
+
+def boundary_contrast(
+    epi: np.ndarray,
+    wm: np.ndarray,
+    brain: np.ndarray,
+    vox_mm,
+    d_mm: float = 1.5,
+    max_pts: int = 200_000,
+) -> dict[str, float]:
+    """GM-WM contrast of ``epi`` across the WM boundary of ``wm`` (posterior, same grid).
+
+    Per boundary point: (gm - wm) / mean(gm, wm) of the EPI sampled ``d_mm`` outside and
+    inside along the c2 gradient. Points whose samples fall outside the EPI's field of
+    view (zero) are dropped. Returns the median contrast, the share of positive points
+    and the point count (a slab that misses the brain has few).
+    """
+    from scipy import ndimage
+
+    vox = np.asarray(vox_mm, dtype=float)
+    g = np.stack(np.gradient(ndimage.gaussian_filter(wm.astype(np.float32), 1.0)), 0)
+    g /= vox[:, None, None, None]  # per mm
+    pts = np.argwhere((wm > 0.4) & (wm < 0.6) & brain)
+    if len(pts) > max_pts:
+        pts = pts[:: len(pts) // max_pts + 1]
+    gp = g[:, pts[:, 0], pts[:, 1], pts[:, 2]].T
+    norm = np.linalg.norm(gp, axis=1)
+    keep = norm > 1e-6
+    pts, n = pts[keep], gp[keep] / norm[keep, None]  # n points into WM
+    step = d_mm * n / vox  # voxels
+    out_wm = ndimage.map_coordinates(epi, (pts + step).T, order=1, mode="constant")
+    out_gm = ndimage.map_coordinates(epi, (pts - step).T, order=1, mode="constant")
+    ok = (out_wm > 0) & (out_gm > 0)
+    if ok.sum() < 100:
+        return {"contrast": float("nan"), "pos_frac": float("nan"), "n_pts": float(ok.sum())}
+    c = (out_gm[ok] - out_wm[ok]) / (0.5 * (out_gm[ok] + out_wm[ok]))
+    return {"contrast": float(np.median(c)), "pos_frac": float((c > 0).mean()),
+            "n_pts": float(ok.sum())}  # fmt: skip
 
 
 def rms_displacement(m1: np.ndarray, m2: np.ndarray, pts_rai: np.ndarray) -> float:
@@ -86,12 +157,18 @@ class AllineateCheck(Check):
         epi, t1 = (inputs[r] for r in list(inputs)[:2])
         work.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
-        mean, brain = work / "epi_mean.nii.gz", work / "t1_brain.nii.gz"
+        mean = work / "epi_mean.nii.gz"
+        seg = work / "seg" / "t1"
+        brain, wm = Path(f"{seg}_brain.nii.gz"), Path(f"{seg}_c2.nii.gz")
         res = UnitResult()
         epi, _ = self.trim_noise(epi, work, log, res)
         timed(["3dTstat", "-overwrite", "-mean", "-prefix", str(mean), str(epi)], work, log)
-        timed(["3dSkullStrip", "-overwrite", "-input", str(t1), "-prefix", str(brain)],
-              work, log, timeout_s=1800)  # fmt: skip
+        tpm = os.environ.get("FFS_TPM")
+        if not tpm:
+            raise RuntimeError("FFS_TPM (SPM's tpm/TPM.nii) is needed for the T1 strip")
+        seg.parent.mkdir(exist_ok=True)
+        timed(["ffs_segment", "-input", str(t1), "-tpm", tpm, "-prefix", str(seg), "-brain",
+               "-no_invwarp", "-device", device], work, log, timeout_s=1800)  # fmt: skip
 
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
         out = {s: work / s for s in ("ref", "ffs")}
@@ -113,15 +190,14 @@ class AllineateCheck(Check):
         res.timings.append(("ffs", device.split(",")[0], t, None))
 
         b = nib.Nifti1Image.from_filename(str(brain))
-        vol = np.asarray(b.dataobj)
-        ijk = np.argwhere(vol > 0)[:: max(1, int((vol > 0).sum() // 200000))]
+        mask = np.asarray(nib.Nifti1Image.from_filename(f"{seg}_brainmask.nii.gz").dataobj) > 0
+        ijk = np.argwhere(mask)[:: max(1, int(mask.sum() // 200000))]
         ras = apply_affine(b.affine, ijk)
         rai = ras * np.array([-1.0, -1.0, 1.0])
         m_ref = read_aff12(out["ref"] / "al.aff12.1D")
         m_ffs = read_aff12(out["ffs"] / "al.aff12.1D")
         a = np.asarray(nib.Nifti1Image.from_filename(str(out["ref"] / "al.nii.gz")).dataobj)
         c = np.asarray(nib.Nifti1Image.from_filename(str(out["ffs"] / "al.nii.gz")).dataobj)
-        mask = vol > 0
         x, y = a[mask].astype(float), c[mask].astype(float)
         x, y = x - x.mean(), y - y.mean()
         res.metrics["reference"] = {
@@ -156,13 +232,33 @@ class AllineateCheck(Check):
             if f"{k}_ref" in yard and f"{k}_ffs" in yard:
                 yard[f"{k}_ffs_minus_ref"] = yard[f"{k}_ffs"] - yard[f"{k}_ref"]
         res.metrics["yardstick"] = yard
+
+        # tissue judge: needs no cost either tool optimises (see the module docstring)
+        wmv = np.asarray(nib.Nifti1Image.from_filename(str(wm)).dataobj, dtype=np.float32)
+        bvox = np.sqrt((b.affine[:3, :3] ** 2).sum(0))
+        truth: dict[str, float] = {}
+        for s, img in (("ref", a), ("ffs", c)):
+            e_al = np.asarray(img, dtype=np.float32)
+            truth[f"epi_in_brain_{s}"] = epi_in_brain(e_al, mask, bvox)
+            for k, v in boundary_contrast(e_al, wmv, mask, bvox).items():
+                truth[f"wm_{k}_{s}"] = v
+            pf = truth[f"wm_pos_frac_{s}"]
+            truth[f"aligned_{s}"] = float(
+                truth[f"epi_in_brain_{s}"] > IN_BRAIN_MIN and pf == pf and pf > POS_FRAC_MIN
+            )
+        res.metrics["truth"] = truth
         res.artifacts += [(out[s] / "allcost.txt", "keep") for s in out]
         res.artifacts += [(out[s] / "al.nii.gz", "regenerable") for s in out]
         res.artifacts += [(out[s] / "al.aff12.1D", "keep") for s in out]
-        res.artifacts += [(mean, "keep"), (brain, "regenerable"), (log, "keep")]
+        res.artifacts += [(mean, "keep"), (log, "keep")]
+        res.artifacts += [(f, "regenerable") for f in sorted(seg.parent.glob("*.nii.gz"))]
         res.provenance["ref"] = {"tool": "3dAllineate", "version": afni_version("3dAllineate"),
                                  "args": ARGS}  # fmt: skip
         res.provenance["ffs"] = {"tool": "ffs_allineate", **ffs_version(), "args": ARGS,
                                  "device": device}  # fmt: skip
-        res.provenance["inputs_prep"] = {"epi": "3dTstat -mean", "t1": "3dSkullStrip"}
+        res.provenance["inputs_prep"] = {
+            "epi": "3dTstat -mean",
+            "t1": "ffs_segment -brain (bias-corrected, GM+WM+CSF > 0.95)",
+            "tpm": tpm,
+        }
         return res

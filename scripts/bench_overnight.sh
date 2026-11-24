@@ -23,7 +23,7 @@ UNIT="ffs-bench-$STAMP"
 
 systemd-run --user --unit="$UNIT" --collect \
     -p MemoryMax=96G -p MemorySwapMax=0 \
-    --setenv=PATH --setenv=FSLDIR --setenv=FSLOUTPUTTYPE --setenv=FFS_BENCHMARK_DATA_DIR \
+    --setenv=PATH --setenv=FFS_TPM --setenv=FSLDIR --setenv=FSLOUTPUTTYPE --setenv=FFS_BENCHMARK_DATA_DIR \
     --setenv=FFS_BENCH_ROOT="$ROOT" --setenv=PYTHONUNBUFFERED=1 \
     --working-directory="$ROOT" \
     bash -c "exec '$PY' -m fastfuncstuff.benchmark.work -run -until '$UNTIL' -device '$DEVICE' >> '$LOG' 2>&1"
