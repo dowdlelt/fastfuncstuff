@@ -79,7 +79,7 @@ def _stim_args(conds: dict[str, list[tuple[float, float]]], tdir: Path) -> list[
             args += ["-stim_times", str(i), str(f), model]
         else:  # varying durations: married onset:duration, amplitude 1 per event
             f.write_text(" ".join(f"{o:.3f}:{d:.3f}" for o, d in ev) + "\n")
-            args += ["-stim_times", str(i), str(f), "dmBLOCK(1)"]
+            args += ["-stim_times_AM1", str(i), str(f), "dmBLOCK(1)"]  # AM1 reads the :dur
         args += ["-stim_label", str(i), _label(tt, i)]
     return args
 

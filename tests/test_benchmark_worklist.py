@@ -122,11 +122,12 @@ def test_reml_events_to_stim_times(tmp_path):
     assert set(conds) == {"face", "house", "event"}  # n/a pooled as 'event', singleton dropped
     args = _stim_args(conds, tmp_path)
     assert args[:2] == ["-num_stimts", "3"]
-    models = {args[i + 3]: args[i + 6] for i, a in enumerate(args) if a == "-stim_times"}
+    models = {args[i + 3]: args[i + 6] for i, a in enumerate(args) if a.startswith("-stim_times")}
     by_label = dict(zip(models.values(), models.keys(), strict=True))
     assert by_label["face"] == "BLOCK(2,1)"
     assert by_label["house"] == "dmBLOCK(1)"
     assert by_label["event"] == "GAM"
+    assert args[args.index("dmBLOCK(1)") - 3] == "-stim_times_AM1"  # 3dDeconvolve refuses plain
     house_file = next(p for p in tmp_path.glob("c*.1D") if ":" in p.read_text())
     assert house_file.read_text().split() == ["5.000:1.000", "15.000:3.000"]
 
