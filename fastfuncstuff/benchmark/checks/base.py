@@ -69,6 +69,35 @@ def timed(
     if rc != 0:
         tail = "".join(open(log).readlines()[-15:])
         raise RuntimeError(f"{cmd[0]} exited {rc}:\n{tail}")
+    with open(log, "a") as f:
+        f.write(f"# wall {dt:.3f} s\n")
+    return dt
+
+
+def timed_cached(
+    cmd: list[str],
+    stamp: Path,
+    outputs: list[Path],
+    cwd: Path,
+    log: Path,
+    timeout_s: float = 3600.0,
+) -> float:
+    """``timed``, but a rerun whose ``stamp`` records this exact command and whose
+    ``outputs`` exist returns the recorded seconds instead of fitting again.
+
+    For fits that take hours (3dQwarp at minpatch 9): a unit that fails while scoring
+    should not pay for the fit twice, and the timing must be the fit's, not a cache hit.
+    """
+    import json
+
+    if stamp.exists() and all(o.exists() for o in outputs):
+        rec = json.loads(stamp.read_text())
+        if rec.get("cmd") == cmd:
+            with open(log, "a") as f:
+                f.write(f"$ (reused, {rec['seconds']:.1f} s recorded) {shlex.join(cmd)}\n")
+            return float(rec["seconds"])
+    dt = timed(cmd, cwd, log, timeout_s=timeout_s)
+    stamp.write_text(json.dumps({"cmd": cmd, "seconds": dt}))
     return dt
 
 

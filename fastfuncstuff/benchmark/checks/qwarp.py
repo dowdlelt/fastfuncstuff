@@ -21,7 +21,7 @@ import os
 
 import numpy as np
 
-from .base import Check, UnitResult, _stable_rank, afni_version, ffs_version, timed
+from .base import Check, UnitResult, _stable_rank, afni_version, ffs_version, timed, timed_cached
 
 DXYZ = "1"
 QWARP_ARGS = ["-minpatch", "9", "-blur", "0", "3"]
@@ -42,7 +42,7 @@ class QwarpCheck(Check):
     needs = [["@ds:labels_cohort"]]
     sampling = "depth"
     reference = "AFNI 3dQwarp"
-    timeout_s = 3 * 3600.0  # 3dQwarp at minpatch 9 on a 1 mm brain is tens of minutes
+    timeout_s = 4 * 3600.0  # 3dQwarp at minpatch 9 on a 1 mm brain: 2 h 13 min measured
 
     def plan(self, manifest, index, n):
         """``n`` ordered pairs, spread so sources and bases repeat as little as possible."""
@@ -100,15 +100,19 @@ class QwarpCheck(Check):
         sides = {"ref": work / "ref", "ffs": work / "ffs"}
         for d in sides.values():
             d.mkdir(exist_ok=True)
-        t = timed(
+        t = timed_cached(
             ["3dQwarp", "-overwrite", "-base", str(B), "-source", str(SA),
              "-prefix", str(sides["ref"] / "qw.nii.gz"), *QWARP_ARGS],
+            sides["ref"] / "fit.timing.json",
+            [sides["ref"] / "qw.nii.gz", sides["ref"] / "qw_WARP.nii.gz"],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         res.timings.append(("ref", "cpu", t, threads))
-        t = timed(
+        t = timed_cached(
             ["ffs_qwarp", "-base", str(B), "-source", str(SA),
              "-prefix", str(sides["ffs"] / "qw"), *QWARP_ARGS, "-device", device],
+            sides["ffs"] / "fit.timing.json",
+            [sides["ffs"] / "qw.nii.gz", sides["ffs"] / "qw_WARP.nii.gz"],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         res.timings.append(("ffs", device.split(",")[0], t, None))
@@ -140,7 +144,12 @@ class QwarpCheck(Check):
             jac = d / "jac.nii.gz"
             timed(["3dNwarpFuncs", "-overwrite", "-nwarp", str(warp), "-bulk",
                    "-prefix", str(jac)], work, log)  # fmt: skip
-            j = load(jac).astype(np.float64)
+            # warps live on each tool's padded grid (3dQwarp 187x243x196, ffs 187x244x196
+            # for a 179x210x179 base): score folding on the base grid
+            jac_b = d / "jac_base.nii.gz"
+            timed(["3dresample", "-overwrite", "-master", str(B), "-rmode", "NN",
+                   "-input", str(jac), "-prefix", str(jac_b)], work, log)  # fmt: skip
+            j = load(jac_b).astype(np.float64)
             inside = load(B) > 0
             truth[f"fold_frac_{side}"] = float((j[inside] <= 0).mean())
             warped[side] = next(iter(sorted(d.glob("qw.nii*"))))
@@ -159,7 +168,11 @@ class QwarpCheck(Check):
 
         for d in sides.values():
             res.artifacts += [(p, "regenerable") for p in sorted(d.glob("qw*"))]
-            res.artifacts += [(d / "jac.nii.gz", "regenerable"), (d / "lab_warped.nii.gz", "keep")]
+            res.artifacts += [
+                (d / "jac.nii.gz", "regenerable"),
+                (d / "jac_base.nii.gz", "regenerable"),
+            ]
+            res.artifacts += [(d / "lab_warped.nii.gz", "keep"), (d / "fit.timing.json", "keep")]
         res.artifacts += [(p, "regenerable") for p in (S, SL, B, SA)]
         res.artifacts += [(BL, "keep"), (SLA, "keep"), (aff, "keep"), (log, "keep")]
         res.provenance["ref"] = {"tool": "3dQwarp", "version": afni_version("3dQwarp"),

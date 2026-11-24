@@ -154,3 +154,16 @@ def test_reml_events_non_bids_columns(tmp_path):
         "event_onset\tduration\tstimulus\n1\t20\tcheck\n60\t20\tcheck\n3\t0.4\tletter\n9\t0.4\tletter\n"
     )
     assert {k: len(v) for k, v in _conditions(ev).items()} == {"check": 2, "letter": 2}
+
+
+def test_timed_cached_reuses_recorded_fit(tmp_path):
+    """A rerun with the same command and outputs returns the recorded seconds, no refit."""
+    from fastfuncstuff.benchmark.checks.base import timed_cached
+
+    out, stamp, log = tmp_path / "out.txt", tmp_path / "fit.timing.json", tmp_path / "log"
+    cmd = ["sh", "-c", f"echo x >> {out}"]
+    t1 = timed_cached(cmd, stamp, [out], tmp_path, log)
+    t2 = timed_cached(cmd, stamp, [out], tmp_path, log)
+    assert t2 == t1 and out.read_text() == "x\n"
+    timed_cached([*cmd[:2], cmd[2] + " "], stamp, [out], tmp_path, log)  # new command: refits
+    assert out.read_text() == "x\nx\n"
