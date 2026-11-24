@@ -97,6 +97,14 @@ class PhysioCheck(Check):
             rels += [m.rel for m in index.matching(p, ".json")]
         return list(dict.fromkeys(rels))
 
+    def plan(self, manifest, index, n):
+        # an acquisition offers physio when some runs have it (ds002785: 188 of ~200), so
+        # a sampled run can still lack a recording
+        return [
+            (k, i) for k, i in super().plan(manifest, index, n)
+            if any(r.endswith("_physio.tsv.gz") for r in i)
+        ]  # fmt: skip
+
     def run(self, key, inputs, work, device):
         imgs = [r for r in inputs if r.endswith((".nii", ".nii.gz")) and "_physio" not in r]
         mag = next(r for r in imgs if "part-phase" not in r and not r.endswith("_phase.nii.gz"))
