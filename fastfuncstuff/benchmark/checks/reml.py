@@ -33,24 +33,40 @@ ONSET_COLS = ("onset", "event_onset", "onset_s", "onsets")
 CONDITION_COLS = ("trial_type", "stimulus", "condition", "event_type", "stim_type")
 
 
-def event_columns(header: list[str]) -> tuple[str | None, str | None]:
+def event_columns(
+    header: list[str], curated: dict | None = None
+) -> tuple[str | None, str | None, str | None]:
+    """(onset, duration, condition) column names: the curated ``events_columns`` mapping
+    first (a curated condition of None = one condition), then the known aliases."""
     pick = lambda opts: next((c for c in opts if c in header), None)  # noqa: E731
-    return pick(ONSET_COLS), pick(CONDITION_COLS)
+    cur = curated or {}
+    cols = (
+        cur["onset"] if "onset" in cur else pick(ONSET_COLS),
+        cur["duration"] if "duration" in cur else pick(("duration",)),
+        cur["trial_type"] if "trial_type" in cur else pick(CONDITION_COLS),
+    )
+    missing = [c for c in cols if c is not None and c not in header]
+    if missing:
+        raise ValueError(f"curated events_columns {missing} not in the header {header}")
+    return cols
 
 
-def _conditions(events_tsv: Path) -> dict[str, list[tuple[float, float]]]:
+def _conditions(
+    events_tsv: Path, curated: dict | None = None
+) -> dict[str, list[tuple[float, float]]]:
     """condition -> [(onset, duration)], the commonest first, n/a dropped."""
     with open(events_tsv, newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         rows = list(reader)
-        onset_col, cond_col = event_columns(list(reader.fieldnames or []))
+        onset_col, dur_col, cond_col = event_columns(list(reader.fieldnames or []), curated)
     if onset_col is None:
         return {}
     out: dict[str, list[tuple[float, float]]] = {}
     for r in rows:
         try:
             onset = float(r[onset_col])
-            dur = float(r.get("duration") or 0)
+            d = r.get(dur_col) if dur_col else None
+            dur = 0.0 if d in (None, "", "n/a") else float(d)
         except (KeyError, ValueError):
             continue
         tt = ((r.get(cond_col) if cond_col else None) or "event").strip()
@@ -144,8 +160,11 @@ class RemlCheck(Check):
             raise ValueError(f"unknown curated stimulus model {model.get('kind')!r}")
         freq = float((model.get("freq_hz_subjects") or {}).get(key.get("sub"), model["freq_hz"]))
         with open(events, newline="") as f:
-            blocks = [(float(r["onset"]), float(r["duration"]))
-                      for r in csv.DictReader(f, delimiter="\t")]  # fmt: skip
+            reader = csv.DictReader(f, delimiter="\t")
+            on, du, _ = event_columns(
+                list(reader.fieldnames or []), self.curation.get("events_columns")
+            )
+            blocks = [(float(r[on]), float(r[du])) for r in reader]
         nt = nib.Nifti1Image.from_filename(str(image)).shape[3]
         regs = sinusoid_regressors(blocks, freq, float(tr), nt)
         args = ["-num_stimts", str(len(regs))]
@@ -170,9 +189,14 @@ class RemlCheck(Check):
                 "fix the sidecar (or curated block) before this run can be modelled"
             )
         model = self.curation.get("stimulus_model")
-        conds = {} if model else _conditions(events)
+        cols = self.curation.get("events_columns") or {}
+        conds = {} if model else _conditions(events, cols)
         if not model and not conds:
-            raise ValueError(f"no trial_type with >= {MIN_EVENTS} events in {events.name}")
+            raise ValueError(
+                f"no condition with >= {MIN_EVENTS} events in {events.name} (columns "
+                f"{event_columns(events.read_text().splitlines()[0].split(chr(9)), cols)}); "
+                "set curated events_columns, or exclude_units if it is not a design"
+            )
         work.mkdir(parents=True, exist_ok=True)
         log = work / "commands.log"
         tdir = work / "timing"
@@ -274,7 +298,7 @@ class RemlCheck(Check):
         res.provenance["inputs_prep"] = {
             "scaling": "3dcalc c*step(b)*min(200,a/b*100), b = 3dTstat mean, c = 3dAutomask",
             "conditions": {k: len(v) for k, v in conds.items()},
-            "event_columns": event_columns(events.read_text().splitlines()[0].split("\t")),
+            "event_columns": event_columns(events.read_text().splitlines()[0].split("\t"), cols),
             "stimulus_model": model,
         }
         return res

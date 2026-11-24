@@ -201,7 +201,8 @@ def test_unit_curation_and_read_meta_overrides(tmp_path):
         "noise_volumes": 3, "noise_volumes_acquisitions": {"task-b_bold": 0}}}  # fmt: skip
     a, b = unit_curation(m, "task-a_bold"), unit_curation(m, "task-b_bold")
     assert a == {"sidecar": {"RepetitionTime": 1.184}, "noise_volumes": 3,
-                 "stimulus_model": None, "sidecar_files": [], "source": "dataset owner"}  # fmt: skip
+                 "stimulus_model": None, "sidecar_files": [], "events_columns": {},
+                 "source": "dataset owner"}  # fmt: skip
     assert b["noise_volumes"] == 0
     side = tmp_path / "run_bold.json"
     side.write_text(json.dumps({"RepetitionTime": 0.037, "EchoTime": 0.02}))
@@ -210,6 +211,47 @@ def test_unit_curation_and_read_meta_overrides(tmp_path):
     assert chk.read_meta({"run_bold.json": side}) == {"RepetitionTime": 1.184, "EchoTime": 0.02}
     with pytest.raises(ValueError, match="source"):
         apply_curation({**m, "curated": {"sidecar": {"RepetitionTime": 1.0}}})
+
+
+def test_events_columns_curated_beat_aliases(tmp_path):
+    """MassedEvents writes event_onset/stimulus; the aliases find them, a curated mapping
+    can pick another column, and trial_type None models every row as one condition."""
+    import pytest
+
+    from fastfuncstuff.benchmark.checks.reml import _conditions
+
+    ev = tmp_path / "run_events.tsv"
+    ev.write_text("event_onset\tduration\tstimulus\tblock\n"
+                  "10\t20\tcheckerboard\tA\n40\t0.4\tletter\tA\n"
+                  "70\t20\tcheckerboard\tB\n90\t0.4\tletter\tB\n")  # fmt: skip
+    assert sorted(_conditions(ev)) == ["checkerboard", "letter"]
+    assert _conditions(ev)["checkerboard"] == [(10.0, 20.0), (70.0, 20.0)]
+    assert sorted(_conditions(ev, {"trial_type": "block"})) == ["A", "B"]
+    assert list(_conditions(ev, {"trial_type": None})) == ["event"]
+    assert _conditions(ev, {"duration": None})["letter"] == [(40.0, 0.0), (90.0, 0.0)]
+    with pytest.raises(ValueError, match="not in the header"):
+        _conditions(ev, {"trial_type": "trial_type"})
+
+
+def test_unit_exclusion_matches_key_and_check():
+    from fastfuncstuff.benchmark.census import unit_curation, unit_exclusion
+
+    m = {"dataset_id": "X", "acquisitions": [], "curated": {
+        "events_columns": {"trial_type": "stimulus"},
+        "events_columns_acquisitions": {"task-b_bold": {"trial_type": None}},
+        "exclude_units": [
+            {"check": "blipflip", "match": {"sub": "2490", "ses": "01"}, "reason": "PA = AP"},
+            {"match": {"acq": "task-movie_bold"}, "reason": "continuous features"}]}}  # fmt: skip
+    assert (
+        unit_exclusion(m, "blipflip", {"acq": "fmap-epi", "sub": "2490", "ses": "01"}) == "PA = AP"
+    )
+    assert unit_exclusion(m, "moco", {"acq": "fmap-epi", "sub": "2490", "ses": "01"}) is None
+    assert unit_exclusion(m, "blipflip", {"acq": "fmap-epi", "sub": "2490", "ses": "02"}) is None
+    assert (
+        unit_exclusion(m, "reml", {"acq": "task-movie_bold", "sub": "1"}) == "continuous features"
+    )
+    assert unit_curation(m, "task-a_bold")["events_columns"] == {"trial_type": "stimulus"}
+    assert unit_curation(m, "task-b_bold")["events_columns"] == {"trial_type": None}
 
 
 def test_sinusoid_regressors_phase_free():

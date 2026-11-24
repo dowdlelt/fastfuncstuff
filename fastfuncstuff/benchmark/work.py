@@ -41,7 +41,9 @@ def plan(wl, manifests: Path, check_name: str, datasets: list[str], n: int) -> N
             print(f"{ds}: excluded ({m['excluded']}), skipped")
             continue
         index = Index(source_from_manifest(m).list_files())
-        units = check.plan(m, index, n)
+        from .census import unit_exclusion
+
+        units = [u for u in check.plan(m, index, n) if not unit_exclusion(m, check.name, u[0])]
         added = wl.add_units(check.name, ds, units)
         print(f"{ds}: {len(units)} units planned for {check.name}, {added} new")
 
@@ -152,6 +154,13 @@ def run(
         label = f"[{u['id']}] {u['check_name']} {u['dataset']} {' '.join(f'{k}-{v}' for k, v in key.items())}"
         print(label, flush=True)
         work = root / "units" / u["check_name"] / u["dataset"] / f"unit{u['id']:06d}"
+        from .census import unit_exclusion
+
+        why = unit_exclusion(_manifest(manifests, u["dataset"]), u["check_name"], key)
+        if why:  # curated after the unit was planned
+            wl.finish(u["id"], "excluded", why)
+            print(f"    excluded: {why}", flush=True)
+            continue
         try:
             m = _manifest(manifests, u["dataset"])
             paths, downloaded = fetch(m, json.loads(u["inputs"]), root / "cache")
@@ -164,7 +173,7 @@ def run(
 
             chk = checks[u["check_name"]]()
             chk.curation = unit_curation(m, key.get("acq"))
-            if chk.curation["sidecar"] or chk.curation["noise_volumes"] is not None:
+            if chk.curation["sidecar"] or chk.curation["noise_volumes"] is not None or chk.curation["events_columns"]:  # fmt: skip
                 wl.record_provenance(u["id"], "curation", chk.curation)
             res = chk.run(key, paths, work, device)
             for judge, vals in res.metrics.items():

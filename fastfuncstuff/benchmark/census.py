@@ -619,6 +619,16 @@ _CURATED_TEMPLATE: dict[str, Any] = {
     # acquisition id -> how the stimulus is modelled when the events file cannot say it
     # (ds004645 checker: one 240 s row, the stimulus is a 0.05 Hz contrast oscillation)
     "stimulus_models": {},
+    # which events.tsv column is which, when the BIDS names are absent or wrong:
+    # {"onset": "event_onset", "duration": "duration", "trial_type": "stimulus"}. A trial_type
+    # of null models every row as one condition. Unset keys fall back to the aliases a check
+    # knows (reml.ONSET_COLS / CONDITION_COLS).
+    "events_columns": {},
+    "events_columns_acquisitions": {},  # acquisition id -> the same mapping
+    # single units a check must not run, matched on the unit key (acq, sub, ses, run) and
+    # optionally the check: [{"check": "blipflip", "match": {"sub": "2490", "ses": "01"},
+    # "reason": "..."}]. A matching pending unit is marked excluded when claimed.
+    "exclude_units": [],
     "notes": "",
 }
 
@@ -681,8 +691,23 @@ def unit_curation(manifest: dict[str, Any], acq: str | None) -> dict[str, Any]:
         "noise_volumes": None if nv is None else int(nv),
         "stimulus_model": (cur["stimulus_models"] or {}).get(acq),
         "sidecar_files": list(cur["sidecar_files"] or []),
+        "events_columns": {
+            **(cur["events_columns"] or {}),
+            **((cur["events_columns_acquisitions"] or {}).get(acq) or {}),
+        },
         "source": cur["source"],
     }
+
+
+def unit_exclusion(manifest: dict[str, Any], check: str, key: dict[str, Any]) -> str | None:
+    """The curated reason ``check`` must skip the unit ``key``, or None."""
+    cur = {**_CURATED_TEMPLATE, **(manifest.get("curated") or {})}
+    for rule in cur["exclude_units"] or []:
+        if rule.get("check") not in (None, check):
+            continue
+        if all(str(key.get(k)) == str(v) for k, v in (rule.get("match") or {}).items()):
+            return str(rule.get("reason") or "excluded by curation")
+    return None
 
 
 def load_manifests(out_dir: Path, curated: bool = True) -> list[dict[str, Any]]:
