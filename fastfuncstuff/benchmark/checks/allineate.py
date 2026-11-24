@@ -127,6 +127,10 @@ class AllineateCheck(Check):
             "affine_rms_mm": rms_displacement(m_ref, m_ffs, rai),
             "aligned_r": float((x * y).sum() / np.sqrt((x * x).sum() * (y * y).sum())),
             "ref_rms_from_identity_mm": rms_displacement(m_ref, np.eye(4), rai),
+            "ffs_rms_from_identity_mm": rms_displacement(m_ffs, np.eye(4), rai),
+            # isotropic scale; ffs failures so far sit on its 0.8 bound (ds002603, ds004645)
+            "scale_ref": float(abs(np.linalg.det(m_ref[:3, :3])) ** (1 / 3)),
+            "scale_ffs": float(abs(np.linalg.det(m_ffs[:3, :3])) ** (1 / 3)),
         }
         yard: dict[str, float | None] = {}
         for s in out:
