@@ -494,6 +494,18 @@ class TestComputeCost:
         cost = _compute_cost(vol, vol, None, CostContext(name="lpc"))
         assert math.isfinite(cost.item())
 
+    def test_lpc_zz_on_a_volume_with_weight(self):
+        # lpc+ZZ scored on whole volumes (the start-choice path) read the 3-D volume
+        # as a batch of candidates and indexed past the weight: IndexError on CPU, a
+        # device-side assert on CUDA.
+        torch.manual_seed(0)
+        vol = _sphere_volume((24, 24, 24)) + 0.05 * torch.randn(24, 24, 24)
+        weight = (vol > 0.1).float()
+        name, micho, zfinal = _parse_cost("lpc+ZZ")
+        ctx = CostContext(name=name, micho=micho, micho_zfinal=zfinal, micho_npts=500)
+        cost = _compute_cost(vol, -vol, weight, ctx)
+        assert cost.dim() == 0 and math.isfinite(cost.item())
+
     def test_unknown_cost_raises(self):
         vol = torch.randn(8, 8, 8)
         with pytest.raises(ValueError, match="Unknown cost"):
@@ -1989,6 +2001,49 @@ class TestMovie:
         final = rec._frames[-1].values[0].float()
         inner = expected > 0.05
         torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)
+
+
+def test_cmass_start_margin_is_sign_safe():
+    from fastfuncstuff.processing.allineate import _cmass_wins
+
+    assert _cmass_wins(0.2, 0.1) and not _cmass_wins(0.11, 0.1)
+    # negative (wrong-sign lpc) starts: cmass must still score clearly HIGHER
+    assert not _cmass_wins(-0.12, -0.10)
+    assert _cmass_wins(-0.05, -0.10) and not _cmass_wins(-0.09, -0.10)
+
+
+def test_late_seeds_skip_the_blurred_stage(monkeypatch):
+    """The start poses join at the sharp stage and compete on the sharp cost.
+
+    Blurred lpc between an EPI and a stripped T1 ranks the wrong pose above the right
+    one, so a start sent through the blur was walked off the answer before the sharp
+    cost could see it (bench ds002785/ds002603/ds004499: every lpc EPI->T1 fit at the
+    0.8 scale bound). AFNI appends its null set at the fine pass for the same reason.
+    """
+    import fastfuncstuff.processing.allineate as al
+
+    seen: list[tuple[str, np.ndarray]] = []
+
+    def fake_refine(base, source, weight, params, config, ctx, voxdims, bounds, device, **kw):
+        seen.append((kw["desc"], np.asarray(params).copy()))
+        # the "sharp" stage scores the late seed best, the blurred stage the trial
+        good = np.allclose(params, _identity_physical())
+        return params, (1.0 if good else 0.5) if kw["desc"].startswith("S1") else 0.0
+
+    monkeypatch.setattr(al, "_refine_adam_normalized", fake_refine)
+    vol = _sphere_volume((24, 24, 24))
+    far = _identity_physical()
+    far[0], far[6] = 5.0, 0.8
+    cfg = AffineAlignConfig(cost="ls", powell_maxfev=0, verb=0)
+    best, cost = al._refine_progressive(
+        vol, vol, None, [far], cfg, CostContext(name="ls"), (1.0, 1.0, 1.0),
+        _compute_param_bounds(vol.shape), DEV, verb=0, late_seeds=[_identity_physical()],
+    )  # fmt: skip
+    blurred = [p for d, p in seen if d.startswith("S0")]
+    sharp = [p for d, p in seen if d.startswith("S1")]
+    assert len(blurred) == 1 and np.allclose(blurred[0], far)
+    assert len(sharp) == 2
+    assert np.allclose(best, _identity_physical()) and cost == 1.0
 
 
 def test_search_pivot_is_the_grid_centre_and_round_trips():

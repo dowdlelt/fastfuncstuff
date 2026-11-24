@@ -923,7 +923,9 @@ def _compute_cost(
         raise ValueError(f"Unknown cost function: {name}")
 
     if ctx.micho is not None:
-        cost = cost + _micho_terms(ctx, base, warped, weight)
+        # Flattened: _micho_terms reads a 2-D input as a batch of candidates, and a
+        # volume is 3-D (lpc+ZZ died indexing a 63x74x62 volume as 63 candidates).
+        cost = cost + _micho_terms(ctx, base.reshape(-1), warped.reshape(-1), weight)
 
     # Overlap penalty (subtracted because we maximise; AFNI adds it to a cost it
     # minimises). Only when -ov is set and a transform is available.
@@ -1454,9 +1456,12 @@ def _coarse_search_joint(
         )
         movie.stage("coarse polish")
     coarse_cost = _batched_sampled_cost(source_blur, pts_xyz, base_pts, weight_c, blokset_c, ctx_c)
+    # Rigid polish, as AFNI's coarse pass (6 parameters, scale frozen): on a blurred
+    # cross-contrast cost, freeing scale lets a seed shrink the source into whatever
+    # spurious optimum the blur made -- the EPI->T1 lpc fits all ran to the 0.8 bound.
     out_phys, out_costs = _refine_adam_batched(
         [seeds[i].cpu().numpy() for i in top],
-        config,
+        replace(config, dof="rigid"),
         bounds,
         device,
         coarse_cost,
@@ -1481,19 +1486,15 @@ def _coarse_search_joint(
         if len(trials) >= config.tbest:
             break
 
-    # Insurance seed (AFNI carries the identity/pinit transform into the fine
-    # pass): the cmass shift is already baked into align_matrix, so the identity
-    # *residual* is the "trust cmass, no rotation" fallback. If the coarse search
-    # ever ranks only bad basins, refinement still has this known-decent start to
-    # fall back to, and it's nearly free now that trials are batched.
+    # The start itself is NOT added here: it joins at the sharp stage (see
+    # _refine_progressive ``late_seeds``), as AFNI's null set does.
     out = [p for _, p in trials]
-    out.append(_identity_physical())
 
     if verb >= 1:
         p = trials[0][1]
         print(
             f"  Joint coarse: {B} seeds → polished {nkeep} → kept {len(trials)} "
-            f"(+identity) (best cost={trials[0][0]:.4f}, "
+            f"(best cost={trials[0][0]:.4f}, "
             f"rot=({p[3]:.1f}°,{p[4]:.1f}°,{p[5]:.1f}°), "
             f"shift=({p[0]:.1f},{p[1]:.1f},{p[2]:.1f}))"
         )
@@ -2711,6 +2712,7 @@ def _refine_progressive(
     verb: int = 1,
     sample: SampleSet | None = None,
     skip_blur: bool = False,
+    late_seeds: list[np.ndarray] | tuple = (),
 ) -> tuple[np.ndarray, float]:
     """Progressive multi-resolution refinement: Adam (GPU) + Powell polish.
 
@@ -2727,12 +2729,22 @@ def _refine_progressive(
     (AFNI ``rad=sqrt(blokrad^2+smooth^2)``) so the now-correlated neighbours
     don't dominate the within-blok variance.
 
+    ``late_seeds`` (the start poses: identity residual, the other start) skip the
+    blurred stage and join at the first sharp one, so the winner is picked on the
+    unblurred cost. AFNI does the same with its null set (identity + cmass, appended
+    to the candidates before the fine pass, fineblur 0). It matters for inverse
+    contrast: blurred lpc between an EPI and a stripped T1 is inverted -- on ds002785
+    the wrong pose scores better than the right one at every blur from 5 to 8 mm,
+    in AFNI's cost as in ours -- so a good start sent through the blur is walked
+    away from the answer before the sharp cost, which ranks it 50x better, can see it.
+
     Returns:
         (params, cost): the (12,) best refined parameters (physical units) and
         the best cost achieved (the in-mask sampled cost for blok costs).
     """
     free_mask = _get_free_mask(config.dof)
     trials = [(0.0, p.copy()) for p in trial_params_list]
+    late = [(0.0, np.asarray(p, dtype=np.float64).copy()) for p in late_seeds]
 
     vmean = sum(voxdims) / 3.0
 
@@ -2784,6 +2796,13 @@ def _refine_progressive(
 
     cma_state: dict = {}  # CMA-ES covariance carried between resolution stages
     for si, (sigma_vox, n_iters, lr, dedup_after) in enumerate(stages):
+        if sigma_vox == 0.0 and late:
+            trials = trials + late
+            late = []
+            # the CMA covariance was learned for the carried trials, not these
+            cma_state.clear()
+        if not trials:
+            continue
         if sigma_vox > 0.0:
             base_s = _separable_smooth_3d(base, sigma_vox)
             source_s = _separable_smooth_3d(source, sigma_vox)
@@ -3652,6 +3671,15 @@ def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
 _CMASS_START_MARGIN = 1.25
 
 
+def _cmass_wins(c_cmass: float, c_hdr: float) -> bool:
+    """cmass beats the headers by the margin (higher cost is better).
+
+    Costs can be negative far from the answer (lpc with the wrong sign of
+    correlation), where ``c_cmass > 1.25 * c_hdr`` lets cmass win while scoring
+    worse, so the margin is taken on the magnitude."""
+    return c_cmass - c_hdr > (_CMASS_START_MARGIN - 1.0) * abs(c_hdr)
+
+
 def _header_or_cmass_start(
     setup: _GridSetup,
     base: Tensor,
@@ -3663,7 +3691,7 @@ def _header_or_cmass_start(
     verb: int,
     *,
     force_cross_grid: bool = False,
-) -> tuple[_GridSetup, AffineAlignConfig]:
+) -> tuple[_GridSetup, AffineAlignConfig, np.ndarray | None]:
     """Start where the headers put the source, unless the cmass shift scores better.
 
     The cmass shift is a guess from two centroids. With partial slabs they do not
@@ -3674,9 +3702,15 @@ def _header_or_cmass_start(
     start. The two cannot share one setup: the source is resampled, and its
     validity mask built, at the start, so a header candidate scored inside the
     cmass setup is judged against a field of view already cut away. Hence two
-    preparations and one cost each, at the identity residual."""
+    preparations and one cost each, at the identity residual.
+
+    The third return is the start NOT chosen, as a residual on the chosen setup (a
+    pure voxel translation by the cmass shift): the choice is made on a blurred cost,
+    which can rank the two backwards (ds002785: cmass 3 mm from the answer, headers
+    13 mm, headers chosen), so the loser is still refined -- on the sharp cost,
+    see ``late_seeds``. The choice still decides which footprint the cost samples."""
     if not np.any(setup.cmass_shift != 0.0) or config.cmass_direct is not None:
-        return setup, config
+        return setup, config, None
     hdr_config = replace(config, cmass=False)
     hdr = _prepare_grid(
         base, base_header, source_native, source_header, hdr_config, device, 0,
@@ -3705,13 +3739,17 @@ def _header_or_cmass_start(
     # The headers are the prior; cmass is a guess from two centroids. On ds003427
     # sub-05 a 2.5% start-cost edge sent cmass 29 mm off, while correct header
     # starts won by 1.4-9x, so cmass has to win clearly.
-    use_hdr = c_cmass < _CMASS_START_MARGIN * c_hdr
+    use_hdr = not _cmass_wins(c_cmass, c_hdr)
     if verb >= 1:
         print(
             f"  Start: headers cost {c_hdr:.4f}, headers + cmass {c_cmass:.4f} "
             f"-> {'headers' if use_hdr else 'cmass'}"
         )
-    return (hdr, hdr_config) if use_hdr else (setup, config)
+    # Pivot-free: a pure translation reads the same about any centre.
+    t = np.asarray(setup.cmass_shift, dtype=np.float64)
+    other = _identity_physical()
+    other[:3] = t if use_hdr else -t
+    return (hdr, hdr_config, other) if use_hdr else (setup, config, other)
 
 
 def _align(
@@ -3756,7 +3794,7 @@ def _align(
         save_weight_path=None if full_to_work is not None else save_weight_path,
         force_cross_grid=full_to_work is not None,
     )
-    setup, config = _header_or_cmass_start(
+    setup, config, other_start = _header_or_cmass_start(
         setup, base, base_header, source_native, source_header, config, device, verb,
         force_cross_grid=full_to_work is not None,
     )  # fmt: skip
@@ -3923,6 +3961,10 @@ def _align(
     if verb >= 1:
         print("Refinement phase:")
 
+    # The starts (AFNI's null set) join at the sharp stage, never the blurred one.
+    late_seeds = [] if not config.twopass else [_identity_physical()]
+    if other_start is not None:
+        late_seeds.append(other_start)
     with _recording_cost_trace(save_cost_trace_path is not None) as cost_trace:
         best_params_phys, best_refine_cost = _refine_progressive(
             base_opt,
@@ -3936,6 +3978,7 @@ def _align(
             device,
             verb,
             sample=sample,
+            late_seeds=late_seeds,
         )
     if cost_trace is not None and save_cost_trace_path is not None:
         cost_trace.save(save_cost_trace_path)
