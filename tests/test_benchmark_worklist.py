@@ -167,3 +167,10 @@ def test_timed_cached_reuses_recorded_fit(tmp_path):
     assert t2 == t1 and out.read_text() == "x\n"
     timed_cached([*cmd[:2], cmd[2] + " "], stamp, [out], tmp_path, log)  # new command: refits
     assert out.read_text() == "x\nx\n"
+
+
+def test_parse_allcost_reads_named_costs():
+    from fastfuncstuff.benchmark.checks.allineate import parse_allcost
+
+    text = "++ allcost output: init #0\n   ls   = 0.2856\n   nmi  = 0.946878\n   lpc+ = 1\n   hel  = -0.0854437\n"
+    assert parse_allcost(text) == {"ls": 0.2856, "nmi": 0.946878, "hel": -0.0854437}

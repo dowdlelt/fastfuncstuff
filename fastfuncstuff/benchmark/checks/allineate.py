@@ -9,8 +9,11 @@ stripped T1's brain voxels, and the correlation of the two aligned means. ffs_al
 search is stochastic (CMA-ES), so a unit is one draw: report the distribution over
 units, not a per-unit pass.
 
-TODO: a common-yardstick judge (both matrices scored by one cost, e.g. lpc evaluated by
-3dAllineate at each matrix), so this check can say which fit is better.
+Judge (yardstick): each tool's aligned mean scored against the stripped T1 by one
+program (3dAllineate -allcostX -nocmass, no source automask: with it ls is 0.52 for an
+image against itself). Histogram costs (hel, nmi, mi) are the comparison, since neither
+tool optimises them; AFNI's allcostX lpc/lpa are recorded raw (they print +24 for an
+identical pair, so read them only as a ranking). Lower is better for all of them.
 """
 
 from __future__ import annotations
@@ -22,6 +25,19 @@ import numpy as np
 from .base import Check, UnitResult, afni_version, ffs_version, timed
 
 ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
+
+
+YARD_COSTS = ("hel", "nmi", "mi", "lpc", "lpa", "ls")
+
+
+def parse_allcost(text: str) -> dict[str, float]:
+    """``name = value`` lines of 3dAllineate -allcostX output."""
+    out = {}
+    for ln in text.splitlines():
+        parts = ln.split("=")
+        if len(parts) == 2 and parts[0].strip() in YARD_COSTS:
+            out[parts[0].strip()] = float(parts[1])
+    return out
 
 
 def read_aff12(path) -> np.ndarray:
@@ -111,6 +127,18 @@ class AllineateCheck(Check):
             "aligned_r": float((x * y).sum() / np.sqrt((x * x).sum() * (y * y).sum())),
             "ref_rms_from_identity_mm": rms_displacement(m_ref, np.eye(4), rai),
         }
+        yard: dict[str, float | None] = {}
+        for s in out:
+            ylog = out[s] / "allcost.txt"
+            timed(["3dAllineate", "-base", str(brain), "-source", str(out[s] / "al.nii.gz"),
+                   "-cost", "lpc", "-nocmass", "-allcostX"], out[s], ylog)  # fmt: skip
+            for k, v in parse_allcost(ylog.read_text()).items():
+                yard[f"{k}_{s}"] = v
+        for k in ("hel", "nmi", "mi"):
+            if f"{k}_ref" in yard and f"{k}_ffs" in yard:
+                yard[f"{k}_ffs_minus_ref"] = yard[f"{k}_ffs"] - yard[f"{k}_ref"]
+        res.metrics["yardstick"] = yard
+        res.artifacts += [(out[s] / "allcost.txt", "keep") for s in out]
         res.artifacts += [(out[s] / "al.nii.gz", "regenerable") for s in out]
         res.artifacts += [(out[s] / "al.aff12.1D", "keep") for s in out]
         res.artifacts += [(mean, "keep"), (brain, "regenerable"), (log, "keep")]
