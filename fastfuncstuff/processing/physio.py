@@ -465,8 +465,10 @@ def notch_tr_harmonics(
 
 
 def _bandpass(x: np.ndarray, lo: float, hi: float, fs: float, order: int = 3) -> np.ndarray:
-    b, a = signal.butter(order, [lo, min(hi, 0.45 * fs)], btype="band", fs=fs)
-    return signal.filtfilt(b, a, x - x.mean())
+    # second-order sections: as (b, a) a ~1 Hz band at a 10 kHz recording rate (ds003192)
+    # has its poles on z = 1 and filtfilt refuses it
+    sos = signal.butter(order, [lo, min(hi, 0.45 * fs)], btype="band", fs=fs, output="sos")
+    return signal.sosfiltfilt(sos, x - x.mean())
 
 
 def track_rate(

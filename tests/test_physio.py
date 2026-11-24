@@ -921,3 +921,15 @@ def test_cli_multiecho_checks_echo_order_and_cleans_each_echo(tmp_path):
         main([*args, "-phase", phase[1], *common])
     with pytest.raises(SystemExit, match="must increase"):
         main(["-input", args[2], args[1], *common])
+
+
+def test_find_beats_at_a_10khz_recording_rate():
+    """ds003192 records pulse at 10 kHz: a ~1 Hz band in (b, a) form had its poles on
+    z = 1 and filtfilt raised; second-order sections keep it stable."""
+    from fastfuncstuff.processing.physio import CARDIAC_BAND, find_beats
+
+    fs, hr = 10_000.0, 1.15
+    t = np.arange(0, 60, 1 / fs)
+    x = np.sin(2 * np.pi * hr * t) ** 15 + 0.05 * np.random.default_rng(0).standard_normal(t.size)
+    pk = find_beats(t, x, CARDIAC_BAND)
+    assert abs(1 / np.median(np.diff(pk)) - hr) < 0.02
