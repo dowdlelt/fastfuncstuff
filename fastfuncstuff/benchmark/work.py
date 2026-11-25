@@ -315,6 +315,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from .worklist import Worklist
 
+    # Only -plan starts a worklist; anything else on a missing one is a mistyped root, and
+    # opening it would leave an empty database there that reports nothing.
+    if not args.plan and not (args.root / "worklist.sqlite").exists():
+        p.error(f"no worklist at {args.root} (wrong -root / FFS_BENCH_ROOT?)")
     wl = Worklist(args.root / "worklist.sqlite")
     if args.plan:
         if not args.datasets:
