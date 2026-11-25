@@ -1486,6 +1486,7 @@ def _coarse_search_joint(
                 pts_xyz,
                 zero_outside=True,
                 interp=ctx_c.interp,
+                fused_cpu=not _batch_is_free(source_blur.device),
             )
             val = local_pearson_value_batched(base_pts, wb, weight_c, blokset_c, ctx.ppow)
         costs.append((-val) if is_lpc else val.abs())
@@ -1907,6 +1908,7 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
     """
     is_lpc = ctx.name == "lpc"
     pearson_base = prepare_local_pearson_batched(base_pts, weight_s, blokset)
+    fused_cpu = not _batch_is_free(source_stage.device)
     # Available memory and point geometry are stable within one refinement stage.
     candidate_batch_steps: dict[int, int] = {}
 
@@ -1935,7 +1937,12 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
                 )
 
         warped = sample_affine_at_points_batched(
-            source_stage, matrices, points_xyz, zero_outside=True, interp=ctx.interp
+            source_stage,
+            matrices,
+            points_xyz,
+            zero_outside=True,
+            interp=ctx.interp,
+            fused_cpu=fused_cpu,
         )  # (T, M)
         val = local_pearson_value_batched_prepared(pearson_base, warped, ctx.ppow)  # (T,)
         c = (-val) if is_lpc else val.abs()

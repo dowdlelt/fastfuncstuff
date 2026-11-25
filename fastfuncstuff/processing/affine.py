@@ -1038,12 +1038,112 @@ def _normalized_grid_constants(
     return matrix, scale * (-0.5) - 1.0, scale * upper - 1.0
 
 
+def _trilinear_points_batched(
+    flat: Tensor, nz: int, ny: int, nx: int, matrices: Tensor, homog: Tensor
+) -> Tensor:
+    """Trilinear sample of ``source`` at ``matrices @ homog`` -> (B, M), zero outside.
+
+    The same arithmetic as the grid_sample route below (border-clamped trilinear,
+    AFNI's outval=0 past the half-voxel border), written as one elementwise chain so
+    inductor can fuse it into a single loop: transform, bounds test, clamp, eight
+    gathers, blend. It works in voxel coordinates directly, skipping grid_sample's
+    [-1, 1] round trip, so it agrees with that route to float rounding (5.6e-6 max on
+    values ~0.6) and a point lying exactly on the half-voxel border can land on the
+    other side of it. Only worth calling compiled: eager it is 3x SLOWER than
+    grid_sample, compiled 4.3x faster on the CPU (289k points x 8 candidates,
+    54 -> 12.6 ms).
+
+    Takes the volume flattened, with its shape as plain ints: a 3-D tensor argument
+    made dynamo guard on its strides and recompile whenever the grid changed.
+    """
+    c = torch.einsum("bij,mj->bmi", matrices[:, :3, :], homog)  # (B, M, 3) voxel x, y, z
+    sx, sy, sz = c[..., 0], c[..., 1], c[..., 2]
+    oob = (
+        (sx < -0.5)
+        | (sx > nx - 0.5)
+        | (sy < -0.5)
+        | (sy > ny - 0.5)
+        | (sz < -0.5)
+        | (sz > nz - 0.5)
+    )
+    sx, sy, sz = sx.clamp(0, nx - 1), sy.clamp(0, ny - 1), sz.clamp(0, nz - 1)
+    x0 = sx.floor().clamp(max=max(nx - 2, 0))
+    y0 = sy.floor().clamp(max=max(ny - 2, 0))
+    z0 = sz.floor().clamp(max=max(nz - 2, 0))
+    fx, fy, fz = sx - x0, sy - y0, sz - z0
+    dx, dy, dz = min(1, nx - 1), min(1, ny - 1) * nx, min(1, nz - 1) * nx * ny
+    base = (z0.long() * ny + y0.long()) * nx + x0.long()
+
+    def lerp_x(off):
+        return flat[base + off] * (1 - fx) + flat[base + off + dx] * fx
+
+    c0 = lerp_x(0) * (1 - fy) + lerp_x(dy) * fy
+    c1 = lerp_x(dz) * (1 - fy) + lerp_x(dz + dy) * fy
+    return (c0 * (1 - fz) + c1 * fz).masked_fill(oob, 0.0)
+
+
+_fused_point_sampler: dict[str, object] = {}
+
+
+def _get_fused_point_sampler():
+    """Compiled :func:`_trilinear_points_batched`, or None if compiling is unavailable.
+
+    A failed build latches to None, so the caller falls back to grid_sample (the
+    eager form of the fused kernel is the slow one, see its docstring).
+    """
+    import os
+
+    from .interp import _already_compiling, _is_compile_failure
+
+    if (
+        os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
+        or os.environ.get("FFS_FUSED_SAMPLER") == "0"
+        or _already_compiling()
+    ):
+        return None
+    if "cpu" not in _fused_point_sampler:
+        try:
+            _fused_point_sampler["cpu"] = torch.compile(_trilinear_points_batched, dynamic=True)
+        except Exception:
+            _fused_point_sampler["cpu"] = None
+    compiled = _fused_point_sampler["cpu"]
+    if compiled is None:
+        return None
+
+    def call(source, matrices, homog):
+        nz, ny, nx = source.shape
+        b = matrices.shape[0]
+        if b == 1:
+            # dynamo specializes a size-1 dim, so a lone candidate would cost a second
+            # compile; score it twice instead.
+            matrices = matrices.expand(2, -1, -1)
+        try:
+            # Always without grad: dynamo guards on grad mode, and the callers that
+            # get here never need it -- a mismatch recompiled once per call site.
+            with torch.no_grad():
+                out = compiled(  # type: ignore[operator]
+                    source.contiguous().reshape(-1), nz, ny, nx, matrices, homog
+                )
+            return out[:b]
+        except Exception as exc:
+            if not _is_compile_failure(exc):
+                raise
+            _fused_point_sampler["cpu"] = None
+            print(
+                f"  [compile] fused point sampler failed ({type(exc).__name__}); using grid_sample"
+            )
+            return None
+
+    return call
+
+
 def sample_affine_at_points_batched(
     source: Tensor,
     matrices: Tensor,
     points_xyz: Tensor,
     zero_outside: bool = True,
     interp: str = "linear",
+    fused_cpu: bool = False,
 ) -> Tensor:
     """Sample ``source`` at M points under B transforms -> (B, M).
 
@@ -1053,6 +1153,12 @@ def sample_affine_at_points_batched(
     so only one copy of the source is needed regardless of B; other kernels go
     through the separable resampler, which takes scattered coordinates directly.
     Caller should chunk B to bound the B*M grid memory.
+
+    ``fused_cpu`` asks for the compiled fused trilinear kernel on the CPU (linear,
+    zero_outside, no autograd). It is opt-in and decided by the caller, not by a
+    timer, because it differs from the grid_sample route at float rounding and a
+    search that switched part-way would depend on machine timing. A caller with
+    enough work to repay a compile (ffs_allineate's CPU refinement) sets it.
     """
     device = source.device
     dtype = source.dtype
@@ -1061,6 +1167,19 @@ def sample_affine_at_points_batched(
     pts = points_xyz.to(device=device, dtype=dtype)
     homog = torch.cat([pts, torch.ones(M, 1, device=device, dtype=dtype)], dim=1)  # (M,4)
     snz, sny, snx = source.shape
+
+    if (
+        fused_cpu
+        and interp == "linear"
+        and zero_outside
+        and device.type == "cpu"
+        and not (torch.is_grad_enabled() and (matrices.requires_grad or source.requires_grad))
+    ):
+        fused = _get_fused_point_sampler()
+        if fused is not None:
+            out = fused(source, matrices.to(dtype), homog)
+            if out is not None:
+                return out
 
     if interp == "linear":
         # Normalizing *after* the transform was half the sampler's wall time: it
