@@ -802,7 +802,12 @@ def _parse_work_dxyz(value: str | float | None) -> str | float:
 
 def _select_device(device_arg: str | None) -> torch.device:
     """Honour ``-device`` if given, else use the canonical CUDA > CPU policy."""
-    return setup_device(device_arg, tf32=REGISTRATION_TF32)
+    device = setup_device(device_arg, tf32=REGISTRATION_TF32)
+    if device.type == "cpu":
+        from fastfuncstuff.utils import keep_freed_memory_in_process
+
+        keep_freed_memory_in_process()
+    return device
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:

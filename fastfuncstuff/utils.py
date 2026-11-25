@@ -52,6 +52,41 @@ def suppress_io_progress() -> Iterator[None]:
 MPS_DEVICE = torch.device("mps", 0)
 
 
+_ALLOCATOR_TUNED = False
+
+
+def keep_freed_memory_in_process() -> bool:
+    """Stop glibc handing per-chunk buffers back to the kernel. Linux only; idempotent.
+
+    A CPU loop that allocates a few tens of MB per step (a batch of sampling grids,
+    say) otherwise maps fresh pages from the kernel and unmaps them on every step:
+    glibc's dynamic mmap threshold and its 128 KiB trim threshold return them as
+    soon as they are freed, and the kernel zeroes each page again on the next touch.
+    ffs_allineate on CPU spent 504 of 2380 CPU-seconds in the kernel this way; with
+    this a sample + local-Pearson loop went 4.64 s -> 2.66 s (sys 6.1 s -> 0.5 s).
+    Blocks over 32 MiB are still mapped and returned as before, so a huge
+    temporary does not stay resident.
+    """
+    global _ALLOCATOR_TUNED
+    if _ALLOCATOR_TUNED:
+        return True
+    import ctypes
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        m_trim_threshold, m_top_pad, m_mmap_threshold = -1, -2, -3
+        ok = libc.mallopt(m_mmap_threshold, 32 << 20)
+        ok &= libc.mallopt(m_trim_threshold, (1 << 31) - 1)
+        ok &= libc.mallopt(m_top_pad, 256 << 20)
+    except (OSError, AttributeError):
+        return False
+    _ALLOCATOR_TUNED = bool(ok)
+    return _ALLOCATOR_TUNED
+
+
 def get_device(prefer_device: str | None = None) -> torch.device:
     """
     Select the execution device.
