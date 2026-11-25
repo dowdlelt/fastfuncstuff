@@ -55,6 +55,7 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     combine_brain_masks,
     enable_determinism,
+    frame_coverage,
     image_support,
     parse_prefix,
     preallineate_outputs,
@@ -70,7 +71,6 @@ from fastfuncstuff.processing.affine import base_into_source_frame
 from fastfuncstuff.processing.formwarp import METRICS
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
-from fastfuncstuff.processing.mask import data_coverage_mask
 from fastfuncstuff.processing.optiwarp import (
     FORCES,
     MATCH_MODES,
@@ -998,13 +998,7 @@ def _run_timeseries(
     inv_frames: list[tuple] = []
     min_jac = float("inf")
     for t in tqdm(range(n_t), desc="optiwarp", disable=args.verb < 1, leave=True):
-        cover_t = (
-            None
-            if args.nocoverage
-            else data_coverage_mask(
-                source[t].float().to(device), erode=args.coverage_erode, device=device
-            )
-        )
+        cover_t = frame_coverage(source[t], args, device)
         res = optiwarp(
             base,
             source[t],

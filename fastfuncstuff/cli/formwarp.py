@@ -43,6 +43,7 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     combine_brain_masks,
     enable_determinism,
+    frame_coverage,
     image_support,
     parse_prefix,
     preallineate_outputs,
@@ -65,7 +66,6 @@ from fastfuncstuff.processing.formwarp import (
 )
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
-from fastfuncstuff.processing.mask import data_coverage_mask
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -822,13 +822,7 @@ def _run_timeseries(
     inv_frames: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     quiet = config.verb
     for t in tqdm(range(n_t), desc="formwarp", disable=args.verb < 1, leave=True):
-        cover_t = (
-            None
-            if args.nocoverage
-            else data_coverage_mask(
-                source[t].float().to(device), erode=args.coverage_erode, device=device
-            )
-        )
+        cover_t = frame_coverage(source[t], args, device)
         # Silence per-volume SyN chatter; the bar is the progress signal.
         res = formwarp(
             base,

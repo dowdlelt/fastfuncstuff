@@ -5486,7 +5486,18 @@ def add_coverage_args(parser, automask_help: str | None = None) -> None:
         "image's empty region is excluded from the metric AND filled from the other "
         "image, so a clipped FoV presents no artificial edge for the warp to chase. "
         "Use this when a zero background is a REAL edge you want registered -- a "
-        "skull-stripped anatomical, say -- rather than data loss.",
+        "skull-stripped anatomical, say -- rather than data loss. An image that looks "
+        "skull-stripped already gets this automatically (see -force_coverage).",
+    )
+    g.add_argument(
+        "-force_coverage",
+        "-force-coverage",
+        action="store_true",
+        help="Keep coverage handling on an image whose zero background looks like a "
+        "masked brain (under 40%% of the grid and under 75%% of its own bounding box). "
+        "By default such an image's background counts as a real edge, because "
+        "cross-filling it erases the brain boundary: on stripped T1 -> MNI it lost up "
+        "to 10 cortical labels per subject and folded the warp.",
     )
     g.add_argument(
         "-void_guard",
@@ -5568,15 +5579,39 @@ def image_support(
             frac = 100.0 * cover.float().mean().item()
             if frac < 99.95:
                 print(f"Coverage ({label}): {frac:.1f}% of voxels hold data")
-        if verb >= 0 and looks_skull_stripped(cover):
-            print(
-                f"  ⚠️  WARNING: the {label}'s zero background looks like a masked brain, not "
-                "missing data.\n"
-                "      Coverage handling will erase that boundary and block the warp from "
-                "pulling tissue in across it.\n"
-                "      For skull-stripped images, rerun with -nocoverage."
-            )
+        if looks_skull_stripped(cover):
+            # A stripped brain's zero background is anatomy, not missing data, and the
+            # coverage machinery treats it as missing: cross-fill paints the other
+            # image's intensities over it and the void guard blocks motion across it.
+            # Warning about it was not enough -- the benchmark, autoproc and the preset
+            # tuner all ran with it on (wiki: ffs warp label loss to MNI).
+            if getattr(args, "force_coverage", False):
+                if verb >= 0:
+                    print(
+                        f"  ⚠️  WARNING: the {label}'s zero background looks like a masked "
+                        "brain; keeping coverage handling as -force_coverage asked."
+                    )
+            else:
+                cover = None
+                if verb >= 1:
+                    print(
+                        f"  the {label} looks skull-stripped: its zero background is "
+                        "treated as a real edge, not missing data (-force_coverage to "
+                        "override)"
+                    )
     return brain, cover
+
+
+def frame_coverage(vol: torch.Tensor, args, device: torch.device) -> torch.Tensor | None:
+    """Per-frame coverage for timeseries mode, under :func:`image_support`'s rules."""
+    from fastfuncstuff.processing.mask import data_coverage_mask, looks_skull_stripped
+
+    if args.nocoverage:
+        return None
+    cover = data_coverage_mask(vol.float().to(device), erode=args.coverage_erode, device=device)
+    if looks_skull_stripped(cover) and not getattr(args, "force_coverage", False):
+        return None
+    return cover
 
 
 def combine_brain_masks(

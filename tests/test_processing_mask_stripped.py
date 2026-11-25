@@ -24,3 +24,28 @@ def test_clipped_fov_and_slab_are_not():
     slab = (z.abs() < 0.3) & (y.abs() < 0.9) & (x.abs() < 0.9)  # partial-coverage box
     assert not looks_skull_stripped(slab)
     assert not looks_skull_stripped(torch.ones(10, 10, 10, dtype=torch.bool))
+
+
+def _args(**kw):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        **{"nocoverage": False, "coverage_erode": 0, "force_coverage": False, **kw}
+    )
+
+
+def test_image_support_drops_coverage_on_a_stripped_brain():
+    """Coverage on a stripped T1 -> MNI pair lost up to 10 labels and folded the warp."""
+    from fastfuncstuff.cli_utils import frame_coverage, image_support
+
+    z, y, x = _grid()
+    vol = ((z / 0.7) ** 2 + (y / 0.8) ** 2 + (x / 0.7) ** 2 <= 1).float() * 100.0
+    cpu = torch.device("cpu")
+    assert image_support(vol, _args(), cpu, False, "base", 0)[1] is None
+    assert frame_coverage(vol, _args(), cpu) is None
+    assert image_support(vol, _args(force_coverage=True), cpu, False, "base", 0)[1] is not None
+    assert frame_coverage(vol, _args(force_coverage=True), cpu) is not None
+
+    clipped = ((z + 0.5 * y) < 0.6).float() * 100.0  # a clipped FoV keeps its coverage
+    assert image_support(clipped, _args(), cpu, False, "base", 0)[1] is not None
+
