@@ -147,6 +147,10 @@ BUILT_SETTINGS = (
 #: reporting "(none)" over a window full of data.
 NONE_LABEL = "(choose a dataset)"
 
+#: Colour-scale swatch in the picker, logical pixels. The icon is drawn at
+#: exactly this aspect, so Qt never letterboxes it into a thinner strip.
+CMAP_SWATCH = (40, 10)
+
 
 class _Bridge(QtCore.QObject):
     """Marshals worker-thread load completions onto the GUI thread."""
@@ -1700,9 +1704,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         form.addRow(self.thrbrick_head, self.thrbrick_row)
 
         self.cmap_box = QtWidgets.QComboBox()
-        self.cmap_box.setIconSize(QtCore.QSize(40, 10))
+        self.cmap_box.setIconSize(QtCore.QSize(*CMAP_SWATCH))
+        # macOS draws a combo's popup as a native menu, whose delegate shrinks
+        # every icon to the 16 px small-icon size: the swatches were dashes.
+        # A plain item delegate keeps the combo's icon size, as Linux does.
+        self.cmap_box.setItemDelegate(QtWidgets.QStyledItemDelegate(self.cmap_box))
+        self.cmap_box.view().setIconSize(self.cmap_box.iconSize())
         for name in available_colormaps():
-            self.cmap_box.addItem(colormap_icon(name), name)
+            self.cmap_box.addItem(colormap_icon(name, *CMAP_SWATCH), name)
         self.cmap_box.activated.connect(
             lambda _: self._apply(SetColormap, colormap=self.cmap_box.currentText())
         )

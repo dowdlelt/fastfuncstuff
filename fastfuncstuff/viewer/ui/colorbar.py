@@ -34,14 +34,20 @@ BAR_MIN_HEIGHT = 150
 TICKS = 1000
 
 
-def colormap_icon(name: str, width: int = 64, height: int = 12) -> QtGui.QIcon:
-    """A left-to-right swatch of one scale, for a picker to show beside its name."""
-    lut = build_lut(name, width, device=torch.device("cpu"))
-    rgb = (lut * 255).round().to(torch.uint8).unsqueeze(0).expand(height, -1, -1).contiguous()
-    image = QtGui.QImage(
-        rgb.numpy().data, width, height, 3 * width, QtGui.QImage.Format.Format_RGB888
-    ).copy()
-    return QtGui.QIcon(QtGui.QPixmap.fromImage(image))
+def colormap_icon(name: str, width: int = 40, height: int = 10, scale: int = 2) -> QtGui.QIcon:
+    """A left-to-right swatch of one scale, for a picker to show beside its name.
+
+    ``width`` x ``height`` is the logical size; the pixels are ``scale`` times
+    that and tagged with the device-pixel ratio, so a Retina screen gets a
+    sharp swatch instead of an upscaled blur, and other screens downsample.
+    """
+    w, h = width * scale, height * scale
+    lut = build_lut(name, w, device=torch.device("cpu"))
+    rgb = (lut * 255).round().to(torch.uint8).unsqueeze(0).expand(h, -1, -1).contiguous()
+    image = QtGui.QImage(rgb.numpy().data, w, h, 3 * w, QtGui.QImage.Format.Format_RGB888).copy()
+    pixmap = QtGui.QPixmap.fromImage(image)
+    pixmap.setDevicePixelRatio(scale)
+    return QtGui.QIcon(pixmap)
 
 
 def thresholds_itself(layer) -> bool:
