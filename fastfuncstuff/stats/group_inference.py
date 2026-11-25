@@ -88,7 +88,10 @@ def _ols_nulls(design, ya, yb, n_iter, seed) -> list[BrickNull]:
         ]
     out = []
     for k, sp in enumerate(t_tests(design, ya, yb)):
-        src = OlsNull(sp.y.float(), sp.x, sp.c, n_iter=n_iter, seed=seed, permute=sp.permute)
+        src = OlsNull(
+            sp.y.float(), sp.x, sp.c, n_iter=n_iter, seed=seed, permute=sp.permute,
+            x_of_perm=sp.x_of_perm,
+        )  # fmt: skip
         out.append(BrickNull(sp.label, sp.brick, src, main=(k == 0)))
     return out
 

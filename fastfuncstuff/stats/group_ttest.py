@@ -14,15 +14,19 @@ against:
 * paired: a one-sample test of A-B, then each set alone; set B borrows set A's
   covariates (3dttest++ does the same).
 
-The null used for cluster inference (:class:`OlsNull`) never refits: for a
-fixed design the flipped/permuted data enter only through ``Q^T y*`` and
+The null used for cluster inference (:class:`OlsNull`) never refits voxel by
+voxel: the flipped/permuted data enter only through ``Q^T y*`` and
 ``||y*||^2``, and the latter is invariant under sign flips and permutations,
 so a batch of null t-maps is a couple of GEMMs against the residual matrix.
-See [[Group-level inference]] in the wiki.
+With covariates, a permutation moves each subject's covariates with its data
+and re-centres them within the new sets (3dttest++ since March 2020), so the
+design changes per iteration; only its small per-iteration factor is
+recomputed, never the voxel side.  See [[Group-level inference]] in the wiki.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -79,14 +83,27 @@ class TtestDesign:
     def two_sets(self) -> bool:
         return self.n_b > 0
 
-    def centered_covariates(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Covariates as they enter the model, after ``-center``."""
+    def centered_covariates(
+        self, perm: np.ndarray | None = None
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Covariates as they enter the model, after ``-center``.
+
+        ``perm`` (length nA+nB) relabels the sets for a permutation null: row
+        ``i`` of the stacked A-then-B covariates becomes subject ``perm[i]``'s,
+        and centring is redone within the new sets, as 3dttest++'s
+        ``TT_matrix_setup`` permutes the raw columns before ``TT_centerize``.
+        """
         if not self.q:
             return None, None
         ca = np.asarray(self.cov_a, dtype=np.float64)
         cb = None
         if self.two_sets:
             cb = ca.copy() if self.paired else np.asarray(self.cov_b, dtype=np.float64)
+        if perm is not None:
+            if cb is None or self.paired:
+                raise ValueError("covariate permutation needs two independent sets")
+            both = np.vstack([ca, cb])[np.asarray(perm)]
+            ca, cb = both[: self.n_a], both[self.n_a :]
         if self.center == "NONE":
             return ca, cb
         if self.center == "SAME" and cb is not None and not self.paired:
@@ -332,6 +349,9 @@ class TestSpec:
     x: np.ndarray
     c: np.ndarray
     permute: bool  # label permutation is meaningful (independent sets, A-B block)
+    # With covariates, the design a relabeling ``perm`` produces (covariates
+    # follow their subjects and are re-centred); None when X does not change.
+    x_of_perm: Callable[[np.ndarray], np.ndarray] | None = None
 
 
 def t_tests(design: TtestDesign, ya: Tensor, yb: Tensor | None = None) -> list[TestSpec]:
@@ -366,10 +386,18 @@ def t_tests(design: TtestDesign, ya: Tensor, yb: Tensor | None = None) -> list[T
             )
         blocks.append(one(design.label_a, ya, ca))
         blocks.append(one(design.label_b, yb, cb))
+    x_of_perm = None
+    if design.two_sets and not design.paired and design.q:
+        na, nb = design.n_a, design.n_b
+
+        def x_of_perm(pi: np.ndarray) -> np.ndarray:
+            return two_sample_matrix(*design.centered_covariates(pi), na, nb)
+
     out = []
     for j, (prefix, y, x, cons, perm) in enumerate(blocks):
+        xp = x_of_perm if perm else None
         for k, c in enumerate(cons):
-            out.append(TestSpec(f"{prefix}_{names[k]}", 2 * (j * p1 + k), y, x, c, perm))
+            out.append(TestSpec(f"{prefix}_{names[k]}", 2 * (j * p1 + k), y, x, c, perm, xp))
     return out
 
 
@@ -384,12 +412,16 @@ class OlsNull:
 
     Each iteration flips the sign of every residual at random and, with
     ``permute``, also shuffles which row of the design each residual sits in
-    (3dttest++'s ``-randomsign`` / ``-permute``).  All flips are drawn up front
-    from ``seed``, so iteration ``i`` is the same map whatever batch size the
+    (3dttest++'s ``-randomsign`` / ``-permute``).  ``x_of_perm`` gives the
+    design for a relabeling when it changes with it (covariates travel with
+    their subjects and are re-centred, as 3dttest++ does since March 2020);
+    without it the design is fixed.  All flips are drawn up front from
+    ``seed``, so iteration ``i`` is the same map whatever batch size the
     memory plan chooses.
 
     For y* = Pi (s . r):  Q^T y* = (Q[Pi^-1] . s)^T r, the contrast numerator is
-    the same with Q w in place of Q, and ||y*||^2 = ||r||^2.
+    the same with Q w in place of Q, and ||y*||^2 = ||r||^2.  A per-iteration
+    design brings its own Q, w and scale; the voxel side is unchanged.
     """
 
     y: Tensor  # [N, V] on device (already blurred, if blurring)
@@ -398,6 +430,7 @@ class OlsNull:
     n_iter: int
     seed: int = 0
     permute: bool = False
+    x_of_perm: Callable[[np.ndarray], np.ndarray] | None = None
     dof: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -418,6 +451,11 @@ class OlsNull:
         self._perm = (
             np.stack([rng.permutation(n) for _ in range(self.n_iter)]) if self.permute else None
         )
+        self._qi = self._qwi = self._scalei = None
+        if self._perm is not None and self.x_of_perm is not None:
+            self._qi, self._qwi, self._scalei = _per_design_factors(
+                np.stack([self.x_of_perm(pi) for pi in self._perm]), self.c
+            )
         self._toz = TToZ(self.dof, dev)
 
     @property
@@ -436,22 +474,50 @@ class OlsNull:
     def t_maps(self, start: int, nb: int) -> Tensor:
         dev = self._r.device
         s = torch.as_tensor(self._signs[start : start + nb], device=dev)  # [nb, N]
+        scale: float | Tensor = self._scale
         if self._perm is None:
             a = self._qw.unsqueeze(0) * s  # [nb, N]
             b = self._q.T.unsqueeze(0) * s.unsqueeze(1)  # [nb, p, N]
         else:
             inv = torch.as_tensor(np.argsort(self._perm[start : start + nb], axis=1), device=dev)
-            a = self._qw[inv] * s
-            b = self._q[inv].transpose(1, 2) * s.unsqueeze(1)
+            if self._qi is None:
+                a = self._qw[inv] * s
+                b = self._q[inv].transpose(1, 2) * s.unsqueeze(1)
+            else:
+                sl = slice(start, start + nb)
+                qi = torch.as_tensor(self._qi[sl], device=dev)  # [nb, N, p]
+                qwi = torch.as_tensor(self._qwi[sl], device=dev)  # [nb, N]
+                scale = torch.as_tensor(self._scalei[sl], device=dev).unsqueeze(1)
+                a = torch.gather(qwi, 1, inv) * s
+                rows = torch.gather(qi, 1, inv.unsqueeze(2).expand(-1, -1, qi.shape[2]))
+                b = rows.transpose(1, 2) * s.unsqueeze(1)
         num = a @ self._r  # [nb, V]
         proj = torch.einsum("bpn,nv->bpv", b, self._r)
         rss = (self._ss.unsqueeze(0) - (proj * proj).sum(1)).clamp_min(0)
-        se = torch.sqrt(rss / self.dof) * self._scale
+        se = torch.sqrt(rss / self.dof) * scale
         return torch.where(se > 0, num / torch.where(se > 0, se, torch.ones_like(se)), 0.0)
 
     def __call__(self, start: int, nb: int) -> Tensor:
         """A :data:`cluster_inference.NullSource`: ``[nb, V]`` null z-maps."""
         return self._toz(self.t_maps(start, nb))
+
+
+def _per_design_factors(xs: np.ndarray, c: np.ndarray):
+    """``Q``, ``Q w`` and contrast scale for a stack of designs ``[k, N, p]``.
+
+    By SVD rather than QR: a permutation can hand one set a covariate that is
+    constant within it (all one sex), which centring zeroes.  The A-B contrast
+    stays estimable, so that direction is dropped (its Q column zeroed) rather
+    than blowing the fit up; dof stays nominal.
+    """
+    u, sv, vt = np.linalg.svd(xs, full_matrices=False)  # [k,N,p], [k,p], [k,p,p]
+    keep = sv > sv[:, :1] * max(xs.shape[1:]) * np.finfo(np.float64).eps
+    inv_s = np.where(keep, 1.0 / np.where(keep, sv, 1.0), 0.0)
+    g = inv_s * np.einsum("kpq,q->kp", vt, c)  # S^+ V^T c
+    q = u * keep[:, None, :]
+    qw = np.einsum("knp,kp->kn", q, g)
+    f32 = np.float32
+    return q.astype(f32), qw.astype(f32), np.sqrt((g * g).sum(1)).astype(f32)
 
 
 class TToZ2D:

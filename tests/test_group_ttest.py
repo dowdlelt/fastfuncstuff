@@ -137,6 +137,60 @@ def test_null_shortcut_equals_refitting_the_flipped_data(kind):
         np.testing.assert_allclose(got[i], fit.t[0].numpy(), rtol=2e-4, atol=2e-4)
 
 
+@pytest.mark.parametrize("center", ["DIFF", "SAME", "NONE"])
+def test_permutation_null_moves_covariates_with_their_subjects(center):
+    """3dttest++ (March 2020 on) permutes the raw covariate columns with the
+    data, re-centres within the new sets, then refits; a fixed X is the old
+    behaviour this replaces."""
+    from fastfuncstuff.stats.group_ttest import t_tests
+
+    ya, yb = _data(9)
+    ya, yb = ya.float(), yb.float()
+    rng = np.random.default_rng(10)
+    ca, cb = rng.standard_normal((9, 2)) + 2, rng.standard_normal((7, 2))
+    des = TtestDesign(9, 7, cov_a=ca, cov_b=cb, cov_names=("a", "b"), center=center)
+    sp = t_tests(des, ya, yb)[0]
+    assert sp.permute and sp.x_of_perm is not None
+    null = OlsNull(sp.y, sp.x, sp.c, n_iter=8, seed=2, permute=True, x_of_perm=sp.x_of_perm)
+    got = null.t_maps(0, 8).numpy()
+    x0 = sp.x
+    r = sp.y.numpy() - x0 @ (np.linalg.pinv(x0) @ sp.y.numpy())
+    both = np.vstack([ca, cb])
+    for i in range(8):
+        pi = null._perm[i]
+        nca, ncb = both[pi][:9], both[pi][9:]
+        if center == "DIFF":
+            nca, ncb = nca - nca.mean(0), ncb - ncb.mean(0)
+        elif center == "SAME":
+            mu = both.mean(0)
+            nca, ncb = nca - mu, ncb - mu
+        x = np.zeros((16, 6))
+        x[:9, 0], x[:9, 1:3], x[9:, 3], x[9:, 4:6] = 1, nca, 1, ncb
+        ystar = (r * null._signs[i][:, None])[pi]
+        fit = ols_contrasts(torch.tensor(ystar, dtype=torch.float64), x, sp.c[None])
+        np.testing.assert_allclose(got[i], fit.t[0].numpy(), rtol=2e-4, atol=2e-4)
+
+
+def test_permuted_design_with_a_constant_covariate_drops_it():
+    """A binary covariate can land all one level in a permuted set; centring
+    zeroes it there, and the A-B intercept must still come out as the fit on
+    the design without that column."""
+    from fastfuncstuff.stats.group_ttest import _per_design_factors
+
+    rng = np.random.default_rng(11)
+    x = np.zeros((10, 4))
+    x[:5, 0], x[5:, 2] = 1, 1
+    x[5:, 3] = rng.standard_normal(5)  # set A's covariate column stays all zero
+    c = np.array([1.0, 0, -1.0, 0])
+    q, qw, scale = _per_design_factors(x[None], c)
+    y = rng.standard_normal((10, 3))
+    xr, cr = x[:, [0, 2, 3]], np.array([1.0, -1.0, 0])
+    beta = np.linalg.lstsq(xr, y, rcond=None)[0]
+    np.testing.assert_allclose(qw[0] @ y, cr @ beta, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(scale[0], np.sqrt(cr @ np.linalg.solve(xr.T @ xr, cr)), rtol=1e-5)
+    np.testing.assert_allclose(q[0] @ (q[0].T @ y), xr @ beta, rtol=1e-4, atol=1e-5)
+
+
 def test_null_is_independent_of_batching():
     ya, _ = _data(6)
     y, x, c = main_test(TtestDesign(9), ya.float(), None)
