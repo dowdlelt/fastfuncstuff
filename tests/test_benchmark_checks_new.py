@@ -58,3 +58,61 @@ def test_nordic_memory_guard_and_tsnr():
     x = 100 + rng.standard_normal((4, 4, 2, 200)).astype(np.float32)
     mask = np.ones((4, 4, 2), bool)
     assert 80 < median_tsnr(x, mask, 200) < 120
+
+
+def test_warp_mni_plan_spreads_groups_and_cohort_scores(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.benchmark.checks.warp_mni import WarpMniCheck, cohort_scores
+    from fastfuncstuff.benchmark.checks.warp_pair import deformation_judges
+
+    cohort = [{"id": f"{g}-{i}", "image": "h", "brain": "b", "labels": "l"}
+              for g in ("OASIS-TRT-20", "NKI-RS-22", "MMRR-21") for i in range(1, 6)]  # fmt: skip
+    units = WarpMniCheck().plan({"dataset_id": "MB", "cohort": cohort}, None, 4)
+    groups = [k["subject"].rsplit("-", 1)[0] for k, _ in units]
+    assert len(units) == 4 and len(set(groups[:3])) == 3  # one per group before any repeats
+
+    lab = np.zeros((10, 10, 10), np.int16)
+    lab[2:5, 2:8, 2:8], lab[5:8, 2:8, 2:8] = 1, 2
+    shifted = np.roll(lab, 1, axis=1)
+    for i, arr in enumerate((lab, lab, shifted)):
+        d = tmp_path / f"unit{i:06d}" / "ants"
+        d.mkdir(parents=True)
+        nib.save(nib.Nifti1Image(arr, np.eye(4)), d / "labels_mni.nii.gz")
+    s = cohort_scores(sorted(tmp_path.glob("unit*")), tools=("ants", "sswarper"))
+    assert set(s) == {"ants"} and s["ants"]["n_subjects"] == 3
+    shift_dice = s["ants"]["pair_dice_median"]  # two of the three pairs involve the shift
+    assert 0.5 < shift_dice < 1.0
+    assert abs(s["ants"]["pair_dice_mean"] - (1.0 + 2 * shift_dice) / 3) < 1e-12
+
+    detj = np.array([1.0, 0.5, 2.0, -0.1])
+    j = deformation_judges(detj, np.ones(4, bool))
+    assert j["fold_frac"] == 0.25 and abs(j["logjac_sd"] - np.log([1, 0.5, 2]).std()) < 1e-12
+
+
+def test_label_judges_flag_a_lost_label_and_write_a_table():
+    from fastfuncstuff.benchmark.checks.warp_pair import deformation_judges, label_judges
+
+    aff = np.zeros((12, 12, 12), np.int32)
+    aff[1:6, 1:6, 1:6], aff[6:11, 6:11, 6:11], aff[1:3, 8:10, 8:10] = 1, 2, 3
+    warped = aff.copy()
+    warped[3:6, 1:6, 1:6] = 0  # label 1 keeps 2/5 of its volume: lost
+    warped[aff == 3] = 0  # label 3 vanishes
+    detj = np.ones(aff.shape)
+    detj[warped == 2] = 2.0
+    j, tsv = label_judges(warped, aff, detj, np.array([1, 2, 3]), base=aff)
+    assert j["n_labels_lost"] == 2 and j["n_labels_vanished"] == 1
+    assert abs(j["label_vol_ratio_min"]) < 1e-12 and j["label_vol_ratio_max"] == 1.0
+    assert abs(j["label_logjac_max"] - np.log(2)) < 1e-9
+    lines = tsv.splitlines()
+    assert lines[0].split("\t") == [
+        "label",
+        "vox_affine",
+        "vox_warped",
+        "vol_ratio",
+        "mean_logjac",
+        "dice",
+    ]
+    assert lines[1].split("\t")[:4] == ["1", "125", "50", "0.4000"] and len(lines) == 4
+    d = deformation_judges(np.r_[np.full(98, 1.0), 0.3, 3.0], np.ones(100, bool))
+    assert d["frac_det_below_half"] == d["frac_det_above_2"] == 0.01

@@ -80,13 +80,82 @@ def _load(p: Path) -> np.ndarray:
 
 
 def deformation_judges(detj: np.ndarray, inside: np.ndarray) -> dict[str, float]:
-    """Folding share and log det J spread inside the base brain (det J itself, not bulk)."""
+    """Folding, and how far local volume change reaches, inside the base brain.
+
+    ``detj`` is det J itself (not AFNI's bulk = det J - 1). The spread hides a squeezed
+    corner, so the tails are reported too: 0.1/1/99/99.9th percentiles of log det J and
+    the share of voxels whose volume more than halves or doubles."""
     d = detj[inside].astype(np.float64)
     pos = d[d > 0]
+    lj = np.log(pos) if pos.size else np.array([np.nan])
+    p001, p01, p99, p999 = np.percentile(lj, [0.1, 1, 99, 99.9])
     return {
         "fold_frac": float((d <= 0).mean()),
-        "logjac_sd": float(np.log(pos).std()) if pos.size else float("nan"),
+        "logjac_sd": float(lj.std()),
+        "logjac_p001": float(p001),
+        "logjac_p01": float(p01),
+        "logjac_p99": float(p99),
+        "logjac_p999": float(p999),
+        "frac_det_below_half": float((d < 0.5).mean()),
+        "frac_det_above_2": float((d > 2.0).mean()),
     }
+
+
+LOST_RATIO = 0.5  # a label the warp leaves with under half its volume is "lost"
+
+
+def label_judges(
+    warped: np.ndarray,
+    affine: np.ndarray,
+    detj: np.ndarray,
+    labels: np.ndarray,
+    base: np.ndarray | None = None,
+) -> tuple[dict[str, float], str]:
+    """What the warp itself did to each label, beyond the affine.
+
+    For every label: its volume after the warp over its volume after the affine alone (the
+    warp's own share; shrinking a little may be right, vanishing is not), and the mean
+    log det J where it lands. Returns summary judges and a per-label TSV (with Dice against
+    ``base`` when a traced base exists)."""
+    n_aff = np.array([(affine == lab).sum() for lab in labels], np.float64)
+    n_w = np.array([(warped == lab).sum() for lab in labels], np.float64)
+    ok = n_aff > 0
+    ratio = np.where(ok, n_w / np.maximum(n_aff, 1), np.nan)
+    lj = np.log(np.clip(detj.astype(np.float64), 1e-6, None))
+    mlj = np.array(
+        [lj[warped == lab].mean() if n > 0 else np.nan for lab, n in zip(labels, n_w, strict=True)]
+    )
+    r = ratio[ok]
+    j = {
+        "label_vol_ratio_min": float(np.nanmin(r)),
+        "label_vol_ratio_p10": float(np.nanpercentile(r, 10)),
+        "label_vol_ratio_median": float(np.nanmedian(r)),
+        "label_vol_ratio_max": float(np.nanmax(r)),
+        "n_labels_shrunk_20pct": float((r < 0.8).sum()),
+        "n_labels_lost": float((r < LOST_RATIO).sum()),
+        "n_labels_vanished": float(((n_w == 0) & ok).sum()),
+        "n_labels_grown_25pct": float((r > 1.25).sum()),
+        "label_logjac_min": float(np.nanmin(mlj)),
+        "label_logjac_max": float(np.nanmax(mlj)),
+    }
+    cols = ["label", "vox_affine", "vox_warped", "vol_ratio", "mean_logjac"]
+    dice = None
+    if base is not None:
+        cols.append("dice")
+        dice = _dice_per_label(warped.astype(np.int32), base.astype(np.int32), labels)
+    rows = ["\t".join(cols)]
+    for i, lab in enumerate(labels):
+        row = [
+            str(int(lab)),
+            str(int(n_aff[i])),
+            str(int(n_w[i])),
+            f"{ratio[i]:.4f}",
+            f"{mlj[i]:+.4f}",
+        ]
+        if dice is not None:
+            row.append(f"{dice[i]:.4f}")
+        rows.append("\t".join(row))
+    return j, "\n".join(rows) + "\n"
 
 
 def dice_judges(lab: np.ndarray, base_lab: np.ndarray, labels: np.ndarray) -> dict[str, float]:
@@ -127,6 +196,15 @@ class WarpPairCheck(QwarpCheck):
             {f"{k}_affine": v for k, v in dice_judges(_load(SLA), base_lab_v, labels).items()}
         )
 
+        sla_v = _load(SLA).astype(np.int32)
+        label_loss: dict[str, float | None] = {}
+
+        def lab_judges(tool: str, d: Path, warped: np.ndarray, detj: np.ndarray) -> None:
+            j, tsv = label_judges(warped.astype(np.int32), sla_v, detj, labels, base_lab_v)
+            label_loss.update({f"{k}_{tool}": v for k, v in j.items()})
+            (d / "labels.tsv").write_text(tsv)
+            res.artifacts.append((d / "labels.tsv", "keep"))
+
         def afni_warp_judges(tool: str, d: Path, warp: Path) -> None:
             lab = d / "lab_warped.nii.gz"
             timed(["3dNwarpApply", "-overwrite", "-nwarp", str(warp), "-source", str(SLA),
@@ -142,6 +220,7 @@ class WarpPairCheck(QwarpCheck):
                    "-input", str(jac), "-prefix", str(jac_b)], work, log)  # fmt: skip
             detj = _load(jac_b).astype(np.float64) + 1.0  # bulk = det J - 1
             deform.update({f"{k}_{tool}": v for k, v in deformation_judges(detj, inside).items()})
+            lab_judges(tool, d, _load(lab), detj)
             lab_ffs = d / "lab_ffs_nwarp.nii.gz"
             timed(["ffs_nwarp", "-source", str(SLA), "-nwarp", str(warp), "-master", str(B),
                    "-interp", "NN", "-prefix", str(lab_ffs), "-device", device], work, log)  # fmt: skip
@@ -173,7 +252,9 @@ class WarpPairCheck(QwarpCheck):
         jac = ad / "jac.nii.gz"
         timed(["CreateJacobianDeterminantImage", "3", str(ants_warp), str(jac), "0", "0"],
               work, log, env=env)  # fmt: skip
-        deform.update({f"{k}_ants": v for k, v in deformation_judges(_load(jac), inside).items()})
+        detj_ants = _load(jac).astype(np.float64)
+        deform.update({f"{k}_ants": v for k, v in deformation_judges(detj_ants, inside).items()})
+        lab_judges("ants", ad, _load(lab), detj_ants)
         res.artifacts += [(lab, "keep"), (jac, "regenerable"), (ants_warp, "keep"),
                           (ad / "ants_0InverseWarp.nii.gz", "regenerable"),
                           (ad / "ants_warped.nii.gz", "regenerable"), (ad / "fit.timing.json", "keep")]  # fmt: skip
@@ -219,6 +300,7 @@ class WarpPairCheck(QwarpCheck):
         res.metrics["truth"] = truth
         res.metrics["deformation"] = deform
         res.metrics["nwarp"] = nwarp
+        res.metrics["label_loss"] = label_loss
         res.metrics["reference"] = {
             f"dice_mean_{t}": truth.get(f"dice_mean_{t}")
             for t in ("ants", "formwarp_ants", "qwarp", "optiwarp")

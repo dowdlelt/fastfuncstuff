@@ -259,6 +259,12 @@ def main(argv: list[str] | None = None) -> int:
         "-ingest", metavar="DIR", type=Path, help="Register a synced host set (re-ingest replaces)."
     )
     act.add_argument("-hosts", action="store_true", help="List ingested host sets.")
+    act.add_argument(
+        "-cohort",
+        metavar="CHECK",
+        help="Score a cohort check across its finished units (warp_mni: pairwise label Dice "
+        "in template space) for each of -datasets; writes cohort_*.json beside the units.",
+    )
     p.add_argument("-datasets", nargs="+", default=[], help="Dataset ids (with -plan).")
     p.add_argument(
         "-n",
@@ -314,6 +320,16 @@ def main(argv: list[str] | None = None) -> int:
         from .hostset import ingest
 
         ingest(wl, args.root, args.ingest)
+    elif args.cohort:
+        if args.cohort != "warp_mni":
+            p.error("-cohort knows warp_mni only")
+        from .checks.warp_mni import write_cohort
+
+        for ds in args.datasets or ["Mindboggle101"]:
+            done = [r["id"] for r in wl.db.execute(
+                "SELECT id FROM units WHERE check_name='warp_mni' AND dataset=? AND status='done'", (ds,))]  # fmt: skip
+            out = write_cohort(args.root, ds, done)
+            print(out.read_text())
     elif args.hosts:
         from .hostset import hostsets
 

@@ -17,6 +17,7 @@ from .qwarp import QwarpCheck
 from .reml import RemlCheck
 from .segment import SegmentCheck
 from .slicetime import SlicetimeCheck
+from .warp_mni import WarpMniCheck
 from .warp_pair import WarpPairCheck
 
 CHECKS: dict[str, type[Check]] = {
@@ -33,6 +34,7 @@ CHECKS: dict[str, type[Check]] = {
         FcCheck,
         SegmentCheck,
         WarpPairCheck,
+        WarpMniCheck,
     )
 }
 
