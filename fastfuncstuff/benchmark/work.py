@@ -223,7 +223,10 @@ def run(
             print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
         if not keep:
             # A host set's outputs are the only copy of that host's results: keep them.
-            freed = wl.prune(u["id"], under=root / "cache" if wl.meta("hostset") else None)
+            # A host set keeps its outputs for inspection unless exported with -prune_outputs;
+            # outputs marked keep (warps, label maps) always stay.
+            keep_out = wl.meta("hostset") and wl.meta("prune_outputs") != "yes"
+            freed = wl.prune(u["id"], under=root / "cache" if keep_out else None)
             if freed:
                 print(f"    pruned {freed / 1e6:.0f} MB", flush=True)
         n_done += 1
@@ -285,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
         help="-export_hostset: copy inputs of local-tree datasets (NIREP16, Mindboggle101, "
         "private sets) into the host set instead of skipping them.",
     )
+    p.add_argument(
+        "-prune_outputs",
+        action="store_true",
+        help="-export_hostset: the other host prunes regenerable outputs too, as here "
+        "(default keeps them all for inspection). Halves what a large warp set syncs back.",
+    )
     p.add_argument("-check", help="Only run units of this check (with -run).")
     p.add_argument("-max_units", type=int, default=10**9, help="Stop after this many units.")
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
@@ -330,7 +339,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.checks:
             p.error("-export_hostset needs -checks")
         export_hostset(wl, args.manifests, args.export_hostset, args.checks, args.n or 2,
-                       args.label, args.datasets, args.include_pending, args.bundle_local)  # fmt: skip
+                       args.label, args.datasets, args.include_pending, args.bundle_local,
+                       args.prune_outputs)  # fmt: skip
     elif args.ingest:
         from .hostset import ingest
 

@@ -79,6 +79,7 @@ def export_hostset(
     datasets: list[str] = (),  # type: ignore[assignment]
     include_pending: bool = False,
     bundle_local: bool = False,
+    prune_outputs: bool = False,
 ) -> Path:
     import yaml
 
@@ -134,6 +135,7 @@ def export_hostset(
         exported_from=socket.gethostname(),
         exported_at=time.strftime("%Y-%m-%d %H:%M"),
         checks=json.dumps(checks),
+        prune_outputs="yes" if prune_outputs else "no",
     )
     hs.close()
     by_check: dict[str, int] = {}

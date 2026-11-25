@@ -143,7 +143,8 @@ def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):
     wl.add_units("warp_mni", "Coh", [({"subject": "01"}, ["sub-01/t1.nii.gz"])])  # pending
 
     out = export_hostset(wl, man, tmp_path / "hs", ["warp_mni"], 2, "srv", bundle_local=True,
-                         include_pending=True)  # fmt: skip
+                         include_pending=True, prune_outputs=True)  # fmt: skip
+    assert Worklist(out / "worklist.sqlite").meta("prune_outputs") == "yes"
     assert sorted(p.name for p in (out / "data" / "Coh" / "sub-01").iterdir()) == [
         "t1.json",
         "t1.nii.gz",
