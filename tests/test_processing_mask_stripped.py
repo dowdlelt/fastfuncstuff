@@ -49,3 +49,16 @@ def test_image_support_drops_coverage_on_a_stripped_brain():
     clipped = ((z + 0.5 * y) < 0.6).float() * 100.0  # a clipped FoV keeps its coverage
     assert image_support(clipped, _args(), cpu, False, "base", 0)[1] is not None
 
+
+def test_cross_fill_lands_on_the_receiving_scale():
+    """A fill on the other image's raw scale is a cliff of its own (3e5 into ~1.6e3)."""
+    from fastfuncstuff.processing.mask import cross_fill_no_data
+
+    z, y, x = _grid()
+    fixed = 1600.0 + 100.0 * x
+    moving = 200.0 * fixed  # same anatomy, 200x the intensity
+    fcov, mcov = (z < 0.5), (z > -0.5)
+    f_m, m_m, cover = cross_fill_no_data(fixed * fcov, moving * mcov, fcov, mcov)
+    torch.testing.assert_close(f_m, fixed, rtol=1e-5, atol=1e-2)
+    torch.testing.assert_close(m_m, moving, rtol=1e-5, atol=1.0)
+    assert bool((cover == (fcov & mcov)).all())

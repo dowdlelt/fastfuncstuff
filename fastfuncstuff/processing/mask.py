@@ -791,6 +791,9 @@ def cross_fill_no_data(
     exclusion, 0.69 adding this fill. The hard edge, not the weighting, is what drives
     the artifact.
 
+    The fill is rescaled by the ratio of the two images' medians over the shared
+    support, so it lands on the receiving image's scale.
+
     Callers must use the returned images for the METRIC ONLY and keep the originals
     for the final resample -- filling the output would fabricate anatomy into a saved
     image. Pass only *data coverage* here, never a brain automask: an automask
@@ -800,13 +803,38 @@ def cross_fill_no_data(
     f_metric, m_metric = fixed, moving
     if fixed_cover is not None:
         fixed_cover = fixed_cover.to(fixed.device) > 0
-        f_metric = torch.where(fixed_cover, fixed, moving)
     if moving_cover is not None:
         moving_cover = moving_cover.to(moving.device) > 0
-        m_metric = torch.where(moving_cover, moving, fixed)
-
     if fixed_cover is not None and moving_cover is not None:
         cover = fixed_cover & moving_cover
     else:
         cover = fixed_cover if moving_cover is None else moving_cover
+    if cover is None:
+        return f_metric, m_metric, None
+
+    # The fill has to arrive on the receiving image's intensity scale, or it is a cliff
+    # of its own: a T1 at ~3e5 filled into a template at ~1.6e3 painted the template's
+    # void 200x brighter than its tissue, and the warp chased that edge until it folded.
+    ratio = _median_ratio(moving, fixed, cover)
+    if fixed_cover is not None:
+        f_metric = torch.where(fixed_cover, fixed, moving / ratio)
+    if moving_cover is not None:
+        m_metric = torch.where(moving_cover, moving, fixed * ratio)
     return f_metric, m_metric, cover
+
+
+def _median_ratio(a: Tensor, b: Tensor, region: Tensor, max_samples: int = 1 << 20) -> float:
+    """``median(a) / median(b)`` over ``region``, on a strided sample.
+
+    1.0 whenever either median is not positive (a zero-mean or signed image has no
+    scale to match, and dividing by it would be worse than not matching at all).
+    """
+    idx = torch.nonzero(region.reshape(-1), as_tuple=False).flatten()
+    if idx.numel() == 0:
+        return 1.0
+    idx = idx[:: max(1, idx.numel() // max_samples)]
+    ma = float(a.reshape(-1)[idx].float().median())
+    mb = float(b.reshape(-1)[idx].float().median())
+    if not (ma > 0 and mb > 0):
+        return 1.0
+    return ma / mb
