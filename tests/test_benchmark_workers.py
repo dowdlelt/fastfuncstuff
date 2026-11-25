@@ -116,3 +116,34 @@ def test_hostset_export_run_ingest_round_trip(tmp_path, capsys):
     assert str(dest / "units/moco" / u["dataset"] / "unit1/ffs/moco.nii") in paths
     (res,) = got.results("moco")
     assert res["unit_id"] == u["id"] and res["seconds.ffs.cpu"] == 12.5
+
+
+def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):
+    import yaml
+
+    from fastfuncstuff.benchmark.fetch import fetch
+    from fastfuncstuff.benchmark.hostset import export_hostset
+
+    tree = tmp_path / "private"
+    (tree / "sub-01").mkdir(parents=True)
+    (tree / "sub-01" / "t1.nii.gz").write_bytes(b"img")
+    (tree / "sub-01" / "t1.json").write_text("{}")
+    (tree / "sub-01" / "other.nii.gz").write_bytes(b"not an input")
+    root, man = tmp_path / "bench", tmp_path / "bench" / "manifests"
+    man.mkdir(parents=True)
+    (man / "Coh.yaml").write_text(yaml.safe_dump(
+        {"dataset_id": "Coh", "source": {"kind": "local", "uri": str(tree)}, "acquisitions": []}))  # fmt: skip
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("warp_mni", "Coh", [({"subject": "01"}, ["sub-01/t1.nii.gz"])])  # pending
+
+    out = export_hostset(wl, man, tmp_path / "hs", ["warp_mni"], 2, "srv", bundle_local=True,
+                         include_pending=True)  # fmt: skip
+    assert sorted(p.name for p in (out / "data" / "Coh" / "sub-01").iterdir()) == [
+        "t1.json",
+        "t1.nii.gz",
+    ]
+    m = yaml.safe_load((out / "manifests" / "Coh.yaml").read_text())
+    assert m["source"]["uri"] == "${FFS_BENCH_ROOT}/data/Coh"
+    monkeypatch.setenv("FFS_BENCH_ROOT", str(out))  # as -run sets it on the other host
+    paths, downloaded = fetch(m, ["sub-01/t1.nii.gz"], out / "cache")
+    assert paths["sub-01/t1.nii.gz"].read_bytes() == b"img" and downloaded == []

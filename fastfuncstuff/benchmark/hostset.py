@@ -25,24 +25,34 @@ from .worklist import Worklist
 
 
 def select_units(
-    wl: Worklist, checks: list[str], n: int, manifests: dict[str, dict], datasets: list[str]
+    wl: Worklist,
+    checks: list[str],
+    n: int,
+    manifests: dict[str, dict],
+    datasets: list[str],
+    include_pending: bool = False,
+    bundle_local: bool = False,
 ) -> tuple[list, list[str]]:
-    """Up to ``n`` finished units per check, distinct datasets first, from public sources.
+    """Up to ``n`` units per check, distinct datasets first.
 
-    Finished units only: the point is a comparison with what this host already measured.
-    Datasets on a local (private) tree cannot be fetched elsewhere and are skipped."""
+    Finished units by default: the point is a comparison with what this host already
+    measured; ``include_pending`` adds units not run here yet. Datasets on a local tree
+    cannot be fetched elsewhere, so they are skipped unless ``bundle_local`` copies their
+    inputs into the host set."""
     picked, skipped = [], []
+    states = ("done", "pending") if include_pending else ("done",)
     for check in checks:
         rows = wl.db.execute(
-            "SELECT * FROM units WHERE check_name=? AND status='done' ORDER BY dataset, id",
-            (check,),
+            f"SELECT * FROM units WHERE check_name=? AND status IN ({','.join('?' * len(states))})"
+            " ORDER BY dataset, id",
+            (check, *states),
         ).fetchall()
         by_ds: dict[str, list] = {}
         for r in rows:
             if datasets and r["dataset"] not in datasets:
                 continue
             m = manifests.get(r["dataset"])
-            if m is None or m["source"]["kind"] != "s3":
+            if m is None or (m["source"]["kind"] != "s3" and not bundle_local):
                 if r["dataset"] not in skipped:
                     skipped.append(r["dataset"])
                 continue
@@ -66,16 +76,22 @@ def export_hostset(
     n: int,
     label: str,
     datasets: list[str] = (),  # type: ignore[assignment]
+    include_pending: bool = False,
+    bundle_local: bool = False,
 ) -> Path:
+    import yaml
+
     from .census import load_manifests
 
     out = Path(out)
     if (out / "worklist.sqlite").exists():
         raise FileExistsError(f"{out} already holds a worklist; pick a new directory")
     manifests = {m["dataset_id"]: m for m in load_manifests(manifests_dir, curated=False)}
-    units, skipped = select_units(wl, checks, n, manifests, list(datasets))
+    units, skipped = select_units(
+        wl, checks, n, manifests, list(datasets), include_pending, bundle_local
+    )
     if not units:
-        raise ValueError(f"no finished, publicly fetchable units for {checks}")
+        raise ValueError(f"no exportable units for {checks}")
     (out / "manifests").mkdir(parents=True)
     hs = Worklist(out / "worklist.sqlite")
     with hs._tx():
@@ -85,8 +101,30 @@ def export_hostset(
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (u["id"], u["check_name"], u["dataset"], u["unit_key"], u["inputs"], time.time()),
             )
+    bundled_mb = 0.0
     for ds in sorted({u["dataset"] for u in units}):
-        shutil.copy2(manifests_dir / f"{ds}.yaml", out / "manifests" / f"{ds}.yaml")
+        m = manifests[ds]
+        if m["source"]["kind"] == "s3":
+            shutil.copy2(manifests_dir / f"{ds}.yaml", out / "manifests" / f"{ds}.yaml")
+            continue
+        # Local tree: copy each unit's inputs (and same-stem sidecars) under DIR/data/<ds>/ and
+        # point the manifest there; ${FFS_BENCH_ROOT} is expanded where the set runs.
+        src_root = Path(m["source"]["uri"])
+        for u in units:
+            if u["dataset"] != ds:
+                continue
+            for rel in json.loads(u["inputs"]):
+                for f in [src_root / rel, *(src_root / rel).parent.glob(_stem(rel) + ".json")]:
+                    dst = out / "data" / ds / f.relative_to(src_root)
+                    if f.is_file() and not dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dst)
+                        bundled_mb += f.stat().st_size / 1e6
+        m = {
+            **m,
+            "source": {**m["source"], "uri": f"${{FFS_BENCH_ROOT}}/data/{ds}", "bundled": True},
+        }
+        (out / "manifests" / f"{ds}.yaml").write_text(yaml.safe_dump(m, sort_keys=False))
     hs.set_meta(
         hostset=uuid.uuid4().hex,
         label=label,
@@ -99,9 +137,19 @@ def export_hostset(
     for u in units:
         by_check[u["check_name"]] = by_check.get(u["check_name"], 0) + 1
     print(f"{out}: {len(units)} units  " + "  ".join(f"{c} {k}" for c, k in by_check.items()))
+    if bundled_mb:
+        print(f"bundled local inputs: {bundled_mb:.0f} MB under {out / 'data'}")
     if skipped:
-        print(f"skipped local-only datasets: {' '.join(skipped)}")
+        print(f"skipped local-only datasets (use -bundle_local): {' '.join(skipped)}")
     return out
+
+
+def _stem(rel: str) -> str:
+    name = Path(rel).name
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return Path(name).stem
 
 
 def ingest(wl: Worklist, root: Path, src: Path) -> Path:

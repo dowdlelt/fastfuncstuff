@@ -21,7 +21,8 @@ def source_from_manifest(manifest: dict) -> LocalSource | S3Source:
     if src["kind"] == "s3":
         bucket, _, prefix = src["uri"][5:].partition("/")
         return S3Source(prefix.strip("/"), bucket=bucket)
-    return LocalSource(Path(src["uri"]))
+    # a bundled host set names its data relative to the root it runs from
+    return LocalSource(Path(os.path.expandvars(src["uri"])))
 
 
 def fetch(manifest: dict, rels: list[str], cache_dir: Path) -> tuple[dict[str, Path], list[Path]]:

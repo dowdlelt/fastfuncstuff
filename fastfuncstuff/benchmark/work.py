@@ -274,6 +274,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("-checks", nargs="+", default=[], help="Checks for -export_hostset.")
     p.add_argument("-label", default="host", help="Name of the host set (-export_hostset).")
+    p.add_argument(
+        "-include_pending",
+        action="store_true",
+        help="-export_hostset: also take units not yet run here (default: finished only).",
+    )
+    p.add_argument(
+        "-bundle_local",
+        action="store_true",
+        help="-export_hostset: copy inputs of local-tree datasets (NIREP16, Mindboggle101, "
+        "private sets) into the host set instead of skipping them.",
+    )
     p.add_argument("-check", help="Only run units of this check (with -run).")
     p.add_argument("-max_units", type=int, default=10**9, help="Stop after this many units.")
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
@@ -315,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.checks:
             p.error("-export_hostset needs -checks")
         export_hostset(wl, args.manifests, args.export_hostset, args.checks, args.n or 2,
-                       args.label, args.datasets)  # fmt: skip
+                       args.label, args.datasets, args.include_pending, args.bundle_local)  # fmt: skip
     elif args.ingest:
         from .hostset import ingest
 
@@ -351,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.run:
         import os
 
+        # bundled host-set manifests name their data as ${FFS_BENCH_ROOT}/data/<ds>
+        os.environ.setdefault("FFS_BENCH_ROOT", str(args.root))
         if os.environ.get("FFS_BENCH_CPUS"):  # a pool worker: its own cores, inherited by tools
             os.sched_setaffinity(0, [int(c) for c in os.environ["FFS_BENCH_CPUS"].split(",")])
         if args.threads:
