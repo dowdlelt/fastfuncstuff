@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import census
-from .base import Check, UnitResult, _stable_rank, ffs_version, timed
+from .base import Check, UnitResult, _stable_rank, cpu_threads, ffs_threads, ffs_version, timed
 
 TOPUP_CONFIG = "b02b0.cnf"
 FFS_ARGS = ["-config", "standard", "-estmov"]  # b02b0 estimates movement at coarse levels
@@ -168,7 +168,7 @@ class BlipflipCheck(Check):
         )
 
         res = UnitResult()
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or None
+        threads = cpu_threads()
         t_ref = timed(
             ["topup", f"--imain={both}", f"--datain={acqp}", f"--config={TOPUP_CONFIG}",
              f"--out={ref / 'tu'}", f"--fout={ref / 'field'}", f"--iout={ref / 'unwarped'}"],
@@ -183,7 +183,7 @@ class BlipflipCheck(Check):
                  "-readout", f"{readout:.6f}", *args, "-prefix", str(out / "dc"), "-device", device],
                 work, log, timeout_s=self.timeout_s,
             )  # fmt: skip
-            res.timings.append((side, device.split(",")[0], t_ffs, None))
+            res.timings.append((side, device.split(",")[0], t_ffs, ffs_threads(device)))
 
         def load(p: Path) -> np.ndarray:
             return np.asarray(nib.Nifti1Image.from_filename(str(p)).dataobj, dtype=np.float64)

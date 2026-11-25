@@ -122,6 +122,16 @@ def trailing_noise_count(means: list[float], frac: float = NOISE_FRAC) -> int:
     return k
 
 
+def cpu_threads() -> int:
+    """Threads a CPU tool was given: the worker's budget, else the CPUs this process may use."""
+    return int(os.environ.get("OMP_NUM_THREADS") or 0) or len(os.sched_getaffinity(0))
+
+
+def ffs_threads(device: str) -> int | None:
+    """Threads behind an ffs timing: the CPU budget on -device cpu, None on a GPU."""
+    return cpu_threads() if device.startswith("cpu") else None
+
+
 STEADY_FRAC = 0.05
 
 

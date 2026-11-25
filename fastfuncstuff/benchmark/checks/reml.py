@@ -16,11 +16,10 @@ ridge, so lambda and stdev are the meaningful parity numbers (see stages/glm.py)
 from __future__ import annotations
 
 import csv
-import os
 from pathlib import Path
 
 from ..validation import compare_bucket_volumes
-from .base import Check, UnitResult, afni_version, ffs_version, timed
+from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 MAX_CONDITIONS = 12
 MIN_EVENTS = 2
@@ -229,7 +228,7 @@ class RemlCheck(Check):
 
         ref = work / "ref"
         ref.mkdir(exist_ok=True)
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         t_ref = timed(
             ["3dREMLfit", "-overwrite", "-matrix", str(xmat), "-input", str(scaled),
              "-mask", str(mask), "-tout", "-nofdr", "-Obuck", str(ref / "ols.nii.gz"),
@@ -248,7 +247,7 @@ class RemlCheck(Check):
                  "-device", device],
                 work, log, timeout_s=self.timeout_s,
             )  # fmt: skip
-            res.timings.append((side, device.split(",")[0], t, None))
+            res.timings.append((side, device.split(",")[0], t, ffs_threads(device)))
 
         from ..stages.glm import THRESHOLDS as T
 

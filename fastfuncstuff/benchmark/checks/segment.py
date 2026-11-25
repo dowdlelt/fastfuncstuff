@@ -25,7 +25,15 @@ from pathlib import Path
 import numpy as np
 
 from .. import census
-from .base import Check, UnitResult, _stable_rank, ffs_version, timed_cached
+from .base import (
+    Check,
+    UnitResult,
+    _stable_rank,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed_cached,
+)
 
 MATLAB = "/usr/local/MATLAB/R2025a/bin/matlab"
 SPM_DIR = Path.home() / "Dropbox/Resources/code/matlab_toolboxes/spm25"
@@ -182,7 +190,7 @@ class SegmentCheck(Check):
                     shutil.copyfileobj(fi, fo)
             else:
                 shutil.copyfile(src, t1)
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 1
+        threads = cpu_threads()
         matlab = os.environ.get("FFS_MATLAB", MATLAB)
         ref_c = [ref / f"c{k}t1.nii" for k in (1, 2, 3)]
         t_ref = timed_cached([matlab, "-batch", spm_script(t1, tpm, threads)],
@@ -196,7 +204,7 @@ class SegmentCheck(Check):
                "-no_invwarp", "-device", device]  # fmt: skip
         ffs_c = [Path(f"{prefix}_c{k}.nii.gz") for k in (1, 2, 3)]
         t = timed_cached(cmd, ffs / "stamp.json", ffs_c, work, log, timeout_s=self.timeout_s)
-        res.timings.append(("ffs", device.split(",")[0], t, None))
+        res.timings.append(("ffs", device.split(",")[0], t, ffs_threads(device)))
 
         load = lambda p: np.asarray(nib.Nifti1Image.from_filename(str(p)).dataobj, np.float32)  # noqa: E731
         pr, pf = [load(p) for p in ref_c], [load(p) for p in ffs_c]

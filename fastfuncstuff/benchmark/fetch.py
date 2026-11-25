@@ -7,6 +7,7 @@ are never registered as artifacts, so pruning cannot touch them.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import urllib.parse
 import urllib.request
@@ -38,7 +39,8 @@ def fetch(manifest: dict, rels: list[str], cache_dir: Path) -> tuple[dict[str, P
         dest = Path(cache_dir) / manifest["dataset_id"] / rel
         if not dest.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
-            part = dest.with_name(dest.name + ".part")
+            # Per-process name: parallel workers may fetch the same file; the rename is atomic.
+            part = dest.with_name(f"{dest.name}.part{os.getpid()}")
             url = f"{src._host}/{urllib.parse.quote(src.prefix + rel)}"
             with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
                 shutil.copyfileobj(r, f, length=1 << 20)

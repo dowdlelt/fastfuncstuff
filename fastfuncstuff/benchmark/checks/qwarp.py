@@ -18,11 +18,19 @@ anatomical labels); NIREP: Christensen et al. 2006, LNCS 4057.
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 
-from .base import Check, UnitResult, _stable_rank, afni_version, ffs_version, timed, timed_cached
+from .base import (
+    Check,
+    UnitResult,
+    _stable_rank,
+    afni_version,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed,
+    timed_cached,
+)
 
 DXYZ = "1"
 QWARP_ARGS = ["-minpatch", "9", "-blur", "0", "3"]
@@ -97,7 +105,7 @@ class QwarpCheck(Check):
         )  # fmt: skip
 
         res = UnitResult()
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         sides = {"ref": work / "ref", "ffs": work / "ffs"}
         for d in sides.values():
             d.mkdir(exist_ok=True)
@@ -116,7 +124,7 @@ class QwarpCheck(Check):
             [sides["ffs"] / "qw.nii.gz", sides["ffs"] / "qw_WARP.nii.gz"],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
-        res.timings.append(("ffs", device.split(",")[0], t, None))
+        res.timings.append(("ffs", device.split(",")[0], t, ffs_threads(device)))
 
         def load(p):
             return np.asarray(nib.Nifti1Image.from_filename(str(p)).dataobj)

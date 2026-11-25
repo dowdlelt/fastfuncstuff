@@ -6,10 +6,8 @@ The frozen input is the raw first-echo magnitude and the SliceTiming its sidecar
 
 from __future__ import annotations
 
-import os
-
 from ..validation import compare_timeseries_4d
-from .base import Check, UnitResult, afni_version, ffs_version, timed
+from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 REF_ARGS = ["-tzero", "0", "-wsinc9"]
 FFS_ARGS = ["-tzero", "0", "-wsinc9"]
@@ -42,7 +40,7 @@ class SlicetimeCheck(Check):
         res = UnitResult()
         image, _ = self.trim_noise(image, work, log, res)
 
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         t_ref = timed(
             ["3dTshift", "-overwrite", "-prefix", str(ref_out), *REF_ARGS, "-tpattern", f"@{tp}", str(image)],
             work, log, timeout_s=self.timeout_s,
@@ -52,7 +50,7 @@ class SlicetimeCheck(Check):
             ["ffs_slicetime", "-input", str(image), *FFS_ARGS, "-tpattern", str(tp), "-prefix", str(ffs_out), "-device", device],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
-        res.timings.append(("ffs", device.split(",")[0], t_ffs, None))
+        res.timings.append(("ffs", device.split(",")[0], t_ffs, ffs_threads(device)))
 
         r = compare_timeseries_4d(str(ref_out), str(ffs_out), sample_frac=0.2)
         if "error" in r:

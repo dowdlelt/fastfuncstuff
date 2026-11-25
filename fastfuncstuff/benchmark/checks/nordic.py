@@ -26,7 +26,16 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import Check, UnitResult, ffs_version, timed_cached, trailing_noise_count, volume_means
+from .base import (
+    Check,
+    UnitResult,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed_cached,
+    trailing_noise_count,
+    volume_means,
+)
 
 NORDIC_TOOLBOX = Path.home() / "Dropbox/Resources/code/matlab_toolboxes/NORDIC_Raw"
 MATLAB = "/usr/local/MATLAB/R2025a/bin/matlab"
@@ -131,7 +140,7 @@ class NordicCheck(Check):
         else:
             ext_mag = ext
         del mag_img
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 1
+        threads = cpu_threads()
         toolbox = os.environ.get("NORDIC_MATLAB_PATH", str(NORDIC_TOOLBOX))
         arga = {**REF_ARGA, "noise_volume_last": k}
         script = (
@@ -156,7 +165,7 @@ class NordicCheck(Check):
                    "-save-gfactor-map", *extra, "-device", device]  # fmt: skip
             t = timed_cached(cmd, d / "stamp.json", [d / "nordic.nii.gz"], work, log,
                              timeout_s=self.timeout_s)  # fmt: skip
-            res.timings.append((side, device.split(",")[0], t, None))
+            res.timings.append((side, device.split(",")[0], t, ffs_threads(device)))
             outs[side] = (d / "nordic.nii.gz", d / "nordic_gfactor.nii.gz")
 
         load = lambda p: np.asarray(nib.Nifti1Image.from_filename(str(p)).dataobj, np.float32)  # noqa: E731

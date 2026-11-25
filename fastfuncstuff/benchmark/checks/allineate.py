@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import Check, UnitResult, afni_version, ffs_version, timed
+from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
 
@@ -170,7 +170,7 @@ class AllineateCheck(Check):
         timed(["ffs_segment", "-input", str(t1), "-tpm", tpm, "-prefix", str(seg), "-brain",
                "-no_invwarp", "-device", device], work, log, timeout_s=1800)  # fmt: skip
 
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         out = {s: work / s for s in ("ref", "ffs")}
         for d in out.values():
             d.mkdir(exist_ok=True)
@@ -187,7 +187,7 @@ class AllineateCheck(Check):
              "-1Dmatrix_save", str(out["ffs"] / "al.aff12.1D"), *ARGS, "-device", device],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
-        res.timings.append(("ffs", device.split(",")[0], t, None))
+        res.timings.append(("ffs", device.split(",")[0], t, ffs_threads(device)))
 
         b = nib.Nifti1Image.from_filename(str(brain))
         mask = np.asarray(nib.Nifti1Image.from_filename(f"{seg}_brainmask.nii.gz").dataobj) > 0

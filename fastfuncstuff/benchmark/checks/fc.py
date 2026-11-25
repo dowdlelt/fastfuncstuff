@@ -14,12 +14,11 @@ disagreement.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
 
-from .base import Check, UnitResult, afni_version, ffs_version, timed
+from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 CUBE_MM = 15.0
 MIN_ROI_VOXELS = 10
@@ -98,7 +97,7 @@ class FcCheck(Check):
 
         ref = work / "ref"
         ref.mkdir(exist_ok=True)
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         t_ref = timed(["3dNetCorr", "-overwrite", "-inset", str(src), "-in_rois", str(rois_p),
                        "-mask", str(mask_p), "-fish_z", "-prefix", str(ref / "net")],
                       work, log, timeout_s=self.timeout_s)  # fmt: skip
@@ -113,7 +112,7 @@ class FcCheck(Check):
             t = timed(["ffs_fc", "-input", str(src), "-atlas", str(rois_p), "-mask", str(mask_p),
                        "-prefix", str(d / "fc"), *extra, "-device", device, "-quiet"],
                       work, log, timeout_s=self.timeout_s)  # fmt: skip
-            res.timings.append((side, device.split(",")[0], t, None))
+            res.timings.append((side, device.split(",")[0], t, ffs_threads(device)))
             cc[side] = np.load(d / "fc_fc.npz")["CC"]
         if cc["ffs"].shape != cc_ref.shape:
             raise ValueError(f"ROI count differs: ref {cc_ref.shape}, ffs {cc['ffs'].shape}")

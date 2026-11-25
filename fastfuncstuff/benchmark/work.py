@@ -1,7 +1,8 @@
-"""Benchmark runner: plan units into the worklist, then work through them one at a time.
+"""Benchmark runner: plan units into the worklist, then work through them.
 
     python -m fastfuncstuff.benchmark.work -plan moco -datasets ds002603 -n 2
     python -m fastfuncstuff.benchmark.work -run [-check moco] [-max_units 5]
+    python -m fastfuncstuff.benchmark.work -run -device cpu -workers 0 -threads 6
     python -m fastfuncstuff.benchmark.work -status
     python -m fastfuncstuff.benchmark.work -results moco
 
@@ -18,6 +19,18 @@ from pathlib import Path
 
 from fastfuncstuff._paths import get_bench_root
 from fastfuncstuff.cli_help import FfsArgumentParser
+
+
+def worker_info() -> dict:
+    """Which worker ran the unit, on which CPUs, with how many threads."""
+    import os
+
+    return {
+        "worker": os.environ.get("FFS_BENCH_WORKER", "0/1"),
+        "cpus": os.environ.get("FFS_BENCH_CPUS")
+        or ",".join(map(str, sorted(os.sched_getaffinity(0)))),
+        "threads": int(os.environ.get("OMP_NUM_THREADS") or 0) or None,
+    }
 
 
 def _manifest(manifests: Path, dataset: str) -> dict:
@@ -163,7 +176,10 @@ def run(
             continue
         try:
             m = _manifest(manifests, u["dataset"])
-            paths, downloaded = fetch(m, json.loads(u["inputs"]), root / "cache")
+            paths, _ = fetch(m, json.loads(u["inputs"]), root / "cache")
+            # Every cached input, not only the ones this unit downloaded: with parallel
+            # workers another unit may have fetched it, and the last user prunes it.
+            cached = [p for p in paths.values() if (root / "cache") in p.parents]
             wl.record_provenance(
                 u["id"],
                 "inputs",
@@ -182,13 +198,14 @@ def run(
                 wl.record_timing(u["id"], side, dev, sec, thr)
             for path, retention in res.artifacts:
                 wl.record_artifact(u["id"], path, retention)
-            for path in downloaded:
+            for path in cached:
                 wl.record_artifact(u["id"], path, "regenerable")
             for side, vals in res.provenance.items():
                 wl.record_provenance(u["id"], side, vals)
             from ..benchmark.arch import get_hardware_info
 
             wl.record_provenance(u["id"], "host", get_hardware_info(device))
+            wl.record_provenance(u["id"], "worker", worker_info())
             wl.finish(u["id"], "done")
             t = {s: sec for s, _, sec, _ in res.timings}
             ref_m = res.metrics.get("reference", {})
@@ -235,6 +252,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
     p.add_argument("-keep", action="store_true", help="Do not prune regenerable outputs.")
     p.add_argument(
+        "-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for -run, each pinned to its own -threads cores; 0 = as many as "
+        "fit the cores and the CPU quota. More than 1 needs -device cpu.",
+    )
+    p.add_argument(
+        "-threads",
+        type=int,
+        help="Threads (and physical cores) per worker, given to every tool it runs: AFNI, "
+        "ffs, MATLAB, FSL. Default: whatever the environment says.",
+    )
+    p.add_argument(
         "-until",
         metavar="HH:MM",
         help="Claim no new unit after this local time (next occurrence), e.g. 07:00.",
@@ -252,7 +282,27 @@ def main(argv: list[str] | None = None) -> int:
         if not args.datasets:
             p.error("-plan needs -datasets")
         plan(wl, args.manifests, args.plan, args.datasets, args.n)
+    elif args.run and args.workers != 1:
+        from .workers import launch
+
+        if not args.threads:
+            p.error("-workers needs -threads")
+        child = ["-run", "-root", str(args.root), "-manifests", str(args.manifests),
+                 "-device", args.device]  # fmt: skip
+        child += ["-check", args.check] if args.check else []
+        child += ["-until", args.until] if args.until else []
+        child += ["-keep"] if args.keep else []
+        wl.close()
+        return launch(child, args.workers or None, args.threads, args.device, args.max_units)
     elif args.run:
+        import os
+
+        if os.environ.get("FFS_BENCH_CPUS"):  # a pool worker: its own cores, inherited by tools
+            os.sched_setaffinity(0, [int(c) for c in os.environ["FFS_BENCH_CPUS"].split(",")])
+        if args.threads:
+            from .workers import thread_env
+
+            os.environ.update(thread_env(args.threads))
         run(
             wl,
             args.root,

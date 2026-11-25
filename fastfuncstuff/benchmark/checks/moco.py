@@ -7,13 +7,13 @@ Synthetic-truth scoring (scripts/moco_truth) is the next judge to add.
 
 from __future__ import annotations
 
-import os
-
 from ..validation import compare_1d_params, compare_aff12_series, compare_moco_ssd, compare_volumes
 from .base import (
     Check,
     UnitResult,
     afni_version,
+    cpu_threads,
+    ffs_threads,
     ffs_version,
     first_steady_volume,
     timed,
@@ -54,7 +54,7 @@ class MocoCheck(Check):
             "rule": "first volume within 5% of the run median mean",
         }
 
-        threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
+        threads = cpu_threads()
         t_ref = timed(
             [
                 "3dvolreg", "-overwrite", *REF_ARGS, "-base", str(base), "-prefix", str(ref / "moco.nii"),
@@ -79,7 +79,7 @@ class MocoCheck(Check):
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         (ffs / "mean_moco.nii").replace(ffs / "mean.nii")
-        res.timings.append(("ffs", device.split(",")[0], t_ffs, None))
+        res.timings.append(("ffs", device.split(",")[0], t_ffs, ffs_threads(device)))
 
         mp = compare_1d_params(str(ref / "motion.1D"), str(ffs / "motion.1D"))
         af = compare_aff12_series(str(ref / "moco.aff12.1D"), str(ffs / "moco.aff12.1D"))

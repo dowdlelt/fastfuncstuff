@@ -224,9 +224,21 @@ class Worklist:
         if unit_id is not None:
             q += " AND unit_id=?"
             args.append(unit_id)
+        # Parallel workers share the input cache: a file another running unit reads stays
+        # until the last unit using it is pruned.
+        busy = {
+            (u["dataset"], rel)
+            for u in self.db.execute(
+                "SELECT dataset, inputs FROM units WHERE status='running' AND id IS NOT ?",
+                (unit_id,),
+            )
+            for rel in json.loads(u["inputs"])
+        }
         freed = 0
         for row in self.db.execute(q, args).fetchall():
             p = Path(row["path"])
+            if any(p.as_posix().endswith(f"/{ds}/{rel}") for ds, rel in busy):
+                continue
             if p.is_file():
                 p.unlink()
                 freed += row["bytes"] or 0

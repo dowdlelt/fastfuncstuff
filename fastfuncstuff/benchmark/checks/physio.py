@@ -19,7 +19,7 @@ import json
 
 import numpy as np
 
-from .base import Check, UnitResult, ffs_version, timed
+from .base import Check, UnitResult, ffs_threads, ffs_version, timed
 
 PLV_RIGHT = 0.5
 
@@ -163,7 +163,7 @@ class PhysioCheck(Check):
             cmd += ["-phase", str(ph[0])]
         cmd += ["-tpattern", str(tp), "-TR", f"{tr:g}", "-prefix", str(prefix), "-no_qc"]
         t = timed([*cmd, "-device", device], work, log, timeout_s=self.timeout_s)
-        res.timings.append(("ffs", device.split(",")[0], t, None))
+        res.timings.append(("ffs", device.split(",")[0], t, ffs_threads(device)))
 
         from ...processing.physio import CARDIAC_BAND, RESP_BAND, beat_phase, find_beats
 
