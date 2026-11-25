@@ -1225,6 +1225,11 @@ def _get_gather_contract(device: torch.device):
     return compiled
 
 
+# A CPU call with more heavy points than this is split into chunks with the compile
+# gate re-checked between them (see _separable_resample_3d).
+_REGATE_MIN_POINTS = 1 << 20
+
+
 def _separable_resample_3d(
     source: Tensor,
     x_coords: Tensor,
@@ -1390,6 +1395,20 @@ def _separable_resample_3d(
     # The channel count scales the slab, so shrink the chunk to match.
     chunk = max(1, _resample_chunk_size(M, ntaps, device) // n_ch)
     gather_contract = _get_gather_contract(device)  # compiled once eager time pays for it
+    # On the CPU one call can be the whole job: ffs_allineate's final wsinc5 is a
+    # single 21 s eager call in a fresh process, so a gate checked once per call
+    # never sees the time it is spending. Split a long eager call into a few
+    # chunks and re-ask the gate between them (CPU only: CUDA time is async, and
+    # its eager path is the Triton kernel above anyway).
+    regate = (
+        device.type == "cpu"
+        and gather_contract is _gather_contract
+        and M > _REGATE_MIN_POINTS
+        and not needs_grad
+        and _budget_accounted(device)
+    )
+    if regate:
+        chunk = min(chunk, max(_REGATE_MIN_POINTS // 4, M // 16))
     measuring_warmup = device.type in _compile_pending_measure
     accounted = _budget_accounted(device)
     # Wall clock for the warmup (it is host-side work, which CUDA events can't
@@ -1422,8 +1441,21 @@ def _separable_resample_3d(
         yi = (yb.long()[:, None] + offsets[None, :]).clamp(0, ny - 1)
         zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
 
+        if regate:
+            t_chunk = time.perf_counter()
+            result[..., idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
+            if gather_contract is _gather_contract:
+                _eager_seconds["cpu"] += time.perf_counter() - t_chunk
+                gather_contract = _get_gather_contract(device)
+            elif "cpu" in _compile_pending_measure:
+                # The first chunk through the compiled function paid the warmup.
+                _compile_pending_measure.discard("cpu")
+                _record_compile_cost("cpu", time.perf_counter() - t_chunk)
+            continue
         result[..., idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
 
+    if regate:
+        return result.reshape((n_ch, *out_shape) if batched else out_shape)
     if measuring_warmup:
         # This call ran the compile; almost all of the wall time is it. Remember
         # what it cost so the next process gates on this machine's number.

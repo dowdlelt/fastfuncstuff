@@ -244,3 +244,23 @@ def test_a_runtime_error_inside_compiled_code_is_not_swallowed(monkeypatch):
     fn = interp.compile_with_eager_fallback(lambda x: x)
     with pytest.raises(ValueError, match="genuine bug"):
         fn(torch.zeros(1))
+
+
+class TestRegateWithinOneCall:
+    def test_one_long_cpu_call_switches_to_compiled_partway(self, monkeypatch):
+        """ffs_allineate's final wsinc5 is ONE 21 s eager call in a fresh process; a
+        gate checked once per call never saw it. The call must re-ask between chunks,
+        and switching mid-call must not change the result."""
+        monkeypatch.setattr(interp, "_REGATE_MIN_POINTS", 1000)
+        nx = 24
+        src = torch.randn(nx, nx, nx)
+        zz, yy, xx = torch.meshgrid(
+            *(torch.arange(nx, dtype=torch.float32) + 0.3 for _ in range(3)), indexing="ij"
+        )
+        monkeypatch.setenv("FFS_NWARP_NO_COMPILE", "1")
+        eager = interp._separable_resample_3d(src, xx, yy, zz, "wsinc5")
+        monkeypatch.delenv("FFS_NWARP_NO_COMPILE")
+        interp._compile_cost_cache[interp._compile_cost_key("cpu", "gather")] = 1e-9
+        out = interp._separable_resample_3d(src, xx, yy, zz, "wsinc5")
+        assert _is_compiled(interp._compiled_gather_contract["cpu"])
+        torch.testing.assert_close(out, eager)
