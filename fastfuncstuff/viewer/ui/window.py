@@ -2430,11 +2430,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         key = self.current_key()
         if key is None:
             return
-        from fastfuncstuff.viewer.session import derive_range
+        from fastfuncstuff.viewer.colormap import CYCLIC_COLORMAPS
+        from fastfuncstuff.viewer.session import cyclic_range, derive_range
 
         layer = self.session.state.layers.get(key)
         if layer.time_linked or layer.n_volumes <= 1 or layer.is_computed:
-            lo, hi = derive_range(self.session.shown_volume(key))
+            values = self.session.shown_volume(key)
+            cyclic = layer.colormap in CYCLIC_COLORMAPS
+            lo, hi = cyclic_range(values) if cyclic else derive_range(values)
             self._dispatch(SetRange(key, float(lo), float(hi)))
             return
         # The sub-brick on screen, not the time index -- which on a bucket is
