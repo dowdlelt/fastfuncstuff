@@ -82,10 +82,13 @@ def _load(p: Path) -> np.ndarray:
 def deformation_judges(detj: np.ndarray, inside: np.ndarray) -> dict[str, float]:
     """Folding, and how far local volume change reaches, inside the base brain.
 
-    ``detj`` is det J itself (not AFNI's bulk = det J - 1). The spread hides a squeezed
-    corner, so the tails are reported too: 0.1/1/99/99.9th percentiles of log det J and
-    the share of voxels whose volume more than halves or doubles."""
-    d = detj[inside].astype(np.float64)
+    ``detj`` is det J itself (not AFNI's bulk = det J - 1) of the warp as every tool stores
+    it: in base space, pulling each base voxel from the source. det J > 1 there means a base
+    voxel draws on a larger patch of source, i.e. tissue squeezed, so it is inverted here:
+    every number is the source tissue's own volume change (< 1 shrinks). The spread hides a
+    squeezed corner, so the tails are reported too: 0.1/1/99/99.9th percentiles of log
+    volume change and the share of voxels whose tissue more than halves or doubles."""
+    d = tissue_volume_change(detj[inside])
     pos = d[d > 0]
     lj = np.log(pos) if pos.size else np.array([np.nan])
     p001, p01, p99, p999 = np.percentile(lj, [0.1, 1, 99, 99.9])
@@ -99,6 +102,14 @@ def deformation_judges(detj: np.ndarray, inside: np.ndarray) -> dict[str, float]
         "frac_det_below_half": float((d < 0.5).mean()),
         "frac_det_above_2": float((d > 2.0).mean()),
     }
+
+
+def tissue_volume_change(detj: np.ndarray) -> np.ndarray:
+    """1 / det J of a base-space pullback warp: how much the source tissue that lands at each
+    base voxel grew (> 1) or shrank (< 1). Folds (det J <= 0) stay non-positive."""
+    d = np.asarray(detj, np.float64)
+    with np.errstate(divide="ignore"):
+        return np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), d)
 
 
 LOST_RATIO = 0.5  # a label the warp leaves with under half its volume is "lost"
@@ -115,13 +126,13 @@ def label_judges(
 
     For every label: its volume after the warp over its volume after the affine alone (the
     warp's own share; shrinking a little may be right, vanishing is not), and the mean
-    log det J where it lands. Returns summary judges and a per-label TSV (with Dice against
+    log tissue volume change where it lands (< 0 shrinks; see ``deformation_judges``). Returns summary judges and a per-label TSV (with Dice against
     ``base`` when a traced base exists)."""
     n_aff = np.array([(affine == lab).sum() for lab in labels], np.float64)
     n_w = np.array([(warped == lab).sum() for lab in labels], np.float64)
     ok = n_aff > 0
     ratio = np.where(ok, n_w / np.maximum(n_aff, 1), np.nan)
-    lj = np.log(np.clip(detj.astype(np.float64), 1e-6, None))
+    lj = np.log(np.clip(tissue_volume_change(detj), 1e-6, None))
     mlj = np.array(
         [lj[warped == lab].mean() if n > 0 else np.nan for lab, n in zip(labels, n_w, strict=True)]
     )

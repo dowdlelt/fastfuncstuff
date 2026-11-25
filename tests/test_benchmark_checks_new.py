@@ -88,6 +88,11 @@ def test_warp_mni_plan_spreads_groups_and_cohort_scores(tmp_path):
     detj = np.array([1.0, 0.5, 2.0, -0.1])
     j = deformation_judges(detj, np.ones(4, bool))
     assert j["fold_frac"] == 0.25 and abs(j["logjac_sd"] - np.log([1, 0.5, 2]).std()) < 1e-12
+    # A base-space pullback with det J = 2 draws two source voxels into one: tissue squeezed
+    # to half. The judges speak of the tissue, so it counts as shrunk, not grown.
+    sq = deformation_judges(np.array([1.0, 1.0, 2.5, 1.0]), np.ones(4, bool))
+    assert sq["frac_det_below_half"] == 0.25 and sq["frac_det_above_2"] == 0.0
+    assert sq["logjac_p001"] < 0
 
 
 def test_label_judges_flag_a_lost_label_and_write_a_table():
@@ -103,7 +108,7 @@ def test_label_judges_flag_a_lost_label_and_write_a_table():
     j, tsv = label_judges(warped, aff, detj, np.array([1, 2, 3]), base=aff)
     assert j["n_labels_lost"] == 2 and j["n_labels_vanished"] == 1
     assert abs(j["label_vol_ratio_min"]) < 1e-12 and j["label_vol_ratio_max"] == 1.0
-    assert abs(j["label_logjac_max"] - np.log(2)) < 1e-9
+    assert abs(j["label_logjac_min"] + np.log(2)) < 1e-9  # det J 2 = squeezed to half
     lines = tsv.splitlines()
     assert lines[0].split("\t") == [
         "label",
