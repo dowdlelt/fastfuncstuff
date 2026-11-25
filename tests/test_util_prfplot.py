@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -243,3 +245,115 @@ def test_visual_centre_goes_through_sphere_reg_on_a_subjects_own_sphere(tmp_path
     # on sphere.reg itself it is the direction unchanged
     same = _registered_center(want, "lh", str(tmp_path / "lh.sphere.reg"), reg)
     assert np.array_equal(same, want)
+
+
+def test_angle_is_circular_and_the_rest_a_weighted_median_of_the_reads():
+    """350 and 10 make 0; one heavy outlier moves a mean and not a median."""
+    from fastfuncstuff.processing.prf_surface_sample import _circular, _per_vertex
+
+    rows = np.array([0, 0, 0, 1, 1, 1, 1])
+    weights = np.array([1.0, 1.0, 0.5, 1.0, 2.0, 1.0, 0.0])
+    angle = _circular(rows[:2], weights[:2], np.array([350.0, 10.0]), 2)
+    assert min(angle[0], 360 - angle[0]) < 1e-9 and np.isnan(angle[1])
+
+    values = np.array([2.0, 3.0, 40.0, 5.0, 1.0, 9.0, 1000.0])  # the 1000 has no weight
+    np.testing.assert_array_equal(_per_vertex(rows, weights, values, 3, "median")[:2], [3, 1])
+    np.testing.assert_allclose(_per_vertex(rows, weights, values, 3, "mean")[:2],
+                               [25.0 / 2.5, 16.0 / 4.0])  # fmt: skip
+    assert np.isnan(_per_vertex(rows, weights, values, 3, "median")[2])
+
+
+@pytest.fixture
+def volume_subject(tmp_path):
+    """A subject whose cortex is a 3 mm shell, and a volume bucket fitted on it.
+
+    In the ribbon the fit is good (R2 0.6) and its angle and eccentricity are known
+    functions of direction; the angle crosses the 0/360 seam on the +x side. White
+    matter and the deepest fifth of the ribbon (partial volume, a white surface a
+    little off) hold noise fits (R2 0.02) at angle 180 and eccentricity 50.
+    """
+    import nibabel.freesurfer as nfs
+
+    from fastfuncstuff.io.afni import save_nifti
+
+    from .test_nwarp_surface_cli import CENTRE, CRAS, _icosphere, _vinfo
+
+    subj = tmp_path / "subj"
+    (subj / "surf").mkdir(parents=True)
+    d, f = _icosphere(3)
+    for name, pos in (("white", CENTRE + 20 * d), ("pial", CENTRE + 23 * d)):
+        nfs.write_geometry(str(subj / "surf" / f"lh.{name}"), pos - CRAS, f, volume_info=_vinfo())
+    for name in ("sphere", "sphere.reg"):
+        nfs.write_geometry(str(subj / "surf" / f"lh.{name}"), 100 * d, f)
+
+    affine = np.eye(4)
+    affine[:3, 3] = CENTRE - 30.0
+    ijk = np.stack(np.meshgrid(*(np.arange(61),) * 3, indexing="ij"), -1).astype(float)
+    offset = ijk + affine[:3, 3] - CENTRE
+    radius = np.linalg.norm(offset, axis=-1)
+    u = offset / np.maximum(radius, 1e-6)[..., None]
+    angle = np.degrees(np.arctan2(u[..., 2], u[..., 0])) % 360
+    ecc = 5 + 5 * u[..., 1]
+    white = radius < 20.6
+    bucket = np.stack(
+        [
+            np.where(white, 180.0, angle),
+            np.where(white, 50.0, ecc),
+            np.where(white, 0.02, np.where(radius < 24, 0.6, 0.0)),
+        ],
+        -1,
+    ).astype(np.float32)
+    path = tmp_path / "prf.nii.gz"
+    save_nifti(bucket, output_path=str(path), affine=affine,
+               brick_labels=["angle", "eccentricity", "r2"])  # fmt: skip
+    return dict(subj=subj, bucket=path, dirs=d)
+
+
+def _plot_volume(world, tmp_path, name, *extra):
+    from fastfuncstuff.cli.util_prfplot import main
+
+    prefix = tmp_path / name
+    assert main([
+        "-input", str(world["bucket"]), "-fs_subj", str(world["subj"]),
+        "-surf_hemi", "lh", "-underlay", "none",
+        "-center", "posterior", "-maps", "angle", "eccentricity",
+        "-surf_save", str(prefix), "-prefix", f"{prefix}.png", *extra,
+    ]) == 0  # fmt: skip
+    assert Path(f"{prefix}.png").stat().st_size > 10_000
+    from fastfuncstuff.io.gifti import load_gifti_data
+
+    data, meta = load_gifti_data(f"{prefix}.lh.func.gii")
+    return data, meta
+
+
+def test_a_volume_bucket_is_sampled_onto_the_surface_and_drawn(volume_subject, tmp_path):
+    """The seam survives and the noise fits at the bottom of the ribbon stay out."""
+    d = volume_subject["dirs"]
+    data, meta = _plot_volume(volume_subject, tmp_path, "weighted")
+    angle, ecc, r2 = data.T
+    assert meta["surface_weight"] == "r2" and meta["surface_stat"] == "median"
+    assert meta["depths"] == "0.1 0.3 0.5 0.7 0.9"
+    expect_angle = np.degrees(np.arctan2(d[:, 2], d[:, 0])) % 360
+    error = np.abs((angle - expect_angle + 180) % 360 - 180)
+    assert np.percentile(error, 95) < 3.0
+    assert (error[(np.abs(d[:, 2]) < 0.2) & (d[:, 0] > 0)] < 5).all()  # at the seam
+    # Reads take their voxel's value, never a blend: a voxel centre is up to 0.87 mm
+    # (sqrt(3)/2) off the read, 5 eccentricity units per radian at 20 mm is 0.22 at
+    # most. Measured 0.085.
+    assert np.abs(ecc - (5 + 5 * d[:, 1])).max() < 0.25
+    assert ((r2 > 0.1) & (r2 <= 0.6 + 1e-5)).all()
+
+    plain, _ = _plot_volume(
+        volume_subject, tmp_path, "plain", "-surf_weight", "none", "-surf_stat", "mean"
+    )
+    # What weighting and the median buy: white matter's noise fits pull a plain mean
+    # of the reads off by far more than the voxel grid does (measured median 8.5,
+    # against 0.014 weighted).
+    assert np.median(np.abs(plain[:, 1] - (5 + 5 * d[:, 1]))) > 2.0
+
+
+def test_a_volume_bucket_needs_a_subject(volume_subject, tmp_path):
+    from fastfuncstuff.cli.util_prfplot import main
+
+    with pytest.raises(SystemExit, match="needs -fs_subj"):
+        main(["-input", str(volume_subject["bucket"]), "-prefix", str(tmp_path / "x.png")])

@@ -6,6 +6,8 @@ Usage:
     ffs_util_prfplot -input prf.lh.func.gii -fs_subj /fs/sub-01 -prefix prf_maps.png
     ffs_util_prfplot -input prf.lh.func.gii -fs_subj /fs/sub-01 -center medial \
         -radius 60 -maps angle eccentricity rfsize -units deg -prefix medial.png
+    ffs_util_prfplot -input prf.nii.gz -fs_subj /fs/sub-01 -prefix prf_maps.png \
+        -surf_save prf_surf
 """
 
 from __future__ import annotations
@@ -51,6 +53,23 @@ subject's label/ folder for both (-rois BA_exvivo.thresh.annot -roi_labels V1 V2
 MT). Labels on the subject's own mesh are carried onto a template bucket's mesh
 through ?h.sphere.reg.
 
+A volume bucket (ffs_pyrf fitted on voxels, .nii / .nii.gz / .nii.zst) is sampled
+onto -fs_subj's surfaces first, then drawn exactly like a surface bucket. It must
+already be in register with the subject's anatomy (the chain is the identity, as
+for ffs_pyrf -fs_subj). Fitted parameters are not a time series, so they are
+neither interpolated nor simply averaged. Each vertex reads its own patch of cortex
+at the -surf_depths (the footprints ffs_nwarp -surf uses), every read takes the
+value of the voxel it lands in (never a blend of two fits), and:
+  - polar angle is a circular mean (350 and 10 make 0, not 180);
+  - x, y, eccentricity, size and the rest are a weighted median (-surf_stat mean
+    for the weighted mean): a stray fit at the screen's edge does not move it;
+  - a read's weight is its footprint share times its R2, and nothing below
+    -r2_min (-surf_weight none: footprint shares only);
+  - R2 is the plain ribbon mean, so -r2_min asks how much of the column the model
+    explains.
+-surf_save keeps the sampled buckets as PREFIX.lh/rh.func.gii, which this tool
+then reads directly with no resampling.
+
 Polar angle uses a colour wheel (0 = right horizontal meridian, 90 = up), coloured
 flat per face, because smooth shading would sweep the whole wheel between 350 and
 10 degrees. Spatial values are in the bucket's units: degrees when ffs_pyrf had
@@ -70,16 +89,18 @@ _MAP_STYLE = {
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = FfsArgumentParser(prog="ffs_util_prfplot", description=_DESCRIPTION)
-    p.add_argument("-input", nargs="+", required=True, metavar="PRF.gii",
+    p.add_argument("-input", nargs="+", required=True, metavar="PRF",
                    help="ffs_pyrf surface bucket(s). One hemisphere's file is enough when its "
-                   ".lh/.rh partner sits beside it.")  # fmt: skip
+                   ".lh/.rh partner sits beside it. Or one volume bucket (.nii*), sampled "
+                   "onto -fs_subj's surfaces first.")  # fmt: skip
     p.add_argument("-prefix", required=True, metavar="OUT.png",
                    help="Figure to write; the extension picks the format (.png, .pdf, .svg).")  # fmt: skip
     surf = p.add_argument_group("surfaces")
     surf.add_argument("-fs_subj", metavar="DIR", default=None,
                       help="FreeSurfer subject, or a template folder (onavg-ico64): surf/?h.sphere "
                       "(else ?h.sphere.reg) and surf/?h.sulc are used unless -sphere / "
-                      "-underlay name others. Default: the subject the bucket records.")  # fmt: skip
+                      "-underlay name others. Default: the subject the bucket records. "
+                      "Required for a volume -input: the subject it is sampled onto.")  # fmt: skip
     surf.add_argument("-sphere", nargs="+", metavar="SPHERE", default=None,
                       help="Sphere per hemisphere, in -input's hemisphere order (FreeSurfer "
                       "or .surf.gii), on the bucket's mesh.")  # fmt: skip
@@ -91,6 +112,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       "(.annot, .label, .mgz, .gii), or one or more names in the subject's "
                       "label/ folder, read as ?h.NAME for each hemisphere (BA_exvivo.thresh.annot, "
                       "V1_exvivo.label V2_exvivo.label).")  # fmt: skip
+    vol = p.add_argument_group("volume input (sampled onto -fs_subj's surfaces)")
+    vol.add_argument("-surf_mesh", default="native",
+                     help="Mesh to sample onto: 'native' or a template folder (onavg-ico64).")  # fmt: skip
+    vol.add_argument("-surf_hemi", nargs="+", default=["lh", "rh"], choices=["lh", "rh"],
+                     help="Hemispheres to sample and draw.")  # fmt: skip
+    vol.add_argument("-surf_depths", nargs="+", type=float, default=None, metavar="FRAC",
+                     help="Equivolume depths read, 0 = white and 1 = pial. Default: the five "
+                     "equivolume bin centres (0.1 .. 0.9).")  # fmt: skip
+    vol.add_argument("-surf_sample_mode", choices=["footprint", "point"], default="footprint",
+                     help="footprint reads each vertex's own patch of cortex; point one "
+                     "interpolated value per vertex and depth.")  # fmt: skip
+    vol.add_argument("-surf_stat", choices=["median", "mean"], default="median",
+                     help="Statistic across a vertex's reads for every map but angle (a "
+                     "circular mean) and r2 (the plain mean).")  # fmt: skip
+    vol.add_argument("-surf_weight", choices=["r2", "none"], default="r2",
+                     help="r2: each read weighted by its R2, none under -r2_min; none: "
+                     "footprint and depth shares only.")  # fmt: skip
+    vol.add_argument("-surf_save", metavar="PREFIX", default=None,
+                     help="Also write the sampled buckets as PREFIX.lh.func.gii / "
+                     "PREFIX.rh.func.gii.")  # fmt: skip
     maps = p.add_argument_group("maps")
     maps.add_argument("-maps", nargs="+", default=["angle", "eccentricity", "r2"], metavar="MAP",
                       help="Sub-bricks to draw, one row each: angle, eccentricity, r2, rfsize, "
@@ -425,6 +466,81 @@ def _load_bucket(path: str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     return dict(zip(labels, data.T, strict=True)), meta
 
 
+def _is_volume(path: str) -> bool:
+    from fastfuncstuff.io.gifti import is_gifti
+
+    return not is_gifti(path) and path.lower().endswith((".nii", ".nii.gz", ".nii.zst"))
+
+
+def _sample_volume(args) -> list[tuple[str, str, dict[str, np.ndarray], dict[str, str]]]:
+    """``[(hemi, source, bucket, meta), ...]`` from one volume bucket, sampled."""
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.headers import read_brick_labels
+    from fastfuncstuff.processing.prf_surface_sample import sample_prf_bucket
+    from fastfuncstuff.processing.surface_projection import DEFAULT_DEPTHS
+
+    if len(args.input) != 1:
+        raise SystemExit("ffs_util_prfplot: a volume -input is one bucket (both hemispheres)")
+    if not args.fs_subj:
+        raise SystemExit("ffs_util_prfplot: a volume -input needs -fs_subj to sample onto")
+    if args.surf_depths is not None and not all(0 <= f <= 1 for f in args.surf_depths):
+        raise SystemExit("ffs_util_prfplot: -surf_depths are fractions, 0 (white) to 1 (pial)")
+    path = args.input[0]
+    image = load_nifti(path)
+    labels = read_brick_labels(image)
+    data = np.asarray(image.dataobj, np.float32)
+    data = data.reshape((*data.shape[:3], -1))
+    if len(labels) != data.shape[-1] or not all(labels):
+        raise SystemExit(f"ffs_util_prfplot: {path} has no sub-brick labels; is it an "
+                         "ffs_pyrf bucket?")  # fmt: skip
+    bucket = dict(zip(labels, np.moveaxis(data, -1, 0), strict=True))
+    if "r2" not in bucket:
+        raise SystemExit(f"ffs_util_prfplot: {path} has no r2 to weight and threshold by")
+    missing = [name for name in args.maps if name not in bucket]
+    if missing:
+        raise SystemExit(f"ffs_util_prfplot: {path} has no {', '.join(missing)}; it has "
+                         f"{', '.join(labels)}")  # fmt: skip
+    try:
+        sampled = sample_prf_bucket(
+            bucket,
+            image.affine,
+            tuple(float(z) for z in image.header.get_zooms()[:3]),
+            args.fs_subj,
+            labels=[*args.maps, "r2"],
+            r2_min=args.r2_min / 100.0,  # the bucket's r2 is a fraction
+            weight=args.surf_weight,
+            stat=args.surf_stat,
+            mesh=args.surf_mesh,
+            hemis=tuple(args.surf_hemi),
+            fractions=tuple(args.surf_depths) if args.surf_depths else DEFAULT_DEPTHS,
+            sample=args.surf_sample_mode,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        raise SystemExit(f"ffs_util_prfplot: {error}") from error
+    out = []
+    for part in sampled:
+        out.append((part.hemi, path, part.maps, part.meta))
+        print(f"{part.hemi}: sampled {int(part.covered.sum())} of {part.covered.size} vertices "
+              f"({args.surf_weight}-weighted {args.surf_stat}, depths {part.meta['depths']})")  # fmt: skip
+        if args.surf_save:
+            _save_sampled(f"{args.surf_save}.{part.hemi}.func.gii", part.maps, part.meta)
+    return out
+
+
+def _save_sampled(path: str, maps: dict[str, np.ndarray], meta: dict[str, str]) -> None:
+    """A sampled bucket as a GIfTI this tool (and the viewer) reads like ffs_pyrf's own."""
+    import nibabel as nib
+
+    from fastfuncstuff.io.gifti import save_nifti_data_as_gifti, set_surface_meta
+
+    labels = list(maps)
+    values = np.stack([maps[k] for k in labels], axis=1).astype(np.float32)
+    header = nib.Nifti2Image(np.zeros((len(values), 1, 1, 1), np.float32), np.eye(4)).header
+    set_surface_meta(header, meta)
+    save_nifti_data_as_gifti(path, values[:, None, None, :], header=header, brick_labels=labels)
+    print(f"Wrote {path}")
+
+
 def _pair_inputs(inputs: list[str]) -> list[tuple[str, str]]:
     """``[(hemi, path), ...]`` in lh, rh order."""
     from fastfuncstuff.processing.ribbon_sample import group_hemisphere_files, hemisphere_of
@@ -510,8 +626,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from fastfuncstuff.surface.flatmap import center_direction, draw_flat_map, sphere_view
 
-    pairs = _pair_inputs(args.input)
-    hemis = [hemi for hemi, _ in pairs]
+    if _is_volume(args.input[0]):
+        entries = _sample_volume(args)
+    else:
+        entries = [(hemi, path, *_load_bucket(path)) for hemi, path in _pair_inputs(args.input)]
+    hemis = [hemi for hemi, *_ in entries]
     spheres = _per_hemi(args.sphere, "sphere", hemis)
     underlays = (
         ["none"] * len(hemis)
@@ -523,8 +642,9 @@ def main(argv: list[str] | None = None) -> int:
 
     panels = []
     panel_r2: list[np.ndarray] = []
-    for (hemi, path), sphere, underlay in zip(pairs, spheres, underlays, strict=True):
-        bucket, bucket_meta = _load_bucket(path)
+    for (hemi, path, bucket, bucket_meta), sphere, underlay in zip(
+        entries, spheres, underlays, strict=True
+    ):
         n_vertices = len(next(iter(bucket.values())))
         sphere, vertices, faces, underlay_values, underlay_from = _resolve_surfaces(
             hemi, n_vertices, bucket_meta, path, args.fs_subj, sphere, underlay
@@ -626,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
             side.set_axis_off()
         else:
             side.set_axis_off()
-    title = args.title if args.title is not None else os.path.basename(pairs[0][1])
+    title = args.title if args.title is not None else os.path.basename(entries[0][1])
     fig.suptitle(f"{title}   (R² ≥ {args.r2_min:g}%)", fontsize=10)
     fig.savefig(args.prefix, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig)
