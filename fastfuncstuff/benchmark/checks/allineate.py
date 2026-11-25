@@ -42,6 +42,7 @@ are judged where they are.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -143,6 +144,10 @@ def boundary_contrast(
             "n_pts": float(ok.sum())}  # fmt: skip
 
 
+def _is_inversion(name) -> bool:
+    return "inv" in name.ent or bool(re.fullmatch(r"inv-?\d+", name.ent.get("acq", "").lower()))
+
+
 def partial_axes(epi_affine, epi_shape, brain_affine, brain_mask, frac=PARTIAL_FRAC) -> str:
     """World axes ("x", "y", "z", RAS order) along which the EPI's field of view is shorter
     than ``frac`` of the brain's extent.
@@ -198,7 +203,9 @@ class AllineateCheck(Check):
         ]  # fmt: skip
         if not t1s:
             return []
-        t1s.sort(key=lambda n: (n.ent.get("ses") != ses, len(n.entities), n.rel))
+        # An MP2RAGE inversion saved as T1w (acq-inv1, Forest) is proton-density-like, not
+        # the anatomy anyone aligns to; without this it wins the tie alphabetically over uni.
+        t1s.sort(key=lambda n: (_is_inversion(n), n.ent.get("ses") != ses, len(n.entities), n.rel))
         return [first.rel, t1s[0].rel]
 
     def plan(self, manifest, index, n):

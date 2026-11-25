@@ -360,3 +360,14 @@ def test_allineate_partial_axes_follow_the_slab_not_its_bounding_box():
     assert partial_axes(*epi((128, 160, 30), (1, 1, 1.25), slice_axis=1), brain, mask) == "y"
     assert partial_flag("") == [] and partial_flag("z") == ["-partial_axial"]
     assert partial_flag("y") == ["-partial_coronal"] and partial_flag("yz") == ["-partial_coverage"]
+
+
+def test_allineate_t1_skips_mp2rage_inversions():
+    from fastfuncstuff.benchmark.census import Index
+    from fastfuncstuff.benchmark.checks.allineate import AllineateCheck
+
+    bold = "sub-09/ses-tun/func/sub-09_ses-tun_task-x_bold.nii.gz"
+    anat = "sub-09/ses-ret/anat/sub-09_ses-ret_acq-{}_T1w.nii.gz"
+    idx = Index({bold: 1, **{anat.format(a): 1 for a in ("inv1", "inv2", "uni")}})
+    bold_name = next(n for n in idx.names if n.rel == bold)
+    assert AllineateCheck().unit_inputs([bold_name], idx) == [bold, anat.format("uni")]
