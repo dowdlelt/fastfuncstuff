@@ -115,13 +115,29 @@ class NordicCheck(Check):
             dst = ref / f"{name}{ext}"
             dst.unlink(missing_ok=True)
             dst.symlink_to(src)
+        # NIFTI_NORDIC writes its output in the magnitude's datatype, so an integer input
+        # comes back rounded to integers (ds006947: a g-factor of 6 distinct values, time
+        # series r 0.92). Hand it a float32 copy; the phase datatype does not reach the output.
+        mag_img = nib.Nifti1Image.from_filename(str(mag))
+        if np.issubdtype(mag_img.get_data_dtype(), np.integer):
+            (ref / f"mag{ext}").unlink()
+            ext_mag = ".nii"
+            f32 = nib.Nifti1Image(np.asarray(mag_img.dataobj, dtype=np.float32), mag_img.affine,
+                                  mag_img.header)  # fmt: skip
+            f32.set_data_dtype(np.float32)
+            f32.header.set_slope_inter(1.0, 0.0)
+            nib.save(f32, ref / "mag.nii")
+            res.provenance["ref_input_cast"] = {"mag": f"{mag_img.get_data_dtype()} -> float32"}
+        else:
+            ext_mag = ext
+        del mag_img
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 1
         toolbox = os.environ.get("NORDIC_MATLAB_PATH", str(NORDIC_TOOLBOX))
         arga = {**REF_ARGA, "noise_volume_last": k}
         script = (
             f"maxNumCompThreads({threads}); addpath(genpath('{toolbox}')); "
             + " ".join(f"ARGA.{a} = {v};" for a, v in arga.items())
-            + f" NIFTI_NORDIC('mag{ext}', 'phase{ext}', 'nordic', ARGA);"
+            + f" NIFTI_NORDIC('mag{ext_mag}', 'phase{ext}', 'nordic', ARGA);"
         )
         out_ref, gf_ref = ref / "nordic.nii", ref / "gfactor_nordic.nii"
         matlab = os.environ.get("FFS_MATLAB", MATLAB)
