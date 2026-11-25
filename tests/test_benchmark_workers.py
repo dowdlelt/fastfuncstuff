@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from fastfuncstuff.benchmark.workers import core_slots, cpu_cores, default_workers, thread_env
@@ -57,3 +59,60 @@ def test_prune_spares_cache_files_another_running_unit_reads(tmp_path):
     assert wl.prune(a["id"]) == 0 and f.exists()  # b still reads it
     wl.finish(b["id"], "done")
     assert wl.prune(b["id"]) == 100 and not f.exists()  # the last user removes it
+
+
+def _manifest(d, ds, kind):
+    import yaml
+
+    uri = f"s3://openneuro.org/{ds}" if kind == "s3" else "/private/tree"
+    (d / f"{ds}.yaml").write_text(
+        yaml.safe_dump({"dataset_id": ds, "source": {"kind": kind, "uri": uri}, "acquisitions": []})
+    )
+
+
+def test_hostset_export_run_ingest_round_trip(tmp_path, capsys):
+    from fastfuncstuff.benchmark.hostset import export_hostset, hostsets, ingest
+
+    root, man = tmp_path / "bench", tmp_path / "bench" / "manifests"
+    man.mkdir(parents=True)
+    for ds, kind in (("dsA", "s3"), ("dsB", "s3"), ("Private", "local")):
+        _manifest(man, ds, kind)
+    wl = Worklist(root / "worklist.sqlite")
+    for ds in ("dsA", "dsB", "Private"):
+        wl.add_units("moco", ds, [({"sub": s}, [f"sub-{s}/bold.nii.gz"]) for s in ("01", "02")])
+    while (u := wl.claim_next()) is not None:
+        wl.finish(u["id"], "done")
+    wl.add_units("moco", "dsA", [({"sub": "03"}, ["x"])])  # pending: not exported
+
+    out = export_hostset(wl, man, tmp_path / "hs", ["moco"], 3, "epyc")
+    hs = Worklist(out / "worklist.sqlite")
+    rows = hs.db.execute("SELECT id, dataset, status FROM units ORDER BY id").fetchall()
+    assert [r["dataset"] for r in rows].count("dsA") == 2 and len(rows) == 3  # spread, no Private
+    assert all(r["status"] == "pending" for r in rows)
+    assert sorted(p.name for p in (out / "manifests").iterdir()) == ["dsA.yaml", "dsB.yaml"]
+    assert "Private" in capsys.readouterr().out
+
+    # "the server": run one unit, keep its output, drop its downloaded input
+    u = hs.claim_next()
+    unit_out = Path("/server/bench/units/moco") / u["dataset"] / "unit1" / "ffs" / "moco.nii"
+    hs.record_timing(u["id"], "ffs", "cpu", 12.5, 6)
+    hs.record_artifact(u["id"], unit_out, "regenerable")
+    hs.record_provenance(u["id"], "worker", {"hostname": "epyc01"})
+    cached = out / "cache" / u["dataset"] / "bold.nii.gz"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"x")
+    hs.record_artifact(u["id"], cached, "regenerable")
+    hs.finish(u["id"], "done")
+    hs.prune(u["id"], under=out / "cache")
+    assert not cached.exists()
+    hs.close()
+
+    for _ in range(2):  # re-ingest replaces, never duplicates
+        dest = ingest(wl, root, out)
+    (h,) = hostsets(wl)
+    assert (h["label"], h["hostname"], h["n_done"]) == ("epyc", "epyc01", 1)
+    got = Worklist(dest / "worklist.sqlite")
+    paths = [r["path"] for r in got.db.execute("SELECT path FROM artifacts")]
+    assert str(dest / "units/moco" / u["dataset"] / "unit1/ffs/moco.nii") in paths
+    (res,) = got.results("moco")
+    assert res["unit_id"] == u["id"] and res["seconds.ffs.cpu"] == 12.5

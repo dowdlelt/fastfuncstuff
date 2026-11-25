@@ -24,8 +24,10 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 def worker_info() -> dict:
     """Which worker ran the unit, on which CPUs, with how many threads."""
     import os
+    import socket
 
     return {
+        "hostname": socket.gethostname(),
         "worker": os.environ.get("FFS_BENCH_WORKER", "0/1"),
         "cpus": os.environ.get("FFS_BENCH_CPUS")
         or ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -220,7 +222,8 @@ def run(
             )
             print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
         if not keep:
-            freed = wl.prune(u["id"])
+            # A host set's outputs are the only copy of that host's results: keep them.
+            freed = wl.prune(u["id"], under=root / "cache" if wl.meta("hostset") else None)
             if freed:
                 print(f"    pruned {freed / 1e6:.0f} MB", flush=True)
         n_done += 1
@@ -245,8 +248,26 @@ def main(argv: list[str] | None = None) -> int:
     act.add_argument("-status", action="store_true", help="Unit counts by check, dataset, status.")
     act.add_argument("-results", metavar="CHECK", help="Print finished units of CHECK as TSV.")
     act.add_argument("-retry_failed", action="store_true", help="Return failed units to pending.")
+    act.add_argument(
+        "-export_hostset",
+        metavar="DIR",
+        type=Path,
+        help="Write a host set to DIR: -n finished units of each of -checks (default 2), from "
+        "public datasets, plus their manifests. Run it elsewhere with FFS_BENCH_ROOT=DIR.",
+    )
+    act.add_argument(
+        "-ingest", metavar="DIR", type=Path, help="Register a synced host set (re-ingest replaces)."
+    )
+    act.add_argument("-hosts", action="store_true", help="List ingested host sets.")
     p.add_argument("-datasets", nargs="+", default=[], help="Dataset ids (with -plan).")
-    p.add_argument("-n", type=int, default=1, help="Units per acquisition (breadth checks).")
+    p.add_argument(
+        "-n",
+        type=int,
+        help="Units per acquisition with -plan (default 1); per check with "
+        "-export_hostset (default 2).",
+    )
+    p.add_argument("-checks", nargs="+", default=[], help="Checks for -export_hostset.")
+    p.add_argument("-label", default="host", help="Name of the host set (-export_hostset).")
     p.add_argument("-check", help="Only run units of this check (with -run).")
     p.add_argument("-max_units", type=int, default=10**9, help="Stop after this many units.")
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
@@ -281,7 +302,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.plan:
         if not args.datasets:
             p.error("-plan needs -datasets")
-        plan(wl, args.manifests, args.plan, args.datasets, args.n)
+        plan(wl, args.manifests, args.plan, args.datasets, args.n or 1)
+    elif args.export_hostset:
+        from .hostset import export_hostset
+
+        if not args.checks:
+            p.error("-export_hostset needs -checks")
+        export_hostset(wl, args.manifests, args.export_hostset, args.checks, args.n or 2,
+                       args.label, args.datasets)  # fmt: skip
+    elif args.ingest:
+        from .hostset import ingest
+
+        ingest(wl, args.root, args.ingest)
+    elif args.hosts:
+        from .hostset import hostsets
+
+        for h in hostsets(wl):
+            print(f"{h['label']:<12} {h['uuid'][:8]}  {h['hostname'] or '?':<16} "
+                  f"{h['cpu_model'] or '?':<40} done {h['n_done']} failed {h['n_failed']}  {h['path']}")  # fmt: skip
     elif args.run and args.workers != 1:
         from .workers import launch
 
@@ -319,7 +357,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.retry_failed:
         print(f"{wl.reset('failed', args.check)} units back to pending")
     elif args.results:
-        rows = wl.results(args.results)
+        from .hostset import hostsets
+
+        rows = [{"host": "local", **r} for r in wl.results(args.results)]
+        for h in hostsets(wl):
+            hs = Worklist(Path(h["path"]) / "worklist.sqlite")
+            rows += [{"host": h["label"], **r} for r in hs.results(args.results)]
+            hs.close()
         cols = sorted({k for r in rows for k in r}, key=lambda c: (c.count("."), c))
         print("\t".join(cols))
         for r in rows:

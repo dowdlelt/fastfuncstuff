@@ -6,8 +6,10 @@ fetches its inputs, runs reference and ffs, scores, prunes, and records everythi
 Rows are never deleted when files are pruned, so any result can be traced to the exact
 inputs, versions and command that produced it, and regenerated from them.
 
-Units run one at a time per machine (timings are the product, and parallel runs corrupt
-them -- see the wiki's Benchmark validation), so SQLite's single writer is no limit.
+Parallel workers (work -workers) each own their cores and thread budget, so timings stay
+clean; they write a unit's rows between long tool runs, so SQLite's single writer is no limit.
+Results from other machines arrive as host sets (hostset.py): separate databases registered
+in ``hostsets``, never merged into these tables.
 """
 
 from __future__ import annotations
@@ -62,6 +64,20 @@ CREATE TABLE IF NOT EXISTS timings (
     recorded_at REAL NOT NULL,
     PRIMARY KEY (unit_id, side, device)
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,            -- a host set's identity: hostset (uuid), label, ...
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS hostsets (
+    uuid TEXT PRIMARY KEY,           -- one row per ingested host set; re-ingest replaces it
+    label TEXT NOT NULL,
+    path TEXT NOT NULL,
+    hostname TEXT,
+    cpu_model TEXT,
+    n_done INTEGER,
+    n_failed INTEGER,
+    ingested_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS artifacts (
     unit_id INTEGER NOT NULL REFERENCES units(id),
     path TEXT NOT NULL,
@@ -93,6 +109,15 @@ class Worklist:
 
     def close(self) -> None:
         self.db.close()
+
+    def meta(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else row["value"]
+
+    def set_meta(self, **values: str) -> None:
+        with self._tx():
+            for k, v in values.items():
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (k, v))
 
     @contextmanager
     def _tx(self):
@@ -217,8 +242,10 @@ class Worklist:
             (unit_id, str(p), size, retention),
         )
 
-    def prune(self, unit_id: int | None = None) -> int:
-        """Delete regenerable files (rows stay, stamped). Returns bytes freed."""
+    def prune(self, unit_id: int | None = None, under: Path | None = None) -> int:
+        """Delete regenerable files (rows stay, stamped), only those below ``under`` if
+        given (a host set keeps its outputs and drops just the input cache). Returns bytes
+        freed."""
         q = "SELECT unit_id, path, bytes FROM artifacts WHERE retention='regenerable' AND pruned_at IS NULL"
         args: list[Any] = []
         if unit_id is not None:
@@ -238,6 +265,8 @@ class Worklist:
         for row in self.db.execute(q, args).fetchall():
             p = Path(row["path"])
             if any(p.as_posix().endswith(f"/{ds}/{rel}") for ds, rel in busy):
+                continue
+            if under is not None and Path(under) not in p.parents:
                 continue
             if p.is_file():
                 p.unlink()
@@ -262,7 +291,11 @@ class Worklist:
         for u in self.db.execute(
             "SELECT * FROM units WHERE check_name=? AND status='done' ORDER BY id", (check,)
         ):
-            row: dict[str, Any] = {"dataset": u["dataset"], **json.loads(u["unit_key"])}
+            row: dict[str, Any] = {
+                "unit_id": u["id"],
+                "dataset": u["dataset"],
+                **json.loads(u["unit_key"]),
+            }
             for m in self.db.execute("SELECT * FROM metrics WHERE unit_id=?", (u["id"],)):
                 row[f"{m['judge']}.{m['metric']}"] = m["value"]
             for t in self.db.execute("SELECT * FROM timings WHERE unit_id=?", (u["id"],)):
