@@ -1,13 +1,23 @@
-"""allineate: ffs_allineate against 3dAllineate, mean EPI to the subject's T1w (lpc).
+"""allineate: ffs_allineate against AFNI's EPI-to-anatomy recipe, mean EPI to the T1w.
 
 Unit: one run. Frozen inputs: the run's mean (3dTstat) and the subject's T1w stripped
-once by ``ffs_segment -brain`` (bias-corrected, inside GM+WM+CSF > 0.95), given to both
-tools with identical arguments (lpc, source automask) and each tool's default centring,
-since the defaults are what users get. Not 3dSkullStrip: on a 7T T1 (ds004645) it removed
-the cerebellum, occipital and inferior temporal lobes, where the slab EPI sat.
+once by ``ffs_segment -brain`` (bias-corrected, inside GM+WM+CSF > 0.95). Not
+3dSkullStrip: on a 7T T1 (ds004645) it removed the cerebellum, occipital and inferior
+temporal lobes, where the slab EPI sat.
 
-Judge (reference): RMS displacement in mm between the two fitted affines over the
-stripped T1's brain voxels, and the correlation of the two aligned means. ffs_allineate's
+Reference: align_epi_anat.py as afni_proc.py runs it (anat2epi, EPI strip by 3dAutomask,
+-volreg off -tshift off, ``-anat_has_skull no`` as after @SSwarper) with the options
+afni_proc's help recommends for EPI to anatomy, ``-cost lpc+ZZ -giant_move``. On an EPI
+that covers only part of the brain the plain centre-of-mass shift drags the slab to the
+brain's middle, so the matching ``-partial_*`` flag limits cmass to the covered axes
+(AFNI's own advice; see ``partial_axes``). Its EPI-to-anatomy matrix is applied to the
+mean with wsinc5 on the T1 grid, as ffs writes its own output. A bare 3dAllineate with
+the arguments ffs gets (lpc, source automask, its defaults) runs too, for speed parity
+and continuity with earlier runs; the judges score all three. ffs_allineate runs at its
+defaults, since the defaults are what users get.
+
+Judge (reference): RMS displacement in mm between ffs's and the reference's affines over
+the stripped T1's brain voxels, and the correlation of the two aligned means. ffs_allineate's
 search is stochastic (CMA-ES), so a unit is one draw: report the distribution over
 units, not a per-unit pass.
 
@@ -32,6 +42,7 @@ are judged where they are.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +50,18 @@ import numpy as np
 from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
+
+# align_epi_anat.py as afni_proc.py writes it (db_mod.py, align block) plus the options
+# its help recommends for EPI to anatomy; the -partial_* flag is added per unit.
+AEA_ARGS = ["-anat2epi", "-epi2anat", "-epi_base", "0", "-epi_strip", "3dAutomask",
+            "-anat_has_skull", "no", "-volreg", "off", "-tshift", "off",
+            "-cost", "lpc+ZZ", "-giant_move", "-suffix", "_al"]  # fmt: skip
+
+# An EPI axis shorter than this share of the brain's extent along the same world axis
+# counts as partial. Measured on the benchmark's EPIs (11-25): whole-brain runs span
+# 119-149 mm in I-S, slabs 30-104 mm (HiHiFaces, ds004645); a T1 brain is ~140 mm.
+PARTIAL_FRAC = 0.8
+PARTIAL_FLAG = {"z": "-partial_axial", "y": "-partial_coronal", "x": "-partial_sagittal"}
 
 
 YARD_COSTS = ("hel", "nmi", "mi", "lpc", "lpa", "ls")
@@ -120,6 +143,37 @@ def boundary_contrast(
             "n_pts": float(ok.sum())}  # fmt: skip
 
 
+def partial_axes(epi_affine, epi_shape, brain_affine, brain_mask, frac=PARTIAL_FRAC) -> str:
+    """World axes ("x", "y", "z", RAS order) along which the EPI's field of view is shorter
+    than ``frac`` of the brain's extent.
+
+    Each EPI voxel axis is assigned to the world axis it points along most (an oblique slab
+    is still partial along its own short axis, whose world bounding box is inflated by the
+    tilt); its length is compared to the brain mask's world extent on that axis."""
+    from nibabel.affines import apply_affine
+
+    a = np.asarray(epi_affine, dtype=float)[:3, :3]
+    vox = np.sqrt((a**2).sum(0))
+    ijk = np.argwhere(brain_mask)
+    w = apply_affine(brain_affine, ijk)
+    bvox = np.sqrt((np.asarray(brain_affine)[:3, :3] ** 2).sum(0))
+    brain_ext = w.max(0) - w.min(0) + bvox.mean()
+    out = set()
+    for i in range(3):
+        ax = int(np.argmax(np.abs(a[:, i])))
+        if vox[i] * epi_shape[i] < frac * brain_ext[ax]:
+            out.add("xyz"[ax])
+    return "".join(sorted(out))
+
+
+def partial_flag(axes: str) -> list[str]:
+    """align_epi_anat.py's flag for ``partial_axes``: one partial axis has its own flag
+    (cmass then moves only along the covered axes), more than one leaves AFNI to judge."""
+    if not axes:
+        return []
+    return [PARTIAL_FLAG[axes]] if len(axes) == 1 else ["-partial_coverage"]
+
+
 def rms_displacement(m1: np.ndarray, m2: np.ndarray, pts_rai: np.ndarray) -> float:
     d = (m1 - m2)[:3] @ np.c_[pts_rai, np.ones(len(pts_rai))].T
     return float(np.sqrt((d**2).sum(0).mean()))
@@ -127,10 +181,10 @@ def rms_displacement(m1: np.ndarray, m2: np.ndarray, pts_rai: np.ndarray) -> flo
 
 class AllineateCheck(Check):
     name = "allineate"
-    description = "Affine EPI->T1w: ffs_allineate vs 3dAllineate (lpc), same stripped T1"
+    description = "Affine EPI->T1w: ffs_allineate vs align_epi_anat.py (and 3dAllineate)"
     needs = [["@ds:anat_t1"]]
     sampling = "breadth"
-    reference = "AFNI 3dAllineate"
+    reference = "AFNI align_epi_anat.py (lpc+ZZ -giant_move, -partial_* per unit)"
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]
@@ -171,16 +225,36 @@ class AllineateCheck(Check):
                "-no_invwarp", "-device", device], work, log, timeout_s=1800)  # fmt: skip
 
         threads = cpu_threads()
-        out = {s: work / s for s in ("ref", "ffs")}
+        out = {s: work / s for s in ("ref", "ffs", "3dallineate")}
         for d in out.values():
             d.mkdir(exist_ok=True)
+
+        b = nib.Nifti1Image.from_filename(str(brain))
+        mask = np.asarray(nib.Nifti1Image.from_filename(f"{seg}_brainmask.nii.gz").dataobj) > 0
+        e = nib.Nifti1Image.from_filename(str(mean))
+        axes = partial_axes(e.affine, e.shape[:3], b.affine, mask)
+        aea_args = [*AEA_ARGS, *partial_flag(axes)]
+        # align_epi_anat names its outputs after the inputs' prefixes, in -output_dir.
         t = timed(
+            ["align_epi_anat.py", "-overwrite", "-anat", str(brain), "-epi", str(mean),
+             "-output_dir", str(out["ref"]), *aea_args],
+            work, log, timeout_s=self.timeout_s,
+        )  # fmt: skip
+        shutil.copy(out["ref"] / "epi_mean_al_mat.aff12.1D", out["ref"] / "al.aff12.1D")
+        t += timed(
             ["3dAllineate", "-overwrite", "-base", str(brain), "-source", str(mean),
-             "-prefix", str(out["ref"] / "al.nii.gz"),
-             "-1Dmatrix_save", str(out["ref"] / "al.aff12.1D"), *ARGS],
+             "-1Dmatrix_apply", str(out["ref"] / "al.aff12.1D"), "-master", str(brain),
+             "-final", "wsinc5", "-prefix", str(out["ref"] / "al.nii.gz")],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         res.timings.append(("ref", "cpu", t, threads))
+        t = timed(
+            ["3dAllineate", "-overwrite", "-base", str(brain), "-source", str(mean),
+             "-prefix", str(out["3dallineate"] / "al.nii.gz"),
+             "-1Dmatrix_save", str(out["3dallineate"] / "al.aff12.1D"), *ARGS],
+            work, log, timeout_s=self.timeout_s,
+        )  # fmt: skip
+        res.timings.append(("3dallineate", "cpu", t, threads))
         t = timed(
             ["ffs_allineate", "-base", str(brain), "-source", str(mean),
              "-prefix", str(out["ffs"] / "al.nii.gz"),
@@ -189,15 +263,14 @@ class AllineateCheck(Check):
         )  # fmt: skip
         res.timings.append(("ffs", device.split(",")[0], t, ffs_threads(device)))
 
-        b = nib.Nifti1Image.from_filename(str(brain))
-        mask = np.asarray(nib.Nifti1Image.from_filename(f"{seg}_brainmask.nii.gz").dataobj) > 0
         ijk = np.argwhere(mask)[:: max(1, int(mask.sum() // 200000))]
         ras = apply_affine(b.affine, ijk)
         rai = ras * np.array([-1.0, -1.0, 1.0])
-        m_ref = read_aff12(out["ref"] / "al.aff12.1D")
-        m_ffs = read_aff12(out["ffs"] / "al.aff12.1D")
-        a = np.asarray(nib.Nifti1Image.from_filename(str(out["ref"] / "al.nii.gz")).dataobj)
-        c = np.asarray(nib.Nifti1Image.from_filename(str(out["ffs"] / "al.nii.gz")).dataobj)
+        mats = {s: read_aff12(out[s] / "al.aff12.1D") for s in out}
+        imgs = {s: np.asarray(nib.Nifti1Image.from_filename(str(out[s] / "al.nii.gz")).dataobj)
+                for s in out}  # fmt: skip
+        m_ref, m_ffs = mats["ref"], mats["ffs"]
+        a, c = imgs["ref"], imgs["ffs"]
         x, y = a[mask].astype(float), c[mask].astype(float)
         x, y = x - x.mean(), y - y.mean()
         res.metrics["reference"] = {
@@ -208,10 +281,12 @@ class AllineateCheck(Check):
             # isotropic scale; ffs failures so far sit on its 0.8 bound (ds002603, ds004645)
             "scale_ref": float(abs(np.linalg.det(m_ref[:3, :3])) ** (1 / 3)),
             "scale_ffs": float(abs(np.linalg.det(m_ffs[:3, :3])) ** (1 / 3)),
+            # the earlier reference, kept for continuity: how far plain 3dAllineate lands
+            "3dallineate_rms_from_ref_mm": rms_displacement(mats["3dallineate"], m_ref, rai),
+            "ffs_rms_from_3dallineate_mm": rms_displacement(m_ffs, mats["3dallineate"], rai),
         }
         # How much of the problem the EPI poses: a thin slab or partial field of view is the
         # hard case for both tools, so failures are read against coverage.
-        e = nib.Nifti1Image.from_filename(str(mean))
         vox = np.sqrt((e.affine[:3, :3] ** 2).sum(0))
         ext = vox * np.asarray(e.shape[:3])
         res.metrics["data"] = {
@@ -220,6 +295,8 @@ class AllineateCheck(Check):
             # share of the T1 brain inside the EPI's field of view under each fit
             "brain_coverage_ref": float((np.abs(a[mask]) > 0).mean()),
             "brain_coverage_ffs": float((np.abs(c[mask]) > 0).mean()),
+            # axes align_epi_anat was told are partial (bit per axis: x=1, y=2, z=4)
+            "partial_axes": float(sum(1 << "xyz".index(k) for k in axes)),
         }  # fmt: skip
         yard: dict[str, float | None] = {}
         for s in out:
@@ -229,15 +306,16 @@ class AllineateCheck(Check):
             for k, v in parse_allcost(ylog.read_text()).items():
                 yard[f"{k}_{s}"] = v
         for k in ("hel", "nmi", "mi"):
-            if f"{k}_ref" in yard and f"{k}_ffs" in yard:
-                yard[f"{k}_ffs_minus_ref"] = yard[f"{k}_ffs"] - yard[f"{k}_ref"]
+            for other in ("ref", "3dallineate"):
+                if f"{k}_{other}" in yard and f"{k}_ffs" in yard:
+                    yard[f"{k}_ffs_minus_{other}"] = yard[f"{k}_ffs"] - yard[f"{k}_{other}"]
         res.metrics["yardstick"] = yard
 
         # tissue judge: needs no cost either tool optimises (see the module docstring)
         wmv = np.asarray(nib.Nifti1Image.from_filename(str(wm)).dataobj, dtype=np.float32)
         bvox = np.sqrt((b.affine[:3, :3] ** 2).sum(0))
         truth: dict[str, float] = {}
-        for s, img in (("ref", a), ("ffs", c)):
+        for s, img in imgs.items():
             e_al = np.asarray(img, dtype=np.float32)
             truth[f"epi_in_brain_{s}"] = epi_in_brain(e_al, mask, bvox)
             for k, v in boundary_contrast(e_al, wmv, mask, bvox).items():
@@ -252,8 +330,10 @@ class AllineateCheck(Check):
         res.artifacts += [(out[s] / "al.aff12.1D", "keep") for s in out]
         res.artifacts += [(mean, "keep"), (log, "keep")]
         res.artifacts += [(f, "regenerable") for f in sorted(seg.parent.glob("*.nii.gz"))]
-        res.provenance["ref"] = {"tool": "3dAllineate", "version": afni_version("3dAllineate"),
-                                 "args": ARGS}  # fmt: skip
+        res.provenance["ref"] = {"tool": "align_epi_anat.py", "version": afni_version("3dAllineate"),
+                                 "args": aea_args, "apply": "3dAllineate -1Dmatrix_apply -final wsinc5"}  # fmt: skip
+        res.provenance["3dallineate"] = {"tool": "3dAllineate",
+                                         "version": afni_version("3dAllineate"), "args": ARGS}  # fmt: skip
         res.provenance["ffs"] = {"tool": "ffs_allineate", **ffs_version(), "args": ARGS,
                                  "device": device}  # fmt: skip
         res.provenance["inputs_prep"] = {

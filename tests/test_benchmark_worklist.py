@@ -332,3 +332,31 @@ def test_physio_recording_start_end_aligns_only_without_a_start_time():
     assert recording_start(fs, 312_000, 304.0, 2.0)[0] == -8.0
     assert recording_start({**fs, "StartTime": -8.18}, 166_400, 158.0, 2.0)[0] == -8.18
     assert recording_start({**fs, "StartTime": 0}, 305_000, 304.0, 2.0)[0] == 0.0  # within a TR
+
+
+def test_allineate_partial_axes_follow_the_slab_not_its_bounding_box():
+    """align_epi_anat's -partial_* choice: whole brain none, an axial slab z (even tilted
+    20 deg, whose world box spans ~110 mm in z), a coronal slab y (Forest's occipital)."""
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.allineate import partial_axes, partial_flag
+
+    mask = np.zeros((140, 170, 130), bool)  # 1 mm brain box
+    mask[5:135, 5:165, 5:125] = True
+    brain = np.eye(4)
+
+    def epi(shape, vox, tilt_deg=0.0, slice_axis=2):
+        r = np.radians(tilt_deg)
+        rot = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
+        a = np.eye(4)
+        a[:3, :3] = rot @ np.diag(vox)
+        if slice_axis == 1:  # coronal slices: the third voxel axis points A-P
+            a[:3, :3] = a[:3, :3][:, [0, 2, 1]]
+        return a, shape
+
+    assert partial_axes(*epi((64, 64, 48), (3, 3, 3)), brain, mask) == ""
+    assert partial_axes(*epi((120, 120, 15), (2, 2, 2)), brain, mask) == "z"
+    assert partial_axes(*epi((120, 120, 15), (2, 2, 2), tilt_deg=20), brain, mask) == "z"
+    assert partial_axes(*epi((128, 160, 30), (1, 1, 1.25), slice_axis=1), brain, mask) == "y"
+    assert partial_flag("") == [] and partial_flag("z") == ["-partial_axial"]
+    assert partial_flag("y") == ["-partial_coronal"] and partial_flag("yz") == ["-partial_coverage"]
