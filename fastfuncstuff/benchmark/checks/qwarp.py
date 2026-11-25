@@ -45,6 +45,36 @@ def _dice_per_label(a: np.ndarray, b: np.ndarray, labels: np.ndarray) -> np.ndar
     return np.asarray(out)
 
 
+def prep_pair(src_img, src_lab, base_img, base_lab, prep, work, log):
+    """Both brains and tracings at 1 mm (cubic / NN) and one 3dAllineate affine
+    of source to base, applied to the source image and labels. Every nonlinear tool of a
+    pair starts from the same aligned source, so only the nonlinear part differs."""
+
+    def resample(src, out, mode):
+        timed(["3dresample", "-overwrite", "-dxyz", DXYZ, DXYZ, DXYZ, "-rmode", mode,
+               "-input", str(src), "-prefix", str(out)], work, log)  # fmt: skip
+
+    S, SL = prep / "src.nii.gz", prep / "src_lab.nii.gz"
+    B, BL = prep / "base.nii.gz", prep / "base_lab.nii.gz"
+    resample(src_img, S, "Cu")
+    resample(src_lab, SL, "NN")
+    resample(base_img, B, "Cu")
+    resample(base_lab, BL, "NN")
+    SA, SLA, aff = prep / "src_al.nii.gz", prep / "src_lab_al.nii.gz", prep / "src_al.aff12.1D"
+    timed(
+        ["3dAllineate", "-overwrite", "-base", str(B), "-source", str(S), "-prefix", str(SA),
+         "-1Dmatrix_save", str(aff), "-cost", "ls", "-twopass", "-final", "wsinc5"],
+        work, log, timeout_s=1800,
+    )  # fmt: skip
+    timed(
+        ["3dAllineate", "-overwrite", "-master", str(B), "-source", str(SL),
+         "-1Dmatrix_apply", str(aff), "-final", "NN", "-prefix", str(SLA)],
+        work, log,
+    )  # fmt: skip
+
+    return S, SL, B, BL, SA, SLA, aff
+
+
 class QwarpCheck(Check):
     name = "qwarp"
     description = "Nonlinear warp: ffs_qwarp vs 3dQwarp, Dice of transported manual labels"
@@ -82,27 +112,9 @@ class QwarpCheck(Check):
         prep = work / "prep"
         prep.mkdir(exist_ok=True)
 
-        def resample(src, out, mode):
-            timed(["3dresample", "-overwrite", "-dxyz", DXYZ, DXYZ, DXYZ, "-rmode", mode,
-                   "-input", str(src), "-prefix", str(out)], work, log)  # fmt: skip
-
-        S, SL = prep / "src.nii.gz", prep / "src_lab.nii.gz"
-        B, BL = prep / "base.nii.gz", prep / "base_lab.nii.gz"
-        resample(src_img, S, "Cu")
-        resample(src_lab, SL, "NN")
-        resample(base_img, B, "Cu")
-        resample(base_lab, BL, "NN")
-        SA, SLA, aff = prep / "src_al.nii.gz", prep / "src_lab_al.nii.gz", prep / "src_al.aff12.1D"
-        timed(
-            ["3dAllineate", "-overwrite", "-base", str(B), "-source", str(S), "-prefix", str(SA),
-             "-1Dmatrix_save", str(aff), "-cost", "ls", "-twopass", "-final", "wsinc5"],
-            work, log, timeout_s=1800,
-        )  # fmt: skip
-        timed(
-            ["3dAllineate", "-overwrite", "-master", str(B), "-source", str(SL),
-             "-1Dmatrix_apply", str(aff), "-final", "NN", "-prefix", str(SLA)],
-            work, log,
-        )  # fmt: skip
+        S, SL, B, BL, SA, SLA, aff = prep_pair(
+            src_img, src_lab, base_img, base_lab, prep, work, log
+        )
 
         res = UnitResult()
         threads = cpu_threads()

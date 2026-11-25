@@ -82,6 +82,7 @@ def timed_cached(
     cwd: Path,
     log: Path,
     timeout_s: float = 3600.0,
+    env: dict[str, str] | None = None,
 ) -> float:
     """``timed``, but a rerun whose ``stamp`` records this exact command and whose
     ``outputs`` exist returns the recorded seconds instead of fitting again.
@@ -97,7 +98,7 @@ def timed_cached(
             with open(log, "a") as f:
                 f.write(f"$ (reused, {rec['seconds']:.1f} s recorded) {shlex.join(cmd)}\n")
             return float(rec["seconds"])
-    dt = timed(cmd, cwd, log, timeout_s=timeout_s)
+    dt = timed(cmd, cwd, log, env=env, timeout_s=timeout_s)
     stamp.write_text(json.dumps({"cmd": cmd, "seconds": dt}))
     return dt
 
