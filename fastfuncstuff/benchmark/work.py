@@ -222,7 +222,6 @@ def run(
             )
             print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
         if not keep:
-            # A host set's outputs are the only copy of that host's results: keep them.
             # A host set keeps its outputs for inspection unless exported with -prune_outputs;
             # outputs marked keep (warps, label maps) always stay.
             keep_out = wl.meta("hostset") and wl.meta("prune_outputs") != "yes"
@@ -231,6 +230,38 @@ def run(
                 print(f"    pruned {freed / 1e6:.0f} MB", flush=True)
         n_done += 1
     return n_done
+
+
+def redo(wl, root: Path, check: str, tools: list[str]) -> int:
+    """Send finished units of ``check`` back to pending with ``tools`` marked stale.
+
+    For a tool whose code changed while its command line did not: ``timed_cached`` keys on
+    the command, so a rerun would reuse the old fit. Removing just that tool's stamp makes
+    it refit, while the reference fits (hours of @SSwarper or 3dQwarp) are reused, as long
+    as their outputs are still on disk. A tool is its unit subfolder, ``ffs_<tool>`` or
+    ``<tool>``. Returns the number of units sent back."""
+    rows = wl.db.execute(
+        "SELECT id, dataset FROM units WHERE check_name=? AND status IN ('done', 'failed')",
+        (check,),
+    ).fetchall()
+    seen: set[str] = set()
+    for r in rows:
+        work = root / "units" / check / r["dataset"] / f"unit{r['id']:06d}"
+        for t in tools:
+            for d in (work / f"ffs_{t}", work / t):
+                if d.is_dir():
+                    seen.add(t)
+                    for stamp in ("fit.timing.json", "stamp.json"):  # timed_cached stamps
+                        (d / stamp).unlink(missing_ok=True)
+                    break
+    if rows and (missing := [t for t in tools if t not in seen]):
+        raise ValueError(f"no unit of {check} has a folder for {missing} (ffs_<tool> or <tool>)")
+    with wl._tx():
+        wl.db.executemany(
+            "UPDATE units SET status='pending', claimed_by=NULL, error=NULL WHERE id=?",
+            [(r["id"],) for r in rows],
+        )
+    return len(rows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,6 +282,18 @@ def main(argv: list[str] | None = None) -> int:
     act.add_argument("-status", action="store_true", help="Unit counts by check, dataset, status.")
     act.add_argument("-results", metavar="CHECK", help="Print finished units of CHECK as TSV.")
     act.add_argument("-retry_failed", action="store_true", help="Return failed units to pending.")
+    act.add_argument(
+        "-reset_running",
+        action="store_true",
+        help="Return units left 'running' by a killed run to pending. Only when no -run is "
+        "active on this root.",
+    )
+    act.add_argument(
+        "-redo",
+        metavar="CHECK",
+        help="Return finished units of CHECK to pending and refit -tools on the next -run "
+        "(their code changed, their command line did not); other fits are reused.",
+    )
     act.add_argument(
         "-export_hostset",
         metavar="DIR",
@@ -276,6 +319,12 @@ def main(argv: list[str] | None = None) -> int:
         "-export_hostset (default 2).",
     )
     p.add_argument("-checks", nargs="+", default=[], help="Checks for -export_hostset.")
+    p.add_argument(
+        "-tools",
+        nargs="+",
+        default=[],
+        help="Tools to refit with -redo, by unit subfolder: formwarp for ffs_formwarp, ants.",
+    )
     p.add_argument("-label", default="host", help="Name of the host set (-export_hostset).")
     p.add_argument(
         "-include_pending",
@@ -399,6 +448,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{r['check_name']:<12} {r['dataset']:<24} {r['status']:<10} {r['n']}")
     elif args.retry_failed:
         print(f"{wl.reset('failed', args.check)} units back to pending")
+    elif args.reset_running:
+        print(f"{wl.reset('running', args.check)} units back to pending")
+    elif args.redo:
+        if not args.tools:
+            p.error("-redo needs -tools")
+        n = redo(wl, args.root, args.redo, args.tools)
+        print(f"{n} {args.redo} units back to pending; {' '.join(args.tools)} will refit")
     elif args.results:
         from .hostset import hostsets
 

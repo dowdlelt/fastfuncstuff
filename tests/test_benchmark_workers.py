@@ -154,3 +154,41 @@ def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):
     monkeypatch.setenv("FFS_BENCH_ROOT", str(out))  # as -run sets it on the other host
     paths, downloaded = fetch(m, ["sub-01/t1.nii.gz"], out / "cache")
     assert paths["sub-01/t1.nii.gz"].read_bytes() == b"img" and downloaded == []
+
+
+def test_redo_refits_only_the_named_tool(tmp_path):
+    from fastfuncstuff.benchmark.checks.base import timed_cached
+    from fastfuncstuff.benchmark.work import main, redo
+
+    root = tmp_path / "bench"
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("warp_mni", "Coh", [({"subject": "01"}, ["t1.nii.gz"])])
+    u = wl.claim_next()
+    work = root / "units/warp_mni/Coh" / f"unit{u['id']:06d}"
+    log = work / "commands.log"
+    stamps = {}
+    for tool in ("sswarper", "ffs_formwarp"):
+        d = work / tool
+        d.mkdir(parents=True)
+        out = d / "out.txt"
+        cmd = ["sh", "-c", f"echo fit >> {out}"]
+        timed_cached(cmd, d / "fit.timing.json", [out], work, log)
+        stamps[tool] = (cmd, d / "fit.timing.json", out)
+    wl.finish(u["id"], "done")
+
+    with pytest.raises(ValueError, match="optiwarp"):
+        redo(wl, root, "warp_mni", ["optiwarp"])
+    assert redo(wl, root, "warp_mni", ["formwarp"]) == 1
+    assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"
+    for cmd, stamp, out in stamps.values():
+        timed_cached(cmd, stamp, [out], work, log)
+    assert stamps["sswarper"][2].read_text() == "fit\n"  # reference reused
+    assert stamps["ffs_formwarp"][2].read_text() == "fit\nfit\n"  # changed tool refit
+    wl.close()
+
+    wl = Worklist(root / "worklist.sqlite")
+    wl.claim_next()  # a killed run leaves it 'running'
+    wl.close()
+    assert main(["-root", str(root), "-reset_running"]) == 0
+    wl = Worklist(root / "worklist.sqlite")
+    assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"
