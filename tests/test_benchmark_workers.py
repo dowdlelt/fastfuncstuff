@@ -116,6 +116,12 @@ def test_hostset_export_run_ingest_round_trip(tmp_path, capsys):
     assert str(dest / "units/moco" / u["dataset"] / "unit1/ffs/moco.nii") in paths
     (res,) = got.results("moco")
     assert res["unit_id"] == u["id"] and res["seconds.ffs.cpu"] == 12.5
+    got.close()
+
+    # the next set leaves out what the server already finished
+    out2 = export_hostset(wl, man, tmp_path / "hs2", ["moco"], 3, "epyc")
+    ids2 = {r[0] for r in Worklist(out2 / "worklist.sqlite").db.execute("SELECT id FROM units")}
+    assert u["id"] not in ids2 and len(ids2) == 3
 
 
 def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):

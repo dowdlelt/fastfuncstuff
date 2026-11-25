@@ -32,8 +32,9 @@ def select_units(
     datasets: list[str],
     include_pending: bool = False,
     bundle_local: bool = False,
+    skip_ids: set[int] = frozenset(),  # type: ignore[assignment]
 ) -> tuple[list, list[str]]:
-    """Up to ``n`` units per check, distinct datasets first.
+    """Up to ``n`` units per check, distinct datasets first, leaving out ``skip_ids``.
 
     Finished units by default: the point is a comparison with what this host already
     measured; ``include_pending`` adds units not run here yet. Datasets on a local tree
@@ -49,7 +50,7 @@ def select_units(
         ).fetchall()
         by_ds: dict[str, list] = {}
         for r in rows:
-            if datasets and r["dataset"] not in datasets:
+            if (datasets and r["dataset"] not in datasets) or r["id"] in skip_ids:
                 continue
             m = manifests.get(r["dataset"])
             if m is None or (m["source"]["kind"] != "s3" and not bundle_local):
@@ -87,8 +88,10 @@ def export_hostset(
     if (out / "worklist.sqlite").exists():
         raise FileExistsError(f"{out} already holds a worklist; pick a new directory")
     manifests = {m["dataset_id"]: m for m in load_manifests(manifests_dir, curated=False)}
+    # A unit another host already finished adds nothing on the next one: sets grow by new units.
+    elsewhere = done_on_hosts(wl)
     units, skipped = select_units(
-        wl, checks, n, manifests, list(datasets), include_pending, bundle_local
+        wl, checks, n, manifests, list(datasets), include_pending, bundle_local, elsewhere
     )
     if not units:
         raise ValueError(f"no exportable units for {checks}")
@@ -142,6 +145,18 @@ def export_hostset(
     if skipped:
         print(f"skipped local-only datasets (use -bundle_local): {' '.join(skipped)}")
     return out
+
+
+def done_on_hosts(wl: Worklist) -> set[int]:
+    """Ids of units finished in any ingested host set."""
+    ids: set[int] = set()
+    for h in hostsets(wl):
+        f = Path(h["path"]) / "worklist.sqlite"
+        if f.exists():
+            hs = Worklist(f)
+            ids |= {r[0] for r in hs.db.execute("SELECT id FROM units WHERE status='done'")}
+            hs.close()
+    return ids
 
 
 def _stem(rel: str) -> str:
