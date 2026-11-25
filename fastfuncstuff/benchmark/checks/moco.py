@@ -10,13 +10,22 @@ from __future__ import annotations
 import os
 
 from ..validation import compare_1d_params, compare_aff12_series, compare_moco_ssd, compare_volumes
-from .base import Check, UnitResult, afni_version, ffs_version, timed
+from .base import (
+    Check,
+    UnitResult,
+    afni_version,
+    ffs_version,
+    first_steady_volume,
+    timed,
+    volume_means,
+)
 
 MOTION_PARAM_NAMES = ["roll", "pitch", "yaw", "dS", "dL", "dP"]
 
 # Same settings as the old stage (stages/moco.py), whose thresholds stay the fastbench gate.
-REF_ARGS = ["-heptic", "-base", "0"]
-FFS_ARGS = ["-interp", "heptic", "-final", "heptic", "-weight_automask", "-base", "0", "-save_mean"]
+# The base volume is chosen per run (first steady-state volume), not fixed at 0.
+REF_ARGS = ["-heptic"]
+FFS_ARGS = ["-interp", "heptic", "-final", "heptic", "-weight_automask", "-save_mean"]
 
 
 class MocoCheck(Check):
@@ -39,11 +48,16 @@ class MocoCheck(Check):
         log = work / "commands.log"
         res = UnitResult()
         src, _ = self.trim_noise(src, work, log, res)
+        base = first_steady_volume(volume_means(src))
+        res.provenance["base_volume"] = {
+            "index": base,
+            "rule": "first volume within 5% of the run median mean",
+        }
 
         threads = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count()
         t_ref = timed(
             [
-                "3dvolreg", "-overwrite", *REF_ARGS, "-prefix", str(ref / "moco.nii"),
+                "3dvolreg", "-overwrite", *REF_ARGS, "-base", str(base), "-prefix", str(ref / "moco.nii"),
                 "-1Dfile", str(ref / "motion.1D"), "-1Dmatrix_save", str(ref / "moco.aff12.1D"),
                 str(src),
             ],
@@ -58,7 +72,7 @@ class MocoCheck(Check):
 
         t_ffs = timed(
             [
-                "ffs_moco", *FFS_ARGS, "-input", str(src), "-prefix", str(ffs / "moco.nii"),
+                "ffs_moco", *FFS_ARGS, "-base", str(base), "-input", str(src), "-prefix", str(ffs / "moco.nii"),
                 "-1Dfile", str(ffs / "motion.1D"), "-1Dmatrix_save", str(ffs / "moco.aff12.1D"),
                 "-device", device,
             ],

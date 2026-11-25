@@ -122,6 +122,25 @@ def trailing_noise_count(means: list[float], frac: float = NOISE_FRAC) -> int:
     return k
 
 
+STEADY_FRAC = 0.05
+
+
+def first_steady_volume(means: list[float], frac: float = STEADY_FRAC) -> int:
+    """Index of the first volume whose mean is within ``frac`` of the run median.
+
+    Runs kept without dummy scans start bright (ds004645 at 7T: vol 0 is 33-44% over steady
+    state and still settling at vol 12). Registering to such a base leaves a constant offset
+    that each tool resolves differently, so a check comparing tools should not use it. Capped
+    at a quarter of the run, so a slowly drifting series still gets an early base."""
+    if len(means) < 4:
+        return 0
+    med = sorted(means)[len(means) // 2]
+    for i, m in enumerate(means[: max(1, len(means) // 4)]):
+        if abs(m - med) <= frac * med:
+            return i
+    return len(means) // 4
+
+
 def kill_group(proc: subprocess.Popen, grace_s: float = 10.0) -> None:
     """SIGTERM the process group, then SIGKILL whatever is left after ``grace_s``."""
     import signal

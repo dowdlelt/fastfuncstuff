@@ -187,6 +187,18 @@ def test_trailing_noise_count_finds_rf_off_volumes():
     assert trailing_noise_count([449.0] + sig) == 0  # leading low volume is not trailing noise
 
 
+def test_first_steady_volume_skips_a_bright_start():
+    """ds004645-like: vol 0 ~40% bright, decaying; steady runs keep base 0."""
+    from fastfuncstuff.benchmark.checks.base import first_steady_volume
+
+    sig = [1000.0 + (i % 5) for i in range(200)]
+    bright = [1000.0 * (1 + 0.4 * 0.75**i) for i in range(20)] + sig
+    k = first_steady_volume(bright)
+    assert 0 < k < 20 and bright[k] <= 1050 and bright[k - 1] > 1050
+    assert first_steady_volume(sig) == 0
+    assert first_steady_volume([1000.0 * (1 + i) for i in range(40)]) == 10  # never steady: capped
+
+
 def test_unit_curation_and_read_meta_overrides(tmp_path):
     """Curated sidecar values beat the run's sidecar; per-acquisition entries beat the dataset's."""
     import json
