@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from fastfuncstuff.viewer.residency import Tier, VolumeStore, parse_budget
-from fastfuncstuff.viewer.session import ViewerSession, derive_range
+from fastfuncstuff.viewer.session import ViewerSession, cyclic_range, derive_range
 from fastfuncstuff.viewer.vocab import SetIJK, SetIndex
 
 nib = pytest.importorskip("nibabel")
@@ -339,6 +339,26 @@ def test_derive_range_ignores_non_finite():
     values = np.array([np.nan, np.inf, 1.0, 2.0, 3.0], dtype=np.float32)
     lo, hi = derive_range(values)
     assert np.isfinite(lo) and np.isfinite(hi)
+
+
+@pytest.mark.parametrize(
+    ("low", "high", "period"),
+    [
+        (3.0, 357.0, (0.0, 360.0)),
+        (-175.0, 179.0, (-180.0, 180.0)),
+        (0.1, 6.2, (0.0, 2 * np.pi)),
+        (-3.1, 3.0, (-np.pi, np.pi)),
+    ],
+)
+def test_cyclic_range_snaps_to_the_period_the_angles_live_in(low, high, period):
+    """Percentiles of a polar-angle map stop a few degrees short of the period,
+    which turns every hue and leaves a seam where the wheel should close."""
+    values = np.concatenate([np.linspace(low, high, 500), [np.nan, 0.0]])
+    assert cyclic_range(values) == pytest.approx(period)
+
+
+def test_cyclic_range_falls_back_to_min_max_outside_any_period():
+    assert cyclic_range(np.array([10.0, 500.0, np.nan])) == (10.0, 500.0)
 
 
 def test_derive_range_survives_a_constant_volume():

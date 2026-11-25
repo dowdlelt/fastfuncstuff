@@ -19,6 +19,7 @@ import torch
 from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
+from fastfuncstuff.viewer.colormap import CYCLIC_COLORMAPS
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_of
 from fastfuncstuff.viewer.layers import Layer, SignMode
@@ -89,6 +90,35 @@ def derive_range(
     if hi <= lo:
         hi = lo + 1.0
     return (lo, hi)
+
+
+#: Angle conventions a cyclic map is snapped to, tightest first, so a map in
+#: radians is not mistaken for one in degrees that happens to be small.
+_PERIODS = (
+    (-np.pi, np.pi),
+    (0.0, 2 * np.pi),
+    (-180.0, 180.0),
+    (0.0, 360.0),
+)
+
+
+def cyclic_range(values: np.ndarray) -> tuple[float, float]:
+    """Display range for a cyclic scale: the whole period the values live in.
+
+    A cyclic scale only closes -- 0 and 360 the same red -- when the range is
+    exactly one period, so the finite values are snapped to the tightest of
+    :data:`_PERIODS` that holds them. Values in none of them get their own
+    min and max, which at least shows every one.
+    """
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    lo, hi = float(finite.min()), float(finite.max())
+    slack = 1e-3 * (hi - lo)
+    for start, stop in _PERIODS:
+        if lo >= start - slack and hi <= stop + slack:
+            return (float(start), float(stop))
+    return (lo, hi) if hi > lo else (lo, lo + 1.0)
 
 
 def is_coefficient(layer: Layer, index: int) -> bool:
@@ -965,6 +995,9 @@ class ViewerSession:
             values = self._look_values(key, index)
         except (KeyError, FileNotFoundError, ValueError):
             return {}
+        if colormap in CYCLIC_COLORMAPS:
+            lo, hi = cyclic_range(values)
+            return {"range_lo": lo, "range_hi": hi}
         sample = _look_sample(values)
         if sample.size == 0:
             return {}

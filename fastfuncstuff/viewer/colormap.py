@@ -76,12 +76,21 @@ for _name in ("RdBu", "RdYlBu"):
     _SCALES[_name] = _SCALES[_name][::-1]
 
 #: The order the picker lists them in: by family rather than alphabet, so a
-#: diverging scale sits beside the other diverging ones.
+#: diverging scale sits beside the other diverging ones. The diverging family
+#: comes right after gray and hot because signed maps are most of what gets
+#: coloured.
 _ORDER = (
     "gray",
     "hot",
+    "redblue",
+    "RdBu",
+    "RdYlBu",
+    "coolwarm",
+    "balance",
     "cool",
     "red",
+    "bone",
+    "ice",
     "viridis",
     "plasma",
     "inferno",
@@ -89,13 +98,17 @@ _ORDER = (
     "cividis",
     "turbo",
     "spectrum",
-    "redblue",
-    "RdBu",
-    "RdYlBu",
     "hsv",
+    "phase",
     "twilight",
     "twilight_shifted",
 )
+
+#: Scales whose two ends are one colour, for a phase or an angle. Auto ranges
+#: these to the whole period rather than to percentiles: 2-98% of a polar-angle
+#: map is about 7-353 degrees, which turns every hue a few degrees and leaves
+#: a seam where the wheel should close.
+CYCLIC_COLORMAPS = frozenset({"hsv", "phase", "twilight", "twilight_shifted"})
 
 DEFAULT_LUT_SIZE = 256
 
