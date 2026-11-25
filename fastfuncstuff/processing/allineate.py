@@ -759,6 +759,26 @@ _SAMPLE_MIN_POINTS = 9999
 # 91k -> 2.94s, 166k -> 4.68s. 19 samples/axis is ~185k seeds, the most that
 # buys tickets at a defensible price; -hugerange is what reaches for it.
 _MAX_COARSE_ROT_SAMPLES = 19
+# The CPU pays for every seed (59k seeds x 35k points was 31 s of a 110 s EPI -> T1
+# run), so it gets a coarser rotation lattice: 7 per axis is ~9k seeds, still two
+# orders above AFNI's 2-per-axis grid plus ~50 random starts. An explicit
+# -coarse_n_rot is honoured as given.
+_CPU_MAX_COARSE_ROT_SAMPLES = 7
+# CMA-ES population on the CPU. 19 is free on a GPU; on the CPU a generation costs
+# lambda x trials evaluations. On an EPI -> T1 pair 8 took the run 131 -> 97 s with
+# the benchmark judges unchanged (19 and 10 measured alongside).
+_CPU_CMA_LAM = 8
+
+
+def _batch_is_free(device: torch.device) -> bool:
+    """Whether scoring many candidates in one call costs about what one does.
+
+    True on a GPU, where the refinement is launch-bound (B=1 and B=64 take the same
+    wall time) -- the premise of the CMA-ES population, the coarse seed counts and
+    the match-point floor. False on the CPU, where every candidate is paid for
+    point by point: one candidate over 629k points is ~15 ms at any batch size.
+    """
+    return device.type != "cpu"
 
 
 def _build_sample_set(
@@ -768,6 +788,7 @@ def _build_sample_set(
     n_match: float,
     bloktype: str,
     device: torch.device,
+    n_source_vox: int | None = None,
 ) -> SampleSet | None:
     """Draw a fixed random subset of the weight domain for subsampled costs.
 
@@ -778,6 +799,12 @@ def _build_sample_set(
     domain (so 1.0 == all); ``> 1.0`` -> that many points (e.g. 150000). Every
     path is then floored at ``_SAMPLE_MIN_POINTS`` and clamped to the domain,
     as AFNI does. Returns None if the domain is too small to bother subsampling.
+
+    On the CPU a fractional ``n_match`` is taken of AFNI's ``ntask``
+    (3dAllineate.c:4371): ``sqrt(n_source_vox * n_dom)`` when the source has fewer
+    voxels than the domain, since sampling a 3 mm EPI at the density of a 1 mm base
+    grid adds points and no information (629k -> 289k on an EPI -> T1 base rung).
+    The GPU keeps the full domain, where the extra points cost nothing.
     """
     _, ny, nx = base_opt.shape
     if weight_opt is not None:
@@ -788,10 +815,13 @@ def _build_sample_set(
     if n_dom < 2000:  # tiny / synthetic: not worth the point machinery
         return None
 
+    n_task = n_dom
+    if n_source_vox is not None and n_source_vox < n_dom and not _batch_is_free(device):
+        n_task = int(math.sqrt(float(n_source_vox) * n_dom))
     if n_match <= 0.0:
-        budget = int(_SAMPLE_DEFAULT_FRAC * n_dom)
+        budget = int(_SAMPLE_DEFAULT_FRAC * n_task)
     elif n_match <= 1.0:
-        budget = int(n_match * n_dom)
+        budget = int(n_match * n_task)
     else:
         budget = int(n_match)
     budget = min(max(budget, _SAMPLE_MIN_POINTS), n_dom)
@@ -1416,9 +1446,8 @@ def _coarse_search_joint(
         n_r = config.coarse_n_rot
     else:
         span = float(bounds[3, 1] - bounds[3, 0])
-        n_r = int(
-            min(_MAX_COARSE_ROT_SAMPLES, max(3, round(span / max(config.coarse_step, 0.5)) + 1))
-        )
+        cap = _MAX_COARSE_ROT_SAMPLES if _batch_is_free(device) else _CPU_MAX_COARSE_ROT_SAMPLES
+        n_r = int(min(cap, max(3, round(span / max(config.coarse_step, 0.5)) + 1)))
     tax = [_axis(bounds[a, 0], bounds[a, 1], n_t) for a in range(3)]
     rax = [_axis(bounds[3 + a, 0], bounds[3 + a, 1], n_r) for a in range(3)]
     tg = torch.meshgrid(*tax, indexing="ij")
@@ -1948,6 +1977,26 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
 _BATCH_FREE_WORK = 8.5e7
 
 
+# Trials whose search centres come within this distance (max over free params, in
+# normalized units) are in one basin -- the same threshold the stage-to-stage dedup
+# uses. On a 1 mm EPI -> T1 base rung all four trials converged to within 6e-4 of
+# one cost after 150-199 generations each: three of them were paid for nothing.
+_MERGE_TOL = 0.02
+_MERGE_CHECK_EVERY = 10
+
+
+def _merged_trials(mean: Tensor, best_c: Tensor, alive: Tensor) -> Tensor:
+    """(T,) True for an alive trial whose centre sits on a better alive trial's."""
+    d = (mean[:, None, :] - mean[None, :, :]).abs().amax(dim=-1)  # (T, T)
+    better = best_c[None, :] > best_c[:, None]  # [i, j]: j beats i
+    tie = (best_c[None, :] == best_c[:, None]) & (
+        torch.arange(len(best_c), device=mean.device)[None, :]
+        < torch.arange(len(best_c), device=mean.device)[:, None]
+    )
+    beaten = (d < _MERGE_TOL) & (better | tie) & alive[None, :] & alive[:, None]
+    return beaten.any(dim=1)
+
+
 def _cma_state_dtype(device: torch.device) -> torch.dtype:
     """Use double CMA state except on Metal, which has no float64 tensors."""
     return widest_float_dtype(device)
@@ -2024,7 +2073,9 @@ def _refine_cmaes_batched(
         int(popsize)
         if popsize
         else int(_os.environ.get("FFS_CMA_LAM", "0"))
-        or max(8, 4 + int(3 * math.log(max(n, 2))) + 8)
+        or (
+            max(8, 4 + int(3 * math.log(max(n, 2))) + 8) if _batch_is_free(device) else _CPU_CMA_LAM
+        )
     )
     sigma_min = float(_os.environ.get("FFS_CMA_SMIN", sigma_min))
     sigma0 = float(_os.environ.get("FFS_CMA_S0", sigma0))
@@ -2109,6 +2160,12 @@ def _refine_cmaes_batched(
     patience = int(_os.environ.get("FFS_CMA_PATIENCE", "60"))
     stalled = torch.zeros(T, dtype=torch.long, device=device)
     prev_best = best_c.clone()
+    stopped_at = torch.zeros(T, dtype=torch.long, device=device)
+
+    # A stopped trial's samples are never read again (best_c/best_x only move while
+    # it is alive), so on the CPU, where each candidate is paid for, they are not
+    # scored. On a GPU they ride along for free and the batch shape stays fixed.
+    skip_dead = not _batch_is_free(device)
 
     def _evaluate(cand_free: Tensor) -> Tensor:
         """(T, L, n) free-subspace points -> (T, L) costs, in one batched call."""
@@ -2116,6 +2173,12 @@ def _refine_cmaes_batched(
         full = x0[:, None, :].expand(T, L, 12).clone()
         full[:, :, free_idx] = cand_free.to(torch.float32)
         full = full.clamp_(0.0, 1.0)
+        if skip_dead and not bool(alive.all()):
+            live = alive.nonzero().flatten()
+            flat = full[live].reshape(-1, 12)
+            out = best_c[:, None].expand(T, L).clone()
+            out[live] = batched_cost_fn(p2m_b(_denormalize_t(flat, bmin, span))).reshape(-1, L)
+            return out
         flat = full.reshape(T * L, 12)
         return batched_cost_fn(p2m_b(_denormalize_t(flat, bmin, span))).reshape(T, L)
 
@@ -2131,7 +2194,7 @@ def _refine_cmaes_batched(
         cand = mean[:, None, :] + sigma[:, None, None] * y
 
         vals = _evaluate(cand)  # (T, lam), higher is better
-        n_eval += T * lam
+        n_eval += (int(alive.sum()) if skip_dead else T) * lam
 
         order = vals.argsort(dim=1, descending=True)[:, :mu]  # (T, mu)
         sel_y = y.gather(1, order[:, :, None].expand(T, mu, n))  # (T, mu, n)
@@ -2192,7 +2255,12 @@ def _refine_cmaes_batched(
         stalled = torch.where(best_c > thresh, torch.zeros_like(stalled), stalled + 1)
         prev_best = torch.maximum(prev_best, best_c)
 
+        was_alive = alive
         alive = alive & (sigma > sigma_min) & (stalled < patience)
+        if skip_dead and gi % _MERGE_CHECK_EVERY == _MERGE_CHECK_EVERY - 1:
+            alive = alive & ~_merged_trials(mean, best_c, alive)
+        if verb >= 2:
+            stopped_at = torch.where(was_alive & ~alive, gi + 1, stopped_at)
         if not bool(alive.any()):
             break
         if tqdm is not None and verb >= 1:
@@ -2200,6 +2268,11 @@ def _refine_cmaes_batched(
 
     if verb >= 2:
         print(f"    {desc}: {n_eval} cost evaluations in {gi + 1} generations (lambda={lam})")
+        stops = torch.where(stopped_at > 0, stopped_at, gi + 1).tolist()
+        print(
+            "      per trial (stop gen, best): "
+            + ", ".join(f"({g}, {c:.6f})" for g, c in zip(stops, best_c.tolist(), strict=True))
+        )
 
     if state is not None:
         state["C"], state["p_c"], state["p_sig"] = C, p_c, p_sig
@@ -3432,7 +3505,15 @@ def _prepare_grid(
     sample = None
     if cost_name in _BLOK_COSTS:
         sample = _build_sample_set(
-            base_opt, weight_opt, voxdims, config.n_match, config.bloktype, device
+            base_opt,
+            weight_opt,
+            voxdims,
+            config.n_match,
+            config.bloktype,
+            device,
+            n_source_vox=int(
+                source_native[0].numel() if source_native.dim() > 3 else source_native.numel()
+            ),
         )
         if sample is not None and verb >= 1:
             n_dom = int((weight_opt > 0).sum()) if weight_opt is not None else base_opt.numel()
