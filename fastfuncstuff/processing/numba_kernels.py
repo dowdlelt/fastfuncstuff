@@ -499,3 +499,111 @@ class WarpLinearCPU(torch.autograd.Function):
         outs = [np.empty_like(g) for _ in range(3)]
         _with_threads(_warp_linear_bwd, *ctx.arrays, g, *outs)
         return None, *(torch.from_numpy(o) for o in outs)
+
+
+@njit(parallel=True, cache=True)
+def _moments5_kernel(a, b, w, out):
+    nz, ny, nx = a.shape
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        for j in range(ny):
+            for i in range(nx):
+                wv = w[k, j, i]
+                av = a[k, j, i]
+                bv = b[k, j, i]
+                wa = wv * av
+                wb = wv * bv
+                out[0, k, j, i] = wa
+                out[1, k, j, i] = wb
+                out[2, k, j, i] = wa * av
+                out[3, k, j, i] = wb * bv
+                out[4, k, j, i] = wa * bv
+
+
+def moments5_cpu(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """``w a, w b, w a a, w b b, w a b`` stacked, in torch's left-to-right op order."""
+    out = np.empty((5, *a.shape), dtype=a.dtype)
+    _with_threads(_moments5_kernel, a, b, w, out)
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _local_corr_kernel(s0, s, w, mode, want_grad, grads, part_total, part_w):
+    nz, ny, nx = s0.shape
+    if mode == 0:  # lpa: cost.py _local_pearson_from_moments
+        eps = np.float32(1e-10)
+    else:  # cc: formwarp._local_cc_cost
+        eps = np.float32(1e-6)
+    two = np.float32(2.0)
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        tot = 0.0
+        wt = 0.0
+        for j in range(ny):
+            for i in range(nx):
+                wv = w[k, j, i]
+                sw = max(s0[k, j, i], eps)
+                mx = s[0, k, j, i] / sw
+                my = s[1, k, j, i] / sw
+                a0 = s[2, k, j, i] / sw - mx * mx
+                b0 = s[3, k, j, i] / sw - my * my
+                av = max(a0, eps)
+                bv = max(b0, eps)
+                c = s[4, k, j, i] / sw - mx * my
+                q = np.sqrt(av * bv)
+                r = c / q
+                if mode == 0:
+                    phi = abs(r)
+                else:
+                    phi = c * c / (av * bv)
+                tot += wv * phi
+                wt += wv
+                if want_grad:
+                    if mode == 0:
+                        sgn = _F1 if r > _F0 else (-_F1 if r < _F0 else _F0)
+                        gr = wv * sgn
+                        gc = gr / q
+                        ga = -gr * r / (two * av) if a0 >= eps else _F0
+                        gb = -gr * r / (two * bv) if b0 >= eps else _F0
+                    else:
+                        gc = wv * two * c / (av * bv)
+                        ga = -wv * phi / av if a0 >= eps else _F0
+                        gb = -wv * phi / bv if b0 >= eps else _F0
+                    grads[0, k, j, i] = (ga * (-two * mx) - gc * my) / sw
+                    grads[1, k, j, i] = (gb * (-two * my) - gc * mx) / sw
+                    grads[2, k, j, i] = ga / sw
+                    grads[3, k, j, i] = gb / sw
+                    grads[4, k, j, i] = gc / sw
+        part_total[k] = tot
+        part_w[k] = wt
+
+
+def local_corr_cpu(s0: np.ndarray, s: np.ndarray, w: np.ndarray, mode: int, want_grad: bool):
+    """Sum of ``w * phi`` and of ``w`` over the volume, plus d(w phi)/d(filtered moment)
+    for the five moving moments when ``want_grad`` (phi = |r| for mode 0, r^2 for 1)."""
+    nz = s0.shape[0]
+    grads = np.empty((5, *s0.shape) if want_grad else (5, 1, 1, 1), dtype=s0.dtype)
+    part_total = np.zeros(nz)
+    part_w = np.zeros(nz)
+    _with_threads(_local_corr_kernel, s0, s, w, mode, want_grad, grads, part_total, part_w)
+    return float(part_total.sum()), float(part_w.sum()), grads
+
+
+@njit(parallel=True, cache=True)
+def _combine_grad_kernel(a, b, w, h, scale, ga, gb):
+    nz, ny, nx = a.shape
+    two = np.float32(2.0)
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        for j in range(ny):
+            for i in range(nx):
+                av = a[k, j, i]
+                bv = b[k, j, i]
+                ws = w[k, j, i] * scale
+                ga[k, j, i] = ws * (h[0, k, j, i] + two * av * h[2, k, j, i] + bv * h[4, k, j, i])
+                gb[k, j, i] = ws * (h[1, k, j, i] + two * bv * h[3, k, j, i] + av * h[4, k, j, i])
+
+
+def combine_local_corr_grad_cpu(a, b, w, h, scale: float):
+    """Chain the adjoint-filtered moment gradients ``h`` back to the two images."""
+    ga = np.empty_like(a)
+    gb = np.empty_like(a)
+    _with_threads(_combine_grad_kernel, a, b, w, h, np.float32(scale), ga, gb)
+    return ga, gb

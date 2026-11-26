@@ -211,24 +211,30 @@ class _ClampedCorrelate1d(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs: Tensor):
-        import numpy as np
-
         (grad,) = grad_outputs
-        weights, axis = ctx.weights, ctx.axis - 1
-        r = weights.shape[0] // 2
-        g = grad.detach()[0].contiguous().numpy()
-        n = g.shape[axis]
-        pad = [(0, 0)] * g.ndim
-        pad[axis] = (r, r)
-        from .numba_kernels import correlate1d_cpu
+        return _clamped_correlate_adjoint(grad, ctx.weights, ctx.axis), None, None
 
-        full = correlate1d_cpu(np.pad(g, pad), weights[::-1].copy(), axis - 1, True)
-        full_t = torch.from_numpy(full)
-        out = full_t.narrow(axis, r, n).clone()
-        if r:
-            out.narrow(axis, 0, 1).add_(full_t.narrow(axis, 0, r).sum(axis, keepdim=True))
-            out.narrow(axis, n - 1, 1).add_(full_t.narrow(axis, n + r, r).sum(axis, keepdim=True))
-        return out[None], None, None
+
+def _clamped_correlate_adjoint(grad: Tensor, weights, axis: int) -> Tensor:
+    """Adjoint of :class:`_ClampedCorrelate1d` along ``axis`` of a (1, G, D, H, W) tensor:
+    the flipped correlation of the zero-padded gradient, with the overhang that fell on
+    the replicated pad folded back onto the two edge samples."""
+    import numpy as np
+
+    from .numba_kernels import correlate1d_cpu
+
+    axis = axis - 1  # in the (G, D, H, W) array
+    r = weights.shape[0] // 2
+    g = grad.detach()[0].contiguous().numpy()
+    n = g.shape[axis]
+    pad = [(0, 0)] * g.ndim
+    pad[axis] = (r, r)
+    full_t = torch.from_numpy(correlate1d_cpu(np.pad(g, pad), weights[::-1].copy(), axis - 1, True))
+    out = full_t.narrow(axis, r, n).clone()
+    if r:
+        out.narrow(axis, 0, 1).add_(full_t.narrow(axis, 0, r).sum(axis, keepdim=True))
+        out.narrow(axis, n - 1, 1).add_(full_t.narrow(axis, n + r, r).sum(axis, keepdim=True))
+    return out[None]
 
 
 def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) -> Tensor:
@@ -323,6 +329,81 @@ def _separable_smooth_3d(
     if squeeze:
         vol = vol[0, 0]
     return vol
+
+
+def _separable_smooth_3d_adjoint_cpu(
+    vol: Tensor, sigma: float | tuple[float, float, float], kernel_type: str = "gauss"
+) -> Tensor:
+    """Adjoint of :func:`_separable_smooth_3d` on a CPU (1, G, D, H, W) volume: the
+    per-axis adjoints applied in reverse order, with the same axes skipped."""
+    sigmas = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
+    for axis, axis_sigma in reversed(list(zip((2, 3, 4), sigmas, strict=True))):
+        if vol.shape[axis] > 1 and axis_sigma > 0:
+            kernel = _make_kernel_1d(kernel_type, axis_sigma, vol.device)
+            vol = _clamped_correlate_adjoint(vol, kernel.to(torch.float64).numpy(), axis)
+    return vol
+
+
+_LOCAL_CORR_MODES = {"lpa": 0, "cc": 1}
+
+
+class LocalCorrelationCPU(torch.autograd.Function):
+    """Weighted local-correlation cost of two CPU float32 images, with its gradient.
+
+    ``mode`` ``"lpa"`` is ``-_packed_lpa_correlation`` (mean |local Pearson r|) and
+    ``"cc"`` is formwarp's ``_local_cc_cost`` (mean local r^2); both are built from the
+    same six filtered moments. Autograd through the torch versions records ~30
+    full-volume elementwise ops forward and replays ~40 backward. Here the moments are
+    one pass, the per-voxel correlation and its five derivatives with respect to the
+    filtered moments another, then the adjoint filters and one pass to combine them
+    into d/da and d/db -- the analytic chain rule of the same formulas. ``smoothed_weight``
+    is the filtered weight, which is constant while the images move, so a caller
+    iterating with one weight can filter it once.
+
+    Per-voxel arithmetic follows the torch op order in float32; the sums are in double.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        a: Tensor,
+        b: Tensor,
+        weight: Tensor,
+        smoothed_weight: Tensor | None,
+        sigma: float,
+        kernel_type: str,
+        mode: str,
+    ) -> Tensor:
+
+        from .numba_kernels import local_corr_cpu, moments5_cpu
+
+        a_np, b_np, w_np = (t.detach().contiguous().numpy() for t in (a, b, weight))
+        moments = torch.from_numpy(moments5_cpu(a_np, b_np, w_np))[None]
+        smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0].numpy()
+        if smoothed_weight is None:
+            smoothed_weight = _separable_smooth_3d(weight.detach(), sigma, kernel_type=kernel_type)
+        s0 = smoothed_weight.detach().contiguous().numpy()
+        want_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+        total, wsum, grads = local_corr_cpu(s0, smoothed, w_np, _LOCAL_CORR_MODES[mode], want_grad)
+        denom = max(wsum, 1e-10 if mode == "lpa" else 1e-6)
+        if want_grad:
+            ctx.save_for_backward(a.detach(), b.detach(), weight.detach())
+            ctx.grads = grads
+            ctx.denom, ctx.sigma, ctx.kernel_type = denom, sigma, kernel_type
+        return torch.tensor(-total / denom, dtype=a.dtype)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        from .numba_kernels import combine_local_corr_grad_cpu
+
+        (gout,) = grad_outputs
+        a, b, w = ctx.saved_tensors
+        h = _separable_smooth_3d_adjoint_cpu(
+            torch.from_numpy(ctx.grads)[None], ctx.sigma, ctx.kernel_type
+        )[0].numpy()
+        scale = -float(gout) / ctx.denom
+        ga, gb = combine_local_corr_grad_cpu(a.numpy(), b.numpy(), w.numpy(), h, scale)
+        return torch.from_numpy(ga), torch.from_numpy(gb), None, None, None, None, None
 
 
 def _filter_moment_bank(

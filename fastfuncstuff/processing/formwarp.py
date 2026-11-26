@@ -56,6 +56,7 @@ except ImportError:  # pragma: no cover - tqdm is a hard dep in practice
     _tqdm = None
 
 from .cost import (
+    LocalCorrelationCPU,
     _packed_lpa_correlation,
     _packed_lpc_correlation,
     _separable_smooth_3d,
@@ -419,6 +420,20 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 
 
+def _fused_local_corr_args(
+    a: Tensor, metric: str, cc_radius: int, lpa_sigma: float, lpa_kernel: str
+) -> tuple[float, str] | None:
+    """(extent, kernel) for :class:`cost.LocalCorrelationCPU` when it serves ``metric``
+    here -- cc and lpa, float32 on the CPU, outside torch.compile -- else None."""
+    if a.device.type != "cpu" or a.dtype != torch.float32 or torch.compiler.is_compiling():
+        return None
+    if metric == "cc":
+        return float(cc_radius), "box"
+    if metric == "lpa":
+        return float(lpa_sigma), lpa_kernel
+    return None
+
+
 def image_metric(
     a: Tensor,
     b: Tensor,
@@ -427,6 +442,7 @@ def image_metric(
     cc_radius: int = 4,
     lpa_sigma: float = 4.0,
     lpa_kernel: str = "gauss",
+    smoothed_weight: Tensor | None = None,
 ) -> Tensor:
     """Scalar image metric (lower = better) between two same-grid images.
 
@@ -434,6 +450,9 @@ def image_metric(
     primitives serve directly as registration metrics (SyN update fields here, and
     convergence monitoring for the optical-flow engine).
     """
+    fused = _fused_local_corr_args(a, metric, cc_radius, lpa_sigma, lpa_kernel)
+    if fused is not None:
+        return LocalCorrelationCPU.apply(a, b, weight, smoothed_weight, *fused, metric)
     if metric == "cc":
         return _local_cc_cost(a, b, cc_radius, weight)
     if metric == "mse":
@@ -562,7 +581,9 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     return config.fold_penalty * total.clamp(min=_EPS) ** 0.25 * (total > 0)
 
 
-def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
+def _metric_cost(
+    a: Tensor, b: Tensor, weight: Tensor, config: SynConfig, smoothed_weight: Tensor | None = None
+) -> Tensor:
     """SyN-config wrapper around :func:`image_metric`."""
     return image_metric(
         a,
@@ -572,6 +593,7 @@ def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Ten
         cc_radius=config.cc_radius,
         lpa_sigma=config.lpa_sigma,
         lpa_kernel=config.lpa_kernel,
+        smoothed_weight=smoothed_weight,
     )
 
 
@@ -1257,6 +1279,15 @@ def _syn_level(
     jac_m = jacobian_determinant(mxd, myd, mzd)
     n_damped = n_refused = n_sym_rejected = 0
 
+    # The weight sits on the midpoint grid and never moves, so its filtered copy -- one
+    # of the six local-correlation moments -- is the same every iteration.
+    smoothed_weight = None
+    fused = _fused_local_corr_args(
+        weight, config.metric, config.cc_radius, config.lpa_sigma, config.lpa_kernel
+    )
+    if fused is not None:
+        smoothed_weight = _separable_smooth_3d(weight, fused[0], kernel_type=fused[1])
+
     bar = None
     if _tqdm is not None and config.verb >= 1 and n_iter >= 5:
         bar = _tqdm(total=n_iter, desc=f"SyN {level_tag}", leave=True)
@@ -1268,7 +1299,7 @@ def _syn_level(
 
         fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
         mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
-        cost = _metric_cost(fmid, mmid, weight, config)
+        cost = _metric_cost(fmid, mmid, weight, config, smoothed_weight)
         # The image term is what the level is judged and best-restored on; the penalty
         # only steers the step. Folding lowers the image metric, so scoring the two
         # together would let a folded iterate win on a total the penalty was meant to
