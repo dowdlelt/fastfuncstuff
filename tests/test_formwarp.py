@@ -1062,3 +1062,48 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
     tolerance = 1e-6 if dtype == torch.float32 else 1e-12
     for a, b in zip(grad_a, grad_b, strict=True):
         torch.testing.assert_close(a, b, atol=tolerance, rtol=tolerance)
+
+
+def _patience_run(jac_floor: float, best_patience: int):
+    fixed = _blobs(20, 22, 20)
+    moving = _blobs(20, 22, 20, shift=(2.5, -1.5, 1.0))
+    config = SynConfig(
+        shrink_factors=(1,),
+        smoothing_sigmas=(0.0,),
+        iterations=(40,),
+        # Keep the raw-cost trend from ever firing, so only patience can stop the level.
+        convergence_window=5,
+        convergence_threshold=-1e9,
+        jac_floor=jac_floor,
+        best_patience=best_patience,
+        verb=0,
+    )
+    return formwarp(fixed, moving, config=config, device=DEVICE)
+
+
+def test_best_patience_stops_once_the_kept_iterate_stands_and_returns_the_same_warp():
+    """The regression: iterates past ``jac_floor`` kept lowering the raw cost, so the trend
+    stop never fired and a level ran its whole cap after its last keepable iterate (90 of
+    120 full-resolution iterations on an MNI fit). A floor just under 1 makes every
+    compressing iterate illegal, which reproduces that shape on a phantom."""
+    full = _patience_run(jac_floor=0.97, best_patience=0)
+    lev = full.levels[0]
+    assert lev.iters_run == 40 and lev.best_iter < 40 - 6, "phantom no longer over-runs"
+    assert lev.illegal_iters > 0
+
+    cut = _patience_run(jac_floor=0.97, best_patience=5)
+    clev = cut.levels[0]
+    assert clev.patience_stopped
+    assert clev.iters_run == clev.best_iter + 5 + 1
+    assert clev.best_iter == lev.best_iter
+    for a, b in zip(full.fwd + full.inv, cut.fwd + cut.inv, strict=True):
+        assert torch.equal(a, b)
+
+
+def test_best_patience_does_not_stop_a_level_with_no_legal_iterate():
+    """With nothing legal yet there is no kept iterate to wait on; the level must keep
+    going (and fall back to the best illegal iterate), as before patience existed."""
+    res = _patience_run(jac_floor=1.5, best_patience=3)
+    lev = res.levels[0]
+    assert lev.fold_fallback and not lev.patience_stopped
+    assert lev.iters_run == 40

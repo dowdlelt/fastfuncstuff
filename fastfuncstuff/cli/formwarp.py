@@ -362,6 +362,15 @@ def parse_args(
         default=_D.convergence_threshold,
         help="Convergence slope threshold; larger stops sooner.",
     )
+    p.add_argument(
+        "-best_patience",
+        type=int,
+        default=_D.best_patience,
+        help="Stop a level once the kept (best fold-free) cost has not improved for "
+        "this many iterations; 0 disables (default). Not result-preserving when "
+        "legality flickers around -jac_floor, as it does on T1 -> MNI fits: a later "
+        "iterate can come back fold-free and better.",
+    )
 
     # Folding: discouraged by default, forbidden on request
     p.add_argument(
@@ -698,6 +707,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         iterations=_int_list(args.iters),
         convergence_window=args.conv_window,
         convergence_threshold=args.conv_thresh,
+        best_patience=args.best_patience,
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,

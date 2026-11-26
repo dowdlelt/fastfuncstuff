@@ -56,6 +56,7 @@ except ImportError:  # pragma: no cover - tqdm is a hard dep in practice
     _tqdm = None
 
 from .cost import (
+    LocalCorrelationCPU,
     _packed_lpa_correlation,
     _packed_lpc_correlation,
     _separable_smooth_3d,
@@ -65,12 +66,11 @@ from .cost import (
 from .interp import (
     _grid_sample_3d,
     batched_interp_3ch_multi,
-    trilinear_interpolate_multi,
     warp_image,
 )
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
-from .penalty import compute_jacobian_energy, penalty_energy
+from .penalty import HPEN_CUT, compute_jacobian_energy, penalty_energy
 
 if TYPE_CHECKING:
     from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
@@ -198,6 +198,18 @@ class SynConfig:
     """Convergence slope threshold (ANTs -c convergenceThreshold). A level stops
     once the (range-normalized) downward slope of cost over the window falls below
     this — i.e. the cost has flattened. Larger = stop sooner."""
+
+    best_patience: int = 0
+    """Stop a level once the kept (best legal) cost has not improved for this many
+    iterations; 0 (the default) disables it.
+
+    Opt-in because it is not result-preserving on real data. The level returns the best
+    *legal* iterate (:attr:`fold_aware_best`), and on T1 -> MNI fits legality flickers:
+    the worst half-field voxel's det(J) wanders around :attr:`jac_floor` (and around
+    zero) while the image cost falls smoothly, so iterates go illegal and come back
+    legal *and better* -- after gaps of up to 80 iterations at shrink 2 (MNI unit 615:
+    +0.044 lpa lost at any patience <= 30). It is the right stop when legality is
+    monotone (e.g. with :attr:`fold_guard` on); see ``illegal_iters`` in the level log."""
 
     fold_penalty: float = 0.033333
     """Strength of the **soft** anti-folding penalty added to the cost; 0 disables it.
@@ -346,6 +358,15 @@ def _warp_diff(
     rely on grid_sample's border padding so the whole thing stays in the autograd
     graph w.r.t. the displacement fields.
     """
+    if (
+        source.device.type == "cpu"
+        and source.dtype == xd.dtype == yd.dtype == zd.dtype == torch.float32
+        and not source.requires_grad
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import WarpLinearCPU
+
+        return WarpLinearCPU.apply(source, xd, yd, zd)
     nz, ny, nx = source.shape
     device = source.device
     dtype = source.dtype
@@ -399,6 +420,20 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 
 
+def _fused_local_corr_args(
+    a: Tensor, metric: str, cc_radius: int, lpa_sigma: float, lpa_kernel: str
+) -> tuple[float, str] | None:
+    """(extent, kernel) for :class:`cost.LocalCorrelationCPU` when it serves ``metric``
+    here -- cc and lpa, float32 on the CPU, outside torch.compile -- else None."""
+    if a.device.type != "cpu" or a.dtype != torch.float32 or torch.compiler.is_compiling():
+        return None
+    if metric == "cc":
+        return float(cc_radius), "box"
+    if metric == "lpa":
+        return float(lpa_sigma), lpa_kernel
+    return None
+
+
 def image_metric(
     a: Tensor,
     b: Tensor,
@@ -407,6 +442,7 @@ def image_metric(
     cc_radius: int = 4,
     lpa_sigma: float = 4.0,
     lpa_kernel: str = "gauss",
+    smoothed_weight: Tensor | None = None,
 ) -> Tensor:
     """Scalar image metric (lower = better) between two same-grid images.
 
@@ -414,6 +450,9 @@ def image_metric(
     primitives serve directly as registration metrics (SyN update fields here, and
     convergence monitoring for the optical-flow engine).
     """
+    fused = _fused_local_corr_args(a, metric, cc_radius, lpa_sigma, lpa_kernel)
+    if fused is not None:
+        return LocalCorrelationCPU.apply(a, b, weight, smoothed_weight, *fused, metric)
     if metric == "cc":
         return _local_cc_cost(a, b, cc_radius, weight)
     if metric == "mse":
@@ -505,10 +544,18 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     # alone, so 4.8x of the work exists to differentiate voxels that contribute exactly
     # zero. Find the offenders without a graph, then rebuild the penalty differentiably
     # on 3x3x3 patches around just those.
-    with torch.no_grad():
-        je, se = compute_jacobian_energy(*(f.detach() for f in fields))
-        owing = torch.nonzero(penalty_energy(je, se) > 0, as_tuple=False)
-    del je, se
+    f0 = fields[0]
+    if f0.device.type == "cpu" and f0.dtype == torch.float32 and not torch.compiler.is_compiling():
+        from .numba_kernels import jacobian_cpu
+
+        owing_mask = jacobian_cpu(*fields, cut=HPEN_CUT)[1]
+        assert owing_mask is not None
+        owing = torch.nonzero(owing_mask, as_tuple=False)
+    else:
+        with torch.no_grad():
+            je, se = compute_jacobian_energy(*(f.detach() for f in fields))
+            owing = torch.nonzero(penalty_energy(je, se) > 0, as_tuple=False)
+        del je, se
     if owing.numel() == 0:
         # Routed through every field, so the graph shape does not depend on the data --
         # a bare zero would detach the penalty on the iterations it costs nothing (most
@@ -534,7 +581,9 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     return config.fold_penalty * total.clamp(min=_EPS) ** 0.25 * (total > 0)
 
 
-def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
+def _metric_cost(
+    a: Tensor, b: Tensor, weight: Tensor, config: SynConfig, smoothed_weight: Tensor | None = None
+) -> Tensor:
     """SyN-config wrapper around :func:`image_metric`."""
     return image_metric(
         a,
@@ -544,6 +593,7 @@ def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Ten
         cc_radius=config.cc_radius,
         lpa_sigma=config.lpa_sigma,
         lpa_kernel=config.lpa_kernel,
+        smoothed_weight=smoothed_weight,
     )
 
 
@@ -623,6 +673,11 @@ def invert_displacement_field(
     iteration contracts only while ``max|grad d| < 1``, and outside that the step stops
     shrinking instead of the result getting slowly better.
     """
+    if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
+        from .numba_kernels import invert_displacement_field_cpu
+
+        ex, ey, ez, step = invert_displacement_field_cpu(xd, yd, zd, n_iter)
+        return (ex, ey, ez, step) if return_step else (ex, ey, ez)
     nz, ny, nx = xd.shape
     device = xd.device
     if voxel_grid is None:
@@ -637,13 +692,26 @@ def invert_displacement_field(
     ex = -xd
     ey = -yd
     ez = -zd
-    field = torch.stack([xd, yd, zd], dim=0)
+    field = torch.stack([xd, yd, zd], dim=0)[None]
     step = torch.zeros((), device=device, dtype=xd.dtype)
+    # One sampling grid, refilled in place each sweep with the same arithmetic, in the
+    # same order, as trilinear_interpolate_multi's normalisation -- so the result is
+    # bit-identical to calling it. Its (N, C) return layout cost a transpose out and the
+    # unbind here a transpose back, plus a dozen full-volume temporaries per sweep:
+    # 0.28 s of a 0.47 s sweep on CPU at 193x229x193.
+    n_points = nz * ny * nx
+    grid = torch.empty((1, 1, 1, n_points, 3), device=device, dtype=xd.dtype)
+    grid_cols = grid.view(n_points, 3)
+    axes = ((ii, nx), (jj, ny), (kk, nz))
     for sweep in range(n_iter):
-        sx = (ii + ex).reshape(-1)
-        sy = (jj + ey).reshape(-1)
-        sz = (kk + ez).reshape(-1)
-        sampled = trilinear_interpolate_multi(field, sx, sy, sz).T.reshape(3, nz, ny, nx)
+        for col, ((base, n), disp) in enumerate(zip(axes, (ex, ey, ez), strict=True)):
+            g = grid_cols[:, col]
+            g.copy_(base.reshape(-1)).add_(disp.reshape(-1))
+            if n > 1:
+                g.mul_(2.0).div_(n - 1).sub_(1.0)
+            else:
+                g.mul_(0.0)
+        sampled = _grid_sample_3d(field, grid).reshape(3, nz, ny, nx)
         dx, dy, dz = sampled.unbind(0)
         if sweep == n_iter - 1:
             step = torch.maximum(
@@ -824,6 +892,19 @@ class LevelStats:
     reports this is one whose whole schedule is too aggressive, not one that merely
     took a bad step."""
 
+    illegal_iters: int = 0
+    """Iterations whose (pre-step) fields failed the legality test, so they could not
+    become the kept result however low their cost."""
+
+    patience_stopped: bool = False
+    """The level ended because the kept cost stopped improving (``best_patience``)."""
+
+    cost_trace: list[float] = field(default_factory=list, repr=False)
+    legal_trace: list[bool] = field(default_factory=list, repr=False)
+    jac_min_trace: list[float] = field(default_factory=list, repr=False)
+    """Per-iteration image cost, legality and min half-field det(J): the record behind ``best_iter``, for
+    checking stop rules offline. Not part of :meth:`as_dict`."""
+
     @property
     def hit_cap(self) -> bool:
         return self.iters_run >= self.n_iter_cap
@@ -850,6 +931,10 @@ class LevelStats:
             bits.append(f"{self.refused_iters} refused")
         if self.sym_rejected:
             bits.append(f"{self.sym_rejected} unsymmetrized")
+        if self.illegal_iters:
+            bits.append(f"{self.illegal_iters} illegal")
+        if self.patience_stopped:
+            bits.append("stopped: no legal improvement")
         if self.fold_fallback:
             bits.append("NO LEGAL ITERATE (kept a folded one)")
         bits.append(f"best cost {self.best_cost:.5f}")
@@ -857,6 +942,9 @@ class LevelStats:
 
     def as_dict(self) -> dict:
         d = asdict(self)
+        d.pop("cost_trace", None)
+        d.pop("legal_trace", None)
+        d.pop("jac_min_trace", None)
         d.update(hit_cap=self.hit_cap, starved=self.starved, wasted_iters=self.wasted_iters)
         return d
 
@@ -892,6 +980,11 @@ def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
     Values <= 0 mark folded (non-injective) voxels; this is the diagnostic that says
     whether a flow field stayed anatomically plausible.
     """
+    if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
+        if not (xd.requires_grad or yd.requires_grad or zd.requires_grad):
+            from .numba_kernels import jacobian_cpu
+
+            return jacobian_cpu(xd, yd, zd)[0]
     dxx, dxy, dxz = _grad3(xd)
     dyx, dyy, dyz = _grad3(yd)
     dzx, dzy, dzz = _grad3(zd)
@@ -1151,6 +1244,7 @@ def _syn_level(
     total_var = float(config.total_var)  # type: ignore[arg-type]
     flags = config.warp_flags
     window = config.convergence_window
+    patience = config.best_patience
     nz, ny, nx = fixed.shape
     voxel_grid = torch.meshgrid(
         torch.arange(nz, dtype=fixed.dtype, device=fixed.device),
@@ -1160,11 +1254,15 @@ def _syn_level(
     )
 
     def _snapshot() -> tuple[Field, Field, Field, Field]:
+        # References, not clones: every step rebinds the fields to new tensors and
+        # nothing in the loop writes into one in place, so a held reference cannot
+        # change. Cloning was 12 full volumes per new best -- nearly every iteration
+        # at the finest level, where the best keeps moving.
         return (
-            (fxd.clone(), fyd.clone(), fzd.clone()),
-            (ifxd.clone(), ifyd.clone(), ifzd.clone()),
-            (mxd.clone(), myd.clone(), mzd.clone()),
-            (imxd.clone(), imyd.clone(), imzd.clone()),
+            (fxd, fyd, fzd),
+            (ifxd, ifyd, ifzd),
+            (mxd, myd, mzd),
+            (imxd, imyd, imzd),
         )
 
     # Two running bests: the lowest-cost *legal* state, and the lowest-cost state of
@@ -1174,9 +1272,21 @@ def _syn_level(
     best_cost, best_fields, best_iter = float("inf"), _snapshot(), 0
     any_cost, any_fields, any_iter = float("inf"), _snapshot(), 0
     costs: list[float] = []
+    legals: list[bool] = []
+    jac_mins: list[float] = []
+    patience_stopped = False
     jac_f = jacobian_determinant(fxd, fyd, fzd)
     jac_m = jacobian_determinant(mxd, myd, mzd)
     n_damped = n_refused = n_sym_rejected = 0
+
+    # The weight sits on the midpoint grid and never moves, so its filtered copy -- one
+    # of the six local-correlation moments -- is the same every iteration.
+    smoothed_weight = None
+    fused = _fused_local_corr_args(
+        weight, config.metric, config.cc_radius, config.lpa_sigma, config.lpa_kernel
+    )
+    if fused is not None:
+        smoothed_weight = _separable_smooth_3d(weight, fused[0], kernel_type=fused[1])
 
     bar = None
     if _tqdm is not None and config.verb >= 1 and n_iter >= 5:
@@ -1189,7 +1299,7 @@ def _syn_level(
 
         fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
         mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
-        cost = _metric_cost(fmid, mmid, weight, config)
+        cost = _metric_cost(fmid, mmid, weight, config, smoothed_weight)
         # The image term is what the level is judged and best-restored on; the penalty
         # only steers the step. Folding lowers the image metric, so scoring the two
         # together would let a folded iterate win on a total the penalty was meant to
@@ -1211,9 +1321,10 @@ def _syn_level(
         # ``jac_f``/``jac_m`` are the determinants of exactly those fields: whichever
         # branch the previous iteration took, it left behind the determinant of the
         # field it actually kept, so nothing is recomputed here.
-        legal = not config.fold_aware_best or (
-            min(float(jac_f.min()), float(jac_m.min())) >= config.jac_floor
-        )
+        jac_min = min(float(jac_f.min()), float(jac_m.min()))
+        legal = not config.fold_aware_best or jac_min >= config.jac_floor
+        legals.append(legal)
+        jac_mins.append(jac_min)
         if cost_val < any_cost:
             any_cost, any_iter = cost_val, len(costs) - 1
             any_fields = _snapshot()
@@ -1229,6 +1340,13 @@ def _syn_level(
         if window > 0 and len(costs) >= window:
             if _convergence_value(costs, window) < config.convergence_threshold:
                 break
+        # Nothing after the kept iterate is ever returned, so once it has stood for
+        # ``patience`` iterations the rest of the level is work for nothing. Only once a
+        # legal best exists: a level that inherits a folded field keeps going in the
+        # hope of becoming legal, and falls back to the best illegal iterate otherwise.
+        if patience > 0 and best_cost < float("inf") and len(costs) - 1 - best_iter >= patience:
+            patience_stopped = True
+            break
 
         grads = torch.autograd.grad(cost, leaves)
         # Descent direction (cost is lower=better) for each half-field.
@@ -1323,6 +1441,11 @@ def _syn_level(
         sym_rejected=n_sym_rejected,
         best_cost=best_cost,
         fold_fallback=fold_fallback,
+        illegal_iters=legals.count(False),
+        patience_stopped=patience_stopped,
+        cost_trace=costs,
+        legal_trace=legals,
+        jac_min_trace=jac_mins,
     )
     if config.verb >= 1:
         print(f"  {level_tag}: {stats.describe()}")
