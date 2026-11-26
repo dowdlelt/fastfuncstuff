@@ -65,12 +65,11 @@ from .cost import (
 from .interp import (
     _grid_sample_3d,
     batched_interp_3ch_multi,
-    trilinear_interpolate_multi,
     warp_image,
 )
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
-from .penalty import compute_jacobian_energy, penalty_energy
+from .penalty import HPEN_CUT, compute_jacobian_energy, penalty_energy
 
 if TYPE_CHECKING:
     from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
@@ -517,10 +516,18 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     # alone, so 4.8x of the work exists to differentiate voxels that contribute exactly
     # zero. Find the offenders without a graph, then rebuild the penalty differentiably
     # on 3x3x3 patches around just those.
-    with torch.no_grad():
-        je, se = compute_jacobian_energy(*(f.detach() for f in fields))
-        owing = torch.nonzero(penalty_energy(je, se) > 0, as_tuple=False)
-    del je, se
+    f0 = fields[0]
+    if f0.device.type == "cpu" and f0.dtype == torch.float32 and not torch.compiler.is_compiling():
+        from .field_kernels_cpu import jacobian_cpu
+
+        owing_mask = jacobian_cpu(*fields, cut=HPEN_CUT)[1]
+        assert owing_mask is not None
+        owing = torch.nonzero(owing_mask, as_tuple=False)
+    else:
+        with torch.no_grad():
+            je, se = compute_jacobian_energy(*(f.detach() for f in fields))
+            owing = torch.nonzero(penalty_energy(je, se) > 0, as_tuple=False)
+        del je, se
     if owing.numel() == 0:
         # Routed through every field, so the graph shape does not depend on the data --
         # a bare zero would detach the penalty on the iterations it costs nothing (most
@@ -635,6 +642,11 @@ def invert_displacement_field(
     iteration contracts only while ``max|grad d| < 1``, and outside that the step stops
     shrinking instead of the result getting slowly better.
     """
+    if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
+        from .field_kernels_cpu import invert_displacement_field_cpu
+
+        ex, ey, ez, step = invert_displacement_field_cpu(xd, yd, zd, n_iter)
+        return (ex, ey, ez, step) if return_step else (ex, ey, ez)
     nz, ny, nx = xd.shape
     device = xd.device
     if voxel_grid is None:
@@ -649,13 +661,26 @@ def invert_displacement_field(
     ex = -xd
     ey = -yd
     ez = -zd
-    field = torch.stack([xd, yd, zd], dim=0)
+    field = torch.stack([xd, yd, zd], dim=0)[None]
     step = torch.zeros((), device=device, dtype=xd.dtype)
+    # One sampling grid, refilled in place each sweep with the same arithmetic, in the
+    # same order, as trilinear_interpolate_multi's normalisation -- so the result is
+    # bit-identical to calling it. Its (N, C) return layout cost a transpose out and the
+    # unbind here a transpose back, plus a dozen full-volume temporaries per sweep:
+    # 0.28 s of a 0.47 s sweep on CPU at 193x229x193.
+    n_points = nz * ny * nx
+    grid = torch.empty((1, 1, 1, n_points, 3), device=device, dtype=xd.dtype)
+    grid_cols = grid.view(n_points, 3)
+    axes = ((ii, nx), (jj, ny), (kk, nz))
     for sweep in range(n_iter):
-        sx = (ii + ex).reshape(-1)
-        sy = (jj + ey).reshape(-1)
-        sz = (kk + ez).reshape(-1)
-        sampled = trilinear_interpolate_multi(field, sx, sy, sz).T.reshape(3, nz, ny, nx)
+        for col, ((base, n), disp) in enumerate(zip(axes, (ex, ey, ez), strict=True)):
+            g = grid_cols[:, col]
+            g.copy_(base.reshape(-1)).add_(disp.reshape(-1))
+            if n > 1:
+                g.mul_(2.0).div_(n - 1).sub_(1.0)
+            else:
+                g.mul_(0.0)
+        sampled = _grid_sample_3d(field, grid).reshape(3, nz, ny, nx)
         dx, dy, dz = sampled.unbind(0)
         if sweep == n_iter - 1:
             step = torch.maximum(
@@ -924,6 +949,11 @@ def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
     Values <= 0 mark folded (non-injective) voxels; this is the diagnostic that says
     whether a flow field stayed anatomically plausible.
     """
+    if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
+        if not (xd.requires_grad or yd.requires_grad or zd.requires_grad):
+            from .field_kernels_cpu import jacobian_cpu
+
+            return jacobian_cpu(xd, yd, zd)[0]
     dxx, dxy, dxz = _grad3(xd)
     dyx, dyy, dyz = _grad3(yd)
     dzx, dzy, dzz = _grad3(zd)
@@ -1193,11 +1223,15 @@ def _syn_level(
     )
 
     def _snapshot() -> tuple[Field, Field, Field, Field]:
+        # References, not clones: every step rebinds the fields to new tensors and
+        # nothing in the loop writes into one in place, so a held reference cannot
+        # change. Cloning was 12 full volumes per new best -- nearly every iteration
+        # at the finest level, where the best keeps moving.
         return (
-            (fxd.clone(), fyd.clone(), fzd.clone()),
-            (ifxd.clone(), ifyd.clone(), ifzd.clone()),
-            (mxd.clone(), myd.clone(), mzd.clone()),
-            (imxd.clone(), imyd.clone(), imzd.clone()),
+            (fxd, fyd, fzd),
+            (ifxd, ifyd, ifzd),
+            (mxd, myd, mzd),
+            (imxd, imyd, imzd),
         )
 
     # Two running bests: the lowest-cost *legal* state, and the lowest-cost state of
