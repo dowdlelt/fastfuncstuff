@@ -48,7 +48,16 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
+from .base import (
+    Check,
+    UnitResult,
+    afni_version,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed,
+    timed_cached,
+)
 
 ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
 
@@ -242,9 +251,11 @@ class AllineateCheck(Check):
         axes = partial_axes(e.affine, e.shape[:3], b.affine, mask)
         aea_args = [*AEA_ARGS, *partial_flag(axes)]
         # align_epi_anat names its outputs after the inputs' prefixes, in -output_dir.
-        t = timed(
+        # Cached (minutes per unit), so `work -redo allineate -tools ffs` refits ffs alone.
+        t = timed_cached(
             ["align_epi_anat.py", "-overwrite", "-anat", str(brain), "-epi", str(mean),
              "-output_dir", str(out["ref"]), *aea_args],
+            out["ref"] / "fit.timing.json", [out["ref"] / "epi_mean_al_mat.aff12.1D"],
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         shutil.copy(out["ref"] / "epi_mean_al_mat.aff12.1D", out["ref"] / "al.aff12.1D")
@@ -336,6 +347,10 @@ class AllineateCheck(Check):
         res.artifacts += [(out[s] / "al.nii.gz", "regenerable") for s in out]
         res.artifacts += [(out[s] / "al.aff12.1D", "keep") for s in out]
         res.artifacts += [(mean, "keep"), (log, "keep")]
+        # the cached reference fit, so a -redo of ffs reuses it on pruned host sets too
+        res.artifacts += [
+            (out["ref"] / f, "keep") for f in ("epi_mean_al_mat.aff12.1D", "fit.timing.json")
+        ]
         res.artifacts += [(f, "regenerable") for f in sorted(seg.parent.glob("*.nii.gz"))]
         res.provenance["ref"] = {"tool": "align_epi_anat.py", "version": afni_version("3dAllineate"),
                                  "args": aea_args, "apply": "3dAllineate -1Dmatrix_apply -final wsinc5"}  # fmt: skip
