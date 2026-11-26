@@ -56,8 +56,11 @@ from .cost import (
     BatchedIncrementalCorrelation,
     IncrementalCorrelation,
     _auto_clip,
+    _clip_weight,
     _make_kernel_1d,
+    apply_incor_clip,
     batched_lpa_cost,
+    incor_clipate,
 )
 from .cost_blok import (
     assign_bloks,
@@ -278,6 +281,15 @@ class QwarpConfig:
     finer one (AFNI never switches back). The ball allows single coefficients 2-6x
     larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
     until measured."""
+
+    incor_afni: bool = False
+    """AFNI's INCOR for the global correlations: pearclp clips at
+    ``THD_cliplevel(0.321)`` and the 0.987 quantile (capped at 6.543x the bottom),
+    replaces values slightly *beyond* the clip and divides a clipped voxel's weight
+    by 1 + its clipped coordinates (``INCOR_clipate``); pearclp and pearson then
+    score atanh(r), which reweights the correlation against the penalty by
+    1/(1 - r^2). ffs's pearclp clamps at the 1st/99th percentiles at full weight and
+    scores raw r. Batched path only; opt-in until measured."""
 
     gn_step_search: bool = False
     """Try the Gauss-Newton step at full, half and quarter length each iteration
@@ -1133,12 +1145,20 @@ def _compute_hfactor(patch_size: int, reference_patch_size: int, hfactor_q: floa
     return prat**alpha
 
 
+def _qwarp_clip(config: QwarpConfig, vol: Tensor, weight: Tensor) -> tuple[float, ...]:
+    """The INCOR clip range for one image: AFNI's ``INCOR_clipate`` 4-tuple under
+    ``incor_afni`` with pearclp, else ffs's percentile clamp."""
+    if config.incor_afni and config.cost_method == "pearclp":
+        return incor_clipate(vol.reshape(-1), weight.reshape(-1))
+    return _auto_clip(vol.reshape(-1), weight.reshape(-1))
+
+
 def _global_correlation(
     base: Tensor,
     warped_source: Tensor,
     weight: Tensor,
-    base_clip: tuple[float, float] | None,
-    source_clip: tuple[float, float] | None,
+    base_clip: tuple[float, ...] | None,
+    source_clip: tuple[float, ...] | None,
 ) -> float:
     """Weighted (optionally clipped) Pearson cost over the whole volume.
 
@@ -1148,11 +1168,9 @@ def _global_correlation(
     b_flat = base.reshape(-1)
     s_flat = warped_source.reshape(-1)
     w_flat = weight.reshape(-1)
-    if base_clip:
-        b_flat = b_flat.clamp(base_clip[0], base_clip[1])
-    if source_clip:
-        s_flat = s_flat.clamp(source_clip[0], source_clip[1])
-    wm = w_flat * (w_flat > 0).float()
+    b_flat, nb = apply_incor_clip(b_flat, base_clip)
+    s_flat, ns = apply_incor_clip(s_flat, source_clip)
+    wm = _clip_weight(w_flat * (w_flat > 0).float(), nb, ns)
     sw = wm.sum()
     if sw <= 0:
         return 0.0
@@ -1358,8 +1376,8 @@ def _warpomatic(
     )
     with torch.no_grad():
         state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
-    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-    source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+    base_clip = _qwarp_clip(config, base, weight)
+    source_clip = _qwarp_clip(config, source, weight)
 
     # Compute initial cost so it's never the 666.666 sentinel.
     with torch.no_grad():
@@ -1640,8 +1658,8 @@ def _warpomatic(
             state.warped_source = warp_image(
                 source, state.xd, state.yd, state.zd, mode=config.interp
             )
-        base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-        source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+        base_clip = _qwarp_clip(config, base, weight)
+        source_clip = _qwarp_clip(config, source, weight)
         state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
 
         # Penalty settings. Ramp with ABSOLUTE level (finer patches => stronger
@@ -2380,6 +2398,7 @@ def _improve_warp_batched(
             method=config.cost_method,
             base_clip=base_clip,
             source_clip=source_clip,
+            fisher_z=config.incor_afni and config.cost_method in ("pearclp", "pearson"),
         )
         patch_slices = [(p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop) for p in patches]
         batch_incor.precompute_fixed_parts(

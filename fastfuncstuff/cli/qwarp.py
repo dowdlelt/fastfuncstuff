@@ -882,6 +882,13 @@ def parse_args(
         "a per-parameter box, as 3dQwarp does (experimental)",
     )
     g_opt.add_argument(
+        "-incor_afni",
+        action="store_true",
+        help="AFNI's INCOR scoring for pearclp/pearson: pearclp clips at THD_cliplevel "
+        "and the 0.987 quantile with clipped voxels replaced past the clip and "
+        "down-weighted, and both score atanh(r) instead of r (experimental)",
+    )
+    g_opt.add_argument(
         "-gn_step_search",
         action="store_true",
         help="Try each Gauss-Newton step at full, half and quarter length and keep the "
@@ -1953,6 +1960,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         ball_constraint=args.ball,
         lev0_schedule=args.lev0,
         gn_step_search=args.gn_step_search,
+        incor_afni=args.incor_afni,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

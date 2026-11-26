@@ -130,6 +130,59 @@ def _auto_clip(data: Tensor, weight: Tensor | None = None) -> tuple[float, float
     return (float(sorted_d[i_lo]), float(sorted_d[i_hi]))
 
 
+def incor_clipate(data: Tensor, weight: Tensor | None = None) -> tuple[float, float, float, float]:
+    """AFNI's pearclp clip (``INCOR_clipate``): ``(cbot, ctop, dbot, dtop)``.
+
+    ``cbot`` is ``THD_cliplevel(0.321)`` and ``ctop`` the 0.987 quantile capped at
+    6.543 * cbot, both over the masked voxels. A value beyond a clip is replaced
+    not by the clip itself but slightly past it -- ``dbot = cbot - min(5% of the
+    range, half the gap to the minimum)``, likewise above -- and the voxel's weight
+    is divided by 1 + the number of its clipped coordinates (see
+    :func:`apply_incor_clip`). ffs's own pearclp (:func:`_auto_clip`) clamps at the
+    1st/99th percentiles with full weight.
+    """
+    from .weight import _thd_cliplevel
+
+    d = data[weight > 0] if weight is not None else data.reshape(-1)
+    if d.numel() < 10:
+        lo, hi = float(d.min()), float(d.max())
+        return lo, hi, lo, hi
+    cbot = _thd_cliplevel(d, 0.321)
+    pos = d[d > 0]
+    ctop = float(torch.quantile(pos.float()[:: max(1, pos.numel() // 2_000_000)], 0.987))
+    if cbot > 0:
+        ctop = min(ctop, 6.543 * cbot)
+    dmin, dmax = float(d.min()), float(d.max())
+    if not ctop > cbot:
+        return dmin, dmax, dmin, dmax
+    rng = ctop - cbot
+    dbot = cbot - min(0.05 * rng, 0.5 * max(cbot - dmin, 0.0))
+    dtop = ctop + min(0.05 * rng, 0.5 * max(dmax - ctop, 0.0))
+    return cbot, ctop, dbot, dtop
+
+
+def apply_incor_clip(x: Tensor, clip: tuple[float, ...] | None) -> tuple[Tensor, Tensor | None]:
+    """Clip ``x`` by a 2-tuple (ffs: clamp) or a 4-tuple from :func:`incor_clipate`
+    (AFNI: replace beyond the clip). Returns the values and, for the 4-tuple, a
+    0/1 tensor marking the replaced voxels (None otherwise)."""
+    if not clip:
+        return x, None
+    if len(clip) == 2:
+        return x.clamp(clip[0], clip[1]), None
+    cbot, ctop, dbot, dtop = clip
+    lo, hi = x < cbot, x > ctop
+    out = torch.where(lo, torch.full_like(x, dbot), torch.where(hi, torch.full_like(x, dtop), x))
+    return out, (lo | hi).to(x.dtype)
+
+
+def _clip_weight(w: Tensor, nb: Tensor | None, ns: Tensor | None) -> Tensor:
+    """AFNI's down-weighting of clipped voxels: weight / (1 + clipped coordinates)."""
+    if nb is None and ns is None:
+        return w
+    n = (nb if nb is not None else 0) + (ns if ns is not None else 0)
+    return w / (1.0 + n)
+
+
 # ---------------------------------------------------------------------------
 # LPA: Local Pearson Absolute correlation
 # ---------------------------------------------------------------------------
@@ -847,12 +900,17 @@ class BatchedIncrementalCorrelation:
     def __init__(
         self,
         method: str = "pearclp",
-        base_clip: tuple[float, float] | None = None,
-        source_clip: tuple[float, float] | None = None,
+        base_clip: tuple[float, ...] | None = None,
+        source_clip: tuple[float, ...] | None = None,
+        fisher_z: bool = False,
     ):
+        """A 4-tuple clip (from :func:`incor_clipate`) selects AFNI's replace-and-
+        down-weight clipping; ``fisher_z`` returns atanh(r) as AFNI does for pearson
+        and pearclp (it changes the cost's balance with the penalty by 1/(1-r^2))."""
         self.method = method
         self.base_clip = base_clip
         self.source_clip = source_clip
+        self.fisher_z = fisher_z
 
         self._sw_fixed: Tensor | None = None
         self._swx_fixed: Tensor | None = None
@@ -888,13 +946,11 @@ class BatchedIncrementalCorrelation:
         s = warped_source.reshape(-1)
         w = weight.reshape(-1)
 
-        if self.base_clip:
-            b = b.clamp(self.base_clip[0], self.base_clip[1])
-        if self.source_clip:
-            s = s.clamp(self.source_clip[0], self.source_clip[1])
+        b, nb = apply_incor_clip(b, self.base_clip)
+        s, ns = apply_incor_clip(s, self.source_clip)
 
         mask = w > 0
-        wm = w * mask.float()
+        wm = _clip_weight(w * mask.float(), nb, ns)
 
         # Global sums (once)
         sw_g = wm.sum()
@@ -932,12 +988,10 @@ class BatchedIncrementalCorrelation:
                 ]
             )
 
-        if self.base_clip:
-            bp_all = bp_all.clamp(self.base_clip[0], self.base_clip[1])
-        if self.source_clip:
-            sp_all = sp_all.clamp(self.source_clip[0], self.source_clip[1])
+        bp_all, nbp = apply_incor_clip(bp_all, self.base_clip)
+        sp_all, nsp = apply_incor_clip(sp_all, self.source_clip)
 
-        wpm_all = wp_all * (wp_all > 0).float()
+        wpm_all = _clip_weight(wp_all * (wp_all > 0).float(), nbp, nsp)
 
         # (B,) sums over voxel dim
         self._sw_fixed = sw_g - wpm_all.sum(dim=1)
@@ -958,14 +1012,9 @@ class BatchedIncrementalCorrelation:
         This is the HOT PATH that runs every optimizer iteration.
         No .item() calls, no Python loops, pure tensor ops.
         """
-        if self.base_clip:
-            base_patches = base_patches.clamp(self.base_clip[0], self.base_clip[1])
-        if self.source_clip:
-            source_patches = source_patches.clamp(self.source_clip[0], self.source_clip[1])
-
-        w = weight_patches
-        x = base_patches
-        y = source_patches
+        x, nx_ = apply_incor_clip(base_patches, self.base_clip)
+        y, ny_ = apply_incor_clip(source_patches, self.source_clip)
+        w = _clip_weight(weight_patches, nx_, ny_)
 
         # Sum over voxels (dim=1), keep batch dim → (B,)
         sw = self._sw_fixed + w.sum(dim=1)
@@ -983,4 +1032,6 @@ class BatchedIncrementalCorrelation:
         vxy = swxy / sw_safe - xbar * ybar
 
         corr = vxy / (vxx * vyy).sqrt()
+        if self.fisher_z:
+            corr = corr.clamp(-0.9999, 0.9999).atanh()
         return corr

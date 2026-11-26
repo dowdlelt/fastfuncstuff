@@ -345,3 +345,55 @@ def test_histogram_costs_match_afni(tmp_path):
     assert m.cr_yx == pytest.approx(afni["crU"], abs=0.02)
     # AFNI prints hel = -(1 - affinity); our m.hel is the affinity.
     assert m.hel == pytest.approx(1.0 + afni["hel"], abs=0.02)
+
+
+class TestIncorClipate:
+    """AFNI's pearclp clip (INCOR_clipate), behind QwarpConfig.incor_afni."""
+
+    def test_replacement_lands_beyond_the_clip_and_halves_the_weight(self):
+        from fastfuncstuff.processing.cost import apply_incor_clip, incor_clipate
+
+        g = torch.Generator().manual_seed(0)
+        data = torch.cat([torch.rand(20000, generator=g) * 100 + 50, torch.tensor([5000.0, 0.5])])
+        cbot, ctop, dbot, dtop = incor_clipate(data)
+        assert dbot < cbot < ctop < dtop
+        # 5% of the range, unless half the gap to the extreme is smaller.
+        assert dtop - ctop == pytest.approx(min(0.05 * (ctop - cbot), 0.5 * (5000 - ctop)))
+        assert cbot - dbot == pytest.approx(min(0.05 * (ctop - cbot), 0.5 * (cbot - 0.5)))
+        out, n = apply_incor_clip(data, (cbot, ctop, dbot, dtop))
+        assert n is not None
+        assert out[-2] == pytest.approx(dtop) and out[-1] == pytest.approx(dbot)
+        assert n[-2] == 1 and n[-1] == 1
+        assert torch.equal(out[n == 0], data[n == 0])
+
+    def test_batched_incremental_matches_a_direct_weighted_pearson(self):
+        from fastfuncstuff.processing.cost import (
+            BatchedIncrementalCorrelation,
+            apply_incor_clip,
+            incor_clipate,
+        )
+
+        g = torch.Generator().manual_seed(1)
+        base = torch.rand(12, 13, 14, generator=g) * 100
+        src = base * 0.7 + torch.rand(12, 13, 14, generator=g) * 40
+        base[3, 4, 5] = 900.0  # one spike each, so both clips bind
+        src[6, 7, 8] = -50.0
+        weight = torch.rand(12, 13, 14, generator=g)
+        bc, sc = incor_clipate(base.reshape(-1)), incor_clipate(src.reshape(-1))
+        patch = (2, 9, 3, 10, 1, 8)  # ibot, itop, jbot, jtop, kbot, ktop
+        i0, i1, j0, j1, k0, k1 = patch
+        sl = (slice(k0, k1 + 1), slice(j0, j1 + 1), slice(i0, i1 + 1))
+        inc = BatchedIncrementalCorrelation("pearclp", bc, sc, fisher_z=True)
+        inc.precompute_fixed_parts(base, src, weight, [patch])
+        got = inc.evaluate(
+            base[sl].reshape(1, -1), src[sl].reshape(1, -1), weight[sl].reshape(1, -1)
+        )
+
+        x, nx = apply_incor_clip(base.reshape(-1).double(), bc)
+        y, ny = apply_incor_clip(src.reshape(-1).double(), sc)
+        w = weight.reshape(-1).double() / (1 + nx + ny)
+        xm, ym = (w * x).sum() / w.sum(), (w * y).sum() / w.sum()
+        r = (w * (x - xm) * (y - ym)).sum() / torch.sqrt(
+            (w * (x - xm) ** 2).sum() * (w * (y - ym) ** 2).sum()
+        )
+        assert float(got) == pytest.approx(float(torch.atanh(r)), rel=1e-4)
