@@ -10,9 +10,11 @@ Reference: align_epi_anat.py as afni_proc.py runs it (anat2epi, EPI strip by 3dA
 afni_proc's help recommends for EPI to anatomy, ``-cost lpc+ZZ -giant_move``. On an EPI
 that covers only part of the brain the plain centre-of-mass shift drags the slab to the
 brain's middle, so the matching ``-partial_*`` flag limits cmass to the covered axes
-(AFNI's own advice; see ``partial_axes``). Its EPI-to-anatomy matrix is applied to the
+(AFNI's own advice; see ``partial_axes``). Both tools fit rigid (``-rigid_body`` /
+``-rigid``), as autoproc does; their 12-parameter default is not what anyone here aligns an
+EPI to its own T1 with. Its EPI-to-anatomy matrix is applied to the
 mean with wsinc5 on the T1 grid, as ffs writes its own output. ffs_allineate runs at its
-defaults, since the defaults are what users get. Bare 3dAllineate is not run: EPI to
+defaults apart from -rigid, since the defaults are what users get. Bare 3dAllineate is not run: EPI to
 anatomy is align_epi_anat's job, not 3dAllineate's (it aligned 24 of 51 units here), so
 it measured misuse rather than AFNI.
 
@@ -60,13 +62,17 @@ from .base import (
     timed_cached,
 )
 
-ARGS = ["-cost", "lpc", "-source_automask", "-final", "wsinc5"]
+# Rigid (6 DoF) for both tools: an EPI and a T1 of one head differ by pose, not by scale or
+# shear (distortion is not affine), and autoproc's own EPI->anat step is -rigid. Both tools
+# default to a 12-parameter affine (align_epi_anat's -Allineate_opts carries -warp aff),
+# which let align_epi_anat scale Forest unit 662 by 1.13 to fit a slab.
+ARGS = ["-rigid", "-cost", "lpc", "-source_automask", "-final", "wsinc5"]
 
 # align_epi_anat.py as afni_proc.py writes it (db_mod.py, align block) plus the options
 # its help recommends for EPI to anatomy; the -partial_* flag is added per unit.
 AEA_ARGS = ["-anat2epi", "-epi2anat", "-epi_base", "0", "-epi_strip", "3dAutomask",
             "-anat_has_skull", "no", "-volreg", "off", "-tshift", "off",
-            "-cost", "lpc+ZZ", "-giant_move", "-suffix", "_al"]  # fmt: skip
+            "-cost", "lpc+ZZ", "-giant_move", "-rigid_body", "-suffix", "_al"]  # fmt: skip
 
 # An EPI axis shorter than this share of the brain's extent along the same world axis
 # counts as partial. Measured on the benchmark's EPIs (11-25): whole-brain runs span
@@ -201,8 +207,9 @@ class AllineateCheck(Check):
     sampling = "breadth"
     reference = "AFNI align_epi_anat.py (lpc+ZZ -giant_move, -partial_* per unit)"
     report = ReportSpec(
-        summary="Mean EPI to the subject's stripped T1w: ffs_allineate at its defaults against "
-        "align_epi_anat.py (lpc+ZZ -giant_move, -partial_* where the EPI covers part of the brain).",
+        summary="Mean EPI to the subject's stripped T1w, rigid: ffs_allineate -rigid against "
+        "align_epi_anat.py -rigid_body (lpc+ZZ -giant_move, -partial_* where the EPI covers part "
+        "of the brain).",
         tools={"ref": "align_epi_anat.py", "ffs": "ffs_allineate"},
         timing={"ref": "align_epi_anat.py", "ffs": "ffs_allineate"},
         references=("ref",),
@@ -314,7 +321,7 @@ class AllineateCheck(Check):
             "aligned_r": float((x * y).sum() / np.sqrt((x * x).sum() * (y * y).sum())),
             "ref_rms_from_identity_mm": rms_displacement(m_ref, np.eye(4), rai),
             "ffs_rms_from_identity_mm": rms_displacement(m_ffs, np.eye(4), rai),
-            # isotropic scale; ffs failures so far sit on its 0.8 bound (ds002603, ds004645)
+            # isotropic scale: 1 under -rigid; kept as a guard that the fit really was rigid
             "scale_ref": float(abs(np.linalg.det(m_ref[:3, :3])) ** (1 / 3)),
             "scale_ffs": float(abs(np.linalg.det(m_ffs[:3, :3])) ** (1 / 3)),
         }
