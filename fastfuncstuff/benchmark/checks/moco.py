@@ -7,6 +7,7 @@ Synthetic-truth scoring (scripts/moco_truth) is the next judge to add.
 
 from __future__ import annotations
 
+from ..report_spec import Metric, ReportSpec
 from ..validation import compare_1d_params, compare_aff12_series, compare_moco_ssd, compare_volumes
 from .base import (
     Check,
@@ -34,6 +35,27 @@ class MocoCheck(Check):
     needs = [[]]  # any functional run
     sampling = "breadth"
     reference = "AFNI 3dvolreg"
+    report = ReportSpec(
+        summary="Raw run, registered to its first steady-state volume: ffs_moco against 3dvolreg, "
+        "both heptic.",
+        tools={},
+        timing={"ref": "3dvolreg", "ffs": "ffs_moco"},
+        references=("ref",),
+        metrics=(
+            Metric("reference.aff12_max_trans_mm", "Largest translation difference (mm)",
+                   line=0.5, line_label="gate", log=True,
+                   note="Over all volumes, between the two tools' base-to-source matrices."),
+            Metric("reference.aff12_max_rot", "Largest rotation-block difference",
+                   line=0.05, line_label="gate", log=True,
+                   note="Largest element difference of the matrices' 3x3 blocks."),
+            Metric("reference.mean_image_r", "Mean corrected image, r with 3dvolreg's",
+                   better="higher", line=0.98, line_label="gate"),
+            Metric("reference.motion_min_r", "Motion parameters, lowest r over the six",
+                   better="higher"),
+        ),
+        speedup=(("ffs", "ref"),),
+        code=("fastfuncstuff.cli.moco", "fastfuncstuff.benchmark.checks.moco"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]

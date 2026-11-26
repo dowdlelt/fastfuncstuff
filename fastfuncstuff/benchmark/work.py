@@ -295,6 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         "(their code changed, their command line did not); other fits are reused.",
     )
     act.add_argument(
+        "-report",
+        metavar="DIR",
+        help="Write the accuracy and timing report (index.html, SVG/PDF figures, CSVs) to DIR, "
+        "from this worklist and every ingested host set; -checks limits it.",
+    )
+    act.add_argument(
         "-export_hostset",
         metavar="DIR",
         type=Path,
@@ -318,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Units per acquisition with -plan (default 1); per check with "
         "-export_hostset (default 2).",
     )
-    p.add_argument("-checks", nargs="+", default=[], help="Checks for -export_hostset.")
+    p.add_argument("-checks", nargs="+", default=[], help="Checks for -export_hostset or -report.")
     p.add_argument(
         "-tools",
         nargs="+",
@@ -455,6 +461,10 @@ def main(argv: list[str] | None = None) -> int:
             p.error("-redo needs -tools")
         n = redo(wl, args.root, args.redo, args.tools)
         print(f"{n} {args.redo} units back to pending; {' '.join(args.tools)} will refit")
+    elif args.report:
+        from .report import build_report
+
+        print(build_report(args.root, Path(args.report), args.checks or None))
     elif args.results:
         from .hostset import hostsets
 

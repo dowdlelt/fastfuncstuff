@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import (
     UnitResult,
     _stable_rank,
@@ -182,6 +183,27 @@ class WarpPairCheck(QwarpCheck):
     name = "warp_pair"
     description = "Nonlinear warp family on one pair: ANTs SyN / 3dQwarp vs every ffs warp tool"
     reference = "antsRegistration SyN (every pair), AFNI 3dQwarp (every 4th)"
+    report = ReportSpec(
+        summary="NIREP16 brain to brain, from one shared affine: ANTs SyN (every pair) and 3dQwarp "
+        "(every 4th) against every ffs warp tool; manual labels judge the overlap.",
+        tools={"affine": "affine only", "ants": "ANTs SyN", "3dqwarp": "3dQwarp", "qwarp": "ffs_qwarp",
+               "optiwarp": "ffs_optiwarp", "optiwarp_hs": "ffs_optiwarp (hs)",
+               "formwarp": "ffs_formwarp", "formwarp_ants": "ffs_formwarp (ANTs-like)"},
+        timing={"ref": "ANTs SyN", "ref_3dqwarp": "3dQwarp", "ffs_qwarp": "ffs_qwarp",
+                "ffs_optiwarp": "ffs_optiwarp", "ffs_optiwarp_hs": "ffs_optiwarp (hs)",
+                "ffs_formwarp": "ffs_formwarp", "ffs_formwarp_ants": "ffs_formwarp (ANTs-like)"},
+        references=("affine", "ants", "3dqwarp", "ref", "ref_3dqwarp"),
+        metrics=(
+            Metric("truth.dice_mean_{tool}", "Mean label Dice", better="higher",
+                   note="Source labels carried through each warp, against the base's manual labels."),
+            Metric("label_loss.label_vol_ratio_min_{tool}", "Smallest label kept (volume after warp / after affine)",
+                   better="higher", line=0.5, line_label="lost"),
+            Metric("deformation.frac_det_below_half_{tool}", "Brain squeezed below half its volume (share)"),
+        ),
+        speedup=(("ffs_qwarp", "ref_3dqwarp"), ("ffs_formwarp", "ref"), ("ffs_optiwarp_hs", "ref"),
+                 ("ffs_optiwarp", "ref")),
+        code=("fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_pair"),
+    )  # fmt: skip
     timeout_s = 4 * 3600.0
 
     def run(self, key, inputs, work, device):

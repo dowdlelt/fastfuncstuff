@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import (
     Check,
     UnitResult,
@@ -83,6 +84,30 @@ class WarpMniCheck(Check):
     needs = [["@ds:labels_cohort_head"]]
     sampling = "depth"
     reference = "AFNI @SSwarper; antsRegistration rigid+affine+SyN"
+    report = ReportSpec(
+        summary="Subject T1 to the MNI152 2009 template: @SSwarper and ANTs SyN against the ffs chain "
+        "(ffs_allineate, then each ffs warp tool); DKT31 manual labels follow each warp.",
+        tools={"sswarper": "@SSwarper", "ants": "ANTs SyN", "qwarp": "ffs_qwarp",
+               "optiwarp_hs": "ffs_optiwarp (hs)", "formwarp": "ffs_formwarp"},
+        timing={"ref": "@SSwarper", "ref_ants": "ANTs SyN", "ffs_affine": "ffs_allineate",
+                "ffs_qwarp": "ffs_qwarp", "ffs_optiwarp_hs": "ffs_optiwarp (hs)",
+                "ffs_formwarp": "ffs_formwarp"},
+        references=("sswarper", "ants", "ref", "ref_ants"),
+        metrics=(
+            Metric("label_loss.label_vol_ratio_min_{tool}", "Smallest label kept (volume after warp / after affine)",
+                   better="higher", line=0.5, line_label="lost",
+                   note="Per subject, the label that shrank most; below half counts as lost."),
+            Metric("label_loss.n_labels_lost_{tool}", "Labels lost per subject", better="lower",
+                   note="Labels kept below half their post-affine volume."),
+            Metric("deformation.frac_det_below_half_{tool}", "Brain squeezed below half its volume (share)",
+                   note="Share of brain voxels whose tissue the warp compresses more than 2x."),
+            Metric("deformation.template_r_{tool}", "Warped brain, r with the template", better="higher"),
+            Metric("deformation.brain_dice_{tool}", "Brain mask Dice with the template", better="higher"),
+        ),
+        speedup=(("ffs_affine+ffs_qwarp", "ref"), ("ffs_affine+ffs_formwarp", "ref"),
+                 ("ffs_affine+ffs_optiwarp_hs", "ref"), ("ffs_affine+ffs_formwarp", "ref_ants")),
+        code=("fastfuncstuff.cli.allineate", "fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_mni"),
+    )  # fmt: skip
     timeout_s = 4 * 3600.0
 
     def plan(self, manifest, index, n):

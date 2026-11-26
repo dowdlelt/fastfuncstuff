@@ -92,6 +92,11 @@ dynamics = [
 viz = [
     "imageio>=2.31",
 ]
+# Benchmark report figures (`python -m fastfuncstuff.benchmark.work -report DIR`).
+bench = [
+    "seaborn>=0.13",
+    "jinja2>=3.1",
+]
 
 [project.scripts]
 # Pipeline generator

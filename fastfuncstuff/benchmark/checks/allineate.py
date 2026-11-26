@@ -48,6 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import (
     Check,
     UnitResult,
@@ -199,6 +200,30 @@ class AllineateCheck(Check):
     needs = [["@ds:anat_t1"]]
     sampling = "breadth"
     reference = "AFNI align_epi_anat.py (lpc+ZZ -giant_move, -partial_* per unit)"
+    report = ReportSpec(
+        summary="Mean EPI to the subject's stripped T1w: ffs_allineate at its defaults against "
+        "align_epi_anat.py (lpc+ZZ -giant_move, -partial_* where the EPI covers part of the brain).",
+        tools={"ref": "align_epi_anat.py", "ffs": "ffs_allineate"},
+        timing={"ref": "align_epi_anat.py", "ffs": "ffs_allineate"},
+        references=("ref",),
+        metrics=(
+            Metric("reference.affine_rms_mm", "ffs vs align_epi_anat, RMS displacement (mm)",
+                   line=2.0, line_label="2 mm", log=True,
+                   note="RMS distance between the two affines over the T1's brain voxels."),
+            Metric("truth.aligned_{tool}", "Aligned (tissue judge)", better="higher", kind="rate",
+                   note=f"EPI's bright voxels inside the brain (> {IN_BRAIN_MIN:g}) and GM brighter "
+                   f"than WM at > {POS_FRAC_MIN:g} of WM-boundary points; needs no cost either tool fits."),
+            Metric("truth.wm_contrast_{tool}", "GM-WM contrast across the WM boundary",
+                   better="higher", line=0.0,
+                   note="Aligned EPI sampled 1.5 mm either side of the T1's WM boundary; "
+                   "T2*-weighted GM is brighter, so a right fit reads positive."),
+            Metric("truth.epi_in_brain_{tool}", "EPI bright voxels inside the brain (share)",
+                   better="higher", line=IN_BRAIN_MIN),
+        ),
+        speedup=(("ffs", "ref"),),
+        difficulty=("data.epi_extent_min_mm", "EPI extent along its thinnest axis (mm)"),
+        code=("fastfuncstuff.cli.allineate", "fastfuncstuff.benchmark.checks.allineate"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]
