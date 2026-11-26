@@ -121,3 +121,19 @@ def test_background_band_is_a_no_op_without_an_exact_zero_background():
     assert torch.equal(add_background_band(w, img, radius=15), w)
     base, _ = _skull_stripped_ball()
     assert torch.equal(add_background_band(w := compute_weight_image(base), base, radius=0), w)
+
+
+def test_qwarp_afni_weight_is_wider_and_keeps_its_edge():
+    """Sigma 4.5 (not FWHM) and AFNI's peel-and-redilate: a fuller, wider weight."""
+    from fastfuncstuff.processing.warp import _compute_qwarp_weight
+
+    z, y, x = torch.meshgrid(*(torch.arange(48.0),) * 3, indexing="ij")
+    r = ((z - 24) ** 2 + (y - 24) ** 2 + (x - 24) ** 2).sqrt()
+    g = torch.Generator().manual_seed(0)
+    head = (r < 16).float() * (100 + 10 * torch.rand(48, 48, 48, generator=g))
+    ffs = _compute_qwarp_weight(head)
+    afni = _compute_qwarp_weight(head, afni=True)
+    assert int((afni > 0).sum()) > int((ffs > 0).sum())
+    # The blur reaches further: weight at 2 voxels outside the head is larger.
+    shell = (r > 17.5) & (r < 18.5)
+    assert float(afni[shell].mean()) > float(ffs[shell].mean())

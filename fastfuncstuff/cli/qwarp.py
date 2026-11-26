@@ -882,6 +882,13 @@ def parse_args(
         "a per-parameter box, as 3dQwarp does (experimental)",
     )
     g_opt.add_argument(
+        "-weight_afni",
+        action="store_true",
+        help="3dQwarp's weight image and box: blur sigma 4.5 (not FWHM), AFNI's "
+        "peel-and-redilate erosion, and its autobox of the weight for the patch "
+        "ladder (experimental)",
+    )
+    g_opt.add_argument(
         "-incor_afni",
         action="store_true",
         help="AFNI's INCOR scoring for pearclp/pearson: pearclp clips at THD_cliplevel "
@@ -1961,6 +1968,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         lev0_schedule=args.lev0,
         gn_step_search=args.gn_step_search,
         incor_afni=args.incor_afni,
+        weight_afni=args.weight_afni,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

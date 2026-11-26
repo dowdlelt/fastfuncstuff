@@ -28,6 +28,8 @@ def compute_weight_image(
     clusterize: bool = False,
     hist_cliplevel: bool = False,
     edge_before_smoothing: bool = False,
+    gauss_sigma: float | None = None,
+    erode: str = "6conn",
 ) -> Tensor:
     """Create a weight image from the base image.
 
@@ -44,6 +46,12 @@ def compute_weight_image(
             3dQwarp's ``mri_weightize`` ordering. The default preserves the
             existing moco/allineate behavior and guarantees exactly zero output
             faces after filtering.
+        gauss_sigma: Gaussian sigma in voxels; overrides ``gauss_fwhm`` when set.
+            3dQwarp's ``FIR_blur_volume_3d`` takes 4.5 as a *sigma* (its log message
+            calls it a FWHM).
+        erode: the cleanup erosion between the two cluster passes. ``"6conn"``: a
+            plain 6-connected erosion. ``"afni"``: AFNI's peel with re-dilation
+            (:func:`mask.erode_many`, an opening), which keeps the boundary.
 
     Returns:
         (nz, ny, nx) weight image in [0, 1].
@@ -63,8 +71,8 @@ def compute_weight_image(
         w = _median_filter_ball(w, median_radius)
 
     # Gaussian smooth
-    if gauss_fwhm > 0 and w.sum() > 0:
-        sigma = gauss_fwhm / 2.355  # FWHM to sigma
+    sigma = gauss_sigma if gauss_sigma is not None else gauss_fwhm / 2.355
+    if sigma > 0 and w.sum() > 0:
         w = _gaussian_smooth_3d(w, sigma)
 
     # Drop small values + isolated background: keep the largest cluster of
@@ -78,7 +86,12 @@ def compute_weight_image(
         clip = max(0.05 * wmax, clip2)
         mask = w >= clip
         mask = largest_cluster_6conn(mask)
-        mask = _erode_6conn(mask)
+        if erode == "afni":
+            from .mask import erode_many
+
+            mask = erode_many(mask, npeel=1, peelthr=17)
+        else:
+            mask = _erode_6conn(mask)
         mask = largest_cluster_6conn(mask)
         w = w * mask.to(w.dtype)
 

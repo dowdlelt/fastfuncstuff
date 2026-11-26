@@ -282,6 +282,14 @@ class QwarpConfig:
     larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
     until measured."""
 
+    weight_afni: bool = False
+    """3dQwarp's weight and box: blur the weight with a *sigma* of 4.5 (ffs used
+    FWHM 4.5), erode with AFNI's peel-and-redilate (ffs: a plain 6-connected
+    erosion, a voxel smaller everywhere), and take the patch ladder's box from
+    ``MRI_autobbox`` (cluster + peel, no clip) instead of the nonzero extent. With
+    AFNI's wider weight the brain edge may be covered without
+    :attr:`background_band`; re-ask that once this is measured. Opt-in."""
+
     incor_afni: bool = False
     """AFNI's INCOR for the global correlations: pearclp clips at
     ``THD_cliplevel(0.321)`` and the 0.987 quantile (capped at 6.543x the bottom),
@@ -686,8 +694,13 @@ def _blur_for_patch(
     return vol
 
 
-def _compute_qwarp_weight(base: Tensor) -> Tensor:
-    """AFNI 3dQwarp's default ``mri_weightize`` pipeline."""
+def _compute_qwarp_weight(base: Tensor, afni: bool = False) -> Tensor:
+    """AFNI 3dQwarp's default ``mri_weightize`` pipeline.
+
+    ``afni`` fixes the two places it departed from 3dQwarp: the blur is a sigma of
+    4.5 (ffs read it as a FWHM, sigma 1.91), and the erosion is AFNI's peel with
+    re-dilation rather than a plain one, which was a voxel smaller everywhere.
+    """
     return compute_weight_image(
         base,
         gauss_fwhm=4.5,
@@ -695,6 +708,8 @@ def _compute_qwarp_weight(base: Tensor) -> Tensor:
         clusterize=True,
         hist_cliplevel=True,
         edge_before_smoothing=True,
+        gauss_sigma=4.5 if afni else None,
+        erode="afni" if afni else "6conn",
     )
 
 
@@ -795,7 +810,7 @@ def qwarp(
 
     if weight is None:
         weight_p = add_background_band(
-            _compute_qwarp_weight(base_p), base_p, config.background_band
+            _compute_qwarp_weight(base_p, afni=config.weight_afni), base_p, config.background_band
         )
     else:
         weight_p = (
@@ -1328,7 +1343,7 @@ def _warpomatic(
     do_xyz = (do_x, do_y, do_z)
     axis_w = config.axis_weights
 
-    imin, imax, jmin, jmax, kmin, kmax = _autobox(weight)
+    imin, imax, jmin, jmax, kmin, kmax = _qwarp_autobox(weight, config.weight_afni)
 
     if config.verb >= 1:
         print(
@@ -4882,6 +4897,20 @@ def _improve_warp_serial(
         )
 
     return True
+
+
+def _qwarp_autobox(weight: Tensor, afni: bool) -> tuple[int, int, int, int, int, int]:
+    """The box the patch ladder is built on. ``afni``: 3dQwarp's ``MRI_autobbox``
+    on the weight (nonzero, cluster, peel, cluster; no clip), which can drop thin
+    weight that a plain nonzero box keeps."""
+    if afni:
+        from .autobox import autobox_bounds
+
+        try:
+            return autobox_bounds(weight, clip=False)
+        except ValueError:
+            pass  # an empty weight: fall back to the whole volume below
+    return _autobox(weight)
 
 
 def _autobox(weight: Tensor) -> tuple[int, int, int, int, int, int]:
