@@ -337,3 +337,165 @@ def correlate1d_cpu(arr: np.ndarray, weights: np.ndarray, axis: int, zero_edges:
     finally:
         numba.set_num_threads(prev)
     return out
+
+
+@njit(inline="always")
+def _border_index_grad(coord, size):
+    # _border_index plus d(index)/d(coord) as ATen and autograd compose it: the
+    # unnormalise factor (size-1)/2 times the clip gate (0 at or beyond either face),
+    # then autograd's chain back through the caller's ``2*x/(size-1) - 1``.
+    if size <= 1:
+        return _F0, _F0
+    g = (coord * _F2) / np.float32(size - 1) - _F1
+    ix = ((g + _F1) / _F2) * np.float32(size - 1)
+    lim = np.float32(size - 1)
+    mult = lim / _F2
+    if ix <= _F0:
+        return _F0, _F0
+    if ix >= lim:
+        return lim, _F0
+    return ix, mult
+
+
+@njit(parallel=True, cache=True)
+def _warp_linear_fwd(src, xd, yd, zd, out):
+    nz, ny, nx = src.shape
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        kf = np.float32(k)
+        for j in range(ny):
+            jf = np.float32(j)
+            for i in range(nx):
+                ix = _border_index(np.float32(i) + xd[k, j, i], nx)
+                iy = _border_index(jf + yd[k, j, i], ny)
+                iz = _border_index(kf + zd[k, j, i], nz)
+                x0 = np.floor(ix)
+                y0 = np.floor(iy)
+                z0 = np.floor(iz)
+                x1 = x0 + _F1
+                y1 = y0 + _F1
+                z1 = z0 + _F1
+                i0, j0, k0 = int(x0), int(y0), int(z0)
+                i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+                oi, oj, ok = i1 < nx, j1 < ny, k1 < nz
+                a = src[k0, j0, i0] * ((x1 - ix) * (y1 - iy) * (z1 - iz))
+                if oi:
+                    a += src[k0, j0, i1] * ((ix - x0) * (y1 - iy) * (z1 - iz))
+                if oj:
+                    a += src[k0, j1, i0] * ((x1 - ix) * (iy - y0) * (z1 - iz))
+                if oi and oj:
+                    a += src[k0, j1, i1] * ((ix - x0) * (iy - y0) * (z1 - iz))
+                if ok:
+                    a += src[k1, j0, i0] * ((x1 - ix) * (y1 - iy) * (iz - z0))
+                if ok and oi:
+                    a += src[k1, j0, i1] * ((ix - x0) * (y1 - iy) * (iz - z0))
+                if ok and oj:
+                    a += src[k1, j1, i0] * ((x1 - ix) * (iy - y0) * (iz - z0))
+                if ok and oi and oj:
+                    a += src[k1, j1, i1] * ((ix - x0) * (iy - y0) * (iz - z0))
+                out[k, j, i] = a
+
+
+@njit(parallel=True, cache=True)
+def _warp_linear_bwd(src, xd, yd, zd, gout, gx_out, gy_out, gz_out):
+    nz, ny, nx = src.shape
+    sx2 = np.float32(nx - 1)
+    sy2 = np.float32(ny - 1)
+    sz2 = np.float32(nz - 1)
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        kf = np.float32(k)
+        for j in range(ny):
+            jf = np.float32(j)
+            for i in range(nx):
+                ix, mx = _border_index_grad(np.float32(i) + xd[k, j, i], nx)
+                iy, my = _border_index_grad(jf + yd[k, j, i], ny)
+                iz, mz = _border_index_grad(kf + zd[k, j, i], nz)
+                go = gout[k, j, i]
+                x0 = np.floor(ix)
+                y0 = np.floor(iy)
+                z0 = np.floor(iz)
+                x1 = x0 + _F1
+                y1 = y0 + _F1
+                z1 = z0 + _F1
+                i0, j0, k0 = int(x0), int(y0), int(z0)
+                i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+                oi, oj, ok = i1 < nx, j1 < ny, k1 < nz
+                gix = _F0
+                giy = _F0
+                giz = _F0
+                # ATen grid_sampler_3d_backward's corner terms, in its order.
+                v = src[k0, j0, i0]
+                gix -= v * (y1 - iy) * (z1 - iz) * go
+                giy -= v * (x1 - ix) * (z1 - iz) * go
+                giz -= v * (x1 - ix) * (y1 - iy) * go
+                if oi:
+                    v = src[k0, j0, i1]
+                    gix += v * (y1 - iy) * (z1 - iz) * go
+                    giy -= v * (ix - x0) * (z1 - iz) * go
+                    giz -= v * (ix - x0) * (y1 - iy) * go
+                if oj:
+                    v = src[k0, j1, i0]
+                    gix -= v * (iy - y0) * (z1 - iz) * go
+                    giy += v * (x1 - ix) * (z1 - iz) * go
+                    giz -= v * (x1 - ix) * (iy - y0) * go
+                if oi and oj:
+                    v = src[k0, j1, i1]
+                    gix += v * (iy - y0) * (z1 - iz) * go
+                    giy += v * (ix - x0) * (z1 - iz) * go
+                    giz -= v * (ix - x0) * (iy - y0) * go
+                if ok:
+                    v = src[k1, j0, i0]
+                    gix -= v * (y1 - iy) * (iz - z0) * go
+                    giy -= v * (x1 - ix) * (iz - z0) * go
+                    giz += v * (x1 - ix) * (y1 - iy) * go
+                if ok and oi:
+                    v = src[k1, j0, i1]
+                    gix += v * (y1 - iy) * (iz - z0) * go
+                    giy -= v * (ix - x0) * (iz - z0) * go
+                    giz += v * (ix - x0) * (y1 - iy) * go
+                if ok and oj:
+                    v = src[k1, j1, i0]
+                    gix -= v * (iy - y0) * (iz - z0) * go
+                    giy += v * (x1 - ix) * (iz - z0) * go
+                    giz += v * (x1 - ix) * (iy - y0) * go
+                if ok and oi and oj:
+                    v = src[k1, j1, i1]
+                    gix += v * (iy - y0) * (iz - z0) * go
+                    giy += v * (ix - x0) * (iz - z0) * go
+                    giz += v * (ix - x0) * (iy - y0) * go
+                gx_out[k, j, i] = ((mx * gix) / sx2) * _F2 if nx > 1 else _F0
+                gy_out[k, j, i] = ((my * giy) / sy2) * _F2 if ny > 1 else _F0
+                gz_out[k, j, i] = ((mz * giz) / sz2) * _F2 if nz > 1 else _F0
+
+
+def _with_threads(fn, *args):
+    prev = numba.get_num_threads()
+    numba.set_num_threads(max(1, min(torch.get_num_threads(), prev)))
+    try:
+        fn(*args)
+    finally:
+        numba.set_num_threads(prev)
+
+
+class WarpLinearCPU(torch.autograd.Function):
+    """``out[p] = src[p + d(p)]``, trilinear with border clamping, differentiable in d.
+
+    The numbers of ``formwarp._warp_diff`` (grid normalisation, ATen's sampler and its
+    grid backward, autograd's chain back through the normalisation) in one pass each
+    way, without the stacked grid, the lane split or the chain's temporaries.
+    """
+
+    @staticmethod
+    def forward(ctx, src: Tensor, xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
+        arrays = [t.detach().contiguous().numpy() for t in (src, xd, yd, zd)]
+        out = np.empty_like(arrays[0])
+        _with_threads(_warp_linear_fwd, *arrays, out)
+        ctx.arrays = arrays
+        return torch.from_numpy(out)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        (grad,) = grad_outputs
+        g = grad.detach().contiguous().numpy()
+        outs = [np.empty_like(g) for _ in range(3)]
+        _with_threads(_warp_linear_bwd, *ctx.arrays, g, *outs)
+        return None, *(torch.from_numpy(o) for o in outs)

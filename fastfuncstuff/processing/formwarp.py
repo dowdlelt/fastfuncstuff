@@ -357,6 +357,15 @@ def _warp_diff(
     rely on grid_sample's border padding so the whole thing stays in the autograd
     graph w.r.t. the displacement fields.
     """
+    if (
+        source.device.type == "cpu"
+        and source.dtype == xd.dtype == yd.dtype == zd.dtype == torch.float32
+        and not source.requires_grad
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import WarpLinearCPU
+
+        return WarpLinearCPU.apply(source, xd, yd, zd)
     nz, ny, nx = source.shape
     device = source.device
     dtype = source.dtype
