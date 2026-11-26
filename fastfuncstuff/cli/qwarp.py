@@ -875,6 +875,13 @@ def parse_args(
         "evaluations (experimental) [default: same as every other level, 8]",
     )
     g_opt.add_argument(
+        "-ball",
+        action="store_true",
+        help="AFNI's ball constraint: from the first level whose patch has a side under "
+        "15 voxels (19 quintic), bound each patch's parameters by an L2 ball instead of "
+        "a per-parameter box, as 3dQwarp does (experimental)",
+    )
+    g_opt.add_argument(
         "-batch_tol",
         "-batch-tol",
         type=float,
@@ -1928,6 +1935,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         optimizer=args.optimizer,
         gn_stop_rule=args.gn_stop,
         gn_iters_lev0=args.gn_iters_lev0,
+        ball_constraint=args.ball,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

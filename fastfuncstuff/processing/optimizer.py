@@ -293,6 +293,7 @@ def optimize_warp_params_gauss_newton(
     lam0: float = 1e-3,
     tolerance: float = 1e-5,
     stop_rule: str = "first_reject",
+    ball_radius: float | None = None,
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Levenberg-damped Gauss-Newton over B patches at once.
 
@@ -328,6 +329,9 @@ def optimize_warp_params_gauss_newton(
             raise the damping and retry. A patch freezes only when an *accepted* step
             gains < tolerance or its damping reaches the cap; the loop ends when
             every patch is frozen or the budget is spent.
+        ball_radius: if set, constrain each patch's parameters to the L2 ball of
+            this radius (AFNI's BALLOPT) instead of the box ``|p_i| <= param_max``;
+            a trial outside it is scaled back onto the sphere.
 
     Returns:
         (best_params, best_costs, stats).
@@ -365,7 +369,12 @@ def optimize_warp_params_gauss_newton(
             delta = linalg_lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
-        trial = (best_params + delta).clamp(-param_max, param_max)
+        if ball_radius is None:
+            trial = (best_params + delta).clamp(-param_max, param_max)
+        else:
+            trial = best_params + delta
+            norm = trial.norm(dim=-1, keepdim=True)
+            trial = trial * (ball_radius / norm.clamp_min(ball_radius))
         trial_costs = cost_fn(trial).detach()
         n_evals += 1
 

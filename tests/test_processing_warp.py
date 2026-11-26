@@ -1812,3 +1812,19 @@ def test_global_correlation_of_a_constant_image_is_zero():
         flat = torch.full_like(base, const)
         assert _global_correlation(base, flat, weight, clip, clip) == 0.0
         assert _global_correlation(base, flat, weight, None, None) == 0.0
+
+
+@pytest.mark.parametrize(
+    "basis,widths,expected",
+    [
+        ("cubic_lite", (15, 17, 15), False),
+        ("cubic_lite", (13, 19, 15), True),
+        ("quintic_lite", (17, 17, 17), True),
+        ("quintic", (19, 21, 19), False),
+        ("cubic", (25, 31, 1), False),  # a 2-D volume's single slice is not a patch side
+    ],
+)
+def test_ball_applies_on_afni_patch_widths(basis, widths, expected):
+    from fastfuncstuff.processing.warp import _ball_applies
+
+    assert _ball_applies(basis, widths) is expected

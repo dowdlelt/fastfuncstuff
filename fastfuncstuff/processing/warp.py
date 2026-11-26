@@ -271,6 +271,14 @@ class QwarpConfig:
     ``8*npar+31`` evaluations there; one B=1 GN iteration is one volume pass, so 30
     iterations cost about one fine level."""
 
+    ball_constraint: bool = False
+    """AFNI's BALLOPT: once a level's patch has a side under 15 voxels (19 for the
+    quintic bases), constrain each patch's parameters to an L2 ball of radius
+    :data:`BALL_PARAM_MAX` instead of the per-parameter box, for that level and every
+    finer one (AFNI never switches back). The ball allows single coefficients 2-6x
+    larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
+    until measured."""
+
     gn_coarse_patches: int = 2000
     """Patch count at which the coarse ceiling applies in full; above it the budget
     tapers toward :attr:`gn_iters` as the square root of the patch count."""
@@ -1043,6 +1051,18 @@ def _filter_patches(
 # ---------------------------------------------------------------------------
 
 
+# AFNI's ball radii (mri_nwarp.c, the BALLOPT parmax per basis), against the box
+# half-widths in _get_basis_config.
+BALL_PARAM_MAX = {"cubic_lite": 0.1141, "cubic": 0.0790, "quintic_lite": 0.1111, "quintic": 0.0611}
+
+
+def _ball_applies(basis_type: str, widths: tuple[int, int, int]) -> bool:
+    """AFNI's switch to the ball: any patch side under 15, or 19 for quintic.
+    Axes of one voxel (a 2-D volume) carry no patch and are ignored."""
+    limit = 19 if basis_type.startswith("quintic") else 15
+    return any(1 < w < limit for w in widths)
+
+
 def _get_basis_config(
     basis_type: str,
     nxh: int,
@@ -1515,6 +1535,7 @@ def _warpomatic(
         ngmin -= 1
 
     levdone = False
+    ball_on = False
     lev_start = max(1, config.start_level)
     if config.start_patch > 0:
         # Patch width shrinks geometrically (xwid0 * shrink**lev), so solve for the
@@ -1657,6 +1678,9 @@ def _warpomatic(
             device,
             hfactor=hfactor,
         )
+        if config.ball_constraint and _ball_applies(basis_type, (nxh, nyh, nzh)):
+            ball_on = True  # sticky, as AFNI's BALLOPT is
+        ball_radius = BALL_PARAM_MAX[basis_type] * hfactor if ball_on else None
 
         # Pre-compute shared coordinate grids
         kk_p, jj_p, ii_p = torch.meshgrid(
@@ -1758,6 +1782,7 @@ def _warpomatic(
                         source_clip=source_clip,
                         blok_index_vol=blok_index_vol,
                         nblok=nblok,
+                        ball_radius=ball_radius,
                     )
 
                 # Serial fallback for odd-sized boundary patches
@@ -2253,6 +2278,7 @@ def _improve_warp_batched(
     blok_index_vol: Tensor | None = None,
     nblok: int = 0,
     gn_max_iter: int | None = None,
+    ball_radius: float | None = None,
 ) -> None:
     """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
 
@@ -2630,6 +2656,7 @@ def _improve_warp_batched(
             device,
             max_iter=gn_budget,
             stop_rule=config.gn_stop_rule,
+            ball_radius=ball_radius,
         )
         if use_hybrid:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(

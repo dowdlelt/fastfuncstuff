@@ -268,3 +268,26 @@ class TestGaussNewtonStopRule:
         # Rejected rounds leave the parameters where they were, so the normal
         # equations are not rebuilt for them.
         assert len(calls) < stats.steps_run
+
+
+def test_gn_ball_constraint_bounds_the_norm_not_each_coefficient():
+    """AFNI's BALLOPT: one coefficient may exceed the box half-width, the norm may not."""
+    from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+    target = torch.tensor([[0.5, 0.0, 0.0]])  # far outside both bounds, along one axis
+
+    def normal_eqs(p):
+        return torch.eye(3).expand(1, 3, 3).clone(), (target - p)
+
+    def cost(p):
+        return ((p - target) ** 2).sum(-1)
+
+    box, _, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 1, 3, 0.0421, torch.device("cpu"), max_iter=4
+    )
+    ball, _, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 1, 3, 0.0421, torch.device("cpu"), max_iter=4, ball_radius=0.1141
+    )
+    assert box.abs().max() <= 0.0421 + 1e-7
+    assert ball[0, 0] > 0.0421 * 2
+    assert ball.norm() <= 0.1141 * (1 + 1e-6)
