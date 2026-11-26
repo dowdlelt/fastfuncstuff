@@ -188,6 +188,92 @@ def auto_box_radius(n_voxels_target: int = 500) -> int:
     return max(r, 1)
 
 
+_SLAB_POOL = None
+
+
+def _slab_pool():
+    """Thread pool for the slab-parallel CPU filter, sized to the torch thread budget."""
+    global _SLAB_POOL
+    n = max(1, torch.get_num_threads())
+    if _SLAB_POOL is None or _SLAB_POOL._max_workers != n:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _SLAB_POOL = ThreadPoolExecutor(n, thread_name_prefix="ffs-slab")
+    return _SLAB_POOL
+
+
+def _correlate1d_slabs(arr, weights, axis: int, mode: str):
+    """``scipy.ndimage.correlate1d`` over a (G, D, H, W) array, threaded over slabs.
+
+    ndimage releases the GIL and walks each line through a buffer, so slabs of planes
+    taken across an axis other than ``axis`` filter independently in parallel.
+    """
+    import numpy as np
+    from scipy.ndimage import correlate1d
+
+    out = np.empty_like(arr)
+    split = 1 if axis != 1 else 2
+    n_split = arr.shape[split]
+    n_workers = _slab_pool()._max_workers
+    step = max(1, -(-n_split // (4 * n_workers)))
+    tasks = [
+        (g, slice(i, min(i + step, n_split)))
+        for g in range(arr.shape[0])
+        for i in range(0, n_split, step)
+    ]
+
+    def run(task):
+        g, sl = task
+        idx = (g, sl) if split == 1 else (g, slice(None), sl)
+        correlate1d(arr[idx], weights, axis=axis - 1, output=out[idx], mode=mode)
+
+    if len(tasks) == 1 or n_workers == 1:
+        for t in tasks:
+            run(t)
+    else:
+        list(_slab_pool().map(run, tasks))
+    return out
+
+
+class _ClampedCorrelate1d(torch.autograd.Function):
+    """1-D correlation along one axis of a (1, G, D, H, W) CPU volume, edges replicated.
+
+    The same arithmetic as the replicate-pad + window-sum path, done by ndimage (which
+    accumulates in double) instead of an unfold + matmul. Measured at 193x229x193 with
+    a 25-tap Gaussian: 76 ms against 1108 ms for a 3-axis pass. The backward is the
+    reason this is a Function at all: autograd through unfold + matmul materialises a
+    K-wide window gradient and scatter-adds it back (2.5 s per 3-axis pass), whereas the
+    adjoint of a clamped correlation is just the flipped correlation over a zero-padded
+    gradient with the overhang folded onto the two edge samples.
+    """
+
+    @staticmethod
+    def forward(ctx, vol: Tensor, kernel: Tensor, axis: int) -> Tensor:
+        weights = kernel.detach().to(torch.float64).numpy()
+        ctx.weights, ctx.axis = weights, axis
+        arr = vol.detach()[0].contiguous().numpy()
+        return torch.from_numpy(_correlate1d_slabs(arr, weights, axis - 1, "nearest"))[None]
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        import numpy as np
+
+        (grad,) = grad_outputs
+        weights, axis = ctx.weights, ctx.axis - 1
+        r = weights.shape[0] // 2
+        g = grad.detach()[0].contiguous().numpy()
+        n = g.shape[axis]
+        pad = [(0, 0)] * g.ndim
+        pad[axis] = (r, r)
+        full = _correlate1d_slabs(np.pad(g, pad), weights[::-1].copy(), axis, "constant")
+        full_t = torch.from_numpy(full)
+        out = full_t.narrow(axis, r, n).clone()
+        if r:
+            out.narrow(axis, 0, 1).add_(full_t.narrow(axis, 0, r).sum(axis, keepdim=True))
+            out.narrow(axis, n - 1, 1).add_(full_t.narrow(axis, n + r, r).sum(axis, keepdim=True))
+        return out[None], None, None
+
+
 def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) -> Tensor:
     """One separable pass: convolve ``vol`` (1, G, D, H, W) along ``axis``.
 
@@ -207,6 +293,13 @@ def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) ->
     either way, and this is a CPU cache story.
     """
     radius = kernel.shape[0] // 2
+
+    if (
+        vol.device.type == "cpu"
+        and vol.dtype in (torch.float32, torch.float64)
+        and not torch.compiler.is_compiling()
+    ):
+        return _ClampedCorrelate1d.apply(vol, kernel, axis)
 
     if vol.device.type == "cpu" and n_groups == 1:
         # Convolve along the outermost spatial axis, permuting to get there:
