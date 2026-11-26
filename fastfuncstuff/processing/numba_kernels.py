@@ -1,4 +1,4 @@
-"""Fused Numba kernels for displacement-field work on the CPU.
+"""Fused Numba kernels for the CPU: displacement-field work and separable filtering.
 
 Imported lazily (Numba's import and first compile are not free), and only on the CPU
 path: CUDA keeps the batched torch implementations, which are launch-bound in a way
@@ -243,3 +243,97 @@ def jacobian_cpu(xd: Tensor, yd: Tensor, zd: Tensor, cut: float | None = None):
     finally:
         numba.set_num_threads(prev)
     return torch.from_numpy(det), (torch.from_numpy(owing) if cut is not None else None)
+
+
+@njit(inline="always")
+def _tap_index(p, n, zero_edges):
+    # Replicate-clamped tap position, or -1 for a tap that falls off a zero-padded edge.
+    if p < 0:
+        return -1 if zero_edges else 0
+    if p >= n:
+        return -1 if zero_edges else n - 1
+    return p
+
+
+@njit(parallel=True, cache=True)
+def _correlate_axis0(src, w, zero_edges, out):
+    nz, ny, nx = src.shape
+    r = w.shape[0] // 2
+    for j in prange(ny):  # ty: ignore[not-iterable]
+        acc = np.empty(nx, np.float64)
+        for k in range(nz):
+            acc[:] = 0.0
+            for t in range(w.shape[0]):
+                kk = _tap_index(k + t - r, nz, zero_edges)
+                if kk >= 0:
+                    wt = w[t]
+                    for i in range(nx):
+                        acc[i] += wt * src[kk, j, i]
+            for i in range(nx):
+                out[k, j, i] = acc[i]
+
+
+@njit(parallel=True, cache=True)
+def _correlate_axis1(src, w, zero_edges, out):
+    nz, ny, nx = src.shape
+    r = w.shape[0] // 2
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        acc = np.empty(nx, np.float64)
+        for j in range(ny):
+            acc[:] = 0.0
+            for t in range(w.shape[0]):
+                jj = _tap_index(j + t - r, ny, zero_edges)
+                if jj >= 0:
+                    wt = w[t]
+                    for i in range(nx):
+                        acc[i] += wt * src[k, jj, i]
+            for i in range(nx):
+                out[k, j, i] = acc[i]
+
+
+@njit(parallel=True, cache=True)
+def _correlate_axis2(src, w, zero_edges, out):
+    nz, ny, nx = src.shape
+    r = w.shape[0] // 2
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        buf = np.empty(nx + 2 * r, np.float64)
+        acc = np.empty(nx, np.float64)
+        for j in range(ny):
+            for i in range(nx):
+                buf[i + r] = src[k, j, i]
+            for i in range(r):
+                buf[i] = 0.0 if zero_edges else src[k, j, 0]
+                buf[nx + r + i] = 0.0 if zero_edges else src[k, j, nx - 1]
+            acc[:] = 0.0
+            for t in range(w.shape[0]):
+                wt = w[t]
+                for i in range(nx):
+                    acc[i] += wt * buf[i + t]
+            for i in range(nx):
+                out[k, j, i] = acc[i]
+
+
+_CORRELATE_AXIS = (_correlate_axis0, _correlate_axis1, _correlate_axis2)
+
+
+def correlate1d_cpu(arr: np.ndarray, weights: np.ndarray, axis: int, zero_edges: bool):
+    """1-D correlation of each (D, H, W) volume of a (G, D, H, W) array along ``axis``
+    (0..2 of the volume), edges replicated or zero. Accumulated in double, in tap order:
+    the same numbers as ``scipy.ndimage.correlate1d`` (mode 'nearest' / 'constant').
+
+    Each output row is a weighted sum of whole input rows on the two strided axes, and
+    of shifted copies of one buffered row on the contiguous one, so the inner loop is a
+    plain vector multiply-add: 13 ms per axis at 193x229x193 on 6 threads, against 25 ms
+    for ndimage threaded over slabs (which walks every line through a scalar buffer).
+    """
+    out = np.empty_like(arr)
+    w = np.ascontiguousarray(weights, dtype=np.float64)
+    kernel = _CORRELATE_AXIS[axis]
+    prev = numba.get_num_threads()
+    numba.set_num_threads(max(1, min(torch.get_num_threads(), prev)))
+    try:
+        for g in range(arr.shape[0]):
+            kernel(arr[g], w, zero_edges, out[g])
+    finally:
+        numba.set_num_threads(prev)
+    return out

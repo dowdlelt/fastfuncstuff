@@ -518,7 +518,7 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     # on 3x3x3 patches around just those.
     f0 = fields[0]
     if f0.device.type == "cpu" and f0.dtype == torch.float32 and not torch.compiler.is_compiling():
-        from .field_kernels_cpu import jacobian_cpu
+        from .numba_kernels import jacobian_cpu
 
         owing_mask = jacobian_cpu(*fields, cut=HPEN_CUT)[1]
         assert owing_mask is not None
@@ -643,7 +643,7 @@ def invert_displacement_field(
     shrinking instead of the result getting slowly better.
     """
     if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
-        from .field_kernels_cpu import invert_displacement_field_cpu
+        from .numba_kernels import invert_displacement_field_cpu
 
         ex, ey, ez, step = invert_displacement_field_cpu(xd, yd, zd, n_iter)
         return (ex, ey, ez, step) if return_step else (ex, ey, ez)
@@ -951,7 +951,7 @@ def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
     """
     if xd.device.type == "cpu" and xd.dtype == torch.float32 and not torch.compiler.is_compiling():
         if not (xd.requires_grad or yd.requires_grad or zd.requires_grad):
-            from .field_kernels_cpu import jacobian_cpu
+            from .numba_kernels import jacobian_cpu
 
             return jacobian_cpu(xd, yd, zd)[0]
     dxx, dxy, dxz = _grad3(xd)
