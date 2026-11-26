@@ -66,6 +66,7 @@ from .cost_blok import (
     prepare_blok_pairs,
 )
 from .interp import (
+    _compose_cpu_applies,
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
     batched_interp_3ch_packed,
@@ -2496,6 +2497,26 @@ def _improve_warp_batched(
             with torch.no_grad():
                 full = active_params @ expand_mat
                 hxd_, hyd_, hzd_ = _eval_warp(basis, full, half_widths, do_xyz)
+                if _compose_cpu_applies(source, global_warp_3ch, base_i, hxd_):
+                    from .numba_kernels import compose_and_sample_cpu
+
+                    # The gradient rides along in the same pass: same positions,
+                    # same corner weights, bit-identical to the two-step route.
+                    w_, _ax, _ay, _az, gall = compose_and_sample_cpu(
+                        source,
+                        global_warp_3ch,
+                        hxd_,
+                        hyd_,
+                        hzd_,
+                        base_i,
+                        base_j,
+                        base_k,
+                        source_grad_3ch,
+                    )
+                    assert gall is not None
+                    if len(active_dims) < 3:
+                        gall = gall[list(active_dims)]
+                    return _gn_dispatch(w_, gall)
                 w_, ax_, ay_, az_ = _compose(
                     source,
                     state.xd,
@@ -2537,19 +2558,22 @@ def _improve_warp_batched(
                 # masked voxel contributes zero either way -- while masking
                 # first costs four full-size elementwise passes per iteration,
                 # on the largest tensors in the level.
-                if gn_local:
-                    return _gn_normal_eqs_local(
-                        w_,
-                        gall,
-                        hw_active,
-                        bt,
-                        omega,
-                        base_hat,
-                        gn_kernel,
-                        (nzh, nyh, nxh),
-                        gn_columns,
-                    )
-                return _gn_normal_eqs_3d(w_, gall, hw_active, bt, omega, wsum, base_hat, gn_columns)
+                return _gn_dispatch(w_, gall)
+
+        def _gn_dispatch(w_: Tensor, gall: Tensor) -> tuple[Tensor, Tensor]:
+            if gn_local:
+                return _gn_normal_eqs_local(
+                    w_,
+                    gall,
+                    hw_active,
+                    bt,
+                    omega,
+                    base_hat,
+                    gn_kernel,
+                    (nzh, nyh, nxh),
+                    gn_columns,
+                )
+            return _gn_normal_eqs_3d(w_, gall, hw_active, bt, omega, wsum, base_hat, gn_columns)
 
         def gn_cost(active_params: Tensor) -> Tensor:
             with torch.no_grad():

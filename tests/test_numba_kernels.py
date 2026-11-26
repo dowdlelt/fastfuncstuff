@@ -129,3 +129,49 @@ def test_fused_local_correlation_matches_autograd(mode, sigma, kernel, torch_rou
     torch.testing.assert_close(new.detach(), old.detach(), rtol=1e-6, atol=1e-6)
     for x, y in zip(g_new, g_old, strict=True):
         torch.testing.assert_close(x, y, rtol=0, atol=1e-5 * float(y.abs().max()))
+
+
+@pytest.mark.parametrize(
+    "vol,patch,n_patch",
+    [((20, 23, 21), (5, 6, 4), 7), ((9, 1, 8), (4, 1, 5), 3), ((12, 14, 13), (12, 14, 13), 1)],
+)
+def test_fused_compose_and_sample_is_bit_identical(vol, patch, n_patch, torch_route):
+    """qwarp's compose-and-sample, and the gradient sample Gauss-Newton takes after it."""
+    from fastfuncstuff.processing.interp import (
+        batched_compose_and_interpolate,
+        batched_interp_3ch_packed,
+    )
+    from fastfuncstuff.processing.numba_kernels import compose_and_sample_cpu
+
+    g = torch.Generator().manual_seed(0)
+    nz, ny, nx = vol
+    src = torch.randn(vol, generator=g)
+    warp = torch.randn(3, *vol, generator=g) * 2
+    grad = torch.randn(3, *vol, generator=g)
+    kk, jj, ii = (
+        t.reshape(-1).float()
+        for t in torch.meshgrid(*(torch.arange(n) for n in patch), indexing="ij")
+    )
+    origin = [
+        torch.randint(0, n - p + 1, (n_patch,), generator=g).float() for n, p in zip(vol, patch)
+    ]
+    kb, jb, ib = origin
+    bi, bj, bk = ib[:, None] + ii, jb[:, None] + jj, kb[:, None] + kk
+    # Displacements of a few voxels, so both clamps (the warp's and the source's) bind.
+    h = [torch.randn(n_patch, ii.numel(), generator=g) * 3 for _ in range(3)]
+    args = (src, *warp, *h, ii, jj, kk, ib, jb, kb, nx, ny, nz)
+    kw = dict(global_warp_3ch=warp, base_i=bi, base_j=bj, base_k=bk)
+    with torch.no_grad():
+        new = batched_compose_and_interpolate(*args, **kw)
+        fused = compose_and_sample_cpu(src, warp, *h, bi, bj, bk, grad)
+        torch_route()
+        old = batched_compose_and_interpolate(*args, **kw)
+        pos = [
+            (a + b).clamp(-0.499, n - 0.501)
+            for a, b, n in zip(old[1:], (bi, bj, bk), (nx, ny, nz), strict=True)
+        ]
+        g_old = batched_interp_3ch_packed(grad, *pos).permute(1, 0, 2)
+    for a, b, c in zip(new, fused[:4], old, strict=True):
+        assert torch.equal(a, c)
+        assert torch.equal(b, c)
+    assert torch.equal(fused[4], g_old)

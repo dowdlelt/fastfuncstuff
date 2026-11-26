@@ -622,3 +622,147 @@ def combine_local_corr_grad_cpu(a, b, w, h, scale: float):
     gb = np.empty_like(a)
     _with_threads(_combine_grad_kernel, a, b, w, h, np.float32(scale), ga, gb)
     return ga, gb
+
+
+@njit(inline="always")
+def _corner_weights(ix, iy, iz, nx, ny, nz):
+    # ATen grid_sampler_3d's trilinear corner indices and weights, from a border-
+    # clipped unnormalised position, in its expression order.
+    x0 = np.floor(ix)
+    y0 = np.floor(iy)
+    z0 = np.floor(iz)
+    x1 = x0 + _F1
+    y1 = y0 + _F1
+    z1 = z0 + _F1
+    tnw = (x1 - ix) * (y1 - iy) * (z1 - iz)
+    tne = (ix - x0) * (y1 - iy) * (z1 - iz)
+    tsw = (x1 - ix) * (iy - y0) * (z1 - iz)
+    tse = (ix - x0) * (iy - y0) * (z1 - iz)
+    bnw = (x1 - ix) * (y1 - iy) * (iz - z0)
+    bne = (ix - x0) * (y1 - iy) * (iz - z0)
+    bsw = (x1 - ix) * (iy - y0) * (iz - z0)
+    bse = (ix - x0) * (iy - y0) * (iz - z0)
+    i0, j0, k0 = int(x0), int(y0), int(z0)
+    return i0, j0, k0, i0 + 1 < nx, j0 + 1 < ny, k0 + 1 < nz, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+
+
+@njit(inline="always")
+def _sample_planar(v, c, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse):
+    # One channel of a (C, nz, ny, nx) volume, accumulated in ATen's corner order.
+    i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+    a = _F0
+    a += v[c, k0, j0, i0] * tnw
+    if oi:
+        a += v[c, k0, j0, i1] * tne
+    if oj:
+        a += v[c, k0, j1, i0] * tsw
+    if oi and oj:
+        a += v[c, k0, j1, i1] * tse
+    if ok:
+        a += v[c, k1, j0, i0] * bnw
+    if ok and oi:
+        a += v[c, k1, j0, i1] * bne
+    if ok and oj:
+        a += v[c, k1, j1, i0] * bsw
+    if ok and oi and oj:
+        a += v[c, k1, j1, i1] * bse
+    return a
+
+
+@njit_aten(parallel=True, cache=True)
+def _compose_sample_kernel(
+    src, warp, px, py, pz, bi, bj, bk, slo, sxhi, syhi, szhi, grad, want_grad, out, gout
+):
+    nz, ny, nx = src.shape[1], src.shape[2], src.shape[3]
+    fx, fy, fz = np.float32(nx - 1), np.float32(ny - 1), np.float32(nz - 1)
+    n = px.shape[0]
+    block = 4096
+    for blk in prange((n + block - 1) // block):  # ty: ignore[not-iterable]
+        for p in range(blk * block, min(n, (blk + 1) * block)):
+            hx, hy, hz = px[p], py[p], pz[p]
+            # The query point, clamped as the torch path clamps before normalising.
+            xq = min(max(bi[p] + hx, _F0), fx)
+            yq = min(max(bj[p] + hy, _F0), fy)
+            zq = min(max(bk[p] + hz, _F0), fz)
+            i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse = _corner_weights(
+                _border_index(xq, nx), _border_index(yq, ny), _border_index(zq, nz), nx, ny, nz
+            )
+            ax = hx + _sample_planar(
+                warp, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            ay = hy + _sample_planar(
+                warp, 1, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            az = hz + _sample_planar(
+                warp, 2, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            sx = min(max(ax + bi[p], slo), sxhi)
+            sy = min(max(ay + bj[p], slo), syhi)
+            sz = min(max(az + bk[p], slo), szhi)
+            i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse = _corner_weights(
+                _border_index(sx, nx), _border_index(sy, ny), _border_index(sz, nz), nx, ny, nz
+            )
+            out[0, p] = _sample_planar(
+                src, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            out[1, p] = ax
+            out[2, p] = ay
+            out[3, p] = az
+            if want_grad:
+                gout[0, p] = _sample_planar(
+                    grad, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+                gout[1, p] = _sample_planar(
+                    grad, 1, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+                gout[2, p] = _sample_planar(
+                    grad, 2, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+
+
+def compose_and_sample_cpu(
+    source: Tensor,
+    warp_3ch: Tensor,
+    patch_xd: Tensor,
+    patch_yd: Tensor,
+    patch_zd: Tensor,
+    base_i: Tensor,
+    base_j: Tensor,
+    base_k: Tensor,
+    grad_3ch: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """qwarp's compose-and-sample, ``interp.batched_compose_and_interpolate``, in one pass.
+
+    Per patch voxel: sample the global warp at ``base + h``, add ``h``, sample the
+    source at the composed position -- and, given ``grad_3ch``, the source gradient
+    at that same position, which Gauss-Newton wants next. Bit-identical to the
+    grid_sample route: same clamps, same normalise/unnormalise round trip, same
+    corner order. Returns (B, V) warped values and composed displacements, plus the
+    (3, B, V) gradient sample or None.
+    """
+    b, v = patch_xd.shape
+    nz, ny, nx = source.shape
+    flat = [t.detach().contiguous().reshape(-1).numpy() for t in (patch_xd, patch_yd, patch_zd)]
+    bases = [t.contiguous().reshape(-1).numpy() for t in (base_i, base_j, base_k)]
+    want = grad_3ch is not None
+    out = np.empty((4, b * v), dtype=np.float32)
+    gout = np.empty((3, b * v) if want else (3, 1), dtype=np.float32)
+    grad = grad_3ch.contiguous().numpy() if want else np.empty((3, 1, 1, 1), np.float32)
+    _with_threads(
+        _compose_sample_kernel,
+        source.contiguous().numpy()[None],
+        warp_3ch.contiguous().numpy(),
+        *flat,
+        *bases,
+        np.float32(-0.499),
+        np.float32(nx - 0.501),
+        np.float32(ny - 0.501),
+        np.float32(nz - 0.501),
+        grad,
+        want,
+        out,
+        gout,
+    )
+    res = torch.from_numpy(out).reshape(4, b, v)
+    g = torch.from_numpy(gout).reshape(3, b, v) if want else None
+    return res[0], res[1], res[2], res[3], g

@@ -1601,6 +1601,29 @@ def batched_interp_3ch_packed(
     return result.reshape(B, 3, V)
 
 
+def _compose_cpu_applies(
+    source: Tensor, warp_3ch: Tensor | None, base_i: Tensor | None, patch_xd: Tensor
+) -> bool:
+    """Whether the fused Numba compose-and-sample can stand in for the torch route.
+
+    Same contract as the Triton branch (no autograd: the Adam path backpropagates
+    through the tensor form), on the CPU, float32 throughout. Off under
+    torch.compile, which is also the switch the tests use to reach the torch route.
+    """
+    return (
+        warp_3ch is not None
+        and base_i is not None
+        and source.device.type == "cpu"
+        and source.dim() == 3
+        and source.dtype == torch.float32
+        and warp_3ch.dtype == torch.float32
+        and patch_xd.dtype == torch.float32
+        and base_i.dtype == torch.float32
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+    )
+
+
 def batched_compose_and_interpolate(
     source: Tensor,
     global_xd: Tensor,
@@ -1671,6 +1694,15 @@ def batched_compose_and_interpolate(
                 f"fused compose-and-sample unavailable ({type(exc).__name__}: {exc}); "
                 "falling back to the portable path"
             )
+
+    if _compose_cpu_applies(source, global_warp_3ch, base_i, patch_xd):
+        from .numba_kernels import compose_and_sample_cpu
+
+        assert global_warp_3ch is not None and base_i is not None
+        assert base_j is not None and base_k is not None
+        return compose_and_sample_cpu(
+            source, global_warp_3ch, patch_xd, patch_yd, patch_zd, base_i, base_j, base_k
+        )[:4]
 
     # Global coordinates after local patch displacement: (B, V)
     if base_i is not None:
