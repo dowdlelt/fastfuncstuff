@@ -432,11 +432,14 @@ class WarpState:
     # five times over. See `qwarp_level_gains`.
     level_log: list[dict] = field(default_factory=list)
 
-    # Gradient of the (unchanging) source volume, stacked (3, nz, ny, nx). Built on
-    # first use by the Gauss-Newton path and kept, because it is the same for every
-    # patch of every level and rebuilding it per phase would cost more than the
-    # solve it feeds.
+    # Gradient of the source volume, stacked (3, nz, ny, nx). Built on first use by
+    # the Gauss-Newton path and kept, because without -pblur it is the same for every
+    # patch of every level and rebuilding it per phase would cost more than the solve
+    # it feeds. Keyed on the source tensor it was taken from: with -pblur the source
+    # is re-blurred per level, and a stale gradient left GN solving for an image the
+    # cost was not scoring (accept/reject kept it correct, only slow).
     source_grad_3ch: Tensor = field(default_factory=lambda: torch.empty(0))
+    source_grad_of: Tensor | None = None
 
     # Per-level optimizer-budget telemetry (batched path only); reset each level.
     opt_steps_weighted: int = 0  # sum over batches of steps_run * B
@@ -2466,9 +2469,10 @@ def _improve_warp_batched(
     use_gn, use_hybrid = schedule.use_gn, schedule.use_hybrid
 
     if use_gn:
-        if state.source_grad_3ch.numel() == 0:
+        if state.source_grad_of is not source:
             gz, gy, gx = torch.gradient(source)
             state.source_grad_3ch = torch.stack([gx, gy, gz], dim=0).contiguous()
+            state.source_grad_of = source
         source_grad_3ch = state.source_grad_3ch
         # The columns are the largest tensor here and their assembly is a chain of
         # elementwise passes over it; compiled, that chain becomes one kernel.
