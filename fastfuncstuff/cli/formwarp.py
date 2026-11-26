@@ -363,6 +363,44 @@ def parse_args(
         help="Convergence slope threshold; larger stops sooner.",
     )
     p.add_argument(
+        "-metric_gradient",
+        choices=("exact", "local"),
+        default=_D.metric_gradient,
+        help="cc update field: 'exact' (autograd gradient of the windowed CC) or "
+        "'local' (ANTs' centre-window approximation times the warped image's gradient).",
+    )
+    p.add_argument(
+        "-step_norm",
+        choices=("joint", "per_half"),
+        default=_D.step_norm,
+        help="Scale the step so the largest combined displacement of both halves is "
+        "-grad_step ('joint') or each half's largest is ('per_half', as ANTs).",
+    )
+    p.add_argument(
+        "-update_rule",
+        choices=("additive", "compose"),
+        default=_D.update_rule,
+        help="'additive' (phi += step) or 'compose' (ITK SyN: compose the update onto "
+        "each half's inverse and re-derive; needs -inverter itk).",
+    )
+    p.add_argument(
+        "-inverter",
+        choices=("fixed_point", "itk"),
+        default=_D.inverter,
+        help="Field inversion: 'fixed_point' (-invert_iters undamped sweeps) or 'itk' "
+        "(warm-started, damped, to 0.1 voxel max error, round trip always kept).",
+    )
+    p.add_argument(
+        "-pin_boundary",
+        action="store_true",
+        help="Zero the smoothed update on the volume faces (ITK SyN does).",
+    )
+    p.add_argument(
+        "-keep_last",
+        action="store_true",
+        help="Return each level's last iterate rather than its best (as ANTs).",
+    )
+    p.add_argument(
         "-best_patience",
         type=int,
         default=_D.best_patience,
@@ -708,6 +746,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         convergence_window=args.conv_window,
         convergence_threshold=args.conv_thresh,
         best_patience=args.best_patience,
+        metric_gradient=args.metric_gradient,
+        step_norm=args.step_norm,
+        update_rule=args.update_rule,
+        inverter=args.inverter,
+        pin_boundary=args.pin_boundary,
+        restore_best=not args.keep_last,
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,

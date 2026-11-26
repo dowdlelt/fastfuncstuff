@@ -1107,3 +1107,110 @@ def test_best_patience_does_not_stop_a_level_with_no_legal_iterate():
     lev = res.levels[0]
     assert lev.fold_fallback and not lev.patience_stopped
     assert lev.iters_run == 40
+
+
+# --- ANTs (ITK SyN) parity options ---------------------------------------------------
+
+
+def test_local_cc_update_is_ants_centre_window_derivative():
+    """Against a direct per-voxel evaluation of ANTs' formula on in-bounds windows."""
+    import numpy as np
+
+    from fastfuncstuff.processing.formwarp import _local_cc_update
+
+    g = torch.Generator().manual_seed(0)
+    shape, r = (6, 7, 8), 2
+    f = torch.rand(shape, generator=g, dtype=torch.float64)
+    m = 0.6 * f + 0.4 * torch.rand(shape, generator=g, dtype=torch.float64)
+    cost, uf, um = _local_cc_update(f, m, torch.ones(shape, dtype=torch.float64), r)
+
+    F, M = f.numpy(), m.numpy()
+    exp_m = np.zeros((3, *shape))
+    exp_f = np.zeros((3, *shape))
+    r2s = []
+
+    def cdiff(v, k, j, i):
+        out = []
+        for ax, idx in ((2, i), (1, j), (0, k)):
+            n = v.shape[ax]
+            if idx in (0, n - 1):
+                out.append(0.0)
+                continue
+            sl_hi = [k, j, i]
+            sl_lo = [k, j, i]
+            sl_hi[ax] += 1
+            sl_lo[ax] -= 1
+            out.append(0.5 * (v[tuple(sl_hi)] - v[tuple(sl_lo)]))
+        return out
+
+    for k in range(shape[0]):
+        for j in range(shape[1]):
+            for i in range(shape[2]):
+                win = (slice(max(k - r, 0), k + r + 1), slice(max(j - r, 0), j + r + 1),
+                       slice(max(i - r, 0), i + r + 1))  # fmt: skip
+                a, b = F[win].ravel(), M[win].ravel()
+                sff = ((a - a.mean()) ** 2).sum()
+                smm = ((b - b.mean()) ** 2).sum()
+                sfm = ((a - a.mean()) * (b - b.mean())).sum()
+                r2s.append(sfm * sfm / (sff * smm))
+                fa, ma = F[k, j, i] - a.mean(), M[k, j, i] - b.mean()
+                cm = 2 * sfm / (sff * smm) * (fa - sfm / smm * ma)
+                cf = 2 * sfm / (sff * smm) * (ma - sfm / sff * fa)
+                exp_m[:, k, j, i] = cm * np.array(cdiff(M, k, j, i))
+                exp_f[:, k, j, i] = cf * np.array(cdiff(F, k, j, i))
+
+    assert float(cost) == pytest.approx(-np.mean(r2s), rel=1e-10)
+    np.testing.assert_allclose(torch.stack(um).numpy(), exp_m, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(torch.stack(uf).numpy(), exp_f, rtol=1e-8, atol=1e-12)
+
+
+def test_itk_inverter_reaches_its_tolerance_and_warm_start_helps():
+    from fastfuncstuff.processing.formwarp import _invert_field_itk, _sample_field_zeros
+
+    n = 24
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    bump = torch.exp(-(((xx - 12) ** 2 + (yy - 12) ** 2 + (zz - 12) ** 2) / 30.0))
+    d = (2.0 * bump, -1.0 * bump, 0.5 * bump)
+    e = _invert_field_itk(d, None)
+    s = _sample_field_zeros(d, *e)
+    resid = torch.sqrt(sum((ec + sc) ** 2 for ec, sc in zip(e, s, strict=True)))
+    assert float(resid.max()) <= 0.1
+    # Starting from the answer, one sweep is enough to confirm it.
+    again = _invert_field_itk(d, e, max_iter=1)
+    assert max(float((a - b).abs().max()) for a, b in zip(again, e, strict=True)) < 0.05
+
+
+def test_compose_update_identities():
+    from fastfuncstuff.processing.formwarp import _compose_update
+
+    g = torch.Generator().manual_seed(1)
+    w = tuple(torch.randn(5, 6, 7, generator=g) * 0.3 for _ in range(3))
+    zero = tuple(torch.zeros(5, 6, 7) for _ in range(3))
+    assert all(torch.equal(a, b) for a, b in zip(_compose_update(zero, w), w, strict=True))
+    # grid_sample at the grid points themselves: exact to float32 rounding (measured 1.8e-7).
+    assert all(
+        torch.allclose(a, b, atol=1e-6) for a, b in zip(_compose_update(w, zero), w, strict=True)
+    )
+
+
+def test_ants_parity_options_recover_a_known_shift():
+    nz, ny, nx = 24, 28, 30
+    fixed = _blobs(nz, ny, nx)
+    moving = _blobs(nz, ny, nx, shift=(2.5, -1.5, 1.0))
+    base = dict(metric="cc", cc_radius=3, grad_step=0.4, shrink_factors=(2, 1),
+                smoothing_sigmas=(1.0, 0.0), iterations=(25, 25), verb=0, fold_penalty=0.0,
+                metric_gradient="local", step_norm="per_half", inverter="itk")  # fmt: skip
+    before = ((fixed - moving) ** 2).mean().item()
+    for extra in ({}, {"update_rule": "compose", "pin_boundary": True, "restore_best": False}):
+        res = formwarp(fixed, moving, config=SynConfig(**base, **extra), device=DEVICE)
+        assert ((fixed - res.warped) ** 2).mean().item() < 0.1 * before, extra
+
+
+def test_compose_needs_the_itk_inverter_and_local_needs_cc():
+    fixed = _blobs(8, 8, 8)
+    for bad in ({"update_rule": "compose"}, {"metric_gradient": "local", "metric": "lpa"}):
+        cfg = SynConfig(
+            shrink_factors=(1,), smoothing_sigmas=(0.0,), iterations=(2,), verb=0, **bad
+        )
+        with pytest.raises(ValueError):
+            formwarp(fixed, fixed, config=cfg, device=DEVICE)

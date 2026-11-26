@@ -317,6 +317,47 @@ class SynConfig:
     it under, handing the finer level a field that was illegal before its first step.
     """
 
+    metric_gradient: str = "exact"
+    """How the cc update field is computed: 'exact' or 'local'.
+
+    'exact' is the autograd gradient of the windowed-CC cost: every voxel collects a
+    term from each of the (2r+1)^3 windows that contain it. 'local' is what ANTs'
+    ``antsRegistration`` does (ITK ``ANTSNeighborhoodCorrelationImageToImageMetricv4``):
+    only the window centred on the voxel, times the central-difference gradient of the
+    warped image. Only the 'cc' metric has a 'local' form.
+
+    The difference matters because the update is normalised by its maximum. Measured on
+    NIREP na16 -> na09 at identity, the exact gradient peaks outside the brain, at
+    13,600x its in-brain mean at shrink 8 (ANTs' local form: 19x), so after scaling the
+    brain hardly moves."""
+
+    step_norm: str = "joint"
+    """How the step is scaled to :attr:`grad_step`: 'joint' (the largest combined
+    two-half displacement is grad_step) or 'per_half' (each half's largest is
+    grad_step, as ITK's ``SyNImageRegistrationMethod::ScaleUpdateField`` does). With
+    symmetric halves 'joint' moves each by up to 1/sqrt(2) as far."""
+
+    update_rule: str = "additive"
+    """'additive': ``phi += step``, inverses re-derived by :attr:`inverter`. 'compose':
+    ITK ``SyNImageRegistrationMethod`` -- each half's *inverse* (image -> middle) has
+    the other image's scaled update composed onto it, ``D(x) + u(x + D(x))``, and the
+    half is re-derived by inverting that (requires ``inverter='itk'``)."""
+
+    inverter: str = "fixed_point"
+    """'fixed_point': :attr:`invert_iters` undamped sweeps from ``-d``, round trip kept
+    only if it converged and did no harm. 'itk': ITK ``InvertDisplacementFieldImageFilter``
+    as SyN calls it -- warm-started from the previous inverse, damped (0.75 then 0.5,
+    per-voxel capped), up to 20 sweeps until max error 0.1 or mean 0.001 voxel, zero on
+    the volume faces -- and the forward always re-derived from the inverse."""
+
+    pin_boundary: bool = False
+    """Zero the smoothed update field on the volume faces, as ITK's
+    ``GaussianSmoothDisplacementField`` does whenever its variance is positive."""
+
+    restore_best: bool = True
+    """Return each level's lowest-cost (legal) iterate. False returns the last one, as
+    ITK SyN does."""
+
     fold_aware_best: bool = True
     """Require a state to be fold-free before it can become the best-so-far. Without
     it the snapshot is decided by the image metric alone, and folding *improves* the
@@ -418,6 +459,66 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     vb = (moments[4] / wn - bm * bm).clamp(min=_EPS)
     cc = cov * cov / (va * vb)  # in [0, 1], higher = better
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
+
+
+def _central_diff_zero_edge(vol: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """(gx, gy, gz) central differences with a zero derivative on the outer faces, as
+    ITK's ``CentralDifferenceImageFunction`` returns for an out-of-bounds neighbour."""
+    gz = torch.zeros_like(vol)
+    gy = torch.zeros_like(vol)
+    gx = torch.zeros_like(vol)
+    if vol.shape[0] > 2:
+        gz[1:-1] = 0.5 * (vol[2:] - vol[:-2])
+    if vol.shape[1] > 2:
+        gy[:, 1:-1] = 0.5 * (vol[:, 2:] - vol[:, :-2])
+    if vol.shape[2] > 2:
+        gx[..., 1:-1] = 0.5 * (vol[..., 2:] - vol[..., :-2])
+    return gx, gy, gz
+
+
+def _local_cc_update(
+    f: Tensor, m: Tensor, weight: Tensor, radius: int
+) -> tuple[Tensor, Field, Field]:
+    """ANTs' neighbourhood-CC value and its centre-window update fields for both halves.
+
+    Window sums are over the in-bounds voxels only (zero padding plus a count), as ANTs'
+    scan does. Per voxel, the moving half gets
+    ``2 sFM / (sFF sMM) * (f~ - sFM / sMM * m~) * grad(m)`` and the fixed half the same
+    with the roles swapped -- the derivative of the voxel's own window, ignoring the
+    other windows it belongs to. Returns ``(cost, u_fixed, u_moving)``, cost = -mean r^2
+    over weighted voxels, a degenerate (flat) window counting as r^2 = 1 like ANTs.
+    """
+    k = 2 * radius + 1
+    w = weight
+    stack = torch.stack((w, w * f, w * m, w * f * f, w * m * m, w * f * m))[None]
+    sums = F.avg_pool3d(stack, k, stride=1, padding=radius, count_include_pad=True)[0]
+    n, sf, sm, sff, smm, sfm = (sums * float(k**3)).unbind(0)
+    n_safe = n.clamp(min=_EPS)
+    mean_f, mean_m = sf / n_safe, sm / n_safe
+    vff = sff - sf * mean_f
+    vmm = smm - sm * mean_m
+    vfm = sfm - sf * mean_m
+    # ANTs works in double on [0, 1]-rescaled intensities with an epsilon of 2e-16; in
+    # float32 on raw intensities the matching "flat window" test is relative.
+    scale = torch.maximum(f.abs().max(), m.abs().max()).clamp(min=_EPS)
+    thr = 1e-10 * scale * scale
+    ok = (vff > thr) & (vmm > thr) & (w > 0)
+    prod = (vff * vmm).clamp(min=thr * thr)
+    r2 = torch.where((vff > thr) & (vmm > thr), vfm * vfm / prod, torch.ones_like(prod))
+    common = 2.0 * vfm / prod
+    fa, ma = f - mean_f, m - mean_m
+    zero = torch.zeros_like(f)
+    coef_m = torch.where(ok, common * (fa - vfm / vmm.clamp(min=thr) * ma), zero)
+    coef_f = torch.where(ok, common * (ma - vfm / vff.clamp(min=thr) * fa), zero)
+    gmx, gmy, gmz = _central_diff_zero_edge(m)
+    gfx, gfy, gfz = _central_diff_zero_edge(f)
+    valid = (w > 0) & (n > 0)
+    cost = -(r2 * valid).sum() / valid.sum().clamp(min=1)
+    return (
+        cost,
+        (coef_f * gfx, coef_f * gfy, coef_f * gfz),
+        (coef_m * gmx, coef_m * gmy, coef_m * gmz),
+    )
 
 
 def _fused_local_corr_args(
@@ -722,6 +823,59 @@ def invert_displacement_field(
         ey = -dy
         ez = -dz
     return (ex, ey, ez, step) if return_step else (ex, ey, ez)
+
+
+def _sample_field_zeros(field: Field, xd: Tensor, yd: Tensor, zd: Tensor) -> Field:
+    """Trilinear sample of a 3-component field at ``p + d(p)``, zero outside."""
+    nz, ny, nx = xd.shape
+    kk, jj, ii = torch.meshgrid(
+        *(torch.arange(n, dtype=xd.dtype, device=xd.device) for n in (nz, ny, nx)), indexing="ij"
+    )
+    norm = lambda c, n: 2.0 * c / (n - 1) - 1.0 if n > 1 else c * 0.0  # noqa: E731
+    grid = torch.stack([norm(ii + xd, nx), norm(jj + yd, ny), norm(kk + zd, nz)], dim=-1)[None]
+    out = F.grid_sample(
+        torch.stack(field)[None], grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    )[0]
+    return out[0], out[1], out[2]
+
+
+def _zero_faces(field: Field) -> Field:
+    out = []
+    for c in field:
+        c = c.clone()
+        c[0], c[-1] = 0.0, 0.0
+        c[:, 0], c[:, -1] = 0.0, 0.0
+        c[..., 0], c[..., -1] = 0.0, 0.0
+        out.append(c)
+    return out[0], out[1], out[2]
+
+
+def _compose_update(update: Field, warping: Field) -> Field:
+    """ITK ``ComposeDisplacementFieldsImageFilter``: ``w(x) + u(x + w(x))``."""
+    s = _sample_field_zeros(update, *warping)
+    return warping[0] + s[0], warping[1] + s[1], warping[2] + s[2]
+
+
+def _invert_field_itk(
+    d: Field, init: Field | None, max_iter: int = 20, mean_tol: float = 1e-3, max_tol: float = 0.1
+) -> Field:
+    """ITK ``InvertDisplacementFieldImageFilter`` with SyN's settings (see SynConfig.inverter)."""
+    e: Field = init if init is not None else (torch.zeros_like(d[0]),) * 3
+    for it in range(max_iter):
+        s = _sample_field_zeros(d, *e)
+        cx, cy, cz = e[0] + s[0], e[1] + s[1], e[2] + s[2]
+        norms = torch.sqrt(cx * cx + cy * cy + cz * cz)
+        max_n, mean_n = float(norms.max()), float(norms.mean())
+        eps = 0.75 if it == 0 else 0.5
+        factor = torch.where(
+            norms > eps * max_n, eps * max_n / norms.clamp(min=1e-30), torch.ones_like(norms)
+        )
+        e = _zero_faces(
+            (e[0] - eps * factor * cx, e[1] - eps * factor * cy, e[2] - eps * factor * cz)
+        )
+        if max_n <= max_tol or mean_n <= mean_tol:
+            break
+    return e
 
 
 def _invert_displacement_field_pair_batched(
@@ -1292,14 +1446,26 @@ def _syn_level(
     if _tqdm is not None and config.verb >= 1 and n_iter >= 5:
         bar = _tqdm(total=n_iter, desc=f"SyN {level_tag}", leave=True)
 
+    if config.update_rule == "compose" and config.inverter != "itk":
+        raise ValueError("update_rule='compose' needs inverter='itk'")
+    local_grad = config.metric_gradient == "local"
+    if local_grad and config.metric != "cc":
+        raise ValueError("metric_gradient='local' is only defined for the cc metric")
+
     for _ in range(n_iter):
         # Leaf copies for this step's gradient.
         leaves = [t.detach().requires_grad_(True) for t in (fxd, fyd, fzd, mxd, myd, mzd)]
         lf, lm = leaves[:3], leaves[3:]
 
-        fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
-        mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
-        cost = _metric_cost(fmid, mmid, weight, config, smoothed_weight)
+        if local_grad:
+            with torch.no_grad():
+                fmid = _warp_diff(fixed, fxd, fyd, fzd, voxel_grid)
+                mmid = _warp_diff(moving, mxd, myd, mzd, voxel_grid)
+                cost, local_f, local_m = _local_cc_update(fmid, mmid, weight, config.cc_radius)
+        else:
+            fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
+            mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
+            cost = _metric_cost(fmid, mmid, weight, config, smoothed_weight)
         # The image term is what the level is judged and best-restored on; the penalty
         # only steers the step. Folding lowers the image metric, so scoring the two
         # together would let a folded iterate win on a total the penalty was meant to
@@ -1307,7 +1473,8 @@ def _syn_level(
         # incomparable.
         cost_val = cost.item()
         if config.fold_penalty > 0:
-            cost = cost + _fold_penalty(tuple(lf), config) + _fold_penalty(tuple(lm), config)
+            pen = _fold_penalty(tuple(lf), config) + _fold_penalty(tuple(lm), config)
+            cost = pen if local_grad else cost + pen
         costs.append(cost_val)
         if recorder is not None and recorder.tick():
             # moving->fixed is mid->fixed's inverse half, then moving's half: the same
@@ -1348,14 +1515,24 @@ def _syn_level(
             patience_stopped = True
             break
 
-        grads = torch.autograd.grad(cost, leaves)
-        # Descent direction (cost is lower=better) for each half-field.
-        ufx, ufy, ufz = -grads[0], -grads[1], -grads[2]
-        umx, umy, umz = -grads[3], -grads[4], -grads[5]
+        if local_grad:
+            (ufx, ufy, ufz), (umx, umy, umz) = local_f, local_m
+            if config.fold_penalty > 0:
+                pg = torch.autograd.grad(cost, leaves)
+                ufx, ufy, ufz = ufx - pg[0], ufy - pg[1], ufz - pg[2]
+                umx, umy, umz = umx - pg[3], umy - pg[4], umz - pg[5]
+        else:
+            grads = torch.autograd.grad(cost, leaves)
+            # Descent direction (cost is lower=better) for each half-field.
+            ufx, ufy, ufz = -grads[0], -grads[1], -grads[2]
+            umx, umy, umz = -grads[3], -grads[4], -grads[5]
 
         # Fluid regularization of the update fields.
         ufx, ufy, ufz = _smooth_field(ufx, ufy, ufz, update_var)
         umx, umy, umz = _smooth_field(umx, umy, umz, update_var)
+        if config.pin_boundary and update_var > 0:
+            ufx, ufy, ufz = _zero_faces((ufx, ufy, ufz))
+            umx, umy, umz = _zero_faces((umx, umy, umz))
 
         # Then drop whatever of that update points into a no-data region, leaving the
         # two tangential directions untouched. After the smoothing, so the fluid step
@@ -1364,23 +1541,49 @@ def _syn_level(
             ufx, ufy, ufz = _apply_void_guard(ufx, ufy, ufz, guard, config.void_guard)
             umx, umy, umz = _apply_void_guard(umx, umy, umz, guard, config.void_guard)
 
-        # Normalize the joint update so the largest displacement step is grad_step.
-        norm = torch.sqrt(ufx**2 + ufy**2 + ufz**2 + umx**2 + umy**2 + umz**2)
-        scale = config.grad_step / norm.max().clamp(min=_EPS)
+        # Normalize the update so the largest displacement step is grad_step.
+        if config.step_norm == "per_half":
+            scale_f = config.grad_step / torch.sqrt(ufx**2 + ufy**2 + ufz**2).max().clamp(min=_EPS)
+            scale_m = config.grad_step / torch.sqrt(umx**2 + umy**2 + umz**2).max().clamp(min=_EPS)
+        else:
+            norm = torch.sqrt(ufx**2 + ufy**2 + ufz**2 + umx**2 + umy**2 + umz**2)
+            scale_f = scale_m = config.grad_step / norm.max().clamp(min=_EPS)
+
+        if config.update_rule == "compose":
+            # ITK SyN: the moving image's update moves the fixed half and vice versa,
+            # composed onto each half's image->middle field, then both re-derived.
+            inv_f_tmp = _smooth_field(
+                *_compose_update((scale_m * umx, scale_m * umy, scale_m * umz), (ifxd, ifyd, ifzd)),
+                total_var,
+            )
+            inv_m_tmp = _smooth_field(
+                *_compose_update((scale_f * ufx, scale_f * ufy, scale_f * ufz), (imxd, imyd, imzd)),
+                total_var,
+            )
+            fxd, fyd, fzd = _invert_field_itk(inv_f_tmp, (fxd, fyd, fzd))
+            ifxd, ifyd, ifzd = _invert_field_itk((fxd, fyd, fzd), inv_f_tmp)
+            mxd, myd, mzd = _invert_field_itk(inv_m_tmp, (mxd, myd, mzd))
+            imxd, imyd, imzd = _invert_field_itk((mxd, myd, mzd), inv_m_tmp)
+            if flags:
+                fxd, fyd, fzd = _apply_axis_flags(fxd, fyd, fzd, flags)
+                mxd, myd, mzd = _apply_axis_flags(mxd, myd, mzd, flags)
+            jac_f = jacobian_determinant(fxd, fyd, fzd)
+            jac_m = jacobian_determinant(mxd, myd, mzd)
+            continue
 
         # Step + elastic regularization, with the local anti-fold backoff applied to
         # each half field. Both happen inside the guard: it has to judge the field the
         # level will keep, so it builds it once and hands it back.
         (fxd, fyd, fzd), jac_f, df, rf = _additive_step_with_fold_guard(
             (fxd, fyd, fzd),
-            (scale * ufx, scale * ufy, scale * ufz),
+            (scale_f * ufx, scale_f * ufy, scale_f * ufz),
             total_var,
             config,
             jac_f,
         )
         (mxd, myd, mzd), jac_m, dm, rm = _additive_step_with_fold_guard(
             (mxd, myd, mzd),
-            (scale * umx, scale * umy, scale * umz),
+            (scale_m * umx, scale_m * umy, scale_m * umz),
             total_var,
             config,
             jac_m,
@@ -1393,6 +1596,15 @@ def _syn_level(
             mxd, myd, mzd = _apply_axis_flags(mxd, myd, mzd, flags)
             jac_f = jacobian_determinant(fxd, fyd, fzd)
             jac_m = jacobian_determinant(mxd, myd, mzd)
+
+        if config.inverter == "itk":
+            ifxd, ifyd, ifzd = _invert_field_itk((fxd, fyd, fzd), (ifxd, ifyd, ifzd))
+            fxd, fyd, fzd = _invert_field_itk((ifxd, ifyd, ifzd), (fxd, fyd, fzd))
+            imxd, imyd, imzd = _invert_field_itk((mxd, myd, mzd), (imxd, imyd, imzd))
+            mxd, myd, mzd = _invert_field_itk((imxd, imyd, imzd), (mxd, myd, mzd))
+            jac_f = jacobian_determinant(fxd, fyd, fzd)
+            jac_m = jacobian_determinant(mxd, myd, mzd)
+            continue
 
         # Re-derive inverses, then re-derive forwards from them (symmetrize).
         (ifxd, ifyd, ifzd), (imxd, imyd, imzd), inv_step = _invert_displacement_field_pair(
@@ -1430,6 +1642,8 @@ def _syn_level(
     fold_fallback = best_cost == float("inf") and any_cost < float("inf")
     if fold_fallback:
         best_cost, best_fields, best_iter = any_cost, any_fields, any_iter
+    if not config.restore_best:
+        best_fields, best_iter = _snapshot(), len(costs) - 1
 
     stats = LevelStats(
         iters_run=len(costs),
