@@ -132,8 +132,9 @@ class SynConfig:
 
     update_var: float | tuple[float, ...] = 3.0
     """Fluid regularization: Gaussian sigma smoothing the per-iteration update field.
-    ANTs SyN[,updateFieldVarianceInVoxelSpace=3]. A single value applies to every level;
-    a per-level tuple (one entry per shrink factor) overrides it level by level.
+    A **sigma**, where ANTs' SyN[,updateFieldVarianceInVoxelSpace] is a *variance*: ANTs'
+    3 is sigma sqrt(3) = 1.732 here. A single value applies to every level; a per-level
+    tuple (one entry per shrink factor) overrides it level by level.
 
     Note the units already do most of the work: the sigma is in **voxels of the level's
     own grid**, so a constant 3 is 12 full-resolution voxels at shrink=4 and 3 at
@@ -144,9 +145,9 @@ class SynConfig:
     on NIREP na02->na01 -- not a correction to it."""
 
     total_var: float | tuple[float, ...] = 0.0
-    """Elastic regularization: Gaussian sigma smoothing the accumulated field.
-    ANTs SyN[,,totalFieldVarianceInVoxelSpace=0] (0 = off). Scalar or per-level, as
-    :attr:`update_var`.
+    """Elastic regularization: Gaussian sigma smoothing the accumulated field (0 = off).
+    ANTs' SyN[,,totalFieldVarianceInVoxelSpace] is the square of this. Scalar or
+    per-level, as :attr:`update_var`.
 
     Measured on NIREP na02->na01, a constant 1-2 here is badly counterproductive
     (LNCC 0.374 against 0.549): it re-smooths the *accumulated* field on every
