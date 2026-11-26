@@ -113,6 +113,9 @@ from fastfuncstuff.io.headers import (
     _resolve_indices as _resolve_indices,
 )
 from fastfuncstuff.io.headers import (
+    drop_degenerate_xforms as drop_degenerate_xforms,
+)
+from fastfuncstuff.io.headers import (
     header_tr as header_tr,
 )
 from fastfuncstuff.io.headers import (
@@ -573,6 +576,11 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         # Stub gap (see above); this function's contract is to always return
         # Nifti1Image, matching the .nii.zst branch above.
         assert isinstance(img_out, nib.Nifti1Image)
+
+    if isinstance(img_out, (nib.Nifti1Image, nib.Nifti2Image)):
+        hdr = img_out.header.copy()
+        if drop_degenerate_xforms(hdr, filepath):
+            img_out = type(img_out)(img_out.dataobj, hdr.get_best_affine(), hdr)
 
     _record_grid_space(img_out)
 

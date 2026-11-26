@@ -350,6 +350,37 @@ def _gzip_leading_bytes(path: str, n: int) -> bytes:
 _HEADER_PEEK = 1 << 16
 
 
+def drop_degenerate_xforms(hdr: Any, source: str | Path | None = None) -> bool:
+    """Zero the code of an sform/qform whose matrix cannot map voxels to space.
+
+    BrainVoyager writes ``sform_code=1`` over an all-zero ``srow_*``; trusting the
+    code gives a singular affine with no orientation (``aff2axcodes`` returns
+    ``None``). With its code at 0, ``get_best_affine`` moves on to the qform or
+    the pixdim affine — voxel size only, so the position in space is a guess.
+    Warns (once per file, through the default filter) and returns whether
+    anything was dropped.
+    """
+    dropped: list[str] = []
+    for name, getter in (("sform", hdr.get_sform), ("qform", hdr.get_qform)):
+        if int(hdr[f"{name}_code"]) == 0:
+            continue
+        m = np.asarray(getter(), dtype=np.float64)[:3, :3]
+        if not np.all(np.isfinite(m)) or abs(np.linalg.det(m)) < 1e-12:
+            hdr[f"{name}_code"] = 0
+            dropped.append(name)
+    if dropped:
+        import warnings
+
+        fallback = "qform" if int(hdr["qform_code"]) > 0 else "voxel-size (pixdim) affine"
+        warnings.warn(
+            f"{source or 'NIfTI header'}: {'/'.join(dropped)} matrix is degenerate "
+            f"(singular or non-finite); ignoring it and using the {fallback}. "
+            "Orientation and position may be wrong.",
+            stacklevel=1,
+        )
+    return bool(dropped)
+
+
 def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Header:
     """Header *plus* extensions, reading only as far as the image data starts.
 
@@ -370,7 +401,9 @@ def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Head
     vox_offset = int(stub["vox_offset"]) or sizeof_hdr + 4
     # Cap the extension read: a corrupt vox_offset should not pull the payload in.
     raw = lead if vox_offset <= len(lead) else _read_leading_bytes(path, min(vox_offset, 1 << 22))
-    return klass.from_fileobj(BytesIO(raw[:vox_offset]), check=False)
+    hdr = klass.from_fileobj(BytesIO(raw[:vox_offset]), check=False)
+    drop_degenerate_xforms(hdr, path)
+    return hdr
 
 
 def read_nifti_header(
@@ -408,10 +441,11 @@ def read_nifti_header(
 
     for endian in ("<", ">"):
         (sizeof_hdr,) = struct.unpack(endian + "i", raw[:4])
-        if sizeof_hdr == 348:
-            return nib.Nifti1Header(binaryblock=raw[:348])
-        if sizeof_hdr == 540:
-            return nib.Nifti2Header(binaryblock=raw[:540])
+        if sizeof_hdr in (348, 540):
+            klass: Any = nib.Nifti1Header if sizeof_hdr == 348 else nib.Nifti2Header
+            hdr = klass(binaryblock=raw[:sizeof_hdr])
+            drop_degenerate_xforms(hdr, filepath)
+            return hdr
     raise ValueError(f"Not a recognizable NIfTI-1/2 header (bad sizeof_hdr) in {filepath}")
 
 

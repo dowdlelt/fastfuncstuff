@@ -301,3 +301,34 @@ def test_info_id_flag_reports_header_idcode(tmp_path, capsys):
 
     main(["-id", str(tmp_path / "tagged.nii.gz")])
     assert capsys.readouterr().out.strip() == idc
+
+
+def _zero_sform_nifti(path):
+    """BrainVoyager's layout: sform_code=1 over all-zero srow_*, qform_code=0."""
+    img = nib.Nifti1Image(np.ones((4, 5, 6, 3), np.float32), np.diag([2.0, 2.0, 2.0, 1.0]))
+    img.header.set_zooms((2.0, 2.0, 2.0, 1.0))
+    img.set_qform(None, code=0)
+    nib.save(img, path)
+    hdr = nib.load(path).header.copy()
+    for row in ("srow_x", "srow_y", "srow_z"):
+        hdr[row] = 0.0
+    hdr["sform_code"] = 1
+    hdr["qform_code"] = 0
+    raw = nib.Nifti1Image(np.ones((4, 5, 6, 3), np.float32), None, hdr)
+    raw.to_filename(path)
+    assert nib.load(path).header["sform_code"] == 1
+    assert not nib.load(path).affine[:3, :3].any()
+
+
+def test_zero_sform_falls_back_with_warning(tmp_path):
+    from fastfuncstuff.io.afni import load_nifti
+
+    path = tmp_path / "bv.nii.gz"
+    _zero_sform_nifti(path)
+    with pytest.warns(UserWarning, match="degenerate"):
+        info = read_info(path)
+    assert len(info.orient) == 3 and info.shape == (4, 5, 6, 3)
+    with pytest.warns(UserWarning, match="degenerate"):
+        img = load_nifti(path)
+    assert np.allclose(np.abs(np.diag(img.affine))[:3], 2.0)
+    assert np.allclose(img.affine, info.affine)
