@@ -882,6 +882,15 @@ def parse_args(
         "a per-parameter box, as 3dQwarp does (experimental)",
     )
     g_opt.add_argument(
+        "-lev0",
+        choices=("ffs", "afni"),
+        default=QwarpConfig().lev0_schedule,
+        help="Global level-0 schedule. 'ffs': cubic_lite, cubic, quintic_lite under the "
+        "box. 'afni': 3dQwarp's cubic_lite (box) then cubic, quintic_lite and quintic "
+        "under its wider ball, without its opening SINCC pass (experimental) "
+        "[default: %(default)s]",
+    )
+    g_opt.add_argument(
         "-batch_tol",
         "-batch-tol",
         type=float,
@@ -1936,6 +1945,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         gn_stop_rule=args.gn_stop,
         gn_iters_lev0=args.gn_iters_lev0,
         ball_constraint=args.ball,
+        lev0_schedule=args.lev0,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

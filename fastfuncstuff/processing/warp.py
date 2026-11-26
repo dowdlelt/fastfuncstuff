@@ -279,6 +279,13 @@ class QwarpConfig:
     larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
     until measured."""
 
+    lev0_schedule: str = "ffs"
+    """Bases and bounds of the global level 0. ``"ffs"``: cubic_lite, cubic,
+    quintic_lite, all under the per-parameter box. ``"afni"``: 3dQwarp's order and
+    bounds -- cubic_lite under the box, then cubic, quintic_lite and the full
+    quintic (81 parameters) under the L2 ball -- less AFNI's opening SINCC pass,
+    which needs a basis port. Gauss-Newton path; opt-in until measured."""
+
     gn_coarse_patches: int = 2000
     """Patch count at which the coarse ceiling applies in full; above it the budget
     tapers toward :attr:`gn_iters` as the square root of the patch count."""
@@ -1364,6 +1371,15 @@ def _warpomatic(
         # rather than hardcoded so the serial path comes back if a future torch
         # regresses grid_sample and it lands in utils._MPS_CPU_OPS.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
+        lev0_ball: set[str] = set()
+        if config.lev0_schedule == "afni":
+            # 3dQwarp: SINCC and CUBIC_LITE under the box, then CUBIC, QUINTIC_LITE
+            # and QUINTIC under the ball. SINCC needs its own basis port and is
+            # left out; the rest is AFNI's order and bounds.
+            lev0_bases = ["cubic_lite", "cubic", "quintic_lite", "quintic"]
+            lev0_ball = {"cubic", "quintic_lite", "quintic"}
+        elif config.lev0_schedule != "ffs":
+            raise ValueError(f"unknown lev0_schedule {config.lev0_schedule!r}")
         use_batched_lev0 = cpu_if_mps(device, "grid_sample") == device
 
         if use_batched_lev0:
@@ -1439,6 +1455,7 @@ def _warpomatic(
                     blok_index_vol=blok_index_vol,
                     nblok=nblok,
                     gn_max_iter=config.gn_iters_lev0,
+                    ball_radius=BALL_PARAM_MAX[basis_type] if basis_type in lev0_ball else None,
                 )
             else:
                 _improve_warp_serial(

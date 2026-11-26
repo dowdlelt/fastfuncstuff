@@ -1828,3 +1828,37 @@ def test_ball_applies_on_afni_patch_widths(basis, widths, expected):
     from fastfuncstuff.processing.warp import _ball_applies
 
     assert _ball_applies(basis, widths) is expected
+
+
+@pytest.mark.parametrize(
+    "schedule,expected",
+    [
+        ("ffs", [(12, None), (24, None), (30, None)]),
+        ("afni", [(12, None), (24, 0.0790), (30, 0.1111), (81, 0.0611)]),
+    ],
+)
+def test_level0_schedule_bases_and_bounds(monkeypatch, schedule, expected):
+    """-lev0 afni: 3dQwarp's level-0 bases, the last three under its ball."""
+    import fastfuncstuff.processing.warp as warp_mod
+
+    seen = []
+    real = warp_mod.optimize_warp_params_gauss_newton
+
+    def spy(*a, **k):
+        seen.append((a[3], k.get("ball_radius")))
+        return real(*a, **k)
+
+    monkeypatch.setattr(warp_mod, "optimize_warp_params_gauss_newton", spy)
+    g = torch.Generator().manual_seed(0)
+    base = torch.rand(24, 24, 24, generator=g) + 0.1
+    warp_mod.qwarp(
+        base,
+        base + 0.05 * torch.rand(24, 24, 24, generator=g),
+        weight=torch.ones_like(base),
+        mask=torch.ones_like(base).byte(),
+        config=QwarpConfig(blur_base=0.0, blur_source=0.0, max_level=0, gn_iters=1,
+                           lev0_schedule=schedule, verb=0),
+        device=torch.device("cpu"),
+        pad=False,
+    )  # fmt: skip
+    assert seen == expected
