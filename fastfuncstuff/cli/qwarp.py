@@ -855,6 +855,26 @@ def parse_args(
         "anything else [default: %(default)s]",
     )
     g_opt.add_argument(
+        "-gn_stop",
+        choices=("first_reject", "freeze"),
+        default=QwarpConfig().gn_stop_rule,
+        help="When a Gauss-Newton phase stops. 'first_reject' ends it as soon as every "
+        "patch was rejected or stalled in the same iteration, which with the few "
+        "patches of level 0 and the coarse levels often happens after 2 iterations. "
+        "'freeze' raises the damping and retries after a rejection, stopping a patch "
+        "only on an accepted step that gains under the tolerance (experimental) "
+        "[default: %(default)s]",
+    )
+    g_opt.add_argument(
+        "-gn_iters_lev0",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Gauss-Newton iterations per basis at level 0, the global patch. One "
+        "iteration there is a single volume pass; AFNI gives its optimizer 8*npar+31 "
+        "evaluations (experimental) [default: same as every other level, 8]",
+    )
+    g_opt.add_argument(
         "-batch_tol",
         "-batch-tol",
         type=float,
@@ -1906,6 +1926,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         axis_weights=axis_weights,
         verb=args.verb,
         optimizer=args.optimizer,
+        gn_stop_rule=args.gn_stop,
+        gn_iters_lev0=args.gn_iters_lev0,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

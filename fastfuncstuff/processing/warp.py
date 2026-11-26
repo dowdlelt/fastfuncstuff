@@ -256,6 +256,21 @@ class QwarpConfig:
     +108% runtime for +1.9% on ls. Worth it for a final warp, not for a tuning
     sweep, so it is a choice rather than a default."""
 
+    gn_stop_rule: str = "first_reject"
+    """When the Gauss-Newton loop ends. ``"first_reject"`` (the original rule): as
+    soon as every patch was rejected or gained < tol in the same iteration, so one
+    all-reject round ends the fit -- with 1-6 patches at level 0 and levels 1-3 it
+    routinely ends after 2 iterations. ``"freeze"``: a rejection raises the
+    damping and retries; a patch stops only on an accepted step that gains < tol or
+    at the damping cap (AFNI's NEWUOA likewise keeps going past failed trials).
+    Opt-in until measured on the label cohort."""
+
+    gn_iters_lev0: int | None = None
+    """Gauss-Newton budget per basis at level 0, the single global patch. ``None``
+    keeps the ordinary ceiling (:attr:`gn_iters_coarse`, 8). AFNI gives NEWUOA
+    ``8*npar+31`` evaluations there; one B=1 GN iteration is one volume pass, so 30
+    iterations cost about one fine level."""
+
     gn_coarse_patches: int = 2000
     """Patch count at which the coarse ceiling applies in full; above it the budget
     tapers toward :attr:`gn_iters` as the square root of the patch count."""
@@ -342,10 +357,9 @@ class QwarpConfig:
     batch loop stops only once every patch has converged (or hits the iter cap)."""
 
     batch_optimizer_iters_lev0: int = 120
-    """Max Adam iterations for the single global level-0 patch (CUDA only).
-    Level 0 is one B=1 patch and the foundational alignment, so it gets a
-    larger budget than the per-phase fine patches. CPU still uses the serial
-    derivative-free optimizer (no launch overhead to amortize there)."""
+    """Max Adam iterations for the single global level-0 patch, on every device.
+    Only the Adam optimizer reads it; Gauss-Newton's level-0 budget is
+    :attr:`gn_iters_lev0`."""
 
     hfactor_q: float = 1.0
     """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
@@ -1404,6 +1418,7 @@ def _warpomatic(
                     max_iter=config.batch_optimizer_iters_lev0,
                     blok_index_vol=blok_index_vol,
                     nblok=nblok,
+                    gn_max_iter=config.gn_iters_lev0,
                 )
             else:
                 _improve_warp_serial(
@@ -2237,6 +2252,7 @@ def _improve_warp_batched(
     max_iter: int | None = None,
     blok_index_vol: Tensor | None = None,
     nblok: int = 0,
+    gn_max_iter: int | None = None,
 ) -> None:
     """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
 
@@ -2603,6 +2619,8 @@ def _improve_warp_batched(
             config.gn_iters_coarse,
             max(config.gn_iters, int(round(config.gn_iters * _taper))),
         )
+        if gn_max_iter is not None:
+            gn_budget = gn_max_iter
         best_params, _best_costs, opt_stats = optimize_warp_params_gauss_newton(
             gn_normal_eqs,
             gn_cost,
@@ -2611,6 +2629,7 @@ def _improve_warp_batched(
             param_max,
             device,
             max_iter=gn_budget,
+            stop_rule=config.gn_stop_rule,
         )
         if use_hybrid:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(

@@ -292,6 +292,7 @@ def optimize_warp_params_gauss_newton(
     max_iter: int = 8,
     lam0: float = 1e-3,
     tolerance: float = 1e-5,
+    stop_rule: str = "first_reject",
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Levenberg-damped Gauss-Newton over B patches at once.
 
@@ -320,6 +321,13 @@ def optimize_warp_params_gauss_newton(
         max_iter: GN iterations (each is one solve plus one cost evaluation).
         lam0: initial Levenberg damping, relative to the diagonal of JᵀJ.
         tolerance: stop once every patch improves by less than this, relatively.
+        stop_rule: ``"first_reject"`` ends the loop once every patch either was
+            rejected or gained < tolerance in the same iteration -- so one all-reject
+            round ends the fit, which at level 0 and the coarse levels (1-6 patches)
+            it routinely does. ``"freeze"`` treats a rejection as Levenberg intends:
+            raise the damping and retry. A patch freezes only when an *accepted* step
+            gains < tolerance or its damping reaches the cap; the loop ends when
+            every patch is frozen or the budget is spent.
 
     Returns:
         (best_params, best_costs, stats).
@@ -330,11 +338,21 @@ def optimize_warp_params_gauss_newton(
     lam = torch.full((B, 1, 1), lam0, device=device, dtype=torch.float32)
     eye = torch.eye(n_params, device=device, dtype=torch.float32).expand(B, -1, -1)
 
+    if stop_rule not in ("first_reject", "freeze"):
+        raise ValueError(f"unknown GN stop rule {stop_rule!r}")
+    freeze = stop_rule == "freeze"
+    frozen = torch.zeros(B, dtype=torch.bool, device=device)
+    lam_cap = 1e6
+
     n_evals = 1
     iters_done = 0
+    hmat = grad = None
     for _ in range(max_iter):
         iters_done += 1
-        hmat, grad = normal_eqs_fn(best_params)
+        # After a round in which no patch moved, the parameters -- and so the
+        # normal equations -- are exactly what they were; only the damping changed.
+        if hmat is None or grad is None:
+            hmat, grad = normal_eqs_fn(best_params)
 
         # Marquardt scaling: damp each parameter by its own curvature rather than
         # by a shared absolute value, so the step is invariant to how the basis
@@ -352,17 +370,28 @@ def optimize_warp_params_gauss_newton(
         n_evals += 1
 
         better = trial_costs < best_costs
+        if freeze:
+            better = better & ~frozen
         rel = (best_costs - trial_costs).abs() / best_costs.abs().clamp_min(1e-12)
         best_params = torch.where(better.unsqueeze(-1), trial, best_params)
         best_costs = torch.where(better, trial_costs, best_costs)
         # Classic Levenberg feedback, per patch: trust the model more when it
         # worked, less when it did not.
         lam = torch.where(
-            better.view(B, 1, 1), (lam * 0.33).clamp_min(1e-9), (lam * 4.0).clamp_max(1e6)
+            better.view(B, 1, 1), (lam * 0.33).clamp_min(1e-9), (lam * 4.0).clamp_max(lam_cap)
         )
 
-        if bool(((~better) | (rel < tolerance)).all()):
-            break
+        if freeze:
+            capped = (~better) & (lam.view(B) >= lam_cap)
+            frozen = frozen | (better & (rel < tolerance)) | capped
+            if bool(frozen.all()):
+                break
+            if bool(better.any()):
+                hmat = grad = None
+        else:
+            hmat = grad = None
+            if bool(((~better) | (rel < tolerance)).all()):
+                break
 
     stats = BatchOptStats(
         steps_run=iters_done,
