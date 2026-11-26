@@ -599,7 +599,7 @@ class TestPresets:
 
         assert preset_for("epi2epi", "formwarp") is None
         args = parse_args(["-base", "b", "-source", "s", "-prefix", "o", "-type", "epi2epi"])
-        assert args.total_var == 0.0  # the built-in default, untouched
+        assert args.total_var is None  # untouched: the -style default decides it
 
     def test_help_text_is_generated_from_the_presets(self):
         from fastfuncstuff.processing.tunespec import describe_presets
@@ -652,9 +652,10 @@ class TestPhysicalUnits:
     def test_smoothing_sigmas_are_millimetres(self):
         from fastfuncstuff.processing.tunespec import config_in_voxel_units
 
+        # The ladder is a sigma in mm; formwarp's flags take ANTs' variances in voxels^2.
         out = config_in_voxel_units("formwarp", {"total_var": 3.0, "update_var": 1.5}, (2.0,) * 3)
-        assert out["total_var"] == pytest.approx(1.5)
-        assert out["update_var"] == pytest.approx(0.75)
+        assert out["total_var"] == pytest.approx(1.5**2)
+        assert out["update_var"] == pytest.approx(0.75**2)
 
     def test_zero_smoothing_stays_off(self):
         """0 mm means "no smoothing", which must not be floored into some."""

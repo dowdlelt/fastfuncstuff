@@ -40,6 +40,7 @@ differentiable form. See ``../fmri_wiki/concepts/SyN.md``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -110,7 +111,16 @@ FOLD_GUARD_FLOOR = 0.05
 
 @dataclass
 class SynConfig:
-    """Configuration for the SyN engine."""
+    """Configuration for the SyN engine.
+
+    The defaults are antsRegistration's SyN stage as antsRegistrationSyN.sh runs it --
+    ``-t SyN[0.1,3,0] -m CC[f,m,1,4] -c [100x70x50x20,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox``
+    -- in ANTs' own units, and the engine follows ITK's SyNImageRegistrationMethod step
+    for step (see ../fmri_wiki/concepts/SyN.md, "Parity with antsRegistration": Dice
+    0.6237 against ANTs' 0.6240 on 48 NIREP pairs, transported-label agreement 0.981).
+    :data:`LEGACY_SYN` holds the engine as it was before that, for callers whose
+    settings were tuned against it.
+    """
 
     metric: str = "cc"
     """Image metric: 'cc' (neighborhood cross-correlation, the ANTs SyN default),
@@ -126,42 +136,47 @@ class SynConfig:
     lpa_kernel: str = "gauss"
     """Neighborhood kernel for lpa/lpc: 'gauss' or 'box'."""
 
-    grad_step: float = 0.25
-    """Max per-iteration displacement (voxels) after update-field normalization.
-    The ANTs SyN[gradientStep]; smaller is safer, larger converges faster."""
+    grad_step: float = 0.1
+    """Max per-iteration displacement (voxels of the level) after update-field
+    normalization: ANTs' SyN[gradientStep]. Smaller is safer, larger converges faster."""
 
     update_var: float | tuple[float, ...] = 3.0
-    """Fluid regularization: Gaussian sigma smoothing the per-iteration update field.
-    A **sigma**, where ANTs' SyN[,updateFieldVarianceInVoxelSpace] is a *variance*: ANTs'
-    3 is sigma sqrt(3) = 1.732 here. A single value applies to every level; a per-level
-    tuple (one entry per shrink factor) overrides it level by level.
+    """Fluid regularization: the **variance** (voxels^2) of the Gaussian smoothing the
+    per-iteration update field -- ANTs' SyN[,updateFieldVarianceInVoxelSpace], same units
+    (ITK passes it to ``GaussianOperator::SetVariance``), so 3 is sigma 1.732. Until
+    2026-11-26 this was a sigma; old values square to the new ones. A single value
+    applies to every level; a per-level tuple (one per shrink factor) overrides it.
 
-    Note the units already do most of the work: the sigma is in **voxels of the level's
-    own grid**, so a constant 3 is 12 full-resolution voxels at shrink=4 and 3 at
-    shrink=1. The physical smoothing therefore scales with the pyramid for free, which
+    Note the units already do most of the work: it is in **voxels of the level's
+    own grid**, so a constant value is 4x the physical sigma at shrink=4 that it is
+    at shrink=1. The physical smoothing therefore scales with the pyramid for free, which
     is why ANTs specifies this in voxel space and holds it constant. Per-level control
     is an extension over that, for the case where coarse and fine levels genuinely want
     different priors -- the coarse-level regularisation is what was carrying the quality
     on NIREP na02->na01 -- not a correction to it."""
 
     total_var: float | tuple[float, ...] = 0.0
-    """Elastic regularization: Gaussian sigma smoothing the accumulated field (0 = off).
-    ANTs' SyN[,,totalFieldVarianceInVoxelSpace] is the square of this. Scalar or
-    per-level, as :attr:`update_var`.
+    """Elastic regularization: variance (voxels^2) of the Gaussian smoothing the
+    accumulated field, 0 = off -- ANTs' SyN[,,totalFieldVarianceInVoxelSpace]. Scalar or
+    per-level, as :attr:`update_var`. (A sigma until 2026-11-26.)
 
     Measured on NIREP na02->na01, a constant 1-2 here is badly counterproductive
     (LNCC 0.374 against 0.549): it re-smooths the *accumulated* field on every
     iteration, so the warp decays as fast as it is built. If it is useful at all it will
     be at one level, which is what the per-level form is for."""
 
-    shrink_factors: tuple[int, ...] = (4, 2, 1)
+    shrink_factors: tuple[int, ...] = (8, 4, 2, 1)
     """Per-level isotropic downsample factor (ANTs -f). Coarse-to-fine."""
 
-    smoothing_sigmas: tuple[float, ...] = (2.0, 1.0, 0.0)
+    smoothing_sigmas: tuple[float, ...] = (3.0, 2.0, 1.0, 0.0)
     """Per-level Gaussian pre-smoothing sigma in voxels (ANTs -s ...vox)."""
 
-    iterations: tuple[int, ...] = (300, 210, 120)
-    """Per-level iteration **ceiling** — a bound, not a target.
+    iterations: tuple[int, ...] = (100, 70, 50, 20)
+    """Per-level iteration **ceiling** -- ANTs' -c, whose default this is.
+
+    The note below is from the legacy engine (:data:`LEGACY_SYN`, ceiling 300x210x120),
+    whose stop rule could not fire on a steady descent; ITK's rule
+    (:attr:`convergence_rule`) does, and ANTs' own ceilings apply.
 
     Deliberately set about 3x higher than the level actually needs, because this is
     not a quality knob to be tuned: too few iterations is always wrong, and too many
@@ -212,8 +227,9 @@ class SynConfig:
     +0.044 lpa lost at any patience <= 30). It is the right stop when legality is
     monotone (e.g. with :attr:`fold_guard` on); see ``illegal_iters`` in the level log."""
 
-    fold_penalty: float = 0.033333
-    """Strength of the **soft** anti-folding penalty added to the cost; 0 disables it.
+    fold_penalty: float = 0.0
+    """Strength of the **soft** anti-folding penalty added to the cost; 0 (ANTs: none)
+    disables it. The legacy engine defaulted to 0.033333.
 
     AFNI's ``IW3D_load_energy`` penalty (``processing/penalty.py``, shared with qwarp's
     ``-penfac``), and the default because forbidding folds outright is the wrong shape
@@ -318,8 +334,9 @@ class SynConfig:
     it under, handing the finer level a field that was illegal before its first step.
     """
 
-    metric_gradient: str = "exact"
-    """How the cc update field is computed: 'exact' or 'local'.
+    metric_gradient: str = "auto"
+    """How the update field is computed: 'exact', 'local', or 'auto' (local for cc,
+    exact for every other metric).
 
     'exact' is the autograd gradient of the windowed-CC cost: every voxel collects a
     term from each of the (2r+1)^3 windows that contain it. 'local' is what ANTs'
@@ -332,37 +349,37 @@ class SynConfig:
     13,600x its in-brain mean at shrink 8 (ANTs' local form: 19x), so after scaling the
     brain hardly moves."""
 
-    step_norm: str = "joint"
+    step_norm: str = "per_half"
     """How the step is scaled to :attr:`grad_step`: 'joint' (the largest combined
     two-half displacement is grad_step) or 'per_half' (each half's largest is
     grad_step, as ITK's ``SyNImageRegistrationMethod::ScaleUpdateField`` does). With
     symmetric halves 'joint' moves each by up to 1/sqrt(2) as far."""
 
-    update_rule: str = "additive"
+    update_rule: str = "compose"
     """'additive': ``phi += step``, inverses re-derived by :attr:`inverter`. 'compose':
     ITK ``SyNImageRegistrationMethod`` -- each half's *inverse* (image -> middle) has
     the other image's scaled update composed onto it, ``D(x) + u(x + D(x))``, and the
     half is re-derived by inverting that (requires ``inverter='itk'``)."""
 
-    inverter: str = "fixed_point"
+    inverter: str = "itk"
     """'fixed_point': :attr:`invert_iters` undamped sweeps from ``-d``, round trip kept
     only if it converged and did no harm. 'itk': ITK ``InvertDisplacementFieldImageFilter``
     as SyN calls it -- warm-started from the previous inverse, damped (0.75 then 0.5,
     per-voxel capped), up to 20 sweeps until max error 0.1 or mean 0.001 voxel, zero on
     the volume faces -- and the forward always re-derived from the inverse."""
 
-    pin_boundary: bool = False
+    pin_boundary: bool = True
     """Zero the smoothed update field on the volume faces, as ITK's
     ``GaussianSmoothDisplacementField`` does whenever its variance is positive."""
 
-    convergence_rule: str = "window"
+    convergence_rule: str = "itk"
     """'window': :func:`_convergence_value` (the window normalised by its own range, so
     it never fires on a steady descent). 'itk': ITK ``WindowConvergenceMonitoringFunction``
     -- the window divided by the level's running total of |cost| and the end slope of a
     straight-line fit over it, which does fire on a descent that has slowed. ANTs on
     NIREP na16 -> na09 stopped at 27/100 and 29/70 iterations by it."""
 
-    pyramid: str = "corners"
+    pyramid: str = "itk"
     """Level grids. 'corners': ceil(n / f) voxels stretched so the first and last land on
     the full grid's first and last, and each level warps its own shrunk images. 'itk':
     ITK ``ShrinkImageFilter`` geometry, as antsRegistration uses -- floor(n / f) voxels
@@ -372,14 +389,14 @@ class SynConfig:
     at identity and drifts from it as soon as the points move (measured: 9% larger
     displacement after three level-1 iterations)."""
 
-    field_kernel: str = "sampled"
+    field_kernel: str = "discrete"
     """Kernel for the update/total field smoothing: 'sampled' (a sampled Gaussian of
     sigma ``update_var``) or 'discrete' (ITK ``GaussianOperator``: the discrete Gaussian
     exp(-t) I_n(t) with variance t = sigma^2, cut at 0.001 lost mass, which is what ITK
     SyN smooths with). The discrete kernel is peakier -- centre 0.243 against 0.230 at
     variance 3 -- so the max-normalised step comes out ~4% shorter."""
 
-    restore_best: bool = True
+    restore_best: bool = False
     """Return each level's lowest-cost (legal) iterate. False returns the last one, as
     ITK SyN does."""
 
@@ -403,6 +420,29 @@ class SynConfig:
 
     verb: int = 1
     """Verbosity (0=quiet, 1=normal, 2=detailed)."""
+
+
+LEGACY_SYN: dict = {
+    "grad_step": 0.25,
+    "update_var": 9.0,  # sigma 3
+    "total_var": 0.0,
+    "shrink_factors": (4, 2, 1),
+    "smoothing_sigmas": (2.0, 1.0, 0.0),
+    "iterations": (300, 210, 120),
+    "fold_penalty": 0.033333,
+    "metric_gradient": "exact",
+    "step_norm": "joint",
+    "update_rule": "additive",
+    "inverter": "fixed_point",
+    "pin_boundary": False,
+    "convergence_rule": "window",
+    "pyramid": "corners",
+    "field_kernel": "sampled",
+    "restore_best": True,
+}
+"""The engine before ANTs parity (2026-11-26), as :class:`SynConfig` overrides --
+``replace(SynConfig(), **LEGACY_SYN)``, or ``ffs_formwarp -style legacy``. For callers
+whose settings were chosen against it (autoproc's nonlinear steps)."""
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +559,9 @@ def _local_cc_update(
     k = 2 * radius + 1
     w = weight
     stack = torch.stack((w, w * f, w * m, w * f * f, w * m * m, w * f * m))[None]
-    sums = F.avg_pool3d(stack, k, stride=1, padding=radius, count_include_pad=True)[0]
+    # Zero-pad explicitly: avg_pool3d's own padding refuses a level smaller than the window.
+    stack = F.pad(stack, (radius,) * 6)
+    sums = F.avg_pool3d(stack, k, stride=1)[0]
     n, sf, sm, sff, smm, sfm = (sums * float(k**3)).unbind(0)
     n_safe = n.clamp(min=_EPS)
     mean_f, mean_m = sf / n_safe, sm / n_safe
@@ -1544,8 +1586,9 @@ def _syn_level(
     """
     (fxd, fyd, fzd), (ifxd, ifyd, ifzd), (mxd, myd, mzd), (imxd, imyd, imzd) = fields
     # formwarp() resolves the per-level forms before calling; a level sees one number.
-    update_var = float(config.update_var)  # type: ignore[arg-type]
-    total_var = float(config.total_var)  # type: ignore[arg-type]
+    # ANTs' units: variances, in voxels^2 of this level's grid.
+    update_var = math.sqrt(max(float(config.update_var), 0.0))  # type: ignore[arg-type]
+    total_var = math.sqrt(max(float(config.total_var), 0.0))  # type: ignore[arg-type]
     flags = config.warp_flags
     window = config.convergence_window
     patience = config.best_patience
@@ -1598,7 +1641,9 @@ def _syn_level(
 
     if config.update_rule == "compose" and config.inverter != "itk":
         raise ValueError("update_rule='compose' needs inverter='itk'")
-    local_grad = config.metric_gradient == "local"
+    local_grad = config.metric_gradient == "local" or (
+        config.metric_gradient == "auto" and config.metric == "cc"
+    )
 
     def warp(level_img: Tensor, which: int, d: Field) -> Tensor:
         if full_images is not None and full_images[2] > 1:

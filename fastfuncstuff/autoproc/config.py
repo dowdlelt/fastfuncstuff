@@ -50,12 +50,15 @@ DEFAULT_OPTS: dict[str, str] = {
     # voxels apart, beyond a single fine pass's capture range.
     "xrun_moco": "-twopass",
     # cross-run nonlinear refinement (formwarp/SyN residual). -final_interp wsinc5
-    # for the same reason (sharper warped mean).
-    "xrun_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    # for the same reason (sharper warped mean). Every *_nl step here pins
+    # -style legacy: these settings were validated against formwarp before its
+    # ANTs-parity defaults (2026-11-26), and -update_var 4 is the old sigma 2 in the
+    # variance units the flag now takes.
+    "xrun_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-07",
     # cross-fmap linear/nonlinear (align non-ref fmap groups to the ref fmap).
     "xfmap": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
-    "xfmap_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "xfmap_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # cross-family linear: a child acquisition family's corrected anchor onto the
     # root family's, both in anat space — same contrast, so lpa, not the anat's lpc.
@@ -63,16 +66,16 @@ DEFAULT_OPTS: dict[str, str] = {
     # cross-family nonlinear (-xfam_nonlin): the child's corrected grandmean onto the
     # root's corrected anchor pulled back onto the child's grid, PE axis only (the
     # emitter adds the -no?dis flags). Same-contrast, so the cross-run settings.
-    "xfam_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "xfam_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # cross-session linear/nonlinear (session grandmean → ref session).
     "xses": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
-    "xses_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "xses_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # anat nonlinear by registration (-anat_nonlin_method register): the anat
     # anchor refined onto the anat in the anchor's own frame, PE axis only (the
     # emitter adds the -no?dis flags from the runs' PE direction).
-    "anat_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "anat_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # anat linear (cross-modal EPI→anat) — lpc with EPI masked to brain.
     "anat": "-rigid -cost lpc -source_automask -autoweight -interp cubic -cmass -fast -final wsinc5",
@@ -98,7 +101,7 @@ DEFAULT_OPTS: dict[str, str] = {
     # itself, not just the forward-warp file.)
     "ref_anat_seg": "",
     # ...or by registration (-ref_anat_nonlin_method register), in the ref's frame.
-    "ref_anat_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "ref_anat_nl": "-style legacy -metric lpa -cc_radius 4 -update_var 4 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # T2w → T1w before a two-channel segmentation. Rigid: one head, one session,
     # so anything past pose is contrast, not motion. lpc because the two are

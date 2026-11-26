@@ -42,13 +42,32 @@ def _blobs(nz: int, ny: int, nx: int, shift=(0.0, 0.0, 0.0)) -> torch.Tensor:
     )
 
 
-def test_config_defaults():
+def test_config_defaults_are_antsregistration_syn():
+    """antsRegistrationSyN.sh's SyN stage, in ANTs' units: SyN[0.1,3,0], CC radius 4,
+    -c [100x70x50x20,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox."""
     cfg = SynConfig()
-    assert cfg.metric == "cc"
-    assert cfg.cc_radius == 4
-    assert cfg.update_var == 3.0
-    assert cfg.total_var == 0.0
-    assert cfg.shrink_factors == (4, 2, 1)
+    assert (cfg.metric, cfg.cc_radius) == ("cc", 4)
+    assert (cfg.grad_step, cfg.update_var, cfg.total_var) == (0.1, 3.0, 0.0)
+    assert cfg.iterations == (100, 70, 50, 20)
+    assert cfg.shrink_factors == (8, 4, 2, 1)
+    assert cfg.smoothing_sigmas == (3.0, 2.0, 1.0, 0.0)
+    assert (cfg.convergence_threshold, cfg.convergence_window) == (1e-6, 10)
+    assert cfg.fold_penalty == 0.0 and not cfg.restore_best
+
+
+def test_legacy_style_is_the_pre_parity_engine():
+    from dataclasses import replace
+
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
+    cfg = replace(SynConfig(), **LEGACY_SYN)
+    assert cfg.shrink_factors == (4, 2, 1) and cfg.iterations == (300, 210, 120)
+    assert cfg.update_var == 9.0  # the old sigma-3 default, now a variance
+    assert (cfg.metric_gradient, cfg.inverter, cfg.update_rule) == (
+        "exact",
+        "fixed_point",
+        "additive",
+    )
     assert len(cfg.shrink_factors) == len(cfg.smoothing_sigmas) == len(cfg.iterations)
 
 
@@ -638,18 +657,16 @@ def test_fold_guard_lets_an_inherited_fold_be_climbed_out_of_but_not_deepened():
         assert torch.equal(kept_axis, prev_axis)
 
 
-def test_fold_guard_is_off_by_default_and_the_soft_penalty_is_on():
-    """The default is to discourage folds, not to forbid them.
+def test_fold_guard_is_off_by_default_and_the_soft_penalty_is_legacy_only():
+    """ANTs has no fold control beyond its smoothing, so neither is on by default; the
+    legacy engine discouraged folds with the soft penalty rather than forbidding them
+    (the hard guard fought 47,788 voxels of legitimate compression on NIREP na02->na01
+    to prevent 13 actual folds)."""
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN, _additive_step_with_fold_guard
 
-    Forbidding is the right call case by case (blipflip's single-axis fields), but as a
-    default it fought 47,788 voxels of legitimate compression on NIREP na02->na01 to
-    prevent 13 actual folds.
-    """
-    from fastfuncstuff.processing.formwarp import _additive_step_with_fold_guard
-
-    config = SynConfig()
-    assert config.fold_guard == 0.0
-    assert config.fold_penalty > 0.0
+    assert SynConfig().fold_guard == 0.0 and SynConfig().fold_penalty == 0.0
+    assert LEGACY_SYN["fold_penalty"] > 0.0
+    config = SynConfig(fold_penalty=LEGACY_SYN["fold_penalty"])
 
     # With the guard off the step is taken verbatim, folds and all.
     prev = tuple(torch.zeros(20, 20, 20) for _ in range(3))
@@ -668,7 +685,7 @@ def test_fold_penalty_charges_a_fold_and_not_ordinary_compression():
     """Its deadband is the point: shrinking a structure is anatomy, inverting is not."""
     from fastfuncstuff.processing.formwarp import _fold_penalty, jacobian_determinant
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
 
     def field(slope):
         x = torch.zeros(16, 16, 16)
@@ -821,7 +838,7 @@ def test_sparse_fold_penalty_matches_the_dense_form(amplitude):
     from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty
     from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
 
     def dense(fields):
         je, se = compute_jacobian_energy(*fields)
@@ -858,7 +875,7 @@ def test_fold_penalty_face_voxels_are_not_half_counted():
     from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty, _pad_linear1
     from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
     ramp = torch.zeros(12, 12, 12)
     ramp[:, :, 1:] = -6.0  # the jump is right against the x face
     face = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
@@ -1052,7 +1069,7 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
     source = [torch.randn(5, 6, 7, generator=g, dtype=dtype) * 2 for _ in range(3)]
     direct = [f.clone().requires_grad_() for f in source]
     padded = [f.clone().requires_grad_() for f in source]
-    actual = fw._fold_penalty(tuple(direct), SynConfig())
+    actual = fw._fold_penalty(tuple(direct), SynConfig(fold_penalty=0.033333))
 
     def padded_gather(field, centres):
         full = fw._pad_linear1(field)
@@ -1062,7 +1079,7 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
         return full[nbr[..., 0], nbr[..., 1], nbr[..., 2]].reshape(-1, 3, 3, 3)
 
     monkeypatch.setattr(fw, "_gather_linear1_patches", padded_gather)
-    expected = fw._fold_penalty(tuple(padded), SynConfig())
+    expected = fw._fold_penalty(tuple(padded), SynConfig(fold_penalty=0.033333))
     assert actual.item() > 0
     bits = torch.int32 if dtype == torch.float32 else torch.int64
     assert torch.equal(actual.view(bits), expected.view(bits))
@@ -1076,10 +1093,10 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
 def _patience_run(jac_floor: float, best_patience: int):
     fixed = _blobs(20, 22, 20)
     moving = _blobs(20, 22, 20, shift=(2.5, -1.5, 1.0))
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
     config = SynConfig(
-        shrink_factors=(1,),
-        smoothing_sigmas=(0.0,),
-        iterations=(40,),
+        **{**LEGACY_SYN, "shrink_factors": (1,), "smoothing_sigmas": (0.0,), "iterations": (40,)},
         # Keep the raw-cost trend from ever firing, so only patience can stop the level.
         convergence_window=5,
         convergence_threshold=-1e9,
@@ -1217,7 +1234,11 @@ def test_ants_parity_options_recover_a_known_shift():
 
 def test_compose_needs_the_itk_inverter_and_local_needs_cc():
     fixed = _blobs(8, 8, 8)
-    for bad in ({"update_rule": "compose"}, {"metric_gradient": "local", "metric": "lpa"}):
+    bad_configs = (
+        {"update_rule": "compose", "inverter": "fixed_point"},
+        {"metric_gradient": "local", "metric": "lpa"},
+    )
+    for bad in bad_configs:
         cfg = SynConfig(
             shrink_factors=(1,), smoothing_sigmas=(0.0,), iterations=(2,), verb=0, **bad
         )
@@ -1287,3 +1308,26 @@ def test_full_resolution_level_sampling_matches_the_shrunk_image_at_identity():
     one = torch.ones_like(lvl)
     shifted = _warp_level_from_full(full, one, zero, zero, 4)
     torch.testing.assert_close(shifted[..., :-1], lvl[..., 1:])
+
+
+def test_cli_style_sets_the_defaults_and_explicit_flags_win():
+    from fastfuncstuff.cli.formwarp import _style_knobs, parse_args
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
+    base = ["-base", "b", "-source", "s", "-prefix", "o"]
+    assert _style_knobs(parse_args(base)) == {}  # SynConfig's own (ANTs) defaults
+    assert _style_knobs(parse_args([*base, "-style", "legacy"])) == LEGACY_SYN
+    knobs = _style_knobs(
+        parse_args(
+            [*base, "-style", "legacy", "-update_var", "4", "-keep", "last", "-iters", "5x5x5"]
+        )
+    )
+    assert knobs["update_var"] == 4.0 and knobs["restore_best"] is False
+    assert knobs["iterations"] == (5, 5, 5) and knobs["inverter"] == "fixed_point"
+    # ANTs' per-level variance spelling.
+    assert _style_knobs(parse_args([*base, "-update_var", "16x9x4x3"]))["update_var"] == (
+        16.0,
+        9.0,
+        4.0,
+        3.0,
+    )

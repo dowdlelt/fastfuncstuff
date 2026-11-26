@@ -8,7 +8,8 @@ Arms:
 - antsRegistration rigid + affine + SyN (the antsRegistrationSyN.sh stages) to the template
   brain, from the cohort's own brain extraction.
 - ffs as autoproc -do_mni runs it: ffs_allineate with autoproc's MNI affine options, then a
-  nonlinear backend with -type MNI_T1a (optiwarp_hs, the autoproc default; qwarp; formwarp),
+  nonlinear backend: optiwarp_hs (the autoproc default) and qwarp with -type MNI_T1a, and
+  formwarp with ANTs' own SyN stage flag for flag (it reproduces antsRegistration's SyN),
   from the same brain extraction as ANTs.
 ANTs and ffs share a strip neither made, so their comparison is registration only; @SSwarper
 is judged whole, strip included, because that is how it is used.
@@ -43,16 +44,31 @@ from .base import (
     timed,
     timed_cached,
 )
-from .warp_pair import _ants_version, _dice_per_label, _load, deformation_judges, label_judges
+from .warp_pair import (
+    FORMWARP_AS_ANTS,
+    _ants_version,
+    _dice_per_label,
+    _load,
+    deformation_judges,
+    label_judges,
+)
 
 TEMPLATE = "MNI152_2009_template_SSW.nii.gz"
 # autoproc config DEFAULT_OPTS["mni"] / ["mni_nonlin"] and NL_BACKEND_OPTS, as of 2026-11-25
 MNI_AFFINE = ["-affine", "-cost", "lpa", "-source_automask", "-autoweight", "-cmass",
               "-tbest", "16", "-final", "wsinc5"]  # fmt: skip
 FFS_NL: dict[str, tuple[str, list[str]]] = {
-    "optiwarp_hs": ("ffs_optiwarp", ["-force", "hs", "-metric", "lpa", "-final_interp", "wsinc5"]),
-    "qwarp": ("ffs_qwarp", ["-optimizer", "gn", "-cost", "lpa", "-final", "wsinc5"]),
-    "formwarp": ("ffs_formwarp", ["-metric", "lpa", "-final_interp", "wsinc5"]),
+    "optiwarp_hs": (
+        "ffs_optiwarp",
+        ["-force", "hs", "-metric", "lpa", "-final_interp", "wsinc5", "-type", "MNI_T1a"],
+    ),
+    "qwarp": (
+        "ffs_qwarp",
+        ["-optimizer", "gn", "-cost", "lpa", "-final", "wsinc5", "-type", "MNI_T1a"],
+    ),
+    # ANTs' SyN stage (ANTS_STAGES' last -t), flag for flag in ANTs' units, and no -type
+    # preset: this arm is the ANTs-parity engine, not a tuned fit.
+    "formwarp": ("ffs_formwarp", [*FORMWARP_AS_ANTS, "-final_interp", "wsinc5"]),
 }
 ANTS_STAGES = [
     "-t", "Rigid[0.1]", "-m", "MI[{T},{S},1,32,Regular,0.25]", "-c", "[1000x500x250x0,1e-6,10]",
@@ -264,7 +280,7 @@ class WarpMniCheck(Check):
             extra = [] if cli == "ffs_qwarp" else ["-save_warp"]
             t = timed_cached(
                 [cli, "-base", str(T), "-source", str(al), "-prefix", str(prefix), *args,
-                 "-type", "MNI_T1a", *extra, "-device", device],
+                 *extra, "-device", device],
                 d / "fit.timing.json", [warped, warp], work, log, timeout_s=self.timeout_s,
             )  # fmt: skip
             # the user's cost is affine + nonlinear; the affine is shared, so add it here
@@ -290,7 +306,7 @@ class WarpMniCheck(Check):
                                  "template": str(tpl), "args": ["-extra_qc_off"]}  # fmt: skip
         res.provenance["ref_ants"] = {"tool": "antsRegistration", "version": _ants_version(),
                                       "stages": ANTS_STAGES, "input": "cohort brain extraction"}  # fmt: skip
-        res.provenance["ffs"] = {"affine": MNI_AFFINE, "nonlinear": {k: [c, *a, "-type", "MNI_T1a"]
+        res.provenance["ffs"] = {"affine": MNI_AFFINE, "nonlinear": {k: [c, *a]
                                  for k, (c, a) in FFS_NL.items()}, **ffs_version(), "device": device}  # fmt: skip
         return res
 

@@ -309,12 +309,15 @@ class TestCeilingIsNotSearched:
             assert "optiwarp.conv_window" in r.tune, r.name
 
     def test_defaults_leave_real_headroom(self):
-        """A ceiling only helps if it is comfortably above what levels use."""
-        from fastfuncstuff.processing.formwarp import SynConfig
+        """A ceiling only helps if it is comfortably above what levels use. formwarp's
+        default is ANTs' own -c 100x70x50x20 (ITK's stop rule ends levels early, as in
+        ANTs); the generous ceiling lives on in its legacy style and in optiwarp."""
+        from fastfuncstuff.processing.formwarp import LEGACY_SYN, SynConfig
         from fastfuncstuff.processing.optiwarp import OptiwarpConfig
 
-        for cfg in (SynConfig(), OptiwarpConfig()):
-            assert cfg.iterations == (300, 210, 120)
+        assert OptiwarpConfig().iterations == (300, 210, 120)
+        assert LEGACY_SYN["iterations"] == (300, 210, 120)
+        assert SynConfig().iterations == (100, 70, 50, 20)
 
     def test_iters_remains_available_to_pin_or_tune(self):
         """Not searched by default is not the same as unreachable."""
