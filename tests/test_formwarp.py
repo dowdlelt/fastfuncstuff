@@ -1214,3 +1214,17 @@ def test_compose_needs_the_itk_inverter_and_local_needs_cc():
         )
         with pytest.raises(ValueError):
             formwarp(fixed, fixed, config=cfg, device=DEVICE)
+
+
+def test_itk_convergence_rule_reproduces_values_ants_logged():
+    """antsRegistration 2.6.2 --verbose, SyN level 1 on NIREP na16 -> na09."""
+    from fastfuncstuff.processing.formwarp import _convergence_value_itk
+
+    costs = [-0.9229865616005, -0.9352954357143, -0.9457278091161, -0.9541868123502,
+             -0.9607977710501, -0.9655545575694, -0.9690932685600, -0.9718242223448,
+             -0.9737197689329, -0.9750670069224, -0.9761224189108, -0.9770690239435,
+             -0.9779700489066, -0.9787069160454, -0.9788276503336]  # fmt: skip
+    assert _convergence_value_itk(costs[:9], 10) == float("inf")
+    # Measured agreement ~0.1-0.4%; a least-squares line would be off by 57%.
+    assert _convergence_value_itk(costs[:10], 10) == pytest.approx(3.319450560794e-03, rel=5e-3)
+    assert _convergence_value_itk(costs[:15], 10) == pytest.approx(5.469584820331e-04, rel=5e-3)

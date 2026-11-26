@@ -354,6 +354,13 @@ class SynConfig:
     """Zero the smoothed update field on the volume faces, as ITK's
     ``GaussianSmoothDisplacementField`` does whenever its variance is positive."""
 
+    convergence_rule: str = "window"
+    """'window': :func:`_convergence_value` (the window normalised by its own range, so
+    it never fires on a steady descent). 'itk': ITK ``WindowConvergenceMonitoringFunction``
+    -- the window divided by the level's running total of |cost| and the end slope of a
+    straight-line fit over it, which does fire on a descent that has slowed. ANTs on
+    NIREP na16 -> na09 stopped at 27/100 and 29/70 iterations by it."""
+
     restore_best: bool = True
     """Return each level's lowest-cost (legal) iterate. False returns the last one, as
     ITK SyN does."""
@@ -1371,6 +1378,32 @@ def _convergence_value(
     return float(-slope)
 
 
+def _convergence_value_itk(costs: list[float], window: int) -> float:
+    """ITK ``WindowConvergenceMonitoringFunction::GetConvergenceValue``.
+
+    The last ``window`` costs, each divided by the sum of |cost| over the whole level so
+    far, are fitted on a [0, 1] abscissa by a linear B-spline with two control points --
+    ITK's ``BSplineScatteredDataPointSetToImageFilter``, i.e. the Lee-Wolberg-Shin
+    approximation, not least squares -- and minus its slope is returned. Reproduces the
+    values antsRegistration logs to ~0.1%.
+    """
+    if len(costs) < window:
+        return float("inf")
+    total = sum(abs(c) for c in costs)
+    if total <= 0:
+        return 0.0
+    u = [n / (window - 1) for n in range(window)]
+    phi = []
+    for basis in ((lambda t: 1.0 - t), (lambda t: t)):
+        num = den = 0.0
+        for t, c in zip(u, costs[-window:], strict=True):
+            b = basis(t)
+            num += b**3 * (c / total) / ((1.0 - t) ** 2 + t**2)
+            den += b**2
+        phi.append(num / den)
+    return -(phi[1] - phi[0])
+
+
 def _syn_level(
     fixed: Tensor,
     moving: Tensor,
@@ -1505,7 +1538,12 @@ def _syn_level(
 
         # Early stop once the windowed cost trend has flattened (or turned upward).
         if window > 0 and len(costs) >= window:
-            if _convergence_value(costs, window) < config.convergence_threshold:
+            conv = (
+                _convergence_value_itk(costs, window)
+                if config.convergence_rule == "itk"
+                else _convergence_value(costs, window)
+            )
+            if conv < config.convergence_threshold:
                 break
         # Nothing after the kept iterate is ever returned, so once it has stood for
         # ``patience`` iterations the rest of the level is work for nothing. Only once a

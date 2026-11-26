@@ -396,6 +396,13 @@ def parse_args(
         help="Zero the smoothed update on the volume faces (ITK SyN does).",
     )
     p.add_argument(
+        "-conv_rule",
+        choices=("window", "itk"),
+        default=_D.convergence_rule,
+        help="Early-stop measure: 'window' (range-normalised trailing slope) or 'itk' "
+        "(ANTs: trailing slope over the level's cumulative |cost|).",
+    )
+    p.add_argument(
         "-keep_last",
         action="store_true",
         help="Return each level's last iterate rather than its best (as ANTs).",
@@ -752,6 +759,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         inverter=args.inverter,
         pin_boundary=args.pin_boundary,
         restore_best=not args.keep_last,
+        convergence_rule=args.conv_rule,
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,
