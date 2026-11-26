@@ -566,6 +566,16 @@ Examples:
         "-nocmass", action="store_true", help="Disable center-of-mass pre-alignment"
     )
     search_group.add_argument(
+        "-cmass_partial",
+        type=float,
+        default=0.5,
+        metavar="FRAC",
+        help="No center-of-mass shift along an axis the source covers less than FRAC "
+        "of (by the base's nonzero extent), chosen per axis from the headers: a slab's "
+        "centroid is not the brain's, so on its short axis the shift drags it to the "
+        "middle. AFNI's -cmass+xz / align_epi_anat -partial_*. 0 turns it off.",
+    )
+    search_group.add_argument(
         "-use_headers",
         action="store_true",
         help="Trust the headers' placement, rotation (obliquity) included: start "
@@ -985,6 +995,7 @@ def build_align_config(
         powell_maxfev=powell_maxfev,
         cmass=not (args.nocmass or args.use_headers) and init_matrix is None,
         cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
+        cmass_partial_frac=args.cmass_partial,
         interp=args.interp,
         final_interp=args.final_interp,
         source_automask=args.source_automask,

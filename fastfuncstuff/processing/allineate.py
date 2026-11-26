@@ -187,6 +187,11 @@ class AffineAlignConfig:
     # estimate and uses these directly, so you can reproduce or hand-tune the
     # initial placement (manual positioning) instead of relying on COM matching.
     cmass_direct: tuple[float, float, float] | None = None
+    # Drop the cmass shift along a base axis the source covers less than this share of
+    # (by the base's nonzero extent): a slab's centroid sits in the slab, not the
+    # brain, so on that axis the shift drags it toward the brain's middle (Forest's
+    # posterior coronal slabs: 50-68 mm A-P). AFNI's -cmass+xz, chosen per axis. 0 = off.
+    cmass_partial_frac: float = 0.5
     # Starting transform, as an .aff12.1D would hold it: 4x4, base->source, AFNI
     # DICOM mm. Baked into the pre-resample exactly where the header grid map
     # goes, so the optimiser starts from it and searches only a residual -- the
@@ -1347,6 +1352,36 @@ def _center_of_mass(vol: Tensor, weight: Tensor | None = None) -> Tensor:
         indexing="ij",
     )
     return torch.stack([(w * ii).sum() / wsum, (w * jj).sum() / wsum, (w * kk).sum() / wsum])
+
+
+def _cmass_full_axes(
+    base: Tensor,
+    source_shape: tuple[int, ...],
+    base_affine: np.ndarray,
+    source_affine: np.ndarray,
+    grid_matrix: Tensor,
+    frac: float,
+) -> np.ndarray:
+    """Base voxel axes (x, y, z) along which the source covers the base's data.
+
+    Each source voxel axis is given to the base axis it runs along most (in mm), and
+    measured by its own length, n * voxel size: a tilted slab's bounding box is far
+    taller than the slab. A base axis is partial when a source axis on it is shorter
+    than ``frac`` of the base's nonzero extent there."""
+    s2b = np.linalg.inv(grid_matrix.detach().double().cpu().numpy())[:3, :3]
+    bvox = np.linalg.norm(np.asarray(base_affine, float)[:3, :3], axis=0)
+    svox = np.linalg.norm(np.asarray(source_affine, float)[:3, :3], axis=0)
+    nz = (base != 0).nonzero()  # (z, y, x) indices
+    if nz.shape[0] == 0:
+        return np.ones(3, bool)
+    span = (nz.amax(0) - nz.amin(0) + 1).double().cpu().numpy()[::-1] * bvox  # x, y, z mm
+    nsrc = list(source_shape)[::-1][:3]  # source tensors are (z, y, x)
+    keep = np.ones(3, bool)
+    for i in range(3):
+        j = int(np.argmax(np.abs(s2b[:, i]) * bvox))
+        if nsrc[i] * svox[i] < frac * span[j]:
+            keep[j] = False
+    return keep
 
 
 def _cmass_translation(base: Tensor, source: Tensor, grid_matrix: Tensor | None = None) -> Tensor:
@@ -3320,6 +3355,21 @@ def _prepare_grid(
     elif config.cmass and config.init_matrix is None:
         translation = _cmass_translation(base, source_native, grid_matrix=grid_matrix)
         cmass_shift = translation.cpu().numpy()
+        if grid_matrix is not None and config.cmass_partial_frac > 0:
+            assert base_header is not None and source_header is not None
+            keep = _cmass_full_axes(
+                base, source_native.shape, base_header["affine"], source_header["affine"],
+                grid_matrix, config.cmass_partial_frac,
+            )  # fmt: skip
+            if not keep.all():
+                if verb >= 1:
+                    # name the world direction: the base's voxel axes may be stored rotated
+                    ba = np.abs(np.asarray(base_header["affine"], float)[:3, :3])
+                    axes = ", ".join(("L-R", "A-P", "I-S")[int(np.argmax(ba[:, j]))]
+                                     for j in range(3) if not keep[j])  # fmt: skip
+                    print(f"  Center-of-mass: the source covers only part of the base along "
+                          f"{axes}; no shift along it")  # fmt: skip
+                cmass_shift = np.where(keep, cmass_shift, 0.0)
         if verb >= 1:
             t = cmass_shift
             print(f"  Center-of-mass shift: dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")
