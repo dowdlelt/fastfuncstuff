@@ -410,6 +410,12 @@ def parse_args(
         "'itk' (floor(n/f) voxels at spacing f, centred, as ANTs).",
     )
     p.add_argument(
+        "-field_kernel",
+        choices=("sampled", "discrete"),
+        default=_D.field_kernel,
+        help="Field smoothing kernel: 'sampled' Gaussian or ITK's 'discrete' Gaussian (as ANTs).",
+    )
+    p.add_argument(
         "-keep_last",
         action="store_true",
         help="Return each level's last iterate rather than its best (as ANTs).",
@@ -768,6 +774,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         restore_best=not args.keep_last,
         convergence_rule=args.conv_rule,
         pyramid=args.pyramid,
+        field_kernel=args.field_kernel,
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,

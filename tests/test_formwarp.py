@@ -771,7 +771,16 @@ def test_per_level_regularization_reaches_each_level():
     original = fw._syn_level
 
     def record(
-        fixed, moving, weight, fields, n_iter, config, level_tag="", guard=None, recorder=None
+        fixed,
+        moving,
+        weight,
+        fields,
+        n_iter,
+        config,
+        level_tag="",
+        guard=None,
+        recorder=None,
+        full_images=None,
     ):
         seen.append((level_tag, config.update_var, config.total_var))
         return original(fixed, moving, weight, fields, n_iter, config, level_tag, guard)
@@ -1249,3 +1258,32 @@ def test_itk_pyramid_grid_is_centred_at_spacing_f_and_fields_rescale():
     one = tuple(torch.ones(_itk_level_shape(full, 4)) for _ in range(3))
     assert torch.allclose(_itk_field_between(one, 4, 1, full)[0], torch.full(full, 4.0))
     assert torch.allclose(_itk_field_between(one, 4, 2, full)[1], torch.full((8, 11, 6), 2.0))
+
+
+def test_discrete_gaussian_is_itks_gaussian_operator():
+    """exp(-t) I_n(t), normalised; checked against scipy's ive at variance 3 (ITK
+    GaussianOperator, max error 0.001, gives 13 taps with centre 0.2431)."""
+    from scipy.special import ive
+
+    from fastfuncstuff.processing.formwarp import _discrete_gaussian_kernel
+
+    k = _discrete_gaussian_kernel(3.0, torch.device("cpu"), torch.float64)
+    assert k.numel() == 13
+    assert float(k.sum()) == pytest.approx(1.0, abs=1e-12)
+    raw = torch.tensor([ive(abs(n), 3.0) for n in range(-6, 7)], dtype=torch.float64)
+    torch.testing.assert_close(k, raw / raw.sum(), rtol=1e-12, atol=1e-14)
+    assert float(k[6]) == pytest.approx(0.24313, abs=1e-5)
+
+
+def test_full_resolution_level_sampling_matches_the_shrunk_image_at_identity():
+    from fastfuncstuff.processing.formwarp import _itk_to_level, _warp_level_from_full
+
+    g = torch.Generator().manual_seed(2)
+    full = torch.rand(17, 22, 13, generator=g)
+    lvl = _itk_to_level(full, 4)
+    zero = torch.zeros_like(lvl)
+    torch.testing.assert_close(_warp_level_from_full(full, zero, zero, zero, 4), lvl)
+    # A one-level-voxel shift in x reads the full image four voxels along.
+    one = torch.ones_like(lvl)
+    shifted = _warp_level_from_full(full, one, zero, zero, 4)
+    torch.testing.assert_close(shifted[..., :-1], lvl[..., 1:])
