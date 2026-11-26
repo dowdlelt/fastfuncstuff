@@ -82,7 +82,11 @@ from .optimizer import (
     optimize_warp_params_gauss_newton,
     optimize_warp_params_torch,
 )
-from .penalty import compute_hexahedron_energy, compute_penalty_batched, penalty_energy
+from .penalty import (
+    compute_hexahedron_energy,
+    compute_penalty_batched,
+    hexahedron_penalty_energy,
+)
 from .weight import _thd_cliplevel, add_background_band, compute_weight_image
 
 try:
@@ -2321,8 +2325,7 @@ def _improve_warp_batched(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
-            energy_global = penalty_energy(je_global, se_global)
+            energy_global = hexahedron_penalty_energy(state.xd, state.yd, state.zd)
             global_energy_sum = energy_global.sum()
             # Per-patch energy sums via the same summed-area table _filter_patches
             # uses: eight gathers for the whole phase instead of B slice-and-reduce
@@ -2847,10 +2850,9 @@ def _improve_warp_batched_multi(
         with torch.no_grad():
             for a in range(Na):
                 v = int(active_idx[a])
-                je, se = compute_hexahedron_energy(
+                energy = hexahedron_penalty_energy(
                     mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
-                )
-                energy = penalty_energy(je, se).reshape(-1)
+                ).reshape(-1)
                 patch_e = energy[flat_idx].sum(dim=1)  # (P,)
                 external_pen[a * P : (a + 1) * P] = energy.sum() - patch_e
 
@@ -4049,8 +4051,7 @@ def _improve_warp_batched_mescaled(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_g, se_g = compute_hexahedron_energy(state.xd, state.yd, state.zd)
-            energy_g = penalty_energy(je_g, se_g).reshape(-1)
+            energy_g = hexahedron_penalty_energy(state.xd, state.yd, state.zd).reshape(-1)
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)

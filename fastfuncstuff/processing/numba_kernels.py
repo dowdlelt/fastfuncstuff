@@ -869,3 +869,91 @@ def gn_normal_eqs_cpu(
     iu = np.triu_indices(ncol, 1)
     h[:, iu[1], iu[0]] = h[:, iu[0], iu[1]]
     return torch.from_numpy(h.astype(np.float32)), torch.from_numpy(gpart.sum(1).astype(np.float32))
+
+
+@njit(inline="always")
+def _sq(x):
+    return x * x
+
+
+@njit(parallel=True, cache=True)
+def _hexahedron_penalty_kernel(xd, yd, zd, cut, out):
+    nb, nz, ny, nx = xd.shape
+    half = _HALF
+    third = np.float32(1.0 / 3.0)
+    two = _F2
+    three = np.float32(3.0)
+    lo = np.float32(0.1)
+    hi = np.float32(10.0)
+    p23 = np.float32(2.0 / 3.0)
+    p4 = np.float32(4.0)
+    for task in prange(nb * nz):  # ty: ignore[not-iterable]
+        b = task // nz
+        k = task % nz
+        k1 = min(k + 1, nz - 1)  # replicate padding on the far faces
+        for j in range(ny):
+            j1 = min(j + 1, ny - 1)
+            for i in range(nx):
+                i1 = min(i + 1, nx - 1)
+                # penalty.compute_hexahedron_energy, op for op in float32: corner
+                # c0 = (k, j, i), c1 = +i, c2 = +j, c3 = +ij, c4 = +k, c5 = +ki,
+                # c6 = +kj, c7 = +kji.
+                fx = np.empty(3, np.float32)
+                fy = np.empty(3, np.float32)
+                fz = np.empty(3, np.float32)
+                for c in range(3):
+                    v = xd if c == 0 else (yd if c == 1 else zd)
+                    c0 = v[b, k, j, i]
+                    c1 = v[b, k, j, i1]
+                    c2 = v[b, k, j1, i]
+                    c3 = v[b, k, j1, i1]
+                    c4 = v[b, k1, j, i]
+                    c5 = v[b, k1, j, i1]
+                    c6 = v[b, k1, j1, i]
+                    c7 = v[b, k1, j1, i1]
+                    fx[c] = half * ((c1 - c0) + (c7 - c6))
+                    fy[c] = half * ((c2 - c0) + (c7 - c5))
+                    fz[c] = half * ((c4 - c0) + (c7 - c3))
+                fxx = fx[0] + _F1
+                fxy = fx[1]
+                fxz = fx[2]
+                fyx = fy[0]
+                fyy = fy[1] + _F1
+                fyz = fy[2]
+                fzx = fz[0]
+                fzy = fz[1]
+                fzz = fz[2] + _F1
+                det = (
+                    fxx * (fyy * fzz - fyz * fzy)
+                    - fxy * (fyx * fzz - fyz * fzx)
+                    + fxz * (fyx * fzy - fyy * fzx)
+                )
+                det = min(max(det, lo), hi)
+                je = third * _sq(det - _F1 / det)
+                norm = _sq(fxx) + _sq(fxy)
+                norm = norm + _sq(fxz)
+                norm = norm + _sq(fyx)
+                norm = norm + _sq(fyy)
+                norm = norm + _sq(fyz)
+                norm = norm + _sq(fzx)
+                norm = norm + _sq(fzy)
+                norm = norm + _sq(fzz)
+                vort = two * ((_sq(fyz - fzy) + _sq(fxz - fzx)) + _sq(fxy - fyx))
+                se = max((norm + vort) / det**p23 - three, _F0)
+                ej = max(je - cut, _F0)
+                es = max(se - cut, _F0)
+                out[b, k, j, i] = ej**p4 + es**p4
+
+
+def hexahedron_penalty_energy_cpu(xd: Tensor, yd: Tensor, zd: Tensor, cut: float) -> Tensor:
+    """``penalty_energy(*compute_hexahedron_energy(xd, yd, zd), cut)`` in one stencil pass.
+
+    The torch form builds eight padded corner views per component and ~40 full-size
+    temporaries; this reads the eight corners and writes one number per voxel, in
+    the same float32 op order. Any leading batch dimensions are kept.
+    """
+    shape = xd.shape
+    arrs = [t.detach().reshape(-1, *shape[-3:]).contiguous().numpy() for t in (xd, yd, zd)]
+    out = np.empty_like(arrs[0])
+    _with_threads(_hexahedron_penalty_kernel, *arrs, np.float32(cut), out)
+    return torch.from_numpy(out).reshape(shape)

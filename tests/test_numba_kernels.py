@@ -215,3 +215,29 @@ def test_fused_gn_normal_equations_match_the_chunked_einsum(
         assert rel(new, ref) < 2e-7
         assert rel(new, ref) <= rel(old, ref)
     assert torch.equal(h_new, h_new.transpose(-1, -2))
+
+
+@pytest.mark.parametrize(
+    "shape,scale", [((9, 11, 10), 0.8), ((4, 5, 6, 7), 1.0), ((2, 1, 4), 0.7), ((40, 3, 3, 3), 0.3)]
+)
+def test_fused_hexahedron_penalty_matches_the_torch_route(shape, scale, torch_route):
+    """Float32 rounding, not bits: ATen's pow is Sleef's and Numba's is libm's, so a
+    voxel near the deadband or with a huge energy can differ in its last bits."""
+    from fastfuncstuff.processing.penalty import (
+        compute_hexahedron_energy,
+        hexahedron_penalty_energy,
+        penalty_energy,
+    )
+
+    g = torch.Generator().manual_seed(0)
+    f = [torch.randn(shape, generator=g) * scale for _ in range(3)]
+    new = hexahedron_penalty_energy(*f)
+    torch_route()
+    old = hexahedron_penalty_energy(*f)
+    ref = penalty_energy(*compute_hexahedron_energy(*(t.double() for t in f)))
+    assert new.shape == old.shape == shape
+    torch.testing.assert_close(new, old, rtol=2e-5, atol=1e-6)
+    # What the optimiser consumes is the sum; both routes hold it to float32 rounding.
+    total = ref.sum()
+    assert abs(new.double().sum() - total) / total < 2e-6
+    assert abs(old.double().sum() - total) / total < 2e-6
