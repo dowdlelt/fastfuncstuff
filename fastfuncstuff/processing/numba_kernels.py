@@ -7,11 +7,26 @@ this does not help.
 
 from __future__ import annotations
 
+import functools
+import platform
+
 import numba
 import numpy as np
 import torch
-from numba import njit, prange
+from numba import prange
 from torch import Tensor
+
+njit = numba.njit
+
+# torch's arm64 build compiles ATen with multiply-add contraction, so the float32
+# arithmetic inside one fused ATen kernel (grid_sampler and its backward) rounds
+# through FMA; the x86 wheels do not. LLVM only fuses when told to, so a kernel that
+# replays grid_sampler to the bit has to match that per platform (measured: 7772 of
+# 20000 trilinear samples one ULP off on an M-series without it, 0 with it). Kernels
+# that replay a chain of separate torch elementwise ops (the Jacobian) must NOT
+# contract: each of those ops rounds on its own.
+_ATEN_CONTRACTS = platform.machine().lower() in {"arm64", "aarch64"}
+njit_aten = functools.partial(numba.njit, fastmath={"contract"} if _ATEN_CONTRACTS else False)
 
 _F1 = np.float32(1.0)
 _F2 = np.float32(2.0)
@@ -93,7 +108,7 @@ def _trilinear3(f, x, y, z):
     return a, b, c
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _invert_field_kernel(f, n_iter, ex, ey, ez, step_per_slice):
     nz, ny, nx = f.shape[0], f.shape[1], f.shape[2]
     for k in prange(nz):  # ty: ignore[not-iterable]
@@ -357,7 +372,7 @@ def _border_index_grad(coord, size):
     return ix, mult
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _warp_linear_fwd(src, xd, yd, zd, out):
     nz, ny, nx = src.shape
     for k in prange(nz):  # ty: ignore[not-iterable]
@@ -395,7 +410,7 @@ def _warp_linear_fwd(src, xd, yd, zd, out):
                 out[k, j, i] = a
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _warp_linear_bwd(src, xd, yd, zd, gout, gx_out, gy_out, gz_out):
     nz, ny, nx = src.shape
     sx2 = np.float32(nx - 1)
