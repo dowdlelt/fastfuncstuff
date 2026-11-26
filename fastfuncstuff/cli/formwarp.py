@@ -403,6 +403,13 @@ def parse_args(
         "(ANTs: trailing slope over the level's cumulative |cost|).",
     )
     p.add_argument(
+        "-pyramid",
+        choices=("corners", "itk"),
+        default=_D.pyramid,
+        help="Level grids: 'corners' (ceil(n/f) voxels spanning the full extent) or "
+        "'itk' (floor(n/f) voxels at spacing f, centred, as ANTs).",
+    )
+    p.add_argument(
         "-keep_last",
         action="store_true",
         help="Return each level's last iterate rather than its best (as ANTs).",
@@ -760,6 +767,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         pin_boundary=args.pin_boundary,
         restore_best=not args.keep_last,
         convergence_rule=args.conv_rule,
+        pyramid=args.pyramid,
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,

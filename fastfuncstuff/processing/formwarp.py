@@ -361,6 +361,11 @@ class SynConfig:
     straight-line fit over it, which does fire on a descent that has slowed. ANTs on
     NIREP na16 -> na09 stopped at 27/100 and 29/70 iterations by it."""
 
+    pyramid: str = "corners"
+    """Level grids. 'corners': ceil(n / f) voxels stretched so the first and last land on
+    the full grid's first and last. 'itk': ITK ``ShrinkImageFilter`` geometry, as
+    antsRegistration uses -- floor(n / f) voxels at spacing exactly f, centred."""
+
     restore_best: bool = True
     """Return each level's lowest-cost (legal) iterate. False returns the last one, as
     ITK SyN does."""
@@ -1005,6 +1010,47 @@ def _resize_field(xd: Tensor, yd: Tensor, zd: Tensor, target: tuple[int, int, in
     ry = _resize_volume(yd, target) * sy
     rz = _resize_volume(zd, target) * sz
     return rx, ry, rz
+
+
+def _itk_level_shape(shape: tuple[int, int, int], factor: int) -> tuple[int, int, int]:
+    nz, ny, nx = shape
+    return max(1, nz // factor), max(1, ny // factor), max(1, nx // factor)
+
+
+def _itk_sample(vol: Tensor, out_shape: tuple[int, int, int], out_spacing_in_src: float) -> Tensor:
+    """Trilinear sample of ``vol`` on a centred grid of ``out_shape`` whose voxels are
+    ``out_spacing_in_src`` source voxels apart (border-clamped)."""
+    axes = []
+    for n_src, n_out in zip(vol.shape, out_shape, strict=True):
+        c_src, c_out = (n_src - 1) / 2.0, (n_out - 1) / 2.0
+        pos = (
+            c_src
+            + (torch.arange(n_out, dtype=vol.dtype, device=vol.device) - c_out) * out_spacing_in_src
+        )
+        axes.append(2.0 * pos / (n_src - 1) - 1.0 if n_src > 1 else pos * 0.0)
+    gz, gy, gx = torch.meshgrid(*axes, indexing="ij")
+    grid = torch.stack([gx, gy, gz], dim=-1)[None]
+    return F.grid_sample(
+        vol[None, None], grid, mode="bilinear", padding_mode="border", align_corners=True
+    )[0, 0]
+
+
+def _itk_to_level(vol: Tensor, factor: int) -> Tensor:
+    shape: tuple[int, int, int] = tuple(vol.shape)  # type: ignore[assignment]
+    return _itk_sample(vol, _itk_level_shape(shape, factor), float(factor))
+
+
+def _itk_field_between(
+    field: Field, from_factor: int, to_factor: int, full_shape: tuple[int, int, int]
+) -> Field:
+    """Move a level field (voxel units of its own grid) onto another ITK level grid."""
+    target = full_shape if to_factor == 1 else _itk_level_shape(full_shape, to_factor)
+    if tuple(field[0].shape) == target and from_factor == to_factor:
+        return field
+    ratio = to_factor / from_factor
+    scale = from_factor / to_factor
+    out = tuple(_itk_sample(c, target, ratio) * scale for c in field)
+    return out[0], out[1], out[2]
 
 
 # ---------------------------------------------------------------------------
@@ -1858,32 +1904,46 @@ def formwarp(
     inv_m = (zeros(), zeros(), zeros())
     level_stats: list[LevelStats] = []
 
+    itk_pyramid = config.pyramid == "itk"
+    prev_factor = config.shrink_factors[0]
     for lev in range(n_levels):
         factor = config.shrink_factors[lev]
         sigma = config.smoothing_sigmas[lev]
         n_iter = config.iterations[lev]
-        target = _shrunk_shape(full_shape, factor)  # type: ignore[arg-type]
+        if itk_pyramid:
+            target = _itk_level_shape(full_shape, factor)  # type: ignore[arg-type]
+
+            def to_level(v: Tensor, _f: int = factor) -> Tensor:
+                return _itk_to_level(v, _f)
+        else:
+            target = _shrunk_shape(full_shape, factor)  # type: ignore[arg-type]
+
+            def to_level(v: Tensor, _t: tuple[int, int, int] = target) -> Tensor:
+                return _resize_volume(v, _t)
 
         # Pre-smooth (anti-alias) then shrink the images for this level.
-        f_lvl = _resize_volume(
-            _separable_smooth_3d(f_metric, sigma) if sigma > 0 else f_metric, target
-        )
-        m_lvl = _resize_volume(
-            _separable_smooth_3d(m_metric, sigma) if sigma > 0 else m_metric, target
-        )
+        f_lvl = to_level(_separable_smooth_3d(f_metric, sigma) if sigma > 0 else f_metric)
+        m_lvl = to_level(_separable_smooth_3d(m_metric, sigma) if sigma > 0 else m_metric)
 
         if weight is not None:
-            w_lvl = _resize_volume(weight, target).clamp(min=0.0)
+            w_lvl = to_level(weight).clamp(min=0.0)
         elif mask is not None:
-            w_lvl = (_resize_volume(mask, target) > 0.5).float()
+            w_lvl = (to_level(mask) > 0.5).float()
         else:
             w_lvl = torch.ones(target, device=device)
 
         # Bring the running fields onto this level's grid.
-        phi_f = _resize_field(*phi_f, target)
-        inv_f = _resize_field(*inv_f, target)
-        phi_m = _resize_field(*phi_m, target)
-        inv_m = _resize_field(*inv_m, target)
+        if itk_pyramid:
+            phi_f, inv_f, phi_m, inv_m = (
+                _itk_field_between(fld, prev_factor, factor, full_shape)  # type: ignore[arg-type]
+                for fld in (phi_f, inv_f, phi_m, inv_m)
+            )
+        else:
+            phi_f = _resize_field(*phi_f, target)
+            inv_f = _resize_field(*inv_f, target)
+            phi_m = _resize_field(*phi_m, target)
+            inv_m = _resize_field(*inv_m, target)
+        prev_factor = factor
 
         if config.verb >= 1:
             print(
@@ -1896,7 +1956,7 @@ def formwarp(
         # measured on the grid the updates actually live on.
         guard = None
         if cover is not None and config.void_guard > 0.0:
-            guard = _void_guard_field(_resize_volume(cover.float(), target))
+            guard = _void_guard_field(to_level(cover.float()))
 
         # The level sees one resolved value for each; everything below reads a scalar.
         level_config = replace(config, update_var=update_vars[lev], total_var=total_vars[lev])
@@ -1923,10 +1983,16 @@ def formwarp(
             )
 
     # Restore to full resolution if the finest level was still shrunk.
-    phi_f = _resize_field(*phi_f, full_shape)  # type: ignore[arg-type]
-    inv_f = _resize_field(*inv_f, full_shape)  # type: ignore[arg-type]
-    phi_m = _resize_field(*phi_m, full_shape)  # type: ignore[arg-type]
-    inv_m = _resize_field(*inv_m, full_shape)  # type: ignore[arg-type]
+    if itk_pyramid:
+        phi_f, inv_f, phi_m, inv_m = (
+            _itk_field_between(fld, prev_factor, 1, full_shape)  # type: ignore[arg-type]
+            for fld in (phi_f, inv_f, phi_m, inv_m)
+        )
+    else:
+        phi_f = _resize_field(*phi_f, full_shape)  # type: ignore[arg-type]
+        inv_f = _resize_field(*inv_f, full_shape)  # type: ignore[arg-type]
+        phi_m = _resize_field(*phi_m, full_shape)  # type: ignore[arg-type]
+        inv_m = _resize_field(*inv_m, full_shape)  # type: ignore[arg-type]
 
     # Compose the half-warps into total transforms.
     #   moving->fixed (resample moving into fixed grid): apply inv_f (fixed->middle)

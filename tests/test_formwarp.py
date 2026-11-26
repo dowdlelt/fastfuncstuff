@@ -1228,3 +1228,24 @@ def test_itk_convergence_rule_reproduces_values_ants_logged():
     # Measured agreement ~0.1-0.4%; a least-squares line would be off by 57%.
     assert _convergence_value_itk(costs[:10], 10) == pytest.approx(3.319450560794e-03, rel=5e-3)
     assert _convergence_value_itk(costs[:15], 10) == pytest.approx(5.469584820331e-04, rel=5e-3)
+
+
+def test_itk_pyramid_grid_is_centred_at_spacing_f_and_fields_rescale():
+    from fastfuncstuff.processing.formwarp import (
+        _itk_field_between,
+        _itk_level_shape,
+        _itk_to_level,
+    )
+
+    full = (17, 22, 13)
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float32) for n in full), indexing="ij"
+    )
+    lvl = _itk_to_level(xx, 4)
+    assert tuple(lvl.shape) == _itk_level_shape(full, 4) == (4, 5, 3)
+    # Centred, 4 voxels apart: x = 6 + 4 * (i - 1) for nx 13 -> 3 samples.
+    torch.testing.assert_close(lvl[0, 0], torch.tensor([2.0, 6.0, 10.0]))
+    # A uniform shift of 1 level-4 voxel is 4 full voxels, and 2 at level 2.
+    one = tuple(torch.ones(_itk_level_shape(full, 4)) for _ in range(3))
+    assert torch.allclose(_itk_field_between(one, 4, 1, full)[0], torch.full(full, 4.0))
+    assert torch.allclose(_itk_field_between(one, 4, 2, full)[1], torch.full((8, 11, 6), 2.0))
