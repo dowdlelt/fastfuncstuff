@@ -199,6 +199,18 @@ class SynConfig:
     once the (range-normalized) downward slope of cost over the window falls below
     this — i.e. the cost has flattened. Larger = stop sooner."""
 
+    best_patience: int = 0
+    """Stop a level once the kept (best legal) cost has not improved for this many
+    iterations; 0 (the default) disables it.
+
+    Opt-in because it is not result-preserving on real data. The level returns the best
+    *legal* iterate (:attr:`fold_aware_best`), and on T1 -> MNI fits legality flickers:
+    the worst half-field voxel's det(J) wanders around :attr:`jac_floor` (and around
+    zero) while the image cost falls smoothly, so iterates go illegal and come back
+    legal *and better* -- after gaps of up to 80 iterations at shrink 2 (MNI unit 615:
+    +0.044 lpa lost at any patience <= 30). It is the right stop when legality is
+    monotone (e.g. with :attr:`fold_guard` on); see ``illegal_iters`` in the level log."""
+
     fold_penalty: float = 0.033333
     """Strength of the **soft** anti-folding penalty added to the cost; 0 disables it.
 
@@ -824,6 +836,19 @@ class LevelStats:
     reports this is one whose whole schedule is too aggressive, not one that merely
     took a bad step."""
 
+    illegal_iters: int = 0
+    """Iterations whose (pre-step) fields failed the legality test, so they could not
+    become the kept result however low their cost."""
+
+    patience_stopped: bool = False
+    """The level ended because the kept cost stopped improving (``best_patience``)."""
+
+    cost_trace: list[float] = field(default_factory=list, repr=False)
+    legal_trace: list[bool] = field(default_factory=list, repr=False)
+    jac_min_trace: list[float] = field(default_factory=list, repr=False)
+    """Per-iteration image cost, legality and min half-field det(J): the record behind ``best_iter``, for
+    checking stop rules offline. Not part of :meth:`as_dict`."""
+
     @property
     def hit_cap(self) -> bool:
         return self.iters_run >= self.n_iter_cap
@@ -850,6 +875,10 @@ class LevelStats:
             bits.append(f"{self.refused_iters} refused")
         if self.sym_rejected:
             bits.append(f"{self.sym_rejected} unsymmetrized")
+        if self.illegal_iters:
+            bits.append(f"{self.illegal_iters} illegal")
+        if self.patience_stopped:
+            bits.append("stopped: no legal improvement")
         if self.fold_fallback:
             bits.append("NO LEGAL ITERATE (kept a folded one)")
         bits.append(f"best cost {self.best_cost:.5f}")
@@ -857,6 +886,9 @@ class LevelStats:
 
     def as_dict(self) -> dict:
         d = asdict(self)
+        d.pop("cost_trace", None)
+        d.pop("legal_trace", None)
+        d.pop("jac_min_trace", None)
         d.update(hit_cap=self.hit_cap, starved=self.starved, wasted_iters=self.wasted_iters)
         return d
 
@@ -1151,6 +1183,7 @@ def _syn_level(
     total_var = float(config.total_var)  # type: ignore[arg-type]
     flags = config.warp_flags
     window = config.convergence_window
+    patience = config.best_patience
     nz, ny, nx = fixed.shape
     voxel_grid = torch.meshgrid(
         torch.arange(nz, dtype=fixed.dtype, device=fixed.device),
@@ -1174,6 +1207,9 @@ def _syn_level(
     best_cost, best_fields, best_iter = float("inf"), _snapshot(), 0
     any_cost, any_fields, any_iter = float("inf"), _snapshot(), 0
     costs: list[float] = []
+    legals: list[bool] = []
+    jac_mins: list[float] = []
+    patience_stopped = False
     jac_f = jacobian_determinant(fxd, fyd, fzd)
     jac_m = jacobian_determinant(mxd, myd, mzd)
     n_damped = n_refused = n_sym_rejected = 0
@@ -1211,9 +1247,10 @@ def _syn_level(
         # ``jac_f``/``jac_m`` are the determinants of exactly those fields: whichever
         # branch the previous iteration took, it left behind the determinant of the
         # field it actually kept, so nothing is recomputed here.
-        legal = not config.fold_aware_best or (
-            min(float(jac_f.min()), float(jac_m.min())) >= config.jac_floor
-        )
+        jac_min = min(float(jac_f.min()), float(jac_m.min()))
+        legal = not config.fold_aware_best or jac_min >= config.jac_floor
+        legals.append(legal)
+        jac_mins.append(jac_min)
         if cost_val < any_cost:
             any_cost, any_iter = cost_val, len(costs) - 1
             any_fields = _snapshot()
@@ -1229,6 +1266,13 @@ def _syn_level(
         if window > 0 and len(costs) >= window:
             if _convergence_value(costs, window) < config.convergence_threshold:
                 break
+        # Nothing after the kept iterate is ever returned, so once it has stood for
+        # ``patience`` iterations the rest of the level is work for nothing. Only once a
+        # legal best exists: a level that inherits a folded field keeps going in the
+        # hope of becoming legal, and falls back to the best illegal iterate otherwise.
+        if patience > 0 and best_cost < float("inf") and len(costs) - 1 - best_iter >= patience:
+            patience_stopped = True
+            break
 
         grads = torch.autograd.grad(cost, leaves)
         # Descent direction (cost is lower=better) for each half-field.
@@ -1323,6 +1367,11 @@ def _syn_level(
         sym_rejected=n_sym_rejected,
         best_cost=best_cost,
         fold_fallback=fold_fallback,
+        illegal_iters=legals.count(False),
+        patience_stopped=patience_stopped,
+        cost_trace=costs,
+        legal_trace=legals,
+        jac_min_trace=jac_mins,
     )
     if config.verb >= 1:
         print(f"  {level_tag}: {stats.describe()}")
