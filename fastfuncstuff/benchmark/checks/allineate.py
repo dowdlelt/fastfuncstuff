@@ -11,10 +11,10 @@ afni_proc's help recommends for EPI to anatomy, ``-cost lpc+ZZ -giant_move``. On
 that covers only part of the brain the plain centre-of-mass shift drags the slab to the
 brain's middle, so the matching ``-partial_*`` flag limits cmass to the covered axes
 (AFNI's own advice; see ``partial_axes``). Its EPI-to-anatomy matrix is applied to the
-mean with wsinc5 on the T1 grid, as ffs writes its own output. A bare 3dAllineate with
-the arguments ffs gets (lpc, source automask, its defaults) runs too, for speed parity
-and continuity with earlier runs; the judges score all three. ffs_allineate runs at its
-defaults, since the defaults are what users get.
+mean with wsinc5 on the T1 grid, as ffs writes its own output. ffs_allineate runs at its
+defaults, since the defaults are what users get. Bare 3dAllineate is not run: EPI to
+anatomy is align_epi_anat's job, not 3dAllineate's (it aligned 24 of 51 units here), so
+it measured misuse rather than AFNI.
 
 Judge (reference): RMS displacement in mm between ffs's and the reference's affines over
 the stripped T1's brain voxels, and the correlation of the two aligned means. ffs_allineate's
@@ -25,12 +25,12 @@ Judge (yardstick): each tool's aligned mean scored against the stripped T1 by on
 program (3dAllineate -allcostX -nocmass, no source automask: with it ls is 0.52 for an
 image against itself). Histogram costs (hel, nmi, mi) are the comparison, since neither
 tool optimises them; AFNI's allcostX lpc/lpa/ls are recorded too (lpc reads normally on
-real pairs, -0.54 for 3dAllineate's fit on the first unit, but +24 for an image against
+real pairs, -0.54 for a bare 3dAllineate fit on the first unit, but +24 for an image against
 itself, so not for self-pairs). Lower is better except mi (AFNI prints it unsigned).
 
 Judge (truth, tissue boundary): none of the above sees a fit that moves the data off the
 brain. allcostX scores only the voxels the two images share, so on the ds004645 slab it
-preferred 3dAllineate's fit (-0.17) with the slab off the brain over ffs's on-brain fit
+preferred a bare 3dAllineate fit (-0.17) with the slab off the brain over ffs's on-brain fit
 (-0.07). Two checks that need no cost either tool optimises: the share of the aligned
 EPI's bright voxels inside the T1 brain (dilated 3 mm), and the GM-WM contrast of the
 aligned EPI across the T1's WM boundary (c2 = 0.5), sampled 1.5 mm either side along the
@@ -195,7 +195,7 @@ def rms_displacement(m1: np.ndarray, m2: np.ndarray, pts_rai: np.ndarray) -> flo
 
 class AllineateCheck(Check):
     name = "allineate"
-    description = "Affine EPI->T1w: ffs_allineate vs align_epi_anat.py (and 3dAllineate)"
+    description = "Affine EPI->T1w: ffs_allineate vs align_epi_anat.py"
     needs = [["@ds:anat_t1"]]
     sampling = "breadth"
     reference = "AFNI align_epi_anat.py (lpc+ZZ -giant_move, -partial_* per unit)"
@@ -241,7 +241,7 @@ class AllineateCheck(Check):
                "-no_invwarp", "-device", device], work, log, timeout_s=1800)  # fmt: skip
 
         threads = cpu_threads()
-        out = {s: work / s for s in ("ref", "ffs", "3dallineate")}
+        out = {s: work / s for s in ("ref", "ffs")}
         for d in out.values():
             d.mkdir(exist_ok=True)
 
@@ -266,13 +266,6 @@ class AllineateCheck(Check):
             work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         res.timings.append(("ref", "cpu", t, threads))
-        t = timed(
-            ["3dAllineate", "-overwrite", "-base", str(brain), "-source", str(mean),
-             "-prefix", str(out["3dallineate"] / "al.nii.gz"),
-             "-1Dmatrix_save", str(out["3dallineate"] / "al.aff12.1D"), *ARGS],
-            work, log, timeout_s=self.timeout_s,
-        )  # fmt: skip
-        res.timings.append(("3dallineate", "cpu", t, threads))
         t = timed(
             ["ffs_allineate", "-base", str(brain), "-source", str(mean),
              "-prefix", str(out["ffs"] / "al.nii.gz"),
@@ -299,9 +292,6 @@ class AllineateCheck(Check):
             # isotropic scale; ffs failures so far sit on its 0.8 bound (ds002603, ds004645)
             "scale_ref": float(abs(np.linalg.det(m_ref[:3, :3])) ** (1 / 3)),
             "scale_ffs": float(abs(np.linalg.det(m_ffs[:3, :3])) ** (1 / 3)),
-            # the earlier reference, kept for continuity: how far plain 3dAllineate lands
-            "3dallineate_rms_from_ref_mm": rms_displacement(mats["3dallineate"], m_ref, rai),
-            "ffs_rms_from_3dallineate_mm": rms_displacement(m_ffs, mats["3dallineate"], rai),
         }
         # How much of the problem the EPI poses: a thin slab or partial field of view is the
         # hard case for both tools, so failures are read against coverage.
@@ -324,9 +314,8 @@ class AllineateCheck(Check):
             for k, v in parse_allcost(ylog.read_text()).items():
                 yard[f"{k}_{s}"] = v
         for k in ("hel", "nmi", "mi"):
-            for other in ("ref", "3dallineate"):
-                if f"{k}_{other}" in yard and f"{k}_ffs" in yard:
-                    yard[f"{k}_ffs_minus_{other}"] = yard[f"{k}_ffs"] - yard[f"{k}_{other}"]
+            if f"{k}_ref" in yard and f"{k}_ffs" in yard:
+                yard[f"{k}_ffs_minus_ref"] = yard[f"{k}_ffs"] - yard[f"{k}_ref"]
         res.metrics["yardstick"] = yard
 
         # tissue judge: needs no cost either tool optimises (see the module docstring)
@@ -354,8 +343,6 @@ class AllineateCheck(Check):
         res.artifacts += [(f, "regenerable") for f in sorted(seg.parent.glob("*.nii.gz"))]
         res.provenance["ref"] = {"tool": "align_epi_anat.py", "version": afni_version("3dAllineate"),
                                  "args": aea_args, "apply": "3dAllineate -1Dmatrix_apply -final wsinc5"}  # fmt: skip
-        res.provenance["3dallineate"] = {"tool": "3dAllineate",
-                                         "version": afni_version("3dAllineate"), "args": ARGS}  # fmt: skip
         res.provenance["ffs"] = {"tool": "ffs_allineate", **ffs_version(), "args": ARGS,
                                  "device": device}  # fmt: skip
         res.provenance["inputs_prep"] = {
