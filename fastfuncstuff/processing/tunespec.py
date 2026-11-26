@@ -97,6 +97,10 @@ class ParamSpec:
     # optimum is a property of the anatomy rather than of the matrix, which is the
     # assumption worth making and the one worth being able to falsify.
     units: str = ""
+    # The engine takes the SQUARE of the converted value: the ladder is a Gaussian
+    # sigma (in ``units``), the engine's flag a variance -- formwarp's -update_var and
+    # -total_var, which take ANTs' variances since 2026-11-26.
+    variance: bool = False
     # A legality constraint of the backend, in ITS units, applied after conversion.
     # Separate from `bounds` (which constrains the search in the listed units)
     # because this one is not a judgement about where to look: below AFNI's
@@ -229,25 +233,28 @@ FORMWARP = BackendSpec(
             (0.0, 0.5, 1.0, 2.0, 3.0),
             0.0,
             "regularization",
-            "Elastic (total-field) smoothing, in mm. Off by default, per ANTs.",
+            "Elastic (total-field) smoothing sigma, in mm. Off by default, per ANTs.",
             resolution=GAUSS_SIGMA_RESOLUTION,
             units="mm",
+            variance=True,
         ),
         ParamSpec(
             "formwarp.update_var",
             "-update_var",
-            (1.0, 2.0, 3.0, 4.0),
-            3.0,
+            (1.0, 1.732, 2.0, 3.0, 4.0),
+            1.732,
             "regularization",
-            "Fluid (update-field) smoothing, in mm.",
+            "Fluid (update-field) smoothing sigma, in mm. The default is ANTs' "
+            "SyN[,3] (a variance of 3 voxels^2) at 1 mm.",
             resolution=GAUSS_SIGMA_RESOLUTION,
             units="mm",
+            variance=True,
         ),
         ParamSpec(
             "formwarp.grad_step",
             "-grad_step",
             (0.1, 0.25, 0.5),
-            0.25,
+            0.1,
             "effort",
             "Per-iteration step size, in mm.",
             units="mm",
@@ -255,8 +262,8 @@ FORMWARP = BackendSpec(
         ParamSpec(
             "formwarp.iters",
             "-iters",
-            ((100, 70, 40), (300, 210, 120), (600, 420, 240)),
-            (300, 210, 120),
+            ((100, 70, 50, 20), (200, 140, 100, 40), (400, 280, 200, 80)),
+            (100, 70, 50, 20),
             "effort",
             "Per-level iteration CEILING. Not searched by default and rarely worth "
             "searching: it bounds the solver rather than shaping its answer. Set it "
@@ -841,7 +848,9 @@ PRESETS: dict[tuple[str, str], Preset] = {
         ),
         caveat=(
             "Same pre-fold-guard caveat as optiwarp. formwarp was otherwise the "
-            "robust choice here: 299 PASS / 1 MARGINAL / 0 FAIL over 60 configs."
+            "robust choice here: 299 PASS / 1 MARGINAL / 0 FAIL over 60 configs. "
+            "Tuned on the legacy engine, before formwarp's ANTs-parity defaults "
+            "(2026-11-26): re-tune before trusting it under -style ants."
         ),
     ),
     ("MNI_T1a", "optiwarp_hs"): Preset(
@@ -894,6 +903,10 @@ PRESETS: dict[tuple[str, str], Preset] = {
         },
         dated="2026-09-10",
         provenance=_NIREP16 + ".",
+        caveat=(
+            "Tuned on the legacy engine, before formwarp's ANTs-parity defaults "
+            "(2026-11-26): re-tune before trusting it under -style ants."
+        ),
         see_also="ffs_optiwarp scored higher here; see its -help.",
     ),
     ("MNI_T1a", "qwarp"): Preset(
@@ -1091,6 +1104,8 @@ def to_voxel_units(param: ParamSpec, value: Any, voxdims: tuple[float, float, fl
     if param.units != "mm" or not isinstance(value, (int, float)) or isinstance(value, bool):
         return value
     out = float(value) / voxel_scale(voxdims)
+    if param.variance:
+        return out * out
     if param.voxel_floor is not None and out > 0:
         out = max(out, float(param.voxel_floor))
     if param.quantize == "odd":

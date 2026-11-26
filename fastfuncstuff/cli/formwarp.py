@@ -11,7 +11,7 @@ Usage:
 
     # ANTs-style multiresolution, EPI->anat (cross contrast), with inverse + halfway warps
     ffs_formwarp -base anat.nii.gz -source epi.nii.gz -prefix out.nii.gz \\
-        -metric lpc -shrink 4x2x1 -smooth 2x1x0 -iters 100x70x40 \\
+        -metric lpc -shrink 8x4x2x1 -smooth 3x2x1x0 -iters 100x70x50x20 \\
         -save_warp -save_inverse -save_halfway
 
     # Distortion-style: restrict deformation to the Y (phase-encode) axis
@@ -57,6 +57,7 @@ from fastfuncstuff.cli_utils import (
 )
 from fastfuncstuff.processing.affine import base_into_source_frame
 from fastfuncstuff.processing.formwarp import (
+    LEGACY_SYN,
     METRICS,
     NO_X_DISP,
     NO_Y_DISP,
@@ -109,6 +110,33 @@ def _maybe_list(spec: str | float) -> float | tuple[float, ...]:
     return values[0] if len(values) == 1 else values
 
 
+def _style_knobs(args) -> dict:
+    """The style's values for the style-dependent knobs, overridden by explicit flags."""
+    knobs = dict(LEGACY_SYN) if args.style == "legacy" else {}
+    given = {
+        "grad_step": args.grad_step,
+        "update_var": None if args.update_var is None else _maybe_list(args.update_var),
+        "total_var": None if args.total_var is None else _maybe_list(args.total_var),
+        "shrink_factors": None if args.shrink is None else _int_list(args.shrink),
+        "smoothing_sigmas": None if args.smooth is None else _float_list(args.smooth),
+        "iterations": None if args.iters is None else _int_list(args.iters),
+        "convergence_window": args.conv_window,
+        "convergence_threshold": args.conv_thresh,
+        "metric_gradient": args.metric_gradient,
+        "step_norm": args.step_norm,
+        "update_rule": args.update_rule,
+        "inverter": args.inverter,
+        "pin_boundary": None if args.pin_boundary is None else args.pin_boundary == "yes",
+        "convergence_rule": args.conv_rule,
+        "pyramid": args.pyramid,
+        "field_kernel": args.field_kernel,
+        "restore_best": None if args.keep is None else args.keep == "best",
+        "fold_penalty": args.fold_penalty,
+    }
+    knobs.update({k: v for k, v in given.items() if v is not None})
+    return knobs
+
+
 _EPILOG = """\
 WHICH NONLINEAR BACKEND
 -----------------------
@@ -125,34 +153,34 @@ All three assume the pair is already affinely aligned -- run ffs_allineate first
 
 HOW A LEVEL RUNS (read before tuning anything)
 ----------------------------------------------
--shrink/-smooth/-iters are ANTs' -f/-s/-c, one entry per level, coarse to fine
-(default 4x2x1 / 2x1x0 / 100x70x40). Per level the images are pre-smoothed and
-downsampled, iterations run, and the fields are upsampled to seed the next level.
-Each iteration: evaluate the metric at the midpoint, smooth the update field by
--update_var (fluid), take a step normalized so the largest displacement is
--grad_step voxels, smooth the total field by -total_var (elastic), then re-derive
-each field from its inverse to keep both diffeomorphic.
+The default (-style ants) is antsRegistration's SyN, in ANTs' units: the flags map
+one to one, so `-t SyN[0.1,3,0] -m CC[f,m,1,4] -c [100x70x50x20,1e-6,10] -f 8x4x2x1
+-s 3x2x1x0vox` is `-grad_step 0.1 -update_var 3 -total_var 0 -cc_radius 4 -iters
+100x70x50x20 -conv_thresh 1e-6 -conv_window 10 -shrink 8x4x2x1 -smooth 3x2x1x0` --
+which is also the default. -update_var/-total_var are VARIANCES in voxels^2, as in
+ANTs (they were sigmas before 2026-11-26).
 
-Greedy SyN OVERSHOOTS -- cost falls, then rises. Two defenses are always on: every
-level returns the LOWEST-cost field it saw, and a trailing-window slope test
-(-conv_window / -conv_thresh) stops a level once cost flattens. Because of the
-best-state restoration, raising -iters is safe: extra iterations can never hand
-back a worse warp.
+-shrink/-smooth/-iters are ANTs' -f/-s/-c, one entry per level, coarse to fine.
+Each iteration: evaluate the metric at the midpoint, smooth each half's update field
+by -update_var (fluid), scale it so its largest displacement is -grad_step voxels,
+compose it onto the field, smooth by -total_var (elastic), and re-derive each field
+and its inverse. A level stops when ITK's windowed convergence measure drops below
+-conv_thresh, and returns its last iterate, as ANTs does (-keep best restores the
+lowest-cost one instead).
 
 NOT ENOUGH WARP (structures still visibly misaligned)
 -----------------------------------------------------
-  * Ran out of iterations, or stopped too eagerly: raise -iters (100x70x40 ->
-    200x150x100) and/or lower -conv_thresh (1e-6 -> 1e-8); -conv_window 0 disables
-    early stopping entirely and runs the full budget (still best-restored).
-  * Fine detail never appears: -update_var 3.0 is a strong fluid prior and it is
-    the main thing smoothing detail away. Drop it (3.0 -> 1.5) and make sure the
-    finest level has -smooth 0 and -shrink 1.
+  * Ran out of iterations, or stopped too eagerly: raise -iters (100x70x50x20 ->
+    200x150x100x40) and/or lower -conv_thresh (1e-6 -> 1e-8); -conv_window 0
+    disables early stopping entirely and runs the full budget.
+  * Fine detail never appears: -update_var is the fluid prior and the main thing
+    smoothing detail away. Drop it (3 -> 1.5, a variance) and make sure the finest
+    level has -smooth 0 and -shrink 1.
   * Everything moves a little, nothing moves enough: -grad_step is the per-iteration
     cap in voxels, so total travel is roughly grad_step x iterations. Raise it
-    (0.25 -> 0.5) or add iterations; raising it too far makes the level oscillate,
-    which best-state restoration will silently absorb as "no progress".
-  * Large deformation never bridged: add a coarser level (-shrink 8x4x2x1 -smooth
-    3x2x1x0 -iters 150x100x70x40). Coarse levels are cheap and are where big,
+    (0.1 -> 0.25) or add iterations; raising it too far makes the level oscillate.
+  * Large deformation never bridged: add a coarser level (-shrink 16x8x4x2x1 -smooth
+    4x3x2x1x0 -iters 100x100x70x50x20). Coarse levels are cheap and are where big,
     smooth displacement is actually won.
   * Cost dominated by background or by a clipped FoV edge: -automask, or supply
     -weight. The tissue/nothing cliff at a cut FoV is the strongest gradient in the
@@ -160,14 +188,15 @@ NOT ENOUGH WARP (structures still visibly misaligned)
 
 TOO MUCH WARP (anatomy distorted, ripples, folding)
 ---------------------------------------------------
-  * Raise -fold_penalty to charge folding harder, or -fold_guard 0.5 to forbid it
-    outright (the guard can refuse a step, so it costs fit; prefer the penalty).
-  * Raise -update_var (more fluid smoothing of each update) -- the first knob.
-  * Turn on elastic regularization: -total_var 1-3 smooths the ACCUMULATED field,
-    off by default. This is the one that stops slow accumulation of nonsense.
-  * Lower -grad_step (0.25 -> 0.1) so each iteration commits less.
-  * Cut the finest level (-shrink 4x2 -smooth 2x1 -iters 100x70): most implausible
-    deformation is bought at full resolution.
+  * Raise -update_var (more fluid smoothing of each update) -- the first knob, and
+    the only fold control ANTs has.
+  * Turn on elastic regularization: -total_var 0.5-1 (variance) smooths the
+    ACCUMULATED field, off by default (ANTs' antsRegistrationSyN.sh -t s uses 0).
+  * -fold_penalty 0.03 charges folding (off by default, as in ANTs), or -fold_guard
+    0.5 forbids it outright (the guard can refuse a step, so it costs fit).
+  * Lower -grad_step (0.1 -> 0.05) so each iteration commits less.
+  * Cut the finest level (-shrink 8x4x2 -smooth 3x2x1 -iters 100x70x50): most
+    implausible deformation is bought at full resolution.
   * Blur more at the coarse levels (-smooth 3x2x1) so the fit is not chasing noise.
   * Distortion-only: -noXdis / -noYdis / -noZdis zero a component of every field
     on every iteration, which is a hard constraint, not a penalty.
@@ -184,7 +213,7 @@ like extra regularization; a small one is sharper and noisier.
 TOO SLOW
 --------
   * The finest level dominates -- shorten its -iters before touching anything else.
-  * Coarser -shrink at the top (8x4x2x1) costs almost nothing and often removes
+  * Coarser -shrink at the top (16x8x4x2x1) costs almost nothing and often removes
     iterations from the expensive levels.
   * -metric cc with a large -cc_radius is the expensive metric; radius 2-3 is much
     cheaper than 4.
@@ -294,82 +323,163 @@ def parse_args(
         help="Neighborhood kernel for lpa/lpc.",
     )
 
-    # SyN regularization
+    # Engine style: which defaults the knobs below start from
+    p.add_argument(
+        "-style",
+        choices=("ants", "legacy"),
+        default="ants",
+        help="'ants' (default): antsRegistration's SyN, step for step -- the defaults "
+        "below are antsRegistrationSyN.sh's SyN stage (SyN[0.1,3,0], CC radius 4, "
+        "100x70x50x20, 8x4x2x1, 3x2x1x0vox, [1e-6,10]) in ANTs' units, and the engine "
+        "matches antsRegistration's warps (Dice 0.6237 vs 0.6240 on 48 NIREP pairs). "
+        "'legacy': formwarp before 2026-11-26 (exact metric gradient, joint step, "
+        "fixed-point inverter, 4x2x1 / 300x210x120, grad_step 0.25, update_var 9, "
+        "fold_penalty 0.0333, best-iterate restore). Any knob given explicitly overrides "
+        "the style's value.",
+    )
+
+    # SyN regularization (ANTs units: SyN[gradientStep, updateVar, totalVar])
     p.add_argument(
         "-grad_step",
         "-grad-step",
         type=float,
-        default=_D.grad_step,
-        help="Max per-iteration displacement in voxels (SyN gradientStep).",
+        default=None,
+        help="Max per-iteration displacement in voxels of each level (ANTs SyN "
+        f"gradientStep; default {_D.grad_step:g}).",
     )
     p.add_argument(
         "-update_var",
         "-update-var",
-        default=_D.update_var,
-        help="Fluid regularization: update-field Gaussian sigma, in voxels of each "
-        "level's own grid (so a constant value is already more physical smoothing at "
-        "the coarse levels -- ANTs holds it constant for that reason). One value for "
-        "all levels, or one per level, e.g. 4x3x2.",
+        default=None,
+        help="Fluid regularization: update-field Gaussian VARIANCE in voxels^2 of each "
+        f"level's grid, exactly ANTs' SyN[,updateFieldVariance] (default {_D.update_var:g}, "
+        "i.e. sigma 1.73). Before 2026-11-26 this flag was a sigma: square old values. "
+        "One value for all levels, or one per level, e.g. 16x9x4x4.",
     )
     p.add_argument(
         "-total_var",
         "-total-var",
-        default=_D.total_var,
-        help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off). One "
-        "value for all levels, or one per level, e.g. 2x1x0. Applied to the ACCUMULATED "
-        "field every iteration, so a nonzero value at every level decays the warp as "
-        "fast as it is built (measured LNCC 0.374 against 0.549); if it helps at all it "
-        "will be at one level.",
+        default=None,
+        help="Elastic regularization: total-field Gaussian VARIANCE (voxels^2; 0=off; "
+        "ANTs' SyN[,,totalFieldVariance]). One value for all levels, or one per level. "
+        "Applied to the ACCUMULATED field every iteration, so a nonzero value at every "
+        "level decays the warp as it is built.",
     )
     p.add_argument(
         "-invert_iters",
         "-invert-iters",
         type=int,
         default=_D.invert_iters,
-        help="Fixed-point iterations for displacement-field inversion.",
+        help="Fixed-point sweeps for -inverter fixed_point.",
     )
 
     # Multiresolution (ANTs -f / -s / -c)
     p.add_argument(
-        "-shrink", type=str, default="4x2x1", help="Per-level isotropic shrink factors, e.g. 4x2x1."
+        "-shrink",
+        type=str,
+        default=None,
+        help=f"Per-level isotropic shrink factors (ANTs -f; default {_fmt_schedule(_D.shrink_factors)}).",
     )
     p.add_argument(
         "-smooth",
         type=str,
-        default=_fmt_schedule(_D.smoothing_sigmas),
-        help="Per-level Gaussian pre-smoothing sigmas in voxels, e.g. 2x1x0.",
+        default=None,
+        help="Per-level Gaussian pre-smoothing sigmas in voxels (ANTs -s ...vox; "
+        f"default {_fmt_schedule(_D.smoothing_sigmas)}).",
     )
     p.add_argument(
         "-iters",
         type=str,
-        default=_fmt_schedule(_D.iterations),
-        help="Per-level max iteration counts, e.g. 100x70x40 (an upper bound; "
-        "a level usually stops earlier via convergence).",
+        default=None,
+        help="Per-level max iteration counts (ANTs -c; default "
+        f"{_fmt_schedule(_D.iterations)}); a level usually stops earlier via convergence.",
     )
     p.add_argument(
         "-conv_window",
         "-conv-window",
         type=int,
-        default=_D.convergence_window,
-        help="Trailing-window size for convergence/early-stopping. <=0 disables "
-        "early stopping (run the full -iters). The best-cost warp is always "
-        "returned, so running to exhaustion never over-warps.",
+        default=None,
+        help="Trailing-window size for convergence (ANTs -c [,,window]; default "
+        f"{_D.convergence_window}). <=0 disables early stopping.",
     )
     p.add_argument(
         "-conv_thresh",
         "-conv-thresh",
         type=float,
-        default=_D.convergence_threshold,
-        help="Convergence slope threshold; larger stops sooner.",
+        default=None,
+        help="Convergence threshold (ANTs -c [,thresh,]; default "
+        f"{_D.convergence_threshold:g}); larger stops sooner.",
+    )
+    p.add_argument(
+        "-metric_gradient",
+        choices=("auto", "exact", "local"),
+        default=None,
+        help="Update field: 'exact' (autograd gradient of the metric), 'local' (ANTs' "
+        "centre-window CC approximation times the warped image's gradient; cc only), or "
+        "'auto' (local for cc, exact otherwise; the ants default).",
+    )
+    p.add_argument(
+        "-step_norm",
+        choices=("joint", "per_half"),
+        default=None,
+        help="Scale the step so each half's largest displacement is -grad_step "
+        "('per_half', ANTs) or the two halves' combined largest is ('joint', legacy).",
+    )
+    p.add_argument(
+        "-update_rule",
+        choices=("additive", "compose"),
+        default=None,
+        help="'compose' (ITK SyN: compose the update onto each half's inverse and "
+        "re-derive; needs -inverter itk) or 'additive' (phi += step, legacy).",
+    )
+    p.add_argument(
+        "-inverter",
+        choices=("fixed_point", "itk"),
+        default=None,
+        help="Field inversion: 'itk' (warm-started, damped, to 0.1 voxel max error, "
+        "round trip always kept) or 'fixed_point' (-invert_iters undamped sweeps, legacy).",
+    )
+    p.add_argument(
+        "-pin_boundary",
+        choices=("yes", "no"),
+        default=None,
+        help="Zero the smoothed update on the volume faces (ITK SyN does; ants default yes).",
+    )
+    p.add_argument(
+        "-conv_rule",
+        choices=("window", "itk"),
+        default=None,
+        help="Early-stop measure: 'itk' (ANTs: trailing slope over the level's "
+        "cumulative |cost|) or 'window' (range-normalised trailing slope, legacy).",
+    )
+    p.add_argument(
+        "-pyramid",
+        choices=("corners", "itk"),
+        default=None,
+        help="Level grids: 'itk' (floor(n/f) voxels at spacing f, centred, sampling the "
+        "full-resolution smoothed images, as ANTs) or 'corners' (legacy).",
+    )
+    p.add_argument(
+        "-field_kernel",
+        choices=("sampled", "discrete"),
+        default=None,
+        help="Field smoothing kernel: ITK's 'discrete' Gaussian (ANTs) or a 'sampled' "
+        "Gaussian (legacy).",
+    )
+    p.add_argument(
+        "-keep",
+        choices=("last", "best"),
+        default=None,
+        help="Return each level's 'last' iterate (ANTs) or its lowest-cost legal one "
+        "('best', legacy).",
     )
     p.add_argument(
         "-best_patience",
         type=int,
         default=_D.best_patience,
-        help="Stop a level once the kept (best fold-free) cost has not improved for "
-        "this many iterations; 0 disables (default). Not result-preserving when "
-        "legality flickers around -jac_floor, as it does on T1 -> MNI fits: a later "
-        "iterate can come back fold-free and better.",
+        help="With -keep best: stop a level once the kept (best fold-free) cost has not "
+        "improved for this many iterations; 0 disables (default). Not result-preserving "
+        "when legality flickers around -jac_floor.",
     )
 
     # Folding: discouraged by default, forbidden on request
@@ -377,12 +487,11 @@ def parse_args(
         "-fold_penalty",
         "-fold-penalty",
         type=float,
-        default=_D.fold_penalty,
+        default=None,
         help="Strength of the soft anti-folding penalty (AFNI's warp-distortion "
-        "energy, same primitive as qwarp's -penfac); 0 disables it. Its deadband "
-        "charges nothing until a voxel inverts or more than doubles in volume, so "
-        "ordinary compression -- a large ventricle matched to a small one -- is free. "
-        "Raise it if the warp shows streaks of folded field.",
+        "energy, same primitive as qwarp's -penfac); 0 disables it (ants default; "
+        "legacy 0.0333). Its deadband charges nothing until a voxel inverts or more "
+        "than doubles in volume, so ordinary compression is free.",
     )
     p.add_argument(
         "-guard_floor",
@@ -698,24 +807,16 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         cc_radius=args.cc_radius,
         lpa_sigma=args.lpa_sigma,
         lpa_kernel=args.lpa_kernel,
-        grad_step=args.grad_step,
-        update_var=_maybe_list(args.update_var),
-        total_var=_maybe_list(args.total_var),
         invert_iters=args.invert_iters,
-        shrink_factors=_int_list(args.shrink),
-        smoothing_sigmas=_float_list(args.smooth),
-        iterations=_int_list(args.iters),
-        convergence_window=args.conv_window,
-        convergence_threshold=args.conv_thresh,
         best_patience=args.best_patience,
         void_guard=args.void_guard,
-        fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,
         guard_floor=args.guard_floor,
         guard_refuses=args.guard_refuses,
         warp_flags=warp_flags,
         final_interp=args.final_interp,
         verb=args.verb,
+        **_style_knobs(args),
     )
 
     pfx = parse_prefix(args.prefix)

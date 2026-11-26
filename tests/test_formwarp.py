@@ -42,13 +42,32 @@ def _blobs(nz: int, ny: int, nx: int, shift=(0.0, 0.0, 0.0)) -> torch.Tensor:
     )
 
 
-def test_config_defaults():
+def test_config_defaults_are_antsregistration_syn():
+    """antsRegistrationSyN.sh's SyN stage, in ANTs' units: SyN[0.1,3,0], CC radius 4,
+    -c [100x70x50x20,1e-6,10] -f 8x4x2x1 -s 3x2x1x0vox."""
     cfg = SynConfig()
-    assert cfg.metric == "cc"
-    assert cfg.cc_radius == 4
-    assert cfg.update_var == 3.0
-    assert cfg.total_var == 0.0
-    assert cfg.shrink_factors == (4, 2, 1)
+    assert (cfg.metric, cfg.cc_radius) == ("cc", 4)
+    assert (cfg.grad_step, cfg.update_var, cfg.total_var) == (0.1, 3.0, 0.0)
+    assert cfg.iterations == (100, 70, 50, 20)
+    assert cfg.shrink_factors == (8, 4, 2, 1)
+    assert cfg.smoothing_sigmas == (3.0, 2.0, 1.0, 0.0)
+    assert (cfg.convergence_threshold, cfg.convergence_window) == (1e-6, 10)
+    assert cfg.fold_penalty == 0.0 and not cfg.restore_best
+
+
+def test_legacy_style_is_the_pre_parity_engine():
+    from dataclasses import replace
+
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
+    cfg = replace(SynConfig(), **LEGACY_SYN)
+    assert cfg.shrink_factors == (4, 2, 1) and cfg.iterations == (300, 210, 120)
+    assert cfg.update_var == 9.0  # the old sigma-3 default, now a variance
+    assert (cfg.metric_gradient, cfg.inverter, cfg.update_rule) == (
+        "exact",
+        "fixed_point",
+        "additive",
+    )
     assert len(cfg.shrink_factors) == len(cfg.smoothing_sigmas) == len(cfg.iterations)
 
 
@@ -638,18 +657,16 @@ def test_fold_guard_lets_an_inherited_fold_be_climbed_out_of_but_not_deepened():
         assert torch.equal(kept_axis, prev_axis)
 
 
-def test_fold_guard_is_off_by_default_and_the_soft_penalty_is_on():
-    """The default is to discourage folds, not to forbid them.
+def test_fold_guard_is_off_by_default_and_the_soft_penalty_is_legacy_only():
+    """ANTs has no fold control beyond its smoothing, so neither is on by default; the
+    legacy engine discouraged folds with the soft penalty rather than forbidding them
+    (the hard guard fought 47,788 voxels of legitimate compression on NIREP na02->na01
+    to prevent 13 actual folds)."""
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN, _additive_step_with_fold_guard
 
-    Forbidding is the right call case by case (blipflip's single-axis fields), but as a
-    default it fought 47,788 voxels of legitimate compression on NIREP na02->na01 to
-    prevent 13 actual folds.
-    """
-    from fastfuncstuff.processing.formwarp import _additive_step_with_fold_guard
-
-    config = SynConfig()
-    assert config.fold_guard == 0.0
-    assert config.fold_penalty > 0.0
+    assert SynConfig().fold_guard == 0.0 and SynConfig().fold_penalty == 0.0
+    assert LEGACY_SYN["fold_penalty"] > 0.0
+    config = SynConfig(fold_penalty=LEGACY_SYN["fold_penalty"])
 
     # With the guard off the step is taken verbatim, folds and all.
     prev = tuple(torch.zeros(20, 20, 20) for _ in range(3))
@@ -668,7 +685,7 @@ def test_fold_penalty_charges_a_fold_and_not_ordinary_compression():
     """Its deadband is the point: shrinking a structure is anatomy, inverting is not."""
     from fastfuncstuff.processing.formwarp import _fold_penalty, jacobian_determinant
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
 
     def field(slope):
         x = torch.zeros(16, 16, 16)
@@ -771,7 +788,16 @@ def test_per_level_regularization_reaches_each_level():
     original = fw._syn_level
 
     def record(
-        fixed, moving, weight, fields, n_iter, config, level_tag="", guard=None, recorder=None
+        fixed,
+        moving,
+        weight,
+        fields,
+        n_iter,
+        config,
+        level_tag="",
+        guard=None,
+        recorder=None,
+        full_images=None,
     ):
         seen.append((level_tag, config.update_var, config.total_var))
         return original(fixed, moving, weight, fields, n_iter, config, level_tag, guard)
@@ -812,7 +838,7 @@ def test_sparse_fold_penalty_matches_the_dense_form(amplitude):
     from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty
     from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
 
     def dense(fields):
         je, se = compute_jacobian_energy(*fields)
@@ -849,7 +875,7 @@ def test_fold_penalty_face_voxels_are_not_half_counted():
     from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty, _pad_linear1
     from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
 
-    config = SynConfig()
+    config = SynConfig(fold_penalty=0.033333)
     ramp = torch.zeros(12, 12, 12)
     ramp[:, :, 1:] = -6.0  # the jump is right against the x face
     face = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
@@ -1043,7 +1069,7 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
     source = [torch.randn(5, 6, 7, generator=g, dtype=dtype) * 2 for _ in range(3)]
     direct = [f.clone().requires_grad_() for f in source]
     padded = [f.clone().requires_grad_() for f in source]
-    actual = fw._fold_penalty(tuple(direct), SynConfig())
+    actual = fw._fold_penalty(tuple(direct), SynConfig(fold_penalty=0.033333))
 
     def padded_gather(field, centres):
         full = fw._pad_linear1(field)
@@ -1053,7 +1079,7 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
         return full[nbr[..., 0], nbr[..., 1], nbr[..., 2]].reshape(-1, 3, 3, 3)
 
     monkeypatch.setattr(fw, "_gather_linear1_patches", padded_gather)
-    expected = fw._fold_penalty(tuple(padded), SynConfig())
+    expected = fw._fold_penalty(tuple(padded), SynConfig(fold_penalty=0.033333))
     assert actual.item() > 0
     bits = torch.int32 if dtype == torch.float32 else torch.int64
     assert torch.equal(actual.view(bits), expected.view(bits))
@@ -1067,10 +1093,10 @@ def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
 def _patience_run(jac_floor: float, best_patience: int):
     fixed = _blobs(20, 22, 20)
     moving = _blobs(20, 22, 20, shift=(2.5, -1.5, 1.0))
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
     config = SynConfig(
-        shrink_factors=(1,),
-        smoothing_sigmas=(0.0,),
-        iterations=(40,),
+        **{**LEGACY_SYN, "shrink_factors": (1,), "smoothing_sigmas": (0.0,), "iterations": (40,)},
         # Keep the raw-cost trend from ever firing, so only patience can stop the level.
         convergence_window=5,
         convergence_threshold=-1e9,
@@ -1107,3 +1133,201 @@ def test_best_patience_does_not_stop_a_level_with_no_legal_iterate():
     lev = res.levels[0]
     assert lev.fold_fallback and not lev.patience_stopped
     assert lev.iters_run == 40
+
+
+# --- ANTs (ITK SyN) parity options ---------------------------------------------------
+
+
+def test_local_cc_update_is_ants_centre_window_derivative():
+    """Against a direct per-voxel evaluation of ANTs' formula on in-bounds windows."""
+    import numpy as np
+
+    from fastfuncstuff.processing.formwarp import _local_cc_update
+
+    g = torch.Generator().manual_seed(0)
+    shape, r = (6, 7, 8), 2
+    f = torch.rand(shape, generator=g, dtype=torch.float64)
+    m = 0.6 * f + 0.4 * torch.rand(shape, generator=g, dtype=torch.float64)
+    cost, uf, um = _local_cc_update(f, m, torch.ones(shape, dtype=torch.float64), r)
+
+    F, M = f.numpy(), m.numpy()
+    exp_m = np.zeros((3, *shape))
+    exp_f = np.zeros((3, *shape))
+    r2s = []
+
+    def cdiff(v, k, j, i):
+        out = []
+        for ax, idx in ((2, i), (1, j), (0, k)):
+            n = v.shape[ax]
+            if idx in (0, n - 1):
+                out.append(0.0)
+                continue
+            sl_hi = [k, j, i]
+            sl_lo = [k, j, i]
+            sl_hi[ax] += 1
+            sl_lo[ax] -= 1
+            out.append(0.5 * (v[tuple(sl_hi)] - v[tuple(sl_lo)]))
+        return out
+
+    for k in range(shape[0]):
+        for j in range(shape[1]):
+            for i in range(shape[2]):
+                win = (slice(max(k - r, 0), k + r + 1), slice(max(j - r, 0), j + r + 1),
+                       slice(max(i - r, 0), i + r + 1))  # fmt: skip
+                a, b = F[win].ravel(), M[win].ravel()
+                sff = ((a - a.mean()) ** 2).sum()
+                smm = ((b - b.mean()) ** 2).sum()
+                sfm = ((a - a.mean()) * (b - b.mean())).sum()
+                r2s.append(sfm * sfm / (sff * smm))
+                fa, ma = F[k, j, i] - a.mean(), M[k, j, i] - b.mean()
+                cm = 2 * sfm / (sff * smm) * (fa - sfm / smm * ma)
+                cf = 2 * sfm / (sff * smm) * (ma - sfm / sff * fa)
+                exp_m[:, k, j, i] = cm * np.array(cdiff(M, k, j, i))
+                exp_f[:, k, j, i] = cf * np.array(cdiff(F, k, j, i))
+
+    assert float(cost) == pytest.approx(-np.mean(r2s), rel=1e-10)
+    np.testing.assert_allclose(torch.stack(um).numpy(), exp_m, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(torch.stack(uf).numpy(), exp_f, rtol=1e-8, atol=1e-12)
+
+
+def test_itk_inverter_reaches_its_tolerance_and_warm_start_helps():
+    from fastfuncstuff.processing.formwarp import _invert_field_itk, _sample_field_zeros
+
+    n = 24
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    bump = torch.exp(-(((xx - 12) ** 2 + (yy - 12) ** 2 + (zz - 12) ** 2) / 30.0))
+    d = (2.0 * bump, -1.0 * bump, 0.5 * bump)
+    e = _invert_field_itk(d, None)
+    s = _sample_field_zeros(d, *e)
+    resid = torch.sqrt(sum((ec + sc) ** 2 for ec, sc in zip(e, s, strict=True)))
+    assert float(resid.max()) <= 0.1
+    # Starting from the answer, one sweep is enough to confirm it.
+    again = _invert_field_itk(d, e, max_iter=1)
+    assert max(float((a - b).abs().max()) for a, b in zip(again, e, strict=True)) < 0.05
+
+
+def test_compose_update_identities():
+    from fastfuncstuff.processing.formwarp import _compose_update
+
+    g = torch.Generator().manual_seed(1)
+    w = tuple(torch.randn(5, 6, 7, generator=g) * 0.3 for _ in range(3))
+    zero = tuple(torch.zeros(5, 6, 7) for _ in range(3))
+    assert all(torch.equal(a, b) for a, b in zip(_compose_update(zero, w), w, strict=True))
+    # grid_sample at the grid points themselves: exact to float32 rounding (measured 1.8e-7).
+    assert all(
+        torch.allclose(a, b, atol=1e-6) for a, b in zip(_compose_update(w, zero), w, strict=True)
+    )
+
+
+def test_ants_parity_options_recover_a_known_shift():
+    nz, ny, nx = 24, 28, 30
+    fixed = _blobs(nz, ny, nx)
+    moving = _blobs(nz, ny, nx, shift=(2.5, -1.5, 1.0))
+    base = dict(metric="cc", cc_radius=3, grad_step=0.4, shrink_factors=(2, 1),
+                smoothing_sigmas=(1.0, 0.0), iterations=(25, 25), verb=0, fold_penalty=0.0,
+                metric_gradient="local", step_norm="per_half", inverter="itk")  # fmt: skip
+    before = ((fixed - moving) ** 2).mean().item()
+    for extra in ({}, {"update_rule": "compose", "pin_boundary": True, "restore_best": False}):
+        res = formwarp(fixed, moving, config=SynConfig(**base, **extra), device=DEVICE)
+        assert ((fixed - res.warped) ** 2).mean().item() < 0.1 * before, extra
+
+
+def test_compose_needs_the_itk_inverter_and_local_needs_cc():
+    fixed = _blobs(8, 8, 8)
+    bad_configs = (
+        {"update_rule": "compose", "inverter": "fixed_point"},
+        {"metric_gradient": "local", "metric": "lpa"},
+    )
+    for bad in bad_configs:
+        cfg = SynConfig(
+            shrink_factors=(1,), smoothing_sigmas=(0.0,), iterations=(2,), verb=0, **bad
+        )
+        with pytest.raises(ValueError):
+            formwarp(fixed, fixed, config=cfg, device=DEVICE)
+
+
+def test_itk_convergence_rule_reproduces_values_ants_logged():
+    """antsRegistration 2.6.2 --verbose, SyN level 1 on NIREP na16 -> na09."""
+    from fastfuncstuff.processing.formwarp import _convergence_value_itk
+
+    costs = [-0.9229865616005, -0.9352954357143, -0.9457278091161, -0.9541868123502,
+             -0.9607977710501, -0.9655545575694, -0.9690932685600, -0.9718242223448,
+             -0.9737197689329, -0.9750670069224, -0.9761224189108, -0.9770690239435,
+             -0.9779700489066, -0.9787069160454, -0.9788276503336]  # fmt: skip
+    assert _convergence_value_itk(costs[:9], 10) == float("inf")
+    # Measured agreement ~0.1-0.4%; a least-squares line would be off by 57%.
+    assert _convergence_value_itk(costs[:10], 10) == pytest.approx(3.319450560794e-03, rel=5e-3)
+    assert _convergence_value_itk(costs[:15], 10) == pytest.approx(5.469584820331e-04, rel=5e-3)
+
+
+def test_itk_pyramid_grid_is_centred_at_spacing_f_and_fields_rescale():
+    from fastfuncstuff.processing.formwarp import (
+        _itk_field_between,
+        _itk_level_shape,
+        _itk_to_level,
+    )
+
+    full = (17, 22, 13)
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float32) for n in full), indexing="ij"
+    )
+    lvl = _itk_to_level(xx, 4)
+    assert tuple(lvl.shape) == _itk_level_shape(full, 4) == (4, 5, 3)
+    # Centred, 4 voxels apart: x = 6 + 4 * (i - 1) for nx 13 -> 3 samples.
+    torch.testing.assert_close(lvl[0, 0], torch.tensor([2.0, 6.0, 10.0]))
+    # A uniform shift of 1 level-4 voxel is 4 full voxels, and 2 at level 2.
+    one = tuple(torch.ones(_itk_level_shape(full, 4)) for _ in range(3))
+    assert torch.allclose(_itk_field_between(one, 4, 1, full)[0], torch.full(full, 4.0))
+    assert torch.allclose(_itk_field_between(one, 4, 2, full)[1], torch.full((8, 11, 6), 2.0))
+
+
+def test_discrete_gaussian_is_itks_gaussian_operator():
+    """exp(-t) I_n(t), normalised; checked against scipy's ive at variance 3 (ITK
+    GaussianOperator, max error 0.001, gives 13 taps with centre 0.2431)."""
+    from scipy.special import ive
+
+    from fastfuncstuff.processing.formwarp import _discrete_gaussian_kernel
+
+    k = _discrete_gaussian_kernel(3.0, torch.device("cpu"), torch.float64)
+    assert k.numel() == 13
+    assert float(k.sum()) == pytest.approx(1.0, abs=1e-12)
+    raw = torch.tensor([ive(abs(n), 3.0) for n in range(-6, 7)], dtype=torch.float64)
+    torch.testing.assert_close(k, raw / raw.sum(), rtol=1e-12, atol=1e-14)
+    assert float(k[6]) == pytest.approx(0.24313, abs=1e-5)
+
+
+def test_full_resolution_level_sampling_matches_the_shrunk_image_at_identity():
+    from fastfuncstuff.processing.formwarp import _itk_to_level, _warp_level_from_full
+
+    g = torch.Generator().manual_seed(2)
+    full = torch.rand(17, 22, 13, generator=g)
+    lvl = _itk_to_level(full, 4)
+    zero = torch.zeros_like(lvl)
+    torch.testing.assert_close(_warp_level_from_full(full, zero, zero, zero, 4), lvl)
+    # A one-level-voxel shift in x reads the full image four voxels along.
+    one = torch.ones_like(lvl)
+    shifted = _warp_level_from_full(full, one, zero, zero, 4)
+    torch.testing.assert_close(shifted[..., :-1], lvl[..., 1:])
+
+
+def test_cli_style_sets_the_defaults_and_explicit_flags_win():
+    from fastfuncstuff.cli.formwarp import _style_knobs, parse_args
+    from fastfuncstuff.processing.formwarp import LEGACY_SYN
+
+    base = ["-base", "b", "-source", "s", "-prefix", "o"]
+    assert _style_knobs(parse_args(base)) == {}  # SynConfig's own (ANTs) defaults
+    assert _style_knobs(parse_args([*base, "-style", "legacy"])) == LEGACY_SYN
+    knobs = _style_knobs(
+        parse_args(
+            [*base, "-style", "legacy", "-update_var", "4", "-keep", "last", "-iters", "5x5x5"]
+        )
+    )
+    assert knobs["update_var"] == 4.0 and knobs["restore_best"] is False
+    assert knobs["iterations"] == (5, 5, 5) and knobs["inverter"] == "fixed_point"
+    # ANTs' per-level variance spelling.
+    assert _style_knobs(parse_args([*base, "-update_var", "16x9x4x3"]))["update_var"] == (
+        16.0,
+        9.0,
+        4.0,
+        3.0,
+    )
