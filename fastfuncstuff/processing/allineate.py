@@ -1361,34 +1361,50 @@ def _center_of_mass(vol: Tensor, weight: Tensor | None = None) -> Tensor:
     return torch.stack([(w * ii).sum() / wsum, (w * jj).sum() / wsum, (w * kk).sum() / wsum])
 
 
-def _cmass_full_axes(
+def _cmass_partial_normals(
     base: Tensor,
     source_shape: tuple[int, ...],
     base_affine: np.ndarray,
     source_affine: np.ndarray,
-    grid_matrix: Tensor,
     frac: float,
-) -> np.ndarray:
-    """Base voxel axes (x, y, z) along which the source covers the base's data.
+) -> list[np.ndarray]:
+    """World (mm) unit directions of the source axes that cover only part of the base.
 
-    Each source voxel axis is given to the base axis it runs along most (in mm), and
-    measured by its own length, n * voxel size: a tilted slab's bounding box is far
-    taller than the slab. A base axis is partial when a source axis on it is shorter
-    than ``frac`` of the base's nonzero extent there."""
-    s2b = np.linalg.inv(grid_matrix.detach().double().cpu().numpy())[:3, :3]
-    bvox = np.linalg.norm(np.asarray(base_affine, float)[:3, :3], axis=0)
-    svox = np.linalg.norm(np.asarray(source_affine, float)[:3, :3], axis=0)
+    A source voxel axis is partial when its own length, n * voxel size, is shorter than
+    ``frac`` of the base's nonzero extent measured along that same direction. Its
+    direction comes from the header, so a tilted or double-oblique slab is measured
+    across its own thickness (its bounding box is far taller) and the cmass shift is
+    dropped along the slab normal only, keeping the in-plane part."""
+    ab = np.asarray(base_affine, float)[:3, :3]
+    a_s = np.asarray(source_affine, float)[:3, :3]
     nz = (base != 0).nonzero()  # (z, y, x) indices
     if nz.shape[0] == 0:
-        return np.ones(3, bool)
-    span = (nz.amax(0) - nz.amin(0) + 1).double().cpu().numpy()[::-1] * bvox  # x, y, z mm
+        return []
+    step = max(1, nz.shape[0] // 200_000)
+    pts = nz[::step].flip(-1).double().cpu().numpy() @ ab.T  # mm, up to an offset
     nsrc = list(source_shape)[::-1][:3]  # source tensors are (z, y, x)
-    keep = np.ones(3, bool)
+    normals = []
     for i in range(3):
-        j = int(np.argmax(np.abs(s2b[:, i]) * bvox))
-        if nsrc[i] * svox[i] < frac * span[j]:
-            keep[j] = False
-    return keep
+        vox = float(np.linalg.norm(a_s[:, i]))
+        u = a_s[:, i] / vox
+        span = float(np.ptp(pts @ u)) + float(np.abs(ab.T @ u).max())
+        if nsrc[i] * vox < frac * span:
+            normals.append(u)
+    return normals
+
+
+def _drop_along(shift_vox: np.ndarray, base_affine: np.ndarray, normals: list) -> np.ndarray:
+    """Remove the components of a base-voxel shift along world directions ``normals``."""
+    ab = np.asarray(base_affine, float)[:3, :3]
+    mm = ab @ shift_vox
+    basis: list[np.ndarray] = []
+    for n in normals:  # orthonormalise: two partial axes span a plane
+        v = n - sum((n @ q) * q for q in basis)
+        if np.linalg.norm(v) > 1e-6:
+            basis.append(v / np.linalg.norm(v))
+    for q in basis:
+        mm = mm - (mm @ q) * q
+    return np.linalg.solve(ab, mm)
 
 
 def _cmass_translation(base: Tensor, source: Tensor, grid_matrix: Tensor | None = None) -> Tensor:
@@ -3364,19 +3380,23 @@ def _prepare_grid(
         cmass_shift = translation.cpu().numpy()
         if grid_matrix is not None and config.cmass_partial_frac > 0:
             assert base_header is not None and source_header is not None
-            keep = _cmass_full_axes(
+            normals = _cmass_partial_normals(
                 base, source_native.shape, base_header["affine"], source_header["affine"],
-                grid_matrix, config.cmass_partial_frac,
+                config.cmass_partial_frac,
             )  # fmt: skip
-            if not keep.all():
+            if normals:
                 if verb >= 1:
-                    # name the world direction: the base's voxel axes may be stored rotated
-                    ba = np.abs(np.asarray(base_header["affine"], float)[:3, :3])
-                    axes = ", ".join(("L-R", "A-P", "I-S")[int(np.argmax(ba[:, j]))]
-                                     for j in range(3) if not keep[j])  # fmt: skip
+                    names = []
+                    for n in normals:
+                        j = int(np.argmax(np.abs(n)))
+                        tilt = float(np.degrees(np.arccos(min(1.0, abs(n[j])))))
+                        names.append(
+                            ("L-R", "A-P", "I-S")[j]
+                            + (f" (tilted {tilt:.0f} deg)" if tilt >= 2 else "")
+                        )
                     print(f"  Center-of-mass: the source covers only part of the base along "
-                          f"{axes}; no shift along it")  # fmt: skip
-                cmass_shift = np.where(keep, cmass_shift, 0.0)
+                          f"{', '.join(names)}; no shift along it")  # fmt: skip
+                cmass_shift = _drop_along(cmass_shift, base_header["affine"], normals)
         if verb >= 1:
             t = cmass_shift
             print(f"  Center-of-mass shift: dx={t[0]:.2f}, dy={t[1]:.2f}, dz={t[2]:.2f} voxels")

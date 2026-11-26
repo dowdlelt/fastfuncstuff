@@ -2099,28 +2099,31 @@ def test_batched_clipped_cost_clips_each_candidate_by_its_own_range(cost):
 
 
 def test_cmass_skips_axes_a_slab_covers_only_partly():
-    """Forest: a 40 mm posterior coronal slab drops the A-P (y) cmass shift, nothing else;
-    a tilted slab is measured by its own thickness, not its bounding box."""
-    from fastfuncstuff.processing.allineate import _cmass_full_axes, _compute_grid_matrix
+    """Forest: a 42 mm posterior coronal slab drops the A-P cmass shift and nothing else.
+    A tilted slab is measured across its own thickness (not its bounding box), and the
+    shift is dropped along its normal only: the in-plane part survives."""
+    from fastfuncstuff.processing.allineate import _cmass_partial_normals, _drop_along
 
     base = torch.zeros(160, 170, 140)  # (z, y, x), 1 mm, brain fills it
     base[5:-5, 5:-5, 5:-5] = 1.0
     b_aff = np.eye(4)
-
-    def full(shape_zyx, s_aff, frac=0.5):
-        g = _compute_grid_matrix(s_aff, b_aff, torch.device("cpu"))
-        return _cmass_full_axes(base, shape_zyx, b_aff, s_aff, g, frac).tolist()
-
-    s_aff = np.diag([1.3, 1.3, 1.3, 1.0])  # voxel axes (x, z, y): slices along y
+    s_aff = np.eye(4)  # voxel axes (x, z, y): slices along y
     s_aff[:3, :3] = np.array([[1.3, 0, 0], [0, 0, 1.3], [0, 1.3, 0]])
-    assert full((32, 122, 114), s_aff) == [True, False, True]  # 42 mm A-P slab
-    assert full((122, 122, 114), s_aff) == [True, True, True]  # 159 mm: whole brain
+
+    (n,) = _cmass_partial_normals(base, (32, 122, 114), b_aff, s_aff, 0.5)  # 42 mm slab
+    assert np.allclose(np.abs(n), [0, 1, 0])
+    assert _cmass_partial_normals(base, (122, 122, 114), b_aff, s_aff, 0.5) == []  # 159 mm
+    assert _cmass_partial_normals(base, (32, 122, 114), b_aff, s_aff, 0.0) == []
+    assert np.allclose(_drop_along(np.array([3.0, 50.0, -4.0]), b_aff, [n]), [3.0, 0.0, -4.0])
+
     t = np.deg2rad(30)  # the slab tilted 30 deg about x
     rot = np.array([[1, 0, 0], [0, np.cos(t), -np.sin(t)], [0, np.sin(t), np.cos(t)]])
     s_tilt = s_aff.copy()
     s_tilt[:3, :3] = rot @ s_aff[:3, :3]
-    assert full((32, 122, 114), s_tilt) == [True, False, True]
-    assert full((32, 122, 114), s_aff, frac=0.0) == [True, True, True]
+    (n,) = _cmass_partial_normals(base, (32, 122, 114), b_aff, s_tilt, 0.5)
+    assert np.allclose(np.abs(n), np.abs(rot[:, 1]))
+    kept = _drop_along(np.array([0.0, 50.0, 0.0]), b_aff, [n])
+    assert abs(kept @ n) < 1e-9 and np.linalg.norm(kept) > 20  # in-plane share kept
 
 
 def test_weak_fit_is_refitted_from_the_other_start(monkeypatch):
