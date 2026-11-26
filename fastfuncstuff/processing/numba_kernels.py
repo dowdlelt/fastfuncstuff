@@ -766,3 +766,106 @@ def compose_and_sample_cpu(
     res = torch.from_numpy(out).reshape(4, b, v)
     g = torch.from_numpy(gout).reshape(3, b, v) if want else None
     return res[0], res[1], res[2], res[3], g
+
+
+_GN_BLOCK = 128
+
+
+# reassoc lets LLVM vectorise the block dot products (and contract fuses them); the
+# kernel promises float32 rounding, not bit-identity, so neither costs a guarantee.
+@numba.njit(parallel=True, cache=True, fastmath={"reassoc", "contract"})
+def _gn_normal_eqs_kernel(g, hw, bt, scale, omega, res, mean, has_mean, nsplit, hpart, gpart):
+    nd, nb = g.shape[0], bt.shape[1]
+    ncol = nd * nb
+    nv = g.shape[2]
+    per = (nv + nsplit - 1) // nsplit
+    for task in prange(g.shape[1] * nsplit):  # ty: ignore[not-iterable]
+        b = task // nsplit
+        s = task % nsplit
+        # Columns of up to _GN_BLOCK voxels, transposed so each (p, q) term of the
+        # rank-k update is one contiguous dot product. Summed in float32 within a
+        # block (128 terms), across blocks in float64.
+        cb = np.empty((ncol, _GN_BLOCK), np.float32)
+        rb = np.empty(_GN_BLOCK, np.float32)
+        h = hpart[b, s]
+        gr = gpart[b, s]
+        v = s * per
+        vend = min(nv, (s + 1) * per)
+        while v < vend:
+            k = 0
+            while k < _GN_BLOCK and v < vend:
+                om = omega[b, v]
+                if om > _F0:  # sqrt(omega) = 0 adds exactly nothing
+                    rw = np.sqrt(om)
+                    inv = rw / scale[b, v]
+                    # The columns as _gn_weighted_columns builds them, in its op order.
+                    for d in range(nd):
+                        gd = g[d, b, v]
+                        for n in range(nb):
+                            col = d * nb + n
+                            x = gd * (hw[d] * bt[v, n])
+                            if has_mean:
+                                x = x - mean[b, col]
+                            cb[col, k] = x * inv
+                    rb[k] = rw * res[b, v]
+                    k += 1
+                v += 1
+            for p in range(ncol):
+                acc = _F0
+                for t in range(k):
+                    acc += cb[p, t] * rb[t]
+                gr[p] += acc
+                for q in range(p, ncol):
+                    acc = _F0
+                    for t in range(k):
+                        acc += cb[p, t] * cb[q, t]
+                    h[p, q] += acc
+
+
+def gn_normal_eqs_cpu(
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    scale: Tensor,
+    omega: Tensor,
+    res: Tensor,
+    mean_cols: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """``warp._gn_accumulate`` without building the steepest-descent columns.
+
+    The CPU twin of ``gn_triton``: per patch, each voxel's column vector is formed
+    on the stack and folded straight into ``J' W J`` and ``J' W r``. Accumulated in
+    float64, so it agrees with the chunked einsum to float32 rounding (and is the
+    closer of the two to a float64 reference). When a phase has fewer patches than
+    threads -- level 0 is one patch -- each patch's voxels are split across threads
+    and the partial tiles summed.
+    """
+    d, b, v = g.shape
+    ncol = d * bt.shape[1]
+    threads = max(1, min(torch.get_num_threads(), numba.get_num_threads()))
+    nsplit = max(1, min(-(-2 * threads // b), v // 4096)) if b < 2 * threads else 1
+    hpart = np.zeros((b, nsplit, ncol, ncol))
+    gpart = np.zeros((b, nsplit, ncol))
+    mean = (
+        mean_cols.reshape(b, ncol).contiguous().numpy()
+        if mean_cols is not None
+        else np.zeros((1, 1), np.float32)
+    )
+    _with_threads(
+        _gn_normal_eqs_kernel,
+        g.numpy(),
+        hw.reshape(-1).contiguous().numpy(),
+        bt.contiguous().numpy(),
+        scale.numpy(),
+        omega.contiguous().numpy(),
+        res.contiguous().numpy(),
+        mean,
+        mean_cols is not None,
+        nsplit,
+        hpart,
+        gpart,
+    )
+    h = hpart.sum(1)
+    iu = np.triu_indices(ncol, 1)
+    h[:, iu[1], iu[0]] = h[:, iu[0], iu[1]]
+    return torch.from_numpy(h.astype(np.float32)), torch.from_numpy(gpart.sum(1).astype(np.float32))

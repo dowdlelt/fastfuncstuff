@@ -1998,6 +1998,16 @@ def _gn_accumulate(
                 f"({type(exc).__name__}: {exc}); falling back to the chunked path"
             )
 
+    if (
+        g.device.type == "cpu"
+        and g.dtype == torch.float32
+        and res.dtype == torch.float32
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import gn_normal_eqs_cpu
+
+        return gn_normal_eqs_cpu(g, hw, bt, scale, omega, res, mean_cols)
+
     build = columns_fn if columns_fn is not None else _gn_weighted_columns
     hw_col = hw.reshape(1, 1, d, 1)
     hmat = torch.zeros((b, ncol, ncol), device=g.device, dtype=torch.float32)

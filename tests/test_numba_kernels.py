@@ -153,7 +153,8 @@ def test_fused_compose_and_sample_is_bit_identical(vol, patch, n_patch, torch_ro
         for t in torch.meshgrid(*(torch.arange(n) for n in patch), indexing="ij")
     )
     origin = [
-        torch.randint(0, n - p + 1, (n_patch,), generator=g).float() for n, p in zip(vol, patch)
+        torch.randint(0, n - p + 1, (n_patch,), generator=g).float()
+        for n, p in zip(vol, patch, strict=True)
     ]
     kb, jb, ib = origin
     bi, bj, bk = ib[:, None] + ii, jb[:, None] + jj, kb[:, None] + kk
@@ -175,3 +176,42 @@ def test_fused_compose_and_sample_is_bit_identical(vol, patch, n_patch, torch_ro
         assert torch.equal(a, c)
         assert torch.equal(b, c)
     assert torch.equal(fused[4], g_old)
+
+
+@pytest.mark.parametrize(
+    "n_dir,n_patch,n_vox,n_basis,centred",
+    [(3, 7, 300, 4, True), (2, 3, 500, 8, False), (3, 1, 9000, 12, True), (1, 40, 64, 4, True)],
+)
+def test_fused_gn_normal_equations_match_the_chunked_einsum(
+    n_dir, n_patch, n_vox, n_basis, centred, torch_route
+):
+    """Float32 rounding against the torch route, and closer than it to float64.
+
+    The single-patch case is split across threads (level 0's shape); zero-weight
+    voxels are skipped rather than multiplied by zero.
+    """
+    import fastfuncstuff.processing.warp as W
+
+    g0 = torch.Generator().manual_seed(0)
+    # A strided (D, B, V) view of a (B, 3, V) buffer, as the compose kernel hands it over.
+    g = torch.randn(n_patch, 3, n_vox, generator=g0).permute(1, 0, 2)[:n_dir]
+    hw = torch.rand(n_dir, 1, 1, generator=g0) + 0.5
+    bt = torch.randn(n_vox, n_basis, generator=g0)
+    omega = torch.rand(n_patch, n_vox, generator=g0)
+    omega[omega < 0.2] = 0
+    scale = (torch.rand(n_patch, 1, generator=g0) + 0.5).expand(-1, n_vox)
+    res = torch.randn(n_patch, n_vox, generator=g0)
+    mean = torch.randn(n_patch, 1, n_dir * n_basis, generator=g0) if centred else None
+    args = (g, hw, bt, scale, omega, res, mean)
+    h_new, g_new = W._gn_accumulate(*args, 4096)
+    torch_route()
+    h_old, g_old = W._gn_accumulate(*args, 4096)
+    h_ref, g_ref = W._gn_accumulate(*(a.double() if a is not None else None for a in args), 4096)
+
+    def rel(a, ref):
+        return ((a.double() - ref).abs().max() / ref.abs().max()).item()
+
+    for new, old, ref in ((h_new, h_old, h_ref), (g_new, g_old, g_ref)):
+        assert rel(new, ref) < 2e-7
+        assert rel(new, ref) <= rel(old, ref)
+    assert torch.equal(h_new, h_new.transpose(-1, -2))
