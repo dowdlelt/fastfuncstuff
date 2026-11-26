@@ -294,6 +294,7 @@ def optimize_warp_params_gauss_newton(
     tolerance: float = 1e-5,
     stop_rule: str = "first_reject",
     ball_radius: float | None = None,
+    step_fracs: tuple[float, ...] = (1.0,),
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Levenberg-damped Gauss-Newton over B patches at once.
 
@@ -332,6 +333,11 @@ def optimize_warp_params_gauss_newton(
         ball_radius: if set, constrain each patch's parameters to the L2 ball of
             this radius (AFNI's BALLOPT) instead of the box ``|p_i| <= param_max``;
             a trial outside it is scaled back onto the sphere.
+        step_fracs: fractions of the GN step to try each iteration, keeping the one
+            with the lowest true cost per patch. ``(1.0,)`` is the plain step. The GN
+            model sees only the correlation residual, so the full step can buy
+            correlation at a disproportionate penalty and still be accepted; a short
+            search on the true total lets the penalty choose the step length too.
 
     Returns:
         (best_params, best_costs, stats).
@@ -369,14 +375,23 @@ def optimize_warp_params_gauss_newton(
             delta = linalg_lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if ball_radius is None:
-            trial = (best_params + delta).clamp(-param_max, param_max)
-        else:
-            trial = best_params + delta
-            norm = trial.norm(dim=-1, keepdim=True)
-            trial = trial * (ball_radius / norm.clamp_min(ball_radius))
-        trial_costs = cost_fn(trial).detach()
-        n_evals += 1
+        trial = trial_costs = None
+        for frac in step_fracs:
+            cand = best_params + delta if frac == 1.0 else best_params + frac * delta
+            if ball_radius is None:
+                cand = cand.clamp(-param_max, param_max)
+            else:
+                norm = cand.norm(dim=-1, keepdim=True)
+                cand = cand * (ball_radius / norm.clamp_min(ball_radius))
+            cand_costs = cost_fn(cand).detach()
+            n_evals += 1
+            if trial is None or trial_costs is None:
+                trial, trial_costs = cand, cand_costs
+            else:
+                take = cand_costs < trial_costs
+                trial = torch.where(take.unsqueeze(-1), cand, trial)
+                trial_costs = torch.where(take, cand_costs, trial_costs)
+        assert trial is not None and trial_costs is not None
 
         better = trial_costs < best_costs
         if freeze:

@@ -882,6 +882,12 @@ def parse_args(
         "a per-parameter box, as 3dQwarp does (experimental)",
     )
     g_opt.add_argument(
+        "-gn_step_search",
+        action="store_true",
+        help="Try each Gauss-Newton step at full, half and quarter length and keep the "
+        "one with the lowest total cost, penalty included (experimental)",
+    )
+    g_opt.add_argument(
         "-lev0",
         choices=("ffs", "afni"),
         default=QwarpConfig().lev0_schedule,
@@ -1946,6 +1952,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         gn_iters_lev0=args.gn_iters_lev0,
         ball_constraint=args.ball,
         lev0_schedule=args.lev0,
+        gn_step_search=args.gn_step_search,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

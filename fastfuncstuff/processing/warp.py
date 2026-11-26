@@ -279,6 +279,14 @@ class QwarpConfig:
     larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
     until measured."""
 
+    gn_step_search: bool = False
+    """Try the Gauss-Newton step at full, half and quarter length each iteration
+    and keep whichever gives the lowest true cost (correlation + penalty) per patch.
+    The GN model is built from the correlation residual alone, so a plain step can be
+    accepted while raising the penalty -- a suspected cause of ffs warps being
+    rougher than 3dQwarp's (det J < 0.5 in 12.4% of voxels against 4.8%). Costs two
+    extra cost evaluations per iteration; opt-in until measured."""
+
     lev0_schedule: str = "ffs"
     """Bases and bounds of the global level 0. ``"ffs"``: cubic_lite, cubic,
     quintic_lite, all under the per-parameter box. ``"afni"``: 3dQwarp's order and
@@ -2674,6 +2682,7 @@ def _improve_warp_batched(
             max_iter=gn_budget,
             stop_rule=config.gn_stop_rule,
             ball_radius=ball_radius,
+            step_fracs=(1.0, 0.5, 0.25) if config.gn_step_search else (1.0,),
         )
         if use_hybrid:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(

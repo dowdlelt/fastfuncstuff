@@ -291,3 +291,24 @@ def test_gn_ball_constraint_bounds_the_norm_not_each_coefficient():
     assert box.abs().max() <= 0.0421 + 1e-7
     assert ball[0, 0] > 0.0421 * 2
     assert ball.norm() <= 0.1141 * (1 + 1e-6)
+
+
+def test_gn_step_search_keeps_the_best_fraction_of_the_step():
+    """The model's step is twice too long; the search lands on the minimum at once."""
+    from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+    def normal_eqs(p):
+        return torch.full((p.shape[0], 1, 1), 0.5), (1.0 - p)  # step 2(1-p): lands at 2
+
+    def cost(p):
+        return ((p - 1.0) ** 2).sum(-1)
+
+    plain, c_plain, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 2, 1, 5.0, torch.device("cpu"), max_iter=1, lam0=0.0
+    )
+    searched, c_search, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 2, 1, 5.0, torch.device("cpu"), max_iter=1, lam0=0.0,
+        step_fracs=(1.0, 0.5, 0.25),
+    )  # fmt: skip
+    assert torch.equal(plain, torch.zeros(2, 1))  # 2 is no better than 0: rejected
+    torch.testing.assert_close(searched, torch.ones(2, 1), rtol=0, atol=1e-6)
