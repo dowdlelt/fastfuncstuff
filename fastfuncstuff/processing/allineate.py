@@ -192,6 +192,13 @@ class AffineAlignConfig:
     # brain, so on that axis the shift drags it toward the brain's middle (Forest's
     # posterior coronal slabs: 50-68 mm A-P). AFNI's -cmass+xz, chosen per axis. 0 = off.
     cmass_partial_frac: float = 0.5
+    # Which start to refine from when headers and cmass both exist: None lets the start
+    # costs choose (``_header_or_cmass_start``); "headers" / "cmass" force one.
+    force_start: str | None = None
+    # A fit that ends weak (local correlation < _WEAK_FIT_COST) is refitted from the
+    # start the start costs passed over, each with its own footprint, and the better on
+    # one yardstick kept. Costs a second fit only when the first failed.
+    start_rescue: bool = True
     # Starting transform, as an .aff12.1D would hold it: 4x4, base->source, AFNI
     # DICOM mm. Baked into the pre-resample exactly where the header grid map
     # goes, so the optimiser starts from it and searches only a residual -- the
@@ -3656,6 +3663,9 @@ def allineate(
             save_cost_trace_path,
             info,
         )
+        matrix, warped, info = _rescue_weak_start(
+            base, source, config, base_header, source_header, matrix, warped, info
+        )
         if not _reanchor_wanted(config, info, base_header, source_header):
             return matrix, warped
         from .affine import voxel_matrix_to_dicom
@@ -3712,6 +3722,41 @@ def allineate(
             if moved < config.reanchor_tol_mm:
                 break
         return matrix, warped
+
+
+def _rescue_weak_start(base, source, config, base_header, source_header, matrix, warped, info):
+    """Refit a weak fit from the start the start costs passed over; keep the better.
+
+    The start costs are read far from the answer, where both can be near zero (HiHiFaces
+    434: headers 0.0008, cmass 0.0015), so the choice is a coin toss. The losing start
+    is still refined, but as a late seed inside the winner's setup, whose footprint was
+    built at the winner's pose: on a slab it is scored where the source is not, and
+    never finds its basin (434: lpc 0.17 from the headers alone, 0.02 by default). A
+    second fit gives it its own footprint; both are scored on one yardstick."""
+    chosen = info.get("start")
+    if (
+        not config.start_rescue
+        or config.force_start is not None
+        or chosen is None
+        or info.get("own_score", 1.0) >= _WEAK_FIT_COST
+    ):
+        return matrix, warped, info
+    other = "headers" if chosen == "cmass" else "cmass"
+    if config.verb >= 1:
+        print(f"  Weak fit from the {chosen} start: refitting from the {other} start")
+    info2: dict = {}
+    m2, w2 = _align(
+        base, source, replace(config, force_start=other), base_header, source_header,
+        None, None, None, None, info2,
+    )  # fmt: skip
+    scores = info2["score"]([matrix, m2]) if "score" in info2 else None
+    keep_second = scores is not None and scores[1] > scores[0]
+    if config.verb >= 1 and scores is not None:
+        print(
+            f"  Start rescue: {chosen} {scores[0]:.4f}, {other} {scores[1]:.4f} on a common "
+            f"yardstick -> keeping the {other if keep_second else chosen} fit"
+        )
+    return (m2, w2, info2) if keep_second else (matrix, warped, info)
 
 
 def _common_scores(
@@ -3917,11 +3962,15 @@ def _header_or_cmass_start(
     # The headers are the prior; cmass is a guess from two centroids. On ds003427
     # sub-05 a 2.5% start-cost edge sent cmass 29 mm off, while correct header
     # starts won by 1.4-9x, so cmass has to win clearly.
-    use_hdr = not _cmass_wins(c_cmass, c_hdr)
+    if config.force_start is not None:
+        use_hdr = config.force_start == "headers"
+    else:
+        use_hdr = not _cmass_wins(c_cmass, c_hdr)
     if verb >= 1:
+        why = " (forced)" if config.force_start is not None else ""
         print(
             f"  Start: headers cost {c_hdr:.4f}, headers + cmass {c_cmass:.4f} "
-            f"-> {'headers' if use_hdr else 'cmass'}"
+            f"-> {'headers' if use_hdr else 'cmass'}{why}"
         )
     # Pivot-free: a pure translation reads the same about any centre.
     t = np.asarray(setup.cmass_shift, dtype=np.float64)
@@ -3976,6 +4025,8 @@ def _align(
         setup, base, base_header, source_native, source_header, config, device, verb,
         force_cross_grid=full_to_work is not None,
     )  # fmt: skip
+    if info is not None and other_start is not None:
+        info["start"] = "cmass" if config.cmass else "headers"
     base_opt, source_opt, weight_opt = setup.base_opt, setup.source_opt, setup.weight_opt
     weight = setup.weight
     ctx, voxdims, bounds, sample = setup.ctx, setup.voxdims, setup.bounds, setup.sample
@@ -4251,9 +4302,11 @@ def _align(
         if verb >= 1 and setup.start_footprint is not None:
             print(f"  Footprint overlap (fitted vs sampled): {info['footprint_overlap']:.2f}")
         info["score"] = lambda mats, st=setup, src=source_native: _common_scores(st, src, mats)
-    if verb >= 1 and cost_name in _BLOK_COSTS:
+    if (verb >= 1 or info is not None) and cost_name in _BLOK_COSTS:
         own = _common_scores(setup, source_native, [final_matrix])
-        if own is not None and (msg := _weak_fit_warning(cost_name, abs(own[0]))):
+        if info is not None and own is not None:
+            info["own_score"] = abs(own[0])
+        if verb >= 1 and own is not None and (msg := _weak_fit_warning(cost_name, abs(own[0]))):
             print(msg)
 
     if movie is not None:

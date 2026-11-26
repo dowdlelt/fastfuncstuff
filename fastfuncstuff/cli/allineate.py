@@ -566,6 +566,13 @@ Examples:
         "-nocmass", action="store_true", help="Disable center-of-mass pre-alignment"
     )
     search_group.add_argument(
+        "-no_start_rescue",
+        action="store_true",
+        help="Keep a weak fit (local correlation under 0.05) as it is. By default it is "
+        "refitted from the start (headers or cmass) the start costs passed over, and the "
+        "better of the two on one yardstick is kept; only a failing fit pays for this.",
+    )
+    search_group.add_argument(
         "-cmass_partial",
         type=float,
         default=0.5,
@@ -996,6 +1003,7 @@ def build_align_config(
         cmass=not (args.nocmass or args.use_headers) and init_matrix is None,
         cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
         cmass_partial_frac=args.cmass_partial,
+        start_rescue=not args.no_start_rescue,
         interp=args.interp,
         final_interp=args.final_interp,
         source_automask=args.source_automask,

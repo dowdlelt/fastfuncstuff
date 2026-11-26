@@ -1,6 +1,7 @@
 """Tests for fastfuncstuff.processing.allineate."""
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -2120,3 +2121,28 @@ def test_cmass_skips_axes_a_slab_covers_only_partly():
     s_tilt[:3, :3] = rot @ s_aff[:3, :3]
     assert full((32, 122, 114), s_tilt) == [True, False, True]
     assert full((32, 122, 114), s_aff, frac=0.0) == [True, True, True]
+
+
+def test_weak_fit_is_refitted_from_the_other_start(monkeypatch):
+    """Only a weak fit pays for a second fit; it starts from the start passed over, and
+    the better of the two on the common yardstick is kept."""
+    import fastfuncstuff.processing.allineate as al
+
+    calls = []
+
+    def fake_align(base, source, config, *args):
+        calls.append(config.force_start)
+        args[-1].update(score=lambda mats: [0.01, 0.2])
+        return torch.full((4, 4), 2.0), "second"
+
+    monkeypatch.setattr(al, "_align", fake_align)
+    cfg = al.AffineAlignConfig(verb=0)
+    first = torch.eye(4)
+    weak = {"start": "cmass", "own_score": 0.01}
+    m, w, _ = al._rescue_weak_start(None, None, cfg, None, None, first, "first", weak)
+    assert calls == ["headers"] and w == "second"
+    good = {"start": "cmass", "own_score": 0.3}
+    m, w, _ = al._rescue_weak_start(None, None, cfg, None, None, first, "first", good)
+    assert calls == ["headers"] and w == "first"  # no second fit
+    off = replace(cfg, start_rescue=False)
+    assert al._rescue_weak_start(None, None, off, None, None, first, "first", weak)[1] == "first"
