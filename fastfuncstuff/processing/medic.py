@@ -574,9 +574,15 @@ def save_medic_warp(
             (disp_np, pe_nifti_axis),
             *[(c.detach().cpu().numpy(), a) for c, a in (extra_components or [])],
         ]:
-            feed_sign = -1.0 if axis in (0, 1) else 1.0
-            rpp = float(cardinal[axis, axis])  # signed voxel mm on this axis
-            fill_layout(warp[..., axis], comp, scale=rpp * feed_sign)
+            # The cardinal affine is a scaled signed permutation: voxel axis `axis` lies
+            # along exactly one physical axis, which is the warp component it belongs
+            # in. It is the same index only for axial-ordered data; reading the diagonal
+            # (as this did) wrote zeros for a coronal or sagittal slab -- the corrected
+            # series was right and the saved warp empty (ds002702, RIA, 2026-11-27).
+            col = cardinal[:3, axis]
+            phys = int(np.argmax(np.abs(col)))
+            feed_sign = -1.0 if phys in (0, 1) else 1.0
+            fill_layout(warp[..., phys], comp, scale=float(col[phys]) * feed_sign)
         path = f"{prefix_stem}_warp{nii_ext}"
         save_nifti(warp, path, affine=cardinal)
         return path

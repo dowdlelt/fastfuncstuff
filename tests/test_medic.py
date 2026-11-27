@@ -666,3 +666,28 @@ def test_cli_precomputed_fieldmap_refuses_wrong_length(tmp_path):
     rc = main(["-magnitude", str(m), "-fieldmap", str(f), "-total_readout_time", "0.03",
                "-pe_dir", "j", "-prefix", str(tmp_path / "x"), "-device", "cpu", "-verb", "0"])  # fmt: skip
     assert rc == 1
+
+
+def test_5d_warp_matches_per_frame_on_a_coronal_slab(tmp_path):
+    """The 5-D warp (locomoco / medic default) must put each voxel axis's displacement
+    on the physical axis it lies along. It read the cardinal affine's diagonal, which
+    is zero on a coronal or sagittal slab, and wrote an empty warp (ds002702, RIA)."""
+    import glob
+
+    import nibabel as nib
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.processing.medic import save_medic_warp
+
+    aff = np.array([[-0.8, 0, 0, 80.0], [0, -0.532, -0.597, 24.0],
+                    [0, 0.597, -0.532, -29.0], [0, 0, 0, 1]])  # fmt: skip  # oblique RIA
+    rng = np.random.default_rng(0)
+    disp = torch.from_numpy(rng.normal(0, 1, (6, 7, 5, 3)).astype(np.float32))
+    p5 = save_medic_warp(disp, 1, aff, str(tmp_path / "a"), as_5d=True)
+    pf = save_medic_warp(disp, 1, aff, str(tmp_path / "b"), as_5d=False)
+    w5 = np.asarray(nib.load(p5).dataobj).reshape(6, 7, 5, 3, 3)
+    assert np.abs(w5).max() > 0.1  # not the empty warp
+    for t, f in enumerate(sorted(glob.glob(pf))):
+        wf = np.asarray(nib.load(f).dataobj).reshape(6, 7, 5, 3)
+        np.testing.assert_allclose(w5[:, :, :, t, :], wf, rtol=1e-5, atol=1e-6)
