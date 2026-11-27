@@ -10,6 +10,7 @@ from .allineate import AllineateCheck
 from .base import Check, UnitResult
 from .blipflip import BlipflipCheck
 from .fc import FcCheck
+from .locomoco import LocomocoCheck
 from .moco import MocoCheck
 from .nordic import NordicCheck
 from .physio import PhysioCheck
@@ -35,6 +36,7 @@ CHECKS: dict[str, type[Check]] = {
         SegmentCheck,
         WarpPairCheck,
         WarpMniCheck,
+        LocomocoCheck,
     )
 }
 

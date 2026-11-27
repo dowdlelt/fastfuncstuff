@@ -152,3 +152,28 @@ def test_label_judges_flag_a_lost_label_and_write_a_table():
     assert lines[1].split("\t")[:4] == ["1", "125", "50", "0.4000"] and len(lines) == 4
     d = deformation_judges(np.r_[np.full(98, 1.0), 0.3, 3.0], np.ones(100, bool))
     assert d["frac_det_below_half"] == d["frac_det_above_2"] == 0.01
+
+
+def test_locomoco_intrinsic_judge_and_hires_qualification():
+    """A series that is its median plus noise scores worse than the clean one on every
+    intrinsic judge; only voxels under 1.8 mm (isotropic equivalent) qualify."""
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.locomoco import LocomocoCheck, _intrinsic
+
+    rng = np.random.default_rng(0)
+    z, y, x = np.mgrid[0:12, 0:12, 0:12]
+    med = (100 + 50 * np.sin(x / 2.0) * np.cos(y / 3.0)).astype(np.float32)
+    mask = np.ones(med.shape, bool)
+    clean = np.repeat(med[..., None], 20, axis=3) + rng.normal(0, 1, (*med.shape, 20))
+    noisy = clean + rng.normal(0, 10, clean.shape)
+    a, b = _intrinsic(clean, med, mask), _intrinsic(noisy, med, mask)
+    assert a["tsnr_median"] > b["tsnr_median"] and a["vol_r_mean"] > b["vol_r_mean"]
+    assert a["vol_r_min"] <= a["vol_r_mean"] <= 1.0
+
+    chk = LocomocoCheck.__new__(LocomocoCheck)
+    ds = {"offers": []}
+    acq = {"offers": ["epi_2d"], "entities": {}, "n_subjects": 1}
+    assert chk.qualifies(ds, {**acq, "voxel_mm": [0.8, 0.8, 0.8]})
+    assert not chk.qualifies(ds, {**acq, "voxel_mm": [2.0, 2.0, 2.0]})
+    assert not chk.qualifies(ds, {**acq, "voxel_mm": [0.8, 0.8, 0.8], "offers": ["epi_3d"]})
