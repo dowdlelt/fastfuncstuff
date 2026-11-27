@@ -169,8 +169,30 @@ def _stem(rel: str) -> str:
     return Path(name).stem
 
 
+def _link_or_copy(src: str, dst: str) -> None:
+    """Hard-link a host-set file into its ingested home; copy across filesystems.
+
+    Unit outputs are never rewritten in place (rsync and the runner both write a new file
+    and rename), so a link costs nothing and cannot alias a later change. The worklist is
+    the exception: ingest rewrites its artifact paths, so it is always a real copy."""
+    import os
+
+    if Path(dst).exists():
+        if os.path.samefile(src, dst):
+            return
+        os.unlink(dst)
+    if not Path(src).name.startswith("worklist.sqlite"):
+        try:
+            os.link(src, dst)
+            return
+        except OSError:  # another filesystem, or links not supported
+            pass
+    shutil.copy2(src, dst)
+
+
 def ingest(wl: Worklist, root: Path, src: Path) -> Path:
-    """Copy a synced host set under ROOT/hosts/ and register it; returns where it lives."""
+    """Register a synced host set under ROOT/hosts/ (files hard-linked, not duplicated);
+    returns where it lives."""
     src = Path(src)
     hs = Worklist(src / "worklist.sqlite")
     hid, label = hs.meta("hostset"), hs.meta("label") or "host"
@@ -179,7 +201,13 @@ def ingest(wl: Worklist, root: Path, src: Path) -> Path:
         raise ValueError(f"{src} is not a host set (no hostset id in its meta table)")
     dest = Path(root) / "hosts" / f"{label}-{hid[:8]}"
     if src.resolve() != dest.resolve():
-        shutil.copytree(src, dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns("cache"))
+        shutil.copytree(
+            src,
+            dest,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("cache"),
+            copy_function=_link_or_copy,
+        )
     hs = Worklist(dest / "worklist.sqlite")
     # Artifact paths were written on the other host; point them at the copy.
     for a in hs.db.execute("SELECT unit_id, path FROM artifacts").fetchall():

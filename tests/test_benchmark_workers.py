@@ -117,6 +117,17 @@ def test_hostset_export_run_ingest_round_trip(tmp_path, capsys):
     (res,) = got.results("moco")
     assert res["unit_id"] == u["id"] and res["seconds.ffs.cpu"] == 12.5
     got.close()
+    # outputs are linked, not duplicated; the worklist is a real copy, so the synced set's
+    # own paths are untouched by ingest's rewrite
+    linked = [f for f in out.rglob("*") if f.is_file() and "cache" not in f.parts
+              and not f.name.startswith("worklist.sqlite")]  # fmt: skip
+    assert linked and all(f.samefile(dest / f.relative_to(out)) for f in linked)
+    assert not (out / "worklist.sqlite").samefile(dest / "worklist.sqlite")
+    src_paths = [
+        r["path"]
+        for r in Worklist(out / "worklist.sqlite").db.execute("SELECT path FROM artifacts")
+    ]
+    assert not any(x.startswith(str(dest)) for x in src_paths)
 
     # the next set leaves out what the server already finished
     out2 = export_hostset(wl, man, tmp_path / "hs2", ["moco"], 3, "epyc")
