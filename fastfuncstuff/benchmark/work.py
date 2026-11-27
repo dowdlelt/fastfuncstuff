@@ -64,11 +64,14 @@ def plan(wl, manifests: Path, check_name: str, datasets: list[str], n: int) -> N
 
 
 def deadline_from(hhmm: str | None) -> float | None:
-    """Next occurrence of HH:MM local time, as a timestamp (tomorrow if already past)."""
+    """Next occurrence of HH:MM local time, as a timestamp (tomorrow if already past); or
+    an ISO date and time (2026-11-30T07:00) for a run that spans more than one night."""
     if not hhmm:
         return None
     import datetime as dt
 
+    if "-" in hhmm:
+        return dt.datetime.fromisoformat(hhmm).timestamp()
     h, m = (int(x) for x in hhmm.split(":"))
     now = dt.datetime.now()
     t = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -383,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "-until",
         metavar="HH:MM",
-        help="Claim no new unit after this local time (next occurrence), e.g. 07:00.",
+        help="Claim no new unit after this local time (next occurrence), e.g. 07:00, or "
+        "after an ISO date and time, e.g. 2026-11-30T07:00 (a weekend run).",
     )
     args = p.parse_args(argv)
     if args.root is None:

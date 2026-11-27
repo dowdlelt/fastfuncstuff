@@ -251,3 +251,14 @@ def test_cohort_units_gathers_hosts_latest_run_wins(tmp_path):
         unit(hosts["new"], ids[1]),
         unit(hosts["new"], ids[2]),
     ]
+
+
+def test_until_accepts_hhmm_and_an_iso_datetime():
+    import datetime as dt
+
+    from fastfuncstuff.benchmark.work import deadline_from
+
+    assert deadline_from(None) is None
+    t = deadline_from("07:00")
+    assert t is not None and 0 < t - dt.datetime.now().timestamp() <= 86400
+    assert deadline_from("2026-11-30T07:00") == dt.datetime(2026, 11, 30, 7, 0).timestamp()
