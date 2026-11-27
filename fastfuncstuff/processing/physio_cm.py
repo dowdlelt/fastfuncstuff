@@ -17,6 +17,7 @@ import torch
 
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.core import construct_polynomial_matrix
+from fastfuncstuff.utils import linalg_device
 
 CM_DEGREE = 4  # Legendre drift removed before the search (a k/TR heartbeat is slow)
 CM_RESTARTS = 64
@@ -37,7 +38,9 @@ def temporal_grams(
     """(nt, nt) float64 Gram of the voxel series (fractional change, Legendre drift
     out, unit variance) inside each mask, in one pass, slice by slice: memory is
     O(nt^2 + one slice), never the whole masked volume in float64. Each voxel adds its
-    own outer product, so the Gram of a union is the sum of its parts' Grams."""
+    own outer product, so the Gram of a union is the sum of its parts' Grams.
+    On Metal (no float64) the Grams are built and returned on the CPU."""
+    device = linalg_device(device)
     nt = magnitude.shape[-1]
     L = construct_polynomial_matrix(nt, CM_DEGREE, device=device, dtype=torch.float64)
     Q, _ = plinalg.qr(L.cpu())

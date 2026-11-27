@@ -34,7 +34,7 @@ from scipy import signal
 
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.stats.task_coupling import _orthonormal_basis
-from fastfuncstuff.utils import accum_dtype
+from fastfuncstuff.utils import accum_dtype, linalg_device
 
 from ..glm.core import construct_polynomial_matrix
 from ..io.physio_bids import cmrr_volume_zero, read_cmrr_log  # noqa: F401  (moved; old import path)
@@ -969,7 +969,7 @@ def _refine_pass(
                 X = torch.from_numpy(
                     np.stack([np.cos(mem.phase[:, g]), np.sin(mem.phase[:, g])], 1)
                 )
-                X = X.to(device, dt)
+                X = X.to(dt).to(device)
                 Xs += [X * train[:, 0:1], X * train[:, 1:2]]
             P = _matmul_rows(Y, torch.cat(Xs, 1), device, dt)  # (nv, 4M)
             for m, mem in enumerate(members):
@@ -1070,14 +1070,15 @@ def _stitched_power(cols: np.ndarray, times: np.ndarray, cands) -> float:
 def _voxel_fits(Ys: list[torch.Tensor], phase: np.ndarray, device: torch.device) -> list:
     """Each voxel's complex cardiac coefficient and fit signal-to-residual under
     ``phase`` (nt, G), excitation by excitation: (z, snr) on ``device``, or None."""
+    dt = accum_dtype(device)
     out = []
     for g, Y in enumerate(Ys):
         if Y.shape[0] == 0:
             out.append(None)
             continue
         X = torch.from_numpy(np.stack([np.cos(phase[:, g]), np.sin(phase[:, g])], 1))
-        X = X.to(device).to(torch.float64)
-        Yd = Y.to(device).to(torch.float64)
+        X = X.to(dt).to(device)
+        Yd = Y.to(device).to(dt)
         Yd = Yd - Yd.mean(1, keepdim=True)
         XtX = X.T @ X
         B = (Yd @ X) @ plinalg.inv(XtX)
@@ -1156,7 +1157,7 @@ def slice_alignments(
     for a in range(0, P, step):
         # one upload per chunk; the trig runs on the device (on the host, cos/sin of
         # strided per-excitation slices cost 10x the matmuls)
-        ph = torch.from_numpy(np.stack(phases[a : a + step])).to(device).to(dt)  # (p, nt, G)
+        ph = torch.from_numpy(np.stack(phases[a : a + step])).to(dt).to(device)  # (p, nt, G)
         p_ = ph.shape[0]
         for g, Y in enumerate(Ys):
             if moments[g] is None:
@@ -1725,7 +1726,7 @@ def regress_out(
     The regression spends ``m`` degrees of freedom per voxel that a later GLM does
     not see, as with afni_proc's ``ricor`` block.
     """
-    device = device or torch.device("cpu")
+    device = linalg_device(device or torch.device("cpu"))  # float64 throughout
     nx, ny, nz, nt = data.shape
     m = X.shape[1] // nz
     if X.shape != (nt, nz * m):
@@ -1778,7 +1779,7 @@ def explained_maps(
     motion-locked fits, since raw voxels are scanner locations. Returns maps
     (nx, ny, nz), 0 outside ``mask``, plus ``"all"``.
     """
-    device = device or torch.device("cpu")
+    device = linalg_device(device or torch.device("cpu"))  # float64 throughout
     nx, ny, nz, nt = data.shape
     m = X.shape[1] // nz
     if X.shape != (nt, nz * m):

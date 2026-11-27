@@ -933,3 +933,19 @@ def test_find_beats_at_a_10khz_recording_rate():
     x = np.sin(2 * np.pi * hr * t) ** 15 + 0.05 * np.random.default_rng(0).standard_normal(t.size)
     pk = find_beats(t, x, CARDIAC_BAND)
     assert abs(1 / np.median(np.diff(pk)) - hr) < 0.02
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Metal")
+def test_refine_cardiac_on_metal_matches_cpu():
+    """ffs_physio -device mps died on one float64 step after another (Grams, phase
+    uploads, voxel fits); the whole refinement has to run there and agree."""
+    mag, ph, st = _vascular_run()
+    refs = []
+    for dev in (CPU, torch.device("mps")):
+        tr_ = physio.excitation_traces(mag, st, TR, phase=ph, device=dev)
+        refs.append(physio.refine_cardiac(mag, tr_, st, TR, split_axis=0, device=dev))
+    cpu, mps = refs
+    assert mps.found and cpu.found
+    assert abs(mps.heart_rate_per_min - cpu.heart_rate_per_min) < 0.1
+    assert abs(mps.split_half - cpu.split_half) < 0.01
