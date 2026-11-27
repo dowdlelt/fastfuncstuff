@@ -911,6 +911,24 @@ def parse_args(
         "[default: %(default)s]",
     )
     g_opt.add_argument(
+        "-patch_sweep",
+        choices=("ffs", "afni"),
+        default=QwarpConfig().patch_sweep,
+        help="Patch layout per level. 'afni': 3dQwarp's sweep -- alternating direction, "
+        "a last patch near the edge stretched to it, pulled-back patches solved after "
+        "the rest so overlapping patches never share a batch. 'ffs' can let two "
+        "overlapping patches overwrite each other, leaving seams (experimental) "
+        "[default: %(default)s]",
+    )
+    g_opt.add_argument(
+        "-gn_iters",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Gauss-Newton iteration ceiling per patch at every level after 0 "
+        f"(experimental) [default: {QwarpConfig().gn_iters}]",
+    )
+    g_opt.add_argument(
         "-batch_tol",
         "-batch-tol",
         type=float,
@@ -992,6 +1010,8 @@ def parse_args(
         p.error("-blur accepts one or two values")
     if args.pblur is not None and len(args.pblur) > 2:
         p.error("-pblur accepts zero, one, or two values")
+    if args.gn_iters is not None and args.gn_iters < 1:
+        p.error("-gn_iters must be at least 1")
     if args.background_band < 0:
         p.error("-background_band must be non-negative")
     if not 0.1 <= args.hfactor_q <= 1.0:
@@ -1966,6 +1986,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         gn_iters_lev0=args.gn_iters_lev0,
         ball_constraint=args.ball,
         lev0_schedule=args.lev0,
+        patch_sweep=args.patch_sweep,
         gn_step_search=args.gn_step_search,
         incor_afni=args.incor_afni,
         weight_afni=args.weight_afni,
@@ -1986,6 +2007,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         interp=args.interp,
         final_interp=args.final,
     )
+    if args.gn_iters is not None:  # both ceilings: the coarse taper stays off
+        config = replace(config, gn_iters=args.gn_iters, gn_iters_coarse=args.gn_iters)
 
     if args.blur is not None:
         config.blur_base = args.blur[0]

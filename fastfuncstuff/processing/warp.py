@@ -314,6 +314,18 @@ class QwarpConfig:
     quintic (81 parameters) under the L2 ball -- less AFNI's opening SINCC pass,
     which needs a basis port. Gauss-Newton path; opt-in until measured."""
 
+    patch_sweep: str = "ffs"
+    """How each level's patches are laid out. ``"ffs"``: a lattice from the bottom of
+    the box, the last patch pulled back inside it. ``"afni"``: 3dQwarp's sweep --
+    odd levels from the bottom, even levels from the top; a last patch within a
+    quarter width of the edge is stretched to it rather than followed by another;
+    pulled-back patches run in phases after the rest, so they see their neighbour's
+    update as AFNI's serial sweep does. Under ``"ffs"`` a pulled-back patch shares a
+    phase with the same-parity patch it overlaps by up to a quarter width, both are
+    solved against the old warp, and the later write erases the earlier one: a seam,
+    measured as det J <= 0 already at level 2 on NIREP. Single-volume path only;
+    opt-in until measured."""
+
     gn_coarse_patches: int = 2000
     """Patch count at which the coarse ceiling applies in full; above it the budget
     tapers toward :attr:`gn_iters` as the square root of the patch count."""
@@ -536,6 +548,13 @@ class PatchSpec:
     gi: int  # grid index for checkerboard coloring
     gj: int
     gk: int
+    snapped: int = 0
+    """Axes (bits x=1, y=2, z=4) along which the patch was pulled back from the sweep's
+    regular step to stay inside the box, so it overlaps its same-parity neighbour
+    there by more than the shared seam voxel. AFNI's serial
+    sweep handles that for free; a batched phase would solve both against the same old
+    warp and let the later write erase the earlier one, so these get phases of their
+    own (see :func:`_checkerboard_phases`)."""
 
 
 Padding3D = tuple[int, int, int] | tuple[int, int, int, int, int, int]
@@ -955,6 +974,84 @@ def _generate_patch_grid(
     return patches
 
 
+def _afni_sweep_axis(bbb: int, ttt: int, wid: int, step: int, reverse: bool):
+    """One axis of 3dQwarp's patch sweep (IW3D_warpomatic): ``(bot, top, snapped)``
+    per patch, in sweep order.
+
+    From the bottom: each patch starts ``step`` after the last; one that would cross
+    ``ttt`` is pulled back to end there (snapped), and one ending within ``wid // 4``
+    of it is stretched to it instead, so no sliver patch follows. ``reverse`` mirrors
+    all of it from ``ttt`` down, as AFNI does on even levels."""
+    out = []
+    if not reverse:
+        bot = bbb
+        while True:
+            top = bot + wid - 1
+            if top >= ttt:
+                top, nb = ttt, ttt + 1 - wid
+                out.append((nb, top, nb < bot))
+                return out
+            if top >= ttt - wid // 4:
+                out.append((bot, ttt, False))
+                return out
+            out.append((bot, top, False))
+            bot += step
+    top = ttt
+    while True:
+        bot = top + 1 - wid
+        if bot <= bbb:
+            bot, nt = bbb, bbb + wid - 1
+            out.append((bot, nt, nt > top))
+            return out
+        if bot <= bbb + wid // 4:
+            out.append((bbb, top, False))
+            return out
+        out.append((bot, top, False))
+        top -= step
+
+
+def _generate_patch_grid_afni(
+    ibbb: int,
+    ittt: int,
+    jbbb: int,
+    jttt: int,
+    kbbb: int,
+    kttt: int,
+    xwid: int,
+    ywid: int,
+    zwid: int,
+    xdel: int,
+    ydel: int,
+    zdel: int,
+    reverse: bool,
+) -> list[PatchSpec]:
+    """3dQwarp's patch layout for one level (``QwarpConfig.patch_sweep="afni"``).
+
+    Stretched last patches make sizes vary along an axis; the level loop batches
+    them by shape. Grid indices count in sweep order, so the checkerboard parity of a
+    patch is its distance from where the sweep started."""
+    xs = _afni_sweep_axis(ibbb, ittt, xwid, xdel, reverse)
+    ys = _afni_sweep_axis(jbbb, jttt, ywid, ydel, reverse)
+    zs = _afni_sweep_axis(kbbb, kttt, zwid, zdel, reverse)
+    return [
+        PatchSpec(
+            ibot=i0,
+            itop=i1,
+            jbot=j0,
+            jtop=j1,
+            kbot=k0,
+            ktop=k1,
+            gi=gi,
+            gj=gj,
+            gk=gk,
+            snapped=si | sj << 1 | sk << 2,
+        )  # fmt: skip
+        for gi, (i0, i1, si) in enumerate(xs)
+        for gj, (j0, j1, sj) in enumerate(ys)
+        for gk, (k0, k1, sk) in enumerate(zs)
+    ]
+
+
 def _dedup_last_wins(flat_dst: Tensor) -> tuple[Tensor, Tensor]:
     """Collapse a patch write-back index to one entry per target voxel.
 
@@ -984,19 +1081,26 @@ def _checkerboard_phases(
     patches: list[PatchSpec],
     flat_axis: int | None = None,
 ) -> list[list[PatchSpec]]:
-    """Group patches into 8 checkerboard phases (non-overlapping within each).
+    """Group patches into 8 checkerboard phases (non-overlapping within each), then
+    up to 8 more for snapped patches (:attr:`PatchSpec.snapped`), which run last.
 
     ``flat_axis`` (grid axis 0=x/1=y/2=z) is one voxel thick in slicewise mode, so
     patches can never overlap along it and splitting on its parity is pure overhead:
     collapsing it halves the phase count and doubles the batch each solve sees.
     """
-    phases: list[list[PatchSpec]] = [[] for _ in range(8)]
+    # Index 0 holds the regular patches; 1..7 the snapped ones by which axes snapped.
+    groups: list[list[list[PatchSpec]]] = [[[] for _ in range(8)] for _ in range(8)]
     for p in patches:
         gi = 0 if flat_axis == 0 else p.gi % 2
         gj = 0 if flat_axis == 1 else p.gj % 2
         gk = 0 if flat_axis == 2 else p.gk % 2
-        phases[gi * 4 + gj * 2 + gk].append(p)
-    return phases
+        groups[p.snapped][gi * 4 + gj * 2 + gk].append(p)
+    # Snapped patches run after all 8 regular phases, when every patch they overlap
+    # has been written -- what AFNI's serial sweep gives them. One group per set of
+    # snapped axes: along a snapped axis the group's patches share one index, so the
+    # parity colouring on the others keeps them seam-only. Mixing groups would not (an
+    # x-snapped and a y-snapped patch of equal parity can overlap on both axes).
+    return groups[0] + [ph for g in groups[1:] for ph in g if ph]
 
 
 def _box_sums(vol: Tensor, bounds: Tensor) -> Tensor:
@@ -1704,20 +1808,15 @@ def _warpomatic(
             if wh1 <= lev <= wh2:
                 nlevr = 2
 
-        # Generate patch grid and filter
-        all_patches = _generate_patch_grid(
-            ibbb,
-            ittt,
-            jbbb,
-            jttt,
-            kbbb,
-            kttt,
-            xwid,
-            ywid,
-            zwid,
-            xdel,
-            ydel,
-            zdel,
+        # Generate patch grid and filter. AFNI sweeps odd levels from the bottom of
+        # the box and even levels from the top (no workhard; see QwarpConfig.patch_sweep).
+        afni_sweep = config.patch_sweep == "afni"
+        sweep_reverse = afni_sweep and lev % 2 == 0
+        _grid_args = (ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel)
+        all_patches = (
+            _generate_patch_grid_afni(*_grid_args, reverse=sweep_reverse)
+            if afni_sweep
+            else _generate_patch_grid(*_grid_args)
         )
         valid_patches = _filter_patches(all_patches, weight, mask, nx, ny, nz)
         phases = _checkerboard_phases(valid_patches)
@@ -1750,6 +1849,7 @@ def _warpomatic(
         ii_flat = ii_p.reshape(-1)
         jj_flat = jj_p.reshape(-1)
         kk_flat = kk_p.reshape(-1)
+        shape_cache = {(nxh, nyh, nzh): (basis, half_widths, ii_flat, jj_flat, kk_flat)}
 
         n_valid = sum(len(ph) for ph in phases)
         state.patches_done = 0
@@ -1784,19 +1884,52 @@ def _warpomatic(
 
         for _pass in range(nlevr):
             phase_order = list(range(8))
-            if (lev + _pass) % 2 == 1:
+            if sweep_reverse if afni_sweep else (lev + _pass) % 2 == 1:
                 phase_order = phase_order[::-1]
+            phase_order += list(range(8, len(phases)))  # snapped patches, last
 
             for phase_idx in phase_order:
                 phase_patches = phases[phase_idx]
                 if not phase_patches:
                     continue
 
+                if afni_sweep:
+                    # Stretched last patches come in up to 8 shapes per phase; each
+                    # shape is one batched solve with its own basis (AFNI sets the
+                    # basis up per patch), the level's bounds and penalty.
+                    by_shape: dict[tuple[int, int, int], list[PatchSpec]] = {}
+                    for p in phase_patches:
+                        shp = (p.itop - p.ibot + 1, p.jtop - p.jbot + 1, p.ktop - p.kbot + 1)
+                        by_shape.setdefault(shp, []).append(p)
+                    for (sx, sy, sz), group in by_shape.items():
+                        if (sx, sy, sz) not in shape_cache:
+                            sb, shw, _ = _get_basis_config(
+                                basis_type, sx, sy, sz, device, hfactor=hfactor
+                            )
+                            kk_s, jj_s, ii_s = torch.meshgrid(
+                                torch.arange(sz, dtype=torch.float32, device=device),
+                                torch.arange(sy, dtype=torch.float32, device=device),
+                                torch.arange(sx, dtype=torch.float32, device=device),
+                                indexing="ij",
+                            )
+                            shape_cache[(sx, sy, sz)] = (
+                                sb, shw, ii_s.reshape(-1), jj_s.reshape(-1), kk_s.reshape(-1),
+                            )  # fmt: skip
+                        sb, shw, ii_s, jj_s, kk_s = shape_cache[(sx, sy, sz)]
+                        _improve_warp_batched(
+                            base, source, weight, mask, state, config, device, group,
+                            sb, shw, param_max, ii_s, jj_s, kk_s, sx, sy, sz,
+                            do_xyz=do_xyz, axis_weights=axis_w, use_penalty=use_pen,
+                            pen_fac=pen_fff, base_clip=base_clip, source_clip=source_clip,
+                            blok_index_vol=blok_index_vol, nblok=nblok, ball_radius=ball_radius,
+                        )  # fmt: skip
+
                 # Split into same-size (batchable) and odd-size patches
                 good = [
                     p
                     for p in phase_patches
-                    if (
+                    if not afni_sweep
+                    and (
                         p.itop - p.ibot + 1 == nxh
                         and p.jtop - p.jbot + 1 == nyh
                         and p.ktop - p.kbot + 1 == nzh
@@ -1805,7 +1938,8 @@ def _warpomatic(
                 odd = [
                     p
                     for p in phase_patches
-                    if (
+                    if not afni_sweep
+                    and (
                         p.itop - p.ibot + 1 != nxh
                         or p.jtop - p.jbot + 1 != nyh
                         or p.ktop - p.kbot + 1 != nzh
@@ -1883,7 +2017,7 @@ def _warpomatic(
                     recorder.capture_displacement(
                         (state.xd, state.yd, state.zd),
                         label=f"lev={lev} {xwid}x{ywid}x{zwid}{pass_tag}  "
-                        f"phase {phase_order.index(phase_idx) + 1}/8",
+                        f"phase {phase_order.index(phase_idx) + 1}/{len(phase_order)}",
                     )
 
         # AFNI composes the overlapping patch updates directly; it does not blur
