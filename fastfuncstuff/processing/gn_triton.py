@@ -148,7 +148,12 @@ def gn_normal_eqs_triton(
         mean_pad = torch.zeros((b, ncol_pad), device=g.device, dtype=torch.float32)
         mean_pad[:, :ncol] = mean_cols.reshape(b, ncol)
 
-    block_v = 64 if v < 4096 else 128
+    # A 128-wide tile (more than 64 columns: cubic and the quintics at level 0) has
+    # tl.dot operands of block_v x 128 floats; at block_v 128 with the default
+    # pipelining that is 320 KiB of shared memory, over every consumer GPU's limit.
+    # Narrow voxel blocks and no pipelining fit it.
+    wide = ncol_pad > 64
+    block_v = (16 if ncol_pad > 128 else 32) if wide else (64 if v < 4096 else 128)
     n_split = max(1, min(triton.cdiv(v, block_v), triton.cdiv(_TARGET_PROGRAMS, b)))
 
     h_part = torch.zeros((b, n_split, ncol_pad, ncol_pad), device=g.device, dtype=torch.float32)
@@ -178,6 +183,7 @@ def gn_normal_eqs_triton(
         NCOL_PAD=ncol_pad,
         HAS_MEAN=mean_cols is not None,
         BLOCK_V=block_v,
+        num_stages=1 if wide else 3,
     )
     return (
         h_part.sum(1)[:, :ncol, :ncol].contiguous(),

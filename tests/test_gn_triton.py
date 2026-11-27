@@ -26,6 +26,11 @@ gn_normal_eqs_triton = triton_mod.gn_normal_eqs_triton
         (53, 1024, 2, 10, True, False),  # two directions, padded column tile
         (4096, 729, 3, 10, True, False),  # a fine level: many patches, few voxels
         (1, 65536, 3, 10, True, False),  # level 0: one patch, the whole grid
+        # full quintic (81 columns, a 128-wide tile): -lev0 afni's last level-0 basis.
+        # It overflowed shared memory, and the failure switched the kernel off for
+        # every later level of the run.
+        (1, 65536, 3, 27, True, False),
+        (9, 3375, 3, 27, True, False),
     ],
 )
 def test_fused_normal_eqs_matches_accumulator(monkeypatch, b, v, d, nb, has_mean, per_voxel_scale):

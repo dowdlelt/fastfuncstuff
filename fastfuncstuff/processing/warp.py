@@ -2256,6 +2256,9 @@ def _gn_accumulate(
         and g.dtype == torch.float32
         and res.dtype == torch.float32
         and os.environ.get("FFS_GN_NO_TRITON") != "1"
+        # No real basis is wider than 81 columns; past a 128-wide tile the kernel's
+        # narrow voxel blocks are slower than the eager path.
+        and ncol <= 128
     ):
         try:
             return gn_normal_eqs_triton(g, hw, bt, scale, omega, res, mean_cols)
