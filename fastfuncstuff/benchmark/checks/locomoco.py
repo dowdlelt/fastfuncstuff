@@ -18,7 +18,8 @@ locomoco with ANTs directly, in the brain:
 - agreement: the estimated PE displacements correlated volume by volume (median and worst
   volume; pooled r; median |difference|; each tool's median |displacement|); the
   *correction* each applied (corrected minus moco'd) correlated volume by volume; and
-  every voxel's corrected time series correlated between the two tools.
+  every voxel's corrected time series correlated between the two tools; and the
+  displacements again with both smoothed by ``SMOOTH_VOX`` (locomoco's field is rougher).
 - intrinsic, suggestive and a little circular (the median is also the target), scored
   identically for the moco'd block (``moco``), ANTs and locomoco: each volume's spatial r
   with the median (mean, worst), median tSNR, mean-image sharpness; and whether the two
@@ -59,6 +60,10 @@ ANTS_ARGS = [
     "-c", "[50x30x10,1e-6,5]", "-f", "4x2x1", "-s", "2x1x0vox",
 ]  # fmt: skip
 PE_AXIS = {"i": 0, "j": 1, "k": 2}
+# The two fits differ most in fine detail: ffs_locomoco's field is rougher than SyN's
+# (MindsEye 0.8 mm, 2026-11-27: raw per-volume r 0.38, 0.69 with both smoothed by 2 voxels,
+# 0.74 at 4). Smoothing both alike compares the shape of the correction, not its texture.
+SMOOTH_VOX = 2.0
 
 
 def _rowwise_r(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -97,6 +102,17 @@ def _agreement(
         "correction_r_vol_min": low(r_corr),
         "ts_r_median": med(r_ts),
     }
+
+
+def _smoothed_pe_r(d_ants: np.ndarray, d_ffs: np.ndarray, mask: np.ndarray) -> float | None:
+    """Median per-volume r of two (x, y, z, t) PE fields, both smoothed by ``SMOOTH_VOX``."""
+    from scipy.ndimage import gaussian_filter
+
+    s = (SMOOTH_VOX, SMOOTH_VOX, SMOOTH_VOX, 0.0)
+    a = gaussian_filter(d_ants, s)[mask]
+    b = gaussian_filter(d_ffs, s)[mask]
+    r = _rowwise_r(a.T, b.T)
+    return float(np.nanmedian(r)) if np.isfinite(r).any() else None
 
 
 def _intrinsic(series: np.ndarray, median: np.ndarray, mask: np.ndarray) -> dict[str, float]:
@@ -139,6 +155,9 @@ class LocomocoCheck(Check):
             Metric("agreement.pe_r_vol_median", "PE displacement, locomoco vs ANTs, r per volume "
                    "(median)", better="higher",
                    note="Spatial r of the two estimated PE displacement fields, volume by volume."),
+            Metric("agreement.pe_r_vol_median_smooth", "PE displacement, locomoco vs ANTs, r per "
+                   f"volume, both smoothed {SMOOTH_VOX:g} vox (median)", better="higher",
+                   note="The shape of the two corrections; locomoco's field is rougher than SyN's."),
             Metric("agreement.correction_r_vol_median", "Correction applied, locomoco vs ANTs, "
                    "r per volume (median)", better="higher",
                    note="Corrected minus moco'd image, correlated between the tools per volume."),
@@ -277,10 +296,12 @@ class LocomocoCheck(Check):
             [np.asarray(nib.load(str(ants / f"v{t:04d}_0Warp.nii.gz")).dataobj,
                         np.float32).reshape(*data.shape[:3], 3)[..., comp]
              for t in range(n_t)], axis=3,
-        )[mask]  # fmt: skip
+        )  # fmt: skip
         w = np.asarray(nib.load(str(ffs_warp)).dataobj, np.float32)
-        d_ffs = w.reshape(*data.shape[:3], n_t, 3)[..., comp][mask]
-        res.metrics["agreement"] = _agreement(d_ants, d_ffs, data[mask], ants_data[mask], lm[mask])
+        d_ffs = w.reshape(*data.shape[:3], n_t, 3)[..., comp]
+        agree = _agreement(d_ants[mask], d_ffs[mask], data[mask], ants_data[mask], lm[mask])
+        agree["pe_r_vol_median_smooth"] = _smoothed_pe_r(d_ants, d_ffs, mask)
+        res.metrics["agreement"] = agree
 
         for p in (block, moco, ants_corr, ffs_corr, ffs_warp, *vols):
             res.artifacts.append((p, "regenerable"))

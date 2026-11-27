@@ -197,3 +197,20 @@ def test_locomoco_agreement_judges():
     assert same["ts_r_median"] == pytest.approx(1.0) and same["pe_absdiff_median_mm"] == 0
     flip = _agreement(d, -d, moco, fixed, 2 * moco - fixed)
     assert flip["pe_r_vol_median"] < -0.99 and flip["correction_r_vol_median"] < -0.99
+
+
+def test_locomoco_smoothed_pe_r_ignores_texture():
+    """Same smooth field plus independent fine noise: raw r is low, smoothed r is high."""
+    from scipy.ndimage import gaussian_filter
+
+    from fastfuncstuff.benchmark.checks.locomoco import _rowwise_r, _smoothed_pe_r
+
+    rng = np.random.default_rng(0)
+    shape = (24, 24, 12, 4)
+    smooth = gaussian_filter(rng.standard_normal(shape), (4, 4, 4, 0)) * 20
+    a = smooth + rng.standard_normal(shape)
+    b = smooth + rng.standard_normal(shape)
+    mask = np.ones(shape[:3], bool)
+    raw = float(np.median(_rowwise_r(a[mask].T, b[mask].T)))
+    assert raw < 0.7
+    assert _smoothed_pe_r(a, b, mask) > 0.9
