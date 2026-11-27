@@ -357,12 +357,39 @@ def cohort_scores(unit_dirs: list[Path], tools: tuple[str, ...] = TOOLS) -> dict
     return out
 
 
-def write_cohort(root: Path, dataset: str, unit_ids: list[int]) -> Path:
-    """Score the finished units ``unit_ids`` of ``dataset`` and write the result beside them."""
+def cohort_units(wl, root: Path, dataset: str, exclude_hosts: tuple[str, ...] = ()) -> list[Path]:
+    """Finished warp_mni units of ``dataset`` here and on every ingested host set, the latest
+    run of each unit (the same rule as the report), skipping hosts labelled ``exclude_hosts``."""
+    from ..worklist import Worklist
+
+    q = ("SELECT id, finished_at FROM units WHERE check_name='warp_mni' AND dataset=?"
+         " AND status='done'")  # fmt: skip
+    roots = [Path(root)] + [Path(h["path"]) for h in wl.db.execute(
+        "SELECT label, path FROM hostsets ORDER BY ingested_at") if h["label"] not in exclude_hosts]  # fmt: skip
+    best: dict[int, tuple[float, Path]] = {}
+    for r in roots:
+        db = wl if r == Path(root) else Worklist(r / "worklist.sqlite")
+        for u in db.db.execute(q, (dataset,)).fetchall():
+            if u["id"] not in best or (u["finished_at"] or 0) > best[u["id"]][0]:
+                best[u["id"]] = (
+                    u["finished_at"] or 0,
+                    r / "units" / "warp_mni" / dataset / f"unit{u['id']:06d}",
+                )
+        if db is not wl:
+            db.close()
+    return [best[i][1] for i in sorted(best)]
+
+
+def write_cohort(root: Path, dataset: str, units: list[Path]) -> Path:
+    """Score the finished unit folders ``units`` of ``dataset`` and write the result under
+    ROOT (the units may live on several ingested host sets)."""
     import time
 
-    units = [root / "units" / "warp_mni" / dataset / f"unit{i:06d}" for i in sorted(unit_ids)]
     scores = cohort_scores(units)
-    out = root / "units" / "warp_mni" / dataset / f"cohort_{time.strftime('%Y%m%d-%H%M')}.json"
-    out.write_text(json.dumps({"units": [u.name for u in units], "scores": scores}, indent=1))
+    out = (
+        Path(root) / "units" / "warp_mni" / dataset / f"cohort_{time.strftime('%Y%m%d-%H%M')}.json"
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rel = [str(u.relative_to(root)) if u.is_relative_to(root) else str(u) for u in units]
+    out.write_text(json.dumps({"units": rel, "scores": scores}, indent=1))
     return out

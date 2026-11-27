@@ -203,3 +203,39 @@ def test_redo_refits_only_the_named_tool(tmp_path):
     assert main(["-root", str(root), "-reset_running"]) == 0
     wl = Worklist(root / "worklist.sqlite")
     assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"
+
+
+def test_cohort_units_gathers_hosts_latest_run_wins(tmp_path):
+    """-cohort scores a cohort spread over ingested host sets: each unit from wherever it
+    finished last, here or on a host, and an excluded host's units left out."""
+    from fastfuncstuff.benchmark.checks.warp_mni import cohort_units
+
+    root = tmp_path / "bench"
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("warp_mni", "MB", [({"subject": s}, ["x"]) for s in ("a", "b", "c", "d")])
+    ids = [r["id"] for r in wl.db.execute("SELECT id FROM units ORDER BY id")]
+    hosts = {}
+    for label, done_at in (("old", {ids[0]: 1.0, ids[1]: 1.0}), ("new", {ids[1]: 2.0, ids[2]: 2.0}),
+                           ("skip", {ids[3]: 3.0})):  # fmt: skip
+        hosts[label] = tmp_path / label
+        hs = Worklist(hosts[label] / "worklist.sqlite")
+        for uid, t in done_at.items():
+            row = wl.db.execute("SELECT * FROM units WHERE id=?", (uid,)).fetchone()
+            cols = row.keys()
+            hs.db.execute(f"INSERT INTO units ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                          tuple(row))  # fmt: skip
+            hs.db.execute("UPDATE units SET status='done', finished_at=? WHERE id=?", (t, uid))
+        hs.db.commit()
+        hs.close()
+        wl.db.execute(
+            "INSERT INTO hostsets (uuid, label, path, ingested_at) VALUES (?, ?, ?, ?)",
+            (label, label, str(hosts[label]), len(hosts)),
+        )
+    wl.db.commit()
+    got = cohort_units(wl, root, "MB", exclude_hosts=("skip",))
+    unit = lambda r, i: r / "units" / "warp_mni" / "MB" / f"unit{i:06d}"  # noqa: E731
+    assert got == [
+        unit(hosts["old"], ids[0]),
+        unit(hosts["new"], ids[1]),
+        unit(hosts["new"], ids[2]),
+    ]

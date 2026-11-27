@@ -311,6 +311,12 @@ def main(argv: list[str] | None = None) -> int:
         "-ingest", metavar="DIR", type=Path, help="Register a synced host set (re-ingest replaces)."
     )
     act.add_argument("-hosts", action="store_true", help="List ingested host sets.")
+    p.add_argument(
+        "-exclude_hosts",
+        nargs="+",
+        metavar="LABEL",
+        help="-cohort: leave out units from these ingested host sets (labels as -hosts lists).",
+    )
     act.add_argument(
         "-cohort",
         metavar="CHECK",
@@ -403,13 +409,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cohort:
         if args.cohort != "warp_mni":
             p.error("-cohort knows warp_mni only")
-        from .checks.warp_mni import write_cohort
+        from .checks.warp_mni import cohort_units, write_cohort
 
         for ds in args.datasets or ["Mindboggle101"]:
-            done = [r["id"] for r in wl.db.execute(
-                "SELECT id FROM units WHERE check_name='warp_mni' AND dataset=? AND status='done'", (ds,))]  # fmt: skip
-            out = write_cohort(args.root, ds, done)
-            print(out.read_text())
+            units = cohort_units(wl, args.root, ds, tuple(args.exclude_hosts or ()))
+            print(f"{ds}: {len(units)} finished units")
+            out = write_cohort(args.root, ds, units)
+            print(json.dumps({t: {k: v for k, v in d.items() if not isinstance(v, dict)}
+                              for t, d in json.loads(out.read_text())["scores"].items()}, indent=1))  # fmt: skip
+            print(out)
     elif args.hosts:
         from .hostset import hostsets
 
