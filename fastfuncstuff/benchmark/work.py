@@ -53,7 +53,7 @@ def plan(wl, manifests: Path, check_name: str, datasets: list[str], n: int) -> N
     check = CHECKS[check_name]()
     for ds in datasets:
         m = _manifest(manifests, ds)
-        if m.get("excluded"):
+        if m.get("excluded") and check_name not in m.get("exclude_except_checks", []):
             print(f"{ds}: excluded ({m['excluded']}), skipped")
             continue
         index = Index(source_from_manifest(m).list_files())

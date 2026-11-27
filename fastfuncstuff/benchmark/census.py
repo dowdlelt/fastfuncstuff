@@ -605,6 +605,7 @@ def _local_name(root: Path) -> str:
 
 _CURATED_TEMPLATE: dict[str, Any] = {
     "exclude": None,  # a reason string drops the whole dataset from checks
+    "exclude_except_checks": [],  # checks that still use an excluded dataset
     "exclude_acquisitions": {},  # acquisition id -> reason
     "set": {},  # acquisition field -> value for every acquisition (e.g. field_T a sidecar lacks)
     "set_acquisitions": {},  # acquisition id -> {field: value}
@@ -667,6 +668,7 @@ def apply_curation(manifest: dict[str, Any]) -> dict[str, Any]:
         )
     m = dict(manifest)
     m["excluded"] = cur["exclude"]
+    m["exclude_except_checks"] = list(cur["exclude_except_checks"] or [])
     kept, dropped = [], {}
     for a in manifest["acquisitions"]:
         if a["id"] in (cur["exclude_acquisitions"] or {}):

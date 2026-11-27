@@ -12,12 +12,17 @@ No tool does per-volume nonlinear motion correction, so the reference is built b
    axis nearest the voxel PE axis): locomoco's degrees of freedom exactly, so the judges
    compare fits, not models. Apply, merge. Timed in full, split and merge included.
 
-Judges, none of them truth:
-- intrinsic, scored identically for the moco'd block (``moco``), ANTs and locomoco: median
-  tSNR in the brain, mean r of each volume with the median, and the mean image's
-  sharpness (mean gradient magnitude over mean intensity, in the brain);
-- agreement: locomoco's and ANTs' displacement along the phase-encode axis, per voxel and
-  volume in the brain (r, median |difference|, and each tool's median |displacement|).
+The question (user, 2026-11-27): does the fast method correct the data the way the
+best-in-class slow one does? There is no ground truth, so the headline judges compare
+locomoco with ANTs directly, in the brain:
+- agreement: the estimated PE displacements correlated volume by volume (median and worst
+  volume; pooled r; median |difference|; each tool's median |displacement|); the
+  *correction* each applied (corrected minus moco'd) correlated volume by volume; and
+  every voxel's corrected time series correlated between the two tools.
+- intrinsic, suggestive and a little circular (the median is also the target), scored
+  identically for the moco'd block (``moco``), ANTs and locomoco: each volume's spatial r
+  with the median (mean, worst), median tSNR, mean-image sharpness; and whether the two
+  tools improve the *same* volumes (r across volumes of each tool's gain in that r).
 
 On an oblique slab the nearest physical axis is only approximately the PE axis; ANTs
 restricts physical (LPS) components, not voxel axes.
@@ -56,6 +61,44 @@ ANTS_ARGS = [
 PE_AXIS = {"i": 0, "j": 1, "k": 2}
 
 
+def _rowwise_r(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pearson r between matching rows of two (n, m) arrays (nan where one is constant)."""
+    a = a - a.mean(axis=1, keepdims=True)
+    b = b - b.mean(axis=1, keepdims=True)
+    den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(den > 0, (a * b).sum(axis=1) / den, np.nan)
+
+
+def _agreement(
+    d_ants: np.ndarray, d_ffs: np.ndarray, moco: np.ndarray, ants: np.ndarray, ffs: np.ndarray
+) -> dict[str, float | None]:
+    """locomoco vs ANTs. Displacements are (n_vox, t) PE mm; series (n_vox, t) intensities."""
+    a, b = d_ants.ravel(), d_ffs.ravel()
+    pooled = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else None
+    r_vol = _rowwise_r(d_ants.T, d_ffs.T)
+    r_corr = _rowwise_r((ants - moco).T, (ffs - moco).T)
+    r_ts = _rowwise_r(ants, ffs)
+
+    def med(x: np.ndarray) -> float | None:
+        return float(np.nanmedian(x)) if np.isfinite(x).any() else None
+
+    def low(x: np.ndarray) -> float | None:
+        return float(np.nanmin(x)) if np.isfinite(x).any() else None
+
+    return {
+        "pe_r_vol_median": med(r_vol),
+        "pe_r_vol_min": low(r_vol),
+        "pe_r": pooled,
+        "pe_absdiff_median_mm": float(np.median(np.abs(a - b))),
+        "pe_abs_median_mm_ants": float(np.median(np.abs(a))),
+        "pe_abs_median_mm_ffs": float(np.median(np.abs(b))),
+        "correction_r_vol_median": med(r_corr),
+        "correction_r_vol_min": low(r_corr),
+        "ts_r_median": med(r_ts),
+    }
+
+
 def _intrinsic(series: np.ndarray, median: np.ndarray, mask: np.ndarray) -> dict[str, float]:
     """tSNR, volume-to-median r and mean-image sharpness of a (x, y, z, t) series."""
     v = series[mask]  # (n_vox, t)
@@ -70,6 +113,7 @@ def _intrinsic(series: np.ndarray, median: np.ndarray, mask: np.ndarray) -> dict
     gx, gy, gz = np.gradient(mean_img)
     grad = np.sqrt(gx * gx + gy * gy + gz * gz)[mask]
     return {
+        "_vol_r": r,  # per volume, for the same-volumes judge; not stored
         "tsnr_median": float(tsnr),
         "vol_r_mean": float(r.mean()),
         "vol_r_min": float(r.min()),
@@ -92,15 +136,22 @@ class LocomocoCheck(Check):
         timing={"ref": "ANTs per volume", "ffs": "ffs_locomoco"},
         references=("ref",),
         metrics=(
-            Metric("intrinsic.vol_r_mean_{tool}", "Volume-to-median r, mean", better="higher",
-                   note="Each volume's correlation with the block's temporal median, in the brain."),
-            Metric("intrinsic.tsnr_median_{tool}", "tSNR, median over the brain", better="higher"),
-            Metric("intrinsic.sharpness_{tool}", "Mean-image sharpness", better="higher",
-                   note="Mean gradient magnitude over mean intensity, in the brain."),
-            Metric("agreement.pe_r", "PE displacement, r between locomoco and ANTs",
-                   better="higher"),
+            Metric("agreement.pe_r_vol_median", "PE displacement, locomoco vs ANTs, r per volume "
+                   "(median)", better="higher",
+                   note="Spatial r of the two estimated PE displacement fields, volume by volume."),
+            Metric("agreement.correction_r_vol_median", "Correction applied, locomoco vs ANTs, "
+                   "r per volume (median)", better="higher",
+                   note="Corrected minus moco'd image, correlated between the tools per volume."),
+            Metric("agreement.ts_r_median", "Corrected time series, locomoco vs ANTs, r per voxel "
+                   "(median)", better="higher"),
             Metric("agreement.pe_absdiff_median_mm", "PE displacement, median |difference| (mm)",
                    log=True),
+            Metric("intrinsic.vol_r_mean_{tool}", "Volume-to-median r, mean", better="higher",
+                   note="Suggestive only: the median is also both tools' target."),
+            Metric("intrinsic.same_volumes_r", "Do both tools improve the same volumes? (r)",
+                   better="higher",
+                   note="r across volumes of each tool's gain in volume-to-median r over moco."),
+            Metric("intrinsic.tsnr_median_{tool}", "tSNR, median over the brain", better="higher"),
         ),
         speedup=(("ffs", "ref"),),
         code=("fastfuncstuff.cli.locomoco", "fastfuncstuff.benchmark.checks.locomoco"),
@@ -208,9 +259,16 @@ class LocomocoCheck(Check):
         mask = np.asarray(nib.load(str(mask_p)).dataobj) > 0
         lm = np.asarray(nib.load(str(ffs_corr)).dataobj, np.float32)
         intr: dict[str, float | None] = {}
+        vol_r = {}
         for tag, series in (("moco", data), ("ants", ants_data), ("ffs", lm)):
             for k, v in _intrinsic(series, med, mask).items():
-                intr[f"{k}_{tag}"] = v
+                if k == "_vol_r":
+                    vol_r[tag] = v
+                else:
+                    intr[f"{k}_{tag}"] = v
+        gain_a, gain_f = vol_r["ants"] - vol_r["moco"], vol_r["ffs"] - vol_r["moco"]
+        same = _rowwise_r(gain_a[None], gain_f[None])[0]
+        intr["same_volumes_r"] = float(same) if np.isfinite(same) else None
         res.metrics["intrinsic"] = intr
 
         # PE displacement in that component. Both fields are pull warps in LPS mm (ITK and
@@ -222,14 +280,7 @@ class LocomocoCheck(Check):
         )[mask]  # fmt: skip
         w = np.asarray(nib.load(str(ffs_warp)).dataobj, np.float32)
         d_ffs = w.reshape(*data.shape[:3], n_t, 3)[..., comp][mask]
-        a, b = d_ants.ravel(), d_ffs.ravel()
-        r = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else None
-        res.metrics["agreement"] = {
-            "pe_r": r,
-            "pe_absdiff_median_mm": float(np.median(np.abs(a - b))),
-            "pe_abs_median_mm_ants": float(np.median(np.abs(a))),
-            "pe_abs_median_mm_ffs": float(np.median(np.abs(b))),
-        }
+        res.metrics["agreement"] = _agreement(d_ants, d_ffs, data[mask], ants_data[mask], lm[mask])
 
         for p in (block, moco, ants_corr, ffs_corr, ffs_warp, *vols):
             res.artifacts.append((p, "regenerable"))

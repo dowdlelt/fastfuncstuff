@@ -177,3 +177,23 @@ def test_locomoco_intrinsic_judge_and_hires_qualification():
     assert chk.qualifies(ds, {**acq, "voxel_mm": [0.8, 0.8, 0.8]})
     assert not chk.qualifies(ds, {**acq, "voxel_mm": [2.0, 2.0, 2.0]})
     assert not chk.qualifies(ds, {**acq, "voxel_mm": [0.8, 0.8, 0.8], "offers": ["epi_3d"]})
+
+
+def test_locomoco_agreement_judges():
+    import pytest
+
+    """Identical estimates agree perfectly; a sign-flipped one is anti-correlated."""
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.locomoco import _agreement
+
+    rng = np.random.default_rng(1)
+    d = rng.normal(0, 0.3, (500, 12))
+    moco = 100 + rng.normal(0, 5, (500, 12))
+    fixed = moco + rng.normal(0, 1, (500, 12))
+    same = _agreement(d, d.copy(), moco, fixed, fixed.copy())
+    assert same["pe_r_vol_median"] == pytest.approx(1.0)
+    assert same["correction_r_vol_median"] == pytest.approx(1.0)
+    assert same["ts_r_median"] == pytest.approx(1.0) and same["pe_absdiff_median_mm"] == 0
+    flip = _agreement(d, -d, moco, fixed, 2 * moco - fixed)
+    assert flip["pe_r_vol_median"] < -0.99 and flip["correction_r_vol_median"] < -0.99
