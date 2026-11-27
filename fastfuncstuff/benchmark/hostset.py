@@ -80,6 +80,7 @@ def export_hostset(
     include_pending: bool = False,
     bundle_local: bool = False,
     prune_outputs: bool = False,
+    repeat_elsewhere: bool = False,
 ) -> Path:
     import yaml
 
@@ -90,7 +91,8 @@ def export_hostset(
         raise FileExistsError(f"{out} already holds a worklist; pick a new directory")
     manifests = {m["dataset_id"]: m for m in load_manifests(manifests_dir, curated=False)}
     # A unit another host already finished adds nothing on the next one: sets grow by new units.
-    elsewhere = done_on_hosts(wl)
+    # A new architecture is the exception: re-timing the same units is what it is for.
+    elsewhere = set() if repeat_elsewhere else done_on_hosts(wl)
     units, skipped = select_units(
         wl, checks, n, manifests, list(datasets), include_pending, bundle_local, elsewhere
     )

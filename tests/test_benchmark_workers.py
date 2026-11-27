@@ -133,6 +133,10 @@ def test_hostset_export_run_ingest_round_trip(tmp_path, capsys):
     out2 = export_hostset(wl, man, tmp_path / "hs2", ["moco"], 3, "epyc")
     ids2 = {r[0] for r in Worklist(out2 / "worklist.sqlite").db.execute("SELECT id FROM units")}
     assert u["id"] not in ids2 and len(ids2) == 3
+    # ...unless the next host is a new architecture, where repeating them is the point
+    out3 = export_hostset(wl, man, tmp_path / "hs3", ["moco"], 4, "mac", repeat_elsewhere=True)
+    ids3 = {r[0] for r in Worklist(out3 / "worklist.sqlite").db.execute("SELECT id FROM units")}
+    assert u["id"] in ids3
 
 
 def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):

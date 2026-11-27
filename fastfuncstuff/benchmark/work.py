@@ -357,6 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         help="-export_hostset: the other host prunes regenerable outputs too, as here "
         "(default keeps them all for inspection). Halves what a large warp set syncs back.",
     )
+    p.add_argument(
+        "-repeat_elsewhere",
+        action="store_true",
+        help="-export_hostset: keep units another ingested host already finished (default "
+        "leaves them out). For a new architecture, where re-timing the same units is the point.",
+    )
     p.add_argument("-check", help="Only run units of this check (with -run).")
     p.add_argument("-max_units", type=int, default=10**9, help="Stop after this many units.")
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
@@ -403,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
             p.error("-export_hostset needs -checks")
         export_hostset(wl, args.manifests, args.export_hostset, args.checks, args.n or 2,
                        args.label, args.datasets, args.include_pending, args.bundle_local,
-                       args.prune_outputs)  # fmt: skip
+                       args.prune_outputs, args.repeat_elsewhere)  # fmt: skip
     elif args.ingest:
         from .hostset import ingest
 
