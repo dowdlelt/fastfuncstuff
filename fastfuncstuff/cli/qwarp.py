@@ -64,6 +64,7 @@ from fastfuncstuff.processing.io import (
 from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz, load_warp, prepare_warp_for_grid
 from fastfuncstuff.processing.warp import (
+    QWARP_RECIPES,
     Padding3D,
     QwarpConfig,
     _compute_support_padding,
@@ -786,13 +787,14 @@ def parse_args(
     g_wt.add_argument(
         "-background_band",
         type=int,
-        default=QwarpConfig().background_band,
+        default=None,
         metavar="VOXELS",
         help="Keep this many voxels of empty background around a skull-stripped "
         "base in the automatic weight, at the median brain weight, so tissue "
         "pushed past the template edge costs correlation. 0 disables it (AFNI's "
         "weight). No effect when the base background is not exactly zero or "
-        "with -useweight/-autoweight [default: %(default)s]",
+        "with -useweight/-autoweight [default: {QwarpConfig().background_band}; "
+        "-qwarp_recipe afni: 0]",
     )
     g_wt.add_argument(
         "-autoweight",
@@ -844,7 +846,7 @@ def parse_args(
     g_opt.add_argument(
         "-optimizer",
         choices=("adam", "gn", "hybrid"),
-        default=QwarpConfig().optimizer,
+        default=None,
         help="Per-patch solver. 'adam' is autodiff and works with any cost. 'gn' is "
         "Levenberg-damped Gauss-Newton with an analytic image-gradient Jacobian: no "
         "backward pass, converges in single-figure iterations, and on a 193^3 T1-to-MNI "
@@ -852,18 +854,18 @@ def parse_args(
         "runs gn then a short adam polish, reaching adam's answer at about 3x its "
         "speed. gn and hybrid need a cost with a least-squares form (the correlations, "
         "and lpa/lncc via locally normalised residuals) and fall back to adam for "
-        "anything else [default: %(default)s]",
+        f"anything else [default: {QwarpConfig().optimizer}; -qwarp_recipe afni: hybrid]",
     )
     g_opt.add_argument(
         "-gn_stop",
         choices=("first_reject", "freeze"),
-        default=QwarpConfig().gn_stop_rule,
+        default=None,
         help="When a Gauss-Newton phase stops. 'first_reject' ends it as soon as every "
         "patch was rejected or stalled in the same iteration, which with the few "
         "patches of level 0 and the coarse levels often happens after 2 iterations. "
         "'freeze' raises the damping and retries after a rejection, stopping a patch "
-        "only on an accepted step that gains under the tolerance (experimental) "
-        "[default: %(default)s]",
+        "only on an accepted step that gains under the tolerance "
+        f"[default: {QwarpConfig().gn_stop_rule}; -qwarp_recipe afni: freeze]",
     )
     g_opt.add_argument(
         "-gn_iters_lev0",
@@ -877,23 +879,26 @@ def parse_args(
     g_opt.add_argument(
         "-ball",
         action="store_true",
+        default=None,
         help="AFNI's ball constraint: from the first level whose patch has a side under "
         "15 voxels (19 quintic), bound each patch's parameters by an L2 ball instead of "
-        "a per-parameter box, as 3dQwarp does (experimental)",
+        "a per-parameter box, as 3dQwarp does (on in -qwarp_recipe afni)",
     )
     g_opt.add_argument(
         "-weight_afni",
         action="store_true",
+        default=None,
         help="3dQwarp's weight image and box: blur sigma 4.5 (not FWHM), AFNI's "
         "peel-and-redilate erosion, and its autobox of the weight for the patch "
-        "ladder (experimental)",
+        "ladder (on in -qwarp_recipe afni)",
     )
     g_opt.add_argument(
         "-incor_afni",
         action="store_true",
+        default=None,
         help="AFNI's INCOR scoring for pearclp/pearson: pearclp clips at THD_cliplevel "
         "and the 0.987 quantile with clipped voxels replaced past the clip and "
-        "down-weighted, and both score atanh(r) instead of r (experimental)",
+        "down-weighted, and both score atanh(r) instead of r (on in -qwarp_recipe afni)",
     )
     g_opt.add_argument(
         "-gn_step_search",
@@ -904,21 +909,34 @@ def parse_args(
     g_opt.add_argument(
         "-lev0",
         choices=("ffs", "afni"),
-        default=QwarpConfig().lev0_schedule,
+        default=None,
         help="Global level-0 schedule. 'ffs': cubic_lite, cubic, quintic_lite under the "
         "box. 'afni': 3dQwarp's cubic_lite (box) then cubic, quintic_lite and quintic "
-        "under its wider ball, without its opening SINCC pass (experimental) "
-        "[default: %(default)s]",
+        "under its wider ball, without its opening SINCC pass "
+        f"[default: {QwarpConfig().lev0_schedule}; -qwarp_recipe afni: afni]",
     )
     g_opt.add_argument(
         "-patch_sweep",
         choices=("ffs", "afni"),
-        default=QwarpConfig().patch_sweep,
+        default=None,
         help="Patch layout per level. 'afni': 3dQwarp's sweep -- alternating direction, "
         "a last patch near the edge stretched to it, pulled-back patches solved after "
         "the rest so overlapping patches never share a batch. 'ffs' can let two "
-        "overlapping patches overwrite each other, leaving seams (experimental) "
-        "[default: %(default)s]",
+        "overlapping patches overwrite each other, leaving seams "
+        f"[default: {QwarpConfig().patch_sweep}; -qwarp_recipe afni: afni]",
+    )
+    g_opt.add_argument(
+        "-qwarp_recipe",
+        choices=tuple(QWARP_RECIPES),
+        default="default",
+        help="A tested bundle of settings; any flag given explicitly still wins. "
+        "'default': ffs's tuning -- Dice level with 3dQwarp, fastest, but a rougher "
+        "warp (more voxels squeezed or stretched past 2x). 'afni': every 3dQwarp "
+        "behaviour ffs reproduces (-patch_sweep afni -lev0 afni -ball -incor_afni "
+        "-weight_afni -background_band 0 -gn_stop freeze -optimizer hybrid). On 5 NIREP "
+        "pairs it matches 3dQwarp's Dice (0.620 vs 0.621) and smoothness (log det J "
+        "sd 0.357 vs 0.363) at about 4x the default's time, still 25x+ faster than "
+        "3dQwarp on a GPU [default: %(default)s]",
     )
     g_opt.add_argument(
         "-gn_iters",
@@ -1012,7 +1030,7 @@ def parse_args(
         p.error("-pblur accepts zero, one, or two values")
     if args.gn_iters is not None and args.gn_iters < 1:
         p.error("-gn_iters must be at least 1")
-    if args.background_band < 0:
+    if args.background_band is not None and args.background_band < 0:
         p.error("-background_band must be non-negative")
     if not 0.1 <= args.hfactor_q <= 1.0:
         p.error("-hfactor_q/-warpscale must be in [0.1, 1.0]")
@@ -1669,6 +1687,19 @@ def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
         raise ValueError(f"run failed (exit {rc})")
 
 
+def _recipe_value(args: argparse.Namespace, dest: str, field: str):
+    """An explicit flag, else the -qwarp_recipe's value, else QwarpConfig's default.
+
+    Resolved here rather than in parse_args so batch mode works: a job line re-parses
+    on top of the top-level namespace, and an unset flag must still read as unset there
+    for that line's own -qwarp_recipe to apply."""
+    value = getattr(args, dest, None)
+    if value is not None:
+        return value
+    recipe = QWARP_RECIPES[getattr(args, "qwarp_recipe", "default") or "default"]
+    return recipe.get(field, getattr(QwarpConfig(), field))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "deterministic", False):
@@ -1976,20 +2007,20 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         workhard=tuple(args.workhard) if args.workhard else None,
         cost_method=_resolve_cost(args),
         penalty_factor=args.penfac,
-        background_band=args.background_band,
+        background_band=_recipe_value(args, "background_band", "background_band"),
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
         axis_weights=axis_weights,
         verb=args.verb,
-        optimizer=args.optimizer,
-        gn_stop_rule=args.gn_stop,
+        optimizer=_recipe_value(args, "optimizer", "optimizer"),
+        gn_stop_rule=_recipe_value(args, "gn_stop", "gn_stop_rule"),
         gn_iters_lev0=args.gn_iters_lev0,
-        ball_constraint=args.ball,
-        lev0_schedule=args.lev0,
-        patch_sweep=args.patch_sweep,
+        ball_constraint=_recipe_value(args, "ball", "ball_constraint"),
+        lev0_schedule=_recipe_value(args, "lev0", "lev0_schedule"),
+        patch_sweep=_recipe_value(args, "patch_sweep", "patch_sweep"),
         gn_step_search=args.gn_step_search,
-        incor_afni=args.incor_afni,
-        weight_afni=args.weight_afni,
+        incor_afni=_recipe_value(args, "incor_afni", "incor_afni"),
+        weight_afni=_recipe_value(args, "weight_afni", "weight_afni"),
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

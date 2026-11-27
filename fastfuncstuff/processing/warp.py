@@ -974,6 +974,36 @@ def _generate_patch_grid(
     return patches
 
 
+# Named bundles of QwarpConfig fields (``ffs_qwarp -qwarp_recipe``). "default" is ffs's
+# own tuning: Dice level with 3dQwarp's, ~25x faster than "afni", but rougher (log det J
+# sd 0.48 vs 0.36 on NIREP). "afni" turns on every 3dQwarp behaviour ffs reproduces and
+# the hybrid solver that makes them land where 3dQwarp does: over 5 NIREP pairs, mean
+# Dice 0.620 vs 3dQwarp's 0.621, log det J sd 0.357 vs 0.363, det J < 0.5 in ~1% of
+# brain for both (wiki: qwarp vs 3dQwarp review 2026-11-26, Outcome). Why each is in:
+#   patch_sweep      3dQwarp's layout; without it overlapping patches share a batch (seams)
+#   gn_stop_rule     retry a rejected GN step instead of ending the phase
+#   optimizer        GN alone stops short of NEWUOA's optimum on the big early patches
+#                    (level 3 image r .714 vs AFNI .740); the Adam polish on the true
+#                    cost closes it (.741). Most of the recipe's 4x time over "default".
+#   lev0_schedule    3dQwarp's level-0 bases and ball (level 0 then matches AFNI's Dice)
+#   ball_constraint  3dQwarp's L2 ball for patches with a side under 15
+#   incor_afni       3dQwarp's pearclp clip and atanh(r) scoring
+#   weight_afni, background_band=0   3dQwarp's weight and autobox, no ffs band
+QWARP_RECIPES: dict[str, dict[str, object]] = {
+    "default": {},
+    "afni": {
+        "patch_sweep": "afni",
+        "gn_stop_rule": "freeze",
+        "optimizer": "hybrid",
+        "lev0_schedule": "afni",
+        "ball_constraint": True,
+        "incor_afni": True,
+        "weight_afni": True,
+        "background_band": 0,
+    },
+}
+
+
 def _afni_sweep_axis(bbb: int, ttt: int, wid: int, step: int, reverse: bool):
     """One axis of 3dQwarp's patch sweep (IW3D_warpomatic): ``(bot, top, snapped)``
     per patch, in sweep order.
