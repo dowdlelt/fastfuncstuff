@@ -48,7 +48,7 @@ import torch
 from fastfuncstuff import policy_linalg as plinalg
 from fastfuncstuff.glm.xval import _compute_projection_matrix
 from fastfuncstuff.memory import estimate_chunk_size
-from fastfuncstuff.utils import linalg_device, to_linalg_f64
+from fastfuncstuff.utils import accum_dtype, linalg_device, to_linalg_f64
 
 
 @dataclass
@@ -342,16 +342,17 @@ def df_ceiling_by_voxel_group(
         ss_model = torch.zeros(n_voxels, dtype=torch.float64)
         ss_res = torch.zeros(n_voxels, dtype=torch.float64)
         ss_total = torch.zeros(n_voxels, dtype=torch.float64)
+        acc = accum_dtype(work)  # MPS has no float64; data is centred, so one pass is safe
         for start in range(0, n_voxels, step):
             stop = min(start + step, n_voxels)
             block = projected_data[start:stop].to(work)
             fitted = design @ (solver @ block.T)  # (n_timepoints, chunk)
             residual = block.T - fitted
-            ss_model[start:stop] = fitted.square().sum(dim=0, dtype=torch.float64).cpu()
-            ss_res[start:stop] = residual.square().sum(dim=0, dtype=torch.float64).cpu()
+            ss_model[start:stop] = fitted.square().sum(dim=0, dtype=acc).cpu()
+            ss_res[start:stop] = residual.square().sum(dim=0, dtype=acc).cpu()
             # Nuisance projection removed the intercept, so the data is already
             # centred and this is the same SS_total the R2 divides by.
-            ss_total[start:stop] = block.square().sum(dim=1, dtype=torch.float64).cpu()
+            ss_total[start:stop] = block.square().sum(dim=1, dtype=acc).cpu()
             del block, fitted, residual
 
         del projected_data, projected_design

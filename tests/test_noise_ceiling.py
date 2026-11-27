@@ -1071,3 +1071,18 @@ def test_repeat_ceiling_does_not_move_with_the_design():
 
     torch.testing.assert_close(with_good, with_wrong)
     torch.testing.assert_close(with_good, with_none)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_df_ceiling_runs_on_mps_and_matches_cpu():
+    """The SS accumulators asked Metal for float64 and raised; the work device can be MPS."""
+    from fastfuncstuff.stats.noise_ceiling import df_ceiling_by_voxel_group
+
+    torch.manual_seed(3)
+    n_runs, tp = 3, 200
+    _, narrow, nuisance, run_starts = _wide_vs_narrow_designs(n_runs, tp, n_prompts=8)
+    data = torch.randn(300, 2) @ narrow.T + torch.randn(300, n_runs * tp)
+    kw = dict(data=data, nuisance_per_run=nuisance, run_starts=run_starts, design_matrix=narrow)
+    cpu = df_ceiling_by_voxel_group(**kw, device=torch.device("cpu")).ceiling
+    mps = df_ceiling_by_voxel_group(**kw, device=torch.device("mps")).ceiling
+    torch.testing.assert_close(mps.cpu().to(cpu.dtype), cpu, rtol=1e-3, atol=1e-3)
