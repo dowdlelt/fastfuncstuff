@@ -95,6 +95,37 @@ def test_warp_mni_plan_spreads_groups_and_cohort_scores(tmp_path):
     assert sq["logjac_p001"] < 0
 
 
+def test_cohort_scores_match_per_label_dice(tmp_path):
+    """The bincount scorer gives the per-label-mask Dice: labels missing from some subjects,
+    label ids that are not contiguous, background never counted."""
+    import itertools
+
+    import nibabel as nib
+
+    from fastfuncstuff.benchmark.checks.qwarp import _dice_per_label
+    from fastfuncstuff.benchmark.checks.warp_mni import cohort_scores
+
+    rng = np.random.default_rng(0)
+    labs = []
+    for i in range(5):
+        x = rng.choice(np.array([0, 3, 17, 41, 1002]), size=(12, 11, 10)).astype(np.int32)
+        if i == 1:
+            x[x == 41] = 0  # one subject lacks a label
+        labs.append(x)
+        d = tmp_path / f"unit{i:06d}" / "ants"
+        d.mkdir(parents=True)
+        nib.save(nib.Nifti1Image(x, np.eye(4)), d / "labels_mni.nii.gz")
+    s = cohort_scores(sorted(tmp_path.glob("unit*")), tools=("ants",))["ants"]
+    want = []
+    for a, b in itertools.combinations(labs, 2):
+        common = np.intersect1d(np.unique(a), np.unique(b))
+        want.append(np.nanmean(_dice_per_label(a, b, common[common != 0])))
+    assert abs(s["pair_dice_mean"] - np.mean(want)) < 1e-12
+    assert abs(s["pair_dice_p05"] - np.percentile(want, 5)) < 1e-12
+    assert s["label_vol_median_by_label"]["41"] == np.median([(x == 41).sum() for x in labs])
+    assert "0" not in s["label_vol_median_by_label"]
+
+
 def test_label_judges_flag_a_lost_label_and_write_a_table():
     from fastfuncstuff.benchmark.checks.warp_pair import deformation_judges, label_judges
 

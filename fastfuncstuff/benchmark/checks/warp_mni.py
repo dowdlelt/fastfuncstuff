@@ -47,7 +47,6 @@ from .base import (
 from .warp_pair import (
     FORMWARP_AS_ANTS,
     _ants_version,
-    _dice_per_label,
     _load,
     deformation_judges,
     label_judges,
@@ -324,21 +323,36 @@ def cohort_scores(unit_dirs: list[Path], tools: tuple[str, ...] = TOOLS) -> dict
                 for u in unit_dirs if (u / folder[tool] / "labels_mni.nii.gz").exists()]  # fmt: skip
         if len(labs) < 2:
             continue
+        # Per-label masks over the full template made this hours on one core (100 labels x
+        # 4 passes x 8.5M voxels per pair). Instead: compact label indices on the voxels any
+        # subject labels, per-subject counts once, and per pair one bincount of the voxels
+        # where both carry the same label. Same Dice, ~1000x fewer passes.
+        ids = np.unique(np.concatenate([np.unique(x) for x in labs]))
+        ids = ids[ids != 0]
+        n = len(ids)
+        keep = np.zeros(labs[0].shape, bool)
+        for x in labs:
+            keep |= x != 0
+        idx = [np.searchsorted(ids, x[keep]).astype(np.int32) for x in labs]
+        for x, k in zip(labs, idx, strict=True):
+            k[x[keep] == 0] = n  # background gets its own bin, dropped below
+        del labs, keep
+        vols = np.stack([np.bincount(k, minlength=n + 1)[:n] for k in idx]).astype(np.float64)
         pair = []
-        for a, b in itertools.combinations(labs, 2):
-            common = np.intersect1d(np.unique(a), np.unique(b))
-            pair.append(float(np.nanmean(_dice_per_label(a, b, common[common != 0]))))
+        for i, j in itertools.combinations(range(len(idx)), 2):
+            a, b = idx[i], idx[j]
+            inter = np.bincount(a[a == b], minlength=n + 1)[:n]
+            common = (vols[i] > 0) & (vols[j] > 0)
+            d = 2.0 * inter[common] / (vols[i][common] + vols[j][common])
+            pair.append(float(d.mean()) if d.size else float("nan"))
         p = np.asarray(pair)
         # a tool that squeezes a structure shrinks it in every subject: keep each label's
         # median template-space volume (compare tools label by label) and its spread
-        ids = np.unique(np.concatenate([np.unique(x) for x in labs]))
-        ids = ids[ids != 0]
-        vols = np.array([[(x == i).sum() for i in ids] for x in labs], np.float64)
         med = np.median(vols, axis=0)
         cv = vols.std(axis=0) / np.maximum(vols.mean(axis=0), 1)
         out[tool] = {"label_vol_cv_median": float(np.median(cv)),
                      "label_vol_median_by_label": {str(int(i)): float(v) for i, v in zip(ids, med, strict=True)}}  # fmt: skip
-        out[tool] |= {"n_subjects": len(labs), "pair_dice_mean": float(p.mean()),
+        out[tool] |= {"n_subjects": len(idx), "pair_dice_mean": float(p.mean()),
                      "pair_dice_median": float(np.median(p)), "pair_dice_p05": float(np.percentile(p, 5))}  # fmt: skip
     return out
 
