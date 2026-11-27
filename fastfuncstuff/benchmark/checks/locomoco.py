@@ -53,9 +53,11 @@ MAX_ISO_MM = 1.8  # "high resolution": the in-plane distortion locomoco targets 
 MOCO_ARGS = ["-interp", "heptic", "-final", "heptic", "-weight_automask"]
 FFS_ARGS = ["-ref", "median", "-no_movie", "-no_flow"]
 # Same-contrast EPI to its own median: CC radius 2, three levels, modest SyN step.
-# Fixed and recorded in provenance; deliberately not tuned against locomoco.
+# Fixed and recorded in provenance; deliberately not tuned against locomoco. The output
+# is resampled with windowed sinc (ffs_locomoco's final resample is wsinc5): ANTs'
+# default linear blurs, which lifts its tSNR and lowers its sharpness for free.
 ANTS_ARGS = [
-    "-d", "3", "--float", "1", "-v", "0",
+    "-d", "3", "--float", "1", "-v", "0", "-n", "LanczosWindowedSinc",
     "-t", "SyN[0.2,3,0]",
     "-c", "[50x30x10,1e-6,5]", "-f", "4x2x1", "-s", "2x1x0vox",
 ]  # fmt: skip
@@ -113,6 +115,32 @@ def _smoothed_pe_r(d_ants: np.ndarray, d_ffs: np.ndarray, mask: np.ndarray) -> f
     b = gaussian_filter(d_ffs, s)[mask]
     r = _rowwise_r(a.T, b.T)
     return float(np.nanmedian(r)) if np.isfinite(r).any() else None
+
+
+def score(
+    moco: np.ndarray,
+    ants: np.ndarray,
+    ffs: np.ndarray,
+    median: np.ndarray,
+    mask: np.ndarray,
+    d_ants: np.ndarray,
+    d_ffs: np.ndarray,
+) -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Both judges from (x, y, z, t) series and PE displacement fields: (intrinsic, agreement)."""
+    intr: dict[str, float | None] = {}
+    vol_r = {}
+    for tag, series in (("moco", moco), ("ants", ants), ("ffs", ffs)):
+        for k, v in _intrinsic(series, median, mask).items():
+            if k == "_vol_r":
+                vol_r[tag] = v
+            else:
+                intr[f"{k}_{tag}"] = v
+    gain_a, gain_f = vol_r["ants"] - vol_r["moco"], vol_r["ffs"] - vol_r["moco"]
+    same = _rowwise_r(gain_a[None], gain_f[None])[0]
+    intr["same_volumes_r"] = float(same) if np.isfinite(same) else None
+    agree = _agreement(d_ants[mask], d_ffs[mask], moco[mask], ants[mask], ffs[mask])
+    agree["pe_r_vol_median_smooth"] = _smoothed_pe_r(d_ants, d_ffs, mask)
+    return intr, agree
 
 
 def _intrinsic(series: np.ndarray, median: np.ndarray, mask: np.ndarray) -> dict[str, float]:
@@ -277,19 +305,6 @@ class LocomocoCheck(Check):
         med = np.asarray(nib.load(str(median)).dataobj, np.float32)
         mask = np.asarray(nib.load(str(mask_p)).dataobj) > 0
         lm = np.asarray(nib.load(str(ffs_corr)).dataobj, np.float32)
-        intr: dict[str, float | None] = {}
-        vol_r = {}
-        for tag, series in (("moco", data), ("ants", ants_data), ("ffs", lm)):
-            for k, v in _intrinsic(series, med, mask).items():
-                if k == "_vol_r":
-                    vol_r[tag] = v
-                else:
-                    intr[f"{k}_{tag}"] = v
-        gain_a, gain_f = vol_r["ants"] - vol_r["moco"], vol_r["ffs"] - vol_r["moco"]
-        same = _rowwise_r(gain_a[None], gain_f[None])[0]
-        intr["same_volumes_r"] = float(same) if np.isfinite(same) else None
-        res.metrics["intrinsic"] = intr
-
         # PE displacement in that component. Both fields are pull warps in LPS mm (ITK and
         # DICOM agree on the axes).
         d_ants = np.stack(
@@ -299,9 +314,9 @@ class LocomocoCheck(Check):
         )  # fmt: skip
         w = np.asarray(nib.load(str(ffs_warp)).dataobj, np.float32)
         d_ffs = w.reshape(*data.shape[:3], n_t, 3)[..., comp]
-        agree = _agreement(d_ants[mask], d_ffs[mask], data[mask], ants_data[mask], lm[mask])
-        agree["pe_r_vol_median_smooth"] = _smoothed_pe_r(d_ants, d_ffs, mask)
-        res.metrics["agreement"] = agree
+        res.metrics["intrinsic"], res.metrics["agreement"] = score(
+            data, ants_data, lm, med, mask, d_ants, d_ffs
+        )
 
         for p in (block, moco, ants_corr, ffs_corr, ffs_warp, *vols):
             res.artifacts.append((p, "regenerable"))
