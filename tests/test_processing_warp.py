@@ -9,6 +9,7 @@ import os
 
 import pytest
 import torch
+from torch import Tensor
 
 from fastfuncstuff.processing.warp import (
     PatchSpec,
@@ -181,6 +182,45 @@ class TestQwarpConfig:
             device=torch.device("cpu"),
             pad=False,
         )
+
+    @pytest.mark.parametrize("pblur", [0.0, 0.09])
+    def test_gn_source_gradient_follows_the_source(self, monkeypatch, pblur):
+        """GN's cached source gradient is rebuilt when -pblur re-blurs the source.
+
+        It used to be built once from the level-0 blur and kept for every level, so
+        the normal equations differentiated an image the cost was not scoring.
+        """
+        import fastfuncstuff.processing.warp as warp_mod
+
+        taken: list[Tensor] = []
+        real = torch.gradient
+
+        def counting(t, *a, **k):
+            taken.append(t)
+            return real(t, *a, **k)
+
+        monkeypatch.setattr(torch, "gradient", counting)
+        g = torch.Generator().manual_seed(0)
+        base = torch.rand(24, 24, 24, generator=g) + 0.1
+        log: list[dict] = []
+        warp_mod.qwarp(
+            base,
+            (base + 0.05 * torch.rand(24, 24, 24, generator=g)).clamp_min(0),
+            weight=torch.ones_like(base),
+            mask=torch.ones_like(base).byte(),
+            config=QwarpConfig(
+                blur_base=0.0, blur_source=0.0, pblur_source=pblur, minpatch=11, max_level=2,
+                gn_iters=1, verb=0,
+            ),
+            device=torch.device("cpu"),
+            pad=False,
+            level_log=log,
+        )  # fmt: skip
+        levels = len(log)
+        assert levels >= 2
+        sources = {id(t) for t in taken if t.shape == base.shape}
+        # level_log starts at level 1; the global level 0 blurs (and solves) once more.
+        assert len(sources) == (levels + 1 if pblur > 0 else 1)
 
     def test_custom_values(self):
         cfg = QwarpConfig(
@@ -1772,3 +1812,53 @@ def test_global_correlation_of_a_constant_image_is_zero():
         flat = torch.full_like(base, const)
         assert _global_correlation(base, flat, weight, clip, clip) == 0.0
         assert _global_correlation(base, flat, weight, None, None) == 0.0
+
+
+@pytest.mark.parametrize(
+    "basis,widths,expected",
+    [
+        ("cubic_lite", (15, 17, 15), False),
+        ("cubic_lite", (13, 19, 15), True),
+        ("quintic_lite", (17, 17, 17), True),
+        ("quintic", (19, 21, 19), False),
+        ("cubic", (25, 31, 1), False),  # a 2-D volume's single slice is not a patch side
+    ],
+)
+def test_ball_applies_on_afni_patch_widths(basis, widths, expected):
+    from fastfuncstuff.processing.warp import _ball_applies
+
+    assert _ball_applies(basis, widths) is expected
+
+
+@pytest.mark.parametrize(
+    "schedule,expected",
+    [
+        ("ffs", [(12, None), (24, None), (30, None)]),
+        ("afni", [(12, None), (24, 0.0790), (30, 0.1111), (81, 0.0611)]),
+    ],
+)
+def test_level0_schedule_bases_and_bounds(monkeypatch, schedule, expected):
+    """-lev0 afni: 3dQwarp's level-0 bases, the last three under its ball."""
+    import fastfuncstuff.processing.warp as warp_mod
+
+    seen = []
+    real = warp_mod.optimize_warp_params_gauss_newton
+
+    def spy(*a, **k):
+        seen.append((a[3], k.get("ball_radius")))
+        return real(*a, **k)
+
+    monkeypatch.setattr(warp_mod, "optimize_warp_params_gauss_newton", spy)
+    g = torch.Generator().manual_seed(0)
+    base = torch.rand(24, 24, 24, generator=g) + 0.1
+    warp_mod.qwarp(
+        base,
+        base + 0.05 * torch.rand(24, 24, 24, generator=g),
+        weight=torch.ones_like(base),
+        mask=torch.ones_like(base).byte(),
+        config=QwarpConfig(blur_base=0.0, blur_source=0.0, max_level=0, gn_iters=1,
+                           lev0_schedule=schedule, verb=0),
+        device=torch.device("cpu"),
+        pad=False,
+    )  # fmt: skip
+    assert seen == expected

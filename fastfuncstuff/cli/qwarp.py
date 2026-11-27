@@ -855,6 +855,62 @@ def parse_args(
         "anything else [default: %(default)s]",
     )
     g_opt.add_argument(
+        "-gn_stop",
+        choices=("first_reject", "freeze"),
+        default=QwarpConfig().gn_stop_rule,
+        help="When a Gauss-Newton phase stops. 'first_reject' ends it as soon as every "
+        "patch was rejected or stalled in the same iteration, which with the few "
+        "patches of level 0 and the coarse levels often happens after 2 iterations. "
+        "'freeze' raises the damping and retries after a rejection, stopping a patch "
+        "only on an accepted step that gains under the tolerance (experimental) "
+        "[default: %(default)s]",
+    )
+    g_opt.add_argument(
+        "-gn_iters_lev0",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Gauss-Newton iterations per basis at level 0, the global patch. One "
+        "iteration there is a single volume pass; AFNI gives its optimizer 8*npar+31 "
+        "evaluations (experimental) [default: same as every other level, 8]",
+    )
+    g_opt.add_argument(
+        "-ball",
+        action="store_true",
+        help="AFNI's ball constraint: from the first level whose patch has a side under "
+        "15 voxels (19 quintic), bound each patch's parameters by an L2 ball instead of "
+        "a per-parameter box, as 3dQwarp does (experimental)",
+    )
+    g_opt.add_argument(
+        "-weight_afni",
+        action="store_true",
+        help="3dQwarp's weight image and box: blur sigma 4.5 (not FWHM), AFNI's "
+        "peel-and-redilate erosion, and its autobox of the weight for the patch "
+        "ladder (experimental)",
+    )
+    g_opt.add_argument(
+        "-incor_afni",
+        action="store_true",
+        help="AFNI's INCOR scoring for pearclp/pearson: pearclp clips at THD_cliplevel "
+        "and the 0.987 quantile with clipped voxels replaced past the clip and "
+        "down-weighted, and both score atanh(r) instead of r (experimental)",
+    )
+    g_opt.add_argument(
+        "-gn_step_search",
+        action="store_true",
+        help="Try each Gauss-Newton step at full, half and quarter length and keep the "
+        "one with the lowest total cost, penalty included (experimental)",
+    )
+    g_opt.add_argument(
+        "-lev0",
+        choices=("ffs", "afni"),
+        default=QwarpConfig().lev0_schedule,
+        help="Global level-0 schedule. 'ffs': cubic_lite, cubic, quintic_lite under the "
+        "box. 'afni': 3dQwarp's cubic_lite (box) then cubic, quintic_lite and quintic "
+        "under its wider ball, without its opening SINCC pass (experimental) "
+        "[default: %(default)s]",
+    )
+    g_opt.add_argument(
         "-batch_tol",
         "-batch-tol",
         type=float,
@@ -1906,6 +1962,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         axis_weights=axis_weights,
         verb=args.verb,
         optimizer=args.optimizer,
+        gn_stop_rule=args.gn_stop,
+        gn_iters_lev0=args.gn_iters_lev0,
+        ball_constraint=args.ball,
+        lev0_schedule=args.lev0,
+        gn_step_search=args.gn_step_search,
+        incor_afni=args.incor_afni,
+        weight_afni=args.weight_afni,
         batch_optimizer_lr=args.batch_lr,
         batch_optimizer_iters=args.batch_iters,
         batch_optimizer_tol=args.batch_tol,

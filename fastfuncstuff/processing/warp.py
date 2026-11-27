@@ -56,8 +56,11 @@ from .cost import (
     BatchedIncrementalCorrelation,
     IncrementalCorrelation,
     _auto_clip,
+    _clip_weight,
     _make_kernel_1d,
+    apply_incor_clip,
     batched_lpa_cost,
+    incor_clipate,
 )
 from .cost_blok import (
     assign_bloks,
@@ -66,6 +69,7 @@ from .cost_blok import (
     prepare_blok_pairs,
 )
 from .interp import (
+    _compose_cpu_applies,
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
     batched_interp_3ch_packed,
@@ -81,7 +85,11 @@ from .optimizer import (
     optimize_warp_params_gauss_newton,
     optimize_warp_params_torch,
 )
-from .penalty import compute_hexahedron_energy, compute_penalty_batched, penalty_energy
+from .penalty import (
+    compute_hexahedron_energy,
+    compute_penalty_batched,
+    hexahedron_penalty_energy,
+)
 from .weight import _thd_cliplevel, add_background_band, compute_weight_image
 
 try:
@@ -251,6 +259,61 @@ class QwarpConfig:
     +108% runtime for +1.9% on ls. Worth it for a final warp, not for a tuning
     sweep, so it is a choice rather than a default."""
 
+    gn_stop_rule: str = "first_reject"
+    """When the Gauss-Newton loop ends. ``"first_reject"`` (the original rule): as
+    soon as every patch was rejected or gained < tol in the same iteration, so one
+    all-reject round ends the fit -- with 1-6 patches at level 0 and levels 1-3 it
+    routinely ends after 2 iterations. ``"freeze"``: a rejection raises the
+    damping and retries; a patch stops only on an accepted step that gains < tol or
+    at the damping cap (AFNI's NEWUOA likewise keeps going past failed trials).
+    Opt-in until measured on the label cohort."""
+
+    gn_iters_lev0: int | None = None
+    """Gauss-Newton budget per basis at level 0, the single global patch. ``None``
+    keeps the ordinary ceiling (:attr:`gn_iters_coarse`, 8). AFNI gives NEWUOA
+    ``8*npar+31`` evaluations there; one B=1 GN iteration is one volume pass, so 30
+    iterations cost about one fine level."""
+
+    ball_constraint: bool = False
+    """AFNI's BALLOPT: once a level's patch has a side under 15 voxels (19 for the
+    quintic bases), constrain each patch's parameters to an L2 ball of radius
+    :data:`BALL_PARAM_MAX` instead of the per-parameter box, for that level and every
+    finer one (AFNI never switches back). The ball allows single coefficients 2-6x
+    larger than the box but a smaller total norm. Gauss-Newton path only; opt-in
+    until measured."""
+
+    weight_afni: bool = False
+    """3dQwarp's weight and box: blur the weight with a *sigma* of 4.5 (ffs used
+    FWHM 4.5), erode with AFNI's peel-and-redilate (ffs: a plain 6-connected
+    erosion, a voxel smaller everywhere), and take the patch ladder's box from
+    ``MRI_autobbox`` (cluster + peel, no clip) instead of the nonzero extent. With
+    AFNI's wider weight the brain edge may be covered without
+    :attr:`background_band`; re-ask that once this is measured. Opt-in."""
+
+    incor_afni: bool = False
+    """AFNI's INCOR for the global correlations: pearclp clips at
+    ``THD_cliplevel(0.321)`` and the 0.987 quantile (capped at 6.543x the bottom),
+    replaces values slightly *beyond* the clip and divides a clipped voxel's weight
+    by 1 + its clipped coordinates (``INCOR_clipate``); pearclp and pearson then
+    score atanh(r), which reweights the correlation against the penalty by
+    1/(1 - r^2). ffs's pearclp clamps at the 1st/99th percentiles at full weight and
+    scores raw r. Batched path only; opt-in until measured."""
+
+    gn_step_search: bool = False
+    """Try the Gauss-Newton step at full, half and quarter length each iteration
+    and keep whichever gives the lowest true cost (correlation + penalty) per patch.
+    The GN model is built from the correlation residual alone, so a plain step can be
+    accepted while raising the penalty -- a suspected cause of ffs warps being
+    rougher than 3dQwarp's (det J < 0.5 in 12.4% of voxels against 4.8%). Costs two
+    extra cost evaluations per iteration; opt-in until measured."""
+
+    lev0_schedule: str = "ffs"
+    """Bases and bounds of the global level 0. ``"ffs"``: cubic_lite, cubic,
+    quintic_lite, all under the per-parameter box. ``"afni"``: 3dQwarp's order and
+    bounds -- cubic_lite under the box, then cubic, quintic_lite and the full
+    quintic (81 parameters) under the L2 ball -- less AFNI's opening SINCC pass,
+    which needs a basis port. Gauss-Newton path; opt-in until measured."""
+
     gn_coarse_patches: int = 2000
     """Patch count at which the coarse ceiling applies in full; above it the budget
     tapers toward :attr:`gn_iters` as the square root of the patch count."""
@@ -337,10 +400,9 @@ class QwarpConfig:
     batch loop stops only once every patch has converged (or hits the iter cap)."""
 
     batch_optimizer_iters_lev0: int = 120
-    """Max Adam iterations for the single global level-0 patch (CUDA only).
-    Level 0 is one B=1 patch and the foundational alignment, so it gets a
-    larger budget than the per-phase fine patches. CPU still uses the serial
-    derivative-free optimizer (no launch overhead to amortize there)."""
+    """Max Adam iterations for the single global level-0 patch, on every device.
+    Only the Adam optimizer reads it; Gauss-Newton's level-0 budget is
+    :attr:`gn_iters_lev0`."""
 
     hfactor_q: float = 1.0
     """AFNI-style Hfactor shrinkage for *fine* patches: at the lev=1 patch size
@@ -427,11 +489,14 @@ class WarpState:
     # five times over. See `qwarp_level_gains`.
     level_log: list[dict] = field(default_factory=list)
 
-    # Gradient of the (unchanging) source volume, stacked (3, nz, ny, nx). Built on
-    # first use by the Gauss-Newton path and kept, because it is the same for every
-    # patch of every level and rebuilding it per phase would cost more than the
-    # solve it feeds.
+    # Gradient of the source volume, stacked (3, nz, ny, nx). Built on first use by
+    # the Gauss-Newton path and kept, because without -pblur it is the same for every
+    # patch of every level and rebuilding it per phase would cost more than the solve
+    # it feeds. Keyed on the source tensor it was taken from: with -pblur the source
+    # is re-blurred per level, and a stale gradient left GN solving for an image the
+    # cost was not scoring (accept/reject kept it correct, only slow).
     source_grad_3ch: Tensor = field(default_factory=lambda: torch.empty(0))
+    source_grad_of: Tensor | None = None
 
     # Per-level optimizer-budget telemetry (batched path only); reset each level.
     opt_steps_weighted: int = 0  # sum over batches of steps_run * B
@@ -629,8 +694,13 @@ def _blur_for_patch(
     return vol
 
 
-def _compute_qwarp_weight(base: Tensor) -> Tensor:
-    """AFNI 3dQwarp's default ``mri_weightize`` pipeline."""
+def _compute_qwarp_weight(base: Tensor, afni: bool = False) -> Tensor:
+    """AFNI 3dQwarp's default ``mri_weightize`` pipeline.
+
+    ``afni`` fixes the two places it departed from 3dQwarp: the blur is a sigma of
+    4.5 (ffs read it as a FWHM, sigma 1.91), and the erosion is AFNI's peel with
+    re-dilation rather than a plain one, which was a voxel smaller everywhere.
+    """
     return compute_weight_image(
         base,
         gauss_fwhm=4.5,
@@ -638,6 +708,8 @@ def _compute_qwarp_weight(base: Tensor) -> Tensor:
         clusterize=True,
         hist_cliplevel=True,
         edge_before_smoothing=True,
+        gauss_sigma=4.5 if afni else None,
+        erode="afni" if afni else "6conn",
     )
 
 
@@ -738,7 +810,7 @@ def qwarp(
 
     if weight is None:
         weight_p = add_background_band(
-            _compute_qwarp_weight(base_p), base_p, config.background_band
+            _compute_qwarp_weight(base_p, afni=config.weight_afni), base_p, config.background_band
         )
     else:
         weight_p = (
@@ -1021,6 +1093,18 @@ def _filter_patches(
 # ---------------------------------------------------------------------------
 
 
+# AFNI's ball radii (mri_nwarp.c, the BALLOPT parmax per basis), against the box
+# half-widths in _get_basis_config.
+BALL_PARAM_MAX = {"cubic_lite": 0.1141, "cubic": 0.0790, "quintic_lite": 0.1111, "quintic": 0.0611}
+
+
+def _ball_applies(basis_type: str, widths: tuple[int, int, int]) -> bool:
+    """AFNI's switch to the ball: any patch side under 15, or 19 for quintic.
+    Axes of one voxel (a 2-D volume) carry no patch and are ignored."""
+    limit = 19 if basis_type.startswith("quintic") else 15
+    return any(1 < w < limit for w in widths)
+
+
 def _get_basis_config(
     basis_type: str,
     nxh: int,
@@ -1076,12 +1160,20 @@ def _compute_hfactor(patch_size: int, reference_patch_size: int, hfactor_q: floa
     return prat**alpha
 
 
+def _qwarp_clip(config: QwarpConfig, vol: Tensor, weight: Tensor) -> tuple[float, ...]:
+    """The INCOR clip range for one image: AFNI's ``INCOR_clipate`` 4-tuple under
+    ``incor_afni`` with pearclp, else ffs's percentile clamp."""
+    if config.incor_afni and config.cost_method == "pearclp":
+        return incor_clipate(vol.reshape(-1), weight.reshape(-1))
+    return _auto_clip(vol.reshape(-1), weight.reshape(-1))
+
+
 def _global_correlation(
     base: Tensor,
     warped_source: Tensor,
     weight: Tensor,
-    base_clip: tuple[float, float] | None,
-    source_clip: tuple[float, float] | None,
+    base_clip: tuple[float, ...] | None,
+    source_clip: tuple[float, ...] | None,
 ) -> float:
     """Weighted (optionally clipped) Pearson cost over the whole volume.
 
@@ -1091,11 +1183,9 @@ def _global_correlation(
     b_flat = base.reshape(-1)
     s_flat = warped_source.reshape(-1)
     w_flat = weight.reshape(-1)
-    if base_clip:
-        b_flat = b_flat.clamp(base_clip[0], base_clip[1])
-    if source_clip:
-        s_flat = s_flat.clamp(source_clip[0], source_clip[1])
-    wm = w_flat * (w_flat > 0).float()
+    b_flat, nb = apply_incor_clip(b_flat, base_clip)
+    s_flat, ns = apply_incor_clip(s_flat, source_clip)
+    wm = _clip_weight(w_flat * (w_flat > 0).float(), nb, ns)
     sw = wm.sum()
     if sw <= 0:
         return 0.0
@@ -1253,7 +1343,7 @@ def _warpomatic(
     do_xyz = (do_x, do_y, do_z)
     axis_w = config.axis_weights
 
-    imin, imax, jmin, jmax, kmin, kmax = _autobox(weight)
+    imin, imax, jmin, jmax, kmin, kmax = _qwarp_autobox(weight, config.weight_afni)
 
     if config.verb >= 1:
         print(
@@ -1301,8 +1391,8 @@ def _warpomatic(
     )
     with torch.no_grad():
         state.warped_source = warp_image(source, state.xd, state.yd, state.zd, mode=config.interp)
-    base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-    source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+    base_clip = _qwarp_clip(config, base, weight)
+    source_clip = _qwarp_clip(config, source, weight)
 
     # Compute initial cost so it's never the 666.666 sentinel.
     with torch.no_grad():
@@ -1322,6 +1412,15 @@ def _warpomatic(
         # rather than hardcoded so the serial path comes back if a future torch
         # regresses grid_sample and it lands in utils._MPS_CPU_OPS.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
+        lev0_ball: set[str] = set()
+        if config.lev0_schedule == "afni":
+            # 3dQwarp: SINCC and CUBIC_LITE under the box, then CUBIC, QUINTIC_LITE
+            # and QUINTIC under the ball. SINCC needs its own basis port and is
+            # left out; the rest is AFNI's order and bounds.
+            lev0_bases = ["cubic_lite", "cubic", "quintic_lite", "quintic"]
+            lev0_ball = {"cubic", "quintic_lite", "quintic"}
+        elif config.lev0_schedule != "ffs":
+            raise ValueError(f"unknown lev0_schedule {config.lev0_schedule!r}")
         use_batched_lev0 = cpu_if_mps(device, "grid_sample") == device
 
         if use_batched_lev0:
@@ -1396,6 +1495,8 @@ def _warpomatic(
                     max_iter=config.batch_optimizer_iters_lev0,
                     blok_index_vol=blok_index_vol,
                     nblok=nblok,
+                    gn_max_iter=config.gn_iters_lev0,
+                    ball_radius=BALL_PARAM_MAX[basis_type] if basis_type in lev0_ball else None,
                 )
             else:
                 _improve_warp_serial(
@@ -1492,6 +1593,7 @@ def _warpomatic(
         ngmin -= 1
 
     levdone = False
+    ball_on = False
     lev_start = max(1, config.start_level)
     if config.start_patch > 0:
         # Patch width shrinks geometrically (xwid0 * shrink**lev), so solve for the
@@ -1571,8 +1673,8 @@ def _warpomatic(
             state.warped_source = warp_image(
                 source, state.xd, state.yd, state.zd, mode=config.interp
             )
-        base_clip = _auto_clip(base.reshape(-1), weight.reshape(-1))
-        source_clip = _auto_clip(source.reshape(-1), weight.reshape(-1))
+        base_clip = _qwarp_clip(config, base, weight)
+        source_clip = _qwarp_clip(config, source, weight)
         state.cost = _global_correlation(base, state.warped_source, weight, base_clip, source_clip)
 
         # Penalty settings. Ramp with ABSOLUTE level (finer patches => stronger
@@ -1634,6 +1736,9 @@ def _warpomatic(
             device,
             hfactor=hfactor,
         )
+        if config.ball_constraint and _ball_applies(basis_type, (nxh, nyh, nzh)):
+            ball_on = True  # sticky, as AFNI's BALLOPT is
+        ball_radius = BALL_PARAM_MAX[basis_type] * hfactor if ball_on else None
 
         # Pre-compute shared coordinate grids
         kk_p, jj_p, ii_p = torch.meshgrid(
@@ -1735,6 +1840,7 @@ def _warpomatic(
                         source_clip=source_clip,
                         blok_index_vol=blok_index_vol,
                         nblok=nblok,
+                        ball_radius=ball_radius,
                     )
 
                 # Serial fallback for odd-sized boundary patches
@@ -1997,6 +2103,16 @@ def _gn_accumulate(
                 f"({type(exc).__name__}: {exc}); falling back to the chunked path"
             )
 
+    if (
+        g.device.type == "cpu"
+        and g.dtype == torch.float32
+        and res.dtype == torch.float32
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import gn_normal_eqs_cpu
+
+        return gn_normal_eqs_cpu(g, hw, bt, scale, omega, res, mean_cols)
+
     build = columns_fn if columns_fn is not None else _gn_weighted_columns
     hw_col = hw.reshape(1, 1, d, 1)
     hmat = torch.zeros((b, ncol, ncol), device=g.device, dtype=torch.float32)
@@ -2219,6 +2335,8 @@ def _improve_warp_batched(
     max_iter: int | None = None,
     blok_index_vol: Tensor | None = None,
     nblok: int = 0,
+    gn_max_iter: int | None = None,
+    ball_radius: float | None = None,
 ) -> None:
     """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
 
@@ -2295,6 +2413,7 @@ def _improve_warp_batched(
             method=config.cost_method,
             base_clip=base_clip,
             source_clip=source_clip,
+            fisher_z=config.incor_afni and config.cost_method in ("pearclp", "pearson"),
         )
         patch_slices = [(p.ibot, p.itop, p.jbot, p.jtop, p.kbot, p.ktop) for p in patches]
         batch_incor.precompute_fixed_parts(
@@ -2310,8 +2429,7 @@ def _improve_warp_batched(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_global, se_global = compute_hexahedron_energy(state.xd, state.yd, state.zd)
-            energy_global = penalty_energy(je_global, se_global)
+            energy_global = hexahedron_penalty_energy(state.xd, state.yd, state.zd)
             global_energy_sum = energy_global.sum()
             # Per-patch energy sums via the same summed-area table _filter_patches
             # uses: eight gathers for the whole phase instead of B slice-and-reduce
@@ -2452,9 +2570,10 @@ def _improve_warp_batched(
     use_gn, use_hybrid = schedule.use_gn, schedule.use_hybrid
 
     if use_gn:
-        if state.source_grad_3ch.numel() == 0:
+        if state.source_grad_of is not source:
             gz, gy, gx = torch.gradient(source)
             state.source_grad_3ch = torch.stack([gx, gy, gz], dim=0).contiguous()
+            state.source_grad_of = source
         source_grad_3ch = state.source_grad_3ch
         # The columns are the largest tensor here and their assembly is a chain of
         # elementwise passes over it; compiled, that chain becomes one kernel.
@@ -2496,6 +2615,26 @@ def _improve_warp_batched(
             with torch.no_grad():
                 full = active_params @ expand_mat
                 hxd_, hyd_, hzd_ = _eval_warp(basis, full, half_widths, do_xyz)
+                if _compose_cpu_applies(source, global_warp_3ch, base_i, hxd_):
+                    from .numba_kernels import compose_and_sample_cpu
+
+                    # The gradient rides along in the same pass: same positions,
+                    # same corner weights, bit-identical to the two-step route.
+                    w_, _ax, _ay, _az, gall = compose_and_sample_cpu(
+                        source,
+                        global_warp_3ch,
+                        hxd_,
+                        hyd_,
+                        hzd_,
+                        base_i,
+                        base_j,
+                        base_k,
+                        source_grad_3ch,
+                    )
+                    assert gall is not None
+                    if len(active_dims) < 3:
+                        gall = gall[list(active_dims)]
+                    return _gn_dispatch(w_, gall)
                 w_, ax_, ay_, az_ = _compose(
                     source,
                     state.xd,
@@ -2537,19 +2676,22 @@ def _improve_warp_batched(
                 # masked voxel contributes zero either way -- while masking
                 # first costs four full-size elementwise passes per iteration,
                 # on the largest tensors in the level.
-                if gn_local:
-                    return _gn_normal_eqs_local(
-                        w_,
-                        gall,
-                        hw_active,
-                        bt,
-                        omega,
-                        base_hat,
-                        gn_kernel,
-                        (nzh, nyh, nxh),
-                        gn_columns,
-                    )
-                return _gn_normal_eqs_3d(w_, gall, hw_active, bt, omega, wsum, base_hat, gn_columns)
+                return _gn_dispatch(w_, gall)
+
+        def _gn_dispatch(w_: Tensor, gall: Tensor) -> tuple[Tensor, Tensor]:
+            if gn_local:
+                return _gn_normal_eqs_local(
+                    w_,
+                    gall,
+                    hw_active,
+                    bt,
+                    omega,
+                    base_hat,
+                    gn_kernel,
+                    (nzh, nyh, nxh),
+                    gn_columns,
+                )
+            return _gn_normal_eqs_3d(w_, gall, hw_active, bt, omega, wsum, base_hat, gn_columns)
 
         def gn_cost(active_params: Tensor) -> Tensor:
             with torch.no_grad():
@@ -2562,6 +2704,8 @@ def _improve_warp_batched(
             config.gn_iters_coarse,
             max(config.gn_iters, int(round(config.gn_iters * _taper))),
         )
+        if gn_max_iter is not None:
+            gn_budget = gn_max_iter
         best_params, _best_costs, opt_stats = optimize_warp_params_gauss_newton(
             gn_normal_eqs,
             gn_cost,
@@ -2570,6 +2714,9 @@ def _improve_warp_batched(
             param_max,
             device,
             max_iter=gn_budget,
+            stop_rule=config.gn_stop_rule,
+            ball_radius=ball_radius,
+            step_fracs=(1.0, 0.5, 0.25) if config.gn_step_search else (1.0,),
         )
         if use_hybrid:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(
@@ -2813,10 +2960,9 @@ def _improve_warp_batched_multi(
         with torch.no_grad():
             for a in range(Na):
                 v = int(active_idx[a])
-                je, se = compute_hexahedron_energy(
+                energy = hexahedron_penalty_energy(
                     mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
-                )
-                energy = penalty_energy(je, se).reshape(-1)
+                ).reshape(-1)
                 patch_e = energy[flat_idx].sum(dim=1)  # (P,)
                 external_pen[a * P : (a + 1) * P] = energy.sum() - patch_e
 
@@ -4015,8 +4161,7 @@ def _improve_warp_batched_mescaled(
     external_pen = torch.zeros(B, device=device)
     if use_penalty:
         with torch.no_grad():
-            je_g, se_g = compute_hexahedron_energy(state.xd, state.yd, state.zd)
-            energy_g = penalty_energy(je_g, se_g).reshape(-1)
+            energy_g = hexahedron_penalty_energy(state.xd, state.yd, state.zd).reshape(-1)
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
@@ -4752,6 +4897,20 @@ def _improve_warp_serial(
         )
 
     return True
+
+
+def _qwarp_autobox(weight: Tensor, afni: bool) -> tuple[int, int, int, int, int, int]:
+    """The box the patch ladder is built on. ``afni``: 3dQwarp's ``MRI_autobbox``
+    on the weight (nonzero, cluster, peel, cluster; no clip), which can drop thin
+    weight that a plain nonzero box keeps."""
+    if afni:
+        from .autobox import autobox_bounds
+
+        try:
+            return autobox_bounds(weight, clip=False)
+        except ValueError:
+            pass  # an empty weight: fall back to the whole volume below
+    return _autobox(weight)
 
 
 def _autobox(weight: Tensor) -> tuple[int, int, int, int, int, int]:

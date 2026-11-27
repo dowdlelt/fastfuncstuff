@@ -181,6 +181,29 @@ def penalty_energy(je: Tensor, se: Tensor, cut: float = HPEN_CUT) -> Tensor:
     return ej.pow(4) + es.pow(4)
 
 
+def hexahedron_penalty_energy(xd: Tensor, yd: Tensor, zd: Tensor, cut: float = HPEN_CUT) -> Tensor:
+    """``penalty_energy(*compute_hexahedron_energy(xd, yd, zd), cut)``: the per-voxel
+    penalty field, any leading batch dimensions kept.
+
+    On the CPU (float32, no autograd) one fused Numba stencil pass; it matches the
+    torch route to float32 rounding -- not to the bit, because ATen's ``pow`` is
+    Sleef's and Numba's is libm's -- and is exactly as far from a float64 reference.
+    """
+    if (
+        xd.device.type == "cpu"
+        and xd.dtype == yd.dtype == zd.dtype == torch.float32
+        and xd.ndim >= 3
+        and not (
+            torch.is_grad_enabled() and (xd.requires_grad or yd.requires_grad or zd.requires_grad)
+        )
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import hexahedron_penalty_energy_cpu
+
+        return hexahedron_penalty_energy_cpu(xd, yd, zd, cut)
+    return penalty_energy(*compute_hexahedron_energy(xd, yd, zd), cut)
+
+
 def compute_penalty(
     xd: Tensor,
     yd: Tensor,
@@ -189,8 +212,7 @@ def compute_penalty(
     external_sum: float = 0.0,
 ) -> float:
     """Compute total warp distortion penalty (single volume, serial path)."""
-    je, se = compute_hexahedron_energy(xd, yd, zd)
-    hsum = external_sum + float(penalty_energy(je, se).sum().item())
+    hsum = external_sum + float(hexahedron_penalty_energy(xd, yd, zd).sum().item())
     if hsum > 0:
         return pen_fac * (hsum**0.25)
     return 0.0
@@ -240,10 +262,7 @@ def compute_penalty_batched(
             )
 
     if patch_sums is None:
-        # Batched Jacobian energy: (B, nz, ny, nx)
-        je, se = compute_hexahedron_energy(xd, yd, zd)
-        # Sum over spatial dims, keep batch: (B,)
-        patch_sums = penalty_energy(je, se).sum(dim=(-3, -2, -1))
+        patch_sums = hexahedron_penalty_energy(xd, yd, zd).sum(dim=(-3, -2, -1))
 
     hsum = (external_sums + patch_sums).clamp(min=0)
 

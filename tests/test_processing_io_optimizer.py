@@ -223,3 +223,92 @@ class TestOptimizeWarpParamsBatched:
         # Should have converged near zero, and stopped before the full budget
         assert (best_c < 0.01).all()
         assert stats.steps_run < 500
+
+
+class TestGaussNewtonStopRule:
+    """A first step that overshoots must not end the fit under the freeze rule."""
+
+    @staticmethod
+    def _problem():
+        # Cost (p - 1)^2 per patch; the model's curvature is 10x too small, so the
+        # undamped step lands at p = 10 (cost 81) and only a damped retry gains.
+        def normal_eqs(p):
+            b = p.shape[0]
+            return torch.full((b, 1, 1), 0.2), 2.0 * (1.0 - p)
+
+        def cost(p):
+            return ((p - 1.0) ** 2).sum(-1)
+
+        return normal_eqs, cost
+
+    def test_first_reject_stops_on_the_overshoot(self):
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+        ne, cost = self._problem()
+        params, costs, stats = optimize_warp_params_gauss_newton(
+            ne, cost, 3, 1, 20.0, torch.device("cpu"), max_iter=12
+        )
+        assert stats.steps_run == 1
+        assert torch.equal(params, torch.zeros(3, 1))
+
+    def test_freeze_retries_with_more_damping(self):
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+        ne, cost = self._problem()
+        calls = []
+
+        def counted(p):
+            calls.append(p.clone())
+            return ne(p)
+
+        params, costs, stats = optimize_warp_params_gauss_newton(
+            counted, cost, 3, 1, 20.0, torch.device("cpu"), max_iter=12, stop_rule="freeze"
+        )
+        assert bool((costs < 0.5).all())
+        # Rejected rounds leave the parameters where they were, so the normal
+        # equations are not rebuilt for them.
+        assert len(calls) < stats.steps_run
+
+
+def test_gn_ball_constraint_bounds_the_norm_not_each_coefficient():
+    """AFNI's BALLOPT: one coefficient may exceed the box half-width, the norm may not."""
+    from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+    target = torch.tensor([[0.5, 0.0, 0.0]])  # far outside both bounds, along one axis
+
+    def normal_eqs(p):
+        return torch.eye(3).expand(1, 3, 3).clone(), (target - p)
+
+    def cost(p):
+        return ((p - target) ** 2).sum(-1)
+
+    box, _, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 1, 3, 0.0421, torch.device("cpu"), max_iter=4
+    )
+    ball, _, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 1, 3, 0.0421, torch.device("cpu"), max_iter=4, ball_radius=0.1141
+    )
+    assert box.abs().max() <= 0.0421 + 1e-7
+    assert ball[0, 0] > 0.0421 * 2
+    assert ball.norm() <= 0.1141 * (1 + 1e-6)
+
+
+def test_gn_step_search_keeps_the_best_fraction_of_the_step():
+    """The model's step is twice too long; the search lands on the minimum at once."""
+    from fastfuncstuff.processing.optimizer import optimize_warp_params_gauss_newton
+
+    def normal_eqs(p):
+        return torch.full((p.shape[0], 1, 1), 0.5), (1.0 - p)  # step 2(1-p): lands at 2
+
+    def cost(p):
+        return ((p - 1.0) ** 2).sum(-1)
+
+    plain, c_plain, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 2, 1, 5.0, torch.device("cpu"), max_iter=1, lam0=0.0
+    )
+    searched, c_search, _ = optimize_warp_params_gauss_newton(
+        normal_eqs, cost, 2, 1, 5.0, torch.device("cpu"), max_iter=1, lam0=0.0,
+        step_fracs=(1.0, 0.5, 0.25),
+    )  # fmt: skip
+    assert torch.equal(plain, torch.zeros(2, 1))  # 2 is no better than 0: rejected
+    torch.testing.assert_close(searched, torch.ones(2, 1), rtol=0, atol=1e-6)

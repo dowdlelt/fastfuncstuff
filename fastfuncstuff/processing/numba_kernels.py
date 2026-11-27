@@ -7,11 +7,26 @@ this does not help.
 
 from __future__ import annotations
 
+import functools
+import platform
+
 import numba
 import numpy as np
 import torch
-from numba import njit, prange
+from numba import prange
 from torch import Tensor
+
+njit = numba.njit
+
+# torch's arm64 build compiles ATen with multiply-add contraction, so the float32
+# arithmetic inside one fused ATen kernel (grid_sampler and its backward) rounds
+# through FMA; the x86 wheels do not. LLVM only fuses when told to, so a kernel that
+# replays grid_sampler to the bit has to match that per platform (measured: 7772 of
+# 20000 trilinear samples one ULP off on an M-series without it, 0 with it). Kernels
+# that replay a chain of separate torch elementwise ops (the Jacobian) must NOT
+# contract: each of those ops rounds on its own.
+_ATEN_CONTRACTS = platform.machine().lower() in {"arm64", "aarch64"}
+njit_aten = functools.partial(numba.njit, fastmath={"contract"} if _ATEN_CONTRACTS else False)
 
 _F1 = np.float32(1.0)
 _F2 = np.float32(2.0)
@@ -93,7 +108,7 @@ def _trilinear3(f, x, y, z):
     return a, b, c
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _invert_field_kernel(f, n_iter, ex, ey, ez, step_per_slice):
     nz, ny, nx = f.shape[0], f.shape[1], f.shape[2]
     for k in prange(nz):  # ty: ignore[not-iterable]
@@ -357,7 +372,7 @@ def _border_index_grad(coord, size):
     return ix, mult
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _warp_linear_fwd(src, xd, yd, zd, out):
     nz, ny, nx = src.shape
     for k in prange(nz):  # ty: ignore[not-iterable]
@@ -395,7 +410,7 @@ def _warp_linear_fwd(src, xd, yd, zd, out):
                 out[k, j, i] = a
 
 
-@njit(parallel=True, cache=True)
+@njit_aten(parallel=True, cache=True)
 def _warp_linear_bwd(src, xd, yd, zd, gout, gx_out, gy_out, gz_out):
     nz, ny, nx = src.shape
     sx2 = np.float32(nx - 1)
@@ -607,3 +622,338 @@ def combine_local_corr_grad_cpu(a, b, w, h, scale: float):
     gb = np.empty_like(a)
     _with_threads(_combine_grad_kernel, a, b, w, h, np.float32(scale), ga, gb)
     return ga, gb
+
+
+@njit(inline="always")
+def _corner_weights(ix, iy, iz, nx, ny, nz):
+    # ATen grid_sampler_3d's trilinear corner indices and weights, from a border-
+    # clipped unnormalised position, in its expression order.
+    x0 = np.floor(ix)
+    y0 = np.floor(iy)
+    z0 = np.floor(iz)
+    x1 = x0 + _F1
+    y1 = y0 + _F1
+    z1 = z0 + _F1
+    tnw = (x1 - ix) * (y1 - iy) * (z1 - iz)
+    tne = (ix - x0) * (y1 - iy) * (z1 - iz)
+    tsw = (x1 - ix) * (iy - y0) * (z1 - iz)
+    tse = (ix - x0) * (iy - y0) * (z1 - iz)
+    bnw = (x1 - ix) * (y1 - iy) * (iz - z0)
+    bne = (ix - x0) * (y1 - iy) * (iz - z0)
+    bsw = (x1 - ix) * (iy - y0) * (iz - z0)
+    bse = (ix - x0) * (iy - y0) * (iz - z0)
+    i0, j0, k0 = int(x0), int(y0), int(z0)
+    return i0, j0, k0, i0 + 1 < nx, j0 + 1 < ny, k0 + 1 < nz, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+
+
+@njit(inline="always")
+def _sample_planar(v, c, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse):
+    # One channel of a (C, nz, ny, nx) volume, accumulated in ATen's corner order.
+    i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+    a = _F0
+    a += v[c, k0, j0, i0] * tnw
+    if oi:
+        a += v[c, k0, j0, i1] * tne
+    if oj:
+        a += v[c, k0, j1, i0] * tsw
+    if oi and oj:
+        a += v[c, k0, j1, i1] * tse
+    if ok:
+        a += v[c, k1, j0, i0] * bnw
+    if ok and oi:
+        a += v[c, k1, j0, i1] * bne
+    if ok and oj:
+        a += v[c, k1, j1, i0] * bsw
+    if ok and oi and oj:
+        a += v[c, k1, j1, i1] * bse
+    return a
+
+
+@njit_aten(parallel=True, cache=True)
+def _compose_sample_kernel(
+    src, warp, px, py, pz, bi, bj, bk, slo, sxhi, syhi, szhi, grad, want_grad, out, gout
+):
+    nz, ny, nx = src.shape[1], src.shape[2], src.shape[3]
+    fx, fy, fz = np.float32(nx - 1), np.float32(ny - 1), np.float32(nz - 1)
+    n = px.shape[0]
+    block = 4096
+    for blk in prange((n + block - 1) // block):  # ty: ignore[not-iterable]
+        for p in range(blk * block, min(n, (blk + 1) * block)):
+            hx, hy, hz = px[p], py[p], pz[p]
+            # The query point, clamped as the torch path clamps before normalising.
+            xq = min(max(bi[p] + hx, _F0), fx)
+            yq = min(max(bj[p] + hy, _F0), fy)
+            zq = min(max(bk[p] + hz, _F0), fz)
+            i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse = _corner_weights(
+                _border_index(xq, nx), _border_index(yq, ny), _border_index(zq, nz), nx, ny, nz
+            )
+            ax = hx + _sample_planar(
+                warp, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            ay = hy + _sample_planar(
+                warp, 1, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            az = hz + _sample_planar(
+                warp, 2, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            sx = min(max(ax + bi[p], slo), sxhi)
+            sy = min(max(ay + bj[p], slo), syhi)
+            sz = min(max(az + bk[p], slo), szhi)
+            i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse = _corner_weights(
+                _border_index(sx, nx), _border_index(sy, ny), _border_index(sz, nz), nx, ny, nz
+            )
+            out[0, p] = _sample_planar(
+                src, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+            )
+            out[1, p] = ax
+            out[2, p] = ay
+            out[3, p] = az
+            if want_grad:
+                gout[0, p] = _sample_planar(
+                    grad, 0, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+                gout[1, p] = _sample_planar(
+                    grad, 1, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+                gout[2, p] = _sample_planar(
+                    grad, 2, i0, j0, k0, oi, oj, ok, tnw, tne, tsw, tse, bnw, bne, bsw, bse
+                )
+
+
+def compose_and_sample_cpu(
+    source: Tensor,
+    warp_3ch: Tensor,
+    patch_xd: Tensor,
+    patch_yd: Tensor,
+    patch_zd: Tensor,
+    base_i: Tensor,
+    base_j: Tensor,
+    base_k: Tensor,
+    grad_3ch: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """qwarp's compose-and-sample, ``interp.batched_compose_and_interpolate``, in one pass.
+
+    Per patch voxel: sample the global warp at ``base + h``, add ``h``, sample the
+    source at the composed position -- and, given ``grad_3ch``, the source gradient
+    at that same position, which Gauss-Newton wants next. Bit-identical to the
+    grid_sample route: same clamps, same normalise/unnormalise round trip, same
+    corner order. Returns (B, V) warped values and composed displacements, plus the
+    (3, B, V) gradient sample or None.
+    """
+    b, v = patch_xd.shape
+    nz, ny, nx = source.shape
+    flat = [t.detach().contiguous().reshape(-1).numpy() for t in (patch_xd, patch_yd, patch_zd)]
+    bases = [t.contiguous().reshape(-1).numpy() for t in (base_i, base_j, base_k)]
+    want = grad_3ch is not None
+    out = np.empty((4, b * v), dtype=np.float32)
+    gout = np.empty((3, b * v) if want else (3, 1), dtype=np.float32)
+    grad = grad_3ch.contiguous().numpy() if want else np.empty((3, 1, 1, 1), np.float32)
+    _with_threads(
+        _compose_sample_kernel,
+        source.contiguous().numpy()[None],
+        warp_3ch.contiguous().numpy(),
+        *flat,
+        *bases,
+        np.float32(-0.499),
+        np.float32(nx - 0.501),
+        np.float32(ny - 0.501),
+        np.float32(nz - 0.501),
+        grad,
+        want,
+        out,
+        gout,
+    )
+    res = torch.from_numpy(out).reshape(4, b, v)
+    g = torch.from_numpy(gout).reshape(3, b, v) if want else None
+    return res[0], res[1], res[2], res[3], g
+
+
+_GN_BLOCK = 128
+
+
+# reassoc lets LLVM vectorise the block dot products (and contract fuses them); the
+# kernel promises float32 rounding, not bit-identity, so neither costs a guarantee.
+@numba.njit(parallel=True, cache=True, fastmath={"reassoc", "contract"})
+def _gn_normal_eqs_kernel(g, hw, bt, scale, omega, res, mean, has_mean, nsplit, hpart, gpart):
+    nd, nb = g.shape[0], bt.shape[1]
+    ncol = nd * nb
+    nv = g.shape[2]
+    per = (nv + nsplit - 1) // nsplit
+    for task in prange(g.shape[1] * nsplit):  # ty: ignore[not-iterable]
+        b = task // nsplit
+        s = task % nsplit
+        # Columns of up to _GN_BLOCK voxels, transposed so each (p, q) term of the
+        # rank-k update is one contiguous dot product. Summed in float32 within a
+        # block (128 terms), across blocks in float64.
+        cb = np.empty((ncol, _GN_BLOCK), np.float32)
+        rb = np.empty(_GN_BLOCK, np.float32)
+        h = hpart[b, s]
+        gr = gpart[b, s]
+        v = s * per
+        vend = min(nv, (s + 1) * per)
+        while v < vend:
+            k = 0
+            while k < _GN_BLOCK and v < vend:
+                om = omega[b, v]
+                if om > _F0:  # sqrt(omega) = 0 adds exactly nothing
+                    rw = np.sqrt(om)
+                    inv = rw / scale[b, v]
+                    # The columns as _gn_weighted_columns builds them, in its op order.
+                    for d in range(nd):
+                        gd = g[d, b, v]
+                        for n in range(nb):
+                            col = d * nb + n
+                            x = gd * (hw[d] * bt[v, n])
+                            if has_mean:
+                                x = x - mean[b, col]
+                            cb[col, k] = x * inv
+                    rb[k] = rw * res[b, v]
+                    k += 1
+                v += 1
+            for p in range(ncol):
+                acc = _F0
+                for t in range(k):
+                    acc += cb[p, t] * rb[t]
+                gr[p] += acc
+                for q in range(p, ncol):
+                    acc = _F0
+                    for t in range(k):
+                        acc += cb[p, t] * cb[q, t]
+                    h[p, q] += acc
+
+
+def gn_normal_eqs_cpu(
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    scale: Tensor,
+    omega: Tensor,
+    res: Tensor,
+    mean_cols: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """``warp._gn_accumulate`` without building the steepest-descent columns.
+
+    The CPU twin of ``gn_triton``: per patch, each voxel's column vector is formed
+    on the stack and folded straight into ``J' W J`` and ``J' W r``. Accumulated in
+    float64, so it agrees with the chunked einsum to float32 rounding (and is the
+    closer of the two to a float64 reference). When a phase has fewer patches than
+    threads -- level 0 is one patch -- each patch's voxels are split across threads
+    and the partial tiles summed.
+    """
+    d, b, v = g.shape
+    ncol = d * bt.shape[1]
+    threads = max(1, min(torch.get_num_threads(), numba.get_num_threads()))
+    nsplit = max(1, min(-(-2 * threads // b), v // 4096)) if b < 2 * threads else 1
+    hpart = np.zeros((b, nsplit, ncol, ncol))
+    gpart = np.zeros((b, nsplit, ncol))
+    mean = (
+        mean_cols.reshape(b, ncol).contiguous().numpy()
+        if mean_cols is not None
+        else np.zeros((1, 1), np.float32)
+    )
+    _with_threads(
+        _gn_normal_eqs_kernel,
+        g.numpy(),
+        hw.reshape(-1).contiguous().numpy(),
+        bt.contiguous().numpy(),
+        scale.numpy(),
+        omega.contiguous().numpy(),
+        res.contiguous().numpy(),
+        mean,
+        mean_cols is not None,
+        nsplit,
+        hpart,
+        gpart,
+    )
+    h = hpart.sum(1)
+    iu = np.triu_indices(ncol, 1)
+    h[:, iu[1], iu[0]] = h[:, iu[0], iu[1]]
+    return torch.from_numpy(h.astype(np.float32)), torch.from_numpy(gpart.sum(1).astype(np.float32))
+
+
+@njit(inline="always")
+def _sq(x):
+    return x * x
+
+
+@njit(parallel=True, cache=True)
+def _hexahedron_penalty_kernel(xd, yd, zd, cut, out):
+    nb, nz, ny, nx = xd.shape
+    half = _HALF
+    third = np.float32(1.0 / 3.0)
+    two = _F2
+    three = np.float32(3.0)
+    lo = np.float32(0.1)
+    hi = np.float32(10.0)
+    p23 = np.float32(2.0 / 3.0)
+    p4 = np.float32(4.0)
+    for task in prange(nb * nz):  # ty: ignore[not-iterable]
+        b = task // nz
+        k = task % nz
+        k1 = min(k + 1, nz - 1)  # replicate padding on the far faces
+        for j in range(ny):
+            j1 = min(j + 1, ny - 1)
+            for i in range(nx):
+                i1 = min(i + 1, nx - 1)
+                # penalty.compute_hexahedron_energy, op for op in float32: corner
+                # c0 = (k, j, i), c1 = +i, c2 = +j, c3 = +ij, c4 = +k, c5 = +ki,
+                # c6 = +kj, c7 = +kji.
+                fx = np.empty(3, np.float32)
+                fy = np.empty(3, np.float32)
+                fz = np.empty(3, np.float32)
+                for c in range(3):
+                    v = xd if c == 0 else (yd if c == 1 else zd)
+                    c0 = v[b, k, j, i]
+                    c1 = v[b, k, j, i1]
+                    c2 = v[b, k, j1, i]
+                    c3 = v[b, k, j1, i1]
+                    c4 = v[b, k1, j, i]
+                    c5 = v[b, k1, j, i1]
+                    c6 = v[b, k1, j1, i]
+                    c7 = v[b, k1, j1, i1]
+                    fx[c] = half * ((c1 - c0) + (c7 - c6))
+                    fy[c] = half * ((c2 - c0) + (c7 - c5))
+                    fz[c] = half * ((c4 - c0) + (c7 - c3))
+                fxx = fx[0] + _F1
+                fxy = fx[1]
+                fxz = fx[2]
+                fyx = fy[0]
+                fyy = fy[1] + _F1
+                fyz = fy[2]
+                fzx = fz[0]
+                fzy = fz[1]
+                fzz = fz[2] + _F1
+                det = (
+                    fxx * (fyy * fzz - fyz * fzy)
+                    - fxy * (fyx * fzz - fyz * fzx)
+                    + fxz * (fyx * fzy - fyy * fzx)
+                )
+                det = min(max(det, lo), hi)
+                je = third * _sq(det - _F1 / det)
+                norm = _sq(fxx) + _sq(fxy)
+                norm = norm + _sq(fxz)
+                norm = norm + _sq(fyx)
+                norm = norm + _sq(fyy)
+                norm = norm + _sq(fyz)
+                norm = norm + _sq(fzx)
+                norm = norm + _sq(fzy)
+                norm = norm + _sq(fzz)
+                vort = two * ((_sq(fyz - fzy) + _sq(fxz - fzx)) + _sq(fxy - fyx))
+                se = max((norm + vort) / det**p23 - three, _F0)
+                ej = max(je - cut, _F0)
+                es = max(se - cut, _F0)
+                out[b, k, j, i] = ej**p4 + es**p4
+
+
+def hexahedron_penalty_energy_cpu(xd: Tensor, yd: Tensor, zd: Tensor, cut: float) -> Tensor:
+    """``penalty_energy(*compute_hexahedron_energy(xd, yd, zd), cut)`` in one stencil pass.
+
+    The torch form builds eight padded corner views per component and ~40 full-size
+    temporaries; this reads the eight corners and writes one number per voxel, in
+    the same float32 op order. Any leading batch dimensions are kept.
+    """
+    shape = xd.shape
+    arrs = [t.detach().reshape(-1, *shape[-3:]).contiguous().numpy() for t in (xd, yd, zd)]
+    out = np.empty_like(arrs[0])
+    _with_threads(_hexahedron_penalty_kernel, *arrs, np.float32(cut), out)
+    return torch.from_numpy(out).reshape(shape)
