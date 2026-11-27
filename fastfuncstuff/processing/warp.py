@@ -89,6 +89,7 @@ from .penalty import (
     compute_hexahedron_energy,
     compute_penalty_batched,
     hexahedron_penalty_energy,
+    penalty_value_and_grad,
 )
 from .weight import _thd_cliplevel, add_background_band, compute_weight_image
 
@@ -232,6 +233,20 @@ class QwarpConfig:
     """Adam steps after the Gauss-Newton pass when ``optimizer="hybrid"``. Short by
     design: GN has already done the travelling, this only recovers what the
     least-squares surrogate could not see."""
+
+    polish_grad: str = "autograd"
+    """How the hybrid polish gets its gradient. ``"autograd"``: backpropagation
+    through the warp, which switches every fused kernel off and makes the polish
+    most of a hybrid run. ``"analytic"``: the Gauss-Newton Jacobian times the
+    cost's per-voxel derivative, plus the fused penalty gradient
+    (``penalty_value_and_grad``); drops the global warp's Jacobian, as GN does."""
+
+    hybrid_polish_maxlev: int | None = None
+    """Last level that gets the hybrid polish; finer levels run Gauss-Newton alone.
+    ``None`` polishes every level. The polish runs under autograd, which bypasses
+    the fused kernels, so it is most of a hybrid run's time; and what it buys over
+    GN alone is at the coarse levels, where GN's surrogate stops short on the big
+    patches."""
 
     gn_iters: int = 8
     """Gauss-Newton iterations at the *finest* levels, where a phase holds tens of
@@ -975,16 +990,21 @@ def _generate_patch_grid(
 
 
 # Named bundles of QwarpConfig fields (``ffs_qwarp -qwarp_recipe``). "default" is ffs's
-# own tuning: Dice level with 3dQwarp's, ~25x faster than "afni", but rougher (log det J
+# own tuning: Dice level with 3dQwarp's, ~2x faster than "afni", but rougher (log det J
 # sd 0.48 vs 0.36 on NIREP). "afni" turns on every 3dQwarp behaviour ffs reproduces and
 # the hybrid solver that makes them land where 3dQwarp does: over 5 NIREP pairs, mean
-# Dice 0.620 vs 3dQwarp's 0.621, log det J sd 0.357 vs 0.363, det J < 0.5 in ~1% of
-# brain for both (wiki: qwarp vs 3dQwarp review 2026-11-26, Outcome). Why each is in:
+# Dice 0.619 vs 3dQwarp's 0.621, log det J sd 0.357 vs 0.363, det J < 0.5 in ~1% of
+# brain for both, 21 s on an RTX 5070 Ti (wiki: qwarp vs 3dQwarp review 2026-11-26,
+# Outcome; qwarp is not where you think it spends time, 2026-11-27). Why each is in:
 #   patch_sweep      3dQwarp's layout; without it overlapping patches share a batch (seams)
 #   gn_stop_rule     retry a rejected GN step instead of ending the phase
 #   optimizer        GN alone stops short of NEWUOA's optimum on the big early patches
 #                    (level 3 image r .714 vs AFNI .740); the Adam polish on the true
-#                    cost closes it (.741). Most of the recipe's 4x time over "default".
+#                    cost closes it (.741). Its gain is spread over every level
+#                    (polishing only levels <= 5 kept 0.020 of Dice on the table).
+#   polish_grad      the polish's gradient without autograd, so the fused kernels stay
+#                    on: 46 -> 21 s, Dice 0.620 -> 0.619 (autograd's exact global-warp
+#                    Jacobian is the only term it drops). 5 steps: 17 s, 0.617.
 #   lev0_schedule    3dQwarp's level-0 bases and ball (level 0 then matches AFNI's Dice)
 #   ball_constraint  3dQwarp's L2 ball for patches with a side under 15
 #   incor_afni       3dQwarp's pearclp clip and atanh(r) scoring
@@ -995,6 +1015,7 @@ QWARP_RECIPES: dict[str, dict[str, object]] = {
         "patch_sweep": "afni",
         "gn_stop_rule": "freeze",
         "optimizer": "hybrid",
+        "polish_grad": "analytic",
         "lev0_schedule": "afni",
         "ball_constraint": True,
         "incor_afni": True,
@@ -1841,6 +1862,7 @@ def _warpomatic(
         # Generate patch grid and filter. AFNI sweeps odd levels from the bottom of
         # the box and even levels from the top (no workhard; see QwarpConfig.patch_sweep).
         afni_sweep = config.patch_sweep == "afni"
+        polish_lev = config.hybrid_polish_maxlev is None or lev <= config.hybrid_polish_maxlev
         sweep_reverse = afni_sweep and lev % 2 == 0
         _grid_args = (ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel)
         all_patches = (
@@ -1952,6 +1974,7 @@ def _warpomatic(
                             do_xyz=do_xyz, axis_weights=axis_w, use_penalty=use_pen,
                             pen_fac=pen_fff, base_clip=base_clip, source_clip=source_clip,
                             blok_index_vol=blok_index_vol, nblok=nblok, ball_radius=ball_radius,
+                            polish=polish_lev,
                         )  # fmt: skip
 
                 # Split into same-size (batchable) and odd-size patches
@@ -2005,6 +2028,7 @@ def _warpomatic(
                         blok_index_vol=blok_index_vol,
                         nblok=nblok,
                         ball_radius=ball_radius,
+                        polish=polish_lev,
                     )
 
                 # Serial fallback for odd-sized boundary patches
@@ -2504,6 +2528,7 @@ def _improve_warp_batched(
     nblok: int = 0,
     gn_max_iter: int | None = None,
     ball_radius: float | None = None,
+    polish: bool = True,
 ) -> None:
     """Optimize ALL patches in one checkerboard phase simultaneously on GPU.
 
@@ -2649,41 +2674,8 @@ def _improve_warp_batched(
     _eval_warp = _maybe_compile(evaluate_patch_warp_batched, "eval_warp", device, config.compile)
     _compose = _maybe_compile(batched_compose_and_interpolate, "compose", device, config.compile)
 
-    # Define the batched cost function (differentiable through autograd)
-    def batched_cost(active_params: Tensor) -> Tensor:
-        """(B, n_active) -> (B,) costs. Differentiable."""
-        # Expand active params to full params with axis weights
-        full_params = (
-            active_params @ expand_mat
-        )  # (B, n_active) @ (n_active, n_total) → (B, n_total)
-
-        # Batched basis evaluation: (B, V) displacements
-        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
-
-        # Batched compose + interpolate (fused 4-ch: source + warp in one grid_sample)
-        warped_vals, ah_xd, ah_yd, ah_zd = _compose(
-            source,
-            state.xd,
-            state.yd,
-            state.zd,
-            hxd,
-            hyd,
-            hzd,
-            ii_flat,
-            jj_flat,
-            kk_flat,
-            ibots,
-            jbots,
-            kbots,
-            nx,
-            ny,
-            nz,
-            global_warp_3ch=global_warp_3ch,
-            base_i=base_i,
-            base_j=base_j,
-            base_k=base_k,
-        )
-
+    def patch_cost(warped_vals: Tensor) -> Tensor:
+        """(B, V) unmasked warped source -> (B,) image cost (lower is better)."""
         warped_vals = warped_vals * mask_patches
 
         # Batched cost: (B,) (all conventions are higher == better here)
@@ -2719,7 +2711,44 @@ def _improve_warp_batched(
             # which is this branch's condition.
             assert batch_incor is not None
             corr = batch_incor.evaluate(base_patches, warped_vals, weight_patches)
-        cost = -corr  # negate for minimization
+        return -corr  # negate for minimization
+
+    # Define the batched cost function (differentiable through autograd)
+    def batched_cost(active_params: Tensor) -> Tensor:
+        """(B, n_active) -> (B,) costs. Differentiable."""
+        # Expand active params to full params with axis weights
+        full_params = (
+            active_params @ expand_mat
+        )  # (B, n_active) @ (n_active, n_total) → (B, n_total)
+
+        # Batched basis evaluation: (B, V) displacements
+        hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
+
+        # Batched compose + interpolate (fused 4-ch: source + warp in one grid_sample)
+        warped_vals, ah_xd, ah_yd, ah_zd = _compose(
+            source,
+            state.xd,
+            state.yd,
+            state.zd,
+            hxd,
+            hyd,
+            hzd,
+            ii_flat,
+            jj_flat,
+            kk_flat,
+            ibots,
+            jbots,
+            kbots,
+            nx,
+            ny,
+            nz,
+            global_warp_3ch=global_warp_3ch,
+            base_i=base_i,
+            base_j=base_j,
+            base_k=base_k,
+        )
+
+        cost = patch_cost(warped_vals)
 
         # Batched penalty (fully vectorized, no Python loop)
         if use_penalty and pen_fac > 0:
@@ -2864,6 +2893,65 @@ def _improve_warp_batched(
             with torch.no_grad():
                 return batched_cost(active_params)
 
+        def polish_value_and_grad(active_params: Tensor) -> tuple[Tensor, Tensor]:
+            """Cost and its gradient for the hybrid polish, without autograd through
+            the warp: the fused compose, sampler and penalty kernels all stay on.
+
+            ``d cost / d params = J' (d cost / d w) + d penalty / d params``, where J is
+            the Gauss-Newton Jacobian (source gradient at the sampled positions times
+            the basis, scaled by the half-widths). Like GN's J it treats the composed
+            displacement as moving one-for-one with the patch displacement, i.e. it
+            drops the global warp's own Jacobian. Only the per-voxel cost, a few
+            elementwise passes over (B, V), is differentiated by autograd.
+            """
+            with torch.no_grad():
+                full = active_params @ expand_mat
+                hxd_, hyd_, hzd_ = _eval_warp(basis, full, half_widths, do_xyz)
+                if _compose_cpu_applies(source, global_warp_3ch, base_i, hxd_):
+                    from .numba_kernels import compose_and_sample_cpu
+
+                    w_, ax_, ay_, az_, gall = compose_and_sample_cpu(
+                        source, global_warp_3ch, hxd_, hyd_, hzd_,
+                        base_i, base_j, base_k, source_grad_3ch,
+                    )  # fmt: skip
+                    assert gall is not None
+                else:
+                    w_, ax_, ay_, az_ = _compose(
+                        source, state.xd, state.yd, state.zd, hxd_, hyd_, hzd_,
+                        ii_flat, jj_flat, kk_flat, ibots, jbots, kbots, nx, ny, nz,
+                        global_warp_3ch=global_warp_3ch,
+                        base_i=base_i, base_j=base_j, base_k=base_k,
+                    )  # fmt: skip
+                    sx = (ax_ + base_i).clamp(-0.499, nx - 0.501)
+                    sy = (ay_ + base_j).clamp(-0.499, ny - 0.501)
+                    sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
+                    gall = batched_interp_3ch_packed(source_grad_3ch, sx, sy, sz).permute(1, 0, 2)
+            if batch_incor is not None:
+                corr, dcdw = batch_incor.evaluate_with_grad(
+                    base_patches, w_ * mask_patches, weight_patches
+                )
+                img, dcdw = -corr, -dcdw * mask_patches
+            else:
+                with torch.enable_grad():
+                    w_leaf = w_.detach().requires_grad_(True)
+                    img = patch_cost(w_leaf)
+                    (dcdw,) = torch.autograd.grad(img.sum(), w_leaf)
+            with torch.no_grad():
+                cost = img.detach()
+                G = gall[list(active_dims)] * dcdw.unsqueeze(0)  # (nd, B, V)
+                if use_penalty and pen_fac > 0:
+                    pen, pgrad = penalty_value_and_grad(
+                        ax_.reshape(B, nzh, nyh, nxh),
+                        ay_.reshape(B, nzh, nyh, nxh),
+                        az_.reshape(B, nzh, nyh, nxh),
+                        pen_fac,
+                        external_pen,
+                    )
+                    cost = cost + pen
+                    G = G + pgrad.reshape(3, B, -1)[list(active_dims)]
+                grad = (torch.matmul(G, bt) * hw_active).permute(1, 0, 2).reshape(B, n_active)
+            return cost, grad
+
         # Effort in proportion to what an iteration costs here. A phase of 16
         # patches gets the coarse ceiling outright; one of 67000 gets the base.
         _taper = (config.gn_coarse_patches / max(B, 1)) ** 0.5
@@ -2885,7 +2973,7 @@ def _improve_warp_batched(
             ball_radius=ball_radius,
             step_fracs=(1.0, 0.5, 0.25) if config.gn_step_search else (1.0,),
         )
-        if use_hybrid:
+        if use_hybrid and polish:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(
                 batched_cost,
                 B,
@@ -2897,6 +2985,9 @@ def _improve_warp_batched(
                 tolerance=config.batch_optimizer_tol,
                 patience=config.batch_optimizer_patience,
                 init=best_params,
+                value_and_grad_fn=polish_value_and_grad
+                if config.polish_grad == "analytic"
+                else None,
             )
             opt_stats = BatchOptStats(
                 steps_run=opt_stats.steps_run + polish_stats.steps_run,

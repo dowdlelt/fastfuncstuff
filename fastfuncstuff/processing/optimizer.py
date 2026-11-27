@@ -173,6 +173,7 @@ def optimize_warp_params_batched(
     patience: int = 5,
     clip_group_size: int | None = None,
     init: Tensor | None = None,
+    value_and_grad_fn: Callable[[Tensor], tuple[Tensor, Tensor]] | None = None,
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Optimize parameters for B patches simultaneously using autograd.
 
@@ -192,6 +193,10 @@ def optimize_warp_params_batched(
             converged. The loop stops only once ALL patches have converged.
         init: Optional (B, n_params) starting point; zeros (the identity warp) if
             omitted.
+        value_and_grad_fn: Optional params (B, n_params) -> (costs (B,), grad
+            (B, n_params)) used instead of ``batched_cost_fn`` plus a backward
+            pass inside the loop -- for callers that can form the gradient without
+            autograd. ``batched_cost_fn`` still scores the starting point.
         clip_group_size: If set, clip the gradient norm independently over
             consecutive groups of this many rows (to ``max_norm=1.0`` each),
             instead of one global norm over the whole batch. Used by the
@@ -240,9 +245,11 @@ def optimize_warp_params_batched(
         steps_run += 1
         optimizer.zero_grad(set_to_none=True)
 
-        costs = batched_cost_fn(params)  # (B,) differentiable
-        loss = costs.sum()
-        loss.backward()
+        if value_and_grad_fn is not None:
+            costs, params.grad = value_and_grad_fn(params.detach())
+        else:
+            costs = batched_cost_fn(params)  # (B,) differentiable
+            costs.sum().backward()
 
         # Gradient clipping to prevent explosion. Grouped clipping keeps each
         # group's step size identical to running that group as its own batch

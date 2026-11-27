@@ -267,3 +267,32 @@ def compute_penalty_batched(
     hsum = (external_sums + patch_sums).clamp(min=0)
 
     return pen_fac * hsum.pow(0.25)
+
+
+def penalty_value_and_grad(
+    xd: Tensor, yd: Tensor, zd: Tensor, pen_fac: float, external_sums: Tensor
+) -> tuple[Tensor, Tensor]:
+    """:func:`compute_penalty_batched` and its gradient, ``(B,)`` and ``(3, B, nz, ny, nx)``.
+
+    On CUDA two fused kernels (energy derivative per hexahedron, then a gather onto
+    the corners) -- the analytic polish's reason to exist is to keep the eager
+    eighty-pass chain and its backward out of the loop. Elsewhere, autograd through
+    the tensor route.
+    """
+    if (
+        penalty_sums_triton is not None
+        and not _penalty_triton_unavailable
+        and xd.device.type == "cuda"
+        and xd.dtype == torch.float32
+        and xd.ndim == 4
+        and os.environ.get("FFS_PENALTY_NO_TRITON") != "1"
+    ):
+        from .penalty_triton import penalty_value_and_grad_triton
+
+        return penalty_value_and_grad_triton(xd, yd, zd, HPEN_CUT, pen_fac, external_sums)
+    with torch.enable_grad():
+        leaves = [t.detach().requires_grad_(True) for t in (xd, yd, zd)]
+        value = compute_penalty_batched(*leaves, pen_fac, external_sums)
+        grads = torch.autograd.grad(value.sum(), leaves)
+    # hsum == 0 gives inf * 0 from the fourth root; nothing bites there, so zero.
+    return value.detach(), torch.nan_to_num(torch.stack(grads), nan=0.0, posinf=0.0, neginf=0.0)

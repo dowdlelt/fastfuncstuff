@@ -1035,3 +1035,57 @@ class BatchedIncrementalCorrelation:
         if self.fisher_z:
             corr = corr.clamp(-0.9999, 0.9999).atanh()
         return corr
+
+    def evaluate_with_grad(
+        self,
+        base_patches: Tensor,
+        source_patches: Tensor,
+        weight_patches: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """:meth:`evaluate` and its derivative with respect to ``source_patches``,
+        ``(B,)`` and ``(B, V)``, in closed form -- for the hybrid polish, where
+        autograd through these thirty-odd small passes was a large share of a step.
+
+        With ``r = vxy / sqrt(vxx vyy)`` over the weighted sums,
+        ``dr/dy_v = w_v / sw * ((x_v - xbar) / sqrt(vxx vyy) - r (y_v - ybar) / vyy)``;
+        a clipped source voxel is replaced by a constant, so it has no derivative,
+        and the Fisher z multiplies by ``1 / (1 - r^2)`` inside its clamp. Matches
+        autograd away from the variance and correlation clamps.
+        """
+        x, nx_ = apply_incor_clip(base_patches, self.base_clip)
+        y, ny_ = apply_incor_clip(source_patches, self.source_clip)
+        w = _clip_weight(weight_patches, nx_, ny_)
+        if self.source_clip and len(self.source_clip) == 2:
+            live = (source_patches >= self.source_clip[0]) & (source_patches <= self.source_clip[1])
+        elif ny_ is not None:
+            live = ny_ == 0
+        else:
+            live = None
+
+        sw = self._sw_fixed + w.sum(dim=1)
+        swx = self._swx_fixed + (w * x).sum(dim=1)
+        swy = self._swy_fixed + (w * y).sum(dim=1)
+        swxx = self._swxx_fixed + (w * x * x).sum(dim=1)
+        swyy = self._swyy_fixed + (w * y * y).sum(dim=1)
+        swxy = self._swxy_fixed + (w * x * y).sum(dim=1)
+
+        sw_safe = sw.clamp(min=1e-10)
+        xbar = swx / sw_safe
+        ybar = swy / sw_safe
+        vxx = (swxx / sw_safe - xbar * xbar).clamp(min=1e-20)
+        vyy = (swyy / sw_safe - ybar * ybar).clamp(min=1e-20)
+        vxy = swxy / sw_safe - xbar * ybar
+        sd = (vxx * vyy).sqrt()
+        r = vxy / sd
+
+        a = 1.0 / (sw_safe * sd)  # per patch: d r / d y = w * (a (x - xbar) - b (y - ybar))
+        b = r / (sw_safe * vyy)
+        if self.fisher_z:
+            inside = (r > -0.9999) & (r < 0.9999)
+            fz = torch.where(inside, 1.0 / (1.0 - r * r), torch.zeros_like(r))
+            a, b = a * fz, b * fz
+            r = r.clamp(-0.9999, 0.9999).atanh()
+        grad = w * (a[:, None] * (x - xbar[:, None]) - b[:, None] * (y - ybar[:, None]))
+        if live is not None:
+            grad = grad * live
+        return r, grad

@@ -1957,3 +1957,63 @@ def test_qwarp_afni_patch_sweep_runs_and_aligns():
     before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
     after = evaluate_metrics(MetricInputs(base=base, moving=warped.cpu()), ["ls"])["ls"]
     assert torch.isfinite(warped).all() and after < before
+
+
+def test_hybrid_polish_maxlev_polishes_only_coarse_levels(monkeypatch):
+    """-polish_maxlev: the Adam polish runs at levels 0..LEV only; finer levels get
+    Gauss-Newton alone (the polish is the hybrid's cost, the coarse levels its gain)."""
+    import numpy as np
+    import torch
+
+    import fastfuncstuff.processing.warp as warp_mod
+    from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+    n = 33
+    z, y, x = np.mgrid[0:n, 0:n, 0:n].astype(np.float32)
+    c = n / 2
+    base = torch.from_numpy(100 * np.exp(-((x - c) ** 2 + (y - c) ** 2 + (z - c) ** 2) / 50))
+    moving = torch.from_numpy(100 * np.exp(-((x - c - 1) ** 2 + (y - c) ** 2 + (z - c) ** 2) / 60))
+
+    real = warp_mod.optimize_warp_params_batched
+    calls = []
+
+    def counting(*a, **k):
+        calls.append(k.get("init") is not None)  # the polish warm-starts from GN
+        return real(*a, **k)
+
+    monkeypatch.setattr(warp_mod, "optimize_warp_params_batched", counting)
+
+    def polishes(maxlev):
+        calls.clear()
+        cfg = QwarpConfig(verb=0, cost_method="pearclp", minpatch=9, optimizer="hybrid",
+                          hybrid_polish_maxlev=maxlev)  # fmt: skip
+        warped, *_ = qwarp(base, moving, config=cfg, device=torch.device("cpu"))
+        assert torch.isfinite(warped).all()
+        return sum(calls)
+
+    every, capped, none_after_0 = polishes(None), polishes(1), polishes(0)
+    assert every > capped > none_after_0 >= 1
+
+
+def test_hybrid_analytic_polish_runs_and_aligns():
+    """-polish_grad analytic end to end on the CPU (Numba compose with the gradient
+    riding along, closed-form pearclp derivative, autograd penalty fallback)."""
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+    from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+    n = 33
+    z, y, x = np.mgrid[0:n, 0:n, 0:n].astype(np.float32)
+    c = n / 2
+    base = torch.from_numpy(100 * np.exp(-((x - c) ** 2 + (y - c) ** 2 + (z - c) ** 2) / 50))
+    moving = torch.from_numpy(
+        100 * np.exp(-((x - c - 1.5) ** 2 + (y - c) ** 2 + (z - c) ** 2) / 60)
+    )
+    cfg = QwarpConfig(verb=0, cost_method="pearclp", minpatch=9, optimizer="hybrid",
+                      polish_grad="analytic", incor_afni=True)  # fmt: skip
+    warped, *_ = qwarp(base, moving, config=cfg, device=torch.device("cpu"))
+    before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
+    after = evaluate_metrics(MetricInputs(base=base, moving=warped.cpu()), ["ls"])["ls"]
+    assert torch.isfinite(warped).all() and after < before

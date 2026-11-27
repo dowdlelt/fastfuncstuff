@@ -5,7 +5,7 @@ from fastfuncstuff.processing.warp import QWARP_RECIPES, QwarpConfig
 
 BASE = ["-base", "b.nii.gz", "-source", "s.nii.gz", "-prefix", "out"]
 # CLI dest -> QwarpConfig field, for every field a recipe can set
-DESTS = {"patch_sweep": "patch_sweep", "gn_stop": "gn_stop_rule", "optimizer": "optimizer",
+DESTS = {"patch_sweep": "patch_sweep", "gn_stop": "gn_stop_rule", "optimizer": "optimizer", "polish_grad": "polish_grad",
          "lev0": "lev0_schedule", "ball": "ball_constraint", "incor_afni": "incor_afni",
          "weight_afni": "weight_afni", "background_band": "background_band"}  # fmt: skip
 

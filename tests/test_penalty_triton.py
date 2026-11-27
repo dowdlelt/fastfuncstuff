@@ -78,3 +78,34 @@ def test_autograd_path_keeps_the_tensor_penalty():
 
     assert xd.grad is not None and torch.isfinite(xd.grad).all()
     assert float(xd.grad.abs().sum()) > 0.0
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "shape,amp",
+    [
+        ((5, 9, 9, 9), 0.8),  # offenders everywhere, det clamp reached
+        ((3, 13, 17, 11), 1.5),  # odd extents: the clamped last-plane corners
+        ((2, 1, 6, 7), 1.0),  # a single plane, where every +1 corner is the voxel itself
+        ((4, 9, 9, 9), 0.05),  # inside the deadband: no gradient at all
+    ],
+)
+def test_penalty_gradient_matches_autograd(shape, amp):
+    """The polish's analytic penalty gradient (energy derivative per hexahedron, then
+    a gather onto its corners) against autograd through the tensor route."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    f = [torch.randn(*shape, device=dev) * amp for _ in range(3)]
+    ext = torch.rand(shape[0], device=dev) * 0.1
+    leaves = [t.clone().requires_grad_(True) for t in f]
+    ref = compute_penalty_batched(*leaves, 0.0333, ext)
+    ref.sum().backward()
+    value, grad = triton_mod.penalty_value_and_grad_triton(*f, HPEN_CUT, 0.0333, ext)
+    expect = torch.stack([t.grad for t in leaves])
+    torch.testing.assert_close(value, ref.detach(), rtol=1e-5, atol=1e-6)
+    # measured <= 1.2e-5 of the largest entry (float32 vs autograd's float32 chain)
+    torch.testing.assert_close(
+        grad, expect, rtol=0, atol=5e-5 * max(1.0, expect.abs().max().item())
+    )

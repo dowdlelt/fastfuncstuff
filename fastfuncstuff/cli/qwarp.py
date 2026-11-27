@@ -933,10 +933,11 @@ def parse_args(
         "'default': ffs's tuning -- Dice level with 3dQwarp, fastest, but a rougher "
         "warp (more voxels squeezed or stretched past 2x). 'afni': every 3dQwarp "
         "behaviour ffs reproduces (-patch_sweep afni -lev0 afni -ball -incor_afni "
-        "-weight_afni -background_band 0 -gn_stop freeze -optimizer hybrid). On 5 NIREP "
-        "pairs it matches 3dQwarp's Dice (0.620 vs 0.621) and smoothness (log det J "
-        "sd 0.357 vs 0.363) at about 4x the default's time, still 25x+ faster than "
-        "3dQwarp on a GPU [default: %(default)s]",
+        "-weight_afni -background_band 0 -gn_stop freeze -optimizer hybrid "
+        "-polish_grad analytic). On 5 NIREP pairs it matches 3dQwarp's Dice (0.619 vs "
+        "0.621) and smoothness (log det J sd 0.357 vs 0.363) at about 2x the default's "
+        "time (21 s on an RTX 5070 Ti; 3dQwarp takes 25 min to 2 h on a CPU) "
+        "[default: %(default)s]",
     )
     g_opt.add_argument(
         "-gn_iters",
@@ -945,6 +946,32 @@ def parse_args(
         metavar="N",
         help="Gauss-Newton iteration ceiling per patch at every level after 0 "
         f"(experimental) [default: {QwarpConfig().gn_iters}]",
+    )
+    g_opt.add_argument(
+        "-polish_maxlev",
+        type=int,
+        default=None,
+        metavar="LEV",
+        help="With -optimizer hybrid, polish only levels 0..LEV; finer levels run "
+        "Gauss-Newton alone. The polish is most of a hybrid run's time and earns its "
+        "keep on the coarse levels [default: every level]",
+    )
+    g_opt.add_argument(
+        "-polish_grad",
+        choices=["autograd", "analytic"],
+        default=None,
+        help="Gradient for the -optimizer hybrid polish: backpropagation through the "
+        "warp (slow: it switches the fused kernels off), or the Gauss-Newton Jacobian "
+        "times the cost's per-voxel derivative plus the fused penalty gradient "
+        f"[default: {QwarpConfig().polish_grad}]",
+    )
+    g_opt.add_argument(
+        "-polish_iters",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Adam steps per phase in the -optimizer hybrid polish "
+        f"[default: {QwarpConfig().hybrid_polish_iters}]",
     )
     g_opt.add_argument(
         "-batch_tol",
@@ -1028,6 +1055,8 @@ def parse_args(
         p.error("-blur accepts one or two values")
     if args.pblur is not None and len(args.pblur) > 2:
         p.error("-pblur accepts zero, one, or two values")
+    if args.polish_iters is not None and args.polish_iters < 1:
+        p.error("-polish_iters must be at least 1")
     if args.gn_iters is not None and args.gn_iters < 1:
         p.error("-gn_iters must be at least 1")
     if args.background_band is not None and args.background_band < 0:
@@ -2013,6 +2042,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         axis_weights=axis_weights,
         verb=args.verb,
         optimizer=_recipe_value(args, "optimizer", "optimizer"),
+        polish_grad=_recipe_value(args, "polish_grad", "polish_grad"),
         gn_stop_rule=_recipe_value(args, "gn_stop", "gn_stop_rule"),
         gn_iters_lev0=args.gn_iters_lev0,
         ball_constraint=_recipe_value(args, "ball", "ball_constraint"),
@@ -2038,6 +2068,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         interp=args.interp,
         final_interp=args.final,
     )
+    if args.polish_iters is not None:
+        config = replace(config, hybrid_polish_iters=args.polish_iters)
+    if args.polish_maxlev is not None:
+        config = replace(config, hybrid_polish_maxlev=args.polish_maxlev)
     if args.gn_iters is not None:  # both ceilings: the coarse taper stays off
         config = replace(config, gn_iters=args.gn_iters, gn_iters_coarse=args.gn_iters)
 

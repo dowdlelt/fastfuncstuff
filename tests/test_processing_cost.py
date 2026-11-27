@@ -497,6 +497,34 @@ class TestIncrementalCorrelation:
 
 
 class TestBatchedIncrementalCorrelation:
+    @pytest.mark.parametrize(
+        "clip,fisher_z",
+        [(None, False), (None, True), ((-1.0, 1.5), True), ((-1.0, 1.5, -0.8, 1.2), True)],
+    )
+    def test_evaluate_with_grad_matches_autograd(self, clip, fisher_z):
+        """The hybrid polish's closed-form d corr / d source, for every clip mode
+        (clamp, AFNI replace-and-down-weight) and with the Fisher z."""
+        torch.manual_seed(0)
+        b, v = 6, 500
+        bic = BatchedIncrementalCorrelation(
+            "pearclp", base_clip=clip, source_clip=clip, fisher_z=fisher_z
+        )
+        f64 = dict(dtype=torch.float64)
+        bic._sw_fixed, bic._swx_fixed, bic._swy_fixed = (
+            torch.full((b,), c, **f64) for c in (50.0, 1.0, -2.0)
+        )
+        bic._swxx_fixed, bic._swyy_fixed, bic._swxy_fixed = (
+            torch.full((b,), c, **f64) for c in (40.0, 45.0, 20.0)
+        )
+        x = torch.randn(b, v, **f64)
+        y = (0.6 * x + 0.8 * torch.randn(b, v, **f64)).requires_grad_(True)
+        w = torch.rand(b, v, **f64)
+        r = bic.evaluate(x, y, w)
+        (expect,) = torch.autograd.grad(r.sum(), y)
+        r2, got = bic.evaluate_with_grad(x, y.detach(), w)
+        torch.testing.assert_close(r2, r.detach(), rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(got, expect, rtol=1e-10, atol=1e-12)  # measured ~4e-16
+
     def _make_test_data(self, B=3, nz=6, ny=8, nx=10):
         torch.manual_seed(13)
         base = torch.randn(nz, ny, nx, device=DEV)
