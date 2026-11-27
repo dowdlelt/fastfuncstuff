@@ -262,3 +262,20 @@ def test_until_accepts_hhmm_and_an_iso_datetime():
     t = deadline_from("07:00")
     assert t is not None and 0 < t - dt.datetime.now().timestamp() <= 86400
     assert deadline_from("2026-11-30T07:00") == dt.datetime(2026, 11, 30, 7, 0).timestamp()
+
+
+def test_cpu_helpers_work_without_an_affinity_mask(monkeypatch):
+    """macOS has no os.sched_getaffinity / sched_setaffinity: the runner must still count
+    CPUs and skip pinning rather than crash (the Mac host sets)."""
+    import os
+
+    from fastfuncstuff.benchmark import workers
+    from fastfuncstuff.benchmark.checks.base import cpu_threads
+
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+    monkeypatch.delattr(os, "sched_setaffinity", raising=False)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    assert workers.allowed_cpus() == set(range(os.cpu_count() or 1))
+    workers.pin_to([0])  # no-op, no AttributeError
+    assert cpu_threads() == (os.cpu_count() or 1)
+    assert len(workers.cpu_cores(sysfs="/nonexistent")) == (os.cpu_count() or 1)

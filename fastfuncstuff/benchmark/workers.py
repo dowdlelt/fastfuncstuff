@@ -30,6 +30,21 @@ THREAD_VARS = (
 )
 
 
+def allowed_cpus() -> set[int]:
+    """Logical CPUs this process may run on. macOS has no affinity mask (and Apple Silicon
+    no SMT), so there it is every CPU."""
+    if hasattr(os, "sched_getaffinity"):
+        return set(os.sched_getaffinity(0))
+    return set(range(os.cpu_count() or 1))
+
+
+def pin_to(cpus: list[int]) -> None:
+    """Pin this process to ``cpus`` where the OS allows it (not macOS: there the thread
+    variables alone bound each worker)."""
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, cpus)
+
+
 def cpu_cores(
     cpus: set[int] | None = None, sysfs: str = "/sys/devices/system/cpu"
 ) -> list[list[int]]:
@@ -37,7 +52,7 @@ def cpu_cores(
 
     Reads each CPU's SMT siblings from sysfs; a CPU whose topology cannot be read is its
     own core."""
-    allowed = sorted(cpus if cpus is not None else os.sched_getaffinity(0))
+    allowed = sorted(cpus if cpus is not None else allowed_cpus())
     groups: dict[int, list[int]] = {}
     for c in allowed:
         sib = [c]

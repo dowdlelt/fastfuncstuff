@@ -26,11 +26,12 @@ def worker_info() -> dict:
     import os
     import socket
 
+    from .workers import allowed_cpus
+
     return {
         "hostname": socket.gethostname(),
         "worker": os.environ.get("FFS_BENCH_WORKER", "0/1"),
-        "cpus": os.environ.get("FFS_BENCH_CPUS")
-        or ",".join(map(str, sorted(os.sched_getaffinity(0)))),
+        "cpus": os.environ.get("FFS_BENCH_CPUS") or ",".join(map(str, sorted(allowed_cpus()))),
         "threads": int(os.environ.get("OMP_NUM_THREADS") or 0) or None,
     }
 
@@ -454,7 +455,9 @@ def main(argv: list[str] | None = None) -> int:
         # bundled host-set manifests name their data as ${FFS_BENCH_ROOT}/data/<ds>
         os.environ.setdefault("FFS_BENCH_ROOT", str(args.root))
         if os.environ.get("FFS_BENCH_CPUS"):  # a pool worker: its own cores, inherited by tools
-            os.sched_setaffinity(0, [int(c) for c in os.environ["FFS_BENCH_CPUS"].split(",")])
+            from .workers import pin_to
+
+            pin_to([int(c) for c in os.environ["FFS_BENCH_CPUS"].split(",")])
         if args.threads:
             from .workers import thread_env
 
