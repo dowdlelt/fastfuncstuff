@@ -1862,3 +1862,98 @@ def test_level0_schedule_bases_and_bounds(monkeypatch, schedule, expected):
         pad=False,
     )  # fmt: skip
     assert seen == expected
+
+
+def test_afni_sweep_axis_stretches_and_pulls_back_like_3dqwarp():
+    from fastfuncstuff.processing.warp import _afni_sweep_axis
+
+    # 1..183, width 103, step 51: the second patch ends at 154, inside 183 - 103//4,
+    # so AFNI makes another, which would cross 183 and is pulled back to 81..183.
+    assert _afni_sweep_axis(1, 183, 103, 51, False) == [
+        (1, 103, False),
+        (52, 154, False),
+        (81, 183, True),
+    ]
+    # Box 8..177 at width 99, step 49: the second patch ends at 155 >= 177 - 24, so it
+    # is stretched to the edge -- two patches, AFNI's count -- and nothing snaps.
+    assert _afni_sweep_axis(8, 177, 99, 49, False) == [(8, 106, False), (57, 177, False)]
+    # Even levels sweep from the top, mirrored.
+    assert _afni_sweep_axis(8, 177, 99, 49, True) == [(79, 177, False), (8, 128, False)]
+    assert _afni_sweep_axis(1, 183, 103, 51, True) == [
+        (81, 183, False),
+        (30, 132, False),
+        (1, 103, True),
+    ]
+    assert _afni_sweep_axis(0, 0, 1, 1, False) == [(0, 0, False)]  # 2-D: one slice
+
+
+def test_afni_sweep_phases_never_overlap_beyond_a_seam():
+    """The point of the AFNI sweep: patches solved in one batch must not overlap by more
+    than the voxel where same-parity neighbours abut, or the later write erases the
+    earlier one. Snapped patches are what break that under the ffs sweep."""
+    from fastfuncstuff.processing.warp import (
+        _checkerboard_phases,
+        _generate_patch_grid,
+        _generate_patch_grid_afni,
+    )
+
+    def overlap(a, b):
+        return [min(a[1], b[1]) - max(a[0], b[0]) + 1 for a, b in
+                (((a.ibot, a.itop), (b.ibot, b.itop)), ((a.jbot, a.jtop), (b.jbot, b.jtop)),
+                 ((a.kbot, a.ktop), (b.kbot, b.ktop)))]  # fmt: skip
+
+    def worst(phases):
+        w = 0
+        for ph in phases:
+            for i, a in enumerate(ph):
+                for b in ph[i + 1 :]:
+                    o = overlap(a, b)
+                    if min(o) > 0:
+                        w = max(w, max(x for x in o if x > 0) if min(o) > 1 else 1)
+        return w
+
+    ffs_worst = 0
+    for ext, wid in ((183, 103), (175, 77), (160, 41), (140, 25), (121, 13), (97, 9)):
+        step = (wid - 1) // 2
+        lo, hi = 1, ext
+        for reverse in (False, True):
+            ps = _generate_patch_grid_afni(lo, hi, lo, hi - 7, lo, hi - 3, wid, wid, wid,
+                                           step, step, step, reverse)  # fmt: skip
+            phases = _checkerboard_phases(ps)
+            assert sum(map(len, phases)) == len(ps)
+            assert worst(phases) <= 1, (ext, wid, reverse)
+            # every voxel of the box is covered
+            for axis in ("i", "j", "k"):
+                top = max(getattr(p, f"{axis}top") for p in ps)
+                bot = min(getattr(p, f"{axis}bot") for p in ps)
+                assert bot == lo and top == {"i": hi, "j": hi - 7, "k": hi - 3}[axis]
+        ffs_worst = max(ffs_worst, worst(_checkerboard_phases(
+            _generate_patch_grid(lo, hi, lo, hi, lo, hi, wid, wid, wid, step, step, step))))  # fmt: skip
+    assert ffs_worst > 1  # the defect the AFNI sweep removes
+
+
+def test_qwarp_afni_patch_sweep_runs_and_aligns():
+    """End to end on the CPU: stretched patches of several shapes and snapped phases all
+    go through the batched solver, and the alignment improves."""
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+    from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+    n = 37  # odd extents make the sweep stretch and snap at several levels
+    z, y, x = np.mgrid[0:n, 0 : n + 4, 0 : n - 2].astype(np.float32)
+    c = n / 2
+
+    def blob(cx, r, amp=100.0):
+        return (amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))).astype(
+            np.float32
+        )
+
+    base = torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0))
+    moving = torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0))
+    cfg = QwarpConfig(verb=0, cost_method="pearclp", minpatch=9, patch_sweep="afni")
+    warped, *_ = qwarp(base, moving, config=cfg, device=torch.device("cpu"))
+    before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
+    after = evaluate_metrics(MetricInputs(base=base, moving=warped.cpu()), ["ls"])["ls"]
+    assert torch.isfinite(warped).all() and after < before
