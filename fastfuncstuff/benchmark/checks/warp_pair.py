@@ -8,7 +8,8 @@ References:
 - antsRegistration SyN on every pair, with the nonlinear stage of antsRegistrationSyN.sh:
   CC radius 4, SyN[0.1,3,0], 100x70x50x20 iterations, shrink 8x4x2x1, smooth 3x2x1x0 vox.
 - 3dQwarp (the qwarp check's arguments) on one pair in QWARP_EVERY: it takes 25 min to 2 h.
-ffs: qwarp (3dQwarp's arguments), formwarp with ANTs' SyN settings flag for flag (its
+ffs: qwarp (3dQwarp's arguments), qwarp with ``-qwarp_recipe afni`` (3dQwarp's own
+behaviour, a parity row against 3dqwarp), formwarp with ANTs' SyN settings flag for flag (its
 defaults; the engine reproduces antsRegistration -- Dice 0.6237 vs 0.6240 on these 48 pairs
 -- so this row is a parity check, not a tuned fit), optiwarp at its defaults and with the hs
 force (the autoproc MNI default).
@@ -59,6 +60,8 @@ FORMWARP_AS_ANTS = ["-style", "ants", "-grad_step", "0.1", "-update_var", "3", "
 # source) and STEM_WARP.nii.gz (AFNI-format source->base warp) in its own folder.
 FFS_TOOLS: dict[str, tuple[str, list[str], str]] = {
     "qwarp": ("ffs_qwarp", QWARP_ARGS, "qw"),
+    # 3dQwarp's own behaviour, for parity with the 3dqwarp row (ffs_qwarp -qwarp_recipe)
+    "qwarp_afni": ("ffs_qwarp", [*QWARP_ARGS, "-qwarp_recipe", "afni"], "qw"),
     "formwarp": ("ffs_formwarp", ["-save_warp", *FORMWARP_AS_ANTS], "fw"),
     "optiwarp": ("ffs_optiwarp", ["-save_warp"], "ow"),
     "optiwarp_hs": ("ffs_optiwarp", ["-save_warp", "-force", "hs"], "ow"),
@@ -188,10 +191,10 @@ class WarpPairCheck(QwarpCheck):
         summary="NIREP16 brain to brain, from one shared affine: ANTs SyN (every pair) and 3dQwarp "
         "(every 4th) against every ffs warp tool; manual labels judge the overlap.",
         tools={"affine": "affine only", "ants": "ANTs SyN", "3dqwarp": "3dQwarp", "qwarp": "ffs_qwarp",
-               "optiwarp": "ffs_optiwarp", "optiwarp_hs": "ffs_optiwarp (hs)",
+               "qwarp_afni": "ffs_qwarp (afni)", "optiwarp": "ffs_optiwarp", "optiwarp_hs": "ffs_optiwarp (hs)",
                "formwarp": "ffs_formwarp"},
         timing={"ref": "ANTs SyN", "ref_3dqwarp": "3dQwarp", "ffs_qwarp": "ffs_qwarp",
-                "ffs_optiwarp": "ffs_optiwarp", "ffs_optiwarp_hs": "ffs_optiwarp (hs)",
+                "ffs_qwarp_afni": "ffs_qwarp (afni)", "ffs_optiwarp": "ffs_optiwarp", "ffs_optiwarp_hs": "ffs_optiwarp (hs)",
                 "ffs_formwarp": "ffs_formwarp"},
         references=("affine", "ants", "3dqwarp", "ref", "ref_3dqwarp"),
         metrics=(
@@ -201,7 +204,7 @@ class WarpPairCheck(QwarpCheck):
                    better="higher", line=0.5, line_label="lost"),
             Metric("deformation.frac_det_below_half_{tool}", "Brain squeezed below half its volume (share)"),
         ),
-        speedup=(("ffs_qwarp", "ref_3dqwarp"), ("ffs_formwarp", "ref"), ("ffs_optiwarp_hs", "ref"),
+        speedup=(("ffs_qwarp", "ref_3dqwarp"), ("ffs_qwarp_afni", "ref_3dqwarp"), ("ffs_formwarp", "ref"), ("ffs_optiwarp_hs", "ref"),
                  ("ffs_optiwarp", "ref")),
         code=("fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_pair"),
     )  # fmt: skip
@@ -338,7 +341,7 @@ class WarpPairCheck(QwarpCheck):
         res.metrics["label_loss"] = label_loss
         res.metrics["reference"] = {
             f"dice_mean_{t}": truth.get(f"dice_mean_{t}")
-            for t in ("ants", "formwarp", "qwarp", "optiwarp")
+            for t in ("ants", "formwarp", "qwarp", "qwarp_afni", "optiwarp")
         }
         res.artifacts += [(p, "regenerable") for p in (S, SL, B, SA)]
         res.artifacts += [(BL, "keep"), (SLA, "keep"), (aff, "keep"), (log, "keep")]

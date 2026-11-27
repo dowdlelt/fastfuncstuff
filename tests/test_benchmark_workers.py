@@ -195,6 +195,14 @@ def test_redo_refits_only_the_named_tool(tmp_path):
         timed_cached(cmd, stamp, [out], work, log)
     assert stamps["sswarper"][2].read_text() == "fit\n"  # reference reused
     assert stamps["ffs_formwarp"][2].read_text() == "fit\nfit\n"  # changed tool refit
+    # no tools: back to pending, every fit reused (only a tool added since would run)
+    wl.finish(u["id"], "done")
+    assert redo(wl, root, "warp_mni", []) == 1
+    assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"
+    for cmd, stamp, out in stamps.values():
+        timed_cached(cmd, stamp, [out], work, log)
+    assert stamps["sswarper"][2].read_text() == "fit\n"
+    assert stamps["ffs_formwarp"][2].read_text() == "fit\nfit\n"
     wl.close()
 
     wl = Worklist(root / "worklist.sqlite")

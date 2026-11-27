@@ -292,7 +292,9 @@ def main(argv: list[str] | None = None) -> int:
         "-redo",
         metavar="CHECK",
         help="Return finished units of CHECK to pending and refit -tools on the next -run "
-        "(their code changed, their command line did not); other fits are reused.",
+        "(their code changed, their command line did not); other fits are reused. "
+        "Without -tools nothing refits: only tools the units have not run yet (a tool "
+        "newly added to the check) run on the next -run.",
     )
     act.add_argument(
         "-report",
@@ -465,10 +467,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.reset_running:
         print(f"{wl.reset('running', args.check)} units back to pending")
     elif args.redo:
-        if not args.tools:
-            p.error("-redo needs -tools")
         n = redo(wl, args.root, args.redo, args.tools)
-        print(f"{n} {args.redo} units back to pending; {' '.join(args.tools)} will refit")
+        what = (
+            f"{' '.join(args.tools)} will refit"
+            if args.tools
+            else "only tools not yet run will fit"
+        )
+        print(f"{n} {args.redo} units back to pending; {what}")
     elif args.report:
         from .report import build_report
 
