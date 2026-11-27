@@ -2098,6 +2098,17 @@ def test_batched_clipped_cost_clips_each_candidate_by_its_own_range(cost):
     assert int(got.argmax()) == 3
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_cmass_partial_normals_accepts_an_mps_base():
+    """Casting the nonzero indices to float64 before leaving Metal raised (bench crash)."""
+    from fastfuncstuff.processing.allineate import _cmass_partial_normals
+
+    base = torch.zeros(60, 70, 50, device="mps")
+    base[5:-5, 5:-5, 5:-5] = 1.0
+    (n,) = _cmass_partial_normals(base, (60, 10, 50), np.eye(4), np.eye(4), 0.5)
+    np.testing.assert_allclose(np.abs(n), [0, 1, 0])
+
+
 def test_cmass_skips_axes_a_slab_covers_only_partly():
     """Forest: a 42 mm posterior coronal slab drops the A-P cmass shift and nothing else.
     A tilted slab is measured across its own thickness (not its bounding box), and the

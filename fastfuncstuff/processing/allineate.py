@@ -1381,7 +1381,7 @@ def _cmass_partial_normals(
     if nz.shape[0] == 0:
         return []
     step = max(1, nz.shape[0] // 200_000)
-    pts = nz[::step].flip(-1).double().cpu().numpy() @ ab.T  # mm, up to an offset
+    pts = nz[::step].cpu().flip(-1).double().numpy() @ ab.T  # mm; CPU first: MPS has no float64
     nsrc = list(source_shape)[::-1][:3]  # source tensors are (z, y, x)
     normals = []
     for i in range(3):
