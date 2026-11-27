@@ -223,3 +223,19 @@ def test_ljung_box_on_metal_matches_cpu():
     assert got.dtype == torch.float64
     # Same float32 input and both reductions run on the CPU: identical.
     assert torch.equal(got, _ljung_box_batched(resid))
+
+
+@pytest.mark.gpu
+@_mps
+def test_correlation_matrix_on_metal_is_float64_and_matches_cpu():
+    # ffs_fc -device mps died casting ROI series to float64 on Metal.
+    from fastfuncstuff.connectivity.matrix import correlation_matrix, ledoit_wolf
+
+    x = torch.randn(12, 80, generator=torch.Generator().manual_seed(0))
+    w = torch.rand(80, generator=torch.Generator().manual_seed(1))
+    for got, want in (
+        (correlation_matrix(x.to("mps"), weights=w), correlation_matrix(x, weights=w)),
+        (ledoit_wolf(x.to("mps"))[0], ledoit_wolf(x)[0]),
+    ):
+        assert got.dtype == torch.float64
+        torch.testing.assert_close(got, want)

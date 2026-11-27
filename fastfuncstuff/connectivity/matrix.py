@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from fastfuncstuff.utils import full_fp32_matmul
+from fastfuncstuff.utils import full_fp32_matmul, linalg_device
 
 #: AFNI's Fisher-z ceiling: atanh is capped at 4 (|r| = 0.999329). Without a cap
 #: the diagonal is infinite; past it every r is "identical" for any practical use.
@@ -45,8 +45,13 @@ def unit_rows(
     on their weighted mean and multiplied by ``sqrt(w)``, so ``a @ b`` is the weighted
     Pearson r. Constant rows (nothing to correlate) come back as zeros with
     ``valid = False`` rather than as NaN, so they correlate 0 with everything.
+    A float64 request on a device without float64 (Metal) is served on the CPU, and
+    the rows come back there: ROI-by-time series are small, and the matrices built
+    from them are meant to be float64.
     """
     dtype = dtype or x.dtype
+    if dtype == torch.float64:
+        x = x.to(linalg_device(x.device))  # device before dtype: MPS float64 casts fail
     x = x.to(dtype)
     if weights is not None:
         w = torch.as_tensor(np.asarray(weights) if not isinstance(weights, Tensor) else weights)
