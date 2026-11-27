@@ -61,11 +61,21 @@ def prep_pair(src_img, src_lab, base_img, base_lab, prep, work, log):
     resample(base_img, B, "Cu")
     resample(base_lab, BL, "NN")
     SA, SLA, aff = prep / "src_al.nii.gz", prep / "src_lab_al.nii.gz", prep / "src_al.aff12.1D"
-    timed(
-        ["3dAllineate", "-overwrite", "-base", str(B), "-source", str(S), "-prefix", str(SA),
-         "-1Dmatrix_save", str(aff), "-cost", "ls", "-twopass", "-final", "wsinc5"],
-        work, log, timeout_s=1800,
-    )  # fmt: skip
+    # A unit rerun (work -redo) reuses its reference fits, which were made from this
+    # affine; refitting it would hand the new tools a different aligned source and score
+    # the old fits' labels against it. The matrix is kept, so apply it instead.
+    if aff.exists():
+        timed(
+            ["3dAllineate", "-overwrite", "-master", str(B), "-source", str(S), "-prefix", str(SA),
+             "-1Dmatrix_apply", str(aff), "-final", "wsinc5"],
+            work, log, timeout_s=1800,
+        )  # fmt: skip
+    else:
+        timed(
+            ["3dAllineate", "-overwrite", "-base", str(B), "-source", str(S), "-prefix", str(SA),
+             "-1Dmatrix_save", str(aff), "-cost", "ls", "-twopass", "-final", "wsinc5"],
+            work, log, timeout_s=1800,
+        )  # fmt: skip
     timed(
         ["3dAllineate", "-overwrite", "-master", str(B), "-source", str(SL),
          "-1Dmatrix_apply", str(aff), "-final", "NN", "-prefix", str(SLA)],
