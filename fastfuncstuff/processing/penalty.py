@@ -290,6 +290,15 @@ def penalty_value_and_grad(
         from .penalty_triton import penalty_value_and_grad_triton
 
         return penalty_value_and_grad_triton(xd, yd, zd, HPEN_CUT, pen_fac, external_sums)
+    if (
+        xd.device.type == "cpu"
+        and xd.dtype == yd.dtype == zd.dtype == torch.float32
+        and xd.ndim == 4
+        and not torch.compiler.is_compiling()
+    ):
+        from .numba_kernels import hexahedron_penalty_value_and_grad_cpu
+
+        return hexahedron_penalty_value_and_grad_cpu(xd, yd, zd, HPEN_CUT, pen_fac, external_sums)
     with torch.enable_grad():
         leaves = [t.detach().requires_grad_(True) for t in (xd, yd, zd)]
         value = compute_penalty_batched(*leaves, pen_fac, external_sums)

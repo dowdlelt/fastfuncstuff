@@ -939,6 +939,7 @@ class BatchedIncrementalCorrelation:
         patch_slices: list[tuple[int, int, int, int, int, int]],
         base_patches: Tensor | None = None,
         weight_patches: Tensor | None = None,
+        source_patches: Tensor | None = None,
     ) -> None:
         """Precompute fixed (outside-patch) statistics for all B patches.
 
@@ -950,6 +951,7 @@ class BatchedIncrementalCorrelation:
             patch_slices: List of (ibot, itop, jbot, jtop, kbot, ktop) for B patches.
             base_patches: Optional pre-extracted (B, V) base patches (avoids re-extraction).
             weight_patches: Optional pre-extracted (B, V) weight patches (avoids re-extraction).
+            source_patches: Optional pre-extracted (B, V) warped_source patches.
         """
         _B = len(patch_slices)
         _device = base.device
@@ -983,13 +985,15 @@ class BatchedIncrementalCorrelation:
                     for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
                 ]
             )
-        # warped_source patches always extracted fresh (warped_source changes between phases)
-        sp_all = torch.stack(
-            [
-                warped_source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
-                for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
-            ]
-        )
+        if source_patches is not None:
+            sp_all = source_patches
+        else:
+            sp_all = torch.stack(
+                [
+                    warped_source[kbot : ktop + 1, jbot : jtop + 1, ibot : itop + 1].reshape(-1)
+                    for ibot, itop, jbot, jtop, kbot, ktop in patch_slices
+                ]
+            )
         if weight_patches is not None:
             wp_all = weight_patches
         else:
@@ -1024,6 +1028,37 @@ class BatchedIncrementalCorrelation:
         This is the HOT PATH that runs every optimizer iteration.
         No .item() calls, no Python loops, pure tensor ops.
         """
+        if (
+            base_patches.device.type == "cpu"
+            and base_patches.dtype == source_patches.dtype == weight_patches.dtype == torch.float32
+            and not (
+                torch.is_grad_enabled()
+                and (
+                    base_patches.requires_grad
+                    or source_patches.requires_grad
+                    or weight_patches.requires_grad
+                )
+            )
+            and not torch.compiler.is_compiling()
+        ):
+            from .numba_kernels import incor_eval_cpu
+
+            corr, _ = incor_eval_cpu(
+                base_patches,
+                source_patches,
+                weight_patches,
+                self._sw_fixed,
+                self._swx_fixed,
+                self._swy_fixed,
+                self._swxx_fixed,
+                self._swyy_fixed,
+                self._swxy_fixed,
+                self.base_clip,
+                self.source_clip,
+                self.fisher_z,
+                False,
+            )
+            return corr
         x, nx_ = apply_incor_clip(base_patches, self.base_clip)
         y, ny_ = apply_incor_clip(source_patches, self.source_clip)
         w = _clip_weight(weight_patches, nx_, ny_)
@@ -1064,6 +1099,30 @@ class BatchedIncrementalCorrelation:
         and the Fisher z multiplies by ``1 / (1 - r^2)`` inside its clamp. Matches
         autograd away from the variance and correlation clamps.
         """
+        if (
+            base_patches.device.type == "cpu"
+            and base_patches.dtype == source_patches.dtype == weight_patches.dtype == torch.float32
+            and not torch.compiler.is_compiling()
+        ):
+            from .numba_kernels import incor_eval_cpu
+
+            r, grad = incor_eval_cpu(
+                base_patches,
+                source_patches,
+                weight_patches,
+                self._sw_fixed,
+                self._swx_fixed,
+                self._swy_fixed,
+                self._swxx_fixed,
+                self._swyy_fixed,
+                self._swxy_fixed,
+                self.base_clip,
+                self.source_clip,
+                self.fisher_z,
+                True,
+            )
+            assert grad is not None
+            return r, grad
         x, nx_ = apply_incor_clip(base_patches, self.base_clip)
         y, ny_ = apply_incor_clip(source_patches, self.source_clip)
         w = _clip_weight(weight_patches, nx_, ny_)

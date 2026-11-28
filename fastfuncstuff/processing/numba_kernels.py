@@ -8,6 +8,7 @@ this does not help.
 from __future__ import annotations
 
 import functools
+import math
 import platform
 
 import numba
@@ -31,6 +32,7 @@ njit_aten = functools.partial(numba.njit, fastmath={"contract"} if _ATEN_CONTRAC
 _F1 = np.float32(1.0)
 _F2 = np.float32(2.0)
 _F0 = np.float32(0.0)
+_F05 = np.float32(0.5)
 
 
 @njit(inline="always")
@@ -1025,3 +1027,457 @@ def shear_1d_cpu(vol: Tensor, dim: int, shifts: Tensor, weights: Tensor) -> Tens
     out = np.empty_like(src)
     _with_threads(_SHEAR_AXIS[dim], src, sh, w, out)
     return torch.from_numpy(out)
+
+
+@njit(inline="always")
+def _hex_cell_energy_and_scatter(xd, yd, zd, b, k, j, i, nz, ny, nx, cut, gx, gy, gz):
+    """Evaluate one hexahedron cell; if it exceeds ``cut``, scatter 0.5*dE/dF to corners."""
+    ip = i + 1 if i + 1 < nx else nx - 1
+    jp = j + 1 if j + 1 < ny else ny - 1
+    kp = k + 1 if k + 1 < nz else nz - 1
+
+    x0 = xd[b, k, j, i]
+    x1 = xd[b, k, j, ip]
+    x2 = xd[b, k, jp, i]
+    x3 = xd[b, k, jp, ip]
+    x4 = xd[b, kp, j, i]
+    x5 = xd[b, kp, j, ip]
+    x6 = xd[b, kp, jp, i]
+    x7 = xd[b, kp, jp, ip]
+
+    y0 = yd[b, k, j, i]
+    y1 = yd[b, k, j, ip]
+    y2 = yd[b, k, jp, i]
+    y3 = yd[b, k, jp, ip]
+    y4 = yd[b, kp, j, i]
+    y5 = yd[b, kp, j, ip]
+    y6 = yd[b, kp, jp, i]
+    y7 = yd[b, kp, jp, ip]
+
+    z0 = zd[b, k, j, i]
+    z1 = zd[b, k, j, ip]
+    z2 = zd[b, k, jp, i]
+    z3 = zd[b, k, jp, ip]
+    z4 = zd[b, kp, j, i]
+    z5 = zd[b, kp, j, ip]
+    z6 = zd[b, kp, jp, i]
+    z7 = zd[b, kp, jp, ip]
+
+    half = _F05
+    fxx = half * ((x1 - x0) + (x7 - x6)) + _F1
+    fxy = half * ((y1 - y0) + (y7 - y6))
+    fxz = half * ((z1 - z0) + (z7 - z6))
+    fyx = half * ((x2 - x0) + (x7 - x5))
+    fyy = half * ((y2 - y0) + (y7 - y5)) + _F1
+    fyz = half * ((z2 - z0) + (z7 - z5))
+    fzx = half * ((x4 - x0) + (x7 - x3))
+    fzy = half * ((y4 - y0) + (y7 - y3))
+    fzz = half * ((z4 - z0) + (z7 - z3)) + _F1
+
+    cxx = fyy * fzz - fyz * fzy
+    cxy = -(fyx * fzz - fyz * fzx)
+    cxz = fyx * fzy - fyy * fzx
+    det_raw = fxx * cxx + fxy * cxy + fxz * cxz
+
+    lo = np.float32(0.1)
+    hi = np.float32(10.0)
+    det = det_raw
+    if det < lo:
+        det = lo
+    elif det > hi:
+        det = hi
+    bulk = det - _F1 / det
+    third = np.float32(1.0 / 3.0)
+    je = third * bulk * bulk
+
+    vyz = fyz - fzy
+    vxz = fxz - fzx
+    vxy = fxy - fyx
+    matrix_norm = (
+        fxx * fxx
+        + fxy * fxy
+        + fxz * fxz
+        + fyx * fyx
+        + fyy * fyy
+        + fyz * fyz
+        + fzx * fzx
+        + fzy * fzy
+        + fzz * fzz
+    )
+    vorticity = np.float32(2.0) * (vyz * vyz + vxz * vxz + vxy * vxy)
+    d23 = det ** np.float32(2.0 / 3.0)
+    se = (matrix_norm + vorticity) / d23 - np.float32(3.0)
+    if se < _F0:
+        se = _F0
+
+    ej = je - cut
+    if ej < _F0:
+        ej = _F0
+    es = se - cut
+    if es < _F0:
+        es = _F0
+    if ej == _F0 and es == _F0:
+        return _F0
+
+    contrib = ej * ej * ej * ej + es * es * es * es
+    four = np.float32(4.0)
+    two = np.float32(2.0)
+    dj = four * ej * ej * ej
+    ds = four * es * es * es
+    if det_raw > lo and det_raw < hi:
+        ddet = dj * np.float32(2.0 / 3.0) * bulk * (_F1 + _F1 / (det * det)) - ds * np.float32(
+            2.0 / 3.0
+        ) * (matrix_norm + vorticity) / (d23 * det)
+    else:
+        ddet = _F0
+    a = ds / d23
+
+    cyx = -(fxy * fzz - fxz * fzy)
+    cyy = fxx * fzz - fxz * fzx
+    cyz = -(fxx * fzy - fxy * fzx)
+    czx = fxy * fyz - fxz * fyy
+    czy = -(fxx * fyz - fxz * fyx)
+    czz = fxx * fyy - fxy * fyx
+
+    gxx = half * (ddet * cxx + a * two * fxx)
+    gxy = half * (ddet * cxy + a * (two * fxy + four * vxy))
+    gxz = half * (ddet * cxz + a * (two * fxz + four * vxz))
+    gyx = half * (ddet * cyx + a * (two * fyx - four * vxy))
+    gyy = half * (ddet * cyy + a * two * fyy)
+    gyz = half * (ddet * cyz + a * (two * fyz + four * vyz))
+    gzx = half * (ddet * czx + a * (two * fzx - four * vxz))
+    gzy = half * (ddet * czy + a * (two * fzy - four * vyz))
+    gzz = half * (ddet * czz + a * two * fzz)
+
+    gx[b, k, j, i] -= gxx + gyx + gzx
+    gy[b, k, j, i] -= gxy + gyy + gzy
+    gz[b, k, j, i] -= gxz + gyz + gzz
+
+    gx[b, k, j, ip] += gxx
+    gy[b, k, j, ip] += gxy
+    gz[b, k, j, ip] += gxz
+
+    gx[b, k, jp, i] += gyx
+    gy[b, k, jp, i] += gyy
+    gz[b, k, jp, i] += gyz
+
+    gx[b, k, jp, ip] -= gzx
+    gy[b, k, jp, ip] -= gzy
+    gz[b, k, jp, ip] -= gzz
+
+    gx[b, kp, j, i] += gzx
+    gy[b, kp, j, i] += gzy
+    gz[b, kp, j, i] += gzz
+
+    gx[b, kp, j, ip] -= gyx
+    gy[b, kp, j, ip] -= gyy
+    gz[b, kp, j, ip] -= gyz
+
+    gx[b, kp, jp, i] -= gxx
+    gy[b, kp, jp, i] -= gxy
+    gz[b, kp, jp, i] -= gxz
+
+    gx[b, kp, jp, ip] += gxx + gyx + gzx
+    gy[b, kp, jp, ip] += gxy + gyy + gzy
+    gz[b, kp, jp, ip] += gxz + gyz + gzz
+
+    return contrib
+
+
+@njit(parallel=True, cache=True)
+def _hex_penalty_vg_batch(xd, yd, zd, cut, pen_fac, ext_sums, values, grad):
+    B, nz, ny, nx = xd.shape
+    gx, gy, gz = grad[0], grad[1], grad[2]
+    for b in prange(B):  # ty: ignore[not-iterable]
+        total = np.float64(0.0)
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    total += _hex_cell_energy_and_scatter(
+                        xd, yd, zd, b, k, j, i, nz, ny, nx, cut, gx, gy, gz
+                    )
+        hsum = ext_sums[b] + total
+        if hsum > 0.0:
+            values[b] = pen_fac * (hsum**0.25)
+            if total > 0.0:
+                coef = np.float32(0.25 * pen_fac * (hsum**-0.75))
+                for k in range(nz):
+                    for j in range(ny):
+                        for i in range(nx):
+                            gx[b, k, j, i] *= coef
+                            gy[b, k, j, i] *= coef
+                            gz[b, k, j, i] *= coef
+        else:
+            values[b] = _F0
+
+
+@njit(parallel=True, cache=True)
+def _hex_penalty_vg_slices(xd, yd, zd, cut, pen_fac, ext_sums, values, grad):
+    """For small B, parallelise over k in two disjoint even/odd passes (zero contention)."""
+    B, nz, ny, nx = xd.shape
+    gx, gy, gz = grad[0], grad[1], grad[2]
+    for b in range(B):
+        k_sums = np.zeros(nz, np.float64)
+        for parity in range(2):
+            n_par = (nz - parity + 1) // 2
+            for idx in prange(n_par):  # ty: ignore[not-iterable]
+                k = parity + 2 * idx
+                acc = np.float64(0.0)
+                for j in range(ny):
+                    for i in range(nx):
+                        acc += _hex_cell_energy_and_scatter(
+                            xd, yd, zd, b, k, j, i, nz, ny, nx, cut, gx, gy, gz
+                        )
+                k_sums[k] = acc
+        total = np.float64(0.0)
+        for k in range(nz):
+            total += k_sums[k]
+        hsum = ext_sums[b] + total
+        if hsum > 0.0:
+            values[b] = pen_fac * (hsum**0.25)
+            if total > 0.0:
+                coef = np.float32(0.25 * pen_fac * (hsum**-0.75))
+                for k in prange(nz):  # ty: ignore[not-iterable]
+                    for j in range(ny):
+                        for i in range(nx):
+                            gx[b, k, j, i] *= coef
+                            gy[b, k, j, i] *= coef
+                            gz[b, k, j, i] *= coef
+        else:
+            values[b] = _F0
+
+
+def hexahedron_penalty_value_and_grad_cpu(
+    xd: Tensor, yd: Tensor, zd: Tensor, cut: float, pen_fac: float, external_sums: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Fused CPU counterpart of ``penalty_triton.penalty_value_and_grad_triton``.
+
+    Skips cofactor and corner-scatter work for cells inside the ``cut`` deadband
+    (>99% of voxels), eliminating the 80-pass PyTorch autograd backward on CPU.
+    """
+    b, nz, ny, nx = xd.shape
+    arrs = [t.detach().contiguous().numpy() for t in (xd, yd, zd)]
+    ext = external_sums.detach().to(torch.float64).contiguous().numpy()
+    values = np.empty(b, dtype=np.float32)
+    grad = np.zeros((3, b, nz, ny, nx), dtype=np.float32)
+    kernel = _hex_penalty_vg_batch if b >= 4 else _hex_penalty_vg_slices
+    _with_threads(kernel, *arrs, np.float32(cut), np.float64(pen_fac), ext, values, grad)
+    return torch.from_numpy(values), torch.from_numpy(grad)
+
+
+@njit(inline="always")
+def _apply_clip_scalar(val, mode, c0, c1, c2, c3):
+    """mode: 0=none, 1=clamp(c0,c1), 2=AFNI incor_clipate(cbot,ctop,dbot,dtop).
+    Returns (clipped_val, was_clipped_for_weight, is_live_for_grad)."""
+    if mode == 0:
+        return val, 0, True
+    if mode == 1:
+        if val < c0:
+            return c0, 0, False
+        if val > c1:
+            return c1, 0, False
+        return val, 0, True
+    if val < c0:
+        return c2, 1, False
+    if val > c1:
+        return c3, 1, False
+    return val, 0, True
+
+
+@njit(parallel=True, cache=True)
+def _incor_eval_kernel(
+    base,
+    src,
+    wt,
+    sw_f,
+    swx_f,
+    swy_f,
+    swxx_f,
+    swyy_f,
+    swxy_f,
+    b_mode,
+    b0,
+    b1,
+    b2,
+    b3,
+    s_mode,
+    s0,
+    s1,
+    s2,
+    s3,
+    fisher_z,
+    want_grad,
+    out_r,
+    out_g,
+):
+    B, V = base.shape
+    for b in prange(B):  # ty: ignore[not-iterable]
+        sw = sw_f[b]
+        swx = swx_f[b]
+        swy = swy_f[b]
+        swxx = swxx_f[b]
+        swyy = swyy_f[b]
+        swxy = swxy_f[b]
+        for v in range(V):
+            wv = float(wt[b, v])
+            if wv == 0.0:
+                continue
+            xv, nb, _ = _apply_clip_scalar(float(base[b, v]), b_mode, b0, b1, b2, b3)
+            yv, ns, _ = _apply_clip_scalar(float(src[b, v]), s_mode, s0, s1, s2, s3)
+            n = nb + ns
+            if n == 1:
+                wv *= 0.5
+            elif n == 2:
+                wv *= 1.0 / 3.0
+            sw += wv
+            wx = wv * xv
+            wy = wv * yv
+            swx += wx
+            swy += wy
+            swxx += wx * xv
+            swyy += wy * yv
+            swxy += wx * yv
+
+        sw_safe = sw if sw > 1e-10 else 1e-10
+        inv_sw = 1.0 / sw_safe
+        xbar = swx * inv_sw
+        ybar = swy * inv_sw
+        vxx = swxx * inv_sw - xbar * xbar
+        if vxx < 1e-20:
+            vxx = 1e-20
+        vyy = swyy * inv_sw - ybar * ybar
+        if vyy < 1e-20:
+            vyy = 1e-20
+        vxy = swxy * inv_sw - xbar * ybar
+        sd = math.sqrt(vxx * vyy)
+        r = vxy / sd
+
+        if fisher_z:
+            rc = r
+            if rc < -0.9999:
+                rc = -0.9999
+            elif rc > 0.9999:
+                rc = 0.9999
+            out_r[b] = math.atanh(rc)
+        else:
+            out_r[b] = r
+
+        if want_grad:
+            a = inv_sw / sd
+            bb = r * inv_sw / vyy
+            if fisher_z:
+                if -0.9999 < r < 0.9999:
+                    fz = 1.0 / (1.0 - r * r)
+                    a *= fz
+                    bb *= fz
+                else:
+                    a = 0.0
+                    bb = 0.0
+            for v in range(V):
+                wv = float(wt[b, v])
+                if wv == 0.0:
+                    out_g[b, v] = _F0
+                    continue
+                yv, ns, live = _apply_clip_scalar(float(src[b, v]), s_mode, s0, s1, s2, s3)
+                if not live:
+                    out_g[b, v] = _F0
+                    continue
+                xv, nb, _ = _apply_clip_scalar(float(base[b, v]), b_mode, b0, b1, b2, b3)
+                n = nb + ns
+                if n == 1:
+                    wv *= 0.5
+                elif n == 2:
+                    wv *= 1.0 / 3.0
+                out_g[b, v] = wv * (a * (xv - xbar) - bb * (yv - ybar))
+
+
+def _unpack_clip(clip: tuple[float, ...] | None) -> tuple[int, float, float, float, float]:
+    if not clip:
+        return 0, 0.0, 0.0, 0.0, 0.0
+    if len(clip) == 2:
+        return 1, float(clip[0]), float(clip[1]), 0.0, 0.0
+    return 2, float(clip[0]), float(clip[1]), float(clip[2]), float(clip[3])
+
+
+def incor_eval_cpu(
+    base_patches: Tensor,
+    source_patches: Tensor,
+    weight_patches: Tensor,
+    sw_fixed: Tensor,
+    swx_fixed: Tensor,
+    swy_fixed: Tensor,
+    swxx_fixed: Tensor,
+    swyy_fixed: Tensor,
+    swxy_fixed: Tensor,
+    base_clip: tuple[float, ...] | None,
+    source_clip: tuple[float, ...] | None,
+    fisher_z: bool,
+    want_grad: bool,
+) -> tuple[Tensor, Tensor | None]:
+    """Fused CPU ``BatchIncor.evaluate`` / ``evaluate_with_grad`` (zero temp volumes)."""
+    B, V = base_patches.shape
+    bm, b0, b1, b2, b3 = _unpack_clip(base_clip)
+    sm, s0, s1, s2, s3 = _unpack_clip(source_clip)
+    out_r = np.empty(B, dtype=np.float32)
+    out_g = np.empty((B, V), dtype=np.float32) if want_grad else np.empty((1, 1), dtype=np.float32)
+    _with_threads(
+        _incor_eval_kernel,
+        base_patches.detach().contiguous().numpy(),
+        source_patches.detach().contiguous().numpy(),
+        weight_patches.detach().contiguous().numpy(),
+        sw_fixed.detach().to(torch.float64).contiguous().numpy(),
+        swx_fixed.detach().to(torch.float64).contiguous().numpy(),
+        swy_fixed.detach().to(torch.float64).contiguous().numpy(),
+        swxx_fixed.detach().to(torch.float64).contiguous().numpy(),
+        swyy_fixed.detach().to(torch.float64).contiguous().numpy(),
+        swxy_fixed.detach().to(torch.float64).contiguous().numpy(),
+        bm,
+        b0,
+        b1,
+        b2,
+        b3,
+        sm,
+        s0,
+        s1,
+        s2,
+        s3,
+        fisher_z,
+        want_grad,
+        out_r,
+        out_g,
+    )
+    return torch.from_numpy(out_r), (torch.from_numpy(out_g) if want_grad else None)
+
+
+@njit(cache=True)
+def _scatter_last_wins_4(f0, f1, f2, f3, idx, v0, v1, v2, v3):
+    n = idx.shape[0]
+    for k in range(n):
+        j = idx[k]
+        f0[j] = v0[k]
+        f1[j] = v1[k]
+        f2[j] = v2[k]
+        f3[j] = v3[k]
+
+
+def scatter_last_wins_cpu(
+    fields: tuple[Tensor, Tensor, Tensor, Tensor],
+    flat_idx: Tensor,
+    vals: tuple[Tensor, Tensor, Tensor, Tensor],
+) -> None:
+    """Write four patch value buffers into four global volumes in lattice order.
+
+    Bit-identical to ``_dedup_last_wins`` + four ``index_put_`` calls, without
+    sorting millions of indices per checkerboard phase on the CPU.
+    """
+    _scatter_last_wins_4(
+        fields[0].reshape(-1).numpy(),
+        fields[1].reshape(-1).numpy(),
+        fields[2].reshape(-1).numpy(),
+        fields[3].reshape(-1).numpy(),
+        flat_idx.detach().contiguous().reshape(-1).numpy(),
+        vals[0].detach().contiguous().reshape(-1).numpy(),
+        vals[1].detach().contiguous().reshape(-1).numpy(),
+        vals[2].detach().contiguous().reshape(-1).numpy(),
+        vals[3].detach().contiguous().reshape(-1).numpy(),
+    )

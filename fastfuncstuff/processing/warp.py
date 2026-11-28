@@ -75,6 +75,7 @@ from .interp import (
     batched_interp_3ch_packed,
     batched_trilinear_interpolate,
     batched_trilinear_interpolate_multi,
+    no_gather_compile,
     trilinear_interpolate,
     warp_image,
 )
@@ -907,8 +908,10 @@ def qwarp(
 
     # Final warped image: apply warp to unpadded source, crop to original size.
     # Single pass through the total warp; final_interp (wsinc5 by default, like
-    # 3dQwarp) is where output sharpness comes from.
-    warped_full = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.final_interp)
+    # 3dQwarp) is where output sharpness comes from. Keep the gather eager so a
+    # one-shot CPU resample never pays a mid-call torch.compile warmup.
+    with no_gather_compile():
+        warped_full = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.final_interp)
     warped = _crop_padding(warped_full, padding, (nz_orig, ny_orig, nx_orig))
 
     # Return full padded warp field (caller/io.py handles grid info)
@@ -2615,6 +2618,7 @@ def _improve_warp_batched(
             patch_slices,
             base_patches=base_patches,
             weight_patches=weight_patches,
+            source_patches=state.warped_source.reshape(-1)[_gather_idx],
         )
 
     # Pre-compute external penalty if needed (vectorized: global sum minus each patch)
@@ -3045,14 +3049,23 @@ def _improve_warp_batched(
         # and drift run to run. _dedup_last_wins picks exactly that winner, which is
         # what makes the vectorised form equivalent to the serial loop it replaces
         # rather than merely faster.
-        _w_dst, _w_src = _dedup_last_wins(_gather_idx.reshape(-1))
-        for field, vals in (
-            (state.xd, ah_xd),
-            (state.yd, ah_yd),
-            (state.zd, ah_zd),
-            (state.warped_source, warped_vals),
-        ):
-            field.reshape(-1)[_w_dst] = vals.reshape(-1)[_w_src]
+        if device.type == "cpu":
+            from .numba_kernels import scatter_last_wins_cpu
+
+            scatter_last_wins_cpu(
+                (state.xd, state.yd, state.zd, state.warped_source),
+                _gather_idx,
+                (ah_xd, ah_yd, ah_zd, warped_vals),
+            )
+        else:
+            _w_dst, _w_src = _dedup_last_wins(_gather_idx.reshape(-1))
+            for field, vals in (
+                (state.xd, ah_xd),
+                (state.yd, ah_yd),
+                (state.zd, ah_zd),
+                (state.warped_source, warped_vals),
+            ):
+                field.reshape(-1)[_w_dst] = vals.reshape(-1)[_w_src]
 
     state.patches_done += B
 

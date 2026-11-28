@@ -242,3 +242,93 @@ def test_fused_hexahedron_penalty_matches_the_torch_route(shape, scale, torch_ro
     total = ref.sum()
     assert abs(new.double().sum() - total) / total < 2e-6
     assert abs(old.double().sum() - total) / total < 2e-6
+
+
+@pytest.mark.parametrize(
+    "shape,scale", [((1, 8, 9, 7), 0.7), ((3, 6, 7, 5), 1.1), ((8, 5, 5, 6), 0.9)]
+)
+def test_fused_hexahedron_penalty_value_and_grad_matches_autograd(shape, scale, torch_route):
+    """Covers both the slice-parallel (B < 4) and batch-parallel (B >= 4) kernels."""
+    from fastfuncstuff.processing.penalty import penalty_value_and_grad
+
+    g = torch.Generator().manual_seed(7)
+    f = [torch.randn(shape, generator=g) * scale for _ in range(3)]
+    ext = torch.rand(shape[0], generator=g) * 2.0
+
+    val_new, grad_new = penalty_value_and_grad(*f, pen_fac=0.05, external_sums=ext)
+    torch_route()
+    val_old, grad_old = penalty_value_and_grad(*f, pen_fac=0.05, external_sums=ext)
+
+    torch.testing.assert_close(val_new, val_old, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(grad_new, grad_old, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "base_clip,source_clip",
+    [
+        (None, None),
+        ((50.0, 350.0), (20.0, 300.0)),
+        ((50.0, 350.0, 100.0, 300.0), (20.0, 300.0, 60.0, 260.0)),
+    ],
+)
+@pytest.mark.parametrize("fisher_z", [False, True])
+def test_fused_incor_eval_and_grad_match_torch(base_clip, source_clip, fisher_z, torch_route):
+    from fastfuncstuff.processing.cost import BatchedIncrementalCorrelation
+
+    g = torch.Generator().manual_seed(11)
+    nz, ny, nx = 16, 16, 16
+    base = torch.randn(nz, ny, nx, generator=g) * 100 + 200
+    src = base * 0.8 + torch.randn(nz, ny, nx, generator=g) * 40
+    wt = (torch.rand(nz, ny, nx, generator=g) > 0.25).float() * torch.rand(nz, ny, nx, generator=g)
+    slices = [(1, 8, 1, 8, 1, 8), (6, 13, 1, 8, 1, 8), (1, 8, 6, 13, 6, 13)]
+    bp = torch.stack(
+        [
+            base[k0 : k1 + 1, j0 : j1 + 1, i0 : i1 + 1].reshape(-1)
+            for i0, i1, j0, j1, k0, k1 in slices
+        ]
+    )
+    sp = torch.stack(
+        [
+            src[k0 : k1 + 1, j0 : j1 + 1, i0 : i1 + 1].reshape(-1)
+            for i0, i1, j0, j1, k0, k1 in slices
+        ]
+    )
+    wp = torch.stack(
+        [wt[k0 : k1 + 1, j0 : j1 + 1, i0 : i1 + 1].reshape(-1) for i0, i1, j0, j1, k0, k1 in slices]
+    )
+
+    ic = BatchedIncrementalCorrelation("pearclp", base_clip, source_clip, fisher_z=fisher_z)
+    ic.precompute_fixed_parts(base, src, wt, slices, bp, wp, source_patches=sp)
+    with torch.no_grad():
+        r_eval = ic.evaluate(bp, sp, wp)
+    r_vg, g_vg = ic.evaluate_with_grad(bp, sp, wp)
+
+    torch_route()
+    with torch.no_grad():
+        r_old = ic.evaluate(bp, sp, wp)
+    r_old_vg, g_old_vg = ic.evaluate_with_grad(bp, sp, wp)
+
+    torch.testing.assert_close(r_eval, r_old, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(r_vg, r_old_vg, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_vg, g_old_vg, rtol=1e-5, atol=1e-6)
+
+
+def test_scatter_last_wins_cpu_is_bit_identical_to_dedup():
+    from fastfuncstuff.processing.numba_kernels import scatter_last_wins_cpu
+    from fastfuncstuff.processing.warp import _dedup_last_wins
+
+    g = torch.Generator().manual_seed(13)
+    shape = (6, 7, 8)
+    n_vox = 6 * 7 * 8
+    idx = torch.randint(0, n_vox, (5, 90), generator=g)
+    vals = tuple(torch.randn(5, 90, generator=g) for _ in range(4))
+
+    ref_fields = tuple(torch.zeros(shape) for _ in range(4))
+    dst, src = _dedup_last_wins(idx.reshape(-1))
+    for f, v in zip(ref_fields, vals, strict=True):
+        f.reshape(-1)[dst] = v.reshape(-1)[src]
+
+    new_fields = tuple(torch.zeros(shape) for _ in range(4))
+    scatter_last_wins_cpu(new_fields, idx, vals)
+    for a, b in zip(new_fields, ref_fields, strict=True):
+        assert torch.equal(a, b)
