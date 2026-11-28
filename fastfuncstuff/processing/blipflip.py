@@ -845,7 +845,13 @@ def taper_field_to_object(
     mean_vox = sum(voxel_sizes) / 3.0
     dil = int(round(dilate_mm / mean_vox))
     if dil > 0:
-        mask = F.max_pool3d(mask[None, None], kernel_size=2 * dil + 1, stride=1, padding=dil)[0, 0]
+        # Three 1-D max_pools are bit-identical to a 3-D box max_pool3d and O(3k) instead of O(k^3).
+        k = 2 * dil + 1
+        x = mask[None, None]
+        x = F.max_pool3d(x, kernel_size=(k, 1, 1), stride=1, padding=(dil, 0, 0))
+        x = F.max_pool3d(x, kernel_size=(1, k, 1), stride=1, padding=(0, dil, 0))
+        x = F.max_pool3d(x, kernel_size=(1, 1, k), stride=1, padding=(0, 0, dil))
+        mask = x[0, 0]
     sigma_vox = rolloff_mm / mean_vox
     if sigma_vox > 0:
         mask = _separable_smooth_3d(mask.float(), sigma_vox).clamp(0.0, 1.0).to(field_hz.dtype)
@@ -2281,14 +2287,15 @@ def estimate_motion_pass(
         _build_homo_coords,
         identity_params,
         params_to_matrix,
-        resample_affine_fast,
     )
     from .ffs_moco import (
         MocoConfig,
         _gram_normal_eq,
+        _shear_resample_fn,
         compute_derivative_images,
         gauss_newton_rigid,
     )
+    from .interp import no_gather_compile
     from .weight import compute_weight_image
 
     device = work[ref_idx].data.device
@@ -2303,7 +2310,11 @@ def estimate_motion_pass(
         ref.data, field_hz, ref.readout, ref.sign, _NIFTI_AXIS_TO_TDIM[ref.pe_axis]
     ).to(rdt)
     weight_flat = compute_weight_image(base).reshape(-1)
-    derivs = compute_derivative_images(base, device)  # (6, N)
+    # Four 1-D shears match ffs_moco's rigid path and stay off _separable_resample_3d's
+    # torch.compile gate: under standard's stiff coarse lambda the pair stays distorted and
+    # gauss_newton_rigid runs ~22 iterations, which previously tripped CPU inductor compiles.
+    with no_gather_compile():
+        derivs = compute_derivative_images(base, device, use_shear=True)  # (6, N)
     WJ = weight_flat[None] * derivs  # (6, N) — broadcast weight across the 6 rows
     JtWJ = _gram_normal_eq(WJ, device)  # (6, 6), float64 on cuda/cpu
     coords = _build_homo_coords(shape, device, rdt)
@@ -2317,21 +2328,23 @@ def estimate_motion_pass(
         src = _undistort_scan(
             sc.data, field_hz, sc.readout, sc.sign, _NIFTI_AXIS_TO_TDIM[sc.pe_axis]
         ).to(rdt)
-        params, _ = gauss_newton_rigid(
-            base_flat,
-            src,
-            weight_flat,
-            WJ,
-            JtWJ,
-            identity_params(device=device, dtype=rdt),
-            mcfg,
-            coords=coords,
-        )
-        matrix = _drop_pe_center_translation(params_to_matrix(params), shape, sc.pe_axis)
-        # Bake into the (possibly float64) distorted data via a float32 resample, cast back.
-        sc.data = resample_affine_fast(sc.data.to(rdt), matrix, coords, interp, shape).to(
-            sc.data.dtype
-        )
+        with no_gather_compile():
+            params, _ = gauss_newton_rigid(
+                base_flat,
+                src,
+                weight_flat,
+                WJ,
+                JtWJ,
+                identity_params(device=device, dtype=rdt),
+                mcfg,
+                coords=coords,
+                resample_fn=_shear_resample_fn,
+            )
+            matrix = _drop_pe_center_translation(params_to_matrix(params), shape, sc.pe_axis)
+            # Bake into the (possibly float64) distorted data via a float32 resample, cast back.
+            sc.data = _shear_resample_fn(sc.data.to(rdt), matrix, coords, interp, shape).to(
+                sc.data.dtype
+            )
         # Each pass samples out(x) = in(M x), so the total map back to the scan as
         # acquired is the earlier map applied after this one.
         motion_mats[s] = motion_mats[s] @ matrix

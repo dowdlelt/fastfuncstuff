@@ -321,7 +321,9 @@ def test_locomoco_score_without_reference_keeps_intrinsic_only():
     intr, none = score(series, None, series, med, mask, None, d)
     assert none == {} and agree
     assert not any(k.endswith("_ants") for k in intr) and "same_volumes_r" not in intr
-    assert {k: v for k, v in full.items() if not k.endswith("_ants") and k != "same_volumes_r"} == intr
+    assert {
+        k: v for k, v in full.items() if not k.endswith("_ants") and k != "same_volumes_r"
+    } == intr
 
 
 def test_ffs_only_flag_reaches_only_checks_that_can_skip_their_reference():
@@ -329,3 +331,15 @@ def test_ffs_only_flag_reaches_only_checks_that_can_skip_their_reference():
 
     can = {n for n, c in CHECKS.items() if c.ffs_only_ok}
     assert {"warp_mni", "warp_pair", "locomoco"} <= can and "moco" not in can
+
+
+def test_blipflip_detects_mislabelled_phase_images():
+    """ds001499 sub-CSI1 ses-16 run-03 stores wrapped Siemens phase as _epi."""
+    from fastfuncstuff.benchmark.checks.blipflip import _is_phase_image
+
+    mag = np.array([0.0, 10.0, 500.0, 1200.0], dtype=np.float32)
+    phase = np.array([-4096.0, -1200.0, 0.0, 1500.0, 4092.0], dtype=np.float32)
+    assert not _is_phase_image({"ImageType": ["ORIGINAL", "PRIMARY", "M", "ND"]}, mag)
+    assert _is_phase_image({"ImageType": ["ORIGINAL", "PRIMARY", "P", "ND"]}, mag)
+    assert _is_phase_image({}, phase)
+    assert not _is_phase_image({}, mag)

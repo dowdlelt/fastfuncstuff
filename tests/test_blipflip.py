@@ -1043,3 +1043,28 @@ def test_fine_tiers_estimate_movement_unless_told_not_to():
     ):
         args = B.create_parser().parse_args(argv + base)
         assert B._estmov_for(args.config, args.estmov) is want, argv
+
+
+def test_taper_field_to_object_separable_dilation_matches_3d_max_pool():
+    """Three 1-D max_pools must be bit-identical to 3-D box max_pool3d."""
+    import torch.nn.functional as F
+
+    from fastfuncstuff.processing.blipflip import ScanSpec, taper_field_to_object
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    g = torch.Generator().manual_seed(3)
+    data = torch.zeros(18, 22, 20, dtype=torch.float32)
+    data[6:12, 8:14, 7:13] = 100.0 + torch.rand(6, 6, 6, generator=g) * 20.0
+    field = torch.randn(18, 22, 20, generator=g) * 50.0
+    scans = [ScanSpec(data=data, pe_axis=1, sign=-1.0, readout=0.05)]
+    vox = (2.0, 2.0, 2.0)
+
+    out = taper_field_to_object(field, scans, vox, dilate_mm=6.0, rolloff_mm=4.0)
+
+    # Reference with non-separable 3-D max_pool3d
+    pos = data[data > 0]
+    mask = (data > 0.05 * float(pos.mean())).float()
+    dil = int(round(6.0 / 2.0))
+    mask_ref = F.max_pool3d(mask[None, None], kernel_size=2 * dil + 1, stride=1, padding=dil)[0, 0]
+    mask_ref = _separable_smooth_3d(mask_ref, 4.0 / 2.0).clamp(0.0, 1.0)
+    assert torch.equal(out, field * mask_ref)

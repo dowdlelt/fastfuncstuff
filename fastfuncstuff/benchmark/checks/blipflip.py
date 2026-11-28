@@ -21,7 +21,16 @@ import numpy as np
 
 from .. import census
 from ..report_spec import Metric, ReportSpec
-from .base import Check, UnitResult, _stable_rank, cpu_threads, ffs_threads, ffs_version, timed
+from .base import (
+    Check,
+    NotApplicableError,
+    UnitResult,
+    _stable_rank,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed,
+)
 
 TOPUP_CONFIG = "b02b0.cnf"
 FFS_ARGS = ["-config", "standard", "-estmov"]  # b02b0 estimates movement at coarse levels
@@ -58,6 +67,22 @@ def _r(a: np.ndarray, b: np.ndarray) -> float:
     b = b - b.mean()
     d = np.sqrt((a * a).sum() * (b * b).sum())
     return float((a * b).sum() / d) if d > 0 else float("nan")
+
+
+def _is_phase_image(meta: dict, data: np.ndarray) -> bool:
+    """Detect mislabelled phase images (e.g. ds001499 sub-CSI1 ses-16 run-03 fmap-epi,
+    which carries Siemens wrapped phase [-4096, 4092] and ImageType ['ORIGINAL','PRIMARY','P','ND']
+    without BIDS part-phase)."""
+    img_type = meta.get("ImageType")
+    if isinstance(img_type, list):
+        tokens = {str(t).upper() for t in img_type}
+        if ("P" in tokens or "PHASE" in tokens) and not ("M" in tokens or "MAGNITUDE" in tokens):
+            return True
+    # Magnitude EPI is non-negative; wrapped phase spans symmetric negative/positive values.
+    nz = data[data != 0]
+    if nz.size and float((nz < 0).mean()) > 0.25:
+        return True
+    return False
 
 
 class BlipflipCheck(Check):
@@ -153,6 +178,10 @@ class BlipflipCheck(Check):
             )
             meta.update(self.curation.get("sidecar") or {})
             meta.update(self.file_overrides(rel))
+            if _is_phase_image(meta, data):
+                raise NotApplicableError(
+                    f"{rel} is a phase image (ImageType={meta.get('ImageType')}), not magnitude EPI"
+                )
             pe = meta.get("PhaseEncodingDirection")
             if not pe:
                 raise ValueError(f"no PhaseEncodingDirection for {rel}")
