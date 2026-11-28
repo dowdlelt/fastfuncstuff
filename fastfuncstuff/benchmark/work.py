@@ -152,6 +152,7 @@ def run(
 ) -> int:
     import time
 
+    from .checks.base import NotApplicableError
     from .fetch import fetch, sha256
 
     checks: dict = {}
@@ -214,12 +215,14 @@ def run(
             wl.record_provenance(u["id"], "worker", worker_info())
             wl.finish(u["id"], "done")
             t = {s: sec for s, _, sec, _ in res.timings}
+            # Multi-tool checks time each ffs tool on its own side (ffs_qwarp, ...).
+            ffs_s = t.get("ffs", sum(v for s, v in t.items() if s.startswith("ffs_")))
             ref_m = res.metrics.get("reference", {})
             brief = ", ".join(f"{k}={v:.4g}" for k, v in list(ref_m.items())[:4] if v is not None)
-            print(
-                f"    done: ref {t.get('ref', 0):.1f} s, ffs {t.get('ffs', 0):.1f} s | {brief}",
-                flush=True,
-            )
+            print(f"    done: ref {t.get('ref', 0):.1f} s, ffs {ffs_s:.1f} s | {brief}", flush=True)
+        except NotApplicableError as e:
+            wl.finish(u["id"], "excluded", f"not applicable: {e}")
+            print(f"    excluded: {e}", flush=True)
         except Exception as e:  # a bad unit is recorded, the loop goes on
             wl.finish(
                 u["id"], "failed", f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"

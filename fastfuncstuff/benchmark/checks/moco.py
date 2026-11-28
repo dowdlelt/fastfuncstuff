@@ -64,6 +64,7 @@ class MocoCheck(Check):
 
     def run(self, key, inputs, work, device):
         (src,) = inputs.values()
+        is_cbv = "_cbv." in str(src).rsplit("/", 1)[-1]
         ref, ffs = work / "ref", work / "ffs"
         ref.mkdir(parents=True, exist_ok=True)
         ffs.mkdir(parents=True, exist_ok=True)
@@ -92,9 +93,12 @@ class MocoCheck(Check):
         )
         res.timings.append(("ref", "cpu", t_ref, threads))
 
+        # ffs_moco turns VASO mode on for a *_cbv input (ds004539); this check is plain rigid
+        # moco against 3dvolreg, which sees one series.
+        vaso_off = ["-no_vaso"] if is_cbv else []
         t_ffs = timed(
             [
-                "ffs_moco", *FFS_ARGS, "-base", str(base), "-input", str(src), "-prefix", str(ffs / "moco.nii"),
+                "ffs_moco", *FFS_ARGS, *vaso_off, "-base", str(base), "-input", str(src), "-prefix", str(ffs / "moco.nii"),
                 "-1Dfile", str(ffs / "motion.1D"), "-1Dmatrix_save", str(ffs / "moco.aff12.1D"),
                 "-device", device,
             ],

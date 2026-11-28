@@ -16,6 +16,13 @@ from typing import Any
 from .. import census
 
 
+class NotApplicableError(Exception):
+    """The unit cannot be judged by this check (a rest run planned for a GLM check, say).
+
+    Only the data decides it, so planning from file names cannot rule it out; the runner
+    records the unit as excluded with this reason instead of failed."""
+
+
 @dataclass
 class UnitResult:
     metrics: dict[str, dict[str, float | None]] = field(default_factory=dict)  # judge -> {m: v}

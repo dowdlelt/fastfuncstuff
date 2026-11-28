@@ -214,3 +214,34 @@ def test_locomoco_smoothed_pe_r_ignores_texture():
     raw = float(np.median(_rowwise_r(a[mask].T, b[mask].T)))
     assert raw < 0.7
     assert _smoothed_pe_r(a, b, mask) > 0.9
+
+
+def test_physio_reads_bids_na_as_nan(tmp_path):
+    import gzip
+
+    from fastfuncstuff.benchmark.checks.physio import _read_physio
+
+    p = tmp_path / "x_physio.tsv.gz"
+    with gzip.open(p, "wt") as f:
+        f.write("0.1\t2.0\tn/a\n0.2\t2.5\t1.0\n")
+    d = _read_physio(p, {"Columns": ["resp", "cardiac", "trigger"]})
+    assert np.isnan(d["trigger"][0]) and d["trigger"][1] == 1.0 and d["cardiac"][1] == 2.5
+
+
+def test_reml_rest_run_is_not_applicable(tmp_path):
+    """A run whose events hold no condition with >= 2 events is excluded, not failed."""
+    import pytest
+
+    from fastfuncstuff.benchmark.checks.base import NotApplicableError
+    from fastfuncstuff.benchmark.checks.reml import RemlCheck
+
+    ev = tmp_path / "sub-01_task-rest_events.tsv"
+    ev.write_text("onset\tduration\ttrial_type\n0\t600\trest\n")
+    img = tmp_path / "sub-01_task-rest_bold.nii.gz"
+    img.write_bytes(b"")
+    chk = RemlCheck()
+    chk.curation = {}
+    with pytest.raises(NotApplicableError):
+        chk.run({}, {"sub-01_task-rest_bold.nii.gz": img, ev.name: ev}, tmp_path / "w", "cpu")
+    with pytest.raises(NotApplicableError):
+        chk.run({}, {"sub-01_task-rest_bold.nii.gz": img}, tmp_path / "w", "cpu")

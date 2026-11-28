@@ -19,7 +19,16 @@ import csv
 from pathlib import Path
 
 from ..validation import compare_bucket_volumes
-from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
+from .base import (
+    Check,
+    NotApplicableError,
+    UnitResult,
+    afni_version,
+    cpu_threads,
+    ffs_threads,
+    ffs_version,
+    timed,
+)
 
 MAX_CONDITIONS = 12
 MIN_EVENTS = 2
@@ -177,7 +186,7 @@ class RemlCheck(Check):
         image = next(p for rel, p in inputs.items() if rel.endswith((".nii", ".nii.gz")))
         events = next((p for rel, p in inputs.items() if rel.endswith("_events.tsv")), None)
         if events is None:
-            raise ValueError("no events file among the inputs")
+            raise NotApplicableError("no events file among the inputs")
         meta = self.read_meta(inputs)
         tr = meta.get("RepetitionTime")
         if meta.get("MRAcquisitionType") == "3D" and isinstance(tr, (int, float)) and tr < 0.3:
@@ -191,7 +200,7 @@ class RemlCheck(Check):
         cols = self.curation.get("events_columns") or {}
         conds = {} if model else _conditions(events, cols)
         if not model and not conds:
-            raise ValueError(
+            raise NotApplicableError(
                 f"no condition with >= {MIN_EVENTS} events in {events.name} (columns "
                 f"{event_columns(events.read_text().splitlines()[0].split(chr(9)), cols)}); "
                 "set curated events_columns, or exclude_units if it is not a design"

@@ -59,8 +59,9 @@ def _recording(
 
 def _read_physio(path, meta: dict) -> dict[str, np.ndarray]:
     cols = meta.get("Columns") or []
+    # BIDS writes missing samples as n/a.
     with gzip.open(path, "rt") as f:
-        data = np.loadtxt(f, ndmin=2, dtype=float)
+        data = np.loadtxt((ln.replace("n/a", "nan") for ln in f), ndmin=2, dtype=float)
     return {str(c): data[:, i] for i, c in enumerate(cols) if i < data.shape[1]}
 
 
