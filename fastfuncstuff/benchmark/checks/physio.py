@@ -58,12 +58,73 @@ def _recording(
     return out
 
 
+def _is_numeric_token(tok: str) -> bool:
+    if tok.lower() in ("n/a", "nan", "inf", "-inf", "+inf"):
+        return True
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _numeric_col_indices(
+    path, n_cols: int, max_rows: int | None = 200
+) -> tuple[list[int], str | None]:
+    """(numeric column indices, delimiter) for columns whose tokens are numeric or BIDS 'n/a'."""
+    ok = [True] * n_cols
+    seen = 0
+    delim: str | None = None
+    with gzip.open(path, "rt") as f:
+        for ln in f:
+            stripped = ln.rstrip("\r\n")
+            if not stripped.strip():
+                continue
+            if delim is None and "\t" in stripped:
+                delim = "\t"
+            parts = stripped.split("\t") if delim == "\t" else stripped.split()
+            for i in range(min(n_cols, len(parts))):
+                if ok[i] and not _is_numeric_token(parts[i].strip()):
+                    ok[i] = False
+            seen += 1
+            if max_rows is not None and seen >= max_rows:
+                break
+    return [i for i, keep in enumerate(ok) if keep], delim
+
+
 def _read_physio(path, meta: dict) -> dict[str, np.ndarray]:
     cols = meta.get("Columns") or []
-    # BIDS writes missing samples as n/a.
-    with gzip.open(path, "rt") as f:
-        data = np.loadtxt((ln.replace("n/a", "nan") for ln in f), ndmin=2, dtype=float)
-    return {str(c): data[:, i] for i, c in enumerate(cols) if i < data.shape[1]}
+    if not cols:
+        return {}
+    # Some BIDS physio TSVs mix text columns ("Inhalation"/"Exhalation", ds006947) with
+    # numeric traces. Detect numeric columns first so np.loadtxt stays fast on 10 kHz logs
+    # while skipping text columns cleanly.
+    use, delim = _numeric_col_indices(path, len(cols), max_rows=200)
+    if not use:
+        return {}
+    try:
+        with gzip.open(path, "rt") as f:
+            data = np.loadtxt(
+                (ln.replace("n/a", "nan") for ln in f),
+                delimiter=delim,
+                ndmin=2,
+                dtype=float,
+                usecols=use,
+            )
+    except ValueError:
+        # A text column may start with "n/a" for the first 200 rows; scan the whole file.
+        use, delim = _numeric_col_indices(path, len(cols), max_rows=None)
+        if not use:
+            return {}
+        with gzip.open(path, "rt") as f:
+            data = np.loadtxt(
+                (ln.replace("n/a", "nan") for ln in f),
+                delimiter=delim,
+                ndmin=2,
+                dtype=float,
+                usecols=use,
+            )
+    return {str(cols[i]): data[:, k] for k, i in enumerate(use) if k < data.shape[1]}
 
 
 def _slibase_phase(path, kind: str) -> np.ndarray:
