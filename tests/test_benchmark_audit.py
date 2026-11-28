@@ -101,6 +101,33 @@ def test_benchmark_device_identity_honours_forced_cpu(tmp_path, monkeypatch):
     assert cached["hardware"]["requested_device"] == "cpu,8"
 
 
+def test_darwin_cpu_model_reads_sysctl_brand_string(monkeypatch):
+    """On macOS, platform.processor() is bare 'arm'; arch should report the chip name."""
+    import builtins
+
+    from fastfuncstuff.benchmark import arch
+
+    real_open = builtins.open
+
+    def _no_proc_cpuinfo(path, *a, **kw):
+        if str(path) == "/proc/cpuinfo":
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", _no_proc_cpuinfo)
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.processor", lambda: "arm")
+    monkeypatch.setattr("subprocess.check_output", lambda *a, **kw: "Apple M4 Pro\n")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr("torch.backends.mps.is_available", lambda: True)
+
+    assert arch._get_cpu_model() == "Apple M4 Pro"
+    assert arch.get_ffs_arch_id("mps") == "mps-Apple_M4_Pro"
+    hw = arch.get_hardware_info("mps")
+    assert hw["cpu_model"] == "Apple M4 Pro"
+    assert hw["gpu"] == "Apple M4 Pro"
+
+
 def test_glmsingle_matlab_helper_is_packaged(tmp_path):
     from fastfuncstuff.benchmark.stages.glmsingle_matlab import _matlab_script
 

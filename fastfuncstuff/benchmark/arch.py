@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import subprocess
 
 import torch
 
@@ -18,7 +19,19 @@ def _get_cpu_model() -> str:
                     return line.split(":", 1)[1].strip()
     except OSError:
         pass
-    # macOS / fallback
+    # macOS: platform.processor() reports bare "arm" on Apple Silicon;
+    # sysctl gives the chip name (e.g. "Apple M4 Max").
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if out:
+                return out
+        except (OSError, subprocess.SubprocessError):
+            pass
     return platform.processor() or "unknown"
 
 
@@ -49,7 +62,7 @@ def get_ffs_arch_id(device_spec: str | None = None) -> str:
         gpu_name = torch.cuda.get_device_name(index).replace(" ", "_")
         return f"cuda-{gpu_name}"
     if requested == "mps":
-        proc = platform.processor() or "unknown"
+        proc = _get_cpu_model()
         return f"mps-{proc.replace(' ', '_')}"
     return "cpu"
 
@@ -91,7 +104,7 @@ def get_hardware_info(device_spec: str | None = None) -> dict:
         mem = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
         info["gpu_memory_gb"] = round(mem / 1024**3, 1)
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        info["gpu"] = platform.processor() or "Apple Silicon"
+        info["gpu"] = _get_cpu_model()
     return info
 
 
