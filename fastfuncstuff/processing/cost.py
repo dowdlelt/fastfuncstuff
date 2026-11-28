@@ -327,6 +327,18 @@ def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) ->
         out = torch.matmul(padded.unfold(2, kernel.shape[0], 1), kernel)
         return out.movedim(2, axis) if axis != 2 else out
 
+    if vol.device.type == "mps":
+        # Metal's 3-D conv with 1-D kernels (1x1xK / 1xKx1 / Kx1x1) is ~14x slower
+        # than 1-D conv1d (104.9 ms vs 7.6 ms on 3x179x210x179, torch 2.14 M4 Max),
+        # and 1-D replicate pad avoids Metal's 5-D depth-pad bug at H*W >= 2**16.
+        mv = vol if axis == 4 else vol.movedim(axis, -1).contiguous()
+        lead = mv.shape[:-1]
+        length = mv.shape[-1]
+        padded = F.pad(mv.reshape(-1, 1, length), (radius, radius), mode="replicate")
+        out = F.conv1d(padded, kernel.to(vol.dtype).reshape(1, 1, -1))
+        out = out.reshape(*lead, length)
+        return out if axis == 4 else out.movedim(-1, axis)
+
     pad = [0, 0, 0, 0, 0, 0]
     pad[(4 - axis) * 2] = radius
     pad[(4 - axis) * 2 + 1] = radius

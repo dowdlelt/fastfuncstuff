@@ -59,3 +59,20 @@ def test_depth_only_blurs_match_cpu_on_large_planes(name):
     fn = _large_plane_cases()[name]
     x = torch.rand(24, 300, 300, generator=torch.Generator().manual_seed(0))
     torch.testing.assert_close(fn(x.to("mps")).cpu(), fn(x), rtol=1e-4, atol=1e-4)
+
+
+def test_mps_separable_smooth_multigroup_and_backward_match_cpu():
+    """The 1-D conv1d MPS path matches CPU in both forward and backward passes."""
+    g = torch.Generator().manual_seed(2)
+    x_cpu = torch.rand(1, 3, 24, 28, 32, generator=g, requires_grad=True)
+    w = torch.rand(1, 3, 24, 28, 32, generator=g)
+    y_cpu = _separable_smooth_3d(x_cpu, 1.0, kernel_type="gauss")
+    (y_cpu * w).sum().backward()
+
+    x_mps = x_cpu.detach().to("mps").requires_grad_(True)
+    y_mps = _separable_smooth_3d(x_mps, 1.0, kernel_type="gauss")
+    (y_mps * w.to("mps")).sum().backward()
+
+    torch.testing.assert_close(y_mps.detach().cpu(), y_cpu.detach(), rtol=1e-5, atol=1e-5)
+    assert x_mps.grad is not None and x_cpu.grad is not None
+    torch.testing.assert_close(x_mps.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
