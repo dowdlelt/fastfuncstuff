@@ -228,6 +228,44 @@ def test_physio_reads_bids_na_as_nan(tmp_path):
     assert np.isnan(d["trigger"][0]) and d["trigger"][1] == 1.0 and d["cardiac"][1] == 2.5
 
 
+def test_physio_skips_text_columns_including_late_labels(tmp_path):
+    """ds006947 mixes 'Inhalation'/'Exhalation' text columns with numeric traces."""
+    import gzip
+
+    from fastfuncstuff.benchmark.checks.physio import _read_physio
+
+    p = tmp_path / "ds006947_physio.tsv.gz"
+    with gzip.open(p, "wt") as f:
+        f.write("0.1\t2.0\tInhalation\n0.2\t2.5\tExhalation\n")
+    d = _read_physio(p, {"Columns": ["respiratory", "cardiac", "respiratory_state"]})
+    assert set(d) == {"respiratory", "cardiac"}
+    assert d["cardiac"].tolist() == [2.0, 2.5]
+
+    # A text column whose first >200 rows are n/a triggers the full-scan fallback.
+    p_late = tmp_path / "late_text_physio.tsv.gz"
+    with gzip.open(p_late, "wt") as f:
+        for i in range(210):
+            label = "n/a" if i < 205 else "Peak Inhalation"
+            f.write(f"{i * 0.1:.1f}\t{label}\t{i * 1.0:.1f}\n")
+    d_late = _read_physio(p_late, {"Columns": ["resp", "phase_label", "cardiac"]})
+    assert set(d_late) == {"resp", "cardiac"}
+    assert d_late["cardiac"].shape == (210,) and d_late["cardiac"][-1] == 209.0
+
+
+def test_fc_fz_agreement_uses_capped_fz_near_unit_correlation():
+    """Near |r|=1, both 3dNetCorr (BOBatanhf) and ffs_fc (fisher_z) cap |z| at 4.0."""
+    from fastfuncstuff.benchmark.checks.fc import matrix_agreement
+    from fastfuncstuff.connectivity.matrix import FZ_CAP, fisher_z
+
+    r = np.array([[1.0, 0.9998, 0.5], [0.9998, 1.0, 0.4], [0.5, 0.4, 1.0]])
+    fz_ref = np.round(fisher_z(r, cap=FZ_CAP), 4)
+    fz_ffs = fisher_z(r)
+    assert matrix_agreement(fz_ref, fz_ffs)["max_abs_diff"] < 1e-4
+    # Recomputing with an uncapped clip (old bug) produced a ~0.6 error at r=0.9998.
+    uncapped = np.arctanh(np.clip(r, -0.999999, 0.999999))
+    assert matrix_agreement(fz_ref, uncapped)["max_abs_diff"] > 0.5
+
+
 def test_reml_rest_run_is_not_applicable(tmp_path):
     """A run whose events hold no condition with >= 2 events is excluded, not failed."""
     import pytest

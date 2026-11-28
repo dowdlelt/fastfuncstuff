@@ -123,6 +123,7 @@ class FcCheck(Check):
         cc_ref = read_netcc(ref_netcc)
 
         cc = {}
+        fz = {}
         for side, extra in FFS_VARIANTS.items():
             d = work / side
             d.mkdir(exist_ok=True)
@@ -130,7 +131,9 @@ class FcCheck(Check):
                        "-prefix", str(d / "fc"), *extra, "-device", device, "-quiet"],
                       work, log, timeout_s=self.timeout_s)  # fmt: skip
             res.timings.append((side, device.split(",")[0], t, ffs_threads(device)))
-            cc[side] = np.load(d / "fc_fc.npz")["CC"]
+            npz = np.load(d / "fc_fc.npz")
+            cc[side] = npz["CC"]
+            fz[side] = npz["FZ"]
         if cc["ffs"].shape != cc_ref.shape:
             raise ValueError(f"ROI count differs: ref {cc_ref.shape}, ffs {cc['ffs'].shape}")
 
@@ -138,10 +141,10 @@ class FcCheck(Check):
             f"cc_{k}": v for k, v in matrix_agreement(cc_ref, cc["ffs"]).items()
         }
         m["n_rois"] = float(cc_ref.shape[0])
+        # Both 3dNetCorr (BOBatanhf) and ffs_fc (fisher_z) cap |z| at 4.0; compare ffs_fc's
+        # stored FZ directly rather than recomputing atanh with an arbitrary clip.
         fz_ref = read_netcc(ref_netcc, "FZ")
-        m["fz_max_abs_diff"] = matrix_agreement(
-            fz_ref, np.arctanh(np.clip(cc["ffs"], -0.999999, 0.999999))
-        )["max_abs_diff"]
+        m["fz_max_abs_diff"] = matrix_agreement(fz_ref, fz["ffs"])["max_abs_diff"]
         res.metrics["reference"] = m
         res.metrics["intrinsic"] = {f"default_vs_parity_{k}": v
                                     for k, v in matrix_agreement(cc["ffs"], cc["ffs_default"]).items()}  # fmt: skip
