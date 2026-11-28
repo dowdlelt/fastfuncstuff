@@ -460,6 +460,40 @@ def test_breathing_rate_is_not_captured_by_slow_power_at_the_band_edge():
     assert abs(np.median(rate) - 0.25) < 0.02, np.median(rate) * 60
 
 
+def test_breathing_rate_is_not_captured_by_upper_edge_or_tr_comb():
+    """The old P * f^2 weighting boosted 0.6 Hz by 36x over 0.1 Hz, locking magnitude-only
+    runs onto high-frequency noise or 1/TR lines (e.g. 30/min at TR=2 s, 33.3/min at TR=1.8 s)."""
+    fs = 17.0
+    t = np.arange(0, 400, 1 / fs)
+    rng = np.random.default_rng(5)
+    # Real breathing at 0.22 Hz (13.2/min) + smaller bump at 0.57 Hz (34.2/min)
+    x = 1.0 * np.sin(2 * np.pi * 0.22 * t) + 0.6 * np.sin(2 * np.pi * 0.57 * t + 0.7)
+    x += 0.8 * rng.standard_normal(t.size)
+    _, rate, _ = physio.peak_rate(t, x, physio.RESP_BAND)
+    assert abs(np.median(rate) - 0.22) < 0.02, np.median(rate) * 60
+
+    # Strong 1/TR comb line at 0.50 Hz (TR=2.0 s) on a magnitude trace must be notched & avoided.
+    x_comb = (
+        1.0 * np.sin(2 * np.pi * 0.23 * t)
+        + 3.0 * np.sin(2 * np.pi * 0.50 * t)
+        + 0.4 * rng.standard_normal(t.size)
+    )
+    _, xn, avoid = physio._resp_input("magnitude", t, x_comb, tr=2.0)
+    _, rate_comb, _ = physio.peak_rate(t, xn, physio.RESP_BAND, avoid=avoid)
+    assert abs(np.median(rate_comb) - 0.23) < 0.02, np.median(rate_comb) * 60
+
+
+@pytest.mark.parametrize("f_true", [0.14, 0.45])
+def test_breathing_rate_tracks_slow_and_fast_breathers(f_true):
+    """The soft physiological prior must not prevent tracking genuinely slow or fast breathing."""
+    fs = 17.0
+    t = np.arange(0, 400, 1 / fs)
+    rng = np.random.default_rng(6)
+    x = np.sin(2 * np.pi * f_true * t) + 0.3 * rng.standard_normal(t.size)
+    _, rate, _ = physio.peak_rate(t, x, physio.RESP_BAND)
+    assert abs(np.median(rate) - f_true) < 0.02, np.median(rate) * 60
+
+
 def test_explained_maps_put_each_group_where_its_signal_is():
     """A heartbeat only in one half of the volume and breathing (in magnitude) only in
     the other: the cardiac map must light the first half, respiration the second."""

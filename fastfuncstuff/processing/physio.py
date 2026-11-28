@@ -547,7 +547,10 @@ def _refine_peak(P: np.ndarray, j: int) -> float:
 
 
 def peak_rate(
-    t: np.ndarray, x: np.ndarray, band: tuple[float, float]
+    t: np.ndarray,
+    x: np.ndarray,
+    band: tuple[float, float],
+    avoid: tuple[float | tuple[float, float], ...] = (),
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Cycle-by-cycle rate from peak intervals, for a slow and irregular rhythm.
 
@@ -558,17 +561,42 @@ def peak_rate(
     what physio_calc.py does on the belt. Returns (interval mid-times, rates in Hz,
     whole-run peak prominence).
 
-    The run's rate, which sets the band the peaks are counted in, is the peak of the
-    derivative's spectrum (power x f^2): a plain argmax let slow power at the band's low
-    edge (task blocks, 1/f drift) win, and on two TASKFORCE task runs whose phase trace
-    was coherent with the belt (1.00) it reported 6/min against 15-17 true.
+    The run's rate ``f0``, which sets the band the peaks are counted in, is chosen from
+    interior spectral peaks outside ``avoid`` after removing the empirical 1/f
+    background (log-log slope clamped to ``[-2, 0]``) and applying a broad symmetric
+    log-Gaussian prior centred at the band's geometric midpoint (~14.7/min for
+    ``RESP_BAND``). Previously ``P * f^2`` was used to beat 0.1 Hz task power, which
+    tilted flat/mildly-sloped magnitude spectra 36x toward the 0.6 Hz ceiling and
+    pinned slow-TR runs onto 1/TR lines or 36/min.
     """
     fs = _fs(t)
     xb = _bandpass(x, band[0] * 0.8, band[1] * 1.2, fs)
     f_all, P_all = signal.periodogram(xb * np.hanning(len(xb)), fs=fs, nfft=4 * len(xb))
     inb = (f_all >= band[0]) & (f_all <= band[1])
-    f0 = float(f_all[inb][np.argmax((P_all * f_all**2)[inb])])
-    prominence = float(P_all[inb].max() / np.median(P_all[inb]))
+    ok = inb.copy()
+    for fa in avoid:
+        fc, hw = fa if isinstance(fa, tuple) else (fa, 0.03)
+        ok &= np.abs(f_all - fc) > hw
+    if not ok.any():
+        ok = inb
+    log_f = np.log(np.maximum(f_all[ok], 1e-30))
+    log_p = np.log(P_all[ok] + 1e-30)
+    if log_f.size >= 2 and np.ptp(log_f) > 0:
+        slope, intercept = np.polyfit(log_f, log_p, 1)
+        slope = float(np.clip(slope, -2.0, 0.0))
+    else:
+        slope, intercept = 0.0, float(np.median(log_p))
+    f_safe = np.maximum(f_all, 1e-30)
+    bg = np.exp(intercept + slope * np.log(f_safe))
+    f_mid = float(np.sqrt(band[0] * band[1]))
+    prior = np.exp(-0.5 * (np.log(f_safe / f_mid) / 0.45) ** 2)
+    score = (P_all / bg) * prior
+    peaks_idx, _ = signal.find_peaks(P_all)
+    cands = peaks_idx[ok[peaks_idx]]
+    if cands.size == 0:
+        cands = np.flatnonzero(ok)
+    f0 = float(f_all[cands[int(np.argmax(score[cands]))]])
+    prominence = float(P_all[ok].max() / np.median(P_all[ok]))
     xc = _bandpass(x, 0.6 * f0, 1.6 * f0, fs)
     pk, _ = signal.find_peaks(xc, distance=max(1, int(0.6 * fs / f0)), prominence=0.3 * xc.std())
     if pk.size < 3:
@@ -625,6 +653,21 @@ def _depth_rvt(traces: ExcitationTraces, t_r, x_r, rt, rf) -> np.ndarray:
     return respiration_volume(t_r, x_r, rt, rf)
 
 
+def _resp_input(
+    resp_from: str, t_r: np.ndarray, x_r: np.ndarray, tr: float
+) -> tuple[np.ndarray, np.ndarray, tuple[float, ...]]:
+    """The respiratory trace as ``peak_rate`` should see it, and k/TR lines to avoid.
+
+    At TR >= 1.67 s, 1/TR falls directly inside ``RESP_BAND`` (e.g. 30/min at TR 2 s,
+    33.3/min at TR 1.8 s, 20/min at TR 3 s). Magnitude traces carry that comb line
+    while phase traces do not, so notch and exclude k/TR when reading from magnitude.
+    """
+    if resp_from != "magnitude":
+        return t_r, x_r, ()
+    harmonics = tuple(k / tr for k in range(1, int(RESP_BAND[1] * tr * 1.2) + 2))
+    return t_r, notch_tr_harmonics(t_r, x_r, tr, RESP_BAND), harmonics
+
+
 def _cardiac_input(traces, card_from, t_c, x_c, tr, f_resp):
     """The cardiac trace as the tracker should see it, and the lines it must avoid.
 
@@ -667,7 +710,8 @@ def slice_regressors(
     t_c, x_c = traces.series(card_from, uniform=True)
     t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
-    rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND)
+    t_r, x_r, resp_avoid = _resp_input(resp_from, t_r, x_r, tr)
+    rt, rf, rprom = peak_rate(t_r, x_r, RESP_BAND, avoid=resp_avoid)
     if card_from == "weighted" and traces.cardiac_phase is not None:
         # The detector's own phase: re-tracking its trace with the band-pass tracker
         # would bring back the very failure the constant-modulus path avoids.
@@ -1427,7 +1471,8 @@ def _refine_cardiac(
     if resp_from == "phase" and traces.phase is None:
         resp_from = "magnitude"
     t_r, x_r = traces.series(resp_from, uniform=True)
-    _, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+    t_r, x_r, resp_avoid = _resp_input(resp_from, t_r, x_r, tr)
+    _, rf, _ = peak_rate(t_r, x_r, RESP_BAND, avoid=resp_avoid)
     phi_r = cycle_phase(t_r, x_r, rf)
     resp_phase = np.interp(times.ravel(), t_r, phi_r).reshape(times.shape)
     avoid = cardiac_avoid(tr, float(np.median(rf)))
@@ -1952,13 +1997,14 @@ def model_from_series(
     card_f0: float | None = None,
     resp_phase: str = "histogram",
     source: str = "",
+    resp_avoid: tuple[float | tuple[float, float], ...] = (),
 ) -> PhysioModel:
     """Build the model from a cardiac and a respiratory trace (recorded or data-derived).
 
     ``resp_phase``: "histogram" (Glover; the standard for a belt) or "hilbert"
     (better for the data-derived trace)."""
     peaks = find_beats(t_c, x_c, CARDIAC_BAND, card_f0)
-    rt, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+    rt, rf, _ = peak_rate(t_r, x_r, RESP_BAND, avoid=resp_avoid)
     phase = (
         respiration_phase_histogram(t_r, x_r)
         if resp_phase == "histogram"
@@ -1975,7 +2021,8 @@ def model_from_traces(
     t_c, x_c = traces.series(card_from, uniform=True)
     t_r, x_r = traces.series(resp_from, uniform=True)
     tr = float(np.median(np.diff(traces.times[:, 0])))
-    f_resp = float(np.median(peak_rate(t_r, x_r, RESP_BAND)[1]))
+    t_r, x_r, resp_avoid = _resp_input(resp_from, t_r, x_r, tr)
+    f_resp = float(np.median(peak_rate(t_r, x_r, RESP_BAND, avoid=resp_avoid)[1]))
     t_c, x_c, harmonics = _cardiac_input(traces, card_from, t_c, x_c, tr, f_resp)
     _, cf, _ = track_rate(t_c, x_c, CARDIAC_BAND, 20.0, avoid=harmonics)
     model = model_from_series(
@@ -1986,9 +2033,10 @@ def model_from_traces(
         card_f0=float(np.median(cf)),
         resp_phase="hilbert",
         source=f"data ({card_from}/{resp_from})",
+        resp_avoid=resp_avoid,
     )
     if traces.field_coef is not None and traces.phase is not None:
-        _, rf, _ = peak_rate(t_r, x_r, RESP_BAND)
+        _, rf, _ = peak_rate(t_r, x_r, RESP_BAND, avoid=resp_avoid)
         model.rvt = _depth_rvt(traces, t_r, x_r, None, rf)
     return model
 
