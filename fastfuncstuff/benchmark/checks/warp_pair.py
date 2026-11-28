@@ -174,12 +174,55 @@ def label_judges(
     return j, "\n".join(rows) + "\n"
 
 
-def dice_judges(lab: np.ndarray, base_lab: np.ndarray, labels: np.ndarray) -> dict[str, float]:
-    d = _dice_per_label(lab.astype(np.int32), base_lab, labels)
+def boundary_distances(
+    a: np.ndarray, b: np.ndarray, labels: np.ndarray, spacing=(1.0, 1.0, 1.0)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per label: (HD95, mean surface distance) in mm between the label's boundary in ``a``
+    and in ``b``, both directions pooled (nan where either lacks the label).
+
+    Dice is a volume overlap and averages a boundary that is wrong in one place into a
+    good score; these two read the boundary itself. Each label is cropped to its bounding
+    box (plus a margin) before the distance transform, which keeps 33 labels per tool to
+    seconds."""
+    from scipy import ndimage
+
+    hd, msd = [], []
+    for lab in labels:
+        x, y = a == lab, b == lab
+        if not x.any() or not y.any():
+            hd.append(np.nan)
+            msd.append(np.nan)
+            continue
+        idx = np.argwhere(x | y)
+        lo = np.maximum(idx.min(0) - 2, 0)
+        hi = idx.max(0) + 3
+        box = tuple(slice(int(i), int(j)) for i, j in zip(lo, hi, strict=True))
+        x, y = np.pad(x[box], 1), np.pad(y[box], 1)
+        bx = x & ~ndimage.binary_erosion(x)
+        by = y & ~ndimage.binary_erosion(y)
+        dx = ndimage.distance_transform_edt(~bx, sampling=spacing)
+        dy = ndimage.distance_transform_edt(~by, sampling=spacing)
+        d = np.concatenate([dy[bx], dx[by]])
+        hd.append(float(np.percentile(d, 95)))
+        msd.append(float(d.mean()))
+    return np.asarray(hd), np.asarray(msd)
+
+
+def dice_judges(
+    lab: np.ndarray, base_lab: np.ndarray, labels: np.ndarray, spacing=(1.0, 1.0, 1.0)
+) -> dict[str, float]:
+    """Overlap (Dice) and boundary (HD95, mean surface distance, mm) of each label, summarised
+    over labels. The grid is prep_pair's 1 mm unless ``spacing`` says otherwise."""
+    lab = lab.astype(np.int32)
+    d = _dice_per_label(lab, base_lab, labels)
+    hd, msd = boundary_distances(lab, base_lab, labels, spacing)
     return {
         "dice_mean": float(np.nanmean(d)),
         "dice_median": float(np.nanmedian(d)),
         "dice_min": float(np.nanmin(d)),
+        "hd95_mean": float(np.nanmean(hd)),
+        "hd95_max": float(np.nanmax(hd)),
+        "msd_mean": float(np.nanmean(msd)),
     }
 
 
@@ -200,10 +243,18 @@ class WarpPairCheck(QwarpCheck):
         metrics=(
             Metric("truth.dice_mean_{tool}", "Mean label Dice", better="higher",
                    note="Source labels carried through each warp, against the base's manual labels."),
+            Metric("truth.hd95_mean_{tool}", "Label boundary distance, HD95 (mm, mean over labels)",
+                   note="95th percentile of the distance between each carried label's boundary and "
+                        "the base's, both ways; reads boundary errors that Dice averages away."),
+            Metric("truth.msd_mean_{tool}", "Label boundary distance, mean (mm, mean over labels)"),
+            Metric("deformation.logjac_sd_{tool}", "Spread of log det J in the brain (SD)",
+                   note="How hard the warp deforms: a tool can buy overlap by warping harder."),
             Metric("label_loss.label_vol_ratio_min_{tool}", "Smallest label kept (volume after warp / after affine)",
                    better="higher", line=0.5, line_label="lost"),
             Metric("deformation.frac_det_below_half_{tool}", "Brain squeezed below half its volume (share)"),
         ),
+        tradeoff=(("truth.dice_mean_{tool}", "deformation.logjac_sd_{tool}"),
+                  ("truth.hd95_mean_{tool}", "deformation.logjac_sd_{tool}")),
         speedup=(("ffs_qwarp", "ref_3dqwarp"), ("ffs_qwarp_afni", "ref_3dqwarp"), ("ffs_formwarp", "ref"), ("ffs_optiwarp_hs", "ref"),
                  ("ffs_optiwarp", "ref")),
         code=("fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_pair"),

@@ -37,6 +37,10 @@ class ReportSpec:
     # (ffs sides, reference sides): '+' sums sides, for a chain against one reference tool
     speedup: tuple[tuple[str, str], ...] = ()
     difficulty: tuple[str, str] | None = None  # (metric key, axis label)
+    # (y metric key, x metric key), both with {tool}: each tool's median of y against its
+    # median of x, e.g. label overlap against how hard the warp deforms. A score that a
+    # tool buys by warping harder shows as a move along x, not a win.
+    tradeoff: tuple[tuple[str, str], ...] = ()
     # Entry modules of the tools under test (CLI + check): a unit is drawn hollow when a file
     # they import changed between its run's commit and the newest run's.
     code: tuple[str, ...] = ()

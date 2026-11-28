@@ -245,3 +245,23 @@ def test_reml_rest_run_is_not_applicable(tmp_path):
         chk.run({}, {"sub-01_task-rest_bold.nii.gz": img, ev.name: ev}, tmp_path / "w", "cpu")
     with pytest.raises(NotApplicableError):
         chk.run({}, {"sub-01_task-rest_bold.nii.gz": img}, tmp_path / "w", "cpu")
+
+
+def test_boundary_distances_shifted_cube():
+    """A cube shifted by 2 voxels along x: identical labels score 0; the shifted one has
+    HD95 2 mm (the faces that moved) and a mean below that (the side faces barely moved)."""
+    from fastfuncstuff.benchmark.checks.warp_pair import boundary_distances, dice_judges
+
+    a = np.zeros((30, 30, 30), np.int32)
+    a[8:20, 8:20, 8:20] = 1
+    b = np.roll(a, 2, axis=0)
+    hd, msd = boundary_distances(a, a, np.array([1]))
+    assert hd[0] == 0 and msd[0] == 0
+    hd, msd = boundary_distances(a, b, np.array([1]))
+    assert abs(hd[0] - 2.0) < 1e-6 and 0 < msd[0] < 2.0
+    hd2, _ = boundary_distances(a, b, np.array([1]), spacing=(2.0, 1.0, 1.0))
+    assert abs(hd2[0] - 4.0) < 1e-6  # spacing scales the distance
+    hd, _ = boundary_distances(a, b, np.array([1, 7]))
+    assert np.isnan(hd[1])  # a label one side lacks
+    j = dice_judges(b, a, np.array([1]))
+    assert abs(j["hd95_mean"] - 2.0) < 1e-6 and j["dice_mean"] < 1

@@ -466,6 +466,35 @@ def fig_difficulty(df, m: Metric, spec, pal, out: Path, stem: str) -> str | None
     return _save(fig, out, stem, d)
 
 
+def fig_tradeoff(df, ykey: str, xkey: str, spec: ReportSpec, out: Path, stem: str) -> str | None:
+    """Each tool's median y against its median x (interquartile bars), units faint behind."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    by_key = {m.key: m for m in spec.metrics}
+    ym = by_key.get(ykey, Metric(ykey, ykey))
+    xm = by_key.get(xkey, Metric(xkey, xkey))
+    d = metric_long(df, ym, spec).merge(
+        metric_long(df, xm, spec)[["unit_id", "tool", "value"]].rename(columns={"value": "x"}),
+        on=["unit_id", "tool"],
+    )
+    if d.empty or d.tool.nunique() < 2:
+        return None
+    order = [t for t in spec.tools.values() if t in set(d.tool)]
+    pal = dict(zip(order, sns.color_palette("dark", len(order)), strict=False))
+    fig, ax = plt.subplots(figsize=(5.2, 3.6))
+    for t in order:
+        g = d[d.tool == t]
+        ax.scatter(g.x, g.value, s=6, color=pal[t], alpha=0.18, lw=0)
+        qx, qy = g.x.quantile([0.25, 0.5, 0.75]), g.value.quantile([0.25, 0.5, 0.75])
+        ax.errorbar(qx[0.5], qy[0.5], xerr=[[qx[0.5] - qx[0.25]], [qx[0.75] - qx[0.5]]],
+                    yerr=[[qy[0.5] - qy[0.25]], [qy[0.75] - qy[0.5]]], fmt="o", ms=6,
+                    color=pal[t], capsize=2, lw=1, label=t)  # fmt: skip
+    ax.set(xlabel=_wrap(xm.label, 44), ylabel=_wrap(ym.label))
+    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=7)
+    return _save(fig, out, stem, d)
+
+
 def fig_timing(tim: pd.DataFrame, spec: ReportSpec, out: Path, stem: str) -> str | None:
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -673,6 +702,17 @@ def build_section(root: Path, check: str, spec: ReportSpec, out: Path) -> dict |
                     "caption": f"<b>{html.escape(first.label)} against {html.escape(spec.difficulty[1])}.</b> "
                                f"{_who(df)}. Read failures against how hard the data was.",
                 })  # fmt: skip
+    for i, (ykey, xkey) in enumerate(spec.tradeoff):
+        stem = f"{check}_tradeoff{i:02d}"
+        if fig_tradeoff(df, ykey, xkey, spec, out, stem):
+            better = next((m.better for m in spec.metrics if m.key == ykey), "none")
+            acc.append({
+                "stem": stem, "alt": "trade-off", "fail": "", "nfail": 0,
+                "caption": f"<b>Trade-off.</b> {_who(df)}. Each tool's median (interquartile "
+                           f"bars; units faint) of the score ({better} is better) against how hard "
+                           "its warp deforms. A tool that wins only by moving right bought the "
+                           "score with deformation; a fair win is up/down at the same x.",
+            })  # fmt: skip
     tims = []
     if fig_timing(tim, spec, out, f"{check}_timing"):
         tims.append({
