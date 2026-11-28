@@ -106,3 +106,29 @@ def test_arch_labels_are_short():
     assert arch_label("cpu", "Intel(R) Xeon(R) W-2133 CPU @ 3.60GHz", None) == "Xeon W-2133 (CPU)"
     assert arch_label("cpu", "AMD EPYC 9555 64-Core Processor", None) == "EPYC 9555 (CPU)"
     assert arch_label("cuda", None, "NVIDIA GeForce RTX 5070 Ti") == "RTX 5070 Ti (CUDA)"
+
+
+def test_estimated_speedup_from_calibration_units():
+    """Chronos ran the reference on 3 units (twice the server's time), ffs on all 5: units
+    4 and 5 get the server's time x 2, flagged as estimated; 1-3 are not re-estimated."""
+    import pandas as pd
+
+    from fastfuncstuff.benchmark.report import estimated_speedups
+
+    rows = []
+    for uid in range(1, 6):
+        rows.append(("epyc", uid, "ref", "cpu", 100.0, "EPYC", "EPYC 9555 (CPU)"))
+        rows.append(("local", uid, "ffs_a", "cuda", 4.0, "Xeon", "RTX 9999 (CUDA)"))
+        rows.append(("local", uid, "ffs_b", "cuda", 6.0, "Xeon", "RTX 9999 (CUDA)"))
+        if uid <= 3:
+            rows.append(("local", uid, "ref", "cpu", 200.0, "Xeon", "W-2133 (CPU)"))
+    tim = pd.DataFrame(rows, columns=["host", "unit_id", "side", "device", "seconds",
+                                      "host.cpu_model", "arch"]).assign(dataset="dsA")  # fmt: skip
+    est = estimated_speedups(tim, SPEC)
+    assert sorted(est.unit_id) == [4, 5]
+    assert (est.speedup == 20.0).all() and (est.calib_n == 3).all()
+    assert set(est.ref_arch) == {"W-2133 (CPU)"} and set(est.calib_from) == {"EPYC 9555 (CPU)"}
+    # with two calibration units the ratio is not trusted
+    assert estimated_speedups(
+        tim[~((tim.unit_id == 3) & (tim.side == "ref") & (tim.host == "local"))], SPEC
+    ).empty

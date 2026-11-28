@@ -258,6 +258,72 @@ def speedups(tim: pd.DataFrame, spec: ReportSpec) -> pd.DataFrame:
                     "ffs_s": gd.seconds.sum(), "ref_s": ref_s,
                     "speedup": ref_s / gd.seconds.sum(),
                 })  # fmt: skip
+    meas = pd.DataFrame(rows)
+    est = estimated_speedups(tim, spec)
+    if len(meas):
+        meas["estimated"] = False
+    return pd.concat([meas, est], ignore_index=True) if len(est) else meas
+
+
+MIN_CALIBRATION = 3
+
+
+def estimated_speedups(tim: pd.DataFrame, spec: ReportSpec) -> pd.DataFrame:
+    """Speed-ups on a machine that ran ffs on a unit but not the reference.
+
+    The reference time there is estimated from another machine that did run it: that
+    machine's time on the unit x the median ratio of the two machines' reference times
+    over the units both ran (the calibration units, at least MIN_CALIBRATION). This is
+    what lets the slow references run on the server alone while Chronos and the Mac still
+    report reference CPU -> ffs CPU -> ffs GPU on their own hardware. The spread of the
+    ratio is kept, so the figure can say how far to trust it."""
+    if tim.empty:
+        return pd.DataFrame()
+    t = tim.assign(machine=tim["host.cpu_model"].fillna(tim.host))
+    rows = []
+    for ffs_sides, ref_sides in spec.speedup:
+        fs, rs = ffs_sides.split("+"), ref_sides.split("+")
+        r = t[t.side.isin(rs)]
+        # per (machine, unit): the reference sides' total, only where all of them ran
+        ok = r.groupby(["machine", "unit_id"]).side.nunique() == len(rs)
+        ref = (r.groupby(["machine", "unit_id", "side"]).seconds.min()
+               .groupby(["machine", "unit_id"]).sum()[ok])  # fmt: skip
+        if ref.empty:
+            continue
+        ref_arch = r.groupby("machine").arch.first()
+        by_m = ref.unstack("machine")
+        f = t[t.side.isin(fs)]
+        for (m, uid, _dev), g in f.groupby(["machine", "unit_id", "device"]):
+            if set(g.side) != set(fs) or (
+                m in by_m and uid in by_m.index and by_m.at[uid, m] == by_m.at[uid, m]
+            ):
+                continue  # measured, or incomplete
+            if m not in by_m or uid not in by_m.index:
+                continue
+            best = None
+            for other in by_m.columns:
+                if other == m or by_m.at[uid, other] != by_m.at[uid, other]:
+                    continue
+                both = by_m[[m, other]].dropna()
+                if len(both) < MIN_CALIBRATION:
+                    continue
+                q = both[m] / both[other]
+                if best is None or len(both) > best[1]:
+                    best = (other, len(both), q.median(), q.quantile(0.25), q.quantile(0.75))
+            if best is None:
+                continue
+            other, n, ratio, q1, q3 = best
+            ref_s = by_m.at[uid, other] * ratio
+            ffs_s = g.seconds.sum()
+            rows.append({
+                "host": g.host.iloc[0], "unit_id": uid, "dataset": g.dataset.iloc[0],
+                "pair": f"{' + '.join(spec.timing.get(s, s) for s in fs)} vs "
+                        f"{' + '.join(spec.timing.get(s, s) for s in rs)}",
+                "ffs_arch": g.arch.iloc[0], "ref_arch": ref_arch.get(m, m),
+                "ffs_s": ffs_s, "ref_s": ref_s, "speedup": ref_s / ffs_s, "estimated": True,
+                "calib_from": ref_arch.get(other, other), "calib_n": n,
+                "calib_ratio": ratio, "calib_q1": q1, "calib_q3": q3,
+            })  # fmt: skip
     return pd.DataFrame(rows)
 
 
@@ -529,7 +595,10 @@ def fig_speedup(sp: pd.DataFrame, out: Path, stem: str) -> str | None:
 
     if sp.empty:
         return None
-    sp = sp.assign(row=sp.pair + "\n" + sp.ffs_arch + " vs " + sp.ref_arch)
+    est = sp["estimated"].fillna(False).astype(bool) if "estimated" in sp else False
+    sp = sp.assign(
+        row=sp.pair + "\n" + sp.ffs_arch + " vs " + sp.ref_arch + np.where(est, " (est.)", "")
+    )
     pairs = list(dict.fromkeys(sp.pair))  # the spec's order: its first pair is the headline
     sp = sp.assign(_k=sp.pair.map(pairs.index))
     rows = list(dict.fromkeys(sp.sort_values(["_k", "ffs_arch"], kind="stable").row))
@@ -558,12 +627,19 @@ def fig_overview(sp_all: pd.DataFrame, out: Path, stem: str) -> str | None:
     if sp_all.empty:
         return None
     first = sp_all.groupby("check").pair.transform("first") == sp_all.pair
-    med = (
-        sp_all[first]
-        .groupby(["check", "ffs_arch"]).speedup.median().unstack()
-    )  # fmt: skip
+    est = sp_all.get("estimated", pd.Series(False, index=sp_all.index)).fillna(False).astype(bool)
+
+    def med_of(sel):
+        return sp_all[first & sel].groupby(["check", "ffs_arch"]).speedup.median().unstack()
+
+    meas, guess = med_of(~est), med_of(est)
+    # a cell with no measured reference on that machine shows the calibrated estimate, "~"
+    med = meas.combine_first(guess) if len(guess) else meas
+    is_est = med.isna() if not len(guess) else meas.reindex_like(med).isna() & med.notna()
+    labels = med.map(lambda v: f"{v:.1f}×" if v == v else "")
+    labels = labels.where(~is_est, "~" + labels)
     fig, ax = plt.subplots(figsize=(1.3 * med.shape[1] + 2.2, 0.45 * med.shape[0] + 1.0))
-    sns.heatmap(np.log2(med), annot=med.map(lambda v: f"{v:.1f}×" if v == v else ""),
+    sns.heatmap(np.log2(med), annot=labels,
                 fmt="", cmap="RdBu", center=0, vmin=-4, vmax=4, cbar=False,
                 linewidths=0.6, linecolor="white", ax=ax)  # fmt: skip
     ax.set(xlabel="ffs runs on", ylabel="")
@@ -580,7 +656,9 @@ def _code_line(df: pd.DataFrame) -> tuple[str, bool]:
     # Hosts score on site, so the judges can differ as well as the code they judge.
     sc = df["scorer.check_hash"].fillna("?").str[:8].value_counts()
     scored = ", ".join(f"{s} ({n})" for s, n in sc.items())
-    return f"ffs code: {text}; scorer: {scored}", len(shas) > 1 or len(sc.drop("?", errors="ignore")) > 1
+    return f"ffs code: {text}; scorer: {scored}", len(shas) > 1 or len(
+        sc.drop("?", errors="ignore")
+    ) > 1
 
 
 def _who(df: pd.DataFrame) -> str:
@@ -648,6 +726,7 @@ td,th{border-bottom:1px solid var(--line);padding:2px 8px;text-align:right}td:fi
 {% if overview %}<figure><img src="{{ overview }}.svg" alt="speed-up overview">
 <figcaption><b>Speed-up overview.</b> Median reference time / ffs time per unit, for each check's
 first comparison, by the architecture ffs ran on (the reference runs on that host's CPU).
+"~" marks a cell estimated from calibration units: that machine ran ffs but not the reference.
 <a href="{{ overview }}.pdf">pdf</a> · <a href="{{ overview }}.csv">csv</a></figcaption></figure>{% endif %}
 {{ summary_table }}
 {% for s in sections %}
@@ -732,7 +811,10 @@ def build_section(root: Path, check: str, spec: ReportSpec, out: Path) -> dict |
             "caption": "<b>Speed-up.</b> Reference time / ffs time on the same unit and host; grey "
                        "dots are units, black the median with its 95% bootstrap interval, the median "
                        "printed at the right. Right of the dashed line, ffs is faster. A chain "
-                       "(a + b) is timed in full against the reference that does the same job.",
+                       "(a + b) is timed in full against the reference that does the same job. "
+                       "Rows marked (est.): that machine did not run the reference on these units; "
+                       "its time is another machine's x the median ratio of the two over the "
+                       "units both ran (the csv has the ratio, its quartiles and n).",
         })  # fmt: skip
     ag = agreement(allruns, spec)
     metric_cols = [c for c in df.columns if "." in c and c.split(".")[0] not in PROV_KEYS]
