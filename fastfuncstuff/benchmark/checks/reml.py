@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+from ..report_spec import Metric, ReportSpec
 from ..validation import compare_bucket_volumes
 from .base import (
     Check,
@@ -149,6 +150,22 @@ class RemlCheck(Check):
     needs = [["events"]]
     sampling = "breadth"
     reference = "AFNI 3dREMLfit"
+    report = ReportSpec(
+        summary="GLM with ARMA(1,1) noise on a task run: ffs_reml against 3dREMLfit, same "
+        "design matrix (parity settings; _default is ffs's own defaults).",
+        tools={},
+        timing={"ref": "3dREMLfit", "ffs": "ffs_reml (parity)", "ffs_default": "ffs_reml"},
+        references=("ref",),
+        metrics=(
+            Metric("reference.reml_min_r", "REML betas, lowest r over regressors", better="higher"),
+            Metric("reference.a_r", "ARMA a, r with 3dREMLfit", better="higher"),
+            Metric("reference.b_r", "ARMA b, r with 3dREMLfit", better="higher"),
+            Metric("reference.reml_min_r_default", "REML betas (ffs defaults), lowest r", better="higher"),
+        ),
+        speedup=(("ffs", "ref"), ("ffs_default", "ref")),
+        difficulty=("reference.n_regressors", "regressors"),
+        code=("fastfuncstuff.cli.reml", "fastfuncstuff.benchmark.checks.reml"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]

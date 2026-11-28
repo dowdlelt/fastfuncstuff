@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import census
+from ..report_spec import Metric, ReportSpec
 from .base import (
     Check,
     UnitResult,
@@ -107,6 +108,21 @@ class SegmentCheck(Check):
     needs = [["@ds:anat_t1"]]
     sampling = "depth"
     reference = "SPM25 unified segmentation"
+    report = ReportSpec(
+        summary="Unified segmentation of a T1w: ffs_segment against SPM25, and both against "
+        "manual labels.",
+        tools={"ref": "SPM25", "ffs": "ffs_segment"},
+        timing={"ref": "SPM25", "ffs": "ffs_segment"},
+        references=("ref",),
+        metrics=(
+            Metric("truth.gm_dice_{tool}", "GM Dice with the manual labels", better="higher"),
+            Metric("truth.wm_dice_{tool}", "WM Dice with the manual labels", better="higher"),
+            Metric("reference.gm_dice", "GM Dice with SPM", better="higher"),
+            Metric("reference.csf_dice", "CSF Dice with SPM", better="higher"),
+        ),
+        speedup=(("ffs", "ref"),),
+        code=("fastfuncstuff.cli.segment", "fastfuncstuff.benchmark.checks.segment"),
+    )  # fmt: skip
     timeout_s = 3 * 3600.0
 
     def qualifies(self, manifest, acq):

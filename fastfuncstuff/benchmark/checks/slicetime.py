@@ -6,6 +6,7 @@ The frozen input is the raw first-echo magnitude and the SliceTiming its sidecar
 
 from __future__ import annotations
 
+from ..report_spec import Metric, ReportSpec
 from ..validation import compare_timeseries_4d
 from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
@@ -19,6 +20,19 @@ class SlicetimeCheck(Check):
     needs = [["slice_timing", "epi_2d"]]
     sampling = "breadth"
     reference = "AFNI 3dTshift"
+    report = ReportSpec(
+        summary="Slice timing on the raw run: ffs_slicetime against 3dTshift, same pattern file.",
+        tools={},
+        timing={"ref": "3dTshift", "ffs": "ffs_slicetime"},
+        references=("ref",),
+        metrics=(
+            Metric("reference.median_r", "Voxel time series, median r with 3dTshift", better="higher"),
+            Metric("reference.frac_above_0.99", "Share of voxels with r > 0.99", better="higher"),
+        ),
+        speedup=(("ffs", "ref"),),
+        difficulty=("reference.n_shots", "excitations (shots) per volume"),
+        code=("fastfuncstuff.cli.slicetime", "fastfuncstuff.benchmark.checks.slicetime"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]

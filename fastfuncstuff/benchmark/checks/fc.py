@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import Check, UnitResult, afni_version, cpu_threads, ffs_threads, ffs_version, timed
 
 CUBE_MM = 15.0
@@ -71,6 +72,22 @@ class FcCheck(Check):
     needs = [["rest"]]
     sampling = "breadth"
     reference = "AFNI 3dNetCorr"
+    report = ReportSpec(
+        summary="ROI correlation matrices: ffs_fc (parity) against 3dNetCorr on the same ROIs; "
+        "_default is ffs's own cleaning, compared with parity.",
+        tools={},
+        timing={"ref": "3dNetCorr", "ffs": "ffs_fc (parity)", "ffs_default": "ffs_fc"},
+        references=("ref",),
+        metrics=(
+            Metric("reference.cc_max_abs_diff", "Largest |r difference|", log=True),
+            Metric("reference.fz_max_abs_diff", "Largest |Fisher z difference|", log=True),
+            Metric("intrinsic.default_vs_parity_r", "ffs defaults vs parity, r", better="none",
+                   note="How far ffs's own cleaning moves the matrix; a difference, not an error."),
+        ),
+        speedup=(("ffs", "ref"),),
+        difficulty=("reference.n_rois", "ROIs"),
+        code=("fastfuncstuff.cli.fc", "fastfuncstuff.benchmark.checks.fc"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import (
     Check,
     UnitResult,
@@ -79,6 +80,21 @@ class NordicCheck(Check):
     needs = [["phase"]]
     sampling = "breadth"
     reference = "MATLAB NIFTI_NORDIC"
+    report = ReportSpec(
+        summary="NORDIC on magnitude + phase: ffs_nordic (parity, default) against MATLAB "
+        "NIFTI_NORDIC.",
+        tools={"raw": "raw", "ref": "NIFTI_NORDIC", "ffs": "ffs_nordic (parity)",
+               "ffs_default": "ffs_nordic"},
+        timing={"ref": "NIFTI_NORDIC", "ffs": "ffs_nordic (parity)", "ffs_default": "ffs_nordic"},
+        references=("raw", "ref"),
+        metrics=(
+            Metric("intrinsic.tsnr_{tool}", "Median tSNR", better="higher", log=True),
+            Metric("reference.ts_median_r", "Denoised series, median r with MATLAB", better="higher"),
+            Metric("reference.gfactor_r", "g-factor map, r with MATLAB", better="higher"),
+        ),
+        speedup=(("ffs", "ref"), ("ffs_default", "ref")),
+        code=("fastfuncstuff.cli.nordic", "fastfuncstuff.benchmark.checks.nordic"),
+    )  # fmt: skip
     timeout_s = 4 * 3600.0
 
     def unit_inputs(self, files, index):

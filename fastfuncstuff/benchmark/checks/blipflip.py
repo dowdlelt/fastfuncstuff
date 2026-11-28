@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import census
+from ..report_spec import Metric, ReportSpec
 from .base import Check, UnitResult, _stable_rank, cpu_threads, ffs_threads, ffs_version, timed
 
 TOPUP_CONFIG = "b02b0.cnf"
@@ -65,6 +66,23 @@ class BlipflipCheck(Check):
     needs = [["@ds:fmap_epi"]]
     sampling = "breadth"
     reference = "FSL topup"
+    report = ReportSpec(
+        summary="Field from a blip-up/blip-down pair: ffs_blipflip (standard, workhard) against "
+        "topup b02b0; judged by how well the corrected pair agrees and by the field itself.",
+        tools={"raw": "uncorrected", "topup": "topup", "ffs": "ffs_blipflip",
+               "ffs_workhard": "ffs_blipflip workhard"},
+        timing={"ref": "topup", "ffs": "ffs_blipflip", "ffs_workhard": "ffs_blipflip workhard"},
+        references=("raw", "topup", "ref"),
+        metrics=(
+            Metric("consistency.updown_r_{tool}", "Corrected up vs down, r", better="higher",
+                   note="The two corrected images should be one image; raw shows the start."),
+            Metric("consistency.updown_nrms_{tool}", "Corrected up vs down, normalised RMS"),
+            Metric("reference.field_r", "Field, r with topup's", better="higher"),
+            Metric("reference.field_median_abs_diff_hz", "Field, median |difference| (Hz)"),
+        ),
+        speedup=(("ffs", "ref"), ("ffs_workhard", "ref")),
+        code=("fastfuncstuff.cli.blipflip", "fastfuncstuff.benchmark.checks.blipflip"),
+    )  # fmt: skip
 
     def plan(self, manifest, index, n):
         """Up to ``n`` pairs per fmap acquisition label, distinct subjects first."""

@@ -19,6 +19,7 @@ import json
 
 import numpy as np
 
+from ..report_spec import Metric, ReportSpec
 from .base import Check, UnitResult, ffs_threads, ffs_version, timed
 
 PLV_RIGHT = 0.5
@@ -88,6 +89,20 @@ class PhysioCheck(Check):
     needs = [["epi_2d", "slice_timing", "physio_cardiac"]]
     sampling = "breadth"
     reference = "recorded physiology"
+    report = ReportSpec(
+        summary="Cardiac and respiratory rates found in the data by ffs_physio, against the "
+        "recorded physiology (no reference tool: the recording is the truth).",
+        tools={},
+        timing={"ffs": "ffs_physio"},
+        metrics=(
+            Metric("truth.card_right", "Cardiac rate right", better="higher", kind="rate"),
+            Metric("truth.card_wrong", "Cardiac rate confidently wrong", kind="rate"),
+            Metric("truth.card_rate_abs_err_per_min", "Cardiac rate |error| (per min)", log=True),
+            Metric("truth.card_plv", "Cardiac phase locking with the recording", better="higher"),
+            Metric("truth.resp_plv", "Respiratory phase locking with the recording", better="higher"),
+        ),
+        code=("fastfuncstuff.cli.physio", "fastfuncstuff.benchmark.checks.physio"),
+    )  # fmt: skip
 
     def unit_inputs(self, files, index):
         mags = [f for f in files if f.ent.get("part") != "phase" and f.suffix != "phase"]
