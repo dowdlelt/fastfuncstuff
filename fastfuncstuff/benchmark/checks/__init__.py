@@ -11,6 +11,7 @@ from .base import Check, UnitResult
 from .blipflip import BlipflipCheck
 from .fc import FcCheck
 from .locomoco import LocomocoCheck
+from .melodic import MelodicCheck
 from .moco import MocoCheck
 from .nordic import NordicCheck
 from .physio import PhysioCheck
@@ -37,6 +38,7 @@ CHECKS: dict[str, type[Check]] = {
         WarpPairCheck,
         WarpMniCheck,
         LocomocoCheck,
+        MelodicCheck,
     )
 }
 
