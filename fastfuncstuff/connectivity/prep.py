@@ -99,8 +99,11 @@ def has_baseline(rows: Tensor, run_starts: Sequence[int] = (0,)) -> bool:
     BOLD intensities do (a mean far above the fluctuation); residuals, demeaned or
     z-scored series and difference images do not, and percent change of those divides
     by ~0 -- every ROI mean is then whichever voxels happen to sit nearest zero.
-    Judged per run on the median voxel: mean above 5 standard deviations, and almost
-    no voxel with a non-positive mean.
+    Judged per run on the median voxel: almost no non-positive mean, mean above the
+    raw standard deviation, and mean above 5x the frame-to-frame fluctuation
+    (``diff.std() / sqrt(2)``) so a real positive BOLD run with strong slow scanner
+    drift (e.g. Philips Ingenia gain drift in ds003469 sub-173) is not mistaken for
+    demeaned data.
     """
     if rows.numel() == 0:
         return False
@@ -111,7 +114,17 @@ def has_baseline(rows: Tensor, run_starts: Sequence[int] = (0,)) -> bool:
         sd = seg.std(1)
         if float((mean <= 0).float().mean()) > 0.01:
             return False
-        if not float(mean.median()) > 5.0 * float(sd.median()):
+        med_mean = float(mean.median())
+        med_sd = float(sd.median())
+        if not med_mean > med_sd:
+            return False
+        if seg.shape[1] >= 2:
+            # First-difference std / sqrt(2) measures local fluctuation without slow drift.
+            med_local = float((seg.diff(dim=1).std(1) / (2.0**0.5)).median())
+            eff_sd = min(med_sd, med_local)
+        else:
+            eff_sd = med_sd
+        if not med_mean > 5.0 * eff_sd:
             return False
     return True
 

@@ -648,3 +648,23 @@ def test_node_entropy_and_profile_similarity_match_the_reference_formulas():
     _, overlap = com.node_profile(n)
     np.testing.assert_allclose(overlap, enorm, atol=1e-12)
     np.testing.assert_allclose(com.profile_similarity(n), sim, atol=1e-12)
+
+
+def test_has_baseline_accepts_drifting_positive_bold_and_rejects_demeaned():
+    """ds003469 sub-173 is positive raw BOLD whose scanner gain drifted ~1.7x mid-run
+    (mean/raw_sd = 4.26 < 5, but mean/local_sd >> 5). has_baseline must still accept it
+    while rejecting demeaned, z-scored, or half-rectified noise."""
+    from fastfuncstuff.connectivity.prep import has_baseline
+
+    g = torch.Generator().manual_seed(21)
+    t = torch.linspace(0.0, 1.0, 300)
+    # Positive BOLD with a large mid-run gain step (like ds003469 sub-173)
+    drift = 20000.0 + 14000.0 * torch.sigmoid((t - 0.5) * 20.0)
+    bold_drift = drift[None, :] + 500.0 * torch.randn(50, 300, generator=g)
+    assert float(bold_drift.mean(1).median()) < 5.0 * float(bold_drift.std(1).median())
+    assert has_baseline(bold_drift)
+
+    # Demeaned / z-scored / shifted low-SNR noise must still be rejected
+    assert not has_baseline(torch.randn(50, 300, generator=g))
+    assert not has_baseline(torch.randn(50, 300, generator=g).clamp_min(0.0))
+    assert not has_baseline(2.0 + torch.randn(50, 300, generator=g))
