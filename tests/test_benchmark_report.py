@@ -132,3 +132,38 @@ def test_estimated_speedup_from_calibration_units():
     assert estimated_speedups(
         tim[~((tim.unit_id == 3) & (tim.side == "ref") & (tim.host == "local"))], SPEC
     ).empty
+
+
+def test_accuracy_prefers_a_complete_run_over_a_later_ffs_only_one(tmp_path):
+    """The server ran the unit whole; Chronos later ran it ffs-only (no reference judges).
+    Accuracy keeps the server's row; both runs feed the timings."""
+    root = tmp_path / "bench"
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("toy", "dsA", [({"sub": "01"}, ["x"])])
+    uid = wl.claim_next()["id"]
+    _run(wl, uid, "sha00000", 0.2, "cpu", "AMD EPYC 9555 64-Core Processor")
+    hs_dir = tmp_path / "hs"
+    hs = Worklist(hs_dir / "worklist.sqlite")
+    hs.db.execute(
+        "INSERT INTO units (id, check_name, dataset, unit_key, inputs, added_at)"
+        " VALUES (?, 'toy', 'dsA', '{\"sub\": \"01\"}', '[\"x\"]', ?)",
+        (uid, time.time()),
+    )
+    hs.db.commit()
+    hs.claim_next()
+    time.sleep(0.01)
+    hs.record_metrics(uid, "truth", {"err_ffs": 9.0})
+    hs.record_timing(uid, "ffs_a", "cuda", 1.0, None)
+    hs.record_timing(uid, "ffs_b", "cuda", 1.0, None)
+    hs.record_provenance(uid, "run", {"sides": "ffs"})
+    hs.finish(uid, "done")
+    hs.close()
+    wl.db.execute(
+        "INSERT INTO hostsets VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("abc", "chronos", str(hs_dir), "c", "Xeon", 1, 0, time.time()),
+    )
+    wl.db.commit()
+    wl.close()
+    allruns, df, tim = load_check(root, "toy")
+    assert len(allruns) == 2 and df.iloc[0]["truth.err_ffs"] == 0.2
+    assert set(tim.device) == {"cpu", "cuda"}

@@ -33,6 +33,7 @@ PROV_KEYS = {
     "worker": ("threads", "hostname"),
     "ffs": ("ffs_sha",),
     "scorer": ("check_hash",),  # recorded from 2026-11-28; older units show "?"
+    "run": ("sides",),  # "ffs" for an ffs-only run (work -run -sides ffs)
 }
 
 
@@ -196,7 +197,13 @@ def load_check(
     if not runs:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     allruns = pd.concat(runs, ignore_index=True)
-    latest = allruns.sort_values("finished_at").drop_duplicates("unit_id", keep="last")
+    # Accuracy comes from the latest complete run; an ffs-only run (no reference judges)
+    # counts only when nothing complete exists. Every run still feeds the timings.
+    if "run.sides" not in allruns:
+        allruns["run.sides"] = None
+    complete = allruns["run.sides"].fillna("all").eq("all")
+    latest = (allruns.assign(_c=complete).sort_values(["_c", "finished_at"])
+              .drop_duplicates("unit_id", keep="last").drop(columns="_c"))  # fmt: skip
     # A unit whose latest run predates a change to the tool's code is drawn hollow.
     shas = [s for s in latest["ffs.ffs_sha"].dropna().unique() if isinstance(s, str)]
     # commit date first; a commit git does not know falls back to when its runs finished

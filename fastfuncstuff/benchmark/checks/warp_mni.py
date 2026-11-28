@@ -124,6 +124,7 @@ class WarpMniCheck(Check):
         code=("fastfuncstuff.cli.allineate", "fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_mni"),
     )  # fmt: skip
     timeout_s = 4 * 3600.0
+    ffs_only_ok = True  # the reference is the slow part; ffs judges need no ref output
 
     def plan(self, manifest, index, n):
         """``n`` subjects, round-robin over the cohort's groups in a stable hash order, so a
@@ -205,60 +206,62 @@ class WarpMniCheck(Check):
             return out
 
         # -- @SSwarper, end to end on the head ------------------------------------------
-        sd, sub = work / "sswarper", "s"
-        sd.mkdir(exist_ok=True)
-        qq, qwarp, qaff = (
-            sd / f"anatQQ.{sub}.nii",
-            sd / f"anatQQ.{sub}_WARP.nii",
-            sd / f"anatQQ.{sub}.aff12.1D",
-        )
-        t = timed_cached(
-            ["@SSwarper", "-input", str(head), "-base", str(tpl), "-subid", sub, "-odir", str(sd),
-             "-extra_qc_off"],
-            sd / "fit.timing.json", [qq, qwarp, qaff], work, log, timeout_s=self.timeout_s,
-        )  # fmt: skip
-        res.timings.append(("ref", "cpu", t, threads))
-        judge(
-            "sswarper",
-            qq,
-            afni_labels(sd, f"{qwarp} {qaff}"),
-            afni_detj(sd, qwarp),
-            afni_affine_labels(sd, qaff),
-        )
-        # every output timed_cached checks stays, so `work -redo` can refit one ffs tool
-        # without paying for the references again
-        res.artifacts += [(qwarp, "host"), (qaff, "keep"), (qq, "host"),
-                          (sd / "fit.timing.json", "keep")]  # fmt: skip
+        if self.with_reference:
+            sd, sub = work / "sswarper", "s"
+            sd.mkdir(exist_ok=True)
+            qq, qwarp, qaff = (
+                sd / f"anatQQ.{sub}.nii",
+                sd / f"anatQQ.{sub}_WARP.nii",
+                sd / f"anatQQ.{sub}.aff12.1D",
+            )
+            t = timed_cached(
+                ["@SSwarper", "-input", str(head), "-base", str(tpl), "-subid", sub, "-odir", str(sd),
+                 "-extra_qc_off"],
+                sd / "fit.timing.json", [qq, qwarp, qaff], work, log, timeout_s=self.timeout_s,
+            )  # fmt: skip
+            res.timings.append(("ref", "cpu", t, threads))
+            judge(
+                "sswarper",
+                qq,
+                afni_labels(sd, f"{qwarp} {qaff}"),
+                afni_detj(sd, qwarp),
+                afni_affine_labels(sd, qaff),
+            )
+            # every output timed_cached checks stays, so `work -redo` can refit one ffs tool
+            # without paying for the references again
+            res.artifacts += [(qwarp, "host"), (qaff, "keep"), (qq, "host"),
+                              (sd / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- ANTs rigid + affine + SyN, from the cohort's brain extraction ----------------
-        ad = work / "ants"
-        ad.mkdir(exist_ok=True)
-        env = {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": str(threads)}
-        aw, aaff, awarped = (
-            ad / "ants_1Warp.nii.gz",
-            ad / "ants_0GenericAffine.mat",
-            ad / "ants_warped.nii.gz",
-        )
-        stages = [a.format(T=T, S=brain) for a in ANTS_STAGES]
-        t = timed_cached(
-            ["antsRegistration", "-d", "3", "-o", f"[{ad / 'ants_'},{awarped}]", "-n", "Linear",
-             "-u", "0", "-z", "1", "-w", "[0.005,0.995]", "-r", f"[{T},{brain},1]", *stages],
-            ad / "fit.timing.json", [aw, aaff, awarped], work, log,
-            timeout_s=self.timeout_s, env=env,
-        )  # fmt: skip
-        res.timings.append(("ref_ants", "cpu", t, threads))
-        alab, ajac = ad / "labels_mni.nii.gz", ad / "jac.nii.gz"
-        timed(["antsApplyTransforms", "-d", "3", "-i", str(labels), "-r", str(T), "-o", str(alab),
-               "-n", "NearestNeighbor", "-t", str(aw), "-t", str(aaff)], work, log, env=env)  # fmt: skip
-        timed(["CreateJacobianDeterminantImage", "3", str(aw), str(ajac), "0", "0"],
-              work, log, env=env)  # fmt: skip
-        alab_aff = ad / "labels_affine_mni.nii.gz"
-        timed(["antsApplyTransforms", "-d", "3", "-i", str(labels), "-r", str(T), "-o", str(alab_aff),
-               "-n", "NearestNeighbor", "-t", str(aaff)], work, log, env=env)  # fmt: skip
-        judge("ants", awarped, alab, _load(ajac).astype(np.float64), alab_aff)
-        res.artifacts += [(aw, "host"), (aaff, "keep"), (awarped, "host"),
-                          (ajac, "regenerable"), (ad / "ants_1InverseWarp.nii.gz", "regenerable"),
-                          (ad / "fit.timing.json", "keep")]  # fmt: skip
+        if self.with_reference:
+            ad = work / "ants"
+            ad.mkdir(exist_ok=True)
+            env = {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": str(threads)}
+            aw, aaff, awarped = (
+                ad / "ants_1Warp.nii.gz",
+                ad / "ants_0GenericAffine.mat",
+                ad / "ants_warped.nii.gz",
+            )
+            stages = [a.format(T=T, S=brain) for a in ANTS_STAGES]
+            t = timed_cached(
+                ["antsRegistration", "-d", "3", "-o", f"[{ad / 'ants_'},{awarped}]", "-n", "Linear",
+                 "-u", "0", "-z", "1", "-w", "[0.005,0.995]", "-r", f"[{T},{brain},1]", *stages],
+                ad / "fit.timing.json", [aw, aaff, awarped], work, log,
+                timeout_s=self.timeout_s, env=env,
+            )  # fmt: skip
+            res.timings.append(("ref_ants", "cpu", t, threads))
+            alab, ajac = ad / "labels_mni.nii.gz", ad / "jac.nii.gz"
+            timed(["antsApplyTransforms", "-d", "3", "-i", str(labels), "-r", str(T), "-o", str(alab),
+                   "-n", "NearestNeighbor", "-t", str(aw), "-t", str(aaff)], work, log, env=env)  # fmt: skip
+            timed(["CreateJacobianDeterminantImage", "3", str(aw), str(ajac), "0", "0"],
+                  work, log, env=env)  # fmt: skip
+            alab_aff = ad / "labels_affine_mni.nii.gz"
+            timed(["antsApplyTransforms", "-d", "3", "-i", str(labels), "-r", str(T), "-o", str(alab_aff),
+                   "-n", "NearestNeighbor", "-t", str(aaff)], work, log, env=env)  # fmt: skip
+            judge("ants", awarped, alab, _load(ajac).astype(np.float64), alab_aff)
+            res.artifacts += [(aw, "host"), (aaff, "keep"), (awarped, "host"),
+                              (ajac, "regenerable"), (ad / "ants_1InverseWarp.nii.gz", "regenerable"),
+                              (ad / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- ffs: autoproc's MNI affine, then each backend with -type MNI_T1a --------------
         fd = work / "ffs_affine"

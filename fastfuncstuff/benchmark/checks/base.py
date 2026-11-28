@@ -230,6 +230,12 @@ class Check:
     sampling = "breadth"  # breadth | depth | session
     reference = ""  # the reference tool, for reports
     timeout_s = 3600.0  # per command; a hung tool is killed and the unit marked failed
+    # ffs-only runs (work -run -sides ffs): a check whose reference is slow can skip it on a
+    # machine that is only there to time ffs. Such a run records its timings and the
+    # judges that need no reference output; the report takes accuracy from a complete run.
+    # Checks that cannot skip theirs run whole.
+    ffs_only_ok = False
+    with_reference = True  # set per unit by the runner
     # Set by the runner per unit from the manifest's curated block (census.unit_curation):
     # {"sidecar": {BIDS key: value}, "noise_volumes": int | None, "source": str}.
     curation: dict = {}

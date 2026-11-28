@@ -265,3 +265,29 @@ def test_boundary_distances_shifted_cube():
     assert np.isnan(hd[1])  # a label one side lacks
     j = dice_judges(b, a, np.array([1]))
     assert abs(j["hd95_mean"] - 2.0) < 1e-6 and j["dice_mean"] < 1
+
+
+def test_locomoco_score_without_reference_keeps_intrinsic_only():
+    """An ffs-only run (-sides ffs) has no ANTs series: moco and ffs intrinsic judges are
+    scored, the ANTs ones and every agreement judge are absent, not zero."""
+    import numpy as np
+
+    from fastfuncstuff.benchmark.checks.locomoco import score
+
+    rng = np.random.default_rng(1)
+    med = (100 + rng.normal(0, 5, (8, 8, 8))).astype(np.float32)
+    mask = np.ones(med.shape, bool)
+    series = np.repeat(med[..., None], 12, axis=3) + rng.normal(0, 1, (*med.shape, 12))
+    d = rng.normal(0, 0.3, series.shape)
+    full, agree = score(series, series, series, med, mask, d, d)
+    intr, none = score(series, None, series, med, mask, None, d)
+    assert none == {} and agree
+    assert not any(k.endswith("_ants") for k in intr) and "same_volumes_r" not in intr
+    assert {k: v for k, v in full.items() if not k.endswith("_ants") and k != "same_volumes_r"} == intr
+
+
+def test_ffs_only_flag_reaches_only_checks_that_can_skip_their_reference():
+    from fastfuncstuff.benchmark.checks import CHECKS
+
+    can = {n for n, c in CHECKS.items() if c.ffs_only_ok}
+    assert {"warp_mni", "warp_pair", "locomoco"} <= can and "moco" not in can

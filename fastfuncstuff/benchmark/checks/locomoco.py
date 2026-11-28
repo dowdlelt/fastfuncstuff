@@ -119,22 +119,31 @@ def _smoothed_pe_r(d_ants: np.ndarray, d_ffs: np.ndarray, mask: np.ndarray) -> f
 
 def score(
     moco: np.ndarray,
-    ants: np.ndarray,
+    ants: np.ndarray | None,
     ffs: np.ndarray,
     median: np.ndarray,
     mask: np.ndarray,
-    d_ants: np.ndarray,
+    d_ants: np.ndarray | None,
     d_ffs: np.ndarray,
 ) -> tuple[dict[str, float | None], dict[str, float | None]]:
-    """Both judges from (x, y, z, t) series and PE displacement fields: (intrinsic, agreement)."""
+    """Both judges from (x, y, z, t) series and PE displacement fields: (intrinsic, agreement).
+    Without the reference (an ffs-only run, ``ants`` None) only the intrinsic judges of
+    moco and ffs remain."""
     intr: dict[str, float | None] = {}
     vol_r = {}
-    for tag, series in (("moco", moco), ("ants", ants), ("ffs", ffs)):
+    sides = (
+        (("moco", moco), ("ants", ants), ("ffs", ffs))
+        if ants is not None
+        else (("moco", moco), ("ffs", ffs))
+    )
+    for tag, series in sides:
         for k, v in _intrinsic(series, median, mask).items():
             if k == "_vol_r":
                 vol_r[tag] = v
             else:
                 intr[f"{k}_{tag}"] = v
+    if ants is None or d_ants is None:
+        return intr, {}
     gain_a, gain_f = vol_r["ants"] - vol_r["moco"], vol_r["ffs"] - vol_r["moco"]
     same = _rowwise_r(gain_a[None], gain_f[None])[0]
     intr["same_volumes_r"] = float(same) if np.isfinite(same) else None
@@ -172,6 +181,7 @@ class LocomocoCheck(Check):
     sampling = "breadth"
     reference = "ANTs antsRegistration SyN per volume, deformation restricted to the PE axis"
     timeout_s = 4 * 3600.0
+    ffs_only_ok = True  # ffs-only keeps the intrinsic judges; agreement needs ANTs
     report = ReportSpec(
         summary=f"{N_VOLUMES} volumes of high-resolution 2-D EPI, moco'd once and shared: "
         "ffs_locomoco against antsRegistration SyN per volume (PE axis only), both to the "
@@ -264,8 +274,6 @@ class LocomocoCheck(Check):
         ffs_corr = ffs / "lm_locomoco.nii.gz"
         ffs_warp = ffs / "lm_warp.nii.gz"
 
-        # reference side: split, register each volume, merge -- all of it timed
-        t0 = time.monotonic()
         img = nib.load(str(moco))
         # The physical (LPS) component nearest the voxel PE axis, chosen as AFNI's
         # deobliqued (cardinal) frame chooses it -- the frame locomoco writes its warp
@@ -277,58 +285,64 @@ class LocomocoCheck(Check):
         restrict = "x".join("1" if c == comp else "0" for c in range(3))
         data = np.asarray(img.dataobj, dtype=np.float32)
         n_t = data.shape[3]
-        vols = []
-        for t in range(n_t):
-            p = ants / f"v{t:04d}.nii.gz"
-            nib.save(nib.Nifti1Image(data[..., t], img.affine, img.header), str(p))
-            vols.append(p)
-        split_s = time.monotonic() - t0
-        reg_s = 0.0
-        for t, p in enumerate(vols):
-            out = ants / f"v{t:04d}_"
-            reg_s += timed(
-                ["antsRegistration", *ANTS_ARGS, "-g", restrict, "-m", f"CC[{median},{p},1,2]",
-                 "-o", f"[{out},{out}w.nii.gz]"],
-                work, log, timeout_s=self.timeout_s,
+
+        # reference side: split, register each volume, merge -- all of it timed
+        ants_data = d_ants = None
+        vols: list = []
+        if self.with_reference:
+            t0 = time.monotonic()
+            for t in range(n_t):
+                p = ants / f"v{t:04d}.nii.gz"
+                nib.save(nib.Nifti1Image(data[..., t], img.affine, img.header), str(p))
+                vols.append(p)
+            split_s = time.monotonic() - t0
+            reg_s = 0.0
+            for t, p in enumerate(vols):
+                out = ants / f"v{t:04d}_"
+                reg_s += timed(
+                    ["antsRegistration", *ANTS_ARGS, "-g", restrict, "-m", f"CC[{median},{p},1,2]",
+                     "-o", f"[{out},{out}w.nii.gz]"],
+                    work, log, timeout_s=self.timeout_s,
+                )  # fmt: skip
+            t1 = time.monotonic()
+            ants_data = np.stack(
+                [np.asarray(nib.load(str(ants / f"v{t:04d}_w.nii.gz")).dataobj, np.float32)
+                 for t in range(n_t)], axis=3,
             )  # fmt: skip
-        t1 = time.monotonic()
-        ants_data = np.stack(
-            [np.asarray(nib.load(str(ants / f"v{t:04d}_w.nii.gz")).dataobj, np.float32)
-             for t in range(n_t)], axis=3,
-        )  # fmt: skip
-        ants_corr = ants / "corrected.nii.gz"
-        nib.save(nib.Nifti1Image(ants_data, img.affine, img.header), str(ants_corr))
-        merge_s = time.monotonic() - t1
-        res.timings.append(("ref", "cpu", split_s + reg_s + merge_s, cpu_threads()))
+            ants_corr = ants / "corrected.nii.gz"
+            nib.save(nib.Nifti1Image(ants_data, img.affine, img.header), str(ants_corr))
+            merge_s = time.monotonic() - t1
+            res.timings.append(("ref", "cpu", split_s + reg_s + merge_s, cpu_threads()))
+            # PE displacement in that component. Both fields are pull warps in LPS mm (ITK
+            # and DICOM agree on the axes).
+            d_ants = np.stack(
+                [np.asarray(nib.load(str(ants / f"v{t:04d}_0Warp.nii.gz")).dataobj,
+                            np.float32).reshape(*data.shape[:3], 3)[..., comp]
+                 for t in range(n_t)], axis=3,
+            )  # fmt: skip
+            res.artifacts += [(ants_corr, "regenerable"), *((p, "regenerable") for p in vols)]
+            res.artifacts += [(p, "regenerable") for p in ants.glob("v*_*")]
+            res.provenance["ref"] = {
+                "tool": "antsRegistration", "args": [*ANTS_ARGS, "-g", restrict],
+                "metric": "CC[median, volume, 1, 2]",
+                "seconds": {"split": split_s, "register": reg_s, "merge": merge_s},
+            }  # fmt: skip
 
         # judges
         med = np.asarray(nib.load(str(median)).dataobj, np.float32)
         mask = np.asarray(nib.load(str(mask_p)).dataobj) > 0
         lm = np.asarray(nib.load(str(ffs_corr)).dataobj, np.float32)
-        # PE displacement in that component. Both fields are pull warps in LPS mm (ITK and
-        # DICOM agree on the axes).
-        d_ants = np.stack(
-            [np.asarray(nib.load(str(ants / f"v{t:04d}_0Warp.nii.gz")).dataobj,
-                        np.float32).reshape(*data.shape[:3], 3)[..., comp]
-             for t in range(n_t)], axis=3,
-        )  # fmt: skip
         w = np.asarray(nib.load(str(ffs_warp)).dataobj, np.float32)
         d_ffs = w.reshape(*data.shape[:3], n_t, 3)[..., comp]
-        res.metrics["intrinsic"], res.metrics["agreement"] = score(
-            data, ants_data, lm, med, mask, d_ants, d_ffs
-        )
+        intr, agree = score(data, ants_data, lm, med, mask, d_ants, d_ffs)
+        res.metrics["intrinsic"] = intr
+        if agree:
+            res.metrics["agreement"] = agree
 
-        for p in (block, moco, ants_corr, ffs_corr, ffs_warp, *vols):
-            res.artifacts.append((p, "regenerable"))
-        for p in ants.glob("v*_*"):
+        for p in (block, moco, ffs_corr, ffs_warp):
             res.artifacts.append((p, "regenerable"))
         for p in (median, mask_p, log):
             res.artifacts.append((p, "keep"))
-        res.provenance["ref"] = {
-            "tool": "antsRegistration", "args": [*ANTS_ARGS, "-g", restrict],
-            "metric": "CC[median, volume, 1, 2]",
-            "seconds": {"split": split_s, "register": reg_s, "merge": merge_s},
-        }  # fmt: skip
         res.provenance["ffs"] = {
             "tool": "ffs_locomoco", **ffs_version(), "args": FFS_ARGS, "device": device,
             "pe_dir": ped,

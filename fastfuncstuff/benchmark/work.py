@@ -156,6 +156,7 @@ def run(
     keep: bool,
     until: float | None = None,
     gpu_wait_s: float = 300.0,
+    ffs_only: bool = False,
 ) -> int:
     import time
 
@@ -201,6 +202,7 @@ def run(
             from .census import unit_curation
 
             chk = checks[u["check_name"]]()
+            chk.with_reference = not (ffs_only and chk.ffs_only_ok)
             chk.curation = unit_curation(m, key.get("acq"))
             if chk.curation["sidecar"] or chk.curation["noise_volumes"] is not None or chk.curation["events_columns"]:  # fmt: skip
                 wl.record_provenance(u["id"], "curation", chk.curation)
@@ -218,6 +220,7 @@ def run(
             from .checks.base import scorer_version
 
             wl.record_provenance(u["id"], "scorer", scorer_version(chk))
+            wl.record_provenance(u["id"], "run", {"sides": "all" if chk.with_reference else "ffs"})
             from ..benchmark.arch import get_hardware_info
 
             wl.record_provenance(u["id"], "host", get_hardware_info(device))
@@ -397,6 +400,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-device", default="cuda", help="ffs device for -run (cpu, cuda, cuda,N, mps).")
     p.add_argument("-keep", action="store_true", help="Do not prune regenerable outputs.")
     p.add_argument(
+        "-sides",
+        choices=("all", "ffs"),
+        default="all",
+        help="-run: ffs = skip slow references (warp_mni, warp_pair, locomoco) on a machine "
+        "that is here to time ffs; the report estimates its reference time from calibration "
+        "units and takes accuracy from a complete run elsewhere. Other checks run whole.",
+    )
+    p.add_argument(
         "-workers",
         type=int,
         default=1,
@@ -476,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         child += ["-check", args.check] if args.check else []
         child += ["-until", args.until] if args.until else []
         child += ["-keep"] if args.keep else []
+        child += ["-sides", args.sides]
         wl.close()
         return launch(child, args.workers or None, args.threads, args.device, args.max_units)
     elif args.run:
@@ -500,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
             args.device,
             args.keep,
             until=deadline_from(args.until),
+            ffs_only=args.sides == "ffs",
         )
     elif args.status:
         for r in wl.status():

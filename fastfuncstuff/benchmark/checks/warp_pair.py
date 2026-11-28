@@ -260,6 +260,7 @@ class WarpPairCheck(QwarpCheck):
         code=("fastfuncstuff.cli.qwarp", "fastfuncstuff.cli.optiwarp", "fastfuncstuff.cli.formwarp", "fastfuncstuff.benchmark.checks.warp_pair"),
     )  # fmt: skip
     timeout_s = 4 * 3600.0
+    ffs_only_ok = True  # the reference is the slow part; ffs judges need no ref output
 
     def run(self, key, inputs, work, device):
         src_img, src_lab, base_img, base_lab = (inputs[r] for r in list(inputs)[:4])
@@ -319,36 +320,42 @@ class WarpPairCheck(QwarpCheck):
                                   (lab_ffs, "regenerable")])  # fmt: skip
 
         # -- ANTs SyN (every pair) ------------------------------------------------
-        ad = work / "ants"
-        ad.mkdir(exist_ok=True)
-        ants_warp = ad / "ants_0Warp.nii.gz"
-        env = {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": str(threads)}
-        t = timed_cached(
-            ["antsRegistration", "-d", "3", "-o", f"[{ad / 'ants_'},{ad / 'ants_warped.nii.gz'}]",
-             "-n", "Linear", "-u", "0", "-z", "1", "-w", "[0.005,0.995]",
-             "-m", f"CC[{B},{SA},1,4]", *ANTS_SYN],
-            ad / "fit.timing.json", [ants_warp, ad / "ants_warped.nii.gz"],
-            work, log, timeout_s=self.timeout_s, env=env,
-        )  # fmt: skip
-        res.timings.append(("ref", "cpu", t, threads))
-        lab = ad / "lab_warped.nii.gz"
-        timed(["antsApplyTransforms", "-d", "3", "-i", str(SLA), "-r", str(B), "-o", str(lab),
-               "-n", "NearestNeighbor", "-t", str(ants_warp)], work, log, env=env)  # fmt: skip
-        truth.update(
-            {f"{k}_ants": v for k, v in dice_judges(_load(lab), base_lab_v, labels).items()}
-        )
-        jac = ad / "jac.nii.gz"
-        timed(["CreateJacobianDeterminantImage", "3", str(ants_warp), str(jac), "0", "0"],
-              work, log, env=env)  # fmt: skip
-        detj_ants = _load(jac).astype(np.float64)
-        deform.update({f"{k}_ants": v for k, v in deformation_judges(detj_ants, inside).items()})
-        lab_judges("ants", ad, _load(lab), detj_ants)
-        res.artifacts += [(lab, "keep"), (jac, "regenerable"), (ants_warp, "host"),
-                          (ad / "ants_0InverseWarp.nii.gz", "regenerable"),
-                          (ad / "ants_warped.nii.gz", "host"), (ad / "fit.timing.json", "keep")]  # fmt: skip
+        if self.with_reference:
+            ad = work / "ants"
+            ad.mkdir(exist_ok=True)
+            ants_warp = ad / "ants_0Warp.nii.gz"
+            env = {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": str(threads)}
+            t = timed_cached(
+                ["antsRegistration", "-d", "3", "-o", f"[{ad / 'ants_'},{ad / 'ants_warped.nii.gz'}]",
+                 "-n", "Linear", "-u", "0", "-z", "1", "-w", "[0.005,0.995]",
+                 "-m", f"CC[{B},{SA},1,4]", *ANTS_SYN],
+                ad / "fit.timing.json", [ants_warp, ad / "ants_warped.nii.gz"],
+                work, log, timeout_s=self.timeout_s, env=env,
+            )  # fmt: skip
+            res.timings.append(("ref", "cpu", t, threads))
+            lab = ad / "lab_warped.nii.gz"
+            timed(["antsApplyTransforms", "-d", "3", "-i", str(SLA), "-r", str(B), "-o", str(lab),
+                   "-n", "NearestNeighbor", "-t", str(ants_warp)], work, log, env=env)  # fmt: skip
+            truth.update(
+                {f"{k}_ants": v for k, v in dice_judges(_load(lab), base_lab_v, labels).items()}
+            )
+            jac = ad / "jac.nii.gz"
+            timed(["CreateJacobianDeterminantImage", "3", str(ants_warp), str(jac), "0", "0"],
+                  work, log, env=env)  # fmt: skip
+            detj_ants = _load(jac).astype(np.float64)
+            deform.update(
+                {f"{k}_ants": v for k, v in deformation_judges(detj_ants, inside).items()}
+            )
+            lab_judges("ants", ad, _load(lab), detj_ants)
+            res.artifacts += [(lab, "keep"), (jac, "regenerable"), (ants_warp, "host"),
+                              (ad / "ants_0InverseWarp.nii.gz", "regenerable"),
+                              (ad / "ants_warped.nii.gz", "host"), (ad / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- 3dQwarp (one pair in QWARP_EVERY) --------------------------------------
-        if int(_stable_rank(key["src"], key["base"]), 16) % QWARP_EVERY == 0:
+        if (
+            self.with_reference
+            and int(_stable_rank(key["src"], key["base"]), 16) % QWARP_EVERY == 0
+        ):
             qd = work / "afni_qwarp"
             qd.mkdir(exist_ok=True)
             t = timed_cached(
