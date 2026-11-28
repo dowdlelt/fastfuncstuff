@@ -957,3 +957,71 @@ def hexahedron_penalty_energy_cpu(xd: Tensor, yd: Tensor, zd: Tensor, cut: float
     out = np.empty_like(arrs[0])
     _with_threads(_hexahedron_penalty_kernel, *arrs, np.float32(cut), out)
     return torch.from_numpy(out).reshape(shape)
+
+
+@njit(parallel=True, cache=True)
+def _shear_axis0(src, sh, w, out):
+    nz, ny, nx = src.shape
+    nt = w.shape[2]
+    for j in prange(ny):  # ty: ignore[not-iterable]
+        for i in range(nx):
+            s0 = sh[j, i]
+            for k in range(nz):
+                acc = 0.0
+                base = k + s0
+                for t in range(nt):
+                    kk = base + t
+                    if 0 <= kk < nz:
+                        acc += w[j, i, t] * src[kk, j, i]
+                out[k, j, i] = acc
+
+
+@njit(parallel=True, cache=True)
+def _shear_axis1(src, sh, w, out):
+    nz, ny, nx = src.shape
+    nt = w.shape[2]
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        for i in range(nx):
+            s0 = sh[k, i]
+            for j in range(ny):
+                acc = 0.0
+                base = j + s0
+                for t in range(nt):
+                    jj = base + t
+                    if 0 <= jj < ny:
+                        acc += w[k, i, t] * src[k, jj, i]
+                out[k, j, i] = acc
+
+
+@njit(parallel=True, cache=True)
+def _shear_axis2(src, sh, w, out):
+    nz, ny, nx = src.shape
+    nt = w.shape[2]
+    for k in prange(nz):  # ty: ignore[not-iterable]
+        for j in range(ny):
+            s0 = sh[k, j]
+            for i in range(nx):
+                acc = 0.0
+                base = i + s0
+                for t in range(nt):
+                    ii = base + t
+                    if 0 <= ii < nx:
+                        acc += w[k, j, t] * src[k, j, ii]
+                out[k, j, i] = acc
+
+
+_SHEAR_AXIS = (_shear_axis0, _shear_axis1, _shear_axis2)
+
+
+def shear_1d_cpu(vol: Tensor, dim: int, shifts: Tensor, weights: Tensor) -> Tensor:
+    """Fused 1-D fractional shear along ``dim`` (0..2) with zero-fill outside [0, n).
+
+    Replaces the multi-pass eager gather (6 full-volume ops per tap) and the
+    oneDNN-dependent grouped conv1d with one threaded C-speed pass per axis.
+    """
+    src = vol.detach().contiguous().numpy()
+    sh = shifts.detach().contiguous().numpy()
+    w = weights.detach().contiguous().numpy()
+    out = np.empty_like(src)
+    _with_threads(_SHEAR_AXIS[dim], src, sh, w, out)
+    return torch.from_numpy(out)

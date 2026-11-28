@@ -968,8 +968,14 @@ def parse_args(
 
 
 def _select_device(arg_device: str | None) -> torch.device:
-    """Resolve the -device flag (or auto-detect)."""
-    return setup_device(arg_device, tf32=REGISTRATION_TF32)
+    """Resolve the -device flag (or auto-detect); route MPS to CPU per _MPS_CPU_OPS."""
+    from fastfuncstuff.utils import cpu_if_mps
+
+    device = setup_device(arg_device, tf32=REGISTRATION_TF32)
+    if cpu_if_mps(device, "moco_registration") != device:
+        print("ffs_moco: the CPU beats Metal on this tool; running there.")
+        device = setup_device("cpu", tf32=REGISTRATION_TF32)
+    return device
 
 
 def _parse_base(args: argparse.Namespace, verb: int) -> tuple[torch.Tensor | None, int]:

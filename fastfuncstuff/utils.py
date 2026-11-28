@@ -275,6 +275,9 @@ _MPS_CPU_OPS: dict[str, str] = {
     # 3-D sampling too small a share of the work for Metal to pay for the rest.
     "qwarp_registration": "torch 2.14: 88x105x88 EPI pair, interleaved, three rounds: "
     "285 s MPS vs 247 s CPU (1.15x); 2x at 32^3 and 64^3",
+    "moco_registration": "torch 2.14 M4 Max, interleaved 3 rounds on real bench units: "
+    "Numba CPU shear beats MPS rowconv by 1.6-1.8x across small and large EPIs "
+    "(4.88 vs 8.61 s ds000030, 4.44 vs 7.83 s ds000210, 15.52 vs 24.37 s ds001168)",
     # Measured 2026-11-01, same machine, the shapes these actually arrive in. Metal
     # lost every one. See fastfuncstuff/policy_linalg.py, which is how they get used.
     "inv": "torch 2.14: (100,100) 0.60 ms vs 0.04 ms CPU (14x); (4,4) 33x; batched (1000,12,12) 1.5x",

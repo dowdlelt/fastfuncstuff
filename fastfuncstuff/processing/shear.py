@@ -726,14 +726,40 @@ def _interp_1d_rowconv(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     rows = vol.movedim(dim, -1)
     lead = rows.shape[:-1]
     K = rows[..., 0].numel()
+    af_shape = tuple(1 if d == dim else vol.shape[d] for d in range(vol.ndim))
     cap = n + ntaps
-    shift = ia.to(torch.long).movedim(dim, -1).reshape(K, 1).clamp(-cap, cap)
+    shift = ia.to(torch.long).expand(af_shape).movedim(dim, -1).reshape(K, 1).clamp(-cap, cap)
     pad = int(shift.abs().max()) + ntaps
     padded = torch.nn.functional.pad(rows.reshape(1, K, n), (pad, pad))
-    w = torch.stack([wt.expand(af.shape).movedim(dim, -1).reshape(K) for wt in wlist], dim=-1)
+    w = torch.stack([wt.expand(af_shape).movedim(dim, -1).reshape(K) for wt in wlist], dim=-1)
     filt = torch.nn.functional.conv1d(padded, w.reshape(K, 1, ntaps).to(vol.dtype), groups=K)[0]
     start = torch.arange(n, device=vol.device) + (shift + (pad - lo))
     return torch.gather(filt, -1, start).reshape(*lead, n).movedim(-1, dim)
+
+
+def _interp_1d_cpu(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
+    """Fused threaded Numba 1-D shear on CPU (falls back if compiling or exotic dtype)."""
+    if vol.dtype in (torch.float32, torch.float64) and not torch.compiler.is_compiling():
+        from .numba_kernels import shear_1d_cpu
+
+        nshift = -af
+        ia = torch.floor(nshift)
+        aa = nshift - ia
+        offs, wlist = _shear_taps(aa, mode)
+        lo = -offs[0]
+        af_shape = tuple(1 if d == dim else vol.shape[d] for d in range(vol.ndim))
+        sh = ia.to(torch.int64).expand(af_shape).squeeze(dim).contiguous() - lo
+        w = (
+            torch.stack([wt.expand(af_shape).squeeze(dim) for wt in wlist], dim=-1)
+            .to(vol.dtype)
+            .contiguous()
+        )
+        return shear_1d_cpu(vol, dim, sh, w)
+    return (
+        _interp_1d_rowconv(vol, dim, af, mode)
+        if prefer_cpu_row_convolution()
+        else _interp_1d_along(vol, dim, af, mode)
+    )
 
 
 # The eager pass above runs ~6 unfused full-volume ops per tap (materialized
@@ -806,7 +832,12 @@ def _get_shear_interp(device: torch.device):
     and recompiles every call -- interp._get_gather_contract has the full story).
     """
     if device.type == "cpu":
-        return _interp_1d_rowconv if prefer_cpu_row_convolution() else _interp_1d_along
+        return _interp_1d_cpu
+    if device.type == "mps":
+        # Depthwise conv1d runs natively on Metal (~1-2 ms/shear) with zero
+        # torch.compile warmup; compiling _interp_1d_along with dynamic=False paid
+        # ~18 s per new volume shape on Apple Silicon (M4 Max, torch 2.14).
+        return _interp_1d_rowconv
     if not _shear_compile_allowed(device):
         return _interp_1d_along
     dt = device.type
