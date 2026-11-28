@@ -343,3 +343,12 @@ def test_blipflip_detects_mislabelled_phase_images():
     assert _is_phase_image({"ImageType": ["ORIGINAL", "PRIMARY", "P", "ND"]}, mag)
     assert _is_phase_image({}, phase)
     assert not _is_phase_image({}, mag)
+
+
+def test_allineate_partial_axes_raises_clear_error_on_empty_mask():
+    import pytest
+
+    from fastfuncstuff.benchmark.checks.allineate import partial_axes
+
+    with pytest.raises(ValueError, match="empty brain mask"):
+        partial_axes(np.eye(4), (64, 64, 30), np.eye(4), np.zeros((10, 10, 10), dtype=bool))

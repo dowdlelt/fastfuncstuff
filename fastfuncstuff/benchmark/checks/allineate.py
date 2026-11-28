@@ -176,6 +176,8 @@ def partial_axes(epi_affine, epi_shape, brain_affine, brain_mask, frac=PARTIAL_F
     a = np.asarray(epi_affine, dtype=float)[:3, :3]
     vox = np.sqrt((a**2).sum(0))
     ijk = np.argwhere(brain_mask)
+    if ijk.size == 0:
+        raise ValueError("empty brain mask — segmentation produced no brain voxels")
     w = apply_affine(brain_affine, ijk)
     bvox = np.sqrt((np.asarray(brain_affine)[:3, :3] ** 2).sum(0))
     brain_ext = w.max(0) - w.min(0) + bvox.mean()

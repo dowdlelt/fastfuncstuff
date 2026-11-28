@@ -9,6 +9,7 @@ import torch
 
 from fastfuncstuff.processing.segment_affine import (
     affine_to_params,
+    affine_to_tpm,
     params_to_affine,
     register_to_tpm,
 )
@@ -90,3 +91,40 @@ def test_register_to_tpm_recovers_known_affine():
     start = np.abs(corners @ (np.eye(4) - true).T)[:, :3].max()
     assert start > 8.0
     assert err < 1.0, f"max displacement error {err:.2f} mm (started at {start:.1f})"
+
+
+def test_affine_to_tpm_recovers_off_centre_head_in_zero_padded_fov():
+    """A small/child head sitting low in a zero-padded FoV (ds004440 sub-CLC06) can leave
+    both the header-origin and FoV-centre starts far off the TPM; the data-centroid start
+    must still land inside the basin of attraction."""
+    from fastfuncstuff.processing.segment import apply_affine_pts, sample_tpm_prior
+
+    log_prior, tpm_aff, bg_lo, bg_hi = _synthetic_tpm(n=40, vox=3.0)
+    # Place the head offset by +45 mm in z inside a large zero-padded FoV, and shift
+    # the header origin so header-origin puts it at -45 mm while FoV-centre puts it at +45 mm.
+    nz, ny, nx, vox = 72, 48, 48, 2.5
+    subj_aff = np.diag([vox, vox, vox, 1.0])
+    subj_aff[:3, 3] = [-vox * (nx - 1) / 2, -vox * (ny - 1) / 2, -vox * (nz - 1) / 2 - 45.0]
+    true = np.eye(4)
+    true[2, 3] = 45.0  # subject world -> TPM world (head sits at z_subj = -45 -> z_tpm = 0)
+    # Wait: put the head at z_vox near the bottom (z_subj = -45 - 45 = -90), so
+    # header-origin puts it at -90 mm and FoV-centre puts it at -45 mm, both far off 0.
+    true[2, 3] = 90.0
+
+    idx_z = torch.arange(nz, dtype=torch.float64)
+    idx_y = torch.arange(ny, dtype=torch.float64)
+    idx_x = torch.arange(nx, dtype=torch.float64)
+    zz, yy, xx = torch.meshgrid(idx_z, idx_y, idx_x, indexing="ij")
+    pts = torch.stack([xx, yy, zz], -1).reshape(-1, 3)
+    vox2vox = np.linalg.inv(tpm_aff) @ true @ subj_aff
+    prior = sample_tpm_prior(
+        log_prior, apply_affine_pts(pts, torch.as_tensor(vox2vox)).float(), bg_lo, bg_hi
+    )
+    means = torch.tensor([60.0, 110.0, 30.0, 0.0])  # background = 0 (like air-masked T1w)
+    gen = torch.Generator().manual_seed(1)
+    label = torch.multinomial(prior.double(), 1, generator=gen)[:, 0]
+    img = means[label].reshape(nz, ny, nx)
+    img = torch.where(img > 0, img + 2.0 * torch.randn(nz, ny, nx, generator=gen), img)
+
+    est = affine_to_tpm(img, subj_aff, log_prior, tpm_aff, bg_lo, bg_hi, samp=3.0, regtype="rigid")
+    assert abs(est[2, 3] - true[2, 3]) < 5.0, f"z translation {est[2, 3]:.1f} vs {true[2, 3]:.1f}"

@@ -358,7 +358,11 @@ def affine_to_tpm(
     kw = dict(regtype=regtype, dither=dither, dtype=dtype)
     coarse = _Samples(volume, subj_affine, 8.0, dither=dither, seed=1)
 
-    # The FoV-centre start only changes the origin; the samples (in voxels) are shared.
+    # The FoV-centre and data-centroid starts only change the origin; the samples (in
+    # voxels) are shared. A small/child head sitting off-centre in a large padded FoV
+    # (e.g. ds004440 sub-CLC06) can leave both header-origin and FoV-centre >30 mm off
+    # the TPM brain in opposite directions; centring the nonzero sample centroid lands
+    # directly inside the basin of attraction.
     dims = np.array(volume.shape[::-1], dtype=np.float64)  # (nx, ny, nz)
     centred = subj_affine.copy()
     centred[:3, 3] = -subj_affine[:3, :3] @ ((dims - 1) / 2)
@@ -369,9 +373,21 @@ def affine_to_tpm(
     a2, ll2 = register_to_tpm(
         volume, subj_affine, **common, samp=8.0, fwhm=(fwhm + 1) * 16, samples=coarse, **kw
     )
+    starts = [(a1, ll1), (a2, ll2)]
+    ll3_str = ""
+    if coarse.coords.numel() > 0:
+        com_ijk = coarse.coords.mean(dim=0).cpu().numpy()
+        com_aff = subj_affine.copy()
+        com_aff[:3, 3] = -subj_affine[:3, :3] @ com_ijk
+        a3, ll3 = register_to_tpm(
+            volume, com_aff, **common, samp=8.0, fwhm=(fwhm + 1) * 16, samples=coarse, **kw
+        )
+        a3 = a3 @ com_aff @ np.linalg.inv(subj_affine)
+        starts.append((a3, ll3))
+        ll3_str = f", data-centroid ll={ll3:.4f}"
     if verbose:
-        print(f"  affine starts: FoV-centre ll={ll1:.4f}, header-origin ll={ll2:.4f}")
-    aff = a1 if ll1 > ll2 else a2
+        print(f"  affine starts: FoV-centre ll={ll1:.4f}, header-origin ll={ll2:.4f}{ll3_str}")
+    aff = max(starts, key=lambda pair: pair[1])[0]
 
     fine = _Samples(volume, subj_affine, samp, dither=dither, seed=1)
     aff, _ = register_to_tpm(
