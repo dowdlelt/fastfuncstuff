@@ -23,6 +23,7 @@ MASK_PATH = os.path.join(HERE, "automask.nii.gz")
 OUT_PREFIX = os.path.join(HERE, "phaseprep_ref")
 NOISE_LB = 0.15  # Hz, Stanley §2.2.3 / phaseprep default
 
+
 def load_nifti(path: str) -> nb.Nifti1Image | nb.Nifti2Image:
     image = nb.load(path)
     if not isinstance(image, (nb.Nifti1Image, nb.Nifti2Image)):
@@ -124,14 +125,18 @@ def fit_voxel(idx):
         return idx, SKIP_SSTOT, None
 
     r2_v = 1.0 - float(((m - est) ** 2).sum()) / ss_tot
-    return idx, 0, (
-        r2_v,
-        float(res.beta[0]),
-        float(res.beta[1]),
-        stdm,
-        stdp,
-        est.astype(np.float32),
-        (m - est + mm_x).astype(np.float32),
+    return (
+        idx,
+        0,
+        (
+            r2_v,
+            float(res.beta[0]),
+            float(res.beta[1]),
+            stdm,
+            stdp,
+            est.astype(np.float32),
+            (m - est + mm_x).astype(np.float32),
+        ),
     )
 
 
@@ -154,8 +159,7 @@ if __name__ == "__main__":
     # Force fork on linux so workers inherit `mag`/`pha`/`linear_model` cheaply.
     ctx = mp.get_context("fork")
     with ctx.Pool(N_WORKERS) as pool:
-        pbar = tqdm(total=total, mininterval=0.5, smoothing=0.05,
-                    unit="vox", dynamic_ncols=True)
+        pbar = tqdm(total=total, mininterval=0.5, smoothing=0.05, unit="vox", dynamic_ncols=True)
         for idx, code, payload in pool.imap_unordered(fit_voxel, voxel_ids, chunksize=chunksize):
             if code == 0:
                 r2_v, A, B, stdm, stdp, sim_ts, filt_ts = payload
