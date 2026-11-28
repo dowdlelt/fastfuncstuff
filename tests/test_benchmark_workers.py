@@ -279,3 +279,44 @@ def test_cpu_helpers_work_without_an_affinity_mask(monkeypatch):
     workers.pin_to([0])  # no-op, no AttributeError
     assert cpu_threads() == (os.cpu_count() or 1)
     assert len(workers.cpu_cores(sysfs="/nonexistent")) == (os.cpu_count() or 1)
+
+
+def test_runner_excludes_not_applicable_raised_from_a_reloaded_base(tmp_path, monkeypatch):
+    """The runner reloads checks.base between units, so a check raises a NotApplicableError
+    class other than the one the runner started with; it must still be an exclusion."""
+    from fastfuncstuff.benchmark import fetch, work
+
+    class NotApplicableError(Exception):  # stands in for the reloaded class
+        pass
+
+    class RestCheck:
+        def run(self, key, paths, work_dir, device):
+            raise NotApplicableError("no events file among the inputs")
+
+    root, man = tmp_path / "bench", tmp_path / "bench" / "manifests"
+    man.mkdir(parents=True)
+    _manifest(man, "dsA", "s3")
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("reml", "dsA", [({"sub": "01"}, ["sub-01/bold.nii.gz"])])
+    monkeypatch.setattr(work, "_load_checks", lambda prev: {"reml": RestCheck})
+    monkeypatch.setattr(fetch, "fetch", lambda m, inputs, cache: ({}, None))
+    assert work.run(wl, root, man, None, 5, "cpu", keep=True) == 1
+    (row,) = wl.db.execute("SELECT status, error FROM units").fetchall()
+    assert row["status"] == "excluded" and "no events file" in row["error"]
+
+
+def test_redo_of_a_check_without_tool_folders_reruns_whole_units(tmp_path):
+    """slicetime writes ffs_tshift.nii flat in the unit (no ffs/ folder, no fit stamps):
+    stage 4 of the Mac queue (-redo slicetime -tools ffs) raised instead of rerunning."""
+    from fastfuncstuff.benchmark.work import redo
+
+    root = tmp_path / "bench"
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("slicetime", "dsA", [({"sub": "01"}, ["bold.nii.gz"])])
+    u = wl.claim_next()
+    work = root / "units/slicetime/dsA" / f"unit{u['id']:06d}"
+    work.mkdir(parents=True)
+    (work / "ffs_tshift.nii").write_bytes(b"x")
+    wl.finish(u["id"], "done")
+    assert redo(wl, root, "slicetime", ["ffs"]) == 1
+    assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"

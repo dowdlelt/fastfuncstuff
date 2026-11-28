@@ -125,8 +125,15 @@ def _load_checks(previous: dict) -> dict:
     names = sorted(n for n in sys.modules if n.startswith(f"{__package__}.checks."))
     try:
         if names:
+            # report_spec first: a check that adds a ReportSpec field would otherwise be
+            # built against the class the runner started with, and the reload would fail.
+            spec = (
+                [f"{__package__}.report_spec"]
+                if f"{__package__}.report_spec" in sys.modules
+                else []
+            )
             base = f"{__package__}.checks.base"
-            for n in [base] + [n for n in names if n != base]:
+            for n in spec + [base] + [n for n in names if n != base]:
                 importlib.reload(sys.modules[n])
             pkg = importlib.reload(sys.modules[f"{__package__}.checks"])
         else:
@@ -152,7 +159,6 @@ def run(
 ) -> int:
     import time
 
-    from .checks.base import NotApplicableError
     from .fetch import fetch, sha256
 
     checks: dict = {}
@@ -220,14 +226,17 @@ def run(
             ref_m = res.metrics.get("reference", {})
             brief = ", ".join(f"{k}={v:.4g}" for k, v in list(ref_m.items())[:4] if v is not None)
             print(f"    done: ref {t.get('ref', 0):.1f} s, ffs {ffs_s:.1f} s | {brief}", flush=True)
-        except NotApplicableError as e:
-            wl.finish(u["id"], "excluded", f"not applicable: {e}")
-            print(f"    excluded: {e}", flush=True)
         except Exception as e:  # a bad unit is recorded, the loop goes on
-            wl.finish(
-                u["id"], "failed", f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"
-            )
-            print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            # By name: _load_checks reloads checks.base between units, so the class a check
+            # raises is not the one imported when the runner started.
+            if any(c.__name__ == "NotApplicableError" for c in type(e).__mro__):
+                wl.finish(u["id"], "excluded", f"not applicable: {e}")
+                print(f"    excluded: {e}", flush=True)
+            else:
+                wl.finish(
+                    u["id"], "failed", f"{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}"
+                )
+                print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
         if not keep:
             # A host set keeps its outputs for inspection unless exported with -prune_outputs;
             # outputs marked keep (warps, label maps) always stay.
@@ -246,14 +255,17 @@ def redo(wl, root: Path, check: str, tools: list[str]) -> int:
     the command, so a rerun would reuse the old fit. Removing just that tool's stamp makes
     it refit, while the reference fits (hours of @SSwarper or 3dQwarp) are reused, as long
     as their outputs are still on disk. A tool is its unit subfolder, ``ffs_<tool>`` or
-    ``<tool>``. Returns the number of units sent back."""
+    ``<tool>``. A check that keeps no per-tool folders (slicetime, moco, ...) caches no
+    fits either, so its units simply rerun whole. Returns the number of units sent back."""
     rows = wl.db.execute(
         "SELECT id, dataset FROM units WHERE check_name=? AND status IN ('done', 'failed')",
         (check,),
     ).fetchall()
     seen: set[str] = set()
+    tool_dirs = False
     for r in rows:
         work = root / "units" / check / r["dataset"] / f"unit{r['id']:06d}"
+        tool_dirs = tool_dirs or any(d.is_dir() for d in work.glob("ffs_*"))
         for t in tools:
             for d in (work / f"ffs_{t}", work / t):
                 if d.is_dir():
@@ -261,7 +273,7 @@ def redo(wl, root: Path, check: str, tools: list[str]) -> int:
                     for stamp in ("fit.timing.json", "stamp.json"):  # timed_cached stamps
                         (d / stamp).unlink(missing_ok=True)
                     break
-    if rows and (missing := [t for t in tools if t not in seen]):
+    if tool_dirs and (missing := [t for t in tools if t not in seen]):
         raise ValueError(f"no unit of {check} has a folder for {missing} (ffs_<tool> or <tool>)")
     with wl._tx():
         wl.db.executemany(
