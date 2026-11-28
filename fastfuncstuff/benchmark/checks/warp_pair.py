@@ -343,9 +343,9 @@ class WarpPairCheck(QwarpCheck):
         detj_ants = _load(jac).astype(np.float64)
         deform.update({f"{k}_ants": v for k, v in deformation_judges(detj_ants, inside).items()})
         lab_judges("ants", ad, _load(lab), detj_ants)
-        res.artifacts += [(lab, "keep"), (jac, "regenerable"), (ants_warp, "keep"),
+        res.artifacts += [(lab, "keep"), (jac, "regenerable"), (ants_warp, "host"),
                           (ad / "ants_0InverseWarp.nii.gz", "regenerable"),
-                          (ad / "ants_warped.nii.gz", "keep"), (ad / "fit.timing.json", "keep")]  # fmt: skip
+                          (ad / "ants_warped.nii.gz", "host"), (ad / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- 3dQwarp (one pair in QWARP_EVERY) --------------------------------------
         if int(_stable_rank(key["src"], key["base"]), 16) % QWARP_EVERY == 0:
@@ -360,7 +360,7 @@ class WarpPairCheck(QwarpCheck):
             res.timings.append(("ref_3dqwarp", "cpu", t, threads))
             afni_warp_judges("3dqwarp", qd, qd / "qw_WARP.nii.gz")
             # outputs timed_cached checks stay, so `work -redo` reuses this fit
-            res.artifacts += [(qd / "qw_WARP.nii.gz", "keep"), (qd / "qw.nii.gz", "keep"),
+            res.artifacts += [(qd / "qw_WARP.nii.gz", "host"), (qd / "qw.nii.gz", "host"),
                               (qd / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- ffs tools ------------------------------------------------------------------
@@ -378,8 +378,8 @@ class WarpPairCheck(QwarpCheck):
             res.timings.append((f"ffs_{tool}", dev, t, ffs_threads(device)))
             afni_warp_judges(tool, d, warp)
             res.artifacts += [
-                (warp, "keep"),
-                (warped, "keep"),
+                (warp, "host"),
+                (warped, "host"),
                 (d / "fit.timing.json", "keep"),
             ]
 

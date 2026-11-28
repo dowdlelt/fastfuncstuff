@@ -227,7 +227,7 @@ class WarpMniCheck(Check):
         )
         # every output timed_cached checks stays, so `work -redo` can refit one ffs tool
         # without paying for the references again
-        res.artifacts += [(qwarp, "keep"), (qaff, "keep"), (qq, "keep"),
+        res.artifacts += [(qwarp, "host"), (qaff, "keep"), (qq, "host"),
                           (sd / "fit.timing.json", "keep")]  # fmt: skip
 
         # -- ANTs rigid + affine + SyN, from the cohort's brain extraction ----------------
@@ -256,7 +256,7 @@ class WarpMniCheck(Check):
         timed(["antsApplyTransforms", "-d", "3", "-i", str(labels), "-r", str(T), "-o", str(alab_aff),
                "-n", "NearestNeighbor", "-t", str(aaff)], work, log, env=env)  # fmt: skip
         judge("ants", awarped, alab, _load(ajac).astype(np.float64), alab_aff)
-        res.artifacts += [(aw, "keep"), (aaff, "keep"), (awarped, "keep"),
+        res.artifacts += [(aw, "host"), (aaff, "keep"), (awarped, "host"),
                           (ajac, "regenerable"), (ad / "ants_1InverseWarp.nii.gz", "regenerable"),
                           (ad / "fit.timing.json", "keep")]  # fmt: skip
 
@@ -270,7 +270,7 @@ class WarpMniCheck(Check):
             fd / "fit.timing.json", [al, aff], work, log, timeout_s=self.timeout_s,
         )  # fmt: skip
         res.timings.append(("ffs_affine", dev, t_aff, ffs_threads(device)))
-        res.artifacts += [(aff, "keep"), (al, "keep"), (fd / "fit.timing.json", "keep")]
+        res.artifacts += [(aff, "keep"), (al, "host"), (fd / "fit.timing.json", "keep")]
         for tool, (cli, args) in FFS_NL.items():
             d = work / f"ffs_{tool}"
             d.mkdir(exist_ok=True)
@@ -292,8 +292,8 @@ class WarpMniCheck(Check):
                 afni_affine_labels(d, aff),
             )
             res.artifacts += [
-                (warp, "keep"),
-                (warped, "keep"),
+                (warp, "host"),
+                (warped, "host"),
                 (d / "fit.timing.json", "keep"),
             ]
 

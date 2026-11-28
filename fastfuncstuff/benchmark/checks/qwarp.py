@@ -200,7 +200,7 @@ class QwarpCheck(Check):
         for d in sides.values():
             # the warps are kept: the reference fit costs hours, and fold/Jacobian
             # judges may change after the night (they did, the first night)
-            res.artifacts += [(p, "keep" if "WARP" in p.name else "regenerable")
+            res.artifacts += [(p, "host" if "WARP" in p.name else "regenerable")
                               for p in sorted(d.glob("qw*"))]  # fmt: skip
             res.artifacts += [
                 (d / "jac.nii.gz", "regenerable"),

@@ -79,7 +79,7 @@ def export_hostset(
     datasets: list[str] = (),  # type: ignore[assignment]
     include_pending: bool = False,
     bundle_local: bool = False,
-    prune_outputs: bool = False,
+    prune_outputs: bool = True,
     repeat_elsewhere: bool = False,
 ) -> Path:
     import yaml
@@ -190,6 +190,42 @@ def _link_or_copy(src: str, dst: str) -> None:
         except OSError:  # another filesystem, or links not supported
             pass
     shutil.copy2(src, dst)
+
+
+def submit(root: Path, out: Path) -> Path:
+    """Write what a host sends back: its worklist (every score, timing and provenance row)
+    plus the ``keep`` files, the small set a new judge would need. ``host`` files (warp
+    fields) and the input cache stay behind. ``work -ingest OUT`` reads it like the full
+    set. Returns OUT."""
+    import sqlite3
+
+    root, out = Path(root), Path(out)
+    src = Worklist(root / "worklist.sqlite")
+    if not src.meta("hostset"):
+        raise ValueError(f"{root} is not a host set (no hostset id in its meta table)")
+    out.mkdir(parents=True, exist_ok=True)
+    dst = sqlite3.connect(out / "worklist.sqlite")
+    src.db.backup(dst)  # consistent even while a runner writes
+    dst.close()
+    if (root / "manifests").is_dir():
+        shutil.copytree(root / "manifests", out / "manifests", dirs_exist_ok=True)
+    sent = left = 0
+    for a in src.db.execute("SELECT path, retention FROM artifacts WHERE pruned_at IS NULL"):
+        f = Path(a["path"])
+        if "/units/" not in a["path"] or not f.is_file():
+            continue
+        if a["retention"] != "keep":
+            left += f.stat().st_size
+            continue
+        to = out / "units" / a["path"].split("/units/", 1)[1]
+        to.parent.mkdir(parents=True, exist_ok=True)
+        if not to.exists() or to.stat().st_size != f.stat().st_size:
+            shutil.copy2(f, to)
+        sent += f.stat().st_size
+    src.close()
+    print(f"{out}: worklist + {sent / 1e9:.2f} GB of keep files; "
+          f"{left / 1e9:.2f} GB of host-only outputs left in {root}")  # fmt: skip
+    return out
 
 
 def ingest(wl: Worklist, root: Path, src: Path) -> Path:

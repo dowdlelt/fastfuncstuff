@@ -27,7 +27,11 @@ class NotApplicableError(Exception):
 class UnitResult:
     metrics: dict[str, dict[str, float | None]] = field(default_factory=dict)  # judge -> {m: v}
     timings: list[tuple[str, str, float, int | None]] = field(default_factory=list)
-    artifacts: list[tuple[Path, str]] = field(default_factory=list)  # (path, keep|regenerable)
+    # (path, retention). keep: small files a new judge would need (label maps, motion
+    # parameters, aff12, ROI series); they travel with a host set's submit bundle.
+    # host: big outputs worth keeping where they were made (warp fields, so -redo reuses an
+    # hour-long reference fit) but not worth syncing. regenerable: pruned after scoring.
+    artifacts: list[tuple[Path, str]] = field(default_factory=list)
     provenance: dict[str, dict[str, Any]] = field(default_factory=dict)  # side -> {k: v}
 
 
@@ -175,6 +179,22 @@ def kill_group(proc: subprocess.Popen, grace_s: float = 10.0) -> None:
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+def scorer_version(check_obj: object) -> dict[str, str]:
+    """Which scoring code produced a unit's metrics: a hash of the check's module and of
+    this one. Hosts score on site, so a section can mix scorers as well as ffs code."""
+    import hashlib
+    import inspect
+
+    h = hashlib.sha256()
+    for src in (inspect.getsourcefile(type(check_obj)), __file__):
+        if src:
+            h.update(Path(src).read_bytes())
+    return {
+        "check": type(check_obj).__module__.rsplit(".", 1)[-1],
+        "check_hash": h.hexdigest()[:12],
+    }
 
 
 @lru_cache(maxsize=1)

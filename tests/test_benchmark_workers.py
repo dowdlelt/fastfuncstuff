@@ -158,8 +158,8 @@ def test_hostset_bundles_local_inputs_and_pending_units(tmp_path, monkeypatch):
     wl.add_units("warp_mni", "Coh", [({"subject": "01"}, ["sub-01/t1.nii.gz"])])  # pending
 
     out = export_hostset(wl, man, tmp_path / "hs", ["warp_mni"], 2, "srv", bundle_local=True,
-                         include_pending=True, prune_outputs=True)  # fmt: skip
-    assert Worklist(out / "worklist.sqlite").meta("prune_outputs") == "yes"
+                         include_pending=True)  # fmt: skip
+    assert Worklist(out / "worklist.sqlite").meta("prune_outputs") == "yes"  # the default
     assert sorted(p.name for p in (out / "data" / "Coh" / "sub-01").iterdir()) == [
         "t1.json",
         "t1.nii.gz",
@@ -305,6 +305,14 @@ def test_runner_excludes_not_applicable_raised_from_a_reloaded_base(tmp_path, mo
     assert row["status"] == "excluded" and "no events file" in row["error"]
 
 
+def test_scorer_version_hashes_the_check_source():
+    from fastfuncstuff.benchmark.checks.base import scorer_version
+    from fastfuncstuff.benchmark.checks.slicetime import SlicetimeCheck
+
+    v = scorer_version(SlicetimeCheck())
+    assert v["check"] == "slicetime" and len(v["check_hash"]) == 12
+
+
 def test_redo_of_a_check_without_tool_folders_reruns_whole_units(tmp_path):
     """slicetime writes ffs_tshift.nii flat in the unit (no ffs/ folder, no fit stamps):
     stage 4 of the Mac queue (-redo slicetime -tools ffs) raised instead of rerunning."""
@@ -320,3 +328,34 @@ def test_redo_of_a_check_without_tool_folders_reruns_whole_units(tmp_path):
     wl.finish(u["id"], "done")
     assert redo(wl, root, "slicetime", ["ffs"]) == 1
     assert wl.db.execute("SELECT status FROM units").fetchone()[0] == "pending"
+
+
+def test_submit_sends_keep_files_and_leaves_host_outputs(tmp_path):
+    """A host syncs back its scores plus the small keep set; warp fields (host) stay there,
+    and ingest reads the slim bundle like a full host set."""
+    from fastfuncstuff.benchmark.hostset import export_hostset, ingest, submit
+
+    root, man = tmp_path / "bench", tmp_path / "bench" / "manifests"
+    man.mkdir(parents=True)
+    _manifest(man, "dsA", "s3")
+    wl = Worklist(root / "worklist.sqlite")
+    wl.add_units("warp_pair", "dsA", [({"sub": "01"}, ["x"])])
+    out = export_hostset(wl, man, tmp_path / "hs", ["warp_pair"], 1, "srv", include_pending=True)
+    hs = Worklist(out / "worklist.sqlite")
+    u = hs.claim_next()
+    unit = out / "units/warp_pair/dsA" / f"unit{u['id']:06d}"
+    unit.mkdir(parents=True)
+    for name, ret in (("lab.nii.gz", "keep"), ("WARP.nii.gz", "host")):
+        (unit / name).write_bytes(b"x" * 100)
+        hs.record_artifact(u["id"], unit / name, ret)
+    hs.record_metrics(u["id"], "truth", {"dice_mean_ants": 0.7})
+    hs.finish(u["id"], "done")
+    hs.close()
+
+    bundle = submit(out, tmp_path / "submit")
+    sent = bundle / unit.relative_to(out)
+    assert (sent / "lab.nii.gz").exists() and not (sent / "WARP.nii.gz").exists()
+    assert (bundle / "manifests" / "dsA.yaml").exists()
+    dest = ingest(wl, root, bundle)
+    (res,) = Worklist(dest / "worklist.sqlite").results("warp_pair")
+    assert res["truth.dice_mean_ants"] == 0.7

@@ -32,6 +32,7 @@ PROV_KEYS = {
     "host": ("cpu_model", "gpu", "n_physical_cores"),
     "worker": ("threads", "hostname"),
     "ffs": ("ffs_sha",),
+    "scorer": ("check_hash",),  # recorded from 2026-11-28; older units show "?"
 }
 
 
@@ -90,7 +91,7 @@ def _read_db(path: Path, check: str, host: str) -> tuple[pd.DataFrame, pd.DataFr
     wide = met.pivot_table(index="unit_id", columns="key", values="value", aggfunc="first")
     units = units.set_index("unit_id").join(prov).join(wide).reset_index()
     units.insert(0, "host", host)
-    for c in ("host.cpu_model", "host.gpu", "ffs.ffs_sha", "worker.threads"):
+    for c in ("host.cpu_model", "host.gpu", "ffs.ffs_sha", "worker.threads", "scorer.check_hash"):
         if c not in units:
             units[c] = None
     tim = tim.merge(
@@ -576,7 +577,10 @@ def fig_overview(sp_all: pd.DataFrame, out: Path, stem: str) -> str | None:
 def _code_line(df: pd.DataFrame) -> tuple[str, bool]:
     shas = df["ffs.ffs_sha"].fillna("?").str[:8].value_counts()
     text = ", ".join(f"{s} ({n})" for s, n in shas.items())
-    return f"ffs code: {text}", len(shas) > 1
+    # Hosts score on site, so the judges can differ as well as the code they judge.
+    sc = df["scorer.check_hash"].fillna("?").str[:8].value_counts()
+    scored = ", ".join(f"{s} ({n})" for s, n in sc.items())
+    return f"ffs code: {text}; scorer: {scored}", len(shas) > 1 or len(sc.drop("?", errors="ignore")) > 1
 
 
 def _who(df: pd.DataFrame) -> str:
@@ -743,7 +747,8 @@ def build_section(root: Path, check: str, spec: ReportSpec, out: Path) -> dict |
         "speedups": sp.assign(check=check) if len(sp) else sp,
         "row": {"check": check, "units": len(df), "datasets": df.dataset.nunique(),
                 "hosts": ", ".join(sorted(allruns.host.unique())),
-                "ffs code versions": df["ffs.ffs_sha"].nunique()},
+                "ffs code versions": df["ffs.ffs_sha"].nunique(),
+                "scorer versions": df["scorer.check_hash"].fillna("?").nunique()},
     }  # fmt: skip
 
 

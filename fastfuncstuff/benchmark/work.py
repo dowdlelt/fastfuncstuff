@@ -215,6 +215,9 @@ def run(
                 wl.record_artifact(u["id"], path, "regenerable")
             for side, vals in res.provenance.items():
                 wl.record_provenance(u["id"], side, vals)
+            from .checks.base import scorer_version
+
+            wl.record_provenance(u["id"], "scorer", scorer_version(chk))
             from ..benchmark.arch import get_hardware_info
 
             wl.record_provenance(u["id"], "host", get_hardware_info(device))
@@ -238,9 +241,9 @@ def run(
                 )
                 print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}", flush=True)
         if not keep:
-            # A host set keeps its outputs for inspection unless exported with -prune_outputs;
-            # outputs marked keep (warps, label maps) always stay.
-            keep_out = wl.meta("hostset") and wl.meta("prune_outputs") != "yes"
+            # A host set prunes like this machine (regenerable outputs go once scored) unless
+            # exported with -keep_outputs; keep and host files always stay.
+            keep_out = wl.meta("hostset") and wl.meta("prune_outputs") == "no"
             freed = wl.prune(u["id"], under=root / "cache" if keep_out else None)
             if freed:
                 print(f"    pruned {freed / 1e6:.0f} MB", flush=True)
@@ -331,6 +334,13 @@ def main(argv: list[str] | None = None) -> int:
     act.add_argument(
         "-ingest", metavar="DIR", type=Path, help="Register a synced host set (re-ingest replaces)."
     )
+    act.add_argument(
+        "-submit",
+        metavar="DIR",
+        type=Path,
+        help="On a host: write what to sync back into DIR (worklist + keep files; warp "
+        "fields and other host-only outputs stay). Ingest DIR here.",
+    )
     act.add_argument("-hosts", action="store_true", help="List ingested host sets.")
     p.add_argument(
         "-exclude_hosts",
@@ -371,10 +381,10 @@ def main(argv: list[str] | None = None) -> int:
         "private sets) into the host set instead of skipping them.",
     )
     p.add_argument(
-        "-prune_outputs",
+        "-keep_outputs",
         action="store_true",
-        help="-export_hostset: the other host prunes regenerable outputs too, as here "
-        "(default keeps them all for inspection). Halves what a large warp set syncs back.",
+        help="-export_hostset: the other host keeps its regenerable outputs for inspection "
+        "(default prunes them once scored, as here).",
     )
     p.add_argument(
         "-repeat_elsewhere",
@@ -429,7 +439,11 @@ def main(argv: list[str] | None = None) -> int:
             p.error("-export_hostset needs -checks")
         export_hostset(wl, args.manifests, args.export_hostset, args.checks, args.n or 2,
                        args.label, args.datasets, args.include_pending, args.bundle_local,
-                       args.prune_outputs, args.repeat_elsewhere)  # fmt: skip
+                       not args.keep_outputs, args.repeat_elsewhere)  # fmt: skip
+    elif args.submit:
+        from .hostset import submit
+
+        submit(args.root, args.submit)
     elif args.ingest:
         from .hostset import ingest
 

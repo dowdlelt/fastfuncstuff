@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     unit_id INTEGER NOT NULL REFERENCES units(id),
     path TEXT NOT NULL,
     bytes INTEGER,
-    retention TEXT NOT NULL,         -- keep | regenerable
+    retention TEXT NOT NULL,         -- keep | host | regenerable (see checks/base.py)
     pruned_at REAL,
     PRIMARY KEY (unit_id, path)
 );
